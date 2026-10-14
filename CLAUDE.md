@@ -267,10 +267,10 @@ latency (screens and endpoints), time to first screen, memory, and API parity. R
 # needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
 # plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
 docker pull jellyfin/jellyfin:10.11.8
-docker pull "$(cat bench/testdata/jellyfin12-image.txt)"
+docker pull "$(cat bench/testdata/jellyfin-image.txt)"
 bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
 bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
-bench/testdata/build.sh --prepare-jellyfin12       # upgrade a copy, scan and verify, once
+bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
 bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
 python3 bench/report.py --serve                  # compare runs at 127.0.0.1:8097
@@ -285,11 +285,10 @@ range each cell spanned.
 
 Benchmark performance is NOT a CI gate and is not meant to become one; it is a measuring instrument you
 run deliberately — `bench/run.sh --servers ferrofin --only loaded` on two builds is the
-cheap form for a before/after, skipping both Jellyfins. The fast stdlib reporter
+cheap form for a before/after, skipping Jellyfin. The fast stdlib reporter
 correctness tests (`bench/test_report.py`) do run in CI and gate releases; they do not
-start servers or impose performance thresholds. The benchmark reference is stable
-Jellyfin **12.0.0**, requested by the owner in the approved benchmark improvement plan,
-and pinned by digest in `bench/testdata/jellyfin12-image.txt`. This does not change the
+start servers or impose performance thresholds. The benchmark reference is Jellyfin
+**12.2**, pinned by digest in `bench/testdata/jellyfin-image.txt`. This does not change the
 source-verification `UPSTREAM_TAG` recorded below. So the standing rule is unchanged: body-diff correctness is not a
 latency signal — a 100× slowdown can land "green." Any change touching `ferrofin-core`,
 `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths (`translate_query`,

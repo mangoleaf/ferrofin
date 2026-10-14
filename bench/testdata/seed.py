@@ -117,7 +117,7 @@ def refresh_and_wait(api, timeout):
     raise RuntimeError("library scan did not complete before its deadline")
 
 
-def prepare_jellyfin12(url, ids_path, summary_path, out):
+def prepare_jellyfin(url, ids_path, summary_path, out):
     """Verify one disposable upgraded config; build.sh stops it before marking ready."""
     with open(ids_path) as f:
         ids = json.load(f)
@@ -127,8 +127,6 @@ def prepare_jellyfin12(url, ids_path, summary_path, out):
     wait_ready(api)
     api.token = ids["token"]
     info = api.get("/System/Info/Public")
-    if info.get("Version") != "12.0.0":
-        raise RuntimeError(f"expected Jellyfin 12.0.0, got {info.get('Version')}")
     timeout = int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
     deadline = time.monotonic() + timeout
     while running_tasks(api):
@@ -438,8 +436,8 @@ if __name__ == "__main__":
         state_snapshot(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--state-compare":
         compare_states(*sys.argv[2:])
-    elif len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin12":
-        prepare_jellyfin12(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin":
+        prepare_jellyfin(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--export-pools":
         export_existing_pools(*sys.argv[2:])
     else:

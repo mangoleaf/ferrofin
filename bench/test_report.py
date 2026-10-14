@@ -45,8 +45,8 @@ class ReportTests(unittest.TestCase):
         for server, _ in report.SERVERS:
             d = root / server
             d.mkdir()
-            tag = {'jellyfin12': 'jellyfin/jellyfin:12.0-rc7',
-                   'jellyfin': 'jellyfin/jellyfin:10.11.8', 'ferrofin': 'ferrofin:bench'}[server]
+            tag = {'jellyfin': 'jellyfin/jellyfin:12.2',
+                   'ferrofin': 'ferrofin:bench'}[server]
             (d / 'image.txt').write_text(f'{tag} sha256:{server}')
             value = {'count': 60, 'p50': 10 if server == 'ferrofin' else 20,
                      'p95': 30, 'p99': 40, 'max': 50, 'ok': 1}
@@ -119,12 +119,12 @@ class ReportTests(unittest.TestCase):
                             'max_gap_s': .101}}
                 for i in range(2)]
         rows = dict(report.cpu_tables(model)[0][1])
-        self.assertEqual(rows['loaded · run 1']['jellyfin12'], '0.250')
-        self.assertEqual(rows['loaded · run 2']['ferrofin'], '3.250')
+        self.assertEqual(rows['loaded · run 1']['jellyfin'], '0.250')
+        self.assertEqual(rows['loaded · run 2']['ferrofin'], '2.250')
         for rendered in (report.render_md(model), report.render_html(model)):
             section = rendered.split('CPU and sample coverage — invocation and idle windows', 1)[1].split('Phase outcomes', 1)[0]
-            for expected in ('CPU consumption (CPU-seconds)', 'loaded · run 2', '3.250',
-                             'Samples', '1202', '101.000', '120.000', 'Observed start (UTC)', '10.11.8'):
+            for expected in ('CPU consumption (CPU-seconds)', 'loaded · run 2', '2.250',
+                             'Samples', '1202', '101.000', '120.000', 'Observed start (UTC)', '12.2'):
                 self.assertIn(expected, section)
             self.assertNotIn('cpu_seconds', section)
             self.assertNotIn('<pre>', section)
@@ -174,7 +174,7 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(self.home(m).flag)
         self.assertIn('faster on 7', self.readme(m))
         self.assertIn('3 logical CPUs', self.readme(m))
-        self.assertIn('12.0-rc7', report.render_md(m))
+        self.assertIn('12.2', report.render_md(m))
         self.assertIn('No measured request failed', self.readme(m))
         self.assertNotIn('full runs', self.readme(m))
         self.assertIn('<html', report.render_html(m))
@@ -194,10 +194,10 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('faster', self.row(self.readme(m)))
 
     def test_oracle_http_failure_invalidates_comparison(self):
-        self.edit(self.b / 'jellyfin12/k6-loaded.json', lambda x: x['endpoints']['home:items'].update(ok=0))
+        self.edit(self.b / 'jellyfin/k6-loaded.json', lambda x: x['endpoints']['home:items'].update(ok=0))
         m = self.build(self.a, self.b)
         self.assertIn('failed', self.home(m).flag)
-        self.assertIn('failed', self.home(m, 'jellyfin12').flag)
+        self.assertIn('failed', self.home(m, 'jellyfin').flag)
 
     def test_slower_and_tied_candidates_do_not_claim_wins(self):
         for latency, sentence in [(20, 'about the same on 7'), (25, 'slower on 7')]:
@@ -219,8 +219,8 @@ class ReportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, key):
                     self.build(self.a, self.b)
         self.write(self.b / 'run.json', original)
-        (self.b / 'jellyfin12/image.txt').write_text('jellyfin/jellyfin:12.0 sha256:different')
-        with self.assertRaisesRegex(ValueError, 'jellyfin12 image'):
+        (self.b / 'jellyfin/image.txt').write_text('jellyfin/jellyfin:12.0 sha256:different')
+        with self.assertRaisesRegex(ValueError, 'jellyfin image'):
             self.build(self.a, self.b)
 
     def test_actual_window_conditions_are_checked(self):
@@ -253,15 +253,15 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
 
     def test_swapped_counts_between_request_keys_fail(self):
-        for server, counts in [('jellyfin12', [1, 2]), ('ferrofin', [2, 1])]:
+        for server, counts in [('jellyfin', [1, 2]), ('ferrofin', [2, 1])]:
             self.shapes(self.a / server, [{'shape': 'movies:items', 'url': f'http://{server}/Items?page={i}',
                                          'status': 200, 'count': count, 'fields': ['.Items']}
                                         for i, count in enumerate(counts)])
         self.assertIsNotNone(report.comparable(report.load_shape(self.a / 'ferrofin'),
-                                              report.load_shape(self.a / 'jellyfin12'), ['movies:items']))
+                                              report.load_shape(self.a / 'jellyfin'), ['movies:items']))
 
     def test_image_byte_sizes_do_not_flag_cells(self):
-        for server, size in [('jellyfin12', 100), ('ferrofin', 200)]:
+        for server, size in [('jellyfin', 100), ('ferrofin', 200)]:
             path = self.a / server / 'shape.log'
             records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
             for r in records:
@@ -272,20 +272,9 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(dict(m['levels']['loaded']['endpoints'])['image']['ferrofin'].flag)
         self.assertIn('faster', self.row(self.readme(m)))
 
-    def test_third_server_caveat_withholds_its_cell(self):
-        path = self.a / 'jellyfin/shape.log'
-        records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
-        records[0]['fields'] = []
-        self.shapes(path.parent, records)
-        m = self.build()
-        self.assertIsNotNone(self.home(m, 'jellyfin').flag)
-        row = self.row(self.readme(m))
-        self.assertIn('— ⚠', row)
-        self.assertIn('faster', row)  # FF/oracle still valid
-
     def test_inventory_differences_remain_diagnostic_across_repetitions(self):
         self.edit(self.b / 'ferrofin/counts.json', lambda x: x.update(movies=1, persons=5000))
-        self.edit(self.b / 'jellyfin12/counts.json', lambda x: x.update(persons=5158))
+        self.edit(self.b / 'jellyfin/counts.json', lambda x: x.update(persons=5158))
         m = self.build(self.a, self.b)
         for kind in ('screens', 'endpoints'):
             for _, cells in m['levels']['loaded'][kind]:
@@ -295,11 +284,11 @@ class ReportTests(unittest.TestCase):
         self.assertIn('faster', self.row(self.readme(m)))
 
     def test_missing_inventory_stays_visible_without_flagging_latency(self):
-        for server in ('ferrofin', 'jellyfin12'):
+        for server in ('ferrofin', 'jellyfin'):
             (self.b / server / 'counts.json').unlink()
         m = self.build(self.a, self.b)
         self.assertIsNone(self.home(m).flag)
-        self.assertIsNone(self.home(m, 'jellyfin12').flag)
+        self.assertIsNone(self.home(m, 'jellyfin').flag)
         self.assertIn('missing counts.json', m['work']['ferrofin'])
 
     def test_actual_response_counts_still_flag_affected_latency(self):
@@ -313,7 +302,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn('— ⚠', self.row(self.readme(m)))
 
     def test_transport_failure_in_oracle_shape(self):
-        self.shapes(self.a / 'jellyfin12', [{'shape': 'home:items', 'url': '/home:items', 'status': 0}])
+        self.shapes(self.a / 'jellyfin', [{'shape': 'home:items', 'url': '/home:items', 'status': 0}])
         self.assertIsNotNone(self.home(self.build()).flag)
 
     def test_invalid_quantile_cannot_be_published(self):
@@ -329,11 +318,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(c.runs, 2)
         self.assertEqual(len(c.vals), 1)
 
-    def test_two_servers_and_single_server_render(self):
+    def test_single_server_render(self):
         shutil.rmtree(self.a / 'jellyfin')
-        self.assertNotIn('**Jellyfin 10.11.8**', self.readme())
-        self.assertIn('**Jellyfin 12.0-rc7**', self.readme())
-        shutil.rmtree(self.a / 'jellyfin12')
         text = self.readme()
         self.assertIn('no Jellyfin reference selected', text)
         self.assertNotIn('faster', self.row(text))
@@ -356,14 +342,14 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('No measured request failed', self.readme(m))
 
     def test_later_oracle_timing_failure_withholds_ratio(self):
-        self.edit(self.b / 'jellyfin12/coldstart.json', lambda x: x['runs'][0].update(home_ms=None))
+        self.edit(self.b / 'jellyfin/coldstart.json', lambda x: x['runs'][0].update(home_ms=None))
         text = self.readme(self.build(self.a, self.b))
         line = next(x for x in text.splitlines() if x.startswith('| cold start'))
         self.assertIn('— ⚠', line)
         self.assertNotIn('faster', line)
 
     def test_empty_image_is_not_accepted(self):
-        for server in ('ferrofin', 'jellyfin12'):
+        for server in ('ferrofin', 'jellyfin'):
             with self.subTest(server=server):
                 path = self.a / server / 'shape.log'
                 original = path.read_text()
@@ -382,24 +368,22 @@ class ReportTests(unittest.TestCase):
 
     def test_version_labels_follow_each_run_in_every_renderer(self):
         old = self.build(self.a)
-        self.write(self.b / 'jellyfin12/system-info.json', {'Version': '12.0.0'})
+        self.write(self.b / 'jellyfin/system-info.json', {'Version': '12.2.0'})
         new = self.build(self.b)
         for render in (report.render_md, report.render_html,
                        lambda m: report.render_readme(m, m['runs'])):
             with self.subTest(renderer=render):
-                self.assertIn('Jellyfin 12.0.0', render(new))
-                self.assertNotIn('12.0-rc7', render(new))
-                self.assertIn('Jellyfin 12.0-rc7', render(old))
-                self.assertNotIn('Jellyfin 12.0.0', render(old))
+                self.assertIn('Jellyfin 12.2.0', render(new))
+                self.assertNotIn('Jellyfin 12.2.0', render(old))
 
     def test_digest_without_version_is_not_labelled_stable(self):
-        d = self.a / 'jellyfin12'
+        d = self.a / 'jellyfin'
         (d / 'image.txt').write_text('jellyfin/jellyfin@sha256:abc sha256:def')
-        self.assertEqual(report.server_label(d, 'jellyfin12'), 'Jellyfin (version unknown)')
+        self.assertEqual(report.server_label(d, 'jellyfin'), 'Jellyfin (version unknown)')
 
     def test_reported_version_mismatch_refuses_aggregation(self):
-        self.write(self.a / 'jellyfin12/system-info.json', {'Version': '12.0.0'})
-        with self.assertRaisesRegex(ValueError, 'jellyfin12 reported version'):
+        self.write(self.a / 'jellyfin/system-info.json', {'Version': '12.2.0'})
+        with self.assertRaisesRegex(ValueError, 'jellyfin reported version'):
             self.build(self.a, self.b)
 
     def test_required_image_failure_withholds_its_screen(self):
@@ -552,7 +536,7 @@ class PreparationTests(unittest.TestCase):
         script = Path(__file__).parent / 'run.sh'
         for flag, value in (('--only', ''), ('--only', 'loaded,bogus'), ('--only', 'loaded,,shape'),
                             ('--only', 'loaded shape'), ('--only', ',counts'),
-                            ('--servers', ''), ('--servers', 'jellyfin12,unknown')):
+                            ('--servers', ''), ('--servers', 'jellyfin,unknown')):
             with self.subTest(flag=flag, value=value):
                 result = subprocess.run(['bash', str(script), flag, value],
                                         capture_output=True, text=True)

@@ -44,9 +44,9 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
-ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
+ORACLE = "jellyfin"
 ORACLE_LABEL = "Jellyfin reference"
-SERVERS = [("jellyfin12", "Jellyfin 12"), ("jellyfin", "Jellyfin 10.11"), ("ferrofin", "Ferrofin")]
+SERVERS = [("jellyfin", "Jellyfin"), ("ferrofin", "Ferrofin")]
 SCREENS = ["home", "movies", "detail", "series", "search", "playback"]
 #: The load levels a run may contain, lightest first. A run that skipped one (`--only`)
 #: has no entry for it in `windows.json`, and the renderers drop the level.

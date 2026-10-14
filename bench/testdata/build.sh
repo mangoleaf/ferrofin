@@ -5,37 +5,37 @@
 #
 #   build.sh [DIR] [--scale F] [--seed N]      DIR defaults to bench/testdata
 #   build.sh [DIR] --export-pools            read pools from a disposable source copy
-#   build.sh [DIR] --prepare-jellyfin12       upgrade a copy, scan, verify, stop
+#   build.sh [DIR] --prepare-jellyfin          upgrade a copy, scan, verify, stop
 #
 # Refuses to overwrite: remove DIR/media and DIR/config yourself to rebuild.
 set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/../.."
-DIR=$PWD/bench/testdata; SCALE=1.0; SEED=1; PREPARE12=false; EXPORT_POOLS=false
+DIR=$PWD/bench/testdata; SCALE=1.0; SEED=1; PREPARE=false; EXPORT_POOLS=false
 while [ $# -gt 0 ]; do case "$1" in
   --export-pools) EXPORT_POOLS=true; shift;;
-  --prepare-jellyfin12) PREPARE12=true; shift;;
+  --prepare-jellyfin) PREPARE=true; shift;;
   --scale) SCALE=$2; shift 2;; --seed) SEED=$2; shift 2;; -*) echo "unknown $1" >&2; exit 2;; *) DIR=$1; shift;;
 esac; done
 case "$DIR" in /*) ;; *) DIR=$CALLER/$DIR;; esac   # a user-supplied relative DIR is relative to the caller's shell
 DIR=$(realpath -m "$DIR")
 case "$DIR" in /mnt/mangonas*|/mnt/nvme0/k3s*) echo "refusing to build under $DIR" >&2; exit 1;; esac
 # Explicit preparation is separate from fixture generation and timed runs.
-if "$PREPARE12" && "$EXPORT_POOLS"; then echo "choose preparation or pool export, not both" >&2; exit 2; fi
-if "$PREPARE12" || "$EXPORT_POOLS"; then
+if "$PREPARE" && "$EXPORT_POOLS"; then echo "choose preparation or pool export, not both" >&2; exit 2; fi
+if "$PREPARE" || "$EXPORT_POOLS"; then
   for t in docker python3 jq sha256sum; do command -v "$t" >/dev/null || { echo "$t not installed" >&2; exit 1; }; done
   [ -f "$DIR/config/data/jellyfin.db" ] && [ -f "$DIR/ids.json" ] && [ -f "$DIR/media/summary.json" ] || {
     echo "build the 10.11.8 source fixture first" >&2; exit 1;
   }
-  PREPARED=$DIR/jellyfin12
+  PREPARED=$DIR/jellyfin
   if "$EXPORT_POOLS"; then PREPARED=$DIR/cache/pool-export-$$; fi
   [ ! -e "$PREPARED" ] || { echo "$PREPARED exists; choose a new fixture directory or move the old preparation aside" >&2; exit 1; }
-  IMAGE=$(cat bench/testdata/jellyfin12-image.txt)
+  IMAGE=$(cat bench/testdata/jellyfin-image.txt)
   if "$EXPORT_POOLS"; then IMAGE=jellyfin/jellyfin:10.11.8; fi
   IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
   SOURCE_SHA=$(sha256sum "$DIR/config/data/jellyfin.db" | cut -d' ' -f1)
   IDS_SHA=$(sha256sum "$DIR/ids.json" | cut -d' ' -f1)
-  NAME=bench-prepare12-$$; PORT=18097
+  NAME=bench-prepare-$$; PORT=18097
   if "$EXPORT_POOLS"; then NAME=bench-export-pools-$$; fi
   mkdir -p "$PREPARED/cache"
   cp -r --reflink=auto "$DIR/config" "$PREPARED/config"
@@ -45,10 +45,10 @@ if "$PREPARE12" || "$EXPORT_POOLS"; then
   trap 'docker logs "$NAME" > "$PREPARED/server.log" 2>&1 || true; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
   if "$EXPORT_POOLS"; then
     python3 bench/testdata/seed.py --export-pools "http://127.0.0.1:$PORT" "$DIR/ids.json"
-    echo "Pools exported; prepare Jellyfin 12 again because the ID-file hash changed."
+    echo "Pools exported; prepare Jellyfin again because the ID-file hash changed."
     exit 0
   fi
-  python3 bench/testdata/seed.py --prepare-jellyfin12 "http://127.0.0.1:$PORT" \
+  python3 bench/testdata/seed.py --prepare-jellyfin "http://127.0.0.1:$PORT" \
     "$DIR/ids.json" "$DIR/media/summary.json" "$PREPARED/validation.json"
   docker stop -t 60 "$NAME" >/dev/null
   [ "$(docker inspect -f '{{.State.ExitCode}}' "$NAME")" = 0 ] || {
@@ -58,7 +58,7 @@ if "$PREPARE12" || "$EXPORT_POOLS"; then
     --argjson elapsed "$SECONDS" --slurpfile validation "$PREPARED/validation.json" \
     '{image:$image,image_id:$image_id,source_db_sha256:$source,ids_sha256:$ids,elapsed_s:$elapsed,validation:$validation[0]}' \
     > "$PREPARED/preparation.json"
-  echo "Jellyfin 12.0.0 preparation ready: $PREPARED ($SECONDS seconds)"
+  echo "Jellyfin preparation ready: $PREPARED ($SECONDS seconds)"
   exit 0
 fi
 

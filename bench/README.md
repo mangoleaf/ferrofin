@@ -1,16 +1,15 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 12.0.0 (the reference for future runs) and Jellyfin 10.11.8 (the vendored API
-contract), on identical test data, on one host. Archived runs retain their recorded
-12.0-rc7 labels and raw measurements. Re-rendering archived results applies the current
+Jellyfin 12.2 and Ferrofin, on identical test data, on one host. Archived runs retain
+their recorded labels and raw measurements. Re-rendering archived results applies the current
 validation rules: previously published cells can become flagged (including archived
 Ferrofin detail/playback responses missing `IsOriginal`/`LocalizedOriginal`). Review
 an unpublished preview before replacing any published table. Every number has a definition below. New published results must pass the
 comparability, phase and resource checks described here:
 
-- **comparable** — the server returned the same status and record count as Jellyfin
-  12, matching content type, counts, ordered item IDs and per-item field types for
+- **comparable** — the server returned the same status and record count as Jellyfin,
+  matching content type, counts, ordered item IDs and per-item field types for
   every validated request key; extra object fields are allowed. Required image requests
   must have matching keys/types and successful, non-empty responses. Image byte sizes
   are recorded as diagnostics and never compared for equivalence.
@@ -33,15 +32,14 @@ printed: agreement is the absence of a range, not a claim about one.
 The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was not a
 reliable pass/fail test. Reports retain ranges for review instead.
 
-The owner requested stable 12.0.0 for future benchmarks in the approved plan. This benchmark
-reference is separate from the C# source-parity pin in `handlers/mod.rs`. On 2026-09-16
-the owner also requested plugin checks and background scan suppression; the isolation
+The benchmark reference is separate from the C# source-parity pin in `handlers/mod.rs`.
+The owner requested plugin checks and background scan suppression; the isolation
 policy below implements that request on disposable configurations.
 
 ## What is measured
 
 **Screens.** Load is expressed as *screens a user opens*, each being exactly the request
-set jellyfin-web 10.11.8 issues for it (sources cited in `screens.js`), fired concurrently
+set jellyfin-web issues for it (sources cited in `screens.js`), fired concurrently
 as a browser does (six connections per host), then the first twelve poster images the
 cards would load:
 
@@ -120,9 +118,9 @@ movies, 50 HDR10 4K files, 300 multi-track files and one 3-minute 8 Mbps movie f
 streaming numbers. **Jellyfin 10.11.8 itself scans it** with every remote fetcher off and
 is seeded over its own API (two users; 30 % of movies and 60 % of forty series played,
 5 % favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
-config directory is what Jellyfin 10.11.8 and Ferrofin boot a fresh copy of. Jellyfin
-12 boots a copy of the separately prepared config described below. Ferrofin adoption
-stays inside the run; media is mounted read-only for every server.
+config directory is what Ferrofin boots a fresh copy of. Jellyfin boots a copy of the
+separately prepared config described below. Ferrofin adoption stays inside the run;
+media is mounted read-only for every server.
 
 ## Shared picks and bounded validation
 
@@ -133,14 +131,14 @@ Existing fixtures can export these without regenerating media or reseeding users
 
 ```bash
 bench/testdata/build.sh --export-pools
-# Move an existing testdata/jellyfin12 preparation aside, then:
-bench/testdata/build.sh --prepare-jellyfin12
+# Move an existing testdata/jellyfin preparation aside, then:
+bench/testdata/build.sh --prepare-jellyfin
 ```
 
 Export boots a disposable 10.11.8 source copy and atomically updates only `ids.json`.
 Per-run role tokens live in mode-0600 `ids-private.json`, never in report metadata;
 missing or wrong role credentials fail provisioning instead of falling back to the admin.
-The changed ID-file hash invalidates an earlier Jellyfin 12 preparation. Runs refuse
+The changed ID-file hash invalidates an earlier Jellyfin preparation. Runs refuse
 missing pools; measured servers never supply their own fallback picks. The final partial
 movie page is included using `ceil(movieCount / 100)`.
 
@@ -196,7 +194,7 @@ it is not all-endpoint coverage or a deep-parity score.
 - Ferrofin runs as **core Ferrofin**, with every plugin/compiled-in extension disabled;
   WASM files in the disposable config are rejected. Installed Jellyfin plugins are also
   disabled. Jellyfin's non-uninstallable bundled providers (AudioDB, MusicBrainz, OMDb,
-  Studio Images, TMDb, and ListenBrainz Similarity Provider in 12.0.0) remain loaded and report `Active`: their disable endpoint fails
+  Studio Images, TMDb, and ListenBrainz Similarity Provider) remain loaded and report `Active`: their disable endpoint fails
   when it tries to write a manifest inside `MediaBrowser.Providers.dll`. Their library
   fetchers are disabled instead; this is not a claim that those assemblies are unloaded.
   `plugins-before.json`, `plugins.json`, `tasks-before.json`, `tasks.json` and `libraries.json`
@@ -286,10 +284,10 @@ and Python `Pillow`.
 
 ```bash
 docker build -t ferrofin:bench .                  # the commit under test
-docker pull jellyfin/jellyfin:10.11.8
-docker pull "$(cat bench/testdata/jellyfin12-image.txt)"  # immutable Jellyfin 12.0 image
+docker pull jellyfin/jellyfin:10.11.8              # source fixture builder only
+docker pull "$(cat bench/testdata/jellyfin-image.txt)"   # the pinned Jellyfin reference
 bench/testdata/build.sh                           # source fixture, once, ~20 min
-bench/testdata/build.sh --prepare-jellyfin12        # once per source fixture / pinned image
+bench/testdata/build.sh --prepare-jellyfin          # once per source fixture / pinned image
 bench/run.sh                                      # one full run, ~40 min → bench/runs/<version>/report.md
 python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the full tables: medians, markers, notes
 python3 bench/report.py --readme README.md bench/runs/A bench/runs/B bench/runs/C
@@ -297,7 +295,7 @@ python3 bench/report.py --readme README.md bench/runs/A bench/runs/B bench/runs/
 python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
 
-Jellyfin preparation copies the stopped 10.11.8 config into `testdata/jellyfin12/`,
+Jellyfin preparation copies the stopped 10.11.8 config into `testdata/jellyfin/`,
 boots the pinned image, explicitly requests a full library scan, and waits for that
 scan's last-execution end time to advance with a successful result. An initial Idle
 state does not count as completion. It verifies movie, series, episode, album and
@@ -309,10 +307,10 @@ must not already exist, so a failed preparation cannot silently become a ready f
 `preparation.json` records the image ID, source database and ID-file hashes, server
 version, scan result, counts and preparation elapsed time. Runs reject a preparation
 whose source, IDs or image no longer match, and copy its config for each run. The
-source 10.11.8 config and prepared 12 config remain stopped and unchanged. Each run
-also records `/System/Info/Public` in `system-info.json`; all report labels use that
-version, falling back to `image.txt` for archived runs. RC7 and stable runs cannot be
-pooled. Preparation logs and validation evidence stay beside the prepared config.
+source 10.11.8 config and prepared Jellyfin config remain stopped and unchanged. Each
+run also records `/System/Info/Public` in `system-info.json`; all report labels use that
+version, falling back to `image.txt` for archived runs. Different Jellyfin versions
+cannot be pooled. Preparation logs and validation evidence stay beside the prepared config.
 
 A run is named for the code it measured: `v0.42.1` on a tag, `v0.42.1-3-7e80268` when
 the branch is that many commits past the tag, and `-dirty` appended when the working
@@ -328,7 +326,7 @@ The viewer lists every run under `bench/runs`; tick the runs to render (several 
 median + ranges) and optionally a baseline. Cells stay numeric in both renderers: the
 median, the range its runs spanned (in brackets in the markdown; under the number in the
 viewer's tiles and on the cell's hover text in its tables), and `⚠[n]` pointing at a
-numbered note. Both also print each cell's speed against the recorded Jellyfin 12 reference as
+numbered note. Both also print each cell's speed against the recorded Jellyfin reference as
 `X.Y× faster` (memory says lighter), shown only where both numbers stand; with a
 baseline the viewer adds each server's percentage change against an earlier run of
 itself (green = faster/smaller). Localhost only,
@@ -337,9 +335,9 @@ stdlib only, no JavaScript.
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
 `--only loaded` for a before/after on two builds, or a comma list such as
 `--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
-The default still selects all phases and all three servers. A shared host must be quiet: stop
+The default still selects all phases and both servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.
 
 For repeated comparisons, rotate order explicitly, for example
-`--servers jellyfin12,ferrofin` followed by `--servers ferrofin,jellyfin12`.
+`--servers jellyfin,ferrofin` followed by `--servers ferrofin,jellyfin`.
 Use the same phase selection and settings; affinity alone does not make a busy host quiet.

@@ -1,4 +1,4 @@
-// The six screens a jellyfin-web 10.11.8 user waits for, as the request sets the web
+// The six screens a jellyfin-web user waits for, as the request sets the web
 // client issues (PLAN_BENCHMARK_V3 §2 D3). Each iteration = "a user opens screen X",
 // requests issued concurrently as the browser does (http.batch), dependent requests
 // (images of the returned cards) after. Sources are cited per screen.
