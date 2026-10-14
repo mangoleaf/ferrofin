@@ -14,7 +14,10 @@
 //! interval-expired, "Search for missing metadata" or "Replace all
 //! metadata" one runs its providers once (a folder has no `DateModified`
 //! to drift, so a changed directory is no trigger), merged by
-//! `RefreshWithProviders`' rule ([`merge_refresh`]).
+//! `RefreshWithProviders`' rule ([`merge_refresh`]). Every album then
+//! credits its artists as people, as the end of each upstream album refresh
+//! does ([`set_album_people`](LibraryScanner::set_album_people)) — written
+//! only where the credits moved.
 //!
 //! An artist known only by name (a compilation's album artist: no folder, no
 //! library) is never walked. Upstream's `ArtistsValidator` refreshes it after
@@ -27,7 +30,7 @@ use ferrofin_traits::providers::ItemUpdateType;
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::RemoteSearchResult;
@@ -259,6 +262,42 @@ fn provider_row(item: &BaseItemEntity) -> BaseItemEntity {
 /// `AudioDbArtistProvider` mark `"en"` so it does not block a provider that
 /// can serve the requested language (`AudioDbAlbumProvider.cs:122-131`).
 const AUDIODB_LANGUAGE: &str = "en";
+
+/// `AlbumMetadataService.SetPeople` (`:195-227`): an album credits each of
+/// its album artists, then each of its artists — `None` when it has neither,
+/// as upstream then leaves its credits alone. The columns split as
+/// `BaseItemMapper` reads them (`Split('|', RemoveEmptyEntries)`), so an
+/// all-blank entry still counts as an artist for that guard but is never
+/// credited; `update_people` trims and de-duplicates the rest as
+/// `PeopleHelper.AddPerson` does.
+fn album_people(album: &BaseItemEntity) -> Option<Vec<PeopleEntity>> {
+    fn entries(column: Option<&str>) -> Vec<&str> {
+        column
+            .unwrap_or_default()
+            .split('|')
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+    let album_artists = entries(album.album_artists.as_deref());
+    let artists = entries(album.artists.as_deref());
+    if album_artists.is_empty() && artists.is_empty() {
+        return None;
+    }
+    let credits = album_artists
+        .into_iter()
+        .map(|name| (name, "AlbumArtist"))
+        .chain(artists.into_iter().map(|name| (name, "Artist")));
+    Some(
+        credits
+            .filter(|(name, _)| !name.trim().is_empty())
+            .map(|(name, kind)| PeopleEntity {
+                name: name.to_owned(),
+                person_type: Some(kind.to_owned()),
+                ..PeopleEntity::default()
+            })
+            .collect(),
+    )
+}
 
 /// `values` as a `|`-joined list column; `None` when empty.
 fn joined(values: &[String]) -> Option<String> {
@@ -520,12 +559,14 @@ impl LibraryScanner {
     /// (`GetMusicBrainzArtistId`, `AlbumInfoExtensions.cs:50-60`); a by-name
     /// artist is refreshed after the library validation
     /// (`ArtistsValidator`). An item whose decision runs nothing is skipped
-    /// without a read. Between two items the lane's refreshes run; an item
-    /// one of them refreshed as far as this scan would (`served`,
-    /// [`RefreshReach::covers`]) is left alone — it had its own music pass,
-    /// and what this scan decided for it is stale. An item that cannot be
-    /// read or written is skipped and reported once for the pass; it keeps
-    /// what made it due, so the next scan tries it again.
+    /// without a read of its own. Between two items the lane's refreshes
+    /// run; an item one of them refreshed as far as this scan would
+    /// (`served`, [`RefreshReach::covers`]) is left alone — it had its own
+    /// music pass, and what this scan decided for it is stale. An item that
+    /// cannot be read or written is skipped and reported once for the pass;
+    /// it keeps what made it due, so the next scan tries it again. After the
+    /// albums, every album's artist credits are checked in batches
+    /// ([`Self::set_album_people`]), a sweep that does not serve the lane.
     pub(super) async fn refresh_music(
         &self,
         work: &[MusicRefresh<'_>],
@@ -565,8 +606,65 @@ impl LibraryScanner {
                     skipped.note(item.id, &err);
                 }
             }
+            if kind == MusicKind::Album {
+                self.set_album_people(work, run.cancel).await;
+            }
         }
         skipped.report("music");
+    }
+
+    /// `AlbumMetadataService.AfterMetadataRefresh` → `SetPeople`
+    /// (`AlbumMetadataService.cs:62-67,195-227`), which ends every album
+    /// refresh — a quiet one too: `RefreshMetadata` calls it whatever the
+    /// refresh found (`MetadataService.cs:235`). So every album of `work`
+    /// credits its album artists and artists ([`album_people`]) as its row
+    /// now stands, with no lock consulted, as upstream. Written only where
+    /// the stored credits differ: 12.2's `UpdatePeople` returns before its
+    /// write transaction when an item's mappings are unchanged
+    /// (`PeopleRepository.cs:149-161`), so an unchanged library writes
+    /// nothing ([`super::credits_differ`] compares names, types and roles in
+    /// order but not `SortOrder`, which an album credit never carries).
+    /// (Jellyfin 10.11 dropped every artist credit in `UpdatePeople`,
+    /// `PeopleRepository.cs:98,112` at v10.11.8, so an adopted 10.11 database
+    /// has none until this runs.) A window whose read fails is skipped, and a
+    /// cancel stops the sweep before its next write; the next scan credits
+    /// what was left.
+    async fn set_album_people(&self, work: &[MusicRefresh<'_>], cancel: &ScanCancel) {
+        let (Some(items), Some(people)) = (&self.item_repository, &self.people) else {
+            return;
+        };
+        let albums: Vec<Uuid> = work
+            .iter()
+            .filter(|w| w.kind == MusicKind::Album)
+            .map(|w| w.id)
+            .collect();
+        for window in albums.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let read = match items.retrieve_items(window).await {
+                Ok(rows) => people.get_people_batch(window).await.map(|s| (rows, s)),
+                Err(err) => Err(err),
+            };
+            let (rows, mut stored) = match read {
+                Ok(read) => read,
+                Err(err) => {
+                    tracing::warn!(%err, albums = window.len(), "failed to read albums' artist credits");
+                    continue;
+                }
+            };
+            for row in rows {
+                let (Some(credits), Ok(id)) = (album_people(&row), Uuid::parse_str(&row.id)) else {
+                    continue;
+                };
+                if super::credits_differ(&stored.remove(&id).unwrap_or_default(), &credits) {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    self.persist_people(id, Some(credits)).await;
+                }
+            }
+        }
     }
 
     /// Upstream's `ArtistsValidator` (`ArtistsValidator.cs:86-91`), after
@@ -2051,5 +2149,215 @@ mod tests {
                 MusicSource::Dynamic(0)
             ]
         );
+    }
+
+    /// `AlbumMetadataService.SetPeople` (`:195-227`): every album artist as
+    /// `AlbumArtist`, then every artist as `Artist`; a blank entry is never
+    /// credited (`IsNullOrWhiteSpace`), though it still passes the `Any()`
+    /// guard, so it clears the album's credits; an album naming neither has
+    /// no credits to write (`None`).
+    #[test]
+    fn an_album_credits_its_album_artists_then_its_artists() {
+        let credits = |album_artists: Option<&str>, artists: Option<&str>| {
+            super::album_people(&BaseItemEntity {
+                album_artists: album_artists.map(str::to_owned),
+                artists: artists.map(str::to_owned),
+                ..BaseItemEntity::default()
+            })
+            .map(|people| {
+                people
+                    .into_iter()
+                    .map(|p| (p.name, p.person_type.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let owned = |rows: &[(&str, &str)]| Some(pairs(rows));
+        assert_eq!(
+            credits(Some("Synthetic Ensemble"), Some("Synthetic Ensemble")),
+            owned(&[
+                ("Synthetic Ensemble", "AlbumArtist"),
+                ("Synthetic Ensemble", "Artist")
+            ])
+        );
+        assert_eq!(
+            credits(Some("Band|Lead"), Some("Lead|Guest")),
+            owned(&[
+                ("Band", "AlbumArtist"),
+                ("Lead", "AlbumArtist"),
+                ("Lead", "Artist"),
+                ("Guest", "Artist")
+            ])
+        );
+        assert_eq!(credits(None, Some("Solo")), owned(&[("Solo", "Artist")]));
+        assert_eq!(credits(None, None), None);
+        assert_eq!(credits(Some(""), Some("||")), None);
+        assert_eq!(credits(Some(" "), None), owned(&[]));
+    }
+
+    /// Every album the pass is handed credits its artists, due or not — an
+    /// adopted 10.11 album with stored artists and no credits as well as a
+    /// first-refreshed one whose artists come from its track — in
+    /// `SetPeople`'s order, as Jellyfin 12.2 stores them (`ListOrder` from 0,
+    /// empty `Role`, no `SortOrder`). An album naming no artist keeps its
+    /// credits, and a second pass over the same albums writes nothing.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn the_music_pass_credits_every_albums_artists_once() {
+        use super::super::{FetcherPolicy, LibraryScanner, ScanRun, Served};
+        use super::MusicRefresh;
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_type_lookup::stored_type_name;
+        use crate::refresh_plan::{ItemRefreshPlan, RefreshRequest};
+        use ferrofin_db::entities::base_items::PeopleEntity;
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService as _, PeopleRepository as _};
+        use ferrofin_traits::providers::MetadataRefreshOptions;
+        use std::sync::Arc;
+
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let people = Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+            db.clone(),
+        ));
+        let (adopted, fresh, unnamed, track) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let album = |id: Uuid, artists: Option<&str>| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::MusicAlbum)
+                .unwrap()
+                .to_owned(),
+            is_folder: true,
+            album_artists: artists.map(str::to_owned),
+            artists: artists.map(str::to_owned),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(&[
+                album(adopted, Some("Synthetic Ensemble")),
+                album(fresh, None),
+                album(unnamed, None),
+                BaseItemEntity {
+                    id: guid_to_db(track),
+                    type_: stored_type_name(BaseItemKind::Audio).unwrap().to_owned(),
+                    parent_id: Some(guid_to_db(fresh)),
+                    album_artists: Some("Synthetic Soloist".into()),
+                    artists: Some("Synthetic Soloist|Guest Player".into()),
+                    ..BaseItemEntity::default()
+                },
+            ])
+            .await
+            .unwrap();
+        persistence.set_ancestors(track, &[fresh]).await.unwrap();
+        people
+            .update_people(
+                unnamed,
+                &[PeopleEntity {
+                    name: "Some Producer".into(),
+                    person_type: Some("Producer".into()),
+                    ..PeopleEntity::default()
+                }],
+            )
+            .await
+            .unwrap();
+
+        let views = tempfile::tempdir().unwrap();
+        let scanner = LibraryScanner::new(
+            Arc::new(crate::FerrofinVirtualFolderManager::new(views.path())),
+            Arc::new(crate::FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(crate::test_support::item_repository_over(db.clone()))
+        .with_people(people.clone());
+        let defaults = MetadataRefreshOptions::default();
+        let request = RefreshRequest {
+            options: &defaults,
+            force_save: false,
+        };
+        let refresh = |id, plan, aggregate| MusicRefresh {
+            id,
+            kind: MusicKind::Album,
+            plan,
+            request,
+            identified: None,
+            policy: FetcherPolicy::default(),
+            aggregate,
+            owns_stamp: false,
+            owns_save: false,
+        };
+        let first = ItemRefreshPlan {
+            is_first_refresh: true,
+            ..ItemRefreshPlan::IDLE
+        };
+        let work = [
+            refresh(adopted, ItemRefreshPlan::IDLE, false),
+            refresh(fresh, first, true),
+            refresh(unnamed, ItemRefreshPlan::IDLE, false),
+        ];
+        scanner
+            .refresh_music(&work, ScanRun::defaults(), &mut Served::new())
+            .await;
+
+        let credits = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, i64, Option<i64>, String)>(
+                    r#"SELECT p."Name", p."PersonType", m."ListOrder", m."SortOrder", m."Role"
+                       FROM "PeopleBaseItemMap" m JOIN "Peoples" p ON p."Id" = m."PeopleId"
+                       WHERE m."ItemId" = ?1 ORDER BY m."ListOrder""#,
+                )
+                .bind(guid_to_db(id))
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+            }
+        };
+        let row = |name: &str, kind: &str, order| {
+            (name.to_owned(), kind.to_owned(), order, None, String::new())
+        };
+        assert_eq!(
+            credits(adopted).await,
+            [
+                row("Synthetic Ensemble", "AlbumArtist", 0),
+                row("Synthetic Ensemble", "Artist", 1)
+            ]
+        );
+        assert_eq!(
+            credits(fresh).await,
+            [
+                row("Synthetic Soloist", "AlbumArtist", 0),
+                row("Synthetic Soloist", "Artist", 1),
+                row("Guest Player", "Artist", 2)
+            ]
+        );
+        assert_eq!(
+            credits(unnamed).await,
+            [row("Some Producer", "Producer", 0)]
+        );
+
+        // `adoption/unchanged_scan.py`'s audit: triggers count every write,
+        // a delete-and-reinsert of identical rows included.
+        sqlx::raw_sql(
+            r#"CREATE TABLE "Writes" ("TableName" TEXT);
+               CREATE TRIGGER "MapInsert" AFTER INSERT ON "PeopleBaseItemMap" BEGIN INSERT INTO "Writes" VALUES ('map'); END;
+               CREATE TRIGGER "MapUpdate" AFTER UPDATE ON "PeopleBaseItemMap" BEGIN INSERT INTO "Writes" VALUES ('map'); END;
+               CREATE TRIGGER "MapDelete" AFTER DELETE ON "PeopleBaseItemMap" BEGIN INSERT INTO "Writes" VALUES ('map'); END;
+               CREATE TRIGGER "PeopleInsert" AFTER INSERT ON "Peoples" BEGIN INSERT INTO "Writes" VALUES ('people'); END;"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        scanner
+            .refresh_music(&work, ScanRun::defaults(), &mut Served::new())
+            .await;
+        let writes: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM "Writes""#)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(writes, 0, "an unchanged pass rewrites no credit");
     }
 }
