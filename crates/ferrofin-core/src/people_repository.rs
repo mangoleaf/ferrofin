@@ -553,9 +553,8 @@ fn is_valid_person_type(value: &str) -> bool {
 }
 
 /// Appends the shared `TranslateQuery` predicates (item scope, parent scope,
-/// person-type in/out, max list order, name range/substring) onto a builder
-/// whose `FROM "Peoples" p` clause is already open. Returns whether the
-/// `PeopleBaseItemMap` join alias `m` is required by the caller's projection.
+/// person-type in/out, max list order, name range/substring, must-have-item)
+/// onto a builder whose `FROM "Peoples" p` clause is already open.
 fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) {
     if !filter.item_id.is_nil() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mx WHERE mx."PeopleId" = p."Id" AND mx."ItemId" = "#);
@@ -640,6 +639,23 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         qb.push(r#" AND ferrofin_lower_invariant(p."Name") >= "#);
         qb.push_bind(lower_invariant(ge));
     }
+    if filter.must_have_item {
+        qb.push(" AND ");
+        qb.push(has_person_item("p"));
+    }
+}
+
+/// C# `MustHaveItem`: a `Person` item with exactly this credit's name exists
+/// (`BaseItems.Any(b => b.Type == personType && b.Name == e.Name)`).
+///
+/// The `=` is BINARY, like EF's `==` on the uncollated column. The lookup seeks
+/// `IX_BaseItems_Name` and reads the row to check `Type` (the `+` keeps the
+/// planner off the `Type`-led indexes); the type literal is a constant, so
+/// inlining it is injection-safe.
+fn has_person_item(alias: &str) -> String {
+    format!(
+        r#"EXISTS (SELECT 1 FROM "BaseItems" b WHERE b."Name" = {alias}."Name" AND +b."Type" = '{PERSON_TYPE_NAME}')"#
+    )
 }
 
 /// Opens `SELECT <cols> FROM <from> p WHERE 1 = 1`, applying the optional
@@ -683,17 +699,43 @@ fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> 
 /// per query on the bench library (7.5k people, `limit=100`). The dedup test
 /// per candidate row is a covering-index seek on
 /// `FerrofinIX_Peoples_NameNoCase_Cover`.
-const DEDUP_PEOPLE_PREDICATE: &str = r#" AND p."Id" = (SELECT MIN(d."Id") FROM "Peoples" d
-     WHERE d."Name" = p."Name" COLLATE NOCASE)"#;
+///
+/// Under `must_have_item` the representative is the lowest id among the rows
+/// that *have* an item, as upstream dedups the already-filtered candidates: a
+/// `john doe` credit with no item must not hide the `John Doe` one that has it.
+fn dedup_people_predicate(filter: &InternalPeopleQuery) -> String {
+    let candidate = if filter.must_have_item {
+        format!(" AND {}", has_person_item("d"))
+    } else {
+        String::new()
+    };
+    format!(
+        r#" AND p."Id" = (SELECT MIN(d."Id") FROM "Peoples" d
+     WHERE d."Name" = p."Name" COLLATE NOCASE{candidate})"#
+    )
+}
 
-/// The total column for an **unnarrowed** by-name listing: the deduped set is
-/// then exactly the distinct lower-cased names, so the total comes off
+/// The total for an **unnarrowed** by-name listing: the deduped set is then
+/// exactly the distinct lower-cased names, so the total comes off
 /// `FerrofinIX_Peoples_NameNoCase_Cover` as a plain index-only distinct count —
 /// no `MIN("Id")` aggregation, no row materialization, and (being an
 /// uncorrelated scalar sub-select) evaluated **once** per statement rather
-/// than per row.
-const TOTAL_ALL_NAMES: &str =
-    r#"(SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples") AS "TotalCount""#;
+/// than per row. Under `must_have_item` (every `/Persons` request) it counts
+/// only the names with an item (upstream's
+/// `candidates.Select(Name.ToLower).Distinct().Count()`), which is no longer
+/// index-only: each `Peoples` row costs an `IX_BaseItems_Name` seek plus a
+/// `BaseItems` row read to check `Type`, the same per-row probe upstream's
+/// `MustHaveItem` pays.
+fn distinct_names_count(filter: &InternalPeopleQuery) -> String {
+    if filter.must_have_item {
+        format!(
+            r#"(SELECT COUNT(DISTINCT c."Name" COLLATE NOCASE) FROM "Peoples" c WHERE {})"#,
+            has_person_item("c")
+        )
+    } else {
+        r#"(SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples")"#.to_owned()
+    }
+}
 
 /// The total column for a **narrowed** by-name listing: the predicates apply to
 /// the deduped representative row, so the total can only be counted over the
@@ -707,9 +749,11 @@ const TOTAL_FILTERED_WINDOW: &str = r#"COUNT(*) OVER() AS "TotalCount""#;
 ///
 /// When nothing narrows it, the deduped set is the whole `Peoples` table
 /// collapsed by lower-cased name, so its size is a distinct count that needs no
-/// aggregate over the representative rows ([`TOTAL_ALL_NAMES`]). `max_list_order`
-/// is deliberately absent: it is only emitted for an item-scoped query, which
-/// never reaches the by-name path.
+/// aggregate over the representative rows ([`distinct_names_count`]).
+/// `max_list_order` is deliberately absent: it is only emitted for an
+/// item-scoped query, which never reaches the by-name path. So is
+/// `must_have_item`: the distinct count applies it itself, keeping the default
+/// `/Persons` page off the window function.
 fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
     let name_bound = [
         &filter.name_contains,
@@ -741,16 +785,16 @@ fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
 /// response-body assertion can see.
 fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     let total = if narrows_by_name(filter) {
-        TOTAL_FILTERED_WINDOW
+        TOTAL_FILTERED_WINDOW.to_owned()
     } else {
-        TOTAL_ALL_NAMES
+        format!(r#"{} AS "TotalCount""#, distinct_names_count(filter))
     };
     let mut qb = base_query_from(
         &format!(r#"p."Id", p."Name", p."PersonType", {total}"#),
         r#""Peoples""#,
         filter,
     );
-    qb.push(DEDUP_PEOPLE_PREDICATE);
+    qb.push(dedup_people_predicate(filter));
     push_predicates(&mut qb, filter);
     qb.push(r#" ORDER BY p."Name""#);
     let start = filter.start_index.unwrap_or(0);
@@ -777,15 +821,14 @@ impl FerrofinPeopleRepository {
     /// aggregate over the representative rows.
     async fn count_people_total(&self, filter: &InternalPeopleQuery) -> Result<i64, ServiceError> {
         if !narrows_by_name(filter) {
-            return sqlx::query_scalar(
-                r#"SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples""#,
-            )
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_err);
+            return QueryBuilder::<Sqlite>::new(format!("SELECT {}", distinct_names_count(filter)))
+                .build_query_scalar()
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err);
         }
         let mut qb = base_query_from("COUNT(*)", r#""Peoples""#, filter);
-        qb.push(DEDUP_PEOPLE_PREDICATE);
+        qb.push(dedup_people_predicate(filter));
         push_predicates(&mut qb, filter);
         let count: i64 = qb
             .build_query_scalar()
@@ -812,19 +855,19 @@ impl FerrofinPeopleRepository {
     /// pass before the `LIMIT` could discard them, which on the *unnarrowed*
     /// listing (`/Persons?userId=…&limit=100`, the benchmark's request and the
     /// client's default People browse) is the whole table. The total is still
-    /// exact — the only production caller, `LibraryManager::get_people`,
-    /// discards it, and `/Persons` reports Jellyfin's own page-length total via
-    /// `get_people_items`, but a repository must not hand back a number that
-    /// isn't the total — it is just no longer bought with an extra pass over
-    /// all people. Measured on the bench library (7.5k names / 9.4k rows,
-    /// `limit=100`): 5.5 ms → 2.7 ms p50 (3.3 ms → 1.6 ms min); unpaged:
-    /// 11.2 ms → 6.6 ms. A narrowed query keeps the window function, which
-    /// measures fastest there (e.g. a name substring: 3.2 ms window vs 5.9 ms
+    /// exact, but no longer bought by re-materializing every deduped row.
+    /// Measured on the bench library (7.5k names / 9.4k rows, `limit=100`,
+    /// before `must_have_item`): 5.5 ms → 2.7 ms p50 (3.3 ms → 1.6 ms min);
+    /// unpaged: 11.2 ms → 6.6 ms. Since Jellyfin 12.2 `/Persons` reports this
+    /// total and sets `must_have_item`, so its unnarrowed count probes
+    /// `BaseItems` once per `Peoples` row ([`distinct_names_count`]) — still one
+    /// scalar pass, not the window's. A narrowed query keeps the window
+    /// function, which measures fastest there (e.g. a name substring: 3.2 ms window vs 5.9 ms
     /// for any second-pass shape, since the window only spans the matches).
     ///
     /// The third cost was the dedup itself: as a derived table it had to
     /// aggregate all 7.5k people and sort them through a temp B-tree before the
-    /// `LIMIT` could drop 98% of the result. [`DEDUP_PEOPLE_PREDICATE`] moves it
+    /// `LIMIT` could drop 98% of the result. [`dedup_people_predicate`] moves it
     /// onto a plain `"Peoples"` scan driven by `IX_Peoples_Name`, which already
     /// supplies the ordering — 1.26 ms → 0.31 ms per query, and `/Persons`
     /// 2.8 ms → 1.4 ms p50 at its calibrated rate.
@@ -1283,7 +1326,7 @@ mod tests {
     }
 
     use super::{FerrofinPeopleRepository, PERSON_TYPE_NAME};
-    use crate::test_support::{seed_item, test_db};
+    use crate::test_support::{seed_item, seed_named_item, test_db};
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_db::store::guid_to_db;
     use ferrofin_model::data::BaseItemKind;
@@ -2240,5 +2283,192 @@ mod tests {
             .expect("past narrowed");
         assert!(past_narrowed.items.is_empty());
         assert_eq!(past_narrowed.total_record_count, 3);
+    }
+
+    /// Upstream `PeopleRepositoryMustHaveItemTests` (v12.2): a movie credits
+    /// two actors, and only "With Item" has a by-name `Person` item behind it.
+    /// `update_people` materializes one for every credit, so the other is
+    /// deleted to reproduce upstream's fixture.
+    async fn must_have_item_repo() -> FerrofinPeopleRepository {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0x9301);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        repo.update_people(
+            movie,
+            &[
+                person("With Item", "Actor"),
+                person("Without Item", "Actor"),
+            ],
+        )
+        .await
+        .expect("credits");
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Type" = ?1 AND "Name" = 'Without Item'"#)
+            .bind(PERSON_TYPE_NAME)
+            .execute(db.writer())
+            .await
+            .expect("drop item");
+        repo
+    }
+
+    #[tokio::test]
+    async fn without_must_have_item_returns_and_counts_every_credit() {
+        let result = must_have_item_repo()
+            .await
+            .get_people(&InternalPeopleQuery::default())
+            .await
+            .expect("people");
+        assert_eq!(result.total_record_count, 2);
+        assert_eq!(result.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn must_have_item_drops_the_credit_without_an_item() {
+        let result = must_have_item_repo()
+            .await
+            .get_people(&InternalPeopleQuery {
+                must_have_item: true,
+                ..Default::default()
+            })
+            .await
+            .expect("people");
+        let names: Vec<&str> = result.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["With Item"]);
+    }
+
+    #[tokio::test]
+    async fn must_have_item_counts_only_what_it_can_return() {
+        let result = must_have_item_repo()
+            .await
+            .get_people(&InternalPeopleQuery {
+                must_have_item: true,
+                ..Default::default()
+            })
+            .await
+            .expect("people");
+        assert_eq!(result.total_record_count, 1);
+    }
+
+    #[tokio::test]
+    async fn must_have_item_count_agrees_with_the_page_when_limited() {
+        let result = must_have_item_repo()
+            .await
+            .get_people(&InternalPeopleQuery {
+                must_have_item: true,
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .expect("people");
+        assert_eq!(
+            usize::try_from(result.total_record_count).ok(),
+            Some(result.items.len())
+        );
+    }
+
+    /// Upstream dedups the *filtered* candidates, so a case variant with no
+    /// item must not become the group's representative and hide the person.
+    /// Here the lowest-id row (`john doe`) has no item; `John Doe` does. Every
+    /// query shape returns that person once and counts one: the unnarrowed
+    /// scalar count, the narrowed window, and the past-the-end fallback.
+    #[tokio::test]
+    async fn must_have_item_picks_the_representative_among_rows_with_an_item() {
+        let db = test_db().await;
+        super::seed_people_row(&db, Uuid::from_u128(1), "john doe", "Producer").await;
+        super::seed_people_row(&db, Uuid::from_u128(2), "John Doe", "Actor").await;
+        super::seed_people_row(&db, Uuid::from_u128(3), "Nobody", "Actor").await;
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x9401),
+            BaseItemKind::Person,
+            "John Doe",
+        )
+        .await;
+        let repo = FerrofinPeopleRepository::new(db);
+
+        for (label, query) in [
+            ("unnarrowed", InternalPeopleQuery::default()),
+            (
+                "narrowed",
+                InternalPeopleQuery {
+                    name_contains: Some("doe".to_owned()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let query = InternalPeopleQuery {
+                must_have_item: true,
+                ..query
+            };
+            let page = repo.get_people(&query).await.expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["John Doe"], "{label}");
+            assert_eq!(page.total_record_count, 1, "{label}");
+
+            let past = repo
+                .get_people(&InternalPeopleQuery {
+                    start_index: Some(5),
+                    limit: 1,
+                    ..query
+                })
+                .await
+                .expect("past");
+            assert!(past.items.is_empty(), "{label}");
+            assert_eq!(past.total_record_count, 1, "{label} past the end");
+        }
+    }
+
+    /// The default `/Persons` page sets `must_have_item` and nothing else. It
+    /// must keep the unnarrowed shape (a scalar distinct count, no window, no
+    /// temp B-tree), and every `MustHaveItem` probe must seek
+    /// `IX_BaseItems_Name` rather than walk the Person rows off a `Type` index.
+    #[tokio::test]
+    async fn must_have_item_page_seeks_the_name_index() {
+        let db = test_db().await;
+        let query = InternalPeopleQuery {
+            limit: 100,
+            must_have_item: true,
+            ..Default::default()
+        };
+        assert!(!super::narrows_by_name(&query));
+        let sql = super::by_name_page_query(&query)
+            .into_sql()
+            .as_str()
+            .to_owned();
+        assert!(!sql.contains("OVER()"), "{sql}");
+        assert!(
+            sql.contains(r#"COUNT(DISTINCT c."Name" COLLATE NOCASE)"#),
+            "{sql}"
+        );
+
+        // The bound LIMIT is planned the same as none; plan the unpaged form.
+        let unpaged = InternalPeopleQuery {
+            must_have_item: true,
+            ..Default::default()
+        };
+        let sql = super::by_name_page_query(&unpaged)
+            .into_sql()
+            .as_str()
+            .to_owned();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        let item_probes: Vec<&&str> = details
+            .iter()
+            .filter(|d| d.contains(" b ") || d.ends_with(" b"))
+            .collect();
+        assert_eq!(item_probes.len(), 3, "outer, dedup and count: {details:?}");
+        assert!(
+            item_probes.iter().all(|d| d.starts_with("SEARCH b ")
+                && d.ends_with("USING INDEX IX_BaseItems_Name (Name=?)")),
+            "every item probe seeks the name index: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("TEMP B-TREE")),
+            "the page still comes off the name index in order: {details:?}"
+        );
     }
 }
