@@ -11,8 +11,9 @@
 //! Query translation follows the C# `TranslateQuery`:
 //! - when scoped to an `item_id`, restrict to people credited on that item and
 //!   order by the credit's `ListOrder`, then `PersonType`, then `Name`;
-//! - otherwise collapse to one representative row per lower-cased name (the C#
-//!   `GroupBy(Name.ToLower).Min(Id)`), ordered by name;
+//! - otherwise collapse to one representative row per lower-cased name, the
+//!   lowest id among the rows every predicate keeps (v12.2 dedups the filtered
+//!   candidates), ordered by name;
 //! - `parent_id`, `person_types`/`exclude_person_types` (alphanumeric only),
 //!   `max_list_order`, and the name range/substring predicates are applied as in
 //!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
@@ -552,21 +553,42 @@ fn is_valid_person_type(value: &str) -> bool {
     !value.trim().is_empty() && value.chars().all(char::is_alphanumeric)
 }
 
-/// Appends the shared `TranslateQuery` predicates (item scope, parent scope,
-/// person-type in/out, max list order, name range/substring, must-have-item)
-/// onto a builder whose `FROM "Peoples" p` clause is already open.
-fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) {
+/// Appends the shared `TranslateQuery` predicates (favorite, item scope,
+/// parent scope, person-type in/out, max list order, name range/substring,
+/// must-have-item) on the `Peoples` row aliased `alias`, onto a builder with a
+/// `WHERE` clause already open. The by-name dedup applies them twice: to the
+/// candidate rows its representative is chosen from (`d`) and to the outer row
+/// (`p`).
+#[allow(clippy::too_many_lines)] // one arm per C# `TranslateQuery` predicate
+fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, alias: &str) {
+    if let (Some(user_id), Some(is_favorite)) = (filter.user_id, filter.is_favorite) {
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "UserData" ud
+                JOIN "BaseItems" bi ON bi."Id" = ud."ItemId"
+                WHERE bi."Type" = "#,
+        );
+        qb.push_bind(PERSON_TYPE_NAME);
+        qb.push(format!(
+            r#" AND bi."Name" = {alias}."Name" AND ud."UserId" = "#
+        ));
+        qb.push_bind(guid_to_db(user_id));
+        qb.push(r#" AND ud."IsFavorite" = "#);
+        qb.push_bind(i64::from(is_favorite));
+        qb.push(")");
+    }
     if !filter.item_id.is_nil() {
-        qb.push(r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mx WHERE mx."PeopleId" = p."Id" AND mx."ItemId" = "#);
+        qb.push(format!(
+            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mx WHERE mx."PeopleId" = {alias}."Id" AND mx."ItemId" = "#
+        ));
         qb.push_bind(guid_to_db(filter.item_id));
         qb.push(")");
     }
     if let Some(parent) = filter.parent_id {
-        qb.push(
+        qb.push(format!(
             r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mp
                 JOIN "AncestorIds" a ON a."ItemId" = mp."ItemId"
-                WHERE mp."PeopleId" = p."Id" AND a."ParentItemId" = "#,
-        );
+                WHERE mp."PeopleId" = {alias}."Id" AND a."ParentItemId" = "#
+        ));
         qb.push_bind(guid_to_db(parent));
         qb.push(")");
     }
@@ -576,7 +598,7 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         .filter(|t| is_valid_person_type(t))
         .collect();
     if !include.is_empty() {
-        qb.push(r#" AND p."PersonType" IN ("#);
+        qb.push(format!(r#" AND {alias}."PersonType" IN ("#));
         let mut sep = qb.separated(", ");
         for t in include {
             sep.push_bind(t.clone());
@@ -589,7 +611,9 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         .filter(|t| is_valid_person_type(t))
         .collect();
     if !exclude.is_empty() {
-        qb.push(r#" AND (p."PersonType" IS NULL OR p."PersonType" NOT IN ("#);
+        qb.push(format!(
+            r#" AND ({alias}."PersonType" IS NULL OR {alias}."PersonType" NOT IN ("#
+        ));
         let mut sep = qb.separated(", ");
         for t in exclude {
             sep.push_bind(t.clone());
@@ -599,9 +623,9 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
     if let Some(max_order) = filter.max_list_order
         && !filter.item_id.is_nil()
     {
-        qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mo WHERE mo."PeopleId" = p."Id" AND mo."ItemId" = "#,
-        );
+        qb.push(format!(
+            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mo WHERE mo."PeopleId" = {alias}."Id" AND mo."ItemId" = "#
+        ));
         qb.push_bind(guid_to_db(filter.item_id));
         qb.push(r#" AND mo."ListOrder" <= "#);
         qb.push_bind(i64::from(max_order));
@@ -612,7 +636,9 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND ferrofin_upper_invariant(p."Name") LIKE "#);
+        qb.push(format!(
+            r#" AND ferrofin_upper_invariant({alias}."Name") LIKE "#
+        ));
         qb.push_bind(format!("%{}%", upper_invariant(contains)));
     }
     if let Some(prefix) = filter
@@ -620,7 +646,9 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND ferrofin_upper_invariant(p."Name") LIKE "#);
+        qb.push(format!(
+            r#" AND ferrofin_upper_invariant({alias}."Name") LIKE "#
+        ));
         qb.push_bind(format!("{}%", upper_invariant(prefix)));
     }
     if let Some(less) = filter
@@ -628,7 +656,9 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND ferrofin_lower_invariant(p."Name") < "#);
+        qb.push(format!(
+            r#" AND ferrofin_lower_invariant({alias}."Name") < "#
+        ));
         qb.push_bind(lower_invariant(less));
     }
     if let Some(ge) = filter
@@ -636,12 +666,14 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND ferrofin_lower_invariant(p."Name") >= "#);
+        qb.push(format!(
+            r#" AND ferrofin_lower_invariant({alias}."Name") >= "#
+        ));
         qb.push_bind(lower_invariant(ge));
     }
     if filter.must_have_item {
         qb.push(" AND ");
-        qb.push(has_person_item("p"));
+        qb.push(has_person_item(alias));
     }
 }
 
@@ -658,38 +690,19 @@ fn has_person_item(alias: &str) -> String {
     )
 }
 
-/// Opens `SELECT <cols> FROM <from> p WHERE 1 = 1`, applying the optional
-/// `is_favorite` user-data restriction as an `EXISTS` sub-select (C# joins
-/// `UserData` on the person item's name). `from` is either the raw
-/// `"Peoples"` table or the deduped derived table (see
-/// [`FerrofinPeopleRepository::get_people_by_name`]) — the predicates only
-/// reference `p."Name"`/`p."Id"`/`p."PersonType"`, which both shapes expose.
-fn base_query_from(cols: &str, from: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
-    let mut qb = QueryBuilder::new(format!("SELECT {cols} FROM {from} p WHERE 1 = 1"));
-    if let (Some(user_id), Some(is_favorite)) = (filter.user_id, filter.is_favorite) {
-        qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "UserData" ud
-                JOIN "BaseItems" bi ON bi."Id" = ud."ItemId"
-                WHERE bi."Type" = "#,
-        );
-        qb.push_bind(PERSON_TYPE_NAME);
-        qb.push(r#" AND bi."Name" = p."Name" AND ud."UserId" = "#);
-        qb.push_bind(guid_to_db(user_id));
-        qb.push(r#" AND ud."IsFavorite" = "#);
-        qb.push_bind(i64::from(is_favorite));
-        qb.push(")");
-    }
-    qb
-}
-
-fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
-    base_query_from(cols, r#""Peoples""#, filter)
+/// Opens `SELECT <cols> FROM "Peoples" p WHERE 1 = 1`, ready for
+/// [`push_predicates`].
+fn base_query(cols: &str) -> QueryBuilder<Sqlite> {
+    QueryBuilder::new(format!(r#"SELECT {cols} FROM "Peoples" p WHERE 1 = 1"#))
 }
 
 /// Restricts a plain `"Peoples"` scan to one representative row per lower-cased
-/// name: the `MIN("Id")` row, exactly the representative the earlier
-/// `GROUP BY` on the case-insensitive name selected (verified row-identical,
-/// ids included, on the bench library).
+/// name: the lowest id among the rows that pass every predicate. This is
+/// upstream's own formulation (v12.2 `PeopleRepository.GetPeople`), which dedups
+/// the already-filtered candidates — `!candidates.Any(other => same name &&
+/// other.Id < p.Id)` — so a `john doe` credit with no item must not hide the
+/// `John Doe` one that has it, and an Actor row must not hide the same person's
+/// Director row from `personTypes=Director`.
 ///
 /// As a *predicate* rather than a derived table, the page can be driven from
 /// `IX_Peoples_Name` — which already supplies the `ORDER BY p."Name"` — so the
@@ -700,19 +713,20 @@ fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> 
 /// per candidate row is a covering-index seek on
 /// `FerrofinIX_Peoples_NameNoCase_Cover`.
 ///
-/// Under `must_have_item` the representative is the lowest id among the rows
-/// that *have* an item, as upstream dedups the already-filtered candidates: a
-/// `john doe` credit with no item must not hide the `John Doe` one that has it.
-fn dedup_people_predicate(filter: &InternalPeopleQuery) -> String {
-    let candidate = if filter.must_have_item {
-        format!(" AND {}", has_person_item("d"))
-    } else {
-        String::new()
-    };
-    format!(
-        r#" AND p."Id" = (SELECT MIN(d."Id") FROM "Peoples" d
-     WHERE d."Name" = p."Name" COLLATE NOCASE{candidate})"#
-    )
+/// `NOT EXISTS … d."Id" < p."Id"` rather than `p."Id" = (SELECT MIN(d."Id") …)`:
+/// the index check on `Id` runs before the per-row predicates and the probe
+/// stops at the first lower passing row, where `MIN` would run every predicate
+/// on every row of the name group. Callers emit it *after* the outer
+/// predicates: SQLite evaluates correlated sub-selects in written order, so a
+/// row that fails a predicate (`isFavorite`, a selective `parentId`) is
+/// rejected before its name group is probed.
+fn push_dedup_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) {
+    qb.push(
+        r#" AND NOT EXISTS (SELECT 1 FROM "Peoples" d
+     WHERE d."Name" = p."Name" COLLATE NOCASE AND d."Id" < p."Id""#,
+    );
+    push_predicates(qb, filter, "d");
+    qb.push(")");
 }
 
 /// The total for an **unnarrowed** by-name listing: the deduped set is then
@@ -737,15 +751,15 @@ fn distinct_names_count(filter: &InternalPeopleQuery) -> String {
     }
 }
 
-/// The total column for a **narrowed** by-name listing: the predicates apply to
-/// the deduped representative row, so the total can only be counted over the
+/// The total column for a **narrowed** by-name listing: the deduped set depends
+/// on the predicates, so the total can only be counted over the
 /// already-filtered result. `COUNT(*) OVER()` costs one extra pass over the
 /// *filtered* rows, which for a narrowed query is far cheaper than re-running
-/// the dedup aggregate a second time (measured below).
+/// the dedup a second time (measured below).
 const TOTAL_FILTERED_WINDOW: &str = r#"COUNT(*) OVER() AS "TotalCount""#;
 
 /// Whether `filter` narrows the by-name listing at all — i.e. whether any
-/// predicate that [`base_query_from`]/[`push_predicates`] can emit is active.
+/// predicate that [`push_predicates`] can emit is active.
 ///
 /// When nothing narrows it, the deduped set is the whole `Peoples` table
 /// collapsed by lower-cased name, so its size is a distinct count that needs no
@@ -789,13 +803,9 @@ fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     } else {
         format!(r#"{} AS "TotalCount""#, distinct_names_count(filter))
     };
-    let mut qb = base_query_from(
-        &format!(r#"p."Id", p."Name", p."PersonType", {total}"#),
-        r#""Peoples""#,
-        filter,
-    );
-    qb.push(dedup_people_predicate(filter));
-    push_predicates(&mut qb, filter);
+    let mut qb = base_query(&format!(r#"p."Id", p."Name", p."PersonType", {total}"#));
+    push_predicates(&mut qb, filter, "p");
+    push_dedup_predicate(&mut qb, filter);
     qb.push(r#" ORDER BY p."Name""#);
     let start = filter.start_index.unwrap_or(0);
     if filter.limit > 0 || start > 0 {
@@ -827,9 +837,9 @@ impl FerrofinPeopleRepository {
                 .await
                 .map_err(db_err);
         }
-        let mut qb = base_query_from("COUNT(*)", r#""Peoples""#, filter);
-        qb.push(dedup_people_predicate(filter));
-        push_predicates(&mut qb, filter);
+        let mut qb = base_query("COUNT(*)");
+        push_predicates(&mut qb, filter, "p");
+        push_dedup_predicate(&mut qb, filter);
         let count: i64 = qb
             .build_query_scalar()
             .fetch_one(self.db.pool())
@@ -838,12 +848,10 @@ impl FerrofinPeopleRepository {
         Ok(count)
     }
 
-    /// The `/Persons` by-name listing: deduped representatives with the
-    /// predicates applied to the representative row (exactly the previous
-    /// `p."Id" IN (SELECT MIN(...) GROUP BY ...)` semantics — verified
-    /// row-identical on the bench library) and paging pushed into SQL, with
-    /// the exact total inlined in the same statement (fallback COUNT on empty
-    /// pages past the last row).
+    /// The `/Persons` by-name listing: one representative per name among the
+    /// rows the predicates keep ([`push_dedup_predicate`]) and paging pushed
+    /// into SQL, with the exact total inlined in the same statement (fallback
+    /// COUNT on empty pages past the last row).
     ///
     /// The pre-paging shape materialized the ENTIRE deduped table through sqlx
     /// on every request (7k rows for a `limit=100` page) and sliced in Rust —
@@ -867,7 +875,7 @@ impl FerrofinPeopleRepository {
     ///
     /// The third cost was the dedup itself: as a derived table it had to
     /// aggregate all 7.5k people and sort them through a temp B-tree before the
-    /// `LIMIT` could drop 98% of the result. [`dedup_people_predicate`] moves it
+    /// `LIMIT` could drop 98% of the result. [`push_dedup_predicate`] moves it
     /// onto a plain `"Peoples"` scan driven by `IX_Peoples_Name`, which already
     /// supplies the ordering — 1.26 ms → 0.31 ms per query, and `/Persons`
     /// 2.8 ms → 1.4 ms p50 at its calibrated rate.
@@ -959,8 +967,8 @@ impl PeopleRepository for FerrofinPeopleRepository {
                     ORDER BY mr."ListOrder" LIMIT 1) AS "Role""#,
                 guid_to_db(filter.item_id)
             );
-            let mut qb = base_query(&cols, filter);
-            push_predicates(&mut qb, filter);
+            let mut qb = base_query(&cols);
+            push_predicates(&mut qb, filter, "p");
             qb.push(
                 r#" ORDER BY (SELECT MIN(mo."ListOrder") FROM "PeopleBaseItemMap" mo
                     WHERE mo."PeopleId" = p."Id" AND mo."ItemId" = "#,
@@ -1221,8 +1229,8 @@ impl PeopleRepository for FerrofinPeopleRepository {
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<Vec<String>, ServiceError> {
-        let mut qb = base_query(r#"DISTINCT p."Name""#, filter);
-        push_predicates(&mut qb, filter);
+        let mut qb = base_query(r#"DISTINCT p."Name""#);
+        push_predicates(&mut qb, filter, "p");
         qb.push(r#" ORDER BY p."Name""#);
         let mut names: Vec<String> = qb
             .build_query_scalar::<String>()
@@ -2167,7 +2175,7 @@ mod tests {
 
         // A narrowed query deliberately keeps the window function: it spans
         // only the matching rows there, which measures faster than any shape
-        // that re-runs the dedup aggregate.
+        // that re-runs the dedup.
         let narrowed = InternalPeopleQuery {
             limit: 100,
             person_types: vec!["Actor".to_owned()],
@@ -2217,7 +2225,7 @@ mod tests {
         // "dan" collapses onto "Dan" (one deduped person, two Peoples rows), so
         // the total counts names, not rows. The duplicate is a non-Actor on both
         // rows, keeping the person-type assertion below independent of which row
-        // wins `MIN("Id")` as the group's representative.
+        // has the lower id and so represents the group.
         repo.update_people(item_b, &[person("dan", "Producer")])
             .await
             .expect("b");
@@ -2470,5 +2478,185 @@ mod tests {
             !details.iter().any(|d| d.contains("TEMP B-TREE")),
             "the page still comes off the name index in order: {details:?}"
         );
+    }
+
+    /// Issue #58: upstream (v12.2 `PeopleRepository.GetPeople`) filters first
+    /// and then keeps one row per name, so the representative is chosen among
+    /// the rows that pass. Ann has an Actor row (lowest id, credited outside the
+    /// folder), then Director and Writer rows (credited inside it); each filter
+    /// below drops her Actor row and must still return and count her, by her
+    /// Director row. Picking the representative before filtering lands on the
+    /// Actor row and loses her.
+    #[tokio::test]
+    async fn by_name_filters_pick_the_representative_among_matching_rows() {
+        let db = test_db().await;
+        let folder = Uuid::from_u128(0x9501);
+        let inside = Uuid::from_u128(0x9502);
+        let outside = Uuid::from_u128(0x9503);
+        for (id, kind) in [
+            (folder, BaseItemKind::Folder),
+            (inside, BaseItemKind::Movie),
+            (outside, BaseItemKind::Movie),
+        ] {
+            seed_item(&db, id, kind).await;
+        }
+        sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+            .bind(guid_to_db(inside))
+            .bind(guid_to_db(folder))
+            .execute(db.writer())
+            .await
+            .expect("ancestor");
+        for (row, name, person_type, item) in [
+            (1, "Ann", "Actor", outside),
+            (2, "Ann", "Director", inside),
+            (3, "Bob", "Actor", inside),
+            (4, "Ann", "Writer", inside),
+        ] {
+            let row = Uuid::from_u128(row);
+            super::seed_people_row(&db, row, name, person_type).await;
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, '')"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(row))
+            .execute(db.writer())
+            .await
+            .expect("credit");
+        }
+        for (id, name) in [(0x9504, "Ann"), (0x9505, "Bob")] {
+            seed_named_item(&db, Uuid::from_u128(id), BaseItemKind::Person, name).await;
+        }
+        let repo = FerrofinPeopleRepository::new(db);
+
+        for (label, query, expected) in [
+            (
+                "personTypes",
+                InternalPeopleQuery {
+                    person_types: vec!["Director".to_owned()],
+                    ..Default::default()
+                },
+                &["Ann"][..],
+            ),
+            (
+                "excludePersonTypes",
+                InternalPeopleQuery {
+                    exclude_person_types: vec!["Actor".to_owned()],
+                    ..Default::default()
+                },
+                &["Ann"][..],
+            ),
+            (
+                "parentId",
+                InternalPeopleQuery {
+                    parent_id: Some(folder),
+                    ..Default::default()
+                },
+                &["Ann", "Bob"][..],
+            ),
+        ] {
+            let query = InternalPeopleQuery {
+                must_have_item: true,
+                ..query
+            };
+            let page = repo.get_people(&query).await.expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, expected, "{label}");
+            assert_eq!(
+                usize::try_from(page.total_record_count).ok(),
+                Some(expected.len()),
+                "{label}: the total counts what the page returns"
+            );
+            // Ann's Writer row passes the last two filters too: the lowest
+            // passing id represents her, never a higher one.
+            assert_eq!(page.items[0].id, guid_to_db(Uuid::from_u128(2)), "{label}");
+
+            let past = repo
+                .get_people(&InternalPeopleQuery {
+                    start_index: Some(5),
+                    limit: 1,
+                    ..query
+                })
+                .await
+                .expect("past");
+            assert!(past.items.is_empty(), "{label}");
+            assert_eq!(
+                usize::try_from(past.total_record_count).ok(),
+                Some(expected.len()),
+                "{label} past the end"
+            );
+        }
+    }
+
+    /// The narrowed listings keep their plan once the predicates also run
+    /// inside the dedup sub-select: the dedup is still a covering seek on
+    /// `FerrofinIX_Peoples_NameNoCase_Cover` (never a scan), and the only sort is
+    /// the one the `COUNT(*) OVER()` window already paid to order its
+    /// materialized matches before the fix.
+    #[tokio::test]
+    async fn narrowed_by_name_dedup_keeps_the_name_index_plan() {
+        let db = test_db().await;
+        for query in [
+            InternalPeopleQuery {
+                person_types: vec!["Director".to_owned()],
+                ..Default::default()
+            },
+            InternalPeopleQuery {
+                exclude_person_types: vec!["Actor".to_owned()],
+                ..Default::default()
+            },
+            InternalPeopleQuery {
+                parent_id: Some(Uuid::from_u128(0x9601)),
+                ..Default::default()
+            },
+            InternalPeopleQuery {
+                name_contains: Some("ann".to_owned()),
+                ..Default::default()
+            },
+        ] {
+            let query = InternalPeopleQuery {
+                must_have_item: true,
+                ..query
+            };
+            let sql = super::by_name_page_query(&query)
+                .into_sql()
+                .as_str()
+                .to_owned();
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                    .fetch_all(db.pool())
+                    .await
+                    .expect("plan");
+            let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+            let dedup: Vec<&&str> = details.iter().filter(|d| d.contains(" d ")).collect();
+            assert!(
+                !dedup.is_empty()
+                    && dedup.iter().all(|d| d.starts_with(
+                        "SEARCH d USING COVERING INDEX FerrofinIX_Peoples_NameNoCase_Cover (Name=?"
+                    )),
+                "{query:?}: the dedup sub-select seeks the case-folded name index: {details:?}"
+            );
+            let sorts: Vec<&&str> = details
+                .iter()
+                .filter(|d| d.contains("TEMP B-TREE"))
+                .collect();
+            assert_eq!(
+                sorts,
+                [&"USE TEMP B-TREE FOR ORDER BY"],
+                "{query:?}: only the window's ordering sort, as before the fix: {details:?}"
+            );
+            if query.parent_id.is_some() {
+                // The outer predicates are written before the dedup, so a row
+                // outside the parent is rejected before its name group is
+                // probed: the outer `mp` probe is planned first.
+                let first = |prefix: &str| details.iter().position(|d| d.starts_with(prefix));
+                let (Some(outer), Some(dedup)) = (first("SEARCH mp "), first("SEARCH d ")) else {
+                    panic!("{query:?}: both probes planned: {details:?}");
+                };
+                assert!(
+                    outer < dedup,
+                    "{query:?}: outer predicates before the dedup: {details:?}"
+                );
+            }
+        }
     }
 }
