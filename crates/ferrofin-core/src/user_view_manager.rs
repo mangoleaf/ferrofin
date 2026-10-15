@@ -2108,6 +2108,89 @@ mod tests {
         );
     }
 
+    /// `HasVisibleItem` counts a playlist only when `IsVisible(user)` passes
+    /// it, and a private playlist has no administrator exception: an
+    /// administrator who neither owns nor shares the only playlist gets no
+    /// Playlists view, as Jellyfin 12.2 answers (issue #53). The owner does.
+    #[tokio::test]
+    async fn an_administrator_gets_no_playlists_view_for_others_private_playlists() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().expect("tempdir");
+        let metadata = tempfile::tempdir().expect("tempdir");
+        let (owner, admin) = (Uuid::from_u128(0x5401), Uuid::from_u128(0x5402));
+        crate::test_support::seed_named_user(&db, owner, "owner").await;
+        crate::test_support::seed_named_user(&db, admin, "admin").await;
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &guid_to_db(admin),
+            ferrofin_db::enums::PermissionKind::IsAdministrator,
+            true,
+        )
+        .await
+        .expect("admin");
+        let folder = Uuid::from_u128(0x5403);
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let playlist = Uuid::from_u128(0x5404);
+        crate::test_support::seed_child_item(&db, playlist, BaseItemKind::Playlist, "Mine", folder)
+            .await;
+        let mut row = crate::test_support::fetch_item(&db, playlist).await;
+        row.path = Some(data.path().join("playlists/Mine").display().to_string());
+        // Created playlists sit under the playlists folder, their top parent.
+        row.top_parent_id = Some(guid_to_db(folder));
+        row.data = Some(
+            serde_json::json!({"OwnerUserId": owner, "OpenAccess": false, "Shares": []})
+                .to_string(),
+        );
+        crate::test_support::save_item(&db, &row).await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(metadata.path())
+            .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            })
+            .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
+                db.clone(),
+            )))
+            .with_visibility(visibility);
+        let lists_playlists = |user| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_user_views(user)
+                    .await
+                    .expect("views")
+                    .iter()
+                    .any(|v| v.name.as_deref() == Some("Playlists"))
+            }
+        };
+
+        assert!(!lists_playlists(admin).await, "an administrator non-member");
+        assert!(lists_playlists(owner).await, "the owner");
+
+        // The first child (by SortName) stays hidden; a later open one counts.
+        let open = Uuid::from_u128(0x5405);
+        crate::test_support::seed_child_item(&db, open, BaseItemKind::Playlist, "Zed", folder)
+            .await;
+        let mut row = crate::test_support::fetch_item(&db, open).await;
+        row.path = Some(data.path().join("playlists/Zed").display().to_string());
+        row.top_parent_id = Some(guid_to_db(folder));
+        row.data = Some(serde_json::json!({"OwnerUserId": owner, "OpenAccess": true}).to_string());
+        crate::test_support::save_item(&db, &row).await;
+        assert!(
+            lists_playlists(admin).await,
+            "an open playlist lists the view"
+        );
+    }
+
     fn manager(db: &Database) -> FerrofinUserViewManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ItemTypeLookup::new());

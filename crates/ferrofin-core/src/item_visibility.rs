@@ -168,7 +168,7 @@ impl ItemVisibility {
             .map(|playlist| {
                 let row = context.rows.get(&row_id(playlist)).unwrap_or(playlist);
                 if context.shared_playlist(row) {
-                    context.parental_allowed_child(row_id(row))
+                    context.has_parental_allowed_child(row, user)
                 } else {
                     context.visible(row, false)
                 }
@@ -204,12 +204,12 @@ impl ItemVisibility {
         Ok(())
     }
 
-    /// `follow_playlist_members` also loads playlist members, which only
-    /// [`Context::parental_allowed_child`] reads.
+    /// `playlist_links` also reads playlists' members, which only a
+    /// rating-limited user's `HasParentalAllowedChild` needs.
     async fn load_hierarchy(
         &self,
         rows: &mut HashMap<Uuid, BaseItemEntity>,
-        follow_playlist_members: bool,
+        playlist_links: bool,
     ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
         let mut examined = HashSet::new();
         let mut requested: HashSet<Uuid> = rows.keys().copied().collect();
@@ -229,7 +229,7 @@ impl ItemVisibility {
                 .iter()
                 .filter(|id| match kind(&rows[id]) {
                     BaseItemKind::BoxSet => true,
-                    BaseItemKind::Playlist => follow_playlist_members,
+                    BaseItemKind::Playlist => playlist_links,
                     _ => false,
                 })
                 .copied()
@@ -293,10 +293,11 @@ impl ItemVisibility {
             .chain(items.iter().cloned())
             .map(|row| (row_id(&row), row))
             .collect();
-        // Only a maximum parental rating makes a playlist's members matter.
-        let follow_playlist_members = user.is_some_and(|u| u.max_parental_rating_score.is_some());
         let links = self
-            .load_hierarchy(&mut rows, follow_playlist_members)
+            .load_hierarchy(
+                &mut rows,
+                user.is_some_and(|user| user.max_parental_rating_score.is_some()),
+            )
             .await?;
         for row in rows.values_mut() {
             row.path = self.paths.expand_opt(row.path.as_deref());
@@ -554,7 +555,7 @@ impl Context<'_> {
             .user
             .ok_or_else(|| ServiceError::backend("missing visibility user"))?;
         if self.shared_playlist(item) {
-            let allowed = if let Some(allowed) = self.playlists.get(&id) {
+            let shared = if let Some(allowed) = self.playlists.get(&id) {
                 *allowed
             } else {
                 let value = data(item);
@@ -574,7 +575,7 @@ impl Context<'_> {
                             })
                         })
             };
-            return Ok(allowed && self.parental_allowed_child(id)?);
+            return Ok(shared && self.has_parental_allowed_child(item, user)?);
         }
         if kind(item) == BaseItemKind::CollectionFolder
             && (!self.folder_allowed(id, false)
@@ -586,10 +587,6 @@ impl Context<'_> {
             return Ok(false);
         }
         if !self.parental(item, skip_allowed || kind(item) == BaseItemKind::Person)? {
-            return Ok(false);
-        }
-        // A playlist file: `base.IsVisible(user) && HasParentalAllowedChild(user)`.
-        if kind(item) == BaseItemKind::Playlist && !self.parental_allowed_child(id)? {
             return Ok(false);
         }
         if self.modern_boxset(item) {
@@ -627,36 +624,44 @@ impl Context<'_> {
                     accessible |= self.visible(row, false)?;
                 }
             }
-            if !accessible || !self.parental_allowed_child(id)? {
+            // `BoxSet.IsVisible` applies the same member rule.
+            if !accessible || !self.has_parental_allowed_child(item, user)? {
                 return Ok(false);
             }
+        }
+        if kind(item) == BaseItemKind::Playlist {
+            return self.has_parental_allowed_child(item, user);
         }
         Ok(true)
     }
 
-    /// 12.1 `Playlist.HasParentalAllowedChild`, which `BoxSet.IsVisible`
-    /// applies to its members too: a user with a maximum parental rating sees
-    /// the container only when it has no linked child or one that passes the
-    /// rating (`IsParentalAllowed(user, true)`). A missing child is skipped,
-    /// as `GetLinkedChildren` skips it.
-    fn parental_allowed_child(&self, id: Uuid) -> Result<bool, ServiceError> {
-        let user = self
-            .user
-            .ok_or_else(|| ServiceError::backend("missing visibility user"))?;
+    /// `Playlist.HasParentalAllowedChild` (v12.2 Playlist.cs:261-271): a
+    /// rating-limited user sees a playlist only when it has no members or one
+    /// of them passes `IsParentalAllowed(user, true)`.
+    fn has_parental_allowed_child(
+        &self,
+        item: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
         if user.max_parental_rating_score.is_none() {
             return Ok(true);
         }
-        let mut present = false;
-        for child in self.links.get(&id).into_iter().flatten() {
-            let Some(child) = self.rows.get(child) else {
-                continue;
-            };
-            if self.parental(child, true)? {
+        let mut members = self
+            .links
+            .get(&row_id(item))
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.rows.get(id))
+            .peekable();
+        if members.peek().is_none() {
+            return Ok(true);
+        }
+        for member in members {
+            if self.parental(member, true)? {
                 return Ok(true);
             }
-            present = true;
         }
-        Ok(!present)
+        Ok(false)
     }
 
     fn standalone(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
@@ -1436,44 +1441,40 @@ mod tests {
         assert!(f.visible(&nested).await);
     }
 
-    /// 12.1 `Playlist.HasParentalAllowedChild`: under a maximum parental
-    /// rating a playlist — shared or a file — is visible only when it is
-    /// empty or a member passes the rating, whoever owns it.
+    /// `Playlist.HasParentalAllowedChild` gates every arm of `Playlist.IsVisible`
+    /// for a rating-limited user: the owner's own playlist hides when every
+    /// member exceeds the limit, an empty one stays visible, and a file
+    /// playlist outside the data directory follows the same rule.
     #[tokio::test]
-    async fn playlists_need_a_member_within_the_parental_limit() {
+    async fn playlists_need_a_parentally_allowed_member() {
         let mut f = Fixture::new().await;
         let library = f
             .item(90, BaseItemKind::CollectionFolder, Some("/library"), None)
             .await;
-        let rated = |id, rating: &'static str| {
-            let f = &f;
-            let library = &library;
-            async move {
-                let mut movie = f
-                    .item(
-                        id,
-                        BaseItemKind::Movie,
-                        Some("/library/movie"),
-                        Some(library),
-                    )
-                    .await;
-                movie.official_rating = Some(rating.to_owned());
-                f.save(&movie).await;
-                movie
-            }
-        };
-        let r_movie = rated(91, "R").await;
-        let pg_movie = rated(92, "PG").await;
-        let mut shared = f
+        let mut members = Vec::new();
+        for (id, rating) in [(91, "R"), (92, "G")] {
+            let mut movie = f
+                .item(
+                    id,
+                    BaseItemKind::Movie,
+                    Some(&format!("/library/{id}")),
+                    Some(&library),
+                )
+                .await;
+            movie.official_rating = Some(rating.to_owned());
+            f.save(&movie).await;
+            members.push(movie);
+        }
+        let mut owned = f
             .item(
                 93,
                 BaseItemKind::Playlist,
-                Some("/server/data/playlists/shared"),
+                Some("/server/data/playlists/owned"),
                 None,
             )
             .await;
-        shared.data = Some(serde_json::json!({"OpenAccess": true}).to_string());
-        f.save(&shared).await;
+        owned.data = Some(serde_json::json!({"OwnerUserId": f.user.id}).to_string());
+        f.save(&owned).await;
         let file = f
             .item(
                 94,
@@ -1482,54 +1483,96 @@ mod tests {
                 Some(&library),
             )
             .await;
-        let link = |playlist: &BaseItemEntity, member: &BaseItemEntity| {
-            let (playlist, member) = (row_id(playlist), row_id(member));
-            let db = f.db.clone();
-            async move {
-                crate::FerrofinLinkedChildrenService::new(db)
-                    .upsert_linked_child(playlist, member, 0)
-                    .await
-                    .expect("link");
-            }
-        };
         f.user.max_parental_rating_score = Some(13);
-        assert!(f.visible(&shared).await, "an empty playlist");
-        for playlist in [&shared, &file] {
-            link(playlist, &r_movie).await;
+        assert!(f.visible(&owned).await, "an empty playlist stays visible");
+        for playlist in [&owned, &file] {
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(playlist), row_id(&members[0]), 0)
+                .await
+                .expect("link");
         }
-        assert!(!f.visible(&shared).await, "only an R member");
-        assert!(!f.visible(&file).await, "a file playlist too");
+        assert!(!f.visible(&owned).await, "every member exceeds the limit");
+        assert!(!f.visible(&file).await, "file playlists apply it too");
+        f.user.max_parental_rating_score = None;
+        assert!(f.visible(&owned).await && f.visible(&file).await);
+        f.user.max_parental_rating_score = Some(13);
+        crate::FerrofinLinkedChildrenService::new(f.db.clone())
+            .upsert_linked_child(row_id(&owned), row_id(&members[1]), 1)
+            .await
+            .expect("link");
+        assert!(f.visible(&owned).await, "one allowed member is enough");
+    }
+
+    /// `playlist_policy` is `Playlist.IsVisible` minus the owner/share test,
+    /// which the playlist manager answers itself: a shared playlist owned by
+    /// someone else passes it, and only `HasParentalAllowedChild` can reject
+    /// it; a playlist file also answers to `base.IsVisible`, its tags here.
+    #[tokio::test]
+    async fn playlist_policy_leaves_the_owner_check_to_the_manager() {
+        let mut f = Fixture::new().await;
+        let library = f
+            .item(95, BaseItemKind::CollectionFolder, Some("/library"), None)
+            .await;
+        let mut movie = f
+            .item(96, BaseItemKind::Movie, Some("/library/96"), Some(&library))
+            .await;
+        movie.official_rating = Some("R".to_owned());
+        f.save(&movie).await;
+        let mut shared = f
+            .item(
+                97,
+                BaseItemKind::Playlist,
+                Some("/server/data/playlists/theirs"),
+                None,
+            )
+            .await;
+        shared.data = Some(
+            serde_json::json!({"OwnerUserId": Uuid::from_u128(999), "OpenAccess": false})
+                .to_string(),
+        );
+        f.save(&shared).await;
+        let mut file = f
+            .item(
+                98,
+                BaseItemKind::Playlist,
+                Some("/library/list.m3u"),
+                Some(&library),
+            )
+            .await;
         assert_eq!(
             f.service
                 .playlist_policy(&[shared.clone(), file.clone()], &f.user)
                 .await
                 .expect("policy"),
-            [false, false]
+            [true, true],
+            "another user's private playlist: the owner check is the manager's"
         );
-
-        link(&shared, &pg_movie).await;
-        assert!(f.visible(&shared).await, "one member within the limit");
-        f.user.max_parental_rating_score = None;
-        assert!(f.visible(&file).await, "no limit, no member check");
+        for playlist in [&shared, &file] {
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(playlist), row_id(&movie), 0)
+                .await
+                .expect("link");
+        }
+        f.user.max_parental_rating_score = Some(13);
         assert_eq!(
             f.service
-                .playlist_policy(std::slice::from_ref(&file), &f.user)
+                .playlist_policy(&[shared.clone(), file.clone()], &f.user)
                 .await
                 .expect("policy"),
-            [true]
+            [false, false],
+            "only an R member"
         );
-        // A playlist file is also `base.IsVisible`: its own blocked tag hides it.
-        let mut tagged = file.clone();
-        tagged.tags = Some("Private".to_owned());
-        f.save(&tagged).await;
+        f.user.max_parental_rating_score = None;
+        file.tags = Some("Private".to_owned());
+        f.save(&file).await;
         f.pref(PreferenceKind::BlockedTags, &["private"]).await;
         assert_eq!(
             f.service
-                .playlist_policy(&[tagged, shared.clone()], &f.user)
+                .playlist_policy(&[file, shared], &f.user)
                 .await
                 .expect("policy"),
             [false, true],
-            "the shared playlist answers to its owner/shares, not to tags"
+            "a blocked tag hides the file, not the shared playlist"
         );
     }
 
