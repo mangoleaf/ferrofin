@@ -726,6 +726,26 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
     );
 }
 
+/// `GET /Playlists/{id}/Items?userId=` is `RequestHelpers.GetUserId`: a
+/// non-administrator naming another user is `403`, or the member filter
+/// would run as whoever they named.
+#[tokio::test]
+async fn playlist_items_for_another_user_as_non_admin_is_forbidden() {
+    let other = Uuid::from_u128(0x0999);
+    let app = state(
+        Arc::new(RecordingPlaylists::default()),
+        Arc::new(RecordingCollections::default()),
+    );
+    let (status, _) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?userId={other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn add_items_to_playlist_records_call() {
     let pl = Arc::new(RecordingPlaylists::default());

@@ -1091,8 +1091,8 @@ pub async fn build_app_state(
             .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
-            // 12.1 lists a playlists/boxsets view only when the user can see
-            // a child in it, which needs the user's own visibility rules.
+            // 12.2 lists a playlists/boxsets view only when the user can see
+            // an item of its kind, which needs the user's own visibility rules.
             .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
@@ -1784,13 +1784,16 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> =
-        Arc::new(FerrofinPlaylistManager::new(
+    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = Arc::new(
+        FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&item_repository),
             Arc::clone(&collection_paths),
-        ));
+        )
+        // `Playlist.IsVisible`'s parental half, beside the owner/shares.
+        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users)),
+    );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
     // now that every backing manager exists. Once registered, the scheduler

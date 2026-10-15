@@ -147,6 +147,35 @@ impl ItemVisibility {
         Ok(result)
     }
 
+    /// `Playlist.IsVisible` for each of `playlists`, in input order, without
+    /// the owner/share test the playlist manager answers itself: a shared
+    /// playlist needs only 12.1's `HasParentalAllowedChild`, a playlist file
+    /// `base.IsVisible(user) && HasParentalAllowedChild(user)`.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy.
+    pub async fn playlist_policy(
+        &self,
+        playlists: &[BaseItemEntity],
+        user: &UserEntity,
+    ) -> Result<Vec<bool>, ServiceError> {
+        if playlists.is_empty() {
+            return Ok(Vec::new());
+        }
+        let context = self.load(playlists, Some(user)).await?;
+        playlists
+            .iter()
+            .map(|playlist| {
+                let row = context.rows.get(&row_id(playlist)).unwrap_or(playlist);
+                if context.shared_playlist(row) {
+                    context.has_parental_allowed_child(row, user)
+                } else {
+                    context.visible(row, false)
+                }
+            })
+            .collect()
+    }
+
     /// Recomputes persisted parental scores from effective custom/official ratings
     /// and inherited metadata country, matching `BaseItem.OnMetadataChanged`.
     ///
@@ -595,19 +624,9 @@ impl Context<'_> {
                     accessible |= self.visible(row, false)?;
                 }
             }
-            if !accessible {
+            // `BoxSet.IsVisible` applies the same member rule.
+            if !accessible || !self.has_parental_allowed_child(item, user)? {
                 return Ok(false);
-            }
-            if user.max_parental_rating_score.is_some() {
-                let mut any = false;
-                let mut present = false;
-                for child in children.iter().filter_map(|id| self.rows.get(id)) {
-                    present = true;
-                    any |= self.parental(child, true)?;
-                }
-                if present && !any {
-                    return Ok(false);
-                }
             }
         }
         if kind(item) == BaseItemKind::Playlist {
@@ -1482,6 +1501,79 @@ mod tests {
             .await
             .expect("link");
         assert!(f.visible(&owned).await, "one allowed member is enough");
+    }
+
+    /// `playlist_policy` is `Playlist.IsVisible` minus the owner/share test,
+    /// which the playlist manager answers itself: a shared playlist owned by
+    /// someone else passes it, and only `HasParentalAllowedChild` can reject
+    /// it; a playlist file also answers to `base.IsVisible`, its tags here.
+    #[tokio::test]
+    async fn playlist_policy_leaves_the_owner_check_to_the_manager() {
+        let mut f = Fixture::new().await;
+        let library = f
+            .item(95, BaseItemKind::CollectionFolder, Some("/library"), None)
+            .await;
+        let mut movie = f
+            .item(96, BaseItemKind::Movie, Some("/library/96"), Some(&library))
+            .await;
+        movie.official_rating = Some("R".to_owned());
+        f.save(&movie).await;
+        let mut shared = f
+            .item(
+                97,
+                BaseItemKind::Playlist,
+                Some("/server/data/playlists/theirs"),
+                None,
+            )
+            .await;
+        shared.data = Some(
+            serde_json::json!({"OwnerUserId": Uuid::from_u128(999), "OpenAccess": false})
+                .to_string(),
+        );
+        f.save(&shared).await;
+        let mut file = f
+            .item(
+                98,
+                BaseItemKind::Playlist,
+                Some("/library/list.m3u"),
+                Some(&library),
+            )
+            .await;
+        assert_eq!(
+            f.service
+                .playlist_policy(&[shared.clone(), file.clone()], &f.user)
+                .await
+                .expect("policy"),
+            [true, true],
+            "another user's private playlist: the owner check is the manager's"
+        );
+        for playlist in [&shared, &file] {
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(playlist), row_id(&movie), 0)
+                .await
+                .expect("link");
+        }
+        f.user.max_parental_rating_score = Some(13);
+        assert_eq!(
+            f.service
+                .playlist_policy(&[shared.clone(), file.clone()], &f.user)
+                .await
+                .expect("policy"),
+            [false, false],
+            "only an R member"
+        );
+        f.user.max_parental_rating_score = None;
+        file.tags = Some("Private".to_owned());
+        f.save(&file).await;
+        f.pref(PreferenceKind::BlockedTags, &["private"]).await;
+        assert_eq!(
+            f.service
+                .playlist_policy(&[file, shared], &f.user)
+                .await
+                .expect("policy"),
+            [false, true],
+            "a blocked tag hides the file, not the shared playlist"
+        );
     }
 
     #[tokio::test]
