@@ -16,8 +16,8 @@
 //! - the `Emby` scheme name in place of `MediaBrowser`
 //!
 //! Parsing lives in `ferrofin-core`'s `FerrofinAuthorizationContext`, behind
-//! the `ferrofin_traits` `AuthorizationContext` seam. `/socket` resolves its
-//! token separately (`handlers::websocket`).
+//! the `ferrofin_traits` `AuthorizationContext` seam. The session WebSocket
+//! (`handlers::websocket`) authenticates through the same path.
 //!
 //! Two pieces mirror the C# `MediaBrowser.Controller.Net` layer:
 //!

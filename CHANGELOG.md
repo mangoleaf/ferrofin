@@ -178,6 +178,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
   copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
   before that copy makes it on the next boot
+- The `/socket` WebSocket authenticates like every other request, as Jellyfin 12.2's does:
+  Emby-era credentials (`api_key`, `X-Emby-Token`, `X-MediaBrowser-Token`) count only with
+  `EnableLegacyAuthorization`, and a connection without valid credentials is refused with
+  `403` instead of opening. A socket that authenticates with the `Authorization` header, as
+  jellyfin-sdk-kotlin clients' sockets do, now joins its session, so remote control and SyncPlay
+  reach those clients (#75). Opening a socket no longer blanks the session's remote address,
+  so the dashboard and the session activity entries show the client's IP. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)

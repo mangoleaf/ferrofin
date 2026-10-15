@@ -12,11 +12,12 @@ major-version upgrade.
 
 `/System/Info` now reports `Version` `12.2.0` (1.3.x reported `10.11.8`). As in Jellyfin 12,
 only the `Authorization: MediaBrowser …` header and the `ApiKey` query parameter
-authenticate HTTP requests by default. The Emby-era forms are refused while
-`EnableLegacyAuthorization` is `false`, the default on a fresh install since 1.2.0:
+authenticate by default, on HTTP requests and the `/socket` WebSocket alike. The
+Emby-era forms are refused while `EnableLegacyAuthorization` is `false`, the default on
+a fresh install since 1.2.0:
 
 - the `X-Emby-Authorization` header (sign-in returns `400`, "app is required")
-- the bare `X-Emby-Token` and `X-MediaBrowser-Token` headers (`401`)
+- the bare `X-Emby-Token` and `X-MediaBrowser-Token` headers (`401`; `403` on the socket)
 - the `api_key` query parameter, and the `Emby` scheme name in place of `MediaBrowser`
 
 1.2.0 through 1.3.x refused them too on a fresh install, while reporting 10.11.8, a
@@ -33,6 +34,16 @@ deprecated them, so only for such a client). jellyfin-web has no switch for it; 
   `"EnableLegacyAuthorization": true` and `POST` the whole document back to
   `/System/Configuration`. It takes effect on the next request, without a restart.
 - **Stopped server:** set `"EnableLegacyAuthorization": true` in `config/system.json`.
+
+The `/socket` WebSocket used to read its token itself: it took `api_key`, `X-Emby-Token`
+and `X-MediaBrowser-Token` whatever the flag said, ignored the `Authorization` header, and
+opened without any credentials (keep-alive only). It now authenticates like every other
+request and, as in Jellyfin 12.2, refuses a connection without valid credentials with
+`403` before the upgrade. The bundled jellyfin-web 12.x is unaffected (it sends
+`?ApiKey=`), but a client whose socket sends `api_key` or a bare token header (jellyfin-web
+10.11, for one) now loses its live updates and remote control unless the flag is on.
+Clients built on jellyfin-sdk-kotlin send only the `Authorization` header on the socket;
+their socket now joins their session, so remote control and SyncPlay reach them.
 
 ## Unreleased — a set-up server no longer starts without its database
 
