@@ -3086,6 +3086,13 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(self.people.get_people(query).await?.items)
     }
 
+    async fn get_people_page(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
+        self.people.get_people(query).await
+    }
+
     async fn get_people_batch(
         &self,
         item_ids: &[Uuid],

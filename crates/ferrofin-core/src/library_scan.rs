@@ -11883,7 +11883,8 @@ impl LibraryScanner {
             ) {
                 (Some(series), Some(season), Some(episode)) => {
                     ferrofin_providers::tmdb::ordered_download_images(
-                        tmdb.episode_images(series, season, episode).await,
+                        tmdb.episode_images(series, season, episode, language.as_deref())
+                            .await,
                         language.as_deref().unwrap_or("en"),
                     )
                 }
@@ -11931,6 +11932,10 @@ impl LibraryScanner {
         current: &[ItemImageInfo],
         preferences: ferrofin_providers::image_policy::ImageAcquisitionPolicy<'_>,
     ) -> Vec<ItemImageInfo> {
+        let request_language = ferrofin_providers::tmdb::normalize_language(
+            Some(&preferred_language(entity, policy)),
+            Some(&policy.country_code()),
+        );
         let images = if policy.image_enabled(short, fetcher_names::TMDB) {
             match (
                 entity.series_id.as_deref(),
@@ -11938,7 +11943,7 @@ impl LibraryScanner {
             ) {
                 (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
                     Some(id) => tmdb
-                        .season_images(id, number)
+                        .season_images(id, number, request_language.as_deref())
                         .await
                         .into_iter()
                         .map(RemoteImage::from)

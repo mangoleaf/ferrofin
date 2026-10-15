@@ -48,6 +48,10 @@ const TICKS_PER_MS: i64 = 10_000;
 /// Default latency cushion added when scheduling a command's `When`, in ms.
 /// ponytail: Jellyfin's `Group.DefaultPing`; surface as a setting if tuned.
 const DEFAULT_PING_MS: i64 = 500;
+/// Upper bound on a client-reported ping, in ms. Pings are scaled into resume
+/// delays, so an unbounded value lets one session push the whole group's
+/// playback arbitrarily far out. Upstream `Group.MaxPing` (Group.cs).
+const MAX_PING_MS: i64 = 10_000;
 /// How stale a client's self-reported `When` may be before its elapsed time is
 /// discarded, in ms. ponytail: Jellyfin's `Group.TimeSyncOffset` (Group.cs:97).
 const TIME_SYNC_OFFSET_MS: i64 = 2000;
@@ -442,7 +446,11 @@ impl Group {
     }
 
     fn highest_ping_ms(&self) -> i64 {
-        self.members.iter().map(|m| m.ping_ms).max().unwrap_or(0)
+        self.members
+            .iter()
+            .map(|m| m.ping_ms)
+            .max()
+            .unwrap_or(DEFAULT_PING_MS)
     }
 
     /// The distinct user ids behind the group's member sessions.
@@ -1256,11 +1264,8 @@ impl Group {
                     Target::AllGroup
                 }
             } else {
-                // :502-503 — upstream compares a TICK count against `DefaultPing`,
-                // which is milliseconds. Ported as written: the `max` is inert for
-                // any ping above 0.000025 ms, and "correcting" it would move
-                // `When` by half a second against the oracle on a zero ping.
-                let recovered = (2 * self.highest_ping_ms() * TICKS_PER_MS).max(DEFAULT_PING_MS);
+                let recovered =
+                    (2 * self.highest_ping_ms() * TICKS_PER_MS).max(DEFAULT_PING_MS * TICKS_PER_MS);
                 self.last_activity = now + ticks(recovered);
                 Target::AllGroup
             };
@@ -1961,7 +1966,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             match &request {
                 PlaybackRequest::Ping { ping } => {
                     if let Some(m) = group.member_mut(&session.session_id) {
-                        m.ping_ms = (*ping).max(0);
+                        m.ping_ms = (*ping).clamp(0, MAX_PING_MS);
                     }
                 }
                 PlaybackRequest::IgnoreWait { ignore_wait } => {
@@ -3836,5 +3841,38 @@ mod tests {
         m.handle_request(&a, play(2)).await.unwrap();
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
         assert!(m.get_group(&a, info.group_id).await.is_ok());
+    }
+
+    #[test]
+    fn empty_group_returns_default_ping() {
+        let group = Group::new(Uuid::new_v4(), String::new(), Utc::now());
+        assert_eq!(group.highest_ping_ms(), DEFAULT_PING_MS);
+    }
+
+    #[tokio::test]
+    async fn ping_is_clamped_to_max() {
+        let (m, _bus) = mgr();
+        let a = session("s1", "alice");
+        m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, PlaybackRequest::Ping { ping: i64::MAX })
+            .await
+            .unwrap();
+        let reg = m.lock();
+        let group = reg.groups.values().next().unwrap();
+        assert_eq!(group.highest_ping_ms(), MAX_PING_MS);
+    }
+
+    #[tokio::test]
+    async fn negative_ping_is_clamped_to_zero() {
+        let (m, _bus) = mgr();
+        let a = session("s1", "alice");
+        m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, PlaybackRequest::Ping { ping: -1 })
+            .await
+            .unwrap();
+        let reg = m.lock();
+        let group = reg.groups.values().next().unwrap();
+        let member = group.members.first().unwrap();
+        assert_eq!(member.ping_ms, 0);
     }
 }

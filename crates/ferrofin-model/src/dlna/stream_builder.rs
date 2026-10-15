@@ -526,6 +526,10 @@ impl<'a> StreamBuilder<'a> {
             is_eligible_for_direct_play = false;
         }
 
+        if is_manifest_container(item.container.as_deref()) {
+            is_eligible_for_direct_play = false;
+        }
+
         if bitrate_limit_exceeded {
             transcode_reasons = TranscodeReasons::CONTAINER_BITRATE_EXCEEDS_LIMIT;
         }
@@ -2685,6 +2689,14 @@ fn format_level(v: f64) -> String {
     format_f64(v)
 }
 
+/// A manifest (HLS/DASH) container is not a byte stream and cannot be direct-played.
+fn is_manifest_container(container: Option<&str>) -> bool {
+    const MANIFESTS: &[&str] = &["hls", "applehttp", "dash"];
+    let Some(c) = container else { return false };
+    c.split(',')
+        .any(|part| MANIFESTS.iter().any(|m| part.eq_ignore_ascii_case(m)))
+}
+
 // Keep the range-name helper referenced so it is not flagged unused.
 #[allow(dead_code)]
 const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
@@ -2692,3 +2704,25 @@ const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
 // Ordering import retained for clarity of intent in comparators.
 #[allow(dead_code)]
 const _ORDERING: Option<Ordering> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::is_manifest_container;
+
+    #[test]
+    fn manifest_containers_detected() {
+        assert!(is_manifest_container(Some("hls")));
+        assert!(is_manifest_container(Some("HLS")));
+        assert!(is_manifest_container(Some("applehttp")));
+        assert!(is_manifest_container(Some("dash")));
+        assert!(is_manifest_container(Some("mp4,hls")));
+    }
+
+    #[test]
+    fn non_manifest_containers_not_flagged() {
+        assert!(!is_manifest_container(Some("mp4")));
+        assert!(!is_manifest_container(Some("mkv")));
+        assert!(!is_manifest_container(Some("ts")));
+        assert!(!is_manifest_container(None));
+    }
+}

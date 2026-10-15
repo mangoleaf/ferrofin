@@ -3667,6 +3667,7 @@ impl LocalProviderManager {
     /// The TMDB image providers: a title's poster/backdrop/logo set (by its
     /// stored/found id, else a title search), a box set's collection artwork,
     /// a person's profile.
+    #[allow(clippy::too_many_lines)]
     async fn tmdb_images(
         &self,
         source: RemoteImageSource,
@@ -3676,6 +3677,7 @@ impl LocalProviderManager {
         let Some(tmdb) = &self.tmdb else {
             return Vec::new();
         };
+        let request_language = self.preferred_metadata_language(entity).await;
         let name = entity_name(entity);
         let stored_tmdb_id = provider_id_of_pairs(ids, "Tmdb").and_then(parse_numeric_provider_id);
         match source {
@@ -3694,7 +3696,7 @@ impl LocalProviderManager {
                         .map(|h| h.tmdb_id);
                 }
                 match tmdb_id {
-                    Some(id) => tmdb.all_images(kind, id).await,
+                    Some(id) => tmdb.all_images(kind, id, Some(&request_language)).await,
                     None => Vec::new(),
                 }
             }
@@ -3719,7 +3721,8 @@ impl LocalProviderManager {
                 let Some(collection_id) = collection_id else {
                     return Vec::new();
                 };
-                tmdb.collection_images(collection_id).await
+                tmdb.collection_images(collection_id, Some(&request_language))
+                    .await
             }
             RemoteImageSource::TmdbSeason | RemoteImageSource::TmdbEpisode => {
                 // `TmdbSeason/EpisodeImageProvider`: both hop to the PARENT
@@ -3750,21 +3753,27 @@ impl LocalProviderManager {
                     let Some(season_number) = number(entity.index_number) else {
                         return Vec::new();
                     };
-                    tmdb.season_images(series_tmdb_id, season_number).await
+                    tmdb.season_images(series_tmdb_id, season_number, Some(&request_language))
+                        .await
                 } else {
                     let season_number = number(entity.parent_index_number).unwrap_or(1);
                     let Some(episode_number) = number(entity.index_number) else {
                         return Vec::new();
                     };
-                    tmdb.episode_images(series_tmdb_id, season_number, episode_number)
-                        .await
+                    tmdb.episode_images(
+                        series_tmdb_id,
+                        season_number,
+                        episode_number,
+                        Some(&request_language),
+                    )
+                    .await
                 }
             }
             _ => {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
                 // else the first name-search hit.
                 let language = crate::tmdb::normalize_language(
-                    Some(&self.preferred_metadata_language(entity).await),
+                    Some(&request_language),
                     Some(&self.preferred_metadata_country_code(entity).await),
                 );
                 let id = match (stored_tmdb_id, name) {
@@ -3778,7 +3787,10 @@ impl LocalProviderManager {
                     (None, None) => None,
                 };
                 match id {
-                    Some(id) => tmdb.person_images(id, language.as_deref()).await,
+                    Some(id) => {
+                        tmdb.person_images(id, language.as_deref(), Some(&request_language))
+                            .await
+                    }
                     None => Vec::new(),
                 }
             }

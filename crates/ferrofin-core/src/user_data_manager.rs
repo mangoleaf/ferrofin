@@ -625,6 +625,17 @@ impl UserDataManager for FerrofinUserDataManager {
         Ok(())
     }
 
+    async fn get_stream_default_data(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
+        let row = self.read_row(item_id, user_id).await?;
+        Ok(row.map_or((None, None), |r| {
+            (r.audio_stream_index, r.subtitle_stream_index)
+        }))
+    }
+
     async fn get_user_data_dto(
         &self,
         item_id: Uuid,
@@ -789,6 +800,7 @@ impl UserDataManager for FerrofinUserDataManager {
                 row.play_count += 1;
                 row.played = supports_played_status(kind);
                 row.playback_position_ticks = 0;
+                row.last_played_date = Some(chrono::Utc::now());
                 self.upsert_row(&row).await?;
                 self.notify_saved(user_id, item_id, reason).await;
                 return Ok(true);
@@ -851,6 +863,9 @@ impl UserDataManager for FerrofinUserDataManager {
         }
 
         row.playback_position_ticks = position_ticks;
+        if played_to_completion || position_ticks > 0 {
+            row.last_played_date = Some(chrono::Utc::now());
+        }
         self.upsert_row(&row).await?;
         self.notify_saved(user_id, item_id, reason).await;
         // "A completed version marks every alternate version played and
@@ -951,21 +966,23 @@ impl UserDataManager for FerrofinUserDataManager {
         item_id: Uuid,
     ) -> Result<(), ServiceError> {
         // Port of the user-data half of C# SessionManager.OnPlaybackStart:
-        // PlayCount++, LastPlayedDate = now, and non-resumable kinds (photos,
-        // books — anything without position-ticks resume) are played outright.
-        // The LastPlayedDate stamp is what Next Up's recently-watched HAVING
-        // filter reads; the stop-path `update_play_state` deliberately never
-        // writes it, exactly like upstream.
+        // PlayCount++, and non-resumable kinds (photos, books — anything
+        // without position-ticks resume) are played outright.
+        // LastPlayedDate is only set here for items that are unplayed or
+        // non-resumable; a rewatch of a played, resumable item (episode/movie)
+        // defers the stamp to the progress/stop path so that barely-started
+        // rewatches don't advance Next Up.
         let mut row = self
             .read_row(item_id, user_id)
             .await?
             .unwrap_or_else(|| Self::empty_row(item_id, user_id));
         row.play_count += 1;
-        row.last_played_date = Some(chrono::Utc::now());
-        if let Some((_, kind)) = self.item_runtime_and_kind(item_id).await?
-            && supports_played_status(kind)
-            && !supports_position_ticks_resume(kind)
-        {
+        let kind = self.item_runtime_and_kind(item_id).await?.map(|(_, k)| k);
+        let resumable = kind.is_some_and(supports_position_ticks_resume);
+        if !row.played || !resumable {
+            row.last_played_date = Some(chrono::Utc::now());
+        }
+        if kind.is_some_and(|k| supports_played_status(k) && !supports_position_ticks_resume(k)) {
             row.played = true;
         }
         self.upsert_row(&row).await?;
@@ -2266,6 +2283,62 @@ mod tests {
         assert!(row.last_played_date.is_some());
         // A movie resumes by position, so a start alone never marks it played.
         assert!(!row.played);
+    }
+
+    #[tokio::test]
+    async fn rewatch_of_played_episode_defers_last_played_date() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0xA);
+        let item = Uuid::from_u128(0xB);
+        seed_user(&db, user).await;
+        let runtime = 3600 * TICKS_PER_SECOND;
+        seed_movie_with_runtime(&db, item, runtime).await;
+        // Re-type to Episode so it supports_position_ticks_resume.
+        sqlx::query(r#"UPDATE "BaseItems" SET "Type" = 'MediaBrowser.Controller.Entities.TV.Episode' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(item))
+            .execute(db.writer())
+            .await
+            .expect("retype");
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        // First play: stamp is set.
+        mgr.record_playback_start(user, item).await.expect("start");
+        let first = mgr.read_row(item, user).await.unwrap().unwrap();
+        assert!(first.last_played_date.is_some());
+        let first_date = first.last_played_date.unwrap();
+
+        // Mark it played with a completion past 90%.
+        mgr.update_play_state(user, item, Some(runtime * 95 / 100))
+            .await
+            .expect("complete");
+        let after_complete = mgr.read_row(item, user).await.unwrap().unwrap();
+        assert!(after_complete.played);
+        assert!(after_complete.last_played_date.unwrap() >= first_date);
+
+        let completed_date = after_complete.last_played_date.unwrap();
+
+        // Rewatch: start does NOT advance LastPlayedDate.
+        mgr.record_playback_start(user, item)
+            .await
+            .expect("rewatch start");
+        let rewatch = mgr.read_row(item, user).await.unwrap().unwrap();
+        assert_eq!(rewatch.last_played_date.unwrap(), completed_date);
+        assert_eq!(rewatch.play_count, 2);
+
+        // A barely-started stop (below MinResumePct, default 5%) does NOT
+        // advance LastPlayedDate.
+        mgr.update_play_state(user, item, Some(runtime / 100))
+            .await
+            .expect("barely started");
+        let barely = mgr.read_row(item, user).await.unwrap().unwrap();
+        assert_eq!(barely.last_played_date.unwrap(), completed_date);
+
+        // A stop past the resume threshold DOES advance it.
+        mgr.update_play_state(user, item, Some(runtime / 2))
+            .await
+            .expect("mid-episode");
+        let mid = mgr.read_row(item, user).await.unwrap().unwrap();
+        assert!(mid.last_played_date.unwrap() >= completed_date);
     }
 
     #[tokio::test]

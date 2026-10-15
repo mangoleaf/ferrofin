@@ -1378,10 +1378,8 @@ mod tests {
     /// A stand-in ffmpeg: an executable shell script running `body`.
     #[cfg(unix)]
     fn fake_ffmpeg(dir: &std::path::Path, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("ffmpeg");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::stub_script(&path, body);
         path.to_string_lossy().into_owned()
     }
 

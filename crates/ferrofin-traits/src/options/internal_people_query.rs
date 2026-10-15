@@ -52,6 +52,12 @@ pub struct InternalPeopleQuery {
 
     /// Restrict to people the user has (not) favourited, if set.
     pub is_favorite: Option<bool>,
+
+    /// Keep only people with a by-name `Person` item of the same name behind
+    /// them. Set by callers that hand back items rather than credits
+    /// (`GetPeopleItems`), so the total they report describes the people they
+    /// can return (C# `MustHaveItem`, Jellyfin 12.2).
+    pub must_have_item: bool,
 }
 
 #[cfg(test)]
@@ -68,6 +74,7 @@ mod tests {
         assert!(q.exclude_person_types.is_empty());
         assert!(q.user_id.is_none());
         assert!(q.is_favorite.is_none());
+        assert!(!q.must_have_item);
     }
 
     #[test]

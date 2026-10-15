@@ -39,7 +39,7 @@ use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
 use ferrofin_mediaencoding::encoding_helper::helper::{
     shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
 };
-use ferrofin_mediaencoding::encoding_helper::hw;
+use ferrofin_mediaencoding::encoding_helper::{bitstream, hw};
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
 };
@@ -573,6 +573,19 @@ fn segment_file_extension(segment_container: &str) -> &'static str {
 /// decode in browser MSE. Port of `EncodingHelper.IsH265`.
 fn is_hevc(codec: &str) -> bool {
     codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265")
+}
+
+/// Selects the HEVC Dolby Vision MP4 sample entry tag.
+///
+/// Profile 8 uses `hvc1` (what Dolby's official streams use; `dvh1` breaks
+/// strict-tag players like Safari). All other profiles use `dvh1`. Port of
+/// `DynamicHlsController.GetDolbyVisionHevcCodecTag`.
+fn dolby_vision_hevc_codec_tag(stream: Option<&MediaStream>) -> &'static str {
+    if stream.and_then(|s| s.dv_profile) == Some(8) {
+        "hvc1"
+    } else {
+        "dvh1"
+    }
 }
 
 /// The HLS `-hls_segment_type` token for `segment_container`.
@@ -1617,19 +1630,37 @@ impl FerrofinStreamStatePlanner {
         // ---- video -----------------------------------------------------------
         push_split(&mut args, "-c:v");
         args.push(video_encoder.clone());
-        // HEVC output needs the `hvc1` codec tag to decode in browser MSE (only
-        // meaningful in fMP4). Keyed on the *output* codec: the source codec when
-        // copying, else the negotiated target (so `hevc_nvenc` tags too). Port of
-        // `DynamicHlsController`'s `-tag:v:0 hvc1`.
+        // Port of `DynamicHlsController.GetVideoArguments` tag selection:
+        // fMP4 HEVC/AV1 needs a codec tag so players can decode it.
         let output_codec = if copying_video {
             state.video_stream.as_ref().and_then(|s| s.codec.as_deref())
         } else {
             state.output_video_codec.as_deref()
         };
         let output_is_hevc = output_codec.is_some_and(is_hevc);
-        if output_is_hevc && segment_container.eq_ignore_ascii_case("mp4") {
-            push_split(&mut args, "-tag:v:0");
-            args.push("hvc1".to_owned());
+        let output_is_av1 = output_codec.is_some_and(|c| c.eq_ignore_ascii_case("av1"));
+        if (output_is_hevc || output_is_av1) && segment_container.eq_ignore_ascii_case("mp4") {
+            let video_is_dovi = hw::tonemap::is_dovi(state.video_stream.as_ref());
+            let actual_codec = state.actual_output_video_codec();
+            let client_supports_dovi = actual_codec
+                .map(|c| state.requested_range_types(c))
+                .is_some_and(|r| r.iter().any(|s| s.eq_ignore_ascii_case("DOVI")));
+            if copying_video
+                && video_is_dovi
+                && client_supports_dovi
+                && !bitstream::is_dovi_removed(caps, state)
+            {
+                push_split(&mut args, "-tag:v:0");
+                if output_is_hevc {
+                    args.push(dolby_vision_hevc_codec_tag(state.video_stream.as_ref()).to_owned());
+                } else {
+                    args.push("dav1".to_owned());
+                }
+                push_split(&mut args, "-strict -2");
+            } else if output_is_hevc {
+                push_split(&mut args, "-tag:v:0");
+                args.push("hvc1".to_owned());
+            }
         }
         // ---- bitstream filters -----------------------------------------------
         // Only on a stream copy: a re-encode produces a fresh bitstream that
@@ -2180,8 +2211,25 @@ mod tests {
     use ferrofin_model::configuration::HlsAudioSeekStrategy;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case(Some(8), "hvc1")]
+    #[case(Some(5), "dvh1")]
+    #[case(Some(7), "dvh1")]
+    #[case(None, "dvh1")]
+    fn dolby_vision_hevc_codec_tag_selects_tag_for_profile(
+        #[case] profile: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let stream = MediaStream {
+            dv_profile: profile,
+            ..MediaStream::default()
+        };
+        assert_eq!(dolby_vision_hevc_codec_tag(Some(&stream)), expected);
+    }
 
     #[test]
     fn raw_query_params_match_keys_ignoring_case() {
@@ -4616,16 +4664,7 @@ mod tests {
     /// planner's VAAPI prober at it.
     fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
         let path = dir.join("stub-ffmpeg");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::stub_script(&path, &format!("echo 'VAAPI driver: {driver}' >&2\n"));
         FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
     }
 
@@ -5237,8 +5276,10 @@ mod tests {
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
-    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
-    /// under the harness query. `GetStreamingState` yields
+    /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono
+    /// aac) under the harness query. The bit depth matters: an unknown or 10-bit
+    /// source gets `GetBitDepthCompensatedBitrate`'s factor (×1.2 here).
+    /// `GetStreamingState` yields
     /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
     /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
     /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
@@ -5250,6 +5291,7 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
+        video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);
         let src = source("abc", vec![video, audio]);
@@ -5851,8 +5893,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.state.output_audio_codec.as_deref(),
-            Some(format!("/audio/{}/stream", request.item_id).as_str()),
-            "native inference reads the literal bare URL rather than the Container query"
+            Some("aac"),
+            "extensionless URL falls back to aac rather than passing the URL as a codec"
         );
         request.audio_codec = Some("mp3".to_owned());
         let plan = planner

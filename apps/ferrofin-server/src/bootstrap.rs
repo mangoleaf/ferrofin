@@ -1515,7 +1515,6 @@ mod tests {
     /// discovery happy path run without a real ffmpeg install.
     #[cfg(unix)]
     fn write_fake_ffmpeg(dir: &Path, name: &str, banner_tool: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
         // First line satisfies our `<tool> version` prefix check; the `libav*`
         // lines satisfy `EncoderValidator`'s library-version cross-check for the
@@ -1525,8 +1524,7 @@ mod tests {
         // falls through to the version banner, which is what an ffmpeg without
         // that capability effectively produces for our purposes.
         let script = format!(
-            "#!/bin/sh\n\
-             if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
+            "if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
              \x20 T.. = Timeline support\n\
              \x20T.C scale             V->V       Scale the input video size.\n\
              \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
@@ -1561,10 +1559,7 @@ mod tests {
              libavdevice    60.  3.100\nlibavfilter     9. 12.100\nlibswscale      7.  5.100\n\
              libswresample   4. 12.100\nEOF\n"
         );
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        crate::test_exec::stub_script(&path, &script);
         path
     }
 
