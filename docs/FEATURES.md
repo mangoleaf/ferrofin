@@ -67,7 +67,11 @@ Deep-verified against a real Jellyfin server:
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
-  the immutable-tagged-image caching contract.
+  the immutable-tagged-image caching contract. A user's profile image is stored where
+  Jellyfin stores it, `{config}/users/{Username}/profile{ext}`.
+  - **Accepted divergence (a fix, not a gap):** renaming a user moves their profile image
+    to the new name's folder. Jellyfin leaves it, so a new user who takes the old name
+    overwrites the renamed user's image on upload and deletes it on removal.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's

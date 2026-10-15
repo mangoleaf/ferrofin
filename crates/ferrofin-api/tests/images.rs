@@ -205,6 +205,17 @@ fn empty_item() -> BaseItemEntity {
 /// over-gating them would break every client's thumbnail grid.
 struct OkAuth {
     elevated: bool,
+    /// The caller's `EnableUserPreferenceAccess` is off (`AssertCanUpdateUser`).
+    restricted: bool,
+}
+
+impl OkAuth {
+    fn caller(&self) -> UserEntity {
+        UserEntity {
+            enable_user_preference_access: !self.restricted,
+            ..user_entity(USER_ID, "alice")
+        }
+    }
 }
 
 #[async_trait]
@@ -221,7 +232,7 @@ impl AuthService for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(self.caller()),
             is_api_key: self.elevated,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
@@ -243,7 +254,7 @@ impl AuthorizationContext for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(self.caller()),
             is_api_key: self.elevated,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
@@ -602,7 +613,8 @@ impl UserManager for StubUsers {
         _user: &UserEntity,
         _remote_endpoint: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        unimplemented!()
+        // No policy: the caller is not an administrator.
+        Ok(ferrofin_model::dto::UserDto::default())
     }
     async fn update_configuration(
         &self,
@@ -757,6 +769,8 @@ struct Stubs {
     providers: Arc<StubProviders>,
     /// Whether the caller satisfies `RequiresElevation` (see [`OkAuth`]).
     elevated: bool,
+    /// Whether the caller lacks `EnableUserPreferenceAccess` (see [`OkAuth`]).
+    restricted: bool,
 }
 
 /// Builds the image stubs, serving `image_path` for item/by-name images and
@@ -778,6 +792,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             updates: Arc::new(Mutex::new(Vec::new())),
         }),
         elevated: false,
+        restricted: false,
     }
 }
 
@@ -809,9 +824,11 @@ fn state(s: &Stubs) -> AppState {
         Arc::new(ferrofin_api::test_support::FakeDto),
         Arc::new(OkAuth {
             elevated: s.elevated,
+            restricted: s.restricted,
         }),
         Arc::new(OkAuth {
             elevated: s.elevated,
+            restricted: s.restricted,
         }),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
@@ -1446,6 +1463,21 @@ async fn post_user_image_saves_and_returns_204() {
         saved.as_slice(),
         [(USER_ID.to_string(), "image/png".to_owned())]
     );
+}
+
+/// `AssertCanUpdateUser(…, restrictUserPreferences: true)`: a non-admin without
+/// `EnableUserPreferenceAccess` cannot change even their own profile image.
+#[tokio::test]
+async fn user_image_writes_require_preference_access() {
+    let s = Stubs {
+        restricted: true,
+        ..stubs(String::new(), String::new())
+    };
+    let (status, _) = send(&s, "POST", "/UserImage", Some(("image/png", "aGk="))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&s, "DELETE", "/UserImage", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(s.users.saved.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]

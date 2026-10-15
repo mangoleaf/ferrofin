@@ -106,9 +106,9 @@ pub struct FerrofinUserManager {
     /// (update/delete, password, policy, configuration) so cached auth can
     /// never outlive a change to what it authorizes.
     auth_cache: Arc<crate::auth_cache::AuthCache>,
-    /// The directory user profile images are written under
-    /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
-    /// rejects uploads until a directory is configured.
+    /// The directory user profile images are written under — upstream's
+    /// `UserConfigurationDirectoryPath` (`{dir}/{Username}/profile{ext}`). Set by
+    /// the composition root; `None` rejects uploads until a directory is configured.
     profile_image_dir: Option<DirectoryPath>,
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
 }
@@ -383,7 +383,8 @@ impl FerrofinUserManager {
         self
     }
 
-    /// Sets the directory user profile images are stored under, enabling
+    /// Sets the directory user profile images are stored under (the user
+    /// configuration directory, `{config}/users`), enabling
     /// [`save_profile_image`](ferrofin_traits::library::UserManager::save_profile_image).
     #[must_use]
     pub fn with_profile_image_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
@@ -412,6 +413,51 @@ impl FerrofinUserManager {
             .fetch_optional(executor)
             .await
             .map_err(db_err)
+    }
+
+    /// Moves a user's profile image from `{dir}/{old_name}/` to `{dir}/{new_name}/`
+    /// and rebases its `ImageInfos` row on `conn` (the rename's transaction). An
+    /// image stored anywhere else (an adopted path, the earlier
+    /// `{metadata}/users/{id}/` layout) stays put. Returns `(from, to)` when a file
+    /// moved, so the caller can move it back if the transaction fails.
+    async fn move_profile_image_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        user_id: Uuid,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, ServiceError> {
+        let Some(base) = &self.profile_image_dir else {
+            return Ok(None);
+        };
+        let base = base.resolve();
+        let user_id = guid_to_db(user_id);
+        let image = user_repository::profile_image(&mut *conn, &user_id)
+            .await
+            .map_err(db_err)?;
+        let Some(from) = image.map(|i| std::path::PathBuf::from(i.path)) else {
+            return Ok(None);
+        };
+        let Some(file_name) = from
+            .file_name()
+            .filter(|_| from.parent() == Some(base.join(old_name).as_path()))
+        else {
+            return Ok(None);
+        };
+        let to_dir = base.join(new_name);
+        let to = to_dir.join(file_name);
+        user_repository::set_profile_image_path(&mut *conn, &user_id, &to.to_string_lossy())
+            .await
+            .map_err(db_err)?;
+        tokio::fs::create_dir_all(&to_dir)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create profile-image dir: {e}")))?;
+        match tokio::fs::rename(&from, &to).await {
+            Ok(()) => Ok(Some((from, to))),
+            // The row named a missing file; it now names the new home instead.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ServiceError::backend(format!("move profile image: {e}"))),
+        }
     }
 
     /// Fetches a user row by id, or `None`.
@@ -727,7 +773,20 @@ impl UserManager for FerrofinUserManager {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        // Divergence from upstream, which leaves the file: the profile image
+        // directory is keyed by username, so it follows the rename. Otherwise a
+        // new user taking the old name would overwrite this user's avatar.
+        let moved = self
+            .move_profile_image_on(&mut tx, user_id, old_name, new_name)
+            .await?;
+        if let Err(e) = tx.commit().await {
+            if let Some((from, to)) = moved
+                && let Err(undo) = tokio::fs::rename(&to, &from).await
+            {
+                tracing::warn!(user_id = %user_id, error = %undo, "restoring profile image after failed rename");
+            }
+            return Err(db_err(e));
+        }
         self.auth_cache.clear();
         Ok(())
     }
@@ -1305,8 +1364,16 @@ impl UserManager for FerrofinUserManager {
                 "save_profile_image requires a profile-image directory",
             ));
         };
-        // Write `{base}/{userId}/profile{ext}` (extension carries its dot).
-        let dir = base.join(&user.id);
+        // Write `{base}/{Username}/profile{ext}` (extension carries its dot),
+        // refusing a username that escapes `base` (C# `PathHelper.IsContainedIn`).
+        let base = base.resolve();
+        let dir = base.join(&user.username);
+        if !ferrofin_util::path_helper::is_contained_in(
+            &base.to_string_lossy(),
+            &dir.to_string_lossy(),
+        ) {
+            return Err(ServiceError::invalid_input("Invalid user."));
+        }
         let ext = extension.trim_start_matches('.');
         let dest = dir.join(format!("profile.{ext}"));
         std::fs::create_dir_all(&dir)
@@ -1315,31 +1382,42 @@ impl UserManager for FerrofinUserManager {
             .map_err(|e| ServiceError::backend(format!("write profile image: {e}")))?;
         // One image per user: replace any existing row (unique index on UserId).
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
-            .bind(&user.id)
-            .execute(&mut *tx)
+        user_repository::replace_profile_image(&mut tx, &user.id, &dest.to_string_lossy())
             .await
             .map_err(db_err)?;
-        sqlx::query(
-            r#"INSERT INTO "ImageInfos" ("LastModified", "Path", "UserId") VALUES (?1, ?2, ?3)"#,
-        )
-        .bind(datetime_to_db(chrono::Utc::now()))
-        .bind(dest.to_string_lossy().as_ref())
-        .bind(&user.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
 
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
-            .bind(&user.id)
-            .execute(self.db.writer())
+        // `DeleteUserImage`: delete the file, then the row. The row delete is held
+        // open so a failure C# lets escape keeps it, as upstream does.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let path = user_repository::delete_profile_image(&mut *tx, &user.id)
             .await
             .map_err(db_err)?;
+        if let Some(path) = path {
+            match tokio::fs::remove_file(&path).await {
+                // C# `File.Delete` ignores a missing file.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // `UnauthorizedAccessException` escapes the controller's
+                // `catch (IOException)`: the request fails and the row stays.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory
+                    ) =>
+                {
+                    return Err(ServiceError::backend(format!("delete profile image: {e}")));
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user.id, path, error = %e, "deleting user profile image failed");
+                }
+                Ok(()) => {}
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -1348,13 +1426,9 @@ impl UserManager for FerrofinUserManager {
         &self,
         user_id: Uuid,
     ) -> Result<Option<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
-        let row = sqlx::query_as::<_, ferrofin_db::entities::users::ImageInfoEntity>(
-            r#"SELECT * FROM "ImageInfos" WHERE "UserId" = ?1 LIMIT 1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let row = user_repository::profile_image(self.db.pool(), &guid_to_db(user_id))
+            .await
+            .map_err(db_err)?;
         Ok(row.map(|r| ferrofin_traits::options::ItemImageInfo {
             path: r.path,
             image_type: ferrofin_model::entities::ImageType::Profile,
@@ -1690,12 +1764,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(std::path::Path::new(&info.path).starts_with(&replacement));
+        // Upstream layout: `{UserConfigurationDirectoryPath}/{Username}/profile{ext}`.
+        assert_eq!(
+            std::path::Path::new(&info.path),
+            replacement.join("synthetic-avatar").join("profile.jpg")
+        );
         assert!(std::path::Path::new(&info.path).is_file());
         assert!(
             dir.path()
                 .join("users")
-                .join(&user.id)
+                .join("synthetic-avatar")
                 .join("profile.png")
                 .is_file()
         );
@@ -1705,6 +1783,81 @@ mod tests {
                 .await
                 .unwrap()
                 .primary_image_tag
+                .is_none()
+        );
+        // `DeleteUserImage` deletes the file too; clearing again (no row) is a no-op.
+        assert!(!std::path::Path::new(&info.path).exists());
+        mgr.clear_profile_image(&user).await.unwrap();
+    }
+
+    /// C# `File.Delete` throws `UnauthorizedAccessException` for a directory (or
+    /// a permission error), which escapes `DeleteUserImage`'s `catch (IOException)`:
+    /// the request fails and the row is kept.
+    #[tokio::test]
+    async fn clear_profile_image_keeps_the_row_when_the_file_cannot_be_deleted() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinUserManager::new(db).with_profile_image_dir(dir.path().to_path_buf());
+        let user = mgr.create_user("synthetic-undeletable").await.unwrap();
+        mgr.save_profile_image(&user, b"x", "image/png", ".png")
+            .await
+            .unwrap();
+        let path = dir.path().join("synthetic-undeletable/profile.png");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = mgr.clear_profile_image(&user).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "{err:?}");
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        assert!(mgr.get_profile_image(user_id).await.unwrap().is_some());
+    }
+
+    /// Divergence from upstream: the avatar follows a rename, so a new user who
+    /// takes the old name can neither overwrite nor delete the renamed user's image.
+    #[tokio::test]
+    async fn profile_image_follows_a_rename() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinUserManager::new(db).with_profile_image_dir(dir.path().to_path_buf());
+        let alice = mgr.create_user("synthetic-alice").await.unwrap();
+        mgr.save_profile_image(&alice, b"alice", "image/png", ".png")
+            .await
+            .unwrap();
+        let alice_id = Uuid::parse_str(&alice.id).unwrap();
+        mgr.rename_user(alice_id, "synthetic-alice", "synthetic-alice.old")
+            .await
+            .unwrap();
+        let moved = dir.path().join("synthetic-alice.old/profile.png");
+        let info = mgr.get_profile_image(alice_id).await.unwrap().unwrap();
+        assert_eq!(info.path, moved.to_string_lossy());
+        assert!(!dir.path().join("synthetic-alice/profile.png").exists());
+
+        let newcomer = mgr.create_user("synthetic-alice").await.unwrap();
+        mgr.save_profile_image(&newcomer, b"newcomer", "image/png", ".png")
+            .await
+            .unwrap();
+        mgr.clear_profile_image(&newcomer).await.unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"alice");
+    }
+
+    #[tokio::test]
+    async fn profile_image_rejects_username_escaping_user_config_dir() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinUserManager::new(db).with_profile_image_dir(dir.path().join("users"));
+        let mut user = mgr.create_user("synthetic-escape").await.unwrap();
+        // Usernames are validated on create/rename, but an adopted database is
+        // not; C# `PostUserImage` re-checks containment before writing.
+        user.username = "..".to_owned();
+        let err = mgr
+            .save_profile_image(&user, b"x", "image/png", ".png")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidInput(ref m) if m == "Invalid user."));
+        assert!(!dir.path().join("profile.png").exists());
+        assert!(
+            mgr.get_profile_image(Uuid::parse_str(&user.id).unwrap())
+                .await
+                .unwrap()
                 .is_none()
         );
     }

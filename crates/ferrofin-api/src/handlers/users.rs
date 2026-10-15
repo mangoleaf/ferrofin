@@ -306,7 +306,7 @@ pub(crate) async fn user_policy(
 
 /// Ports C# `RequestHelpers.AssertCanUpdateUser`: the caller may update `target`
 /// when the caller is an administrator, or when the caller *is* the target.
-async fn assert_can_update_user(
+pub(crate) async fn assert_can_update_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     target: &UserEntity,

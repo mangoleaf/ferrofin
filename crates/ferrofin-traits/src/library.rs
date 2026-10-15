@@ -1378,25 +1378,33 @@ pub trait UserManager: Send + Sync {
     /// Updates a user's policy (stopgap; prefer [`Self::update_user`]).
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError>;
 
-    /// Clears a user's profile image.
+    /// Clears a user's profile image: deletes the stored file (a missing file is
+    /// not an error) and the `ImageInfos` row, as `DELETE /UserImage` does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the file cannot be deleted for lack of
+    /// permission (C# `UnauthorizedAccessException`); the row is then kept.
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError>;
 
     /// Stores caller-supplied profile-image bytes for a user.
     ///
-    /// Port of the `POST /UserImage` tail: clear any existing profile image, write
-    /// the decoded bytes to the user's `profile{extension}` path, and persist the
-    /// user (`_providerManager.SaveImage(stream, mime, path)` +
+    /// Port of the `POST /UserImage` tail: replace any existing profile-image row
+    /// (like upstream, a previous file at a different path is left on disk), write
+    /// the decoded bytes to `{UserConfigurationDirectoryPath}/{Username}/profile{extension}`,
+    /// and persist the user (`_providerManager.SaveImage(stream, mime, path)` +
     /// `UpdateUserAsync`). `extension` is the image extension derived from the
     /// upload `Content-Type` (e.g. `.png`).
     ///
-    /// The default implementation reports the image pipeline as deferred (as the
-    /// shell provider manager does for `save_image`), so impls without a
+    /// The default implementation returns an error, so impls without a
     /// profile-image store compile unchanged; the concrete manager overrides it.
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] while the image store is deferred, or whatever
-    /// error the concrete write surfaces.
+    /// [`ServiceError::InvalidInput`] when the username would escape the user
+    /// configuration directory (C# `PathHelper.IsContainedIn` → `400 Invalid
+    /// user.`), [`ServiceError::Backend`] from the default implementation, or
+    /// whatever error the concrete write surfaces.
     async fn save_profile_image(
         &self,
         user: &UserEntity,
