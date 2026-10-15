@@ -204,6 +204,29 @@ impl ItemVisibility {
         Ok(())
     }
 
+    /// [`rating_to_items`](ferrofin_providers::metadata_merge::rating_to_items)
+    /// for a box set or playlist: the least restrictive of its members'
+    /// ratings, scored against its `GetPreferredMetadataCountryCode()`, in
+    /// link order; its own rating when no member is rated.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy.
+    pub async fn rating_to_items(
+        &self,
+        container: &BaseItemEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        let ratings = repository::member_ratings(&self.db, row_id(container)).await?;
+        let context = self.load(std::slice::from_ref(container), None).await?;
+        let row = context.rows.get(&row_id(container)).unwrap_or(container);
+        let country = context.metadata_country(row)?;
+        Ok(ferrofin_providers::metadata_merge::rating_to_items(
+            container.official_rating.as_deref(),
+            ratings.iter().map(Option::as_deref),
+            |rating| self.localization.get_rating_score(rating, country),
+        )
+        .map(str::to_owned))
+    }
+
     /// `playlist_links` also reads playlists' members, which only a
     /// rating-limited user's `HasParentalAllowedChild` needs.
     async fn load_hierarchy(
@@ -769,8 +792,6 @@ impl Context<'_> {
         &self,
         item: &BaseItemEntity,
     ) -> Result<Option<ferrofin_model::entities_media::ParentalRatingScore>, ServiceError> {
-        let parents = self.chain(item, false)?;
-        let libraries = self.libraries(item)?;
         let display = self.chain(item, true)?;
         let rating = display
             .iter()
@@ -780,7 +801,19 @@ impl Context<'_> {
                     .iter()
                     .find_map(|row| nonempty(row.official_rating.as_deref()))
             });
-        let country = parents
+        let country = self.metadata_country(item)?;
+        Ok(rating.and_then(|r| self.service.localization.get_rating_score(r, country)))
+    }
+
+    /// `GetPreferredMetadataCountryCode()` short of the server's country,
+    /// which the rating tables fall back to on `None`.
+    fn metadata_country<'a>(
+        &'a self,
+        item: &'a BaseItemEntity,
+    ) -> Result<Option<&'a str>, ServiceError> {
+        let parents = self.chain(item, false)?;
+        let libraries = self.libraries(item)?;
+        Ok(parents
             .iter()
             .find_map(|row| nonempty(row.preferred_metadata_country_code.as_deref()))
             .or_else(|| {
@@ -794,8 +827,7 @@ impl Context<'_> {
                     .iter()
                     .filter_map(|id| self.options.get(id))
                     .find_map(|opts| nonempty(opts.metadata_country_code.as_deref()))
-            });
-        Ok(rating.and_then(|r| self.service.localization.get_rating_score(r, country)))
+            }))
     }
 
     fn block_unrated(&self, item: &BaseItemEntity) -> bool {

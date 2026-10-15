@@ -41,7 +41,7 @@ use ferrofin_providers::metadata_merge::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_traits::providers::MetadataRefreshOptions;
 use uuid::Uuid;
 
 use super::{
@@ -52,6 +52,7 @@ use super::{
 use crate::item_type_lookup;
 use crate::refresh_plan::{
     FileFacts, ImageFetch, ItemRefreshPlan, PassOutcome, ProbeKind, RefreshRequest, StoredState,
+    full_refresh,
 };
 
 /// Which music item a [`MusicRefresh`] refreshes, and so which children its
@@ -129,16 +130,6 @@ pub(super) struct MusicRefresh<'r> {
     /// This pass decides whether the item is saved at all (`SaveInternal`):
     /// no walk refreshed it (a by-name artist).
     pub(super) owns_save: bool,
-}
-
-/// Upstream's `isFullRefresh` (`MetadataService.cs:150`): `isFirstRefresh ||
-/// ReplaceAllMetadata || FullRefresh || requiresRefresh || ForceSave`.
-pub(super) fn full_refresh(plan: &ItemRefreshPlan, request: &RefreshRequest<'_>) -> bool {
-    plan.is_first_refresh
-        || plan.requires_refresh
-        || request.options.replace_all_metadata
-        || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
-        || request.force_save
 }
 
 /// Which of the music providers one refresh runs.

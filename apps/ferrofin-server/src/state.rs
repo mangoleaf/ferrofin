@@ -1023,6 +1023,8 @@ pub async fn build_app_state(
             .with_tvdb(Arc::clone(&the_tvdb))
             .with_localization(Arc::clone(&localization))
             .with_people(Arc::clone(&people_repository))
+            // A box set's or playlist's refresh takes its members' rating.
+            .with_linked_children(Arc::clone(&linked_children_service))
             // The SERVER-WIDE per-item-type MetadataOptions. Identify's
             // provider ordering falls back to this array's
             // `MetadataFetcherOrder` for a kind whose library saved no
@@ -1377,13 +1379,16 @@ pub async fn build_app_state(
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
         Arc::clone(&paths) as Arc<_>;
-    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
-        Arc::new(FerrofinCollectionManager::new(
+    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> = Arc::new(
+        FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
             Arc::clone(&collection_paths),
-        ));
+        )
+        // A box set takes its members' rating when they change.
+        .with_visibility(Arc::clone(&item_visibility)),
+    );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
     // The library monitor drives refreshes from two change sources: the

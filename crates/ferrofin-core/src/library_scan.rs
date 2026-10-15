@@ -5607,7 +5607,7 @@ impl LibraryScanner {
             let music = MusicKind::of_planned(&item.entity);
             let request = *refresh.request_for(item, !is_new);
             let music_pending = music.is_some_and(|kind| {
-                music::full_refresh(&plan, &request)
+                crate::refresh_plan::full_refresh(&plan, &request)
                     || self.music_fetch(kind, &plan, policy, locked).any()
             });
             let pass = ItemPass {
@@ -5666,7 +5666,7 @@ impl LibraryScanner {
                     // item, cleared by the music pass's save and selected by
                     // the next validation's music pass), and test it with a
                     // scan cancelled after the walk.
-                    aggregate: music::full_refresh(&plan, &request)
+                    aggregate: crate::refresh_plan::full_refresh(&plan, &request)
                         || matches!(saved, ItemSaved::Saved),
                     owns_stamp: music_pending,
                     owns_save: false,
