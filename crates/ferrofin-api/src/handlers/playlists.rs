@@ -252,6 +252,7 @@ struct GetPlaylistItemsQuery {
     params(("playlistId" = String, Path, description = "The playlist id")),
     responses(
         (status = 200, description = "Original playlist returned (QueryResult<BaseItemDto>)"),
+        (status = 403, description = "Another user's id without administrator rights"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "ferrofin"
@@ -262,7 +263,9 @@ async fn get_playlist_items(
     Path(playlist_id): Path<Uuid>,
     Query(query): Query<GetPlaylistItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let calling_user_id = query.user_id.unwrap_or_else(|| auth.user_id());
+    // `RequestHelpers.GetUserId(User, userId)`: another user's id only for an
+    // administrator, or every member filter below would be the caller's pick.
+    let calling_user_id = effective_user_id(&state, &auth, query.user_id).await?;
     let user = if calling_user_id.is_nil() {
         None
     } else {
@@ -273,6 +276,12 @@ async fn get_playlist_items(
         .playlists
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
+    // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
+    // the caller may not see (its rating or tags) is out of the page and the
+    // count.
+    if let Some(user) = &user {
+        items = state.library.filter_visible_items(items, user).await?;
+    }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 
     if let Some(start) = query.start_index

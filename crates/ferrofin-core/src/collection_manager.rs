@@ -38,6 +38,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -52,7 +53,7 @@ use ferrofin_traits::collections::{
     PlaylistManager,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::LibraryManager;
+use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -485,6 +486,14 @@ pub struct FerrofinPlaylistManager {
     library_manager: Arc<dyn LibraryManager>,
     items: Arc<dyn ItemRepository>,
     paths: Arc<dyn ServerApplicationPaths>,
+    /// `Playlist.IsVisible` beyond the owner/share check
+    /// ([`Self::require_visible`]) and member visibility for a move, plus the
+    /// users they read. `None` in unit tests: the owner/share check alone then
+    /// decides and every member counts as visible.
+    visibility: Option<(
+        Arc<crate::item_visibility::ItemVisibility>,
+        Arc<dyn UserManager>,
+    )>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -508,7 +517,91 @@ impl FerrofinPlaylistManager {
             library_manager,
             items,
             paths,
+            visibility: None,
         }
+    }
+
+    /// Adds `Playlist.IsVisible`'s parental half to every access decision.
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+        users: Arc<dyn UserManager>,
+    ) -> Self {
+        self.visibility = Some((visibility, users));
+        self
+    }
+
+    /// The visibility evaluator and the caller, when the evaluator is wired.
+    async fn visibility_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<(&crate::item_visibility::ItemVisibility, UserEntity)>, ServiceError> {
+        let Some((visibility, users)) = &self.visibility else {
+            return Ok(None);
+        };
+        Ok(users
+            .get_user_by_id(user_id)
+            .await?
+            .map(|user| (visibility.as_ref(), user)))
+    }
+
+    /// The rest of `Playlist.IsVisible` after [`decide_access`]'s owner/share
+    /// answer ([`ItemVisibility::playlist_policy`](crate::item_visibility::ItemVisibility::playlist_policy)):
+    /// a user with a maximum parental rating sees a playlist only when it is
+    /// empty or a member passes the rating, and a playlist file also answers
+    /// to its own rating and tags. Invisible is `NotFound`, as the C#
+    /// `GetPlaylistForUser` returns null.
+    async fn require_visible(&self, playlist_id: Uuid, user_id: Uuid) -> Result<(), ServiceError> {
+        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
+            return Ok(());
+        };
+        let playlist = self.require_playlist(playlist_id).await?;
+        if visibility
+            .playlist_policy(&[playlist], &user)
+            .await?
+            .contains(&false)
+        {
+            return Err(ServiceError::not_found(format!("playlist {playlist_id}")));
+        }
+        Ok(())
+    }
+
+    /// Which of `entries` are in the caller's member list: a manual link
+    /// (`GET /Playlists/{id}/Items` lists only those) to an existing member
+    /// the caller sees (`IsVisible(user)`). Every manual entry without the
+    /// evaluator.
+    async fn visible_entries(
+        &self,
+        entries: &[Entry],
+        user_id: Uuid,
+    ) -> Result<Vec<bool>, ServiceError> {
+        let manual = |child_type: i64| child_type == i64::from(LINKED_CHILD_MANUAL);
+        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
+            return Ok(entries.iter().map(|(_, t)| manual(*t)).collect());
+        };
+        let ids: Vec<Uuid> = entries
+            .iter()
+            .filter_map(|(child, _)| Uuid::parse_str(child).ok())
+            .collect();
+        let rows = self.items.retrieve_items(&ids).await?;
+        let visible = visibility.visible(&rows, &user, false).await?;
+        let by_id: std::collections::HashMap<Uuid, bool> = rows
+            .iter()
+            .zip(visible)
+            .filter_map(|(row, visible)| Some((Uuid::parse_str(&row.id).ok()?, visible)))
+            .collect();
+        Ok(entries
+            .iter()
+            .map(|(child, child_type)| {
+                manual(*child_type)
+                    && Uuid::parse_str(child)
+                        .ok()
+                        .and_then(|id| by_id.get(&id).copied())
+                        .unwrap_or(false)
+            })
+            .collect())
     }
 
     /// Loads a playlist row or errors with [`ServiceError::NotFound`].
@@ -544,7 +637,10 @@ impl FerrofinPlaylistManager {
         .map_err(db_err)?;
         let not_found = || ServiceError::not_found(format!("playlist {playlist_id}"));
         let (owner, open_access, can_edit) = row.ok_or_else(not_found)?;
-        decide_access(owner.as_deref(), open_access, can_edit, user_id).ok_or_else(not_found)
+        let access = decide_access(owner.as_deref(), open_access, can_edit, user_id)
+            .ok_or_else(not_found)?;
+        self.require_visible(playlist_id, user_id).await?;
+        Ok(access)
     }
 }
 
@@ -703,7 +799,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows)
+        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
+            return Ok(rows);
+        };
+        // `GetPlaylists(userId)`: `.Where(p => p.IsVisible(user))`, whose
+        // parental and file-playlist halves SQL cannot answer.
+        let allowed = visibility.playlist_policy(&rows, &user).await?;
+        Ok(rows
+            .into_iter()
+            .zip(allowed)
+            .filter_map(|(row, allowed)| allowed.then_some(row))
+            .collect())
     }
 
     async fn get_playlist_items(
@@ -715,8 +821,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // in link order (the same ordering `get_linked_children_ids` applies),
         // each carrying the caller's access columns, so the visibility gate
         // costs no extra query. The C# `Forbid()` branch is unreachable here
-        // because visible ⇔ permitted-to-read; per-member parental-control
-        // filtering stays deferred.
+        // because visible ⇔ permitted-to-read.
         let page = self
             .items
             .get_playlist_items_with_access(playlist_id, user_id, LINKED_CHILD_MANUAL)
@@ -739,6 +844,10 @@ impl PlaylistManager for FerrofinPlaylistManager {
         {
             return Err(ServiceError::not_found(format!("playlist {playlist_id}")));
         }
+        // Every member (`GetManageableItems`): `GET /Playlists/{id}` lists
+        // them all as `ItemIds`, and the items endpoint drops the ones the
+        // caller may not see itself, as `PlaylistsController` does.
+        self.require_visible(playlist_id, user_id).await?;
         Ok(page.items)
     }
 
@@ -868,7 +977,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: &str,
         entry_id: &str,
         new_index: i32,
-        _calling_user_id: Uuid,
+        calling_user_id: Uuid,
     ) -> Result<(), ServiceError> {
         // Port of `Playlist.MoveItem`: pull the current order, relocate the entry,
         // then rewrite the `SortOrder` ordinals. `entry_id` is the `ChildId` (as
@@ -890,11 +999,26 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let Some(pos) = entries.iter().position(|(c, _)| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
+        // `new_index` counts the members the caller sees — the list
+        // `GET /Playlists/{id}/Items` gave them (`MoveItemAsync`) — so the
+        // entry lands right after the member it must follow in that list,
+        // hidden members keeping their places. Upstream anchors on the list
+        // before the entry is taken out (`DetermineAdjustedIndex`) and lands
+        // one place short when moving down past a hidden member; this keeps
+        // the index the caller asked for. With every member visible it is a
+        // plain move to `new_index`.
+        let mut visible = self.visible_entries(&entries, calling_user_id).await?;
+        let new_index = usize::try_from(new_index.max(0)).unwrap_or(usize::MAX);
+        if visible[pos] && visible[..pos].iter().filter(|v| **v).count() == new_index {
+            return Ok(());
+        }
         let entry = entries.remove(pos);
-        // Clamp to the valid range of the now-shorter list (C# `Math.Clamp`).
-        let target = usize::try_from(new_index.max(0))
-            .unwrap_or(usize::MAX)
-            .min(entries.len());
+        visible.remove(pos);
+        let shown: Vec<usize> = (0..entries.len()).filter(|i| visible[*i]).collect();
+        let target = match new_index {
+            0 => shown.first().copied().unwrap_or(0),
+            n => shown.get(n - 1).map_or(entries.len(), |prior| prior + 1),
+        };
         entries.insert(target, entry);
         write_entries(self.db.writer(), &pid, &entries).await?;
         if let Ok(playlist) = Uuid::parse_str(playlist_id) {
@@ -2481,6 +2605,131 @@ mod tests {
             .into_iter()
             .map(|(c, _)| Uuid::parse_str(&c).expect("uuid"))
             .collect()
+    }
+
+    /// `Playlist.IsVisible` under a maximum parental rating, everywhere the
+    /// playlist manager answers it: a playlist whose members all exceed the
+    /// rating is missing (12.1 `HasParentalAllowedChild`), while the member
+    /// list stays whole (`GetManageableItems`, which `GET /Playlists/{id}`
+    /// reports as `ItemIds`), and a move counts the members the caller sees
+    /// (`MoveItemAsync`), down past a hidden one too.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one owner, one limited user and their playlists through every access path"
+    )]
+    async fn a_parental_limit_hides_playlists_and_members_beyond_it() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+        use ferrofin_model::playlists::PlaylistCreationResult;
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::library::UserManager;
+        let db = test_db().await;
+        let (owner, kid) = (Uuid::new_v4(), Uuid::new_v4());
+        for (user, name) in [(owner, "owner"), (kid, "kid")] {
+            crate::test_support::seed_named_user(&db, user, name).await;
+            crate::test_support::grant_default_permissions(&db, user).await;
+        }
+        let users: Arc<dyn UserManager> =
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+        let mut limited = users.get_user_by_id(kid).await.expect("read").expect("kid");
+        limited.max_parental_rating_score = Some(13);
+        users.update_user(&limited).await.expect("limit the kid");
+        let (r, pg1, pg2, pg3) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (id, rating) in [(r, "R"), (pg1, "PG"), (pg2, "PG"), (pg3, "PG")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.official_rating = Some(rating.to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let mgr = playlist_manager(&db).with_visibility(
+            Arc::new(crate::item_visibility::ItemVisibility::new(
+                db.clone(),
+                item_repository_over(db.clone()),
+                Arc::new(crate::LocalizationManager::new("US")),
+                "/server/data".to_owned(),
+            )),
+            users,
+        );
+        let create = |name: &str, items: Vec<Uuid>| PlaylistCreationRequest {
+            name: Some(name.to_owned()),
+            item_id_list: items,
+            user_id: owner,
+            users: vec![PlaylistUserPermissions::new(kid, false)],
+            ..PlaylistCreationRequest::default()
+        };
+        let id = |created: PlaylistCreationResult| Uuid::parse_str(&created.id).expect("uuid");
+        let r_only = id(mgr.create_playlist(&create("R", vec![r])).await.expect("R"));
+        let mixed = id(mgr
+            .create_playlist(&create("Mixed", vec![r, pg1, pg2]))
+            .await
+            .expect("mixed"));
+        let empty = id(mgr
+            .create_playlist(&create("Empty", Vec::new()))
+            .await
+            .expect("empty"));
+
+        assert!(matches!(
+            mgr.get_playlist_access(r_only, kid).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.get_playlist_items(r_only, kid).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(
+            mgr.get_playlist_access(r_only, owner).await.is_ok(),
+            "no limit"
+        );
+        assert!(mgr.get_playlist_access(empty, kid).await.is_ok(), "empty");
+        let listed = |rows: Vec<BaseItemEntity>| {
+            let mut ids: Vec<Uuid> = rows
+                .into_iter()
+                .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut expected = vec![mixed, empty];
+        expected.sort();
+        assert_eq!(listed(mgr.get_playlists(kid).await.expect("kid")), expected);
+        assert_eq!(mgr.get_playlists(owner).await.expect("owner").len(), 3);
+
+        let members: Vec<Uuid> = mgr
+            .get_playlist_items(mixed, kid)
+            .await
+            .expect("items")
+            .into_iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
+        assert_eq!(members, [r, pg1, pg2], "the handler drops the R member");
+
+        // The kid sees [pg1, pg2] and moves pg1 to their index 1: after pg2.
+        mgr.move_item(&mixed.to_string(), &pg1.simple().to_string(), 1, kid)
+            .await
+            .expect("move");
+        assert_eq!(rows(&db, mixed).await, [r, pg2, pg1]);
+
+        // Down past a hidden member: [pg1, pg2, R, pg3] shows the kid
+        // [pg1, pg2, pg3]; pg1 to index 2 lands after pg3, not before it.
+        let down = id(mgr
+            .create_playlist(&create("Down", vec![pg1, pg2, r, pg3]))
+            .await
+            .expect("down"));
+        mgr.move_item(&down.to_string(), &pg1.simple().to_string(), 2, kid)
+            .await
+            .expect("move down");
+        assert_eq!(rows(&db, down).await, [pg2, r, pg3, pg1]);
+        // To the top: before the first member the kid sees, the R one kept.
+        mgr.move_item(&down.to_string(), &pg1.simple().to_string(), 0, kid)
+            .await
+            .expect("move up");
+        assert_eq!(rows(&db, down).await, [pg1, pg2, r, pg3]);
     }
 
     async fn seeded_playlist(

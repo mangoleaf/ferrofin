@@ -2858,6 +2858,49 @@ mod tests {
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
 
+    /// The candidate read behind the Playlists/Collections views
+    /// (`UserViewManager.HasVisibleItem`, see
+    /// [`crate::user_view_manager::visible_item_query`]), as the repository
+    /// runs it once the user's top parents are resolved: a seek on a
+    /// `(Type, TopParentId)` index and no scan. It is on `GET /UserViews`, the
+    /// first call every client makes. The planner picks among the
+    /// `IX_BaseItems_Type_TopParentId_*` family — the shared builder's
+    /// alternate-version probe and `SortName` order keep any of them from
+    /// covering — so the seek is what is pinned.
+    #[tokio::test]
+    async fn visible_item_candidates_seek_the_type_top_parent_index() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5501)).await;
+        for kind in [BaseItemKind::Playlist, BaseItemKind::BoxSet] {
+            let mut filter = crate::user_view_manager::visible_item_query(kind, &user);
+            filter.top_parent_ids =
+                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)];
+            let mut builder = build_query(&filter, QueryShape::IdsOnly);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|d| d.starts_with("SEARCH bi USING")
+                    && d.contains("IX_BaseItems_Type_TopParentId_")
+                    && d.contains("(Type=? AND TopParentId=?)")),
+                "{kind:?}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN")),
+                "{kind:?}: {plan:?}"
+            );
+        }
+    }
+
     /// The statement `GetLatestItemList` sends: grouped-threshold subquery
     /// capped at `limit`, the caller's triple ORDER BY verbatim, and no paging
     /// on the outer query (upstream nulls `Limit` before `ApplyQueryPaging`).
