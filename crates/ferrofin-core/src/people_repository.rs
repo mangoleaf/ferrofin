@@ -692,13 +692,13 @@ fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> 
 /// ids included, on the bench library).
 ///
 /// As a *predicate* rather than a derived table, the page can be driven from
-/// `IX_Peoples_Name` — which already supplies the `ORDER BY p."Name"` — so the
-/// `LIMIT` stops the scan after a page's worth of representatives. The derived
-/// table had to aggregate every person and then sort all of them through a temp
-/// B-tree before the `LIMIT` could discard 98% of the result: 1.26 ms → 0.31 ms
-/// per query on the bench library (7.5k people, `limit=100`). The dedup test
-/// per candidate row is a covering-index seek on
-/// `FerrofinIX_Peoples_NameNoCase_Cover`.
+/// `FerrofinIX_Peoples_NameNoCase_Cover` — which already supplies the
+/// `ORDER BY p."Name" COLLATE NOCASE` — so the `LIMIT` stops the scan after a
+/// page's worth of representatives. The derived table had to aggregate every
+/// person and then sort all of them through a temp B-tree before the `LIMIT`
+/// could discard 98% of the result: 1.26 ms → 0.31 ms per query on the bench
+/// library (7.5k people, `limit=100`). The dedup test per candidate row is a
+/// covering-index seek on `FerrofinIX_Peoples_NameNoCase_Cover`.
 ///
 /// Under `must_have_item` the representative is the lowest id among the rows
 /// that *have* an item, as upstream dedups the already-filtered candidates: a
@@ -796,7 +796,11 @@ fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     );
     qb.push(dedup_people_predicate(filter));
     push_predicates(&mut qb, filter);
-    qb.push(r#" ORDER BY p."Name""#);
+    // Upstream orders by `Name.ToLower()`, which EF sends to SQLite as
+    // `lower("Name")`. In the e_sqlite3 Jellyfin bundles (no ICU) that folds
+    // ASCII only before a byte comparison, the same order `NOCASE` gives on
+    // every build — and `NOCASE` keeps the page on the covering index.
+    qb.push(r#" ORDER BY p."Name" COLLATE NOCASE"#);
     let start = filter.start_index.unwrap_or(0);
     if filter.limit > 0 || start > 0 {
         qb.push(" LIMIT ");
@@ -868,7 +872,7 @@ impl FerrofinPeopleRepository {
     /// The third cost was the dedup itself: as a derived table it had to
     /// aggregate all 7.5k people and sort them through a temp B-tree before the
     /// `LIMIT` could drop 98% of the result. [`dedup_people_predicate`] moves it
-    /// onto a plain `"Peoples"` scan driven by `IX_Peoples_Name`, which already
+    /// onto a plain `"Peoples"` scan driven by the name index, which already
     /// supplies the ordering — 1.26 ms → 0.31 ms per query, and `/Persons`
     /// 2.8 ms → 1.4 ms p50 at its calibrated rate.
     async fn get_people_by_name(
@@ -2180,6 +2184,75 @@ mod tests {
                 .as_str()
                 .to_owned()
                 .contains("OVER()")
+        );
+    }
+
+    /// Upstream 12.2 `GetPeople` orders the by-name listing by `Name.ToLower()`,
+    /// so a lowercase name pages among its letter, not after every capitalised
+    /// one — and the case-insensitive order must not cost the page its index
+    /// scan. Jellyfin's bundled (non-ICU) SQLite `lower()` folds ASCII only, so
+    /// `Émile` (`É` is 0xC3 0x89) still sorts before `élodie` (0xC3 0xA9), as a
+    /// live 12.2 returns them; a Unicode-aware fold here would swap the pair.
+    #[tokio::test]
+    async fn by_name_page_orders_case_insensitively() {
+        let db = test_db().await;
+        let item = Uuid::from_u128(0x9111);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        repo.update_people(
+            item,
+            &[
+                person("Zoe", "Actor"),
+                person("de Niro", "Actor"),
+                person("Bob", "Actor"),
+                person("alice", "Actor"),
+                person("élodie", "Actor"),
+                person("Émile", "Actor"),
+            ],
+        )
+        .await
+        .expect("credits");
+
+        for must_have_item in [false, true] {
+            let mut names = Vec::new();
+            for start in [0, 2, 4] {
+                let page = repo
+                    .get_people(&InternalPeopleQuery {
+                        limit: 2,
+                        start_index: Some(start),
+                        must_have_item,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("page");
+                assert_eq!(page.items.len(), 2);
+                names.extend(page.items.into_iter().map(|p| p.name));
+            }
+            assert_eq!(names, ["alice", "Bob", "de Niro", "Zoe", "Émile", "élodie"]);
+        }
+
+        // The default `/Persons` page. (A narrowed page sorts its window-counted
+        // matches through a temp B-tree with either collation.)
+        let sql = super::by_name_page_query(&InternalPeopleQuery {
+            must_have_item: true,
+            ..Default::default()
+        })
+        .into_sql()
+        .as_str()
+        .to_owned();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            details.contains(&"SCAN p USING COVERING INDEX FerrofinIX_Peoples_NameNoCase_Cover"),
+            "the page is read off the NOCASE index in order: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("TEMP B-TREE")),
+            "{details:?}"
         );
     }
 

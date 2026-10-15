@@ -165,6 +165,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
   copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
   before that copy makes it on the next boot
+- `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
+  lowercase name such as `de Niro` lists among the D names instead of after every
+  capitalised one (#60)
 
 ## [1.0.0] - 2026-09-05
 
