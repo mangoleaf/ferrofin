@@ -1,12 +1,23 @@
-//! Request authentication — Jellyfin's `MediaBrowser`/`X-Emby-Token` scheme.
+//! Request authentication — Jellyfin's `MediaBrowser` authorization scheme.
 //!
 //! Jellyfin clients present their access token in one of several places:
 //!
 //! - `Authorization: MediaBrowser Token="…", Client="…", Device="…",
 //!   DeviceId="…", Version="…"`
+//! - the `ApiKey` query parameter
+//!
+//! The Emby-era forms are honoured only while the server configuration's
+//! `EnableLegacyAuthorization` is on (gated in `AuthorizationContext.cs`),
+//! which Jellyfin 12 leaves off by default (`ServerConfiguration.cs`):
+//!
 //! - `X-Emby-Authorization` (same grammar as `Authorization`)
 //! - `X-Emby-Token` / `X-MediaBrowser-Token` (bare token)
-//! - the `api_key` / `ApiKey` query parameter
+//! - the `api_key` query parameter
+//! - the `Emby` scheme name in place of `MediaBrowser`
+//!
+//! Parsing lives in `ferrofin-core`'s `FerrofinAuthorizationContext`, behind
+//! the `ferrofin_traits` `AuthorizationContext` seam. `/socket` resolves its
+//! token separately (`handlers::websocket`).
 //!
 //! Two pieces mirror the C# `MediaBrowser.Controller.Net` layer:
 //!

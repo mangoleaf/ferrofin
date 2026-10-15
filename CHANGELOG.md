@@ -41,7 +41,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   embedded VobSub subtitles render again
 - Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
   and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
-  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
+  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract. Emby-era credentials
+  (`X-Emby-Authorization`, `X-Emby-Token`, `api_key`) still need `EnableLegacyAuthorization`;
+  see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Serve `GET /Items/{itemId}/Collections` (Jellyfin 12.1's `GetItemCollections`): the
   collections the user can see that include the item, sorted and paged as upstream.
   jellyfin-web's item page calls it and hid its Collections section on the old `404`.
