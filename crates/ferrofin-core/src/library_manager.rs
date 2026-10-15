@@ -2407,6 +2407,13 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.retrieve_item(id).await
     }
 
+    async fn build_access_filter(
+        &self,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        self.items.build_access_filter(user).await
+    }
+
     async fn is_item_visible(
         &self,
         item: &BaseItemEntity,

@@ -2314,6 +2314,7 @@ fn by_name_outer_filter(filter: &InternalItemsQuery) -> InternalItemsQuery {
     InternalItemsQuery {
         user: filter.user.clone(),
         user_preferences_loaded: filter.user_preferences_loaded,
+        user_has_content_restrictions: filter.user_has_content_restrictions,
         block_unrated_items: filter.block_unrated_items.clone(),
         exclude_inherited_tags: filter.exclude_inherited_tags.clone(),
         include_inherited_tags: filter.include_inherited_tags.clone(),
@@ -2865,6 +2866,29 @@ impl ItemRepository for FerrofinItemRepository {
 
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
         visible_views(&self.db, user).await
+    }
+
+    async fn build_access_filter(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let mut filter = InternalItemsQuery {
+            include_owned_items: true,
+            ..InternalItemsQuery::default()
+        };
+        filter.set_user(user.clone());
+        // Restrictions first: they decide whether the views lookup is needed.
+        let filter = crate::query_restrictions::resolve(&self.db, &filter)
+            .await?
+            .unwrap_or(filter);
+        if !filter.user_has_content_restrictions {
+            return Ok(None);
+        }
+        Ok(Some(
+            scope_to_user_libraries(&self.db, &filter)
+                .await?
+                .unwrap_or(filter),
+        ))
     }
 
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -8503,6 +8527,62 @@ mod tests {
         set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[first]).await;
 
         assert_eq!(unscoped_names(&repository, &user).await, ["In First"]);
+    }
+
+    /// `PersonsController.BuildAccessFilter`: no filter for a user nothing is
+    /// hidden from (`HasContentRestrictions`); otherwise the user's resolved
+    /// restrictions, scoped to their libraries, with owned items admitted.
+    #[tokio::test]
+    async fn the_access_filter_exists_only_for_a_user_with_content_restrictions() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, second, user_id, user) = two_libraries(&db).await;
+        assert_eq!(repository.build_access_filter(&user).await.unwrap(), None);
+
+        let user_key = guid_to_db(user_id);
+        let tags = |values: &[&str]| values.iter().map(|&v| v.to_owned()).collect::<Vec<_>>();
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user_key,
+            PreferenceKind::BlockedTags,
+            &tags(&["gore"]),
+        )
+        .await
+        .expect("block tag");
+        let filter = repository
+            .build_access_filter(&user)
+            .await
+            .unwrap()
+            .expect("a blocked tag restricts");
+        assert!(filter.user_has_content_restrictions && filter.include_owned_items);
+        assert_eq!(filter.exclude_inherited_tags, ["gore"]);
+        let mut scope = filter.top_parent_ids.clone();
+        scope.sort();
+        assert_eq!(scope, [first, second]);
+
+        // Library access alone is a restriction too.
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user_key,
+            PreferenceKind::BlockedTags,
+            &tags(&[]),
+        )
+        .await
+        .expect("clear tag");
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(&user_key)
+            .bind(i32::from(PermissionKind::EnableAllFolders))
+            .execute(db.writer())
+            .await
+            .expect("revoke");
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[first]).await;
+        let filter = repository
+            .build_access_filter(&user)
+            .await
+            .unwrap()
+            .expect("library access restricts");
+        assert!(filter.exclude_inherited_tags.is_empty());
+        assert_eq!(filter.top_parent_ids, [first]);
     }
 
     /// A Live TV view left behind in an adopted database is not part of the

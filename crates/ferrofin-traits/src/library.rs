@@ -290,6 +290,16 @@ pub trait LibraryManager: Send + Sync {
         Ok(Some(item))
     }
 
+    /// The [`InternalPeopleQuery::access_filter`] for `user`: `None` when
+    /// nothing is hidden from them (`PersonsController.BuildAccessFilter`).
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn build_access_filter(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Err(ServiceError::backend("access filtering is not configured"))
+    }
+
     /// `BaseItem.IsVisible`: the item's own policy, used by parent browse gates.
     /// Managers must supply policy evaluation; the default fails closed.
     async fn is_item_visible(
@@ -848,8 +858,9 @@ pub trait LibraryManager: Send + Sync {
     /// Port of `ILibraryManager.GetPeopleItems` (Jellyfin 12.2): it sets
     /// [`must_have_item`](InternalPeopleQuery::must_have_item), fetches the
     /// credited people via [`Self::get_people_page`], then resolves each name to
-    /// its `Person` [`BaseItemEntity`] (dropping any that no longer resolve),
-    /// preserving the people query's paging. The total is the repository's, so
+    /// its `Person` [`BaseItemEntity`] (dropping any that no longer resolve, or
+    /// that the access filter's user may not see), preserving the people
+    /// query's paging. The total is the repository's, so
     /// it counts exactly the people a page can hand back. The default folds the
     /// calls so every impl gets it for free.
     async fn get_people_items(
@@ -868,6 +879,14 @@ pub trait LibraryManager: Send + Sync {
             .into_iter()
             .flatten()
             .collect();
+        // C# drops the people that fail `IsVisible(query.User)`. A person skips
+        // the allowed-tags check and an item-by-name is never blocked as
+        // unrated, so only a user with content restrictions — the one the
+        // access filter exists for — can fail it.
+        let items = match query.access_filter.as_ref().and_then(|f| f.user.as_ref()) {
+            Some(user) => self.filter_visible_items(items, user).await?,
+            None => items,
+        };
         Ok(QueryResult::new(
             query.start_index,
             Some(page.total_record_count),

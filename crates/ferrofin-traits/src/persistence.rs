@@ -289,6 +289,22 @@ pub trait ItemRepository: Send + Sync {
     /// every library as visible to everybody.
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError>;
 
+    /// The item query whose access settings bound what `user` may see through
+    /// the items behind a name, or `None` when no library, parental rating or
+    /// tag rule hides anything from them.
+    ///
+    /// Port of `PersonsController.BuildAccessFilter` (Jellyfin 12.2): an
+    /// `InternalItemsQuery(user) { IncludeOwnedItems = true }` with the user's
+    /// restrictions resolved and `ConfigureUserAccess` applied, built only when
+    /// `User.HasContentRestrictions()`. Repositories must supply policy
+    /// evaluation; the default fails closed.
+    async fn build_access_filter(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Err(ServiceError::backend("access filtering is not configured"))
+    }
+
     /// Returns the ids of every item whose metadata the user has **locked**
     /// (`IsLocked = 1`).
     ///
