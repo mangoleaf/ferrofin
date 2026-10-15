@@ -28,6 +28,8 @@ pub mod metrics_wiring;
 pub mod planner;
 pub mod seed;
 pub mod state;
+#[cfg(test)]
+mod test_exec;
 pub mod vaapi_probe;
 
 use std::net::SocketAddr;
