@@ -625,6 +625,17 @@ impl UserDataManager for FerrofinUserDataManager {
         Ok(())
     }
 
+    async fn get_stream_default_data(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
+        let row = self.read_row(item_id, user_id).await?;
+        Ok(row.map_or((None, None), |r| {
+            (r.audio_stream_index, r.subtitle_stream_index)
+        }))
+    }
+
     async fn get_user_data_dto(
         &self,
         item_id: Uuid,

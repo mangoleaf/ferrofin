@@ -676,6 +676,18 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalPeopleQuery,
     ) -> Result<Vec<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError>;
 
+    /// [`Self::get_people`] with the repository's total for the whole filtered
+    /// set (C# `IPeopleRepository.GetPeople` returns a `QueryResult`). The
+    /// default can only report the page it was handed; the concrete manager
+    /// overrides it with the repository's count.
+    async fn get_people_page(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError> {
+        let people = self.get_people(query).await?;
+        Ok(QueryResult::new(query.start_index, None, people))
+    }
+
     /// Gets the credited people for a set of item ids at once, keyed by item —
     /// the batch form used to project a page of DTOs without a per-item
     /// `get_people`. The default loops the single-item form; the concrete manager
@@ -833,17 +845,23 @@ pub trait LibraryManager: Send + Sync {
 
     /// Resolves the people matching `query` to their by-name `Person` item rows.
     ///
-    /// Port of `ILibraryManager.GetPeopleItems`: it fetches the credited people
-    /// via [`Self::get_people`], then resolves each name to its `Person`
-    /// [`BaseItemEntity`] (dropping any that no longer resolve), preserving the
-    /// people query's paging. The default folds the two calls so every impl gets
-    /// it for free from [`Self::get_people`] + [`Self::get_named_item`].
+    /// Port of `ILibraryManager.GetPeopleItems` (Jellyfin 12.2): it sets
+    /// [`must_have_item`](InternalPeopleQuery::must_have_item), fetches the
+    /// credited people via [`Self::get_people_page`], then resolves each name to
+    /// its `Person` [`BaseItemEntity`] (dropping any that no longer resolve),
+    /// preserving the people query's paging. The total is the repository's, so
+    /// it counts exactly the people a page can hand back. The default folds the
+    /// calls so every impl gets it for free.
     async fn get_people_items(
         &self,
         query: &InternalPeopleQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let people = self.get_people(query).await?;
-        let names: Vec<String> = people.into_iter().map(|p| p.name).collect();
+        let query = InternalPeopleQuery {
+            must_have_item: true,
+            ..query.clone()
+        };
+        let page = self.get_people_page(&query).await?;
+        let names: Vec<String> = page.items.into_iter().map(|p| p.name).collect();
         let items: Vec<BaseItemEntity> = self
             .get_named_items(BaseItemKind::Person, &names)
             .await?
@@ -852,7 +870,7 @@ pub trait LibraryManager: Send + Sync {
             .collect();
         Ok(QueryResult::new(
             query.start_index,
-            Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
+            Some(page.total_record_count),
             items,
         ))
     }
@@ -1436,6 +1454,22 @@ pub trait UserDataManager: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = reason;
         self.save_user_data(user_id, item_id, user_data).await
+    }
+
+    /// Gets the remembered audio and subtitle stream indices for an item.
+    ///
+    /// Port of the `UserDataManager.GetUserData(user, item)` call inside
+    /// `SetDefaultAudioAndSubtitleStreamIndices`: only the stream-index fields
+    /// are needed, so this avoids constructing the full DTO.  Returns
+    /// `(audio_stream_index, subtitle_stream_index)`, both `None` when no
+    /// user-data row exists.
+    async fn get_stream_default_data(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
+        let _ = (item_id, user_id);
+        Ok((None, None))
     }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.

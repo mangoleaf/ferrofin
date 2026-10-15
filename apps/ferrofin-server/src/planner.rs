@@ -4664,16 +4664,7 @@ mod tests {
     /// planner's VAAPI prober at it.
     fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
         let path = dir.join("stub-ffmpeg");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::stub_script(&path, &format!("echo 'VAAPI driver: {driver}' >&2\n"));
         FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
     }
 
@@ -5285,8 +5276,10 @@ mod tests {
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
-    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
-    /// under the harness query. `GetStreamingState` yields
+    /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono
+    /// aac) under the harness query. The bit depth matters: an unknown or 10-bit
+    /// source gets `GetBitDepthCompensatedBitrate`'s factor (×1.2 here).
+    /// `GetStreamingState` yields
     /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
     /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
     /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
@@ -5298,8 +5291,6 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
-        // The fixture is 8-bit, as ffprobe reports it, so no bit-depth
-        // compensation (`GetBitDepthCompensatedBitrate`) applies.
         video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);

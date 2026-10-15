@@ -2279,10 +2279,11 @@ impl TmdbClient {
 
     /// Every profile candidate, including the language, dimensions and vote
     /// information used by `TmdbPersonImageProvider`'s selection ordering.
+    ///
     /// `language` is the normalized TMDB request language; `request_language`
-    /// is the item's own preferred language the images are labelled against
-    /// (`ConvertProfilesToRemoteImageInfo(profiles, language)` is handed the
-    /// un-normalized `GetPreferredMetadataLanguage()`).
+    /// is the item's raw preferred metadata language the images are labelled
+    /// against, as `ConvertProfilesToRemoteImageInfo(profiles, language)` is
+    /// handed `GetPreferredMetadataLanguage()` upstream.
     pub async fn person_images(
         &self,
         tmdb_id: i64,
