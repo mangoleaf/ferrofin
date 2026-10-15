@@ -526,32 +526,7 @@ impl FerrofinUserViewManager {
         tokio::fs::create_dir_all(playlists_path)
             .await
             .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
-        let entity = BaseItemEntity {
-            // `guid_to_db`, NOT `to_string()`. Jellyfin stores Guid columns
-            // UPPERCASE-hyphenated and `BaseItems."Id"` is plain TEXT with no
-            // COLLATE NOCASE, so a lowercase id is a different row as far as
-            // SQLite is concerned. Writing one here meant the `item_exists`
-            // check above — which binds `guid_to_db(id)` — could never see the
-            // row it had just written, so EVERY `GET /Library/MediaFolders`
-            // re-ran `create_dir_all` plus this upsert through the single
-            // writer connection. Under load that serialized the endpoint:
-            // 1355 ms p50 and 31% errors in the benchmark against Jellyfin's
-            // 0.23 ms. It also leaked into the response — the folder came back
-            // with a lowercase `Id` where Jellyfin sends uppercase, which is
-            // why the suite scored this operation as diverging from upstream.
-            id: ferrofin_db::store::guid_to_db(id),
-            type_: item_type_lookup::stored_type_name(BaseItemKind::PlaylistsFolder)
-                .unwrap_or_default()
-                .to_owned(),
-            name: Some(PLAYLISTS_FOLDER_NAME.to_owned()),
-            sort_name: Some(create_sort_name(PLAYLISTS_FOLDER_NAME)),
-            path: Some(playlists_path.to_string_lossy().into_owned()),
-            parent_id: parent.map(ferrofin_db::store::guid_to_db),
-            top_parent_id: Some(ferrofin_db::store::guid_to_db(id)),
-            is_folder: true,
-            date_created: Some(Utc::now()),
-            ..BaseItemEntity::default()
-        };
+        let entity = crate::aggregate_folder::playlists_folder_row(id, playlists_path, parent);
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;

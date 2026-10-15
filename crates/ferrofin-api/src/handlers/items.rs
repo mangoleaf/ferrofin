@@ -591,6 +591,15 @@ async fn get_items(
 /// playlists folder, or the Playlists view that displays one, lists its
 /// playlists recursively, so the user's post-filter (only playlists they may
 /// open) applies whatever the request asked for.
+///
+/// Every playlist the user may open, wherever it is: Jellyfin 12.2 lists a
+/// playlist file inside a music album in its Playlists view (measured, for
+/// the plain `parentId=<view>` browse jellyfin-web sends and the
+/// `IncludeItemTypes=Playlist` one), not only the playlists the folder holds.
+/// So the listing is re-rooted at the user root, as the typed browse is
+/// ([`redirect_container_browse`]). With no user (an API key without
+/// `userId`, which this route answers with a `400` first, [`resolve_user`])
+/// upstream lists the folder's own children only.
 fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
     if matches!(
         internal.parent_type,
@@ -599,6 +608,9 @@ fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
         internal.recursive = true;
         internal.include_item_types = vec![BaseItemKind::Playlist];
         internal.user_root_children = false;
+        if internal.user.is_some() {
+            reroot_to_user_root(internal);
+        }
     }
 }
 
@@ -1831,8 +1843,8 @@ mod tests {
     use super::*;
 
     /// A browse under either spelling of the playlists folder becomes a
-    /// recursive `[Playlist]` listing (so it is post-filtered per user); any
-    /// other parent is left as asked.
+    /// recursive `[Playlist]` listing from the user root (so it is
+    /// post-filtered per user); any other parent is left as asked.
     #[test]
     fn a_playlists_folder_browse_lists_its_playlists_recursively() {
         for (parent, rewritten) in [
@@ -1841,7 +1853,10 @@ mod tests {
             (Some(BaseItemKind::CollectionFolder), false),
             (None, false),
         ] {
+            let parent_id = Uuid::new_v4();
             let mut query = InternalItemsQuery {
+                user: Some(crate::test_support::sample_user()),
+                parent_id,
                 parent_type: parent,
                 include_item_types: vec![BaseItemKind::Audio],
                 user_root_children: true,
@@ -1852,11 +1867,21 @@ mod tests {
                 (
                     query.recursive,
                     query.include_item_types == [BaseItemKind::Playlist],
-                    query.user_root_children
+                    query.user_root_children,
+                    // Every playlist the user may open, not only the folder's.
+                    query.parent_id.is_nil(),
                 ),
-                (rewritten, rewritten, !rewritten),
+                (rewritten, rewritten, !rewritten, rewritten),
                 "{parent:?}"
             );
+            // With no user the folder keeps its own playlists only.
+            let mut anonymous = InternalItemsQuery {
+                parent_id,
+                parent_type: parent,
+                ..InternalItemsQuery::default()
+            };
+            list_playlists_folder_as_playlists(&mut anonymous);
+            assert_eq!(anonymous.parent_id, parent_id, "{parent:?}");
         }
     }
 

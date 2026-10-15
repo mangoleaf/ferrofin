@@ -1546,7 +1546,9 @@ name = "ferrofin-providers"
 version = "0.4.1"
 dependencies = [
  "async-trait",
+ "chardetng",
  "chrono",
+ "encoding_rs",
  "ferrofin-common",
  "ferrofin-db",
  "ferrofin-model",

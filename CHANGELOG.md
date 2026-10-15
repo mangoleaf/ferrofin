@@ -91,6 +91,21 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
+  `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
+  file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
+  each `[playlist]` folder or folder holding a `playlist.xml` (nothing inside it is an item). Members come
+  from the file's entries in order — relative, absolute or `../`, legacy encodings detected —
+  or from the folder's `playlist.xml`, and follow `PlaylistMetadataService`: read when the
+  playlist is new or its file changes, merged on a full refresh that keeps metadata. Such a
+  playlist is open to everyone and owned by nobody, so it is read-only. Where Jellyfin 12.2
+  writes a `<name>.xml` sidecar beside a playlist file, that sidecar hides the entries and
+  the playlist stays empty; Ferrofin does not port that, and does not take such a sidecar
+  for a folder's `playlist.xml` (#56)
+- Create the internal playlists folder at startup, as `CreateRootFolder` does: a server
+  whose only playlists come from the library scan now lists the Playlists view
+- The Playlists view lists every playlist the user may open, wherever it is, as Jellyfin
+  12.2 does — not only the ones made in the app
 - Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in
   `GET /UserViews`: a view is listed when the user can see at least one playlist (or box
   set) anywhere in their libraries, so a playlist inside a music album now shows the

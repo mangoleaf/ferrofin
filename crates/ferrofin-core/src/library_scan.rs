@@ -1153,7 +1153,9 @@ fn default_probe_concurrency() -> usize {
 fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
     let is_audio = entity.media_type.as_deref() == Some("Audio");
     let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
-    if crate::item_data::path_is_directory(entity) || !is_media {
+    // A folder is never probed — a playlist file's `MediaType` is its
+    // `PlaylistMediaType`, `Audio`, and it is still no track.
+    if entity.is_folder || crate::item_data::path_is_directory(entity) || !is_media {
         return None;
     }
     Some(MediaInfoRequest {
@@ -2578,6 +2580,21 @@ fn sidecars_changed(
 /// any of them can raise — or `None` (no such file, a kind with no NFO, or
 /// the library disabled the reader).
 fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
+    if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
+        // A playlist folder's `PlaylistXmlProvider` monitors its
+        // `playlist.xml` (`BaseXmlProvider.HasChanged`). A playlist file's
+        // members are its own entries, which `RequiresRefresh` watches
+        // through the file's mtime ([`playlists`]).
+        let path = entity.path.as_deref().filter(|p| Path::new(p).is_dir())?;
+        let xml = ferrofin_providers::playlist_xml_path(path, false);
+        let meta = std::fs::metadata(xml)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        return Some(LocalMetadataFile {
+            mtime: DateTime::<Utc>::from(meta.modified().ok()?),
+            format: LocalMetadataFormat::Xml,
+        });
+    }
     if entity.type_.ends_with(".Book") {
         // A book has no NFO reader; its Comic and OPF providers monitor
         // their own files.
@@ -5501,6 +5518,9 @@ impl LibraryScanner {
         // The saved videos that own parts or local versions, which take
         // their metadata once every row is saved ([`Self::copy_to_owned_videos`]).
         let mut owners = OwnedCopies::default();
+        // The playlists whose local readers this walk runs, read once every
+        // row is saved ([`playlists`]).
+        let mut due_playlists: Vec<playlists::DuePlaylist> = Vec::new();
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -5533,6 +5553,7 @@ impl LibraryScanner {
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
                 self.copy_to_owned_videos(&owners).await;
+                self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
                     &mut probes,
                     (&items_added, &moved_away),
@@ -5672,6 +5693,22 @@ impl LibraryScanner {
                     owns_save: false,
                 });
             }
+            // A playlist's local readers run with the rest of its refresh
+            // (`RefreshWithProviders`, skipped for a locked item): what they
+            // found is written once every member's row is saved.
+            if !locked
+                && plan.local_metadata
+                && !matches!(saved, ItemSaved::Cancelled)
+                && item_type_lookup::kind_from_type_name(&item.entity.type_)
+                    == Some(BaseItemKind::Playlist)
+                && let Some(path) = item.entity.path.clone()
+            {
+                due_playlists.push(playlists::DuePlaylist {
+                    id: item.id,
+                    path,
+                    replace: playlists::replaces_members(request.options),
+                });
+            }
             match saved {
                 ItemSaved::Unchanged => outcome.unchanged += 1,
                 ItemSaved::Saved if is_new => outcome.created += 1,
@@ -5684,6 +5721,7 @@ impl LibraryScanner {
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
                     self.copy_to_owned_videos(&owners).await;
+                    self.sync_playlists(&due_playlists, key_folders).await;
                     return Ok(self
                         .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
                         .await);
@@ -5736,6 +5774,7 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
             self.copy_to_owned_videos(&owners).await;
+            self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
                 &mut probes,
                 (&items_added, &moved_away),
@@ -5752,6 +5791,9 @@ impl LibraryScanner {
         // After the groups are linked, so each local version points at its
         // primary.
         self.copy_to_owned_videos(&owners).await;
+        // After every row is saved, so each entry finds its item, and before
+        // the closing passes, whose collage draws the members.
+        self.sync_playlists(&due_playlists, key_folders).await;
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
@@ -12453,8 +12495,8 @@ impl LibraryScanner {
             .map(|m| FileTimes::of(m).mtime);
         // A directory's dates are the folder's rule below, whether the item
         // is a folder or a disc rip's `Video` (`IsFolder = 0`) at the rip's
-        // directory.
-        let times = if is_folder {
+        // directory. A playlist FILE is a folder with a file's dates.
+        let times = if is_folder && kind != BaseItemKind::Playlist {
             None
         } else {
             meta.as_ref().filter(|m| !m.is_dir()).map(FileTimes::of)
@@ -12741,6 +12783,19 @@ impl LibraryScanner {
         let kind = walk.kind;
         let extras_folder = is_extras_folder_below_top(dir, root, naming);
         let entries = self.list(dir, ctx);
+        // `PlaylistResolver` (priority First) answers before every other
+        // resolver, in any library — but not inside a title's own folder,
+        // whose subfolders upstream never resolves.
+        if dir != root
+            && !extras_folder
+            && !walk.under_title
+            && let Some(name) =
+                playlists::playlist_folder_name(dir, || playlists::holds_playlist_xml(&entries))
+        {
+            let (parent, ancestors) = walk.parent(cf, ctx);
+            self.plan_playlist(dir, Some(name), cf, (parent, ancestors), ctx, out);
+            return;
+        }
         // Without a collection type a folder `SeriesResolver` takes (priority
         // Second, before `MovieResolver`) is a series, planned as a tvshows
         // library's is.
@@ -12948,6 +13003,16 @@ impl LibraryScanner {
         extras: &mut Vec<MovieExtra>,
     ) {
         let naming = ctx.naming;
+        // An untyped library's playlist file is a playlist (`PlaylistResolver`,
+        // priority First) where its folder's files resolve at all: not in a
+        // title's own folder, nor in an extras folder.
+        if folder.untyped && playlists::is_playlist_file(&entry.path) {
+            if !folder.own_folder && !folder.extras_folder {
+                let parent = folder.walk.parent(folder.cf, ctx);
+                self.plan_playlist(&entry.path, None, folder.cf, parent, ctx, out);
+            }
+            return;
+        }
         // Upstream resolves EXTRAS first, over every file in the folder —
         // `ExtraRuleResolver` has audio rules as well as video ones
         // (`theme.mp3` is `ExtraRuleType.Filename` + `MediaType.Audio`), and
@@ -13205,6 +13270,11 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // A playlist file is the playlist `PlaylistResolver` makes of it.
+        if playlists::is_playlist_file(&entry.path) {
+            self.plan_playlist(&entry.path, None, cf, (parent, ancestors), ctx, out);
+            return;
+        }
         if !is_audio_file(&entry.path, ctx.naming)
             || video_resolver::is_video_file(&entry.path, ctx.naming)
         {
@@ -13856,6 +13926,11 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // `PlaylistResolver` (priority First) answers before `SeriesResolver`.
+        let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+        if self.plan_playlist_folder(&entry.path, holds_xml, cf, (cf, vec![cf]), ctx, out) {
+            return;
+        }
         {
             let info = series_resolver::resolve(ctx.naming, &entry.path);
             let name = info.name.unwrap_or_else(|| entry.name.clone());
@@ -14093,8 +14168,17 @@ impl LibraryScanner {
     ) {
         let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
         if !(season.season_number.is_some() || season.is_season_folder) {
+            // `SeasonResolver` takes no such folder, so `PlaylistResolver`
+            // (priority First) may. A season folder stays a season: both
+            // resolvers have priority First, and a `[playlist]` season is
+            // too rare to bet on their registration order.
+            let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+            let home = (series_id, vec![cf, series_id]);
+            if self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
+                return;
+            }
             // A non-season subfolder: collect its videos as loose episodes.
-            self.collect_videos(&entry.path, ctx, loose);
+            self.collect_videos(&entry.path, (cf, series_id), ctx, out, loose);
             return;
         }
         let num = season.season_number;
@@ -14142,13 +14226,27 @@ impl LibraryScanner {
     /// Collects every video file under `dir` (recursively) into `out_paths` —
     /// the ones `ctx`'s scope keeps, with the rest of a stack or version
     /// group it keeps a file of ([`episode_file_kept`]).
-    fn collect_videos(&self, dir: &str, ctx: &PlanCtx<'_>, out_paths: &mut Vec<String>) {
+    fn collect_videos(
+        &self,
+        dir: &str,
+        (cf, series_id): (Uuid, Uuid),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+        out_paths: &mut Vec<String>,
+    ) {
         let entries = self.list(dir, ctx);
         note_episode_folder(dir, &entries, ctx);
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
-                if ctx.scope.visits(&entry.path) {
-                    self.collect_videos(&entry.path, ctx, out_paths);
+                if !ctx.scope.visits(&entry.path) {
+                    continue;
+                }
+                // A playlist folder below the series: `PlaylistResolver`
+                // (priority First) takes it before any episode resolver.
+                let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+                let home = (series_id, vec![cf, series_id]);
+                if !self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
+                    self.collect_videos(&entry.path, (cf, series_id), ctx, out, out_paths);
                 }
             } else if video_resolver::is_video_file(&entry.path, ctx.naming)
                 && episode_file_kept(&entry.path, ctx)
@@ -14290,6 +14388,16 @@ impl LibraryScanner {
             }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
+                    continue;
+                }
+                // A season's children go through the resolvers too,
+                // `PlaylistResolver` (priority First) before any other.
+                let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+                let home = match season {
+                    Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
+                    None => (series_id, vec![cf, series_id]),
+                };
+                if self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
                     continue;
                 }
                 self.plan_episodes(
@@ -14778,6 +14886,15 @@ impl LibraryScanner {
         let parent = chain.last().copied().unwrap_or(cf);
         let naming = ctx.naming;
         let entries = self.list(dir, ctx);
+        // A playlist folder (`PlaylistResolver`, priority First, before
+        // `PhotoAlbumResolver`) is no album, and nothing in it resolves: the
+        // movie walk plans it.
+        if dir != root
+            && playlists::playlist_folder_name(dir, || playlists::holds_playlist_xml(&entries))
+                .is_some()
+        {
+            return;
+        }
         let photos = unowned_photos(&entries, naming);
         // A folder that is no album but a disc rip is one video
         // (`FindMovie<Video>`): nothing below it resolves.
@@ -14888,6 +15005,17 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        let ancestors = if parent == cf {
+            vec![cf]
+        } else {
+            vec![cf, parent]
+        };
+        // `PlaylistResolver` (priority First) answers before the artist and
+        // album resolvers.
+        let holds_xml = || playlists::holds_playlist_xml(&self.prelist(dir, ctx));
+        if self.plan_playlist_folder(dir, holds_xml, cf, (parent, ancestors.clone()), ctx, out) {
+            return;
+        }
         if !in_artist
             && self.is_music_artist(dir, ctx)
             && let Some((artist_id, artist)) = self.base_item(
@@ -14940,8 +15068,12 @@ impl LibraryScanner {
         // Below the library's top folder an extras-named folder is never
         // resolved (`CoreResolutionIgnoreRule.cs:46-61`); rows older scans
         // planned in one are reconciled away.
+        let entries = self.list(dir, ctx);
+        // A folder that is neither an artist nor an album plans no row of
+        // its own: its playlist files hang off the nearest one that does.
+        self.plan_playlist_files(&entries, cf, (parent, &ancestors), ctx, out);
         let mut dirs = Vec::new();
-        for entry in self.list(dir, ctx) {
+        for entry in entries {
             if entry.type_ != FileSystemEntryType::Directory {
                 continue;
             }
@@ -15025,7 +15157,7 @@ impl LibraryScanner {
         // an album (`ContainsMusic`), which a cue sheet alone makes it: such
         // an album has no tracks, as upstream's has none.
         let entries = self.list(dir, ctx);
-        let tracks = self.collect_album_tracks(&entries, ctx);
+        let (tracks, playlist_files) = self.collect_album_tracks(&entries, ctx);
         // A directory name is not a filename (`EnsureName` keeps it whole):
         // `file_stem` would cut "Greatest Hits Vol. 2" at the dot.
         let album_name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
@@ -15098,6 +15230,25 @@ impl LibraryScanner {
                 },
             );
         }
+        for path in playlist_files {
+            self.plan_playlist(&path, None, cf, (album_id, ancestors.clone()), ctx, out);
+        }
+        // An album is a folder upstream, so its other subfolders go through
+        // the resolvers too, `PlaylistResolver` first. Its disc folders are
+        // its own (above) and its extras folders are never resolved.
+        let parser = ferrofin_naming::audio::AlbumParser::new(ctx.naming);
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory
+                && !parser.is_multi_part(&entry.path)
+                && !is_extras_dir(entry, ctx.naming)
+                && ctx.scope.visits(&entry.path)
+            {
+                // Nothing else lists these: no look-ahead to keep.
+                let holds_xml = || playlists::holds_playlist_xml(&self.list(&entry.path, ctx));
+                let home = (album_id, ancestors.clone());
+                self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out);
+            }
+        }
     }
 
     /// The audio files sitting directly in `dir` — a resolved artist
@@ -15125,10 +15276,16 @@ impl LibraryScanner {
             vec![cf, parent]
         };
         for entry in self.list(dir, ctx) {
-            if entry.type_ == FileSystemEntryType::Directory
-                || !is_audio_file(&entry.path, ctx.naming)
-                || !ctx.scope.keeps(&entry.path)
-            {
+            if entry.type_ == FileSystemEntryType::Directory {
+                continue;
+            }
+            // A playlist file — a `.pls` is an audio extension too — is the
+            // playlist `PlaylistResolver` makes of it, never a track.
+            if playlists::is_playlist_file(&entry.path) {
+                self.plan_playlist(&entry.path, None, cf, (parent, ancestors.clone()), ctx, out);
+                continue;
+            }
+            if !is_audio_file(&entry.path, ctx.naming) || !ctx.scope.keeps(&entry.path) {
                 continue;
             }
             if is_cue_sheet(&entry.path) || is_theme_song(&entry.path, ctx.naming) {
@@ -15164,19 +15321,27 @@ impl LibraryScanner {
     }
 
     /// The audio files belonging to the album at `dir`: those directly inside,
-    /// plus those in each multi-disc subfolder.
+    /// plus those in each multi-disc subfolder — and, apart, the playlist
+    /// files there, which `PlaylistResolver` takes before `AudioResolver`
+    /// would make a `.pls` a track.
     fn collect_album_tracks(
         &self,
         entries: &[FileSystemEntryInfo],
         ctx: &PlanCtx<'_>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         let naming = ctx.naming;
         // A cue sheet makes a folder an album (`ContainsMusic` counts it) but
         // is no track (`AudioResolver.Resolve` returns null for it); a theme
         // song is never resolved at all.
         // Older scans planned them as tracks; those rows are reconciled.
+        let is_playlist = |e: &FileSystemEntryInfo| {
+            e.type_ != FileSystemEntryType::Directory && playlists::is_playlist_file(&e.path)
+        };
         let is_track = |e: &FileSystemEntryInfo| {
-            if e.type_ == FileSystemEntryType::Directory || !is_audio_file(&e.path, naming) {
+            if e.type_ == FileSystemEntryType::Directory
+                || !is_audio_file(&e.path, naming)
+                || is_playlist(e)
+            {
                 return false;
             }
             if is_cue_sheet(&e.path) || is_theme_song(&e.path, naming) {
@@ -15192,6 +15357,11 @@ impl LibraryScanner {
             .filter(|e| is_track(e))
             .map(|e| e.path.clone())
             .collect();
+        let mut playlist_files: Vec<String> = entries
+            .iter()
+            .filter(|e| is_playlist(e))
+            .map(|e| e.path.clone())
+            .collect();
         let parser = ferrofin_naming::audio::AlbumParser::new(naming);
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && parser.is_multi_part(&entry.path) {
@@ -15200,15 +15370,16 @@ impl LibraryScanner {
                 if ctx.scope.keeps(&entry.path) {
                     ctx.superseded.borrow_mut().push(entry.path.clone());
                 }
-                tracks.extend(
-                    self.list(&entry.path, ctx)
-                        .into_iter()
-                        .filter(|e| is_track(e))
-                        .map(|e| e.path),
+                let disc = self.list(&entry.path, ctx);
+                playlist_files.extend(
+                    disc.iter()
+                        .filter(|e| is_playlist(e))
+                        .map(|e| e.path.clone()),
                 );
+                tracks.extend(disc.into_iter().filter(|e| is_track(e)).map(|e| e.path));
             }
         }
-        tracks
+        (tracks, playlist_files)
     }
 
     /// Whether `dir` resolves as a music album — port of
@@ -15312,6 +15483,12 @@ impl LibraryScanner {
         // year are used here. Every other root shape matches upstream exactly.
         // Recorded as an accepted divergence in `docs/FEATURES.md`.)
         if dir != root {
+            // `PlaylistResolver` shares `BookResolver`'s priority (First) and
+            // takes a folder only by its name or its `playlist.xml`.
+            let holds_xml = || playlists::holds_playlist_xml(&entries);
+            if self.plan_playlist_folder(dir, holds_xml, cf, (cf, vec![cf]), ctx, out) {
+                return;
+            }
             if let Some(book) = single_book_file(&entries) {
                 if ctx.scope.keeps(&book) {
                     self.push_book(&book, folder_name(dir), cf, ctx, out);
@@ -16893,6 +17070,7 @@ fn planner_resolves(item_type: &str) -> bool {
                 | BaseItemKind::Episode
                 | BaseItemKind::MusicAlbum
                 | BaseItemKind::MusicArtist
+                | BaseItemKind::Playlist
         )
     )
 }
@@ -19852,6 +20030,7 @@ mod artwork;
 mod collections;
 mod fanout;
 mod music;
+mod playlists;
 mod trickplay;
 
 #[cfg(test)]

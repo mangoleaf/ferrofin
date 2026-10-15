@@ -167,11 +167,19 @@ Wired and working, with a documented limitation or lighter verification:
     worth the dependency. `.cbz` and `.cbt` are fully read.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
-- **`collection.xml` / `playlist.xml` / `.m3u` playlist files** — the readers and writers are
-  ported and tested, but nothing calls them yet: Ferrofin creates collections and playlists as
-  pathless database rows, and its scanner resolves no collection/playlist *folders*, so there
-  is no on-disk file to read or write. Membership lives in `BaseItems."Data"` (Jellyfin's own
-  source of truth), which is what makes in-place adoption of a Jellyfin database work.
+- **Playlist files are read, never written** — a library scan makes a playlist of each
+  `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
+  named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
+  `playlist.xml` only the members and the media type are read so far — its title, overview,
+  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
+  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
+  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
+  saves XML metadata into the library (a library whose metadata savers are unset), the
+  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
+  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  `collection.xml` is still not read or written: Ferrofin's collections are pathless database
+  rows, with membership in the `LinkedChildren` table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 

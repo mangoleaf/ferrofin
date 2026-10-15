@@ -105,9 +105,7 @@ pub enum LocalMetadataFormat {
     Nfo,
     /// A Jellyfin `.xml` (`BaseXmlProvider`). Upstream's XML readers serve
     /// box sets and playlists only (`BoxSetXmlProvider`,
-    /// `PlaylistXmlProvider`), which the library scan does not resolve, so
-    /// the scan never passes one; the arm is ported for their refresh.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `PlaylistXmlProvider`); the library scan passes a playlist's.
     Xml,
     /// A book's Comic/OPF sidecar or `.cbz` file (`ComicProvider.HasChanged`,
     /// `OpfProvider.HasChanged`): newer than the last save, with no tolerance.

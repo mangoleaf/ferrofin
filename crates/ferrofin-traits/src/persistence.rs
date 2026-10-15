@@ -801,6 +801,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Writes what a library scan read of the playlists it resolved off disk
+    /// (`PlaylistResolver`): each one's ownership row — owned by nobody,
+    /// open to everyone, as the resolver creates it — when it has none, and
+    /// the members its local reader found, when it ran
+    /// ([`ScannedPlaylist::members`]).
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn sync_scanned_playlists(
+        &self,
+        playlists: &[ScannedPlaylist],
+    ) -> Result<(), ServiceError> {
+        let _ = playlists;
+        Ok(())
+    }
+
     /// Copies each owner video's metadata onto the videos it owns, as a save
     /// (or refresh) of the owner does upstream, and returns how many owned
     /// rows were written.
@@ -2110,6 +2129,38 @@ pub struct LocalVersionGroup {
     /// The versions the scan took out of the group: owned by the primary
     /// before the scan's save, and no longer.
     pub released: Vec<Uuid>,
+}
+
+/// One playlist a library scan resolved off disk
+/// ([`ItemPersistenceService::sync_scanned_playlists`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScannedPlaylist {
+    /// The playlist.
+    pub id: Uuid,
+    /// The members its local reader returned, in order — `None` when no
+    /// reader ran or none had anything to say (`HasMetadata` false), which
+    /// leaves the stored members alone. Entries that resolve to no stored
+    /// item are dropped.
+    pub members: Option<Vec<PlaylistMember>>,
+    /// Whether `members` are a playlist file's entries
+    /// (`PlaylistItemsProvider`), which count only when one of them names a
+    /// stored item; a `playlist.xml`'s count whatever they name.
+    pub from_file: bool,
+    /// Whether `members` replace the stored ones, or come first with the
+    /// stored ones not among them appended (`PlaylistMetadataService.
+    /// MergeData` with `replaceData` false).
+    pub replace: bool,
+}
+
+/// One entry a playlist's local reader returned — the C# `LinkedChild`: an
+/// item id, a path, or both (the path wins when it names a stored item).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistMember {
+    /// The item's id (`playlist.xml`'s `<ItemId>`), the fallback when its
+    /// path names no stored item.
+    pub item_id: Option<Uuid>,
+    /// The item's path, resolved as `LibraryManager.FindByPath` does.
+    pub path: Option<String>,
 }
 
 /// One stored item to move to a new identity

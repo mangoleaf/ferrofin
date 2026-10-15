@@ -1428,15 +1428,16 @@ async fn get_items_forwards_the_artist_id_filters() {
     }
 }
 
-/// jellyfin-web's Playlists page browses the Playlists view. Upstream re-roots a
-/// `[Playlist]`-typed browse before it rewrites a playlists folder's listing to
-/// recursive `[Playlist]` (ItemsController.cs v12.2:290-325), so:
-/// - untyped, the view stays the parent and the listing becomes recursive
-///   playlists (post-filtered per user), with no linked-ancestor constraint;
-/// - `IncludeItemTypes=Playlist` re-roots to the user root, again with no
-///   constraint, since the view's collection type is the target's own;
-/// - the playlists folder itself lists its playlists, whatever was asked —
-///   except a `[BoxSet]` browse, which re-roots like any other parent.
+/// jellyfin-web's Playlists page browses the Playlists view. Measured on
+/// Jellyfin 12.2 with a user: the view and the playlists folder each list
+/// every playlist the user may open — the ones made in the app and the
+/// playlist files the library scan found — whatever type was asked, so:
+/// - untyped, the listing becomes recursive playlists from the user root
+///   (post-filtered per user), with no linked-ancestor constraint;
+/// - `IncludeItemTypes=Playlist` re-roots to the user root the same way,
+///   since the view's collection type is the target's own;
+/// - the playlists folder lists them too, whatever was asked — except a
+///   `[BoxSet]` browse, which re-roots like any other parent.
 #[tokio::test]
 async fn playlists_view_browses_list_its_playlists() {
     use ferrofin_model::data::BaseItemKind;
@@ -1462,22 +1463,13 @@ async fn playlists_view_browses_list_its_playlists() {
         assert_eq!(response.status(), StatusCode::OK, "{params}");
         seen.lock().unwrap().take().expect("query_items ran")
     }
-    for (params, parent) in [
-        (
-            format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true"),
-            PLAYLISTS_VIEW_ID,
-        ),
-        (
-            format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true&includeItemTypes=Playlist"),
-            Uuid::nil(),
-        ),
-        (
-            format!("parentId={PLAYLISTS_FOLDER_ID}&includeItemTypes=Audio"),
-            PLAYLISTS_FOLDER_ID,
-        ),
+    for params in [
+        format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true"),
+        format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true&includeItemTypes=Playlist"),
+        format!("parentId={PLAYLISTS_FOLDER_ID}&includeItemTypes=Audio"),
     ] {
         let query = query_for(&params).await;
-        assert_eq!(query.parent_id, parent, "{params}");
+        assert_eq!(query.parent_id, Uuid::nil(), "{params}");
         assert!(query.recursive, "{params}");
         assert_eq!(
             query.include_item_types,
