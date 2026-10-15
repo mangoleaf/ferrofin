@@ -89,9 +89,20 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Port Jellyfin 12.1's routines and rules: `RepairAlternateVersionLinks` (primaries re-derived
   from `LinkedChildren`), `StripEmbeddedLinkedChildren`, the re-dated rating-level pass with
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
-  the user-view consolidation's reference moves, `HasVisibleChild` (a playlists or boxsets
-  library with nothing the user can see has no view), and `ApplyAlternateVersionFiltering` (a
+  the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in
+  `GET /UserViews`: a view is listed when the user can see at least one playlist (or box
+  set) anywhere in their libraries, so a playlist inside a music album now shows the
+  Playlists view, and another user's private playlist no longer does
+- Port the rest of `Playlist.IsVisible`: Jellyfin 12.1's `HasParentalAllowedChild` (a user
+  with a maximum parental rating no longer sees a playlist whose members all exceed it) and,
+  for a playlist file, its own rating and tags. It applies in browsing, the Playlists view and
+  every `/Playlists/{id}` endpoint
+- `GET /Playlists/{id}/Items` leaves out the members the user may not see, as upstream's
+  `GetPlaylistItems` does (`GET /Playlists/{id}` still lists every member in `ItemIds`), and
+  its `userId` parameter names another user only for an administrator (`403` otherwise). A
+  move counts positions among the members the user sees (`MoveItemAsync`)
 - Per-field metadata locks (`LockedFields`, stored in `BaseItemMetadataFields`): the
   metadata editor's checkboxes round-trip, and scans and refreshes keep a locked field
   as the user set it. Editing an item no longer locks it; `LockData` is exactly what the
@@ -165,6 +176,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
   copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
   before that copy makes it on the next boot
+- `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
+  lowercase name such as `de Niro` lists among the D names instead of after every
+  capitalised one (#60)
 
 ## [1.0.0] - 2026-09-05
 

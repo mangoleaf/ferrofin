@@ -554,8 +554,9 @@ fn is_valid_person_type(value: &str) -> bool {
 }
 
 /// Appends the shared `TranslateQuery` predicates (favorite, item scope,
-/// parent scope, person-type in/out, max list order, name range/substring,
-/// must-have-item) on the `Peoples` row aliased `alias`, onto a builder with a
+/// parent scope, appears-in item, person-type in/out, max list order, name
+/// range/substring, must-have-item) on the `Peoples` row aliased `alias`, onto
+/// a builder with a
 /// `WHERE` clause already open. The by-name dedup applies them twice: to the
 /// candidate rows its representative is chosen from (`d`) and to the outer row
 /// (`p`).
@@ -591,6 +592,10 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, 
         ));
         qb.push_bind(guid_to_db(parent));
         qb.push(")");
+    }
+    if !filter.appears_in_item_id.is_nil() {
+        qb.push(" AND ");
+        qb.push(appears_in_item(filter.appears_in_item_id, alias));
     }
     let include: Vec<&String> = filter
         .person_types
@@ -690,6 +695,20 @@ fn has_person_item(alias: &str) -> String {
     )
 }
 
+/// C# `AppearsInItemId`: the credit is on that item
+/// (`PeopleBaseItemMap.Where(m => m.ItemId == appearsInItemId).Select(m =>
+/// m.PeopleId).Contains(e.Id)`). As an `IN` list it drives the query from the
+/// item's credits (an `ItemId` seek on the map's primary key, then a `Peoples`
+/// lookup by id); a correlated `EXISTS` would scan every `Peoples` row and
+/// probe the map per row. The id is a canonically formatted GUID, so inlining
+/// it is injection-safe.
+fn appears_in_item(item_id: Uuid, alias: &str) -> String {
+    format!(
+        r#"{alias}."Id" IN (SELECT ma."PeopleId" FROM "PeopleBaseItemMap" ma WHERE ma."ItemId" = '{}')"#,
+        guid_to_db(item_id)
+    )
+}
+
 /// Opens `SELECT <cols> FROM "Peoples" p WHERE 1 = 1`, ready for
 /// [`push_predicates`].
 fn base_query(cols: &str) -> QueryBuilder<Sqlite> {
@@ -705,13 +724,13 @@ fn base_query(cols: &str) -> QueryBuilder<Sqlite> {
 /// Director row from `personTypes=Director`.
 ///
 /// As a *predicate* rather than a derived table, the page can be driven from
-/// `IX_Peoples_Name` — which already supplies the `ORDER BY p."Name"` — so the
-/// `LIMIT` stops the scan after a page's worth of representatives. The derived
-/// table had to aggregate every person and then sort all of them through a temp
-/// B-tree before the `LIMIT` could discard 98% of the result: 1.26 ms → 0.31 ms
-/// per query on the bench library (7.5k people, `limit=100`). The dedup test
-/// per candidate row is a covering-index seek on
-/// `FerrofinIX_Peoples_NameNoCase_Cover`.
+/// `FerrofinIX_Peoples_NameNoCase_Cover` — which already supplies the
+/// `ORDER BY p."Name" COLLATE NOCASE` — so the `LIMIT` stops the scan after a
+/// page's worth of representatives. The derived table had to aggregate every
+/// person and then sort all of them through a temp B-tree before the `LIMIT`
+/// could discard 98% of the result: 1.26 ms → 0.31 ms per query on the bench
+/// library (7.5k people, `limit=100`). The dedup test per candidate row is a
+/// covering-index seek on `FerrofinIX_Peoples_NameNoCase_Cover`.
 ///
 /// `NOT EXISTS … d."Id" < p."Id"` rather than `p."Id" = (SELECT MIN(d."Id") …)`:
 /// the index check on `Id` runs before the per-row predicates and the probe
@@ -780,6 +799,7 @@ fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
 
     !filter.item_id.is_nil()
         || filter.parent_id.is_some()
+        || !filter.appears_in_item_id.is_nil()
         || (filter.user_id.is_some() && filter.is_favorite.is_some())
         || filter.person_types.iter().any(|t| is_valid_person_type(t))
         || filter
@@ -806,7 +826,11 @@ fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     let mut qb = base_query(&format!(r#"p."Id", p."Name", p."PersonType", {total}"#));
     push_predicates(&mut qb, filter, "p");
     push_dedup_predicate(&mut qb, filter);
-    qb.push(r#" ORDER BY p."Name""#);
+    // Upstream orders by `Name.ToLower()`, which EF sends to SQLite as
+    // `lower("Name")`. In the e_sqlite3 Jellyfin bundles (no ICU) that folds
+    // ASCII only before a byte comparison, the same order `NOCASE` gives on
+    // every build — and `NOCASE` keeps the page on the covering index.
+    qb.push(r#" ORDER BY p."Name" COLLATE NOCASE"#);
     let start = filter.start_index.unwrap_or(0);
     if filter.limit > 0 || start > 0 {
         qb.push(" LIMIT ");
@@ -876,7 +900,7 @@ impl FerrofinPeopleRepository {
     /// The third cost was the dedup itself: as a derived table it had to
     /// aggregate all 7.5k people and sort them through a temp B-tree before the
     /// `LIMIT` could drop 98% of the result. [`push_dedup_predicate`] moves it
-    /// onto a plain `"Peoples"` scan driven by `IX_Peoples_Name`, which already
+    /// onto a plain `"Peoples"` scan driven by the name index, which already
     /// supplies the ordering — 1.26 ms → 0.31 ms per query, and `/Persons`
     /// 2.8 ms → 1.4 ms p50 at its calibrated rate.
     async fn get_people_by_name(
@@ -2191,6 +2215,75 @@ mod tests {
         );
     }
 
+    /// Upstream 12.2 `GetPeople` orders the by-name listing by `Name.ToLower()`,
+    /// so a lowercase name pages among its letter, not after every capitalised
+    /// one — and the case-insensitive order must not cost the page its index
+    /// scan. Jellyfin's bundled (non-ICU) SQLite `lower()` folds ASCII only, so
+    /// `Émile` (`É` is 0xC3 0x89) still sorts before `élodie` (0xC3 0xA9), as a
+    /// live 12.2 returns them; a Unicode-aware fold here would swap the pair.
+    #[tokio::test]
+    async fn by_name_page_orders_case_insensitively() {
+        let db = test_db().await;
+        let item = Uuid::from_u128(0x9111);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        repo.update_people(
+            item,
+            &[
+                person("Zoe", "Actor"),
+                person("de Niro", "Actor"),
+                person("Bob", "Actor"),
+                person("alice", "Actor"),
+                person("élodie", "Actor"),
+                person("Émile", "Actor"),
+            ],
+        )
+        .await
+        .expect("credits");
+
+        for must_have_item in [false, true] {
+            let mut names = Vec::new();
+            for start in [0, 2, 4] {
+                let page = repo
+                    .get_people(&InternalPeopleQuery {
+                        limit: 2,
+                        start_index: Some(start),
+                        must_have_item,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("page");
+                assert_eq!(page.items.len(), 2);
+                names.extend(page.items.into_iter().map(|p| p.name));
+            }
+            assert_eq!(names, ["alice", "Bob", "de Niro", "Zoe", "Émile", "élodie"]);
+        }
+
+        // The default `/Persons` page. (A narrowed page sorts its window-counted
+        // matches through a temp B-tree with either collation.)
+        let sql = super::by_name_page_query(&InternalPeopleQuery {
+            must_have_item: true,
+            ..Default::default()
+        })
+        .into_sql()
+        .as_str()
+        .to_owned();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            details.contains(&"SCAN p USING COVERING INDEX FerrofinIX_Peoples_NameNoCase_Cover"),
+            "the page is read off the NOCASE index in order: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("TEMP B-TREE")),
+            "{details:?}"
+        );
+    }
+
     /// Whichever shape computes it, the total is the number of deduped people
     /// the filter matches — never the page length. A repository that reported
     /// `items.len()` would look right on page 0 of a short library and lie on
@@ -2424,6 +2517,173 @@ mod tests {
             assert!(past.items.is_empty(), "{label}");
             assert_eq!(past.total_record_count, 1, "{label} past the end");
         }
+    }
+
+    /// Two movies with different casts, every credit backed by a `Person`
+    /// item (`update_people` materializes them).
+    async fn two_casts_repo() -> (FerrofinPeopleRepository, Uuid, Uuid) {
+        let db = test_db().await;
+        let (first, second) = (Uuid::from_u128(0x9501), Uuid::from_u128(0x9502));
+        seed_item(&db, first, BaseItemKind::Movie).await;
+        seed_item(&db, second, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db);
+        // Alice is credited twice on the first movie, as two `Peoples` rows.
+        repo.update_people(
+            first,
+            &[
+                person("Alice", "Actor"),
+                person("Bob", "Director"),
+                person("Alice", "Producer"),
+            ],
+        )
+        .await
+        .expect("first cast");
+        repo.update_people(second, &[person("Carol", "Actor"), person("Dave", "Actor")])
+            .await
+            .expect("second cast");
+        (repo, first, second)
+    }
+
+    /// Upstream `TranslateQuery`'s `AppearsInItemId`: `/Persons?appearsInItemId=`
+    /// returns and counts only the people credited on that item, once each
+    /// however often they are credited, on the page, a shorter page (the window
+    /// total) and past the end (the fallback count).
+    #[tokio::test]
+    async fn appears_in_item_returns_and_counts_only_that_items_people() {
+        let (repo, first, second) = two_casts_repo().await;
+        for (item, expected) in [(first, ["Alice", "Bob"]), (second, ["Carol", "Dave"])] {
+            let query = InternalPeopleQuery {
+                appears_in_item_id: item,
+                must_have_item: true,
+                ..Default::default()
+            };
+            assert!(super::narrows_by_name(&query));
+            let page = repo.get_people(&query).await.expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, expected);
+            assert_eq!(page.total_record_count, 2);
+            // `GetPeopleNames` runs the same `TranslateQuery`.
+            assert_eq!(
+                repo.get_people_names(&query).await.expect("names"),
+                expected
+            );
+
+            let short = repo
+                .get_people(&InternalPeopleQuery {
+                    limit: 1,
+                    ..query.clone()
+                })
+                .await
+                .expect("short page");
+            assert_eq!(short.items.len(), 1);
+            assert_eq!(short.total_record_count, 2, "window total");
+
+            let past = repo
+                .get_people(&InternalPeopleQuery {
+                    start_index: Some(5),
+                    limit: 1,
+                    ..query
+                })
+                .await
+                .expect("past");
+            assert!(past.items.is_empty());
+            assert_eq!(past.total_record_count, 2, "past-the-end total");
+        }
+    }
+
+    #[tokio::test]
+    async fn appears_in_an_unknown_item_returns_nothing() {
+        let (repo, _, _) = two_casts_repo().await;
+        let page = repo
+            .get_people(&InternalPeopleQuery {
+                appears_in_item_id: Uuid::from_u128(0x9599),
+                must_have_item: true,
+                ..Default::default()
+            })
+            .await
+            .expect("page");
+        assert!(page.items.is_empty());
+        assert_eq!(page.total_record_count, 0);
+    }
+
+    /// Upstream dedups the filtered candidates, so the name group's
+    /// representative is chosen among the rows credited on the item: the
+    /// lowest-id `john doe` row is credited elsewhere and must not hide the
+    /// `John Doe` one.
+    #[tokio::test]
+    async fn appears_in_item_picks_the_representative_among_its_credits() {
+        let db = test_db().await;
+        let (first, second) = (Uuid::from_u128(0x9601), Uuid::from_u128(0x9602));
+        seed_item(&db, first, BaseItemKind::Movie).await;
+        seed_item(&db, second, BaseItemKind::Movie).await;
+        super::seed_people_row(&db, Uuid::from_u128(1), "john doe", "Producer").await;
+        super::seed_people_row(&db, Uuid::from_u128(2), "John Doe", "Actor").await;
+        for (item, person) in [(second, 1), (first, 2)] {
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role", "ListOrder")
+                   VALUES (?1, ?2, '', 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(Uuid::from_u128(person)))
+            .execute(db.writer())
+            .await
+            .expect("credit");
+        }
+        let repo = FerrofinPeopleRepository::new(db);
+        for (item, expected) in [(first, "John Doe"), (second, "john doe")] {
+            let query = InternalPeopleQuery {
+                appears_in_item_id: item,
+                ..Default::default()
+            };
+            let page = repo.get_people(&query).await.expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, [expected]);
+            assert_eq!(page.total_record_count, 1);
+            let past = repo
+                .get_people(&InternalPeopleQuery {
+                    start_index: Some(5),
+                    limit: 1,
+                    ..query
+                })
+                .await
+                .expect("past");
+            assert_eq!(past.total_record_count, 1, "{expected} past the end");
+        }
+    }
+
+    /// `AppearsInItemId` drives the page from the item's credits: the map is
+    /// sought by `ItemId` and the people looked up by id, never a scan of every
+    /// `Peoples` row with a per-row probe.
+    #[tokio::test]
+    async fn appears_in_item_is_driven_by_the_items_credits() {
+        let db = test_db().await;
+        let query = InternalPeopleQuery {
+            appears_in_item_id: Uuid::from_u128(0x9701),
+            must_have_item: true,
+            ..Default::default()
+        };
+        let sql = super::by_name_page_query(&query)
+            .into_sql()
+            .as_str()
+            .to_owned();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            !details
+                .iter()
+                .any(|d| *d == "SCAN p" || d.starts_with("SCAN p ")),
+            "no scan of every person: {details:?}"
+        );
+        let probes: Vec<&&str> = details.iter().filter(|d| d.contains(" ma ")).collect();
+        assert!(!probes.is_empty(), "{details:?}");
+        assert!(
+            probes.iter().all(|d| d.starts_with("SEARCH ma ")),
+            "{details:?}"
+        );
     }
 
     /// The default `/Persons` page sets `must_have_item` and nothing else. It

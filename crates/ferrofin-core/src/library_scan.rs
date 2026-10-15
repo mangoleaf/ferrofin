@@ -7073,35 +7073,15 @@ impl LibraryScanner {
     }
 
     /// Whether writing `people` would change the credits stored for
-    /// `item_id`. Compared the way `update_people` writes them: deduped on
-    /// (lower-cased name, type) keeping the first ([`dedupe_people`]), names
-    /// trimmed and matched case-insensitively (an existing `Peoples` row keeps
-    /// its casing), then type and role, in credit order. A read failure
-    /// counts as a difference; with no people repository nothing would be
-    /// written, so nothing differs.
-    ///
-    /// [`dedupe_people`]: crate::people_repository::dedupe_people
+    /// `item_id` ([`credits_differ`]). A read failure counts as a difference;
+    /// with no people repository nothing would be written, so nothing
+    /// differs.
     async fn people_differ(&self, item_id: Uuid, people: &[PeopleEntity]) -> bool {
         let Some(repo) = &self.people else {
             return false;
         };
-        let key = |p: &PeopleEntity| {
-            (
-                p.name.trim().to_lowercase(),
-                p.person_type.clone().unwrap_or_default(),
-                p.role.clone().unwrap_or_default(),
-            )
-        };
         match repo.get_people_batch(&[item_id]).await {
-            Ok(mut stored) => {
-                let stored = stored.remove(&item_id).unwrap_or_default();
-                stored
-                    .iter()
-                    .map(key)
-                    .ne(crate::people_repository::dedupe_people(people)
-                        .into_iter()
-                        .map(key))
-            }
+            Ok(mut stored) => credits_differ(&stored.remove(&item_id).unwrap_or_default(), people),
             Err(err) => {
                 tracing::warn!(%err, item_id = %item_id, "failed to read stored credits");
                 true
@@ -7525,7 +7505,7 @@ impl LibraryScanner {
     ///
     /// | pass | selection | upstream |
     /// |---|---|---|
-    /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it | `MetadataService.RefreshMetadata` |
+    /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it; then every album the scan planned, its artist credits written where they moved | `MetadataService.RefreshMetadata`; `AlbumMetadataService.SetPeople` |
     /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
     /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
@@ -11941,13 +11921,16 @@ impl LibraryScanner {
                 entity.series_id.as_deref(),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
+                // `ProviderManager.GetImages` orders each provider's images by
+                // `OrderByLanguageDescending(preferredLanguage)` (v12.2
+                // ProviderManager.cs:365), as the episode and title paths do
+                // here: TMDB's response order is not a ranking.
                 (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
-                    Some(id) => tmdb
-                        .season_images(id, number, request_language.as_deref())
-                        .await
-                        .into_iter()
-                        .map(RemoteImage::from)
-                        .collect(),
+                    Some(id) => ferrofin_providers::tmdb::ordered_download_images(
+                        tmdb.season_images(id, number, request_language.as_deref())
+                            .await,
+                        request_language.as_deref().unwrap_or("en"),
+                    ),
                     None => Vec::new(),
                 },
                 _ => Vec::new(),
@@ -19095,6 +19078,30 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
     if entity.community_rating.is_none() {
         entity.community_rating = d.vote_average.map(f64::from);
     }
+}
+
+/// Whether writing `people` would change `stored`, an item's credits as
+/// `get_people_batch` reads them back. Compared the way `update_people`
+/// writes them: deduped on (lower-cased name, type) keeping the first
+/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
+/// existing `Peoples` row keeps its casing), then type and role, in credit
+/// order.
+///
+/// [`dedupe_people`]: crate::people_repository::dedupe_people
+fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
+    let key = |p: &PeopleEntity| {
+        (
+            p.name.trim().to_lowercase(),
+            p.person_type.clone().unwrap_or_default(),
+            p.role.clone().unwrap_or_default(),
+        )
+    };
+    stored
+        .iter()
+        .map(key)
+        .ne(crate::people_repository::dedupe_people(people)
+            .into_iter()
+            .map(key))
 }
 
 /// The credits `AudioFileProber.FetchDataFromTags` writes with

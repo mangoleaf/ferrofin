@@ -346,6 +346,10 @@ const PLAYLISTS_FOLDER_ID: Uuid = Uuid::from_u128(0x9F1);
 
 /// A playlist inside it — the chain that exercises the plug-in-folder exemption.
 const PLAYLIST_ID: Uuid = Uuid::from_u128(0x9F2);
+/// The user's Playlists view, displaying [`PLAYLISTS_FOLDER_ID`].
+const PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x9F3);
+/// A stale Playlists view whose display parent no longer exists.
+const STALE_PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x9F4);
 /// The physical folder's on-disk path (= one of the library's locations).
 const PHYSICAL_PATH: &str = "/media/movies-real";
 
@@ -410,6 +414,25 @@ impl LibraryManager for OkLibrary {
                 PLAYLIST_ID,
                 "Playlist",
                 BaseItemKind::Playlist,
+            )));
+        }
+        if id == PLAYLISTS_VIEW_ID || id == STALE_PLAYLISTS_VIEW_ID {
+            let shown = if id == PLAYLISTS_VIEW_ID {
+                PLAYLISTS_FOLDER_ID
+            } else {
+                Uuid::from_u128(0xDEAD)
+            };
+            let mut view = item_entity(id, "Playlists", BaseItemKind::UserView);
+            view.data = Some(
+                serde_json::json!({"ViewType":"playlists","DisplayParentId":shown}).to_string(),
+            );
+            return Ok(Some(view));
+        }
+        if id == PLAYLISTS_FOLDER_ID {
+            return Ok(Some(item_entity(
+                PLAYLISTS_FOLDER_ID,
+                "Playlists",
+                BaseItemKind::PlaylistsFolder,
             )));
         }
         if self.adopted_tree && id == COLLECTION_FOLDER_ID {
@@ -1403,6 +1426,82 @@ async fn get_items_forwards_the_artist_id_filters() {
         assert_eq!(query.exclude_artist_ids, [excluded], "{uri}");
         assert!(query.artist_ids.is_empty(), "{uri}");
     }
+}
+
+/// jellyfin-web's Playlists page browses the Playlists view. Upstream re-roots a
+/// `[Playlist]`-typed browse before it rewrites a playlists folder's listing to
+/// recursive `[Playlist]` (ItemsController.cs v12.2:290-325), so:
+/// - untyped, the view stays the parent and the listing becomes recursive
+///   playlists (post-filtered per user), with no linked-ancestor constraint;
+/// - `IncludeItemTypes=Playlist` re-roots to the user root, again with no
+///   constraint, since the view's collection type is the target's own;
+/// - the playlists folder itself lists its playlists, whatever was asked —
+///   except a `[BoxSet]` browse, which re-roots like any other parent.
+#[tokio::test]
+async fn playlists_view_browses_list_its_playlists() {
+    use ferrofin_model::data::BaseItemKind;
+    async fn query_for(params: &str) -> InternalItemsQuery {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock().unwrap().take().expect("query_items ran")
+    }
+    for (params, parent) in [
+        (
+            format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true"),
+            PLAYLISTS_VIEW_ID,
+        ),
+        (
+            format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true&includeItemTypes=Playlist"),
+            Uuid::nil(),
+        ),
+        (
+            format!("parentId={PLAYLISTS_FOLDER_ID}&includeItemTypes=Audio"),
+            PLAYLISTS_FOLDER_ID,
+        ),
+    ] {
+        let query = query_for(&params).await;
+        assert_eq!(query.parent_id, parent, "{params}");
+        assert!(query.recursive, "{params}");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Playlist],
+            "{params}"
+        );
+        assert!(query.linked_child_ancestor_ids.is_empty(), "{params}");
+        assert!(query.apply_folder_display_options, "{params}");
+    }
+    // A view whose display parent is gone gets no folder policy of its own;
+    // re-rooted, it takes the user root's, so the post-filter still runs.
+    let stale = query_for(&format!(
+        "parentId={STALE_PLAYLISTS_VIEW_ID}&recursive=true&includeItemTypes=Playlist"
+    ))
+    .await;
+    assert_eq!(stale.parent_id, Uuid::nil());
+    assert!(stale.apply_folder_display_options);
+    let boxsets = query_for(&format!(
+        "parentId={PLAYLISTS_FOLDER_ID}&recursive=true&includeItemTypes=BoxSet"
+    ))
+    .await;
+    assert_eq!(boxsets.parent_id, Uuid::nil());
+    assert_eq!(boxsets.include_item_types, [BaseItemKind::BoxSet]);
+    assert_eq!(boxsets.linked_child_ancestor_ids, [PLAYLISTS_FOLDER_ID]);
 }
 
 #[tokio::test]

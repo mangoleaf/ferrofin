@@ -72,6 +72,10 @@ Deep-verified against a real Jellyfin server:
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
+    the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
+    before the moved entry is taken out and lands it one place short when it moves down past
+    a member hidden from that user. Ferrofin puts it at the position asked for.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,

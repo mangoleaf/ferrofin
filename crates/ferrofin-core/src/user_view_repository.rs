@@ -179,7 +179,7 @@ async fn typed_views(
 /// serializes the enum by name (`JsonStringEnumConverter`); the numeric form
 /// is accepted too, mapped over the public discriminants, so a blob written
 /// by a converter-less serializer still classifies.
-fn view_type_of(data: Option<&str>) -> Option<String> {
+pub(crate) fn view_type_of(data: Option<&str>) -> Option<String> {
     /// `Jellyfin.Data.Enums.CollectionType`, discriminants 0–12 in order.
     const PUBLIC_NAMES: [&str; 13] = [
         "unknown",
