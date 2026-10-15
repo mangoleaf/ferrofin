@@ -9,25 +9,21 @@
 //! links. Reading it is what lets Ferrofin adopt a library Jellyfin populated;
 //! writing it is what keeps the reverse true.
 //!
-//! # Not yet reachable from the server
+//! # Where the server reads it
 //!
-//! Both C# savers write to `Path.Combine(item.Path, …)`, and both parsers run
-//! against an item resolved from a folder on disk. Jellyfin gives a box set
-//! such a folder — `{DataPath}/collections/{Name} [boxset]/collection.xml` —
-//! so an **adopted** Jellyfin database does carry those paths and those files.
-//! Ferrofin, however, creates a `BoxSet` or `Playlist` as a **pathless** DB row
-//! (`collection_manager`'s `insert_named_item` writes no `Path`) and its
-//! scanner resolves no collection/playlist folders, so nothing in the server
-//! calls into this module today.
+//! The library scan reads a playlist FOLDER's `playlist.xml` for its members
+//! and media type (`PlaylistXmlProvider`; see `ferrofin-core`'s
+//! `library_scan/playlists.rs`, whose TODO records what of it is not yet
+//! applied). Nothing writes these files yet: upstream's `PlaylistXmlSaver`
+//! saves a scanned playlist folder's `playlist.xml` after each refresh that
+//! read it, and that port is the same open work item. A `BoxSet` or
+//! `Playlist` made through the API is a **pathless** DB row
+//! (`collection_manager`'s `insert_named_item` writes no `Path`) with its
+//! membership in the `LinkedChildren` table, which is what Jellyfin 12 reads
+//! too, so it has no folder of its own to save into.
 //!
-//! Nothing is lost by that: membership lives in `BaseItems."Data"`, which is
-//! Jellyfin's own DB source of truth and is what the drop-in round trip
-//! actually exercises — an adopted collection reads back correctly from the
-//! row whether or not its `collection.xml` was parsed.
-//!
-//! This module is the complete, tested reader/writer pair, ready for the day
-//! Ferrofin materializes folder-backed containers. It is deliberately NOT
-//! wired to a synthetic path: writing `collection.xml` somewhere Jellyfin
+//! The savers are complete and tested all the same. They are deliberately
+//! NOT wired to a synthetic path: writing `collection.xml` somewhere Jellyfin
 //! would not look for it would be worse than not writing it.
 
 use std::fmt::Write as _;

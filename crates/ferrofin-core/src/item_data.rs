@@ -473,10 +473,25 @@ pub fn is_disc_folder(data: Option<&str>) -> bool {
 /// path-less folder (a season with no folder of its own) keeps the
 /// `DateModified` it was created with, which no save restats
 /// (`SaveInternal` reads only a file-protocol path).
+///
+/// A playlist FILE (`Playlist.IsFile`) is the one folder whose path is a
+/// file: it keeps the file's `DateModified`, which its refresh compares.
 #[must_use]
 pub fn path_is_directory(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
     item.path.as_deref().is_some_and(|p| !p.is_empty())
-        && (item.is_folder || is_disc_folder(item.data.as_deref()))
+        && ((item.is_folder && !is_playlist_file_row(item)) || is_disc_folder(item.data.as_deref()))
+}
+
+/// Whether `item` is a `Playlist` stored at a playlist file
+/// (`Playlist.IsFile`), told by its extension rather than a stat — a
+/// playlist FOLDER is named anything but `*.m3u`.
+fn is_playlist_file_row(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
+    crate::item_type_lookup::kind_from_type_name(&item.type_)
+        == Some(ferrofin_model::data::BaseItemKind::Playlist)
+        && item
+            .path
+            .as_deref()
+            .is_some_and(ferrofin_providers::is_playlist_file)
 }
 
 /// Whether the library scan's save writes `item`'s `DateModified` as the

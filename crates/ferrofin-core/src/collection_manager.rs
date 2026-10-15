@@ -21,11 +21,15 @@
 //! row (created before owner tracking, or by an API key) grants `Owner` to every
 //! caller for back-compat.
 //!
+//! A playlist the library scan resolved from a `.m3u`/`.pls` file is owned by
+//! nobody and open to everyone (`PlaylistResolver`), so every caller reads it
+//! and none may change it — upstream's `isPermitted` is the owner or an
+//! editing share. That is why `SavePlaylistFile`, which upstream runs after
+//! each change to a playlist FILE, has no caller here: ordering lives in the
+//! linked-children rows.
+//!
 //! Deferred (documented, per the unit-8 minimal-manager rule):
-//! - the on-disk `.m3u`/`.pls` *playlist file* writes (`SavePlaylistFile`) — a
-//!   filesystem concern folded away from the trait; not performed here;
-//!   ordering therefore lives purely in the linked-children rows;
-//!   entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
+//! - entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
 //!   entry-id strings) is approximated by the child item id;
 //! - `remove_playlists` (owned-playlist deletion + share transfer on user
 //!   removal) — ownership is recorded now, but the user-deletion cascade is not
@@ -89,8 +93,13 @@ fn decide_access(
     // A NULL owner in an existing meta row is an API-key playlist: no user
     // owns it, so — like a legacy row — every caller is owner-equivalent.
     // Parse-compare the stored owner GUID so rows written in either case
-    // (legacy lowercase, canonical uppercase) still match.
-    let owner_is_caller = owner.and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
+    // (legacy lowercase, canonical uppercase) still match. The empty GUID is
+    // nobody's: a playlist the library scan found is owned by it
+    // (`PlaylistResolver`), and an API key calls as it — upstream's API-key
+    // edit of such a playlist never gets past `GetPlaylistForUser`, which
+    // asks `IsVisible` of a user it does not have.
+    let owner_is_caller =
+        !user_id.is_nil() && owner.and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
     let level = if owner.is_none() || owner_is_caller {
         PlaylistAccessLevel::Owner
     } else if let Some(can_edit) = can_edit {
@@ -1104,6 +1113,29 @@ mod tests {
         COLLECTIONS_FOLDER_DATA, FerrofinCollectionManager, FerrofinPlaylistManager,
         collections_folder,
     };
+
+    /// A playlist owned by the empty GUID — one the library scan found — is
+    /// open to read for every caller, an API key (the empty caller) too, and
+    /// owned by none of them.
+    #[test]
+    fn the_empty_owner_is_nobody() {
+        use ferrofin_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
+        let nil = ferrofin_db::store::guid_to_db(Uuid::nil());
+        for caller in [Uuid::nil(), Uuid::new_v4()] {
+            assert_eq!(
+                super::decide_access(Some(&nil), Some(1), None, caller),
+                Some(PlaylistAccess {
+                    level: PlaylistAccessLevel::Read,
+                    open_access: true,
+                }),
+                "{caller}"
+            );
+            assert_eq!(
+                super::decide_access(Some(&nil), Some(0), None, caller),
+                None
+            );
+        }
+    }
 
     /// Test paths under a temp root, so the provisioned containers land
     /// somewhere harmless.

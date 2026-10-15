@@ -26,8 +26,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, StoredImageMetadata, StoredItemLinks,
-    VersionPromotion,
+    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, PlaylistMember, ScannedPlaylist,
+    StoredImageMetadata, StoredItemLinks, VersionPromotion,
 };
 use std::collections::HashMap;
 
@@ -1973,6 +1973,71 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 released = writes.release.len(),
                 "synced local alternate versions"
             );
+        }
+        Ok(())
+    }
+
+    async fn sync_scanned_playlists(
+        &self,
+        playlists: &[ScannedPlaylist],
+    ) -> Result<(), ServiceError> {
+        for playlist in playlists {
+            let id = guid_to_db(playlist.id);
+            // Resolved on a reader, before the writer is taken: one lookup
+            // per entry, and a long playlist must not hold the writer.
+            let resolved = match &playlist.members {
+                Some(members) => {
+                    let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+                    let mut ids = Vec::with_capacity(members.len());
+                    for member in members {
+                        if let Some(id) = resolve_playlist_member(&mut conn, member)
+                            .await
+                            .map_err(db_err)?
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    // `PlaylistItemsProvider` drops the entries it cannot
+                    // find, and with none left has no metadata: the stored
+                    // members stay as they are. A `playlist.xml` that reads
+                    // has metadata whatever its entries name.
+                    (!playlist.from_file || !ids.is_empty()).then_some(ids)
+                }
+                None => None,
+            };
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
+            // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody
+            // owns it, everybody reads it — and `Shares` is empty. A row an
+            // adoption imported, or an earlier scan wrote, is kept.
+            sqlx::query(
+                r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+                   VALUES (?1, ?2, 1) ON CONFLICT("PlaylistId") DO NOTHING"#,
+            )
+            .bind(&id)
+            .bind(guid_to_db(Uuid::nil()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if let Some(ids) = resolved {
+                let written = write_scanned_members(&mut tx, &id, ids, playlist.replace)
+                    .await
+                    .map_err(db_err)?;
+                if let Some(count) = written {
+                    tracing::debug!(item_id = %playlist.id, members = count, "synced playlist members");
+                }
+                // A reader with metadata makes the refresh a
+                // `MetadataImport`, which upstream saves: the saved stamp
+                // settles the `playlist.xml` change monitor
+                // (`BaseXmlProvider.HasChanged` compares with it).
+                sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = ?2 WHERE "Id" = ?1"#)
+                    .bind(&id)
+                    .bind(datetime_to_db(chrono::Utc::now()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+            tx.commit().await.map_err(db_err)?;
         }
         Ok(())
     }
@@ -4663,6 +4728,97 @@ async fn point_version_at(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Writes a scanned playlist's members inside the caller's transaction —
+/// `PlaylistMetadataService.MergeData`: `members` (resolved ids, in order)
+/// replace the stored ones, or — `replace` false and some stored — come
+/// first with the stored ones not among them after, told apart by the item
+/// each resolves to (upstream's `DistinctBy` key; see
+/// `library_scan/playlists.rs` for where it differs).
+/// Returns the member count when it wrote, `None` when the stored members
+/// already were the result.
+async fn write_scanned_members(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: &str,
+    members: Vec<Uuid>,
+    replace: bool,
+) -> Result<Option<usize>, sqlx::Error> {
+    // Manual links (`LinkedChildType.Manual`).
+    let mut ids: Vec<(Uuid, i64)> = members.into_iter().map(|id| (id, 0)).collect();
+    let stored: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "ChildId", "ChildType" FROM "LinkedChildren"
+           WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+    )
+    .bind(playlist)
+    .fetch_all(&mut *conn)
+    .await?;
+    let stored: Vec<(Uuid, i64)> = stored
+        .into_iter()
+        .filter_map(|(id, kind)| Uuid::parse_str(&id).ok().map(|id| (id, kind)))
+        .collect();
+    // `if (replaceData || targetItem.LinkedChildren.Length == 0)` takes the
+    // reader's list whole, its repeats with it.
+    if !replace && !stored.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        ids = ids
+            .into_iter()
+            .chain(stored.iter().copied())
+            .filter(|(id, _)| seen.insert(*id))
+            .collect();
+    }
+    if ids == stored {
+        return Ok(None);
+    }
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+        .bind(playlist)
+        .execute(&mut *conn)
+        .await?;
+    // Dense positions, repeats kept: the key is `(ParentId, SortOrder)`, and
+    // a playlist that lists a track twice plays it twice.
+    for (order, (id, kind)) in (0_i64..).zip(&ids) {
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(playlist)
+        .bind(order)
+        .bind(guid_to_db(*id))
+        .bind(kind)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(Some(ids.len()))
+}
+
+/// The stored item a playlist entry names: the item at its path —
+/// `LibraryManager.FindByPath`, the newest `DateCreated` first — else its id
+/// when that is stored (`ItemPersistenceService` resolves a `LinkedChild` by
+/// `Path` before its `LibraryItemId`).
+async fn resolve_playlist_member(
+    conn: &mut sqlx::SqliteConnection,
+    member: &PlaylistMember,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    if let Some(path) = member.path.as_deref() {
+        let id: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1
+               ORDER BY "DateCreated" DESC LIMIT 1"#,
+        )
+        .bind(path)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(id) = id.and_then(|id| Uuid::parse_str(&id).ok()) {
+            return Ok(Some(id));
+        }
+    }
+    let Some(id) = member.item_id else {
+        return Ok(None);
+    };
+    let stored: Option<i64> = sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(stored.map(|_| id))
 }
 
 /// Writes what [`local_version_writes`] decided for `primary` but its

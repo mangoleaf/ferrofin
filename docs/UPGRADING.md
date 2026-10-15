@@ -789,9 +789,16 @@ Behaviour that changed with the shape:
   tests on 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. See the
   [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
-  as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every
-  `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
-  are unchanged and still found by search and `/Items`.
+  as in Jellyfin 12.2 — a playlist file inside a music album counts.
+- **Playlist files in music libraries become playlists.** The next library scan turns each
+  `.m3u`, `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library, and each
+  folder named `… [playlist]` or holding a `playlist.xml`, into a playlist that every user
+  who can see the library can open, but nobody can edit; nothing inside such a folder stays
+  an item. A `.pls` that an older scan listed as a song is removed as a song. The Playlists
+  view now lists these, beside the ones made in the app.
+- An **adopted** Jellyfin database can carry playlist files Jellyfin left empty (where it
+  saved XML metadata beside them). Their entries are read when the file next changes; to read
+  them now, refresh the library's metadata with "Search for missing metadata".
 - Alternate-version groups are re-derived once from `LinkedChildren` (Jellyfin 12.1's
   `RepairAlternateVersionLinks`), and a version is hidden only while its primary exists in the
   same library: an item marked as a version of a row that no longer exists reappears in
