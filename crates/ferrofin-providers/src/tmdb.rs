@@ -2661,6 +2661,29 @@ mod tests {
         }
     }
 
+    /// `TmdbPersonImageProvider` labels profiles against the item's own
+    /// preferred language, not the normalized one it requests them in.
+    #[tokio::test]
+    async fn person_images_are_labelled_against_the_preferred_language() {
+        let server = crate::mock_http::MockServer::always(
+            r#"{"id":1,"images":{"profiles":[
+            {"file_path":"/a.jpg","iso_639_1":"es"},
+            {"file_path":"/b.jpg","iso_639_1":"es","iso_3166_1":"AR"}]}}"#,
+        )
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let labels: Vec<_> = client
+            .person_images(1, Some("es-AR"), Some("es-419"))
+            .await
+            .into_iter()
+            .map(|image| image.language)
+            .collect();
+        assert_eq!(
+            labels,
+            [Some("es-419".to_owned()), Some("es-AR".to_owned())]
+        );
+    }
+
     #[tokio::test]
     async fn collection_metadata_keeps_image_language_param_separate_from_all_language_artwork() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
