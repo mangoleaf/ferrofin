@@ -2279,7 +2279,17 @@ impl TmdbClient {
 
     /// Every profile candidate, including the language, dimensions and vote
     /// information used by `TmdbPersonImageProvider`'s selection ordering.
-    pub async fn person_images(&self, tmdb_id: i64, language: Option<&str>) -> Vec<TmdbImage> {
+    ///
+    /// `language` is the normalized TMDB request language; `request_language`
+    /// is the item's raw preferred metadata language the images are labelled
+    /// against, as `ConvertProfilesToRemoteImageInfo(profiles, language)` is
+    /// handed `GetPreferredMetadataLanguage()` upstream.
+    pub async fn person_images(
+        &self,
+        tmdb_id: i64,
+        language: Option<&str>,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
         let cfg = self.settings().await;
         let Some(person) = self.person_response(tmdb_id, language, &cfg).await else {
             return Vec::new();
@@ -2305,7 +2315,7 @@ impl TmdbClient {
                     language: get_image_language(
                         image.iso_639_1.as_deref(),
                         image.iso_3166_1.as_deref(),
-                        language,
+                        request_language,
                     ),
                 })
             })
@@ -2630,7 +2640,7 @@ mod tests {
                 crate::builtin_plugins::TMDB.id,
                 serde_json::to_vec(&config).unwrap(),
             ));
-            let profiles = client.person_images(1, Some("fr-CA")).await;
+            let profiles = client.person_images(1, Some("fr-CA"), Some("fr-CA")).await;
             let collections = client.collection_images(1, Some("fr-CA")).await;
             assert_eq!(profiles.len(), 1);
             assert_eq!(collections.len(), 2);
@@ -2687,9 +2697,15 @@ mod tests {
         assert!(client.collection(1, Some("fr-CA")).await.is_some());
         assert!(client.collection(1, None).await.is_some());
         assert_eq!(client.collection_images(1, Some("fr-CA")).await.len(), 1);
-        assert_eq!(client.person_images(1, Some("fr-CA")).await.len(), 1);
+        assert_eq!(
+            client
+                .person_images(1, Some("fr-CA"), Some("fr-CA"))
+                .await
+                .len(),
+            1
+        );
         assert!(client.person_details_for_language(1, None).await.is_some());
-        assert_eq!(client.person_images(1, None).await.len(), 1);
+        assert_eq!(client.person_images(1, None, None).await.len(), 1);
         assert!(client.person_lookup(1, Some("fr-CA")).await.is_some());
         handle.await.unwrap();
         let seen = seen.lock().unwrap();
