@@ -11941,13 +11941,16 @@ impl LibraryScanner {
                 entity.series_id.as_deref(),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
+                // `ProviderManager.GetImages` orders each provider's images by
+                // `OrderByLanguageDescending(preferredLanguage)` (v12.2
+                // ProviderManager.cs:365), as the episode and title paths do
+                // here: TMDB's response order is not a ranking.
                 (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
-                    Some(id) => tmdb
-                        .season_images(id, number, request_language.as_deref())
-                        .await
-                        .into_iter()
-                        .map(RemoteImage::from)
-                        .collect(),
+                    Some(id) => ferrofin_providers::tmdb::ordered_download_images(
+                        tmdb.season_images(id, number, request_language.as_deref())
+                            .await,
+                        request_language.as_deref().unwrap_or("en"),
+                    ),
                     None => Vec::new(),
                 },
                 _ => Vec::new(),
