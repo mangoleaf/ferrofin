@@ -1878,12 +1878,13 @@ mod tests {
             "the refresh after a removal leaves a locked set alone"
         );
         set_locked(set, false).await;
-        sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (?1, ?2)"#)
-            .bind(ferrofin_db::enums::metadata_field::to_i32(
-                ferrofin_model::entities::MetadataField::OfficialRating,
-            ))
-            .bind(ferrofin_db::store::guid_to_db(set))
-            .execute(db.writer())
+        library
+            .update_item_locked_fields(
+                set,
+                &[ferrofin_db::enums::metadata_field::to_i32(
+                    ferrofin_model::entities::MetadataField::OfficialRating,
+                )],
+            )
             .await
             .expect("lock the rating");
         collections
