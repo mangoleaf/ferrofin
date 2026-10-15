@@ -553,8 +553,9 @@ fn is_valid_person_type(value: &str) -> bool {
 }
 
 /// Appends the shared `TranslateQuery` predicates (item scope, parent scope,
-/// person-type in/out, max list order, name range/substring, must-have-item)
-/// onto a builder whose `FROM "Peoples" p` clause is already open.
+/// appears-in item, person-type in/out, max list order, name range/substring,
+/// must-have-item) onto a builder whose `FROM "Peoples" p` clause is already
+/// open.
 fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) {
     if !filter.item_id.is_nil() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mx WHERE mx."PeopleId" = p."Id" AND mx."ItemId" = "#);
@@ -569,6 +570,10 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) 
         );
         qb.push_bind(guid_to_db(parent));
         qb.push(")");
+    }
+    if !filter.appears_in_item_id.is_nil() {
+        qb.push(" AND ");
+        qb.push(appears_in_item(filter.appears_in_item_id, "p"));
     }
     let include: Vec<&String> = filter
         .person_types
@@ -658,6 +663,20 @@ fn has_person_item(alias: &str) -> String {
     )
 }
 
+/// C# `AppearsInItemId`: the credit is on that item
+/// (`PeopleBaseItemMap.Where(m => m.ItemId == appearsInItemId).Select(m =>
+/// m.PeopleId).Contains(e.Id)`). As an `IN` list it drives the query from the
+/// item's credits (an `ItemId` seek on the map's primary key, then a `Peoples`
+/// lookup by id); a correlated `EXISTS` would scan every `Peoples` row and
+/// probe the map per row. The id is a canonically formatted GUID, so inlining
+/// it is injection-safe.
+fn appears_in_item(item_id: Uuid, alias: &str) -> String {
+    format!(
+        r#"{alias}."Id" IN (SELECT ma."PeopleId" FROM "PeopleBaseItemMap" ma WHERE ma."ItemId" = '{}')"#,
+        guid_to_db(item_id)
+    )
+}
+
 /// Opens `SELECT <cols> FROM <from> p WHERE 1 = 1`, applying the optional
 /// `is_favorite` user-data restriction as an `EXISTS` sub-select (C# joins
 /// `UserData` on the person item's name). `from` is either the raw
@@ -703,12 +722,17 @@ fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> 
 /// Under `must_have_item` the representative is the lowest id among the rows
 /// that *have* an item, as upstream dedups the already-filtered candidates: a
 /// `john doe` credit with no item must not hide the `John Doe` one that has it.
+/// Under `appears_in_item_id` it is the lowest id among the rows credited on
+/// that item, for the same reason.
 fn dedup_people_predicate(filter: &InternalPeopleQuery) -> String {
-    let candidate = if filter.must_have_item {
-        format!(" AND {}", has_person_item("d"))
-    } else {
-        String::new()
-    };
+    let candidate = [
+        filter.must_have_item.then(|| has_person_item("d")),
+        (!filter.appears_in_item_id.is_nil())
+            .then(|| appears_in_item(filter.appears_in_item_id, "d")),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(String::new(), |all, condition| all + " AND " + &condition);
     format!(
         r#" AND p."Id" = (SELECT MIN(d."Id") FROM "Peoples" d
      WHERE d."Name" = p."Name" COLLATE NOCASE{candidate})"#
@@ -766,6 +790,7 @@ fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
 
     !filter.item_id.is_nil()
         || filter.parent_id.is_some()
+        || !filter.appears_in_item_id.is_nil()
         || (filter.user_id.is_some() && filter.is_favorite.is_some())
         || filter.person_types.iter().any(|t| is_valid_person_type(t))
         || filter
@@ -2416,6 +2441,173 @@ mod tests {
             assert!(past.items.is_empty(), "{label}");
             assert_eq!(past.total_record_count, 1, "{label} past the end");
         }
+    }
+
+    /// Two movies with different casts, every credit backed by a `Person`
+    /// item (`update_people` materializes them).
+    async fn two_casts_repo() -> (FerrofinPeopleRepository, Uuid, Uuid) {
+        let db = test_db().await;
+        let (first, second) = (Uuid::from_u128(0x9501), Uuid::from_u128(0x9502));
+        seed_item(&db, first, BaseItemKind::Movie).await;
+        seed_item(&db, second, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db);
+        // Alice is credited twice on the first movie, as two `Peoples` rows.
+        repo.update_people(
+            first,
+            &[
+                person("Alice", "Actor"),
+                person("Bob", "Director"),
+                person("Alice", "Producer"),
+            ],
+        )
+        .await
+        .expect("first cast");
+        repo.update_people(second, &[person("Carol", "Actor"), person("Dave", "Actor")])
+            .await
+            .expect("second cast");
+        (repo, first, second)
+    }
+
+    /// Upstream `TranslateQuery`'s `AppearsInItemId`: `/Persons?appearsInItemId=`
+    /// returns and counts only the people credited on that item, once each
+    /// however often they are credited, on the page, a shorter page (the window
+    /// total) and past the end (the fallback count).
+    #[tokio::test]
+    async fn appears_in_item_returns_and_counts_only_that_items_people() {
+        let (repo, first, second) = two_casts_repo().await;
+        for (item, expected) in [(first, ["Alice", "Bob"]), (second, ["Carol", "Dave"])] {
+            let query = InternalPeopleQuery {
+                appears_in_item_id: item,
+                must_have_item: true,
+                ..Default::default()
+            };
+            assert!(super::narrows_by_name(&query));
+            let page = repo.get_people(&query).await.expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, expected);
+            assert_eq!(page.total_record_count, 2);
+            // `GetPeopleNames` runs the same `TranslateQuery`.
+            assert_eq!(
+                repo.get_people_names(&query).await.expect("names"),
+                expected
+            );
+
+            let short = repo
+                .get_people(&InternalPeopleQuery {
+                    limit: 1,
+                    ..query.clone()
+                })
+                .await
+                .expect("short page");
+            assert_eq!(short.items.len(), 1);
+            assert_eq!(short.total_record_count, 2, "window total");
+
+            let past = repo
+                .get_people(&InternalPeopleQuery {
+                    start_index: Some(5),
+                    limit: 1,
+                    ..query
+                })
+                .await
+                .expect("past");
+            assert!(past.items.is_empty());
+            assert_eq!(past.total_record_count, 2, "past-the-end total");
+        }
+    }
+
+    #[tokio::test]
+    async fn appears_in_an_unknown_item_returns_nothing() {
+        let (repo, _, _) = two_casts_repo().await;
+        let page = repo
+            .get_people(&InternalPeopleQuery {
+                appears_in_item_id: Uuid::from_u128(0x9599),
+                must_have_item: true,
+                ..Default::default()
+            })
+            .await
+            .expect("page");
+        assert!(page.items.is_empty());
+        assert_eq!(page.total_record_count, 0);
+    }
+
+    /// Upstream dedups the filtered candidates, so the name group's
+    /// representative is chosen among the rows credited on the item: the
+    /// lowest-id `john doe` row is credited elsewhere and must not hide the
+    /// `John Doe` one.
+    #[tokio::test]
+    async fn appears_in_item_picks_the_representative_among_its_credits() {
+        let db = test_db().await;
+        let (first, second) = (Uuid::from_u128(0x9601), Uuid::from_u128(0x9602));
+        seed_item(&db, first, BaseItemKind::Movie).await;
+        seed_item(&db, second, BaseItemKind::Movie).await;
+        super::seed_people_row(&db, Uuid::from_u128(1), "john doe", "Producer").await;
+        super::seed_people_row(&db, Uuid::from_u128(2), "John Doe", "Actor").await;
+        for (item, person) in [(second, 1), (first, 2)] {
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role", "ListOrder")
+                   VALUES (?1, ?2, '', 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(Uuid::from_u128(person)))
+            .execute(db.writer())
+            .await
+            .expect("credit");
+        }
+        let repo = FerrofinPeopleRepository::new(db);
+        for (item, expected) in [(first, "John Doe"), (second, "john doe")] {
+            let query = InternalPeopleQuery {
+                appears_in_item_id: item,
+                ..Default::default()
+            };
+            let page = repo.get_people(&query).await.expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, [expected]);
+            assert_eq!(page.total_record_count, 1);
+            let past = repo
+                .get_people(&InternalPeopleQuery {
+                    start_index: Some(5),
+                    limit: 1,
+                    ..query
+                })
+                .await
+                .expect("past");
+            assert_eq!(past.total_record_count, 1, "{expected} past the end");
+        }
+    }
+
+    /// `AppearsInItemId` drives the page from the item's credits: the map is
+    /// sought by `ItemId` and the people looked up by id, never a scan of every
+    /// `Peoples` row with a per-row probe.
+    #[tokio::test]
+    async fn appears_in_item_is_driven_by_the_items_credits() {
+        let db = test_db().await;
+        let query = InternalPeopleQuery {
+            appears_in_item_id: Uuid::from_u128(0x9701),
+            must_have_item: true,
+            ..Default::default()
+        };
+        let sql = super::by_name_page_query(&query)
+            .into_sql()
+            .as_str()
+            .to_owned();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            !details
+                .iter()
+                .any(|d| *d == "SCAN p" || d.starts_with("SCAN p ")),
+            "no scan of every person: {details:?}"
+        );
+        let probes: Vec<&&str> = details.iter().filter(|d| d.contains(" ma ")).collect();
+        assert!(!probes.is_empty(), "{details:?}");
+        assert!(
+            probes.iter().all(|d| d.starts_with("SEARCH ma ")),
+            "{details:?}"
+        );
     }
 
     /// The default `/Persons` page sets `must_have_item` and nothing else. It
