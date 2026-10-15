@@ -379,6 +379,18 @@ fn local_metadata_changed(stored: &StoredState, fs: &FileFacts) -> bool {
         .is_none_or(|saved| file.mtime - saved > TimeDelta::milliseconds(tolerance))
 }
 
+/// Upstream's `isFullRefresh` (`MetadataService.cs:150`): `isFirstRefresh ||
+/// ReplaceAllMetadata || FullRefresh || requiresRefresh || ForceSave` — the
+/// gate `UpdateMetadataFromChildren` derives a folder's metadata past.
+#[must_use]
+pub fn full_refresh(plan: &ItemRefreshPlan, request: &RefreshRequest<'_>) -> bool {
+    plan.is_first_refresh
+        || plan.requires_refresh
+        || request.options.replace_all_metadata
+        || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+        || request.force_save
+}
+
 /// Decides which providers run for one item.
 ///
 /// - `isFirstRefresh`: `DateLastRefreshed` unset.

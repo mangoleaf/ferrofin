@@ -65,6 +65,77 @@ use crate::item_type_lookup::stored_type_name;
 /// (`0`) used to record a box-set/playlist member.
 const LINKED_CHILD_MANUAL: i32 = 0;
 
+/// How a membership change re-rates its box set or playlist upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rerate {
+    /// `CollectionManager.AddToCollectionAsync` (`:271`) calls
+    /// `UpdateRatingToItems` directly: an `IsLocked` box set — jellyfin-web
+    /// creates them locked unless "search for internet metadata" is ticked —
+    /// still takes its members' rating, and a failure fails the request.
+    Direct,
+    /// The `ForceSave` refresh upstream queues after every other membership
+    /// change (`MetadataService.UpdateOfficialRating`, `:623-635`): a locked
+    /// item keeps its rating, and a failure is logged, never the request's.
+    Refresh,
+}
+
+/// `UpdateRatingToItems` (`BaseItem.cs:2974`) for a box set or playlist whose
+/// membership just changed, then the save upstream always makes, which
+/// re-derives the parental score. A locked `OfficialRating` keeps its rating
+/// on every path: upstream's direct call skips that check, and a field lock a
+/// membership change silently overrides is not ported.
+async fn update_rating_to_items(
+    library_manager: &dyn LibraryManager,
+    visibility: Option<&crate::item_visibility::ItemVisibility>,
+    container: Uuid,
+    how: Rerate,
+) -> Result<(), ServiceError> {
+    let Some(visibility) = visibility else {
+        return Ok(());
+    };
+    let rerate = async {
+        // Only a box set or playlist takes its members' rating: the playlist and
+        // collection writes reach here with whatever id the caller sent.
+        let Some(mut row) = library_manager
+            .get_item_by_id(container)
+            .await?
+            .filter(|row| {
+                matches!(
+                    BaseItemKind::from_stored_type_name(&row.type_),
+                    Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+                )
+            })
+        else {
+            return Ok(());
+        };
+        let rating_locked = library_manager
+            .get_locked_fields_batch(&[container])
+            .await?
+            .get(&container)
+            .is_some_and(|fields| {
+                fields.contains(&ferrofin_model::entities::MetadataField::OfficialRating)
+            });
+        let keeps_rating = rating_locked || (how == Rerate::Refresh && row.is_locked);
+        if !keeps_rating {
+            row.official_rating = visibility.rating_to_items(&row).await?;
+        }
+        library_manager
+            .update_items(std::slice::from_ref(&row), None)
+            .await
+    };
+    match rerate.await {
+        Err(error) if how == Rerate::Refresh => {
+            tracing::warn!(
+                item_id = %container,
+                %error,
+                "could not re-rate a container from its members"
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 /// Decides the caller's [`PlaylistAccess`] from the three joined access columns
 /// (C# `Playlist.IsVisible` plus the owner/`CanEdit` split the controller checks
 /// derive from it). `None` means invisible — callers report `NotFound`.
@@ -258,6 +329,9 @@ pub struct FerrofinCollectionManager {
     library_manager: Arc<dyn LibraryManager>,
     linked_children: Arc<dyn LinkedChildrenService>,
     paths: Arc<dyn ServerApplicationPaths>,
+    /// Scores the members' ratings a box set takes
+    /// ([`update_rating_to_items`]). `None` in unit tests: the rating stays.
+    visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -281,7 +355,33 @@ impl FerrofinCollectionManager {
             library_manager,
             linked_children,
             paths,
+            visibility: None,
         }
+    }
+
+    /// Lets a box set take its members' rating when they change. Called once
+    /// by the composition root.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.visibility = Some(visibility);
+        self
+    }
+
+    async fn update_rating_to_items(
+        &self,
+        collection_id: Uuid,
+        how: Rerate,
+    ) -> Result<(), ServiceError> {
+        update_rating_to_items(
+            self.library_manager.as_ref(),
+            self.visibility.as_deref(),
+            collection_id,
+            how,
+        )
+        .await
     }
 }
 
@@ -310,7 +410,15 @@ impl CollectionManager for FerrofinCollectionManager {
         // but a zero-item create would otherwise leave Data without the
         // LinkedChildren key Jellyfin expects to own).
         item_data::sync_container_data(&self.db, id).await?;
-        Ok(row)
+        if options.item_id_list.is_empty() {
+            return Ok(row);
+        }
+        self.update_rating_to_items(id, Rerate::Direct).await?;
+        Ok(self
+            .library_manager
+            .get_item_by_id(id)
+            .await?
+            .unwrap_or(row))
     }
 
     async fn add_to_collection(
@@ -318,9 +426,18 @@ impl CollectionManager for FerrofinCollectionManager {
         collection_id: Uuid,
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
+        let current = self
+            .linked_children
+            .get_linked_children_ids(collection_id, None)
+            .await?;
         for item_id in item_ids {
             self.linked_children
                 .upsert_linked_child(collection_id, *item_id, LINKED_CHILD_MANUAL)
+                .await?;
+        }
+        // `AddToCollectionAsync` re-rates only when an item was new.
+        if item_ids.iter().any(|id| !current.contains(id)) {
+            self.update_rating_to_items(collection_id, Rerate::Direct)
                 .await?;
         }
         Ok(())
@@ -343,7 +460,8 @@ impl CollectionManager for FerrofinCollectionManager {
             .map_err(db_err)?;
         }
         item_data::sync_container_data(&self.db, collection_id).await?;
-        Ok(())
+        self.update_rating_to_items(collection_id, Rerate::Refresh)
+            .await
     }
 
     async fn get_collections_containing_item(
@@ -533,6 +651,19 @@ impl FerrofinPlaylistManager {
         self
     }
 
+    /// The rating refresh after a membership change ([`update_rating_to_items`]).
+    async fn update_rating_to_items(&self, playlist_id: Uuid) -> Result<(), ServiceError> {
+        update_rating_to_items(
+            self.library_manager.as_ref(),
+            self.visibility
+                .as_ref()
+                .map(|(visibility, _)| visibility.as_ref()),
+            playlist_id,
+            Rerate::Refresh,
+        )
+        .await
+    }
+
     /// The visibility evaluator and the caller, when the evaluator is wired.
     async fn visibility_user(
         &self,
@@ -720,6 +851,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
             item_data::set_data_key(&self.db, id, "PlaylistMediaType", value).await?;
         }
+        if !request.item_id_list.is_empty() {
+            self.update_rating_to_items(id).await?;
+        }
         Ok(PlaylistCreationResult { id: id.to_string() })
     }
 
@@ -774,6 +908,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
             write_entries(self.db.writer(), &guid_to_db(request.id), &entries).await?;
         }
         item_data::sync_container_data(&self.db, request.id).await?;
+        if request.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            self.update_rating_to_items(request.id).await?;
+        }
         Ok(())
     }
 
@@ -937,7 +1074,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
         });
         entries.splice(at..at, added);
         write_entries(self.db.writer(), &pid, &entries).await?;
-        item_data::sync_container_data(&self.db, playlist_id).await
+        item_data::sync_container_data(&self.db, playlist_id).await?;
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        self.update_rating_to_items(playlist_id).await
     }
 
     async fn remove_item_from_playlist(
@@ -968,6 +1109,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         }
         if let Ok(playlist) = Uuid::parse_str(playlist_id) {
             item_data::sync_container_data(&self.db, playlist).await?;
+            self.update_rating_to_items(playlist).await?;
         }
         Ok(())
     }
@@ -1605,6 +1747,208 @@ mod tests {
             .await
             .expect("containing2");
         assert!(containing.is_empty());
+    }
+
+    /// Issue #55: a box set or playlist takes the least restrictive rating of
+    /// its members whenever they change (`UpdateRatingToItems`), and the save
+    /// re-derives its parental score. Unrated members are ignored and removing
+    /// the only rated member keeps the rating. A locked box set still re-rates
+    /// on a direct add (upstream's `AddToCollectionAsync`), but not on an add
+    /// of nothing new or the refresh after a removal; a locked playlist keeps
+    /// its rating; a locked `OfficialRating` keeps it everywhere.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one set of members through every box-set and playlist membership path"
+    )]
+    async fn a_box_set_and_a_playlist_take_their_members_rating() {
+        let db = test_db().await;
+        let (heat, up, unrated) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, rating) in [(heat, Some("R")), (up, Some("PG")), (unrated, None)] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.official_rating = rating.map(str::to_owned);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let items = item_repository_over(db.clone());
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data_dir.path().to_string_lossy().into_owned(),
+        ));
+        let library: Arc<dyn ferrofin_traits::library::LibraryManager> = Arc::new(
+            crate::library_manager::FerrofinLibraryManager::new(
+                items.clone(),
+                Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                    db.clone(),
+                )),
+                Arc::new(
+                    crate::item_persistence_service::FerrofinItemPersistenceService::new(
+                        db.clone(),
+                    ),
+                ),
+                Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                    db.clone(),
+                )),
+            )
+            .with_visibility(Arc::clone(&visibility)),
+        );
+        let rating = |id| {
+            let db = db.clone();
+            async move {
+                let row = crate::test_support::fetch_item(&db, id).await;
+                (row.official_rating, row.inherited_parental_rating_value)
+            }
+        };
+        let set_locked = |id, locked| {
+            let db = db.clone();
+            async move {
+                let mut row = crate::test_support::fetch_item(&db, id).await;
+                row.is_locked = locked;
+                crate::test_support::save_item(&db, &row).await;
+            }
+        };
+        let set_rating = |id, rating: &'static str| {
+            let db = db.clone();
+            async move {
+                let mut row = crate::test_support::fetch_item(&db, id).await;
+                row.official_rating = Some(rating.to_owned());
+                crate::test_support::save_item(&db, &row).await;
+            }
+        };
+        let collections = FerrofinCollectionManager::new(
+            db.clone(),
+            Arc::clone(&library),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths(),
+        )
+        .with_visibility(Arc::clone(&visibility));
+
+        let created = collections
+            .create_collection(&CollectionCreationOptions {
+                name: "Heat Collection".to_owned(),
+                item_id_list: vec![heat, unrated],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        assert_eq!(created.official_rating.as_deref(), Some("R"));
+        let set = Uuid::parse_str(&created.id).expect("uuid");
+        assert_eq!(rating(set).await, (Some("R".to_owned()), Some(17)));
+        collections
+            .add_to_collection(set, &[up])
+            .await
+            .expect("add");
+        assert_eq!(rating(set).await, (Some("PG".to_owned()), Some(10)));
+        collections
+            .remove_from_collection(set, &[up, heat])
+            .await
+            .expect("remove");
+        assert_eq!(
+            rating(set).await,
+            (Some("PG".to_owned()), Some(10)),
+            "no rated member left: the set keeps its rating"
+        );
+        // jellyfin-web creates box sets locked; a direct add still re-rates.
+        set_locked(set, true).await;
+        collections
+            .add_to_collection(set, &[heat])
+            .await
+            .expect("re-add");
+        assert_eq!(rating(set).await.0.as_deref(), Some("R"));
+        set_rating(heat, "G").await;
+        collections
+            .add_to_collection(set, &[heat])
+            .await
+            .expect("add an existing member");
+        assert_eq!(
+            rating(set).await.0.as_deref(),
+            Some("R"),
+            "nothing new was added: no re-rate"
+        );
+        collections
+            .remove_from_collection(set, &[])
+            .await
+            .expect("remove nothing");
+        assert_eq!(
+            rating(set).await.0.as_deref(),
+            Some("R"),
+            "the refresh after a removal leaves a locked set alone"
+        );
+        set_locked(set, false).await;
+        sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (?1, ?2)"#)
+            .bind(ferrofin_db::enums::metadata_field::to_i32(
+                ferrofin_model::entities::MetadataField::OfficialRating,
+            ))
+            .bind(ferrofin_db::store::guid_to_db(set))
+            .execute(db.writer())
+            .await
+            .expect("lock the rating");
+        collections
+            .add_to_collection(set, &[up])
+            .await
+            .expect("add");
+        assert_eq!(
+            rating(set).await.0.as_deref(),
+            Some("R"),
+            "a locked rating stays"
+        );
+
+        set_rating(heat, "R").await;
+        // A movie addressed as a collection keeps its own rating.
+        collections
+            .add_to_collection(heat, &[up])
+            .await
+            .expect("add to a movie");
+        assert_eq!(rating(heat).await, (Some("R".to_owned()), None));
+        let playlists = playlist_manager(&db).with_visibility(
+            Arc::clone(&visibility),
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone())),
+        );
+        let playlists = FerrofinPlaylistManager {
+            library_manager: Arc::clone(&library),
+            ..playlists
+        };
+        let created = playlists
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![unrated, heat],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create playlist");
+        let playlist = Uuid::parse_str(&created.id).expect("uuid");
+        assert_eq!(rating(playlist).await, (Some("R".to_owned()), Some(17)));
+        playlists
+            .add_item_to_playlist(playlist, &[up], None, Uuid::nil())
+            .await
+            .expect("add to playlist");
+        assert_eq!(rating(playlist).await.0.as_deref(), Some("PG"));
+        playlists
+            .update_playlist(&PlaylistUpdateRequest {
+                id: playlist,
+                ids: Some(vec![heat]),
+                ..PlaylistUpdateRequest::default()
+            })
+            .await
+            .expect("replace entries");
+        assert_eq!(rating(playlist).await.0.as_deref(), Some("R"));
+        set_locked(playlist, true).await;
+        playlists
+            .add_item_to_playlist(playlist, &[up], None, Uuid::nil())
+            .await
+            .expect("add to a locked playlist");
+        playlists
+            .remove_item_from_playlist(&playlist.to_string(), &[heat.simple().to_string()])
+            .await
+            .expect("remove from playlist");
+        assert_eq!(
+            rating(playlist).await.0.as_deref(),
+            Some("R"),
+            "a locked playlist keeps its rating"
+        );
     }
 
     #[tokio::test]

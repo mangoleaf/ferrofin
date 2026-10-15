@@ -1150,6 +1150,9 @@ pub struct LocalProviderManager {
     /// The people store a refresh writes a provider's credits to (a
     /// season's TMDB cast). Absent → credits are not written.
     people: Option<Arc<dyn ferrofin_traits::persistence::PeopleRepository>>,
+    /// A box set's or playlist's members, which its refresh takes its
+    /// rating from. Absent → the rating is left as stored.
+    linked_children: Option<Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>>,
     /// The culture table TheTVDB's translations are matched against
     /// (`ThreeLetterISOLanguageNames`, `TvdbCultureInfo`). Absent → no
     /// translation matches but TVDB's own `zhtw`/`pt`/`por` codes.
@@ -1231,6 +1234,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_omdb", &self.omdb.is_some())
             .field("has_tvdb", &self.tvdb.is_some())
             .field("has_people", &self.people.is_some())
+            .field("has_linked_children", &self.linked_children.is_some())
             .field("has_localization", &self.localization.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .field(
@@ -1296,6 +1300,7 @@ impl LocalProviderManager {
             omdb: None,
             tvdb: None,
             people: None,
+            linked_children: None,
             localization: None,
             kind_by_type_name: HashMap::new(),
             virtual_folders: None,
@@ -1424,6 +1429,18 @@ impl LocalProviderManager {
         people: Arc<dyn ferrofin_traits::persistence::PeopleRepository>,
     ) -> Self {
         self.people = Some(people);
+        self
+    }
+
+    /// Attaches the linked-children store, so a box set's or playlist's
+    /// refresh takes its members' rating
+    /// (`EnableUpdatingOfficialRatingFromChildren`).
+    #[must_use]
+    pub fn with_linked_children(
+        mut self,
+        linked_children: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>,
+    ) -> Self {
+        self.linked_children = Some(linked_children);
         self
     }
 
@@ -1744,6 +1761,32 @@ impl LocalProviderManager {
                 Vec::new()
             }
         }
+    }
+
+    /// A box set's or playlist's members' official ratings, in link order
+    /// (`Folder.GetLinkedChildren`); none without a linked-children store.
+    async fn member_ratings(
+        &self,
+        items: &dyn ItemRepository,
+        item_id: Uuid,
+    ) -> Result<Vec<Option<String>>, ServiceError> {
+        let Some(linked) = &self.linked_children else {
+            return Ok(Vec::new());
+        };
+        let ids = linked.get_linked_children_ids(item_id, None).await?;
+        // Only the ratings are kept, so a long playlist is never held as rows.
+        let mut ratings = HashMap::new();
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            for row in items.retrieve_items(chunk).await? {
+                if let Ok(id) = Uuid::parse_str(&row.id) {
+                    ratings.insert(id, row.official_rating);
+                }
+            }
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| ratings.get(id).cloned())
+            .collect())
     }
 
     /// The item's locked metadata fields. Without a store nothing is
@@ -2466,6 +2509,36 @@ impl LocalProviderManager {
             None => (None, 0),
         };
         let fetched = fetched.unwrap_or_default();
+        // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
+        // scores ratings against its `GetPreferredMetadataCountryCode()`.
+        let rating_scorer = match (
+            BaseItemKind::from_stored_type_name(&stored.type_),
+            &self.localization,
+        ) {
+            (Some(BaseItemKind::BoxSet | BaseItemKind::Playlist), Some(localization)) => Some((
+                localization,
+                self.preferred_metadata_country_code(&stored).await,
+            )),
+            _ => None,
+        };
+        let mut base = stored.clone();
+        // `BeforeSave` → `UpdateMetadataFromChildren` → `UpdateOfficialRating`
+        // (`MetadataService.cs:404-483,623-635`): past the `isFullRefresh`
+        // gate, an unlocked container without a locked `OfficialRating` takes
+        // its members' rating before the providers merge.
+        if let Some((localization, country)) = &rating_scorer
+            && crate::refresh_plan::full_refresh(&plan, &request)
+            && !stored.is_locked
+            && !locked_fields.contains(&MetadataField::OfficialRating)
+        {
+            let members = self.member_ratings(items.as_ref(), item_id).await?;
+            base.official_rating = crate::metadata_merge::rating_to_items(
+                base.official_rating.as_deref(),
+                members.iter().map(Option::as_deref),
+                |rating| localization.get_rating_score(rating, Some(country)),
+            )
+            .map(str::to_owned);
+        }
         // `RefreshWithProviders`: a locked item merges nothing; otherwise the
         // provider result — starting from what upstream's `temp` starts with,
         // the item's `ParentIndexNumber` and preferred metadata language and
@@ -2473,7 +2546,7 @@ impl LocalProviderManager {
         // when a provider answered (`UpdateType > None`).
         let current = MetadataResult {
             provider_ids: stored_ids.clone(),
-            ..MetadataResult::of(stored.clone())
+            ..MetadataResult::of(base)
         };
         let merge = RefreshMerge::of(
             options,
@@ -2514,6 +2587,17 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
+        // `OnMetadataChanged` (`BaseItem.cs:2935-2967`): the container's
+        // stored parental score follows its own custom, else official, rating.
+        if let Some((localization, country)) = &rating_scorer {
+            let score = [&row.custom_rating, &row.official_rating]
+                .into_iter()
+                .find_map(|rating| rating.as_deref().filter(|r| !r.is_empty()))
+                .and_then(|rating| localization.get_rating_score(rating, Some(country)));
+            row.inherited_parental_rating_value = score.map(|s| i64::from(s.score));
+            row.inherited_parental_rating_sub_value =
+                score.and_then(|s| s.sub_score.map(i64::from));
+        }
         crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
         let image_saved = if fetch.images && self.image_store.is_some() {
@@ -9465,6 +9549,112 @@ mod tests {
             store.replaced.lock().expect("lock").clone(),
             vec![(item_id, vec![("Tmdb".to_owned(), "2344".to_owned())])]
         );
+    }
+
+    /// A container's members, for its rating (`GetLinkedChildren`).
+    struct Members(Vec<Uuid>);
+
+    #[async_trait]
+    impl ferrofin_traits::persistence::LinkedChildrenService for Members {
+        async fn get_linked_children_ids(
+            &self,
+            _parent_id: Uuid,
+            _child_type: Option<i32>,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(self.0.clone())
+        }
+        async fn find_artists(
+            &self,
+            _artist_names: &[String],
+        ) -> Result<HashMap<String, Vec<BaseItemEntity>>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_manual_linked_parent_ids(
+            &self,
+            _child_id: Uuid,
+            _parent_type: Option<BaseItemKind>,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn reroute_linked_children(
+            &self,
+            _from_child_id: Uuid,
+            _to_child_id: Uuid,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn upsert_linked_child(
+            &self,
+            _parent_id: Uuid,
+            _child_id: Uuid,
+            _child_type: i32,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// Issue #55: past `isFullRefresh` a playlist (as a box set) takes the
+    /// least restrictive of its members' ratings, unrated members ignored, and
+    /// its stored parental score follows. A Default refresh of a refreshed
+    /// playlist, a locked `OfficialRating` and a locked item keep the rating.
+    #[rstest::rstest]
+    #[case::force_save(true, false, &[], Some("PG"), Some(10))]
+    #[case::not_a_full_refresh(false, false, &[], Some("R"), Some(17))]
+    #[case::locked_rating(true, false, &[MetadataField::OfficialRating], Some("R"), Some(17))]
+    #[case::locked_item(true, true, &[], Some("R"), Some(17))]
+    #[tokio::test]
+    async fn a_playlist_refresh_takes_its_members_rating(
+        #[case] force_save: bool,
+        #[case] is_locked: bool,
+        #[case] locked: &[MetadataField],
+        #[case] rating: Option<&str>,
+        #[case] score: Option<i64>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Movies.BoxSet", "Mix");
+        stored.type_ = "MediaBrowser.Controller.Playlists.Playlist".to_owned();
+        stored.id = item_id.to_string();
+        stored.official_rating = Some("R".to_owned());
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        stored.is_locked = is_locked;
+        let mut rows = HashMap::from([(item_id, stored.clone())]);
+        let mut members = Vec::new();
+        for member_rating in [Some("R"), None, Some("PG")] {
+            let mut member = row("Movie", "Member");
+            member.official_rating = member_rating.map(str::to_owned);
+            let id = Uuid::parse_str(&member.id).expect("uuid");
+            members.push(id);
+            rows.insert(id, member);
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore {
+            locked: HashMap::from([(item_id, locked.to_vec())]),
+            ..RecordingStore::default()
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems { rows, seen: tx }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_localization(Arc::new(EnglishAndFrench))
+            .with_linked_children(Arc::new(Members(members)));
+        let options = MetadataRefreshOptions {
+            force_save,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_full_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let row = store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("saved: the stored parental score starts unset");
+        assert_eq!(row.official_rating.as_deref(), rating);
+        assert_eq!(row.inherited_parental_rating_value, score);
     }
 
     /// A season with no folder of its own (a virtual season) refreshes here,
