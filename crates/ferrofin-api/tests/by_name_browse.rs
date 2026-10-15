@@ -291,6 +291,13 @@ impl LibraryManager for ByNameLibrary {
         };
         Ok(row.into_iter().collect())
     }
+    /// No content restrictions in this fixture.
+    async fn build_access_filter(
+        &self,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Ok(None)
+    }
     /// Backs the `get_people_items` default for `GET /Persons`.
     async fn get_people(&self, q: &InternalPeopleQuery) -> Result<Vec<PeopleEntity>, ServiceError> {
         // Nobody is favorited in this fixture: a favorites-scoped query (the

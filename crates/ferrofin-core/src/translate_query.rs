@@ -2249,14 +2249,16 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
     .collect()
 }
 
-/// A by-name row remains visible only while related media satisfies the
-/// scoped user's parental restrictions (`ApplyItemByNameAccessFiltering`).
-fn append_by_name_rating_access(
+/// A by-name row remains visible only while related media sits in the scoped
+/// user's libraries and satisfies their parental restrictions
+/// (`ApplyItemByNameAccessFiltering`). Skipped when nothing is hidden from the
+/// user, as upstream gates it on `UserHasContentRestrictions`.
+fn append_by_name_access(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     kinds: &[String],
 ) {
-    if !has_parental_restrictions(filter) {
+    if !filter.user_has_content_restrictions {
         return;
     }
     for (kind, values) in [
@@ -2356,7 +2358,7 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
                 &to_guid_strings(&filter.top_parent_ids),
             );
             qb.push("))");
-            append_by_name_rating_access(qb, filter, &by_name);
+            append_by_name_access(qb, filter, &by_name);
         }
     }
     if !filter.ancestor_ids.is_empty() {

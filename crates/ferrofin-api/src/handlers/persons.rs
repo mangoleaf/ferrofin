@@ -149,6 +149,9 @@ async fn get_persons(
         name_starts_with_or_greater: query.name_starts_with_or_greater.clone(),
         user_id: Some(user_id),
         is_favorite,
+        // People belong to no library: what a restricted user may see follows
+        // from the items they are credited on.
+        access_filter: state.library.build_access_filter(&user).await?,
         ..InternalPeopleQuery::default()
     };
     let result = state.library.get_people_items(&people_query).await?;

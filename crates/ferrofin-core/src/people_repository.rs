@@ -16,7 +16,8 @@
 //!   candidates), ordered by name;
 //! - `parent_id`, `person_types`/`exclude_person_types` (alphanumeric only),
 //!   `max_list_order`, and the name range/substring predicates are applied as in
-//!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
+//!   C#. The `is_favorite` user-data path is honored via a `UserData` join, and
+//!   the `access_filter` keeps only people credited on an item the user can see.
 
 use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
 
@@ -555,9 +556,8 @@ fn is_valid_person_type(value: &str) -> bool {
 
 /// Appends the shared `TranslateQuery` predicates (favorite, item scope,
 /// parent scope, appears-in item, person-type in/out, max list order, name
-/// range/substring, must-have-item) on the `Peoples` row aliased `alias`, onto
-/// a builder with a
-/// `WHERE` clause already open. The by-name dedup applies them twice: to the
+/// range/substring, must-have-item, access filter) on the `Peoples` row aliased
+/// `alias`, onto a builder with a `WHERE` clause already open. The by-name dedup applies them twice: to the
 /// candidate rows its representative is chosen from (`d`) and to the outer row
 /// (`p`).
 #[allow(clippy::too_many_lines)] // one arm per C# `TranslateQuery` predicate
@@ -680,6 +680,53 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, 
         qb.push(" AND ");
         qb.push(has_person_item(alias));
     }
+    if filter.access_filter.is_some() {
+        qb.push(" AND ").push(accessible_person(alias));
+    }
+}
+
+/// Opens the statement. Under an access filter (C# `AccessFilter`) it starts
+/// with `AccessiblePeople`: the people credited on an item the filter keeps — in
+/// the user's libraries and within their parental and tag restrictions
+/// (`ApplyAccessFiltering`). The filter sets `IncludeOwnedItems`, so a credit
+/// on an alternate version or an extra counts.
+///
+/// Upstream tests each person with a correlated `Any()` over their credits. Run
+/// for every `Peoples` row the total visits, that measured ~8x slower on the
+/// bench library than building the set once, from the libraries' items
+/// (`IX_BaseItems_TopParentId_Id`) to their credits (the map's primary key).
+fn open_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
+    let mut qb = QueryBuilder::new("");
+    let Some(access) = &filter.access_filter else {
+        return qb;
+    };
+    debug_assert!(
+        access.include_owned_items,
+        "the people access filter always admits owned items"
+    );
+    qb.push(
+        r#"WITH "AccessiblePeople" AS MATERIALIZED (SELECT acm."PeopleId" FROM "BaseItems" aci
+            CROSS JOIN "PeopleBaseItemMap" acm ON acm."ItemId" = aci."Id" WHERE 1 = 1"#,
+    );
+    if !access.top_parent_ids.is_empty() {
+        qb.push(" AND ");
+        crate::translate_query::push_in_list(
+            &mut qb,
+            r#"aci."TopParentId""#,
+            &crate::translate_query::to_guid_strings(&access.top_parent_ids),
+        );
+    }
+    crate::translate_query::append_parental_restrictions(&mut qb, access, "aci");
+    qb.push(") ");
+    qb
+}
+
+/// The access filter on the `Peoples` row aliased `alias`: one of the
+/// [`open_query`] statement's `AccessiblePeople`. The `+` keeps the planner
+/// from driving the query off the set, which would lose the name index's order
+/// and dedup every person before the `LIMIT`.
+fn accessible_person(alias: &str) -> String {
+    format!(r#"+{alias}."Id" IN "AccessiblePeople""#)
 }
 
 /// C# `MustHaveItem`: a `Person` item with exactly this credit's name exists
@@ -709,10 +756,12 @@ fn appears_in_item(item_id: Uuid, alias: &str) -> String {
     )
 }
 
-/// Opens `SELECT <cols> FROM "Peoples" p WHERE 1 = 1`, ready for
-/// [`push_predicates`].
-fn base_query(cols: &str) -> QueryBuilder<Sqlite> {
-    QueryBuilder::new(format!(r#"SELECT {cols} FROM "Peoples" p WHERE 1 = 1"#))
+/// Opens `SELECT <cols> FROM "Peoples" p WHERE 1 = 1` (after the access
+/// filter's set, [`open_query`]), ready for [`push_predicates`].
+fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
+    let mut qb = open_query(filter);
+    qb.push(format!(r#"SELECT {cols} FROM "Peoples" p WHERE 1 = 1"#));
+    qb
 }
 
 /// Restricts a plain `"Peoples"` scan to one representative row per lower-cased
@@ -758,15 +807,26 @@ fn push_dedup_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQu
 /// `candidates.Select(Name.ToLower).Distinct().Count()`), which is no longer
 /// index-only: each `Peoples` row costs an `IX_BaseItems_Name` seek plus a
 /// `BaseItems` row read to check `Type`, the same per-row probe upstream's
-/// `MustHaveItem` pays.
+/// `MustHaveItem` pays. Under the access filter it counts only the names with
+/// an accessible credit, a lookup in the set [`open_query`] built once.
 fn distinct_names_count(filter: &InternalPeopleQuery) -> String {
-    if filter.must_have_item {
+    let conditions: Vec<String> = [
+        filter.must_have_item.then(|| has_person_item("c")),
+        filter
+            .access_filter
+            .is_some()
+            .then(|| accessible_person("c")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if conditions.is_empty() {
+        r#"(SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples")"#.to_owned()
+    } else {
         format!(
             r#"(SELECT COUNT(DISTINCT c."Name" COLLATE NOCASE) FROM "Peoples" c WHERE {})"#,
-            has_person_item("c")
+            conditions.join(" AND ")
         )
-    } else {
-        r#"(SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples")"#.to_owned()
     }
 }
 
@@ -784,9 +844,9 @@ const TOTAL_FILTERED_WINDOW: &str = r#"COUNT(*) OVER() AS "TotalCount""#;
 /// collapsed by lower-cased name, so its size is a distinct count that needs no
 /// aggregate over the representative rows ([`distinct_names_count`]).
 /// `max_list_order` is deliberately absent: it is only emitted for an
-/// item-scoped query, which never reaches the by-name path. So is
-/// `must_have_item`: the distinct count applies it itself, keeping the default
-/// `/Persons` page off the window function.
+/// item-scoped query, which never reaches the by-name path. So are
+/// `must_have_item` and the access filter: the distinct count applies them
+/// itself, keeping the default `/Persons` page off the window function.
 fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
     let name_bound = [
         &filter.name_contains,
@@ -823,7 +883,10 @@ fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     } else {
         format!(r#"{} AS "TotalCount""#, distinct_names_count(filter))
     };
-    let mut qb = base_query(&format!(r#"p."Id", p."Name", p."PersonType", {total}"#));
+    let mut qb = base_query(
+        &format!(r#"p."Id", p."Name", p."PersonType", {total}"#),
+        filter,
+    );
     push_predicates(&mut qb, filter, "p");
     push_dedup_predicate(&mut qb, filter);
     // Upstream orders by `Name.ToLower()`, which EF sends to SQLite as
@@ -855,13 +918,15 @@ impl FerrofinPeopleRepository {
     /// aggregate over the representative rows.
     async fn count_people_total(&self, filter: &InternalPeopleQuery) -> Result<i64, ServiceError> {
         if !narrows_by_name(filter) {
-            return QueryBuilder::<Sqlite>::new(format!("SELECT {}", distinct_names_count(filter)))
+            let mut qb = open_query(filter);
+            qb.push(format!("SELECT {}", distinct_names_count(filter)));
+            return qb
                 .build_query_scalar()
                 .fetch_one(self.db.pool())
                 .await
                 .map_err(db_err);
         }
-        let mut qb = base_query("COUNT(*)");
+        let mut qb = base_query("COUNT(*)", filter);
         push_predicates(&mut qb, filter, "p");
         push_dedup_predicate(&mut qb, filter);
         let count: i64 = qb
@@ -991,7 +1056,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
                     ORDER BY mr."ListOrder" LIMIT 1) AS "Role""#,
                 guid_to_db(filter.item_id)
             );
-            let mut qb = base_query(&cols);
+            let mut qb = base_query(&cols, filter);
             push_predicates(&mut qb, filter, "p");
             qb.push(
                 r#" ORDER BY (SELECT MIN(mo."ListOrder") FROM "PeopleBaseItemMap" mo
@@ -1253,7 +1318,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<Vec<String>, ServiceError> {
-        let mut qb = base_query(r#"DISTINCT p."Name""#);
+        let mut qb = base_query(r#"DISTINCT p."Name""#, filter);
         push_predicates(&mut qb, filter, "p");
         qb.push(r#" ORDER BY p."Name""#);
         let mut names: Vec<String> = qb
@@ -2918,5 +2983,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #61: under an access filter a person is kept only when one of
+    /// their credits is on an item the filter admits, and — since upstream
+    /// dedups the filtered candidates — the representative is chosen among the
+    /// rows that pass. Ann's lowest-id row is an Actor credit in the closed
+    /// library; her Director credit is in the open one, so she must still be
+    /// listed and counted once. Bob is credited only in the closed library.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn access_filter_keeps_people_credited_on_an_admitted_item() {
+        let db = test_db().await;
+        let (open, closed) = (Uuid::from_u128(0x6101), Uuid::from_u128(0x6102));
+        let (open_movie, closed_movie) = (Uuid::from_u128(0x6103), Uuid::from_u128(0x6104));
+        crate::test_support::seed_top_parented_item(
+            &db,
+            open_movie,
+            BaseItemKind::Movie,
+            "o",
+            open,
+        )
+        .await;
+        crate::test_support::seed_top_parented_item(
+            &db,
+            closed_movie,
+            BaseItemKind::Movie,
+            "c",
+            closed,
+        )
+        .await;
+        for (row, name, person_type, item) in [
+            (1, "Ann", "Actor", closed_movie),
+            (2, "Ann", "Director", open_movie),
+            (3, "Bob", "Actor", closed_movie),
+        ] {
+            let row = Uuid::from_u128(row);
+            super::seed_people_row(&db, row, name, person_type).await;
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, '')"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(row))
+            .execute(db.writer())
+            .await
+            .expect("credit");
+        }
+        for (id, name) in [(0x6105, "Ann"), (0x6106, "Bob")] {
+            seed_named_item(&db, Uuid::from_u128(id), BaseItemKind::Person, name).await;
+        }
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        let query = |top_parent_ids: Vec<Uuid>, limit| InternalPeopleQuery {
+            limit,
+            must_have_item: true,
+            access_filter: Some(ferrofin_traits::options::InternalItemsQuery {
+                top_parent_ids,
+                include_owned_items: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for limit in [0, 1] {
+            let page = repo
+                .get_people(&query(vec![open], limit))
+                .await
+                .expect("people");
+            let rows: Vec<_> = page
+                .items
+                .iter()
+                .map(|p| (p.name.as_str(), p.person_type.as_deref()))
+                .collect();
+            assert_eq!(rows, [("Ann", Some("Director"))], "limit {limit}");
+            assert_eq!(page.total_record_count, 1, "limit {limit}");
+        }
+        let names = repo
+            .get_people_names(&query(vec![open], 0))
+            .await
+            .expect("names");
+        assert_eq!(names, ["Ann"]);
+        let page = repo
+            .get_people(&query(vec![open, closed], 0))
+            .await
+            .expect("people");
+        assert_eq!(page.total_record_count, 2);
+
+        // Every statement shape opens with the set: the narrowed page (window
+        // total) and, past the last row, both fallback counts.
+        let narrowed = |start_index| InternalPeopleQuery {
+            person_types: vec!["Director".to_owned()],
+            start_index,
+            ..query(vec![open], 10)
+        };
+        let page = repo.get_people(&narrowed(None)).await.expect("narrowed");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total_record_count, 1);
+        for past_the_end in [
+            narrowed(Some(5)),
+            InternalPeopleQuery {
+                start_index: Some(5),
+                ..query(vec![open], 10)
+            },
+        ] {
+            let page = repo.get_people(&past_the_end).await.expect("past the end");
+            assert!(page.items.is_empty());
+            assert_eq!(page.total_record_count, 1);
+        }
+
+        // The accessible set is built once, from the libraries' items to their
+        // credits; the page still walks the name index in order and the total
+        // stays the scalar distinct count, so the `LIMIT` still ends the walk.
+        let sql = super::by_name_page_query(&query(vec![open], 100))
+            .into_sql()
+            .as_str()
+            .to_owned();
+        assert!(!sql.contains("OVER()"), "{sql}");
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        let count = |needle: &str| details.iter().filter(|d| d.contains(needle)).count();
+        assert_eq!(count("MATERIALIZE AccessiblePeople"), 1, "{details:?}");
+        assert_eq!(
+            count("SEARCH aci USING COVERING INDEX IX_BaseItems_TopParentId_Id (TopParentId=?)"),
+            1,
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with("SEARCH acm ") && d.ends_with("(ItemId=?)")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|d| d
+                .starts_with("SCAN p USING COVERING INDEX FerrofinIX_Peoples_NameNoCase_Cover")),
+            "{details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|d| d.contains("TEMP B-TREE FOR ORDER BY")),
+            "{details:?}"
+        );
     }
 }

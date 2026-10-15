@@ -2,6 +2,8 @@
 
 use uuid::Uuid;
 
+use super::InternalItemsQuery;
+
 /// A query over the people (cast/crew) associated with items.
 ///
 /// Mirrors C# `InternalPeopleQuery`. The C# `User` domain property is dropped:
@@ -9,7 +11,7 @@ use uuid::Uuid;
 /// per the port's identity-as-[`Uuid`] rule. All collections default to empty
 /// and all optional filters to `None`, so [`Default`] matches the parameterless
 /// C# constructor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct InternalPeopleQuery {
     /// The index of the first result to return (pagination offset).
     pub start_index: Option<i32>,
@@ -58,6 +60,14 @@ pub struct InternalPeopleQuery {
     /// (`GetPeopleItems`), so the total they report describes the people they
     /// can return (C# `MustHaveItem`, Jellyfin 12.2).
     pub must_have_item: bool,
+
+    /// The item query whose access settings (library access, parental rating,
+    /// tags) a person must satisfy through at least one item they are credited
+    /// on (C# `AccessFilter`, Jellyfin 12.2). People belong to no library, so
+    /// only their credits say whether a user may see them. `None` applies no
+    /// restriction, which is what `/Persons` passes for a user nothing is
+    /// hidden from.
+    pub access_filter: Option<InternalItemsQuery>,
 }
 
 #[cfg(test)]
@@ -75,6 +85,7 @@ mod tests {
         assert!(q.user_id.is_none());
         assert!(q.is_favorite.is_none());
         assert!(!q.must_have_item);
+        assert!(q.access_filter.is_none());
     }
 
     #[test]
