@@ -431,13 +431,11 @@ impl FerrofinUserManager {
             return Ok(None);
         };
         let base = base.resolve();
-        let path: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Path" FROM "ImageInfos" WHERE "UserId" = ?1"#)
-                .bind(guid_to_db(user_id))
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(db_err)?;
-        let Some(from) = path.map(std::path::PathBuf::from) else {
+        let user_id = guid_to_db(user_id);
+        let image = user_repository::profile_image(&mut *conn, &user_id)
+            .await
+            .map_err(db_err)?;
+        let Some(from) = image.map(|i| std::path::PathBuf::from(i.path)) else {
             return Ok(None);
         };
         let Some(file_name) = from
@@ -448,10 +446,7 @@ impl FerrofinUserManager {
         };
         let to_dir = base.join(new_name);
         let to = to_dir.join(file_name);
-        sqlx::query(r#"UPDATE "ImageInfos" SET "Path" = ?2 WHERE "UserId" = ?1"#)
-            .bind(guid_to_db(user_id))
-            .bind(to.to_string_lossy().as_ref())
-            .execute(&mut *conn)
+        user_repository::set_profile_image_path(&mut *conn, &user_id, &to.to_string_lossy())
             .await
             .map_err(db_err)?;
         tokio::fs::create_dir_all(&to_dir)
@@ -1387,20 +1382,9 @@ impl UserManager for FerrofinUserManager {
             .map_err(|e| ServiceError::backend(format!("write profile image: {e}")))?;
         // One image per user: replace any existing row (unique index on UserId).
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
-            .bind(&user.id)
-            .execute(&mut *tx)
+        user_repository::replace_profile_image(&mut tx, &user.id, &dest.to_string_lossy())
             .await
             .map_err(db_err)?;
-        sqlx::query(
-            r#"INSERT INTO "ImageInfos" ("LastModified", "Path", "UserId") VALUES (?1, ?2, ?3)"#,
-        )
-        .bind(datetime_to_db(chrono::Utc::now()))
-        .bind(dest.to_string_lossy().as_ref())
-        .bind(&user.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
@@ -1410,12 +1394,9 @@ impl UserManager for FerrofinUserManager {
         // `DeleteUserImage`: delete the file, then the row. The row delete is held
         // open so a failure C# lets escape keeps it, as upstream does.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        let path: Option<String> =
-            sqlx::query_scalar(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1 RETURNING "Path""#)
-                .bind(&user.id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
+        let path = user_repository::delete_profile_image(&mut *tx, &user.id)
+            .await
+            .map_err(db_err)?;
         if let Some(path) = path {
             match tokio::fs::remove_file(&path).await {
                 // C# `File.Delete` ignores a missing file.
@@ -1445,13 +1426,9 @@ impl UserManager for FerrofinUserManager {
         &self,
         user_id: Uuid,
     ) -> Result<Option<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
-        let row = sqlx::query_as::<_, ferrofin_db::entities::users::ImageInfoEntity>(
-            r#"SELECT * FROM "ImageInfos" WHERE "UserId" = ?1 LIMIT 1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let row = user_repository::profile_image(self.db.pool(), &guid_to_db(user_id))
+            .await
+            .map_err(db_err)?;
         Ok(row.map(|r| ferrofin_traits::options::ItemImageInfo {
             path: r.path,
             image_type: ferrofin_model::entities::ImageType::Profile,
