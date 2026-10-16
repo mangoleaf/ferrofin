@@ -1032,7 +1032,8 @@ mod tests {
         let report = fx.providers.refresh_all().await.expect("pass");
         // Exactly one by-name row carries "Jazz" — the `MusicGenre` row the
         // scanner materializes for a music item's genre — and it earns the
-        // collage. `/MusicGenres` browses it; the Genres tab does not list it.
+        // collage. `/MusicGenres` and a music library's Genres tab list it; an
+        // unscoped or non-music Genres tab does not.
         assert_eq!(report.generated, 1);
         let genre_id = Uuid::parse_str(&genre.id).expect("id");
         let primary = fx.primary_of(genre_id).await.expect("music genre primary");

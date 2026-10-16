@@ -906,10 +906,11 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Genres",
         upstream_file: "Jellyfin.Api/Controllers/GenresController.cs",
         upstream_method: "GetGenres",
-        ferrofin: "handlers/genres.rs get_genres → handlers/by_name.rs → ferrofin-core \
+        ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
+               get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-09-03",
-        divergences: GENRES_DIVERGENCES,
+        date: "2026-10-16",
+        divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
     },
     Verified {
         method: "get",
@@ -954,6 +955,7 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
+    UNKNOWN_PARENT_ID_DIVERGENCE,
     "/Artists is the performer (ItemValueType.Artist) tab, and its rows are the \
      MusicArtist items that exist: Jellyfin's ArtistsValidator materializes a MusicArtist \
      item for every artist name, Ferrofin's scanner only for album artists \
@@ -991,6 +993,7 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
      one gets a narrowed or re-ordered list here and the full SortName-ordered list there.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
+    UNKNOWN_PARENT_ID_DIVERGENCE,
     "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
      inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
      alternate-version / owned-item exclusion is.",
@@ -999,27 +1002,14 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
      append_by_name_filters.",
 ];
 
-/// `/Genres` on top of [`BY_NAME_DIVERGENCES_GENRES_STUDIOS`].
-const GENRES_DIVERGENCES: &[&str] = &[
-    "v12 answers /Genres?parentId=<music or musicvideos collection folder> from \
-     GetMusicGenres (MusicGenre rows, GenresController.cs:141-149); Ferrofin always \
-     answers from the Genre rows. Un-defer path: read the parent's CollectionType \
-     (collection_type_of) in handlers/genres.rs and branch as the controller does.",
-    "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
-     user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
-     ported.",
-    "The shared query struct honors `filters`, `mediaTypes`, `genres`, `tags`, `years`, \
-     `officialRatings`, `genreIds`, `studioIds`, which GenresController does not declare \
-     (ASP.NET ignores them). A client sending one gets a narrowed list here.",
-    "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
-     AncestorIds in every case, so a non-folder parent answers with nothing.",
-    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
-     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
-     alternate-version / owned-item exclusion is.",
-    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
-     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
-     append_by_name_filters.",
-];
+/// Included in the divergence lists of the five by-name VERIFIED rows; the
+/// text also names `/Years` and `/Items/Filters`, which have no row to carry it.
+const UNKNOWN_PARENT_ID_DIVERGENCE: &str = "A `parentId` naming no item: v12's GetParentItem \
+     throws ArgumentException (400 via ExceptionMiddleware); Ferrofin answers 200 with an \
+     empty list. The same holds on /Genres, /MusicGenres, /Studios, /Artists, \
+     /Artists/AlbumArtists, /Years, and /Items/Filters unless includeItemTypes is a lone \
+     Trailer/Program (there the answer is empty filters). Fix path: answer \
+     ApiError::BadRequest(\"Invalid parent id: …\") as items.rs does.";
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the
