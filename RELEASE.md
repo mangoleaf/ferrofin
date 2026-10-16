@@ -33,15 +33,63 @@ major is `0`; use `force_version` for that.
 
 ## Cutting an app release `vX.Y.Z`
 
+Pick the branch to release from:
+- **Feature releases** (a new minor or major) are cut from the current `release/vX.Y.Z` branch.
+  Only one exists at a time.
+- **Patch releases** of the version already out (`vX.Y.Z+1`, bug fixes only) can be cut
+  directly from `main`, which carries the released line.
+
+Either way, the steps are the same; "the release branch" below means the branch you release
+from.
+
 1. **Ensure the branch is green** — the `CI` workflow (lint, tests, per-crate coverage gate)
-   must have succeeded on the commit you are releasing; the workflow refuses otherwise.
-2. **Actions → Release → Run workflow** on `main`, or on a `release/vX.Y.Z` branch when the
-   release's scope is frozen while `main` moves on. Leave `force_version` empty to accept
-   the derived version, or set it to `vX.Y.Z`. The job pushes the annotated tag; it does
-   **not** commit to the branch. A release branch merges back into `main` with a merge
+   must have succeeded on the commit you are releasing; the workflow refuses otherwise. `main`
+   gets CI on every push. A `release/vX.Y.Z` head gets it through the release PR
+   (release branch → `main`), so keep that PR open.
+2. **Freeze and measure the release branch.** PRs are not benchmarked individually, so this
+   is the only performance gate.
+
+   **Freeze.** From here until the tag exists, nothing merges into the release branch. If its
+   head moves anyway, start again from step 1: the workflow tags the head at the time it
+   runs.
+
+   **Benchmark** the release commit as [`bench/README.md`](bench/README.md) describes:
+   - Run the full `bench/run.sh` three times, with both Jellyfins in each run, so every
+     cell has its Jellyfin comparison and its `⚠` notes.
+   - In the same window, interleaved with those runs, measure the previous release as the
+     baseline: `bench/run.sh --out bench/runs/vPREV-baseline-N` with
+     `ghcr.io/mangoleaf/ferrofin:vPREV` tagged as `ferrofin:bench`.
+     - Run names come from the checked-out commit, so without `--out` the baseline would be
+       filed as a candidate run.
+     - Use a fresh directory for each attempt (`-N`): `run.sh` never reuses a run directory.
+     - Keep the two images under their own tags and `docker tag` the right one to
+       `ferrofin:bench` before each run.
+   - In `python3 bench/report.py --serve`, tick the three release runs and pick the
+     baseline directory as the baseline.
+
+   A latency or memory regression against the baseline, or a `⚠` response-shape note that
+   the baseline does not have, blocks the release until it is fixed or the maintainer
+   accepts it. The viewer shows notes for the release runs only. The baseline's own notes are
+   in its `report.md` (`bench/runs/vPREV-baseline-N/report.md`).
+
+   **Validate adoption.** Run the full adoption validation in
+   [`adoption/README.md`](adoption/README.md) against the image built from the release
+   commit: `adoption/run.sh` **and** the synthetic preservation matrix. An adoption failure
+   is never waived; fix it, which means starting again from step 1. Dropping a Jellyfin
+   version instead is also a code change: the adoption gate in
+   `crates/ferrofin-db/src/database.rs` must refuse it, and versions that share a
+   migration set go together.
+3. **Actions → Release → Run workflow** on the branch you are releasing from. Leave `force_version` empty
+   to accept the derived version, or set it to `vX.Y.Z`. The job pushes the annotated tag;
+   it does **not** commit to the branch. A release branch merges back into `main` with a merge
    commit (never squash or rebase), so the release tag stays reachable from `main`.
-3. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
+4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
    Watch it finish, then verify (below).
+5. **Record the results** after the tag, so the record never moves the frozen head: note the
+   benchmark result in the release PR (release branch → `main`), or in the GitHub Release for
+   a patch release from `main`, and update the adoption test record in `adoption/README.md`.
+   After a patch release from `main`, merge `main` into the open release branch so the fix
+   is carried forward.
 
 The workflow needs the repository secret `RELEASE_TOKEN`: a fine-grained personal
 access token for this repository with **Contents: read and write**. Tags pushed with the

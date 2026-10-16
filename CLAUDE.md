@@ -256,12 +256,13 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
-### Perf changes still need evidence — the v3 benchmark is in `bench/`
+### Performance is measured per release, not per PR — the v3 benchmark is in `bench/`
 **Suite v3 exists and is the tool to use** (v2, formerly `suite/`, was scrapped by owner
 decision on 2026-09-02 for policing itself instead of answering questions; do not
 resurrect it from git history). v3 answers four questions and nothing else:
-latency (screens and endpoints), time to first screen, memory, and API parity. Read
-[`bench/README.md`](bench/README.md) first — it defines every number in one sentence.
+latency (screens and endpoints), time to first screen, memory, and response shape vs
+Jellyfin. Read [`bench/README.md`](bench/README.md) first — it defines every number in one
+sentence.
 
 ```bash
 # needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
@@ -281,13 +282,32 @@ Publishable numbers come from **three** runs — `report.py` takes the median an
 range each cell spanned.
 
 `bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
-run deliberately — `bench/run.sh --servers ferrofin --only loaded` on two builds is the
-cheap form for a before/after, skipping both Jellyfins. So the standing rule is unchanged: body-diff correctness is not a
-latency signal — a 100× slowdown can land "green." Any change touching `ferrofin-core`,
-`ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths (`translate_query`,
-`item_repository`, `dto_service`) must come with a measured before/after stated in the
-summary — from `bench/` where the change is on a benchmarked path, else hyperfine/curl
-against a locally run server on the same data.
+run deliberately. **Measurement gates releases, not PRs** (owner decision 2026-10-16), which
+keeps day-to-day work fast:
+- No PR needs a `bench/` or hyperfine before/after. That includes issue fixes, features,
+  `perf:` changes and query-plan changes. A plan change still needs its `EXPLAIN QUERY PLAN`
+  pin test (below).
+- Every app release is measured before it is tagged, on the branch it is cut from:
+  - feature releases come from the current `release/vX.Y.Z`. Only one exists at a time; it
+    moves until it is frozen for the release;
+  - patch releases of the released line come from `main`.
+
+  `RELEASE.md` has the procedure: three full `bench/run.sh` runs on the release commit, plus
+  the previous release's image as a baseline measured in the same window.
+- A latency or memory regression against that baseline blocks the release until it is
+  fixed or the owner accepts it. So does a `⚠` response-shape note the baseline does not
+  have.
+- When chasing a regression, `bench/run.sh --servers ferrofin --only loaded` on two builds is
+  the cheap form, skipping both Jellyfins.
+
+Parity in the project's sense, implementation compared against the upstream C# and recorded
+in `handlers::VERIFIED`, is still done per change. Only measurement moved.
+
+The reason for the release gate is unchanged: body-diff correctness is not a latency signal,
+and a 100× slowdown can land "green." So a PR touching `ferrofin-core`, `ferrofin-db`,
+`ferrofin-api`, or the query/repository/DTO paths (`translate_query`, `item_repository`,
+`dto_service`) notes that in its description, and the release run is read against those
+notes.
 
 **Never accept an index or a plan change from an isolated statement measurement** — a
 statement that gets faster alone routinely drags a hotter query onto the wrong index. Prefer
@@ -306,8 +326,11 @@ fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them 
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
-chain, the adoption gate or the boot repairs.  The shell tests in CI exercise the harness
-without these live fixtures.
+chain, the adoption gate or the boot repairs, because those risk user data. This per-change
+requirement is unaffected by the release-branch rule above. The full adoption validation
+(`adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
+and a failure there blocks the release (see `RELEASE.md`).
+The shell tests in CI exercise the harness without these live fixtures.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

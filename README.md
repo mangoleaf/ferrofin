@@ -311,7 +311,8 @@ Crate map, the C#-to-Rust mapping, and the porting rules: [`docs/ARCHITECTURE.md
 ## Contributing
 
 Every change is gated behind `cargo fmt`, `clippy -D warnings`, the full test suite, and
-an 80 % per-crate line-coverage floor. Perf-touching changes need a measured before/after.
+an 80 % per-crate line-coverage floor. Performance and memory are benchmarked before each
+release.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE.md`](CLAUDE.md).
 
 Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).
