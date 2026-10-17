@@ -804,14 +804,34 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The upstream Jellyfin release every [`VERIFIED`] row was compared against —
-/// one fact for the whole record, so no row can carry a wrong tag or commit.
-/// Owner decision (2026-09-02): Jellyfin 12 (10.12 in all but name) is the source
-/// of truth; where 10.11.8 differs from it, 10.11.8 is the one that is wrong.
-/// The vendored OpenAPI contract stays 10.11.8 — the API surface did not move.
-pub const UPSTREAM_TAG: &str = "v12.0-rc7";
+/// The upstream Jellyfin release behaviour is ported from and every [`VERIFIED`]
+/// row is compared against, except the rows in [`VERIFIED_AGAINST_EARLIER_PIN`].
+/// It is one fact for the whole record, so no row can carry a wrong tag or commit.
+/// Owner decisions: Jellyfin 12 (10.12 in all but name) is the source of truth,
+/// and where 10.11.8 differs from it, 10.11.8 is the one that is wrong
+/// (2026-09-02). The pin is always the **latest Jellyfin release**, never a
+/// release candidate: when a newer one ships, move this tag and commit to it and
+/// list every row not already listed in [`VERIFIED_AGAINST_EARLIER_PIN`] under
+/// the old tag (2026-10-16). The vendored OpenAPI contract stays 10.11.8: that is
+/// the API clients speak, even though Jellyfin 12 dropped operations from it.
+pub const UPSTREAM_TAG: &str = "v12.2";
 /// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
-pub const UPSTREAM_COMMIT: &str = "4910aafa1a";
+pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
+
+/// [`VERIFIED`] rows last compared against an earlier pin, as
+/// `(method, path, tag compared against)`. They are completed verification work,
+/// but not against [`UPSTREAM_TAG`], and the parity line counts them apart.
+/// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
+/// from this list. `v12.0-rc7` is commit `4910aafa1a`.
+pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
+    ("get", "/Shows/NextUp", "v12.0-rc7"),
+    ("get", "/Artists", "v12.0-rc7"),
+    ("get", "/Artists/AlbumArtists", "v12.0-rc7"),
+    ("get", "/Genres", "v12.0-rc7"),
+    ("get", "/MusicGenres", "v12.0-rc7"),
+    ("get", "/Studios", "v12.0-rc7"),
+    ("get", "/UserItems/Resume", "v12.0-rc7"),
+];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -841,20 +861,26 @@ pub struct Verified {
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
-/// ([`UPSTREAM_TAG`]) for behavioral equivalence: parameters honored and their
+/// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
+/// names for that row) for behavioral equivalence: parameters honored and their
 /// defaults, filters, sort, paging, DTO field set and nullability, status
 /// codes, side effects, auth rules.
 ///
 /// Rules, in full:
-/// - a row exists ⇔ the operation is deep-verified; there is no other state and
-///   no other published count (runtime probes are supporting evidence only);
+/// - a row exists ⇔ the operation is deep-verified; the only other state is
+///   being listed in [`VERIFIED_AGAINST_EARLIER_PIN`] (verified against an
+///   earlier pin, owed a re-check), and there is no other published count
+///   (runtime probes are supporting evidence only);
 /// - rows are only ever added or amended — removing one is a visible deletion
 ///   in review, and a benchmark-suite rewrite cannot touch this file;
 /// - `tests/contract_superset.rs` checks every row is a [`REAL_ROUTES`]
-///   operation with a well-formed `upstream_file`/`upstream_method`/`date`, and prints
-///   `N / 412 operations deep-verified` plus the per-controller table — that
-///   printout is the README parity section, it moves only when a row is
-///   written, and it reaches 100 % when the work is done.
+///   operation with a well-formed `upstream_file`/`upstream_method`/`date`,
+///   checks every [`VERIFIED_AGAINST_EARLIER_PIN`] entry is a distinct row with
+///   a tag other than [`UPSTREAM_TAG`], and prints `N / 412 operations
+///   deep-verified against <UPSTREAM_TAG>, plus M compared against an earlier
+///   release` plus the per-controller table — that printout is the README
+///   parity section. N moves when a row is written or re-checked, and when the
+///   pin moves (its rows then become M); N reaches 100 % when the work is done.
 pub const VERIFIED: &[Verified] = &[
     Verified {
         method: "get",

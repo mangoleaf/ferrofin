@@ -168,7 +168,11 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 - **Match the surrounding code.** New HTTP crates mirror the existing `ferrofin-api` shape
   (`create_router`, `AppState`, `error.rs` with `IntoResponse`, a `utoipa` `ApiDoc`).
 - **Port faithfully.** When implementing behavior that mirrors Jellyfin, port it faithfully
-  from the upstream C# (github.com/jellyfin/jellyfin) — including regex tables copied verbatim.
+  from the upstream C# (github.com/jellyfin/jellyfin) at `UPSTREAM_TAG` — including regex tables
+  copied verbatim. That tag is always the **latest Jellyfin release** (owner decision
+  2026-10-16), never a release candidate or an older tag. If
+  `git ls-remote --tags https://github.com/jellyfin/jellyfin` shows a newer release, say so: the
+  pin is stale and moving it is a work item (see `UPSTREAM_TAG` in `handlers/mod.rs`).
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
 - **Metrics** (`/metrics`, `ferrofin-metrics`): all metric work follows
@@ -347,10 +351,12 @@ the substance of what a handler actually does — don't rely on a green checkmar
 (Parity is tracked by `handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
 `crates/ferrofin-api/tests/contract_superset.rs` against the vendored **10.11.8** contract —
 which is a different pin from the C# release named below, deliberately. The contract is the
-API real clients speak, and 12.0-rc7's own surface is smaller (364 operations to 10.11.8's 412 — it drops the
+API real clients speak, and Jellyfin 12's own surface is smaller (12.0-rc7 and 12.1.0: 364 operations to 10.11.8's 412 — it drops the
 DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
 clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
-*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.0-rc7`.
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.2`, the latest
+Jellyfin release; rows compared against an earlier pin are listed in
+`VERIFIED_AGAINST_EARLIER_PIN` until they are re-checked.
 Owner's standing definition: **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
 equivalence** — runtime probes are supporting evidence, never a substitute, and a metric
