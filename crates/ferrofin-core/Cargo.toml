@@ -49,6 +49,8 @@ libc.workspace = true
 [dev-dependencies]
 # Paused-clock debounce tests (tokio::time::pause / start_paused).
 tokio = { workspace = true, features = ["test-util"] }
+# `rate_limit::test_support::skip_backoff`, for tests whose fake provider fails.
+ferrofin-providers = { workspace = true, features = ["test-util"] }
 ferrofin-drawing.workspace = true
 image.workspace = true
 rstest.workspace = true

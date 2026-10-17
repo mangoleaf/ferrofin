@@ -315,6 +315,9 @@ mod tests {
 
     #[tokio::test]
     async fn bad_urls_skip_but_other_failures_stop_that_providers_type_pass() {
+        // Every retry of `/error` is still sent; the limiter's own suite
+        // tests the backoff between them.
+        ferrofin_providers::rate_limit::test_support::skip_backoff();
         let (base, requests) = server();
         let tmp = tempfile::tempdir().unwrap();
         let policy = ImageAcquisitionPolicy::new(None, "Person");

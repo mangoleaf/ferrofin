@@ -25627,6 +25627,9 @@ mod tests {
     /// cast.
     #[tokio::test]
     async fn a_failed_credits_request_is_not_an_answer() {
+        // Every retry of the 500 is still sent; the limiter's own suite tests
+        // the backoff between them.
+        ferrofin_providers::rate_limit::test_support::skip_backoff();
         let tmp = tempfile::tempdir().unwrap();
         let lookup = super::ResolverGuesses::default();
         for (credits, expected) in [
@@ -30825,6 +30828,9 @@ mod tests {
     // every provider for every stored row.
     #[tokio::test]
     async fn a_failed_credits_request_does_not_wipe_a_stored_cast() {
+        // Every retry of the 500 is still sent; the limiter's own suite tests
+        // the backoff between them.
+        ferrofin_providers::rate_limit::test_support::skip_backoff();
         // Season text answers; `/credits` 500s.
         let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), None);
         let tmp = tempfile::tempdir().unwrap();
