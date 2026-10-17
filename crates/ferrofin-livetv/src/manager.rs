@@ -2133,7 +2133,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 );
                 continue;
             };
-            match host.get_channels(&tuner).await {
+            // Names the tuner on the host's own logs (an M3U playlist's
+            // skipped entries).
+            let lineup = tracing::Instrument::instrument(
+                host.get_channels(&tuner),
+                tracing::info_span!("tuner_lineup", tuner = %id),
+            );
+            match lineup.await {
                 Ok(channels) => tuner_lineups.push((id, channels)),
                 Err(e) => {
                     // `BaseTunerHost.GetChannels` logs and falls back to its

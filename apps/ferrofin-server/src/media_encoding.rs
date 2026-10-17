@@ -387,7 +387,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
                  the longest supported wait"
             ));
         };
-        let parts = split_ffmpeg_args(args);
+        let parts = ferrofin_mediaencoding::encoder::split_args(args)?;
         let child = tokio::process::Command::new(&self.ffmpeg_path)
             .args(&parts)
             .stdin(std::process::Stdio::null())
@@ -621,9 +621,9 @@ impl AttachmentIo for FfmpegAttachmentIo {
         working_dir: Option<&str>,
     ) -> Result<i32, String> {
         // `args` is a pre-built ffmpeg command line (a single space-joined
-        // string, matching the C# `arguments` string); split it into parts while
-        // honouring the double-quoted attachment-output path.
-        let parts = split_ffmpeg_args(args);
+        // string, matching the C# `arguments` string), split with the same
+        // splitter every other string-built ffmpeg run uses.
+        let parts = ferrofin_mediaencoding::encoder::split_args(args)?;
         let mut command = tokio::process::Command::new(ffmpeg_path);
         if let Some(dir) = working_dir {
             command.current_dir(dir);
@@ -638,38 +638,6 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .map_err(|e| format!("spawn ffmpeg {ffmpeg_path}: {e}"))?;
         Ok(status.code().unwrap_or(-1))
     }
-}
-
-/// Splits a space-joined ffmpeg argument string into parts, keeping
-/// double-quoted spans (e.g. the `-dump_attachment` output path) as one token
-/// with the surrounding quotes stripped.
-fn split_ffmpeg_args(args: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut has_token = false;
-    for ch in args.chars() {
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                has_token = true;
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if has_token {
-                    out.push(std::mem::take(&mut current));
-                    has_token = false;
-                }
-            }
-            c => {
-                current.push(c);
-                has_token = true;
-            }
-        }
-    }
-    if has_token {
-        out.push(current);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1378,10 +1346,8 @@ mod tests {
     /// A stand-in ffmpeg: an executable shell script running `body`.
     #[cfg(unix)]
     fn fake_ffmpeg(dir: &std::path::Path, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("ffmpeg");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::stub_script(&path, body);
         path.to_string_lossy().into_owned()
     }
 
@@ -1587,26 +1553,51 @@ mod tests {
         assert!(io.read_file("/no/such/file").await.is_err());
     }
 
-    #[test]
-    fn split_ffmpeg_args_keeps_quoted_path_as_one_token() {
-        let args =
-            r#"-dump_attachment:3 "/cache/att/font.ttf" -i file:/media/x.mkv -t 0 -f null null"#;
-        let parts = split_ffmpeg_args(args);
-        assert_eq!(parts[0], "-dump_attachment:3");
-        assert_eq!(parts[1], "/cache/att/font.ttf");
-        assert_eq!(parts[2], "-i");
-        assert_eq!(parts[3], "file:/media/x.mkv");
-        assert_eq!(parts.last().unwrap(), "null");
-    }
-
-    #[test]
-    fn split_ffmpeg_args_handles_plain_tokens() {
-        let parts = split_ffmpeg_args("-i input.mkv -c copy");
-        assert_eq!(parts, vec!["-i", "input.mkv", "-c", "copy"]);
-    }
-
-    #[test]
-    fn split_ffmpeg_args_empty_is_empty() {
-        assert!(split_ffmpeg_args("   ").is_empty());
+    /// The attachment dump spawns ffmpeg with exactly the argv the builder
+    /// quoted. The old hand-rolled splitter here toggled on every `"` and kept
+    /// the `\` escapes, so a media path containing a quote reached ffmpeg
+    /// mangled and fonts were never extracted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_dump_gets_a_quoted_path_back_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp.path().join("argv");
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            &format!("printf '%s\\n' \"$@\" > \"{}\"", record.display()),
+        );
+        let io = FfmpegAttachmentIo {
+            path_manager: Arc::new(FakePathManager {
+                root: tmp.path().to_string_lossy().into_owned(),
+            }),
+        };
+        let media = r#"/media/The "Best" \ Movie.mkv"#;
+        let args = format!(
+            "-dump_attachment:3 {} -i {} -t 0 -f null null",
+            ferrofin_mediaencoding::encoder::quote("/cache/att/font.ttf"),
+            ferrofin_mediaencoding::encoder::get_input_argument("file", media, MediaProtocol::File),
+        );
+        assert_eq!(io.run_ffmpeg(&ffmpeg, &args, None).await.unwrap(), 0);
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            [
+                "-dump_attachment:3",
+                "/cache/att/font.ttf",
+                "-i",
+                &format!("file:{media}"),
+                "-t",
+                "0",
+                "-f",
+                "null",
+                "null",
+            ]
+        );
+        // Unbalanced quoting is refused rather than guessed at.
+        assert!(
+            io.run_ffmpeg(&ffmpeg, r#"-i "unterminated"#, None)
+                .await
+                .is_err()
+        );
     }
 }

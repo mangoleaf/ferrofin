@@ -8,6 +8,58 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the "Clean up collections and playlists" task is gone
+
+Jellyfin 12 deleted this task, and Ferrofin has now removed it too. It ran about 3
+seconds after every start and removed each collection and playlist member whose file it
+could not see at that moment. If the media storage was not mounted yet (a late NFS/SMB
+mount, a NAS slower to boot than the server, an empty bind mount), it emptied every
+playlist and collection, and they stayed empty after the storage came back. Upgrading
+does not bring back members it already removed; restore a backup taken before the loss
+for that.
+
+Nothing replaces it. Deleting an item already removes it from every playlist and
+collection it was in. A member whose file you deleted stays listed until the next library
+scan removes the item. Jellyfin 12 behaves the same way. Dashboard → Scheduled Tasks no
+longer lists the task, and a trigger you saved for it is ignored.
+
+## Unreleased — Ferrofin reports Jellyfin 12.2.0; Emby-era sign-in is off by default
+
+`/System/Info` now reports `Version` `12.2.0` (1.3.x reported `10.11.8`). As in Jellyfin 12,
+only the `Authorization: MediaBrowser …` header and the `ApiKey` query parameter
+authenticate by default, on HTTP requests and the `/socket` WebSocket alike. The
+Emby-era forms are refused while `EnableLegacyAuthorization` is `false`, the default on
+a fresh install since 1.2.0:
+
+- the `X-Emby-Authorization` header (sign-in returns `400`, "app is required")
+- the bare `X-Emby-Token` and `X-MediaBrowser-Token` headers (`401`; `403` on the socket)
+- the `api_key` query parameter, and the `Emby` scheme name in place of `MediaBrowser`
+
+1.2.0 through 1.3.x refused them too on a fresh install, while reporting 10.11.8, a
+version that accepts them by default. An install first set up on 1.0.x or 1.1.0 wrote
+that release's default, `true`, into `config/system.json` and still accepts them. A
+configuration adopted from Jellyfin keeps the value its `system.xml` had: on for a 10.11
+server (Jellyfin 12 turns it off when it upgrades one; Ferrofin does not). Set it to
+`false` in either case to match Jellyfin 12.
+
+If a client that sends these forms cannot be updated, turn the flag on (Jellyfin
+deprecated them, so only for such a client). jellyfin-web has no switch for it; use one of:
+
+- **Running server:** as an administrator, `GET /System/Configuration`, set
+  `"EnableLegacyAuthorization": true` and `POST` the whole document back to
+  `/System/Configuration`. It takes effect on the next request, without a restart.
+- **Stopped server:** set `"EnableLegacyAuthorization": true` in `config/system.json`.
+
+The `/socket` WebSocket used to read its token itself: it took `api_key`, `X-Emby-Token`
+and `X-MediaBrowser-Token` whatever the flag said, ignored the `Authorization` header, and
+opened without any credentials (keep-alive only). It now authenticates like every other
+request and, as in Jellyfin 12.2, refuses a connection without valid credentials with
+`403` before the upgrade. The bundled jellyfin-web 12.x is unaffected (it sends
+`?ApiKey=`), but a client whose socket sends `api_key` or a bare token header (jellyfin-web
+10.11, for one) now loses its live updates and remote control unless the flag is on.
+Clients built on jellyfin-sdk-kotlin send only the `Authorization` header on the socket;
+their socket now joins their session, so remote control and SyncPlay reach them.
+
 ## Unreleased — a set-up server no longer starts without its database
 
 This applies if setup has been completed (`IsStartupWizardCompleted` is `true` in
@@ -87,6 +139,34 @@ release changes what a refresh does once it runs:
 - WASM plugins that supply metadata run at their place in the library's order, and an
   `album.nfo` or `artist.nfo` now wins over every remote provider:
   [plugin metadata sources run at their rank](#unreleased--plugin-metadata-sources-run-at-their-rank).
+- In a library with **Extract trickplay images during the library scan** checked, a scan
+  generates trickplay images several at a time, up to the image-encoding limit (one per
+  CPU unless **Parallel image encoding limit** is set). Jellyfin generates one at a time.
+  Each is an ffmpeg process with its own memory and, with hardware acceleration, its own
+  GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). `FERROFIN_TRICKPLAY_CONCURRENCY` caps it (a new setting, default `auto`; `1`
+  matches Jellyfin; see [`CONFIG.md`](CONFIG.md)).
+- Sonarr's and Radarr's notifications now start a scan. They send camelCase keys
+  (`{"updates":[{"path":…}]}`), which 1.3.x answered with `204` and ignored; request bodies
+  now bind in any letter case, as Jellyfin's do. The reported path is scanned once
+  `LibraryMonitorDelay` has passed, so a library on a network share that the disk watcher
+  cannot see no longer waits for the next scheduled scan.
+- A series identified by name on TheTVDB is searched and chosen as the TVDB plugin does:
+  the search is the name without a trailing year or release tags (a `Show.2026` folder
+  searches "show", not "show 2026"); results whose title (in the metadata language, or an
+  alias) equals or contains the name rank first; and a known year drops every result more
+  than a year away. 1.3.x searched with the year left in the name and took TheTVDB's first
+  result unless one had exactly the item's year, so a folder whose name ends in a year
+  could match an unrelated show.
+  An already-matched series keeps its match: the ids that match stored (TheTVDB's, and the
+  IMDb and TheMovieDb ids that came with it) win over a new search. To re-match one, use
+  **Identify**, which replaces them; or clear its TheTVDB, IMDb and TheMovieDb ids in the
+  metadata editor, then choose **Refresh metadata → Replace all metadata**.
+- A season's and an episode's series name, and an episode's season name, are now those of
+  its series and season, as in Jellyfin. 1.3.x kept the series name the folder gave
+  ("Show 2026") on every season and episode, even after a provider named the series. The
+  first start after upgrading corrects the rows saved before, once, and logs how many (on
+  one test library, 3,223 seasons and episodes across 53 series); each changed row gets a
+  new `Etag`, so clients refetch it once.
 
 Apart from scans, deleting an item now deletes its files, and who may delete one follows
 Jellyfin's rules:
@@ -107,19 +187,17 @@ dashboard, including **Date added behavior for new content** and
 
 Still open in this release:
 
-- Sonarr's webhook notification is answered but not read: Sonarr sends camelCase keys
-  (`updates`, `path`), which Ferrofin does not bind yet, so nothing is scanned. Radarr
-  shares Sonarr's code and is expected to behave the same. A library Sonarr writes to is
-  updated by the disk watcher (where it can see the change) and by scheduled scans.
-- The first scan of an adopted Jellyfin database still rewrites three kinds of item: music
+- The first scan of an adopted Jellyfin database still rewrites two kinds of item: music
   albums, whose cover Ferrofin copies into its own folder where Jellyfin points at the
-  album's `folder.jpg`; music artists, whose running time Ferrofin sums from their tracks
-  where Jellyfin stored 0; and the episodes that are not in a season folder. The
-  seasons Jellyfin made for those episodes keep their ids (and their watch state,
-  images and dates), but Ferrofin files such an episode under its season where
-  Jellyfin files it under the series, so the scan saves each of those episodes once
-  (on a Jellyfin 12.1 test library, about 8,700 episodes under 591 seasons). See the
-  next entry.
+  album's `folder.jpg`; and music artists, whose running time Ferrofin sums from their
+  tracks where Jellyfin stored 0.
+- An episode that is not in a season folder is now filed under its series, as in
+  Jellyfin; the season made for it (a season with no folder of its own) links it as its
+  season, still lists it and still counts it, and clients still see that season as the
+  episode's parent. 1.3.x filed such an episode under that season, which made the first
+  scan of an adopted Jellyfin database save every one of them once (about 8,700 episodes
+  under 591 seasons on a Jellyfin 12.1 test library); it no longer does. On a database
+  1.3.x scanned, the first scan after upgrading saves each such episode once instead.
 - Seasons with no folder of their own now take the ids Jellyfin gives them (from the
   series, the season number and the season's name). On a database an earlier Ferrofin
   scanned, the first start after upgrading moves each such season to its new id, with
@@ -763,9 +841,16 @@ Behaviour that changed with the shape:
   tests on 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. See the
   [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
-  as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every
-  `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
-  are unchanged and still found by search and `/Items`.
+  as in Jellyfin 12.2 — a playlist file inside a music album counts.
+- **Playlist files in music libraries become playlists.** The next library scan turns each
+  `.m3u`, `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library, and each
+  folder named `… [playlist]` or holding a `playlist.xml`, into a playlist that every user
+  who can see the library can open, but nobody can edit; nothing inside such a folder stays
+  an item. A `.pls` that an older scan listed as a song is removed as a song. The Playlists
+  view now lists these, beside the ones made in the app.
+- An **adopted** Jellyfin database can carry playlist files Jellyfin left empty (where it
+  saved XML metadata beside them). Their entries are read when the file next changes; to read
+  them now, refresh the library's metadata with "Search for missing metadata".
 - Alternate-version groups are re-derived once from `LinkedChildren` (Jellyfin 12.1's
   `RepairAlternateVersionLinks`), and a version is hidden only while its primary exists in the
   same library: an item marked as a version of a row that no longer exists reappears in

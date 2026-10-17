@@ -254,7 +254,7 @@ All 412 operations in the vendored Jellyfin 10.11.8 contract are implemented. Wo
 end-to-end: authentication, users and QuickConnect; library scan with live filesystem
 watching; browse and query; images; sessions, playstate and remote control; WebSocket push;
 playlists and collections; direct play and live HLS transcoding (NVENC, VAAPI and QSV
-hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; all 20 scheduled tasks;
+hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; 19 scheduled tasks;
 metrics and tracing; trickplay, chapters, lyrics and media segments; photo and book
 libraries; backup and restore.
 
@@ -311,7 +311,8 @@ Crate map, the C#-to-Rust mapping, and the porting rules: [`docs/ARCHITECTURE.md
 ## Contributing
 
 Every change is gated behind `cargo fmt`, `clippy -D warnings`, the full test suite, and
-an 80 % per-crate line-coverage floor. Perf-touching changes need a measured before/after.
+an 80 % per-crate line-coverage floor. Performance and memory are benchmarked before each
+release.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE.md`](CLAUDE.md).
 
 Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).

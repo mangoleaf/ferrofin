@@ -9,7 +9,8 @@ name: Release
 #   vX.Y.Z-rc.N   → image :vX.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
 #
-# To release: run this workflow manually (workflow_dispatch) on main — it
+# To release: run this workflow manually (workflow_dispatch) on the current release/vX.Y.Z
+# branch (feature releases) or on main (patch releases of the version already out) — it
 # requires green CI on the commit, derives the next version from Conventional
 # Commits, and pushes the tag; the tag push then re-triggers this workflow to
 # build and publish. Requires the RELEASE_TOKEN secret: a PAT with
@@ -30,7 +31,11 @@ permissions: {} # each job grants only what it needs
 jobs:
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
   create-release:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # main (patch releases of the released line) or the current release/vX.Y.Z branch
+    # (feature releases; only one exists at a time). See RELEASE.md.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-latest
     permissions:
       contents: read # the tag push uses RELEASE_TOKEN, not GITHUB_TOKEN

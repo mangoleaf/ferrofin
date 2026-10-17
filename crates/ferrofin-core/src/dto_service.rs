@@ -2721,10 +2721,18 @@ impl FerrofinDtoService {
             .as_deref()
             .map(crate::localization_manager::normalize_original_language);
         if options.contains_field(ItemFields::ParentId) {
-            dto.parent_id = item
-                .parent_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
+            // `dto.ParentId = item.DisplayParentId` (`DtoService.cs:1237-1240`):
+            // an episode's season (a virtual season's episode is stored under
+            // the series), a season's series, else the stored parent. An
+            // empty id is written as null.
+            let display_parent = match BaseItemKind::from_stored_type_name(&item.type_) {
+                Some(BaseItemKind::Episode) => item.season_id.as_deref(),
+                Some(BaseItemKind::Season) => item.series_id.as_deref(),
+                _ => item.parent_id.as_deref(),
+            };
+            dto.parent_id = display_parent
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .filter(|id| !id.is_nil());
         }
         if options.contains_field(ItemFields::Path) {
             dto.path = item.path.clone();

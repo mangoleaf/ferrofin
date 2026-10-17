@@ -168,7 +168,11 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 - **Match the surrounding code.** New HTTP crates mirror the existing `ferrofin-api` shape
   (`create_router`, `AppState`, `error.rs` with `IntoResponse`, a `utoipa` `ApiDoc`).
 - **Port faithfully.** When implementing behavior that mirrors Jellyfin, port it faithfully
-  from the upstream C# (github.com/jellyfin/jellyfin) — including regex tables copied verbatim.
+  from the upstream C# (github.com/jellyfin/jellyfin) at `UPSTREAM_TAG` — including regex tables
+  copied verbatim. That tag is always the **latest Jellyfin release** (owner decision
+  2026-10-16), never a release candidate or an older tag. If
+  `git ls-remote --tags https://github.com/jellyfin/jellyfin` shows a newer release, say so: the
+  pin is stale and moving it is a work item (see `UPSTREAM_TAG` in `handlers/mod.rs`).
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
 - **Metrics** (`/metrics`, `ferrofin-metrics`): all metric work follows
@@ -236,7 +240,16 @@ integration tests are gated behind an env var and skip if ffmpeg is absent:
 ```bash
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
+FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg
 ```
+
+The last one checks that chapter images, trickplay and Intro Skipper analysis are never
+redone for an unchanged file: library scans, the three scheduled tasks, every choice of
+jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate redo) on a
+library, a series and an episode, and a restart, with extraction both during the scan and
+by the tasks. Intro Skipper's automatic timer is off there (its scheduled task drives the
+same engine). It needs an ffmpeg with libx264, and CI does not run it (CI never sets
+`FERROFIN_FFMPEG_TESTS`): run it by hand for changes to those paths.
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
@@ -247,12 +260,13 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
-### Perf changes still need evidence — the v3 benchmark is in `bench/`
+### Performance is measured per release, not per PR — the v3 benchmark is in `bench/`
 **Suite v3 exists and is the tool to use** (v2, formerly `suite/`, was scrapped by owner
 decision on 2026-09-02 for policing itself instead of answering questions; do not
 resurrect it from git history). v3 answers four questions and nothing else:
-latency (screens and endpoints), time to first screen, memory, and API parity. Read
-[`bench/README.md`](bench/README.md) first — it defines every number in one sentence.
+latency (screens and endpoints), time to first screen, memory, and response shape vs
+Jellyfin. Read [`bench/README.md`](bench/README.md) first — it defines every number in one
+sentence.
 
 ```bash
 # needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
@@ -272,13 +286,32 @@ Publishable numbers come from **three** runs — `report.py` takes the median an
 range each cell spanned.
 
 `bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
-run deliberately — `bench/run.sh --servers ferrofin --only loaded` on two builds is the
-cheap form for a before/after, skipping both Jellyfins. So the standing rule is unchanged: body-diff correctness is not a
-latency signal — a 100× slowdown can land "green." Any change touching `ferrofin-core`,
-`ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths (`translate_query`,
-`item_repository`, `dto_service`) must come with a measured before/after stated in the
-summary — from `bench/` where the change is on a benchmarked path, else hyperfine/curl
-against a locally run server on the same data.
+run deliberately. **Measurement gates releases, not PRs** (owner decision 2026-10-16), which
+keeps day-to-day work fast:
+- No PR needs a `bench/` or hyperfine before/after. That includes issue fixes, features,
+  `perf:` changes and query-plan changes. A plan change still needs its `EXPLAIN QUERY PLAN`
+  pin test (below).
+- Every app release is measured before it is tagged, on the branch it is cut from:
+  - feature releases come from the current `release/vX.Y.Z`. Only one exists at a time; it
+    moves until it is frozen for the release;
+  - patch releases of the released line come from `main`.
+
+  `RELEASE.md` has the procedure: three full `bench/run.sh` runs on the release commit, plus
+  the previous release's image as a baseline measured in the same window.
+- A latency or memory regression against that baseline blocks the release until it is
+  fixed or the owner accepts it. So does a `⚠` response-shape note the baseline does not
+  have.
+- When chasing a regression, `bench/run.sh --servers ferrofin --only loaded` on two builds is
+  the cheap form, skipping both Jellyfins.
+
+Parity in the project's sense, implementation compared against the upstream C# and recorded
+in `handlers::VERIFIED`, is still done per change. Only measurement moved.
+
+The reason for the release gate is unchanged: body-diff correctness is not a latency signal,
+and a 100× slowdown can land "green." So a PR touching `ferrofin-core`, `ferrofin-db`,
+`ferrofin-api`, or the query/repository/DTO paths (`translate_query`, `item_repository`,
+`dto_service`) notes that in its description, and the release run is read against those
+notes.
 
 **Never accept an index or a plan change from an isolated statement measurement** — a
 statement that gets faster alone routinely drags a hotter query onto the wrong index. Prefer
@@ -297,8 +330,11 @@ fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them 
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
-chain, the adoption gate or the boot repairs.  The shell tests in CI exercise the harness
-without these live fixtures.
+chain, the adoption gate or the boot repairs, because those risk user data. This per-change
+requirement is unaffected by the release-branch rule above. The full adoption validation
+(`adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
+and a failure there blocks the release (see `RELEASE.md`).
+The shell tests in CI exercise the harness without these live fixtures.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
@@ -315,10 +351,12 @@ the substance of what a handler actually does — don't rely on a green checkmar
 (Parity is tracked by `handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
 `crates/ferrofin-api/tests/contract_superset.rs` against the vendored **10.11.8** contract —
 which is a different pin from the C# release named below, deliberately. The contract is the
-API real clients speak, and 12.0-rc7's own surface is smaller (364 operations to 10.11.8's 412 — it drops the
+API real clients speak, and Jellyfin 12's own surface is smaller (12.0-rc7 and 12.1.0: 364 operations to 10.11.8's 412 — it drops the
 DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
 clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
-*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.0-rc7`.
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.2`, the latest
+Jellyfin release; rows compared against an earlier pin are listed in
+`VERIFIED_AGAINST_EARLIER_PIN` until they are re-checked.
 Owner's standing definition: **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
 equivalence** — runtime probes are supporting evidence, never a substitute, and a metric
@@ -327,8 +365,8 @@ response-shape pass is one of those supporting probes, not the parity number.)
 Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
-burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 20 registered
-scheduled tasks (18 shown in a stock install — the two guide/channel refreshers hide
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 19 registered
+scheduled tasks (17 shown in a stock install — the two guide/channel refreshers hide
 themselves until a tuner exists),
 metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
 (EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered

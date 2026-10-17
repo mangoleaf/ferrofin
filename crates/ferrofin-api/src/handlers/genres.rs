@@ -5,14 +5,11 @@
 //! - `GET /Genres` — the library's genres as a [`QueryResult<BaseItemDto>`].
 //! - `GET /Genres/{genreName}` — a single genre by name.
 //!
-//! Jellyfin routes the list to `GetMusicGenres` when the localized parent is a
-//! music collection folder; the base (non-music) `get_genres` path is used here
-//! and the dedicated `MusicGenresController` serves music genres directly.
-//! Since both now run the SAME query (only the by-name row kind returned
-//! differs — `BaseItemRepository.ByName.cs:44-52`), the parent-collection
-//! branch changes which of the two row kinds a music library's Genres tab
-//! lists; it is an open work item on `GET /Genres`, tracked in
-//! `suite/parity/classifications.json`, not something this file silently drops.
+//! Like Jellyfin, the list answers from `GetMusicGenres` when the parent is a
+//! music or music-videos collection folder: the scanner gives music items only
+//! `MusicGenre` rows, so the `Genre` rows would leave a music library's Genres
+//! tab empty. Both run the same query; only the by-name row kind returned
+//! differs (`BaseItemRepository.ByName.cs:44-54`).
 
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -33,7 +30,8 @@ use crate::state::AppState;
 
 /// `GET /Genres` — the library's genres.
 ///
-/// Port of `GenresController.GetGenres` (base, non-music-collection path).
+/// Port of `GenresController.GetGenres`, including its switch to
+/// `GetMusicGenres` for a music or music-videos library parent.
 #[utoipa::path(
     get,
     path = "/Genres",
@@ -49,7 +47,11 @@ async fn get_genres(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let internal = query.base_query(Some(user.clone()))?;
-    let result = state.library.get_genres(&internal).await?;
+    let result = if is_music_collection_folder(&state, query.parent_id).await? {
+        state.library.get_music_genres(&internal).await?
+    } else {
+        state.library.get_genres(&internal).await?
+    };
     // C# `GenresController` builds its options as
     // `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(enableImages,
     // false, imageTypeLimit, enableImageTypes)` — note the literal `false` for
@@ -64,6 +66,39 @@ async fn get_genres(
     )
     .await?;
     Ok(Json(projected))
+}
+
+/// `parentItem is ICollectionFolder` with `CollectionType` `music` or
+/// `musicvideos` (`GenresController.cs:141-150`).
+///
+/// A library's collection type is stored in its row's `Data` blob, the same
+/// field its DTO's `CollectionType` comes from. Another kind of parent, or no
+/// stored type, keeps the plain genres answer. So does a `parentId` naming no
+/// item, where upstream answers 400 (recorded as `UNKNOWN_PARENT_ID_DIVERGENCE`).
+async fn is_music_collection_folder(
+    state: &AppState,
+    parent_id: Option<uuid::Uuid>,
+) -> Result<bool, ApiError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(false);
+    };
+    let Some(parent) = state.library.get_item_by_id(parent_id).await? else {
+        return Ok(false);
+    };
+    if parent.type_.rsplit('.').next() != Some("CollectionFolder") {
+        return Ok(false);
+    }
+    let data: serde_json::Value = parent
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_default();
+    Ok(data
+        .get("CollectionType")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("music") || kind.eq_ignore_ascii_case("musicvideos")
+        }))
 }
 
 /// `GET /Genres/{genreName}` — a single genre by name.

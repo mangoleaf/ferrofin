@@ -96,7 +96,7 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
 /// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
-/// (12.2.0; handlers are verified against `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// (12.2.0; handlers are ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
 /// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
@@ -283,15 +283,7 @@ pub async fn build_app_state(
     shutdown: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<WiredApp> {
     // ---- paths (concrete) -------------------------------------------------
-    // Sub-directory layout under the program-data root, ported from
-    // `ServerApplicationPaths`: {data}/log, {config}, {cache}, {web}.
-    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-        &config.data_dir,
-        config.data_dir.join("log"),
-        &config.config_dir,
-        &config.cache_dir,
-        &config.web_dir,
-    ));
+    let paths = Arc::new(crate::bootstrap::application_paths(config));
     // The file actually opened (an adopted `jellyfin.db` may live elsewhere) —
     // what a backup archives and a restore writes.
     paths.set_database_path(config.database_path());
@@ -570,53 +562,6 @@ pub async fn build_app_state(
         Some(base) => fanart_client.with_base_url(base),
         None => fanart_client,
     });
-    let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
-        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
-            Arc::clone(&tmdb_client),
-            ferrofin_providers::TmdbKind::Movie,
-        )),
-        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
-            Arc::clone(&tmdb_client),
-            ferrofin_providers::TmdbKind::Series,
-        )),
-        Arc::new(ferrofin_providers::TvdbSearchProvider::new(Arc::clone(
-            &the_tvdb,
-        ))),
-        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
-            Arc::clone(&omdb_client),
-            ferrofin_providers::OmdbKind::Movie,
-        )),
-        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
-            Arc::clone(&omdb_client),
-            ferrofin_providers::OmdbKind::Series,
-        )),
-        // Box sets identify against TMDB's collections, a separate endpoint.
-        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
-            Arc::clone(&tmdb_client),
-        )),
-        // Trailers: OMDb's `IRemoteMetadataProvider<Trailer, TrailerInfo>`.
-        Arc::new(ferrofin_providers::OmdbSearchProvider::for_trailers(
-            Arc::clone(&omdb_client),
-        )),
-        // People identify against TMDB's person search.
-        Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
-            Arc::clone(&tmdb_client),
-        )),
-        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
-        // (selectable by name) but, as in Jellyfin, has no name search.
-        Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
-            Arc::clone(&musicbrainz_client),
-        )),
-        Arc::new(ferrofin_providers::MusicBrainzArtistSearchProvider::new(
-            Arc::clone(&musicbrainz_client),
-        )),
-        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
-            ferrofin_model::data::BaseItemKind::MusicAlbum,
-        )),
-        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
-            ferrofin_model::data::BaseItemKind::MusicArtist,
-        )),
-    ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
     // URL is overridable; empty falls back to the built-in emby-artwork tree.
     let studios_client = Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
@@ -677,6 +622,54 @@ pub async fn build_app_state(
     );
     let localization: Arc<dyn ferrofin_traits::localization::LocalizationManager> =
         localization_impl.clone();
+    let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
+        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Series,
+        )),
+        Arc::new(
+            ferrofin_providers::TvdbSearchProvider::new(Arc::clone(&the_tvdb))
+                .with_localization(Arc::clone(&localization)),
+        ),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Series,
+        )),
+        // Box sets identify against TMDB's collections, a separate endpoint.
+        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
+        // Trailers: OMDb's `IRemoteMetadataProvider<Trailer, TrailerInfo>`.
+        Arc::new(ferrofin_providers::OmdbSearchProvider::for_trailers(
+            Arc::clone(&omdb_client),
+        )),
+        // People identify against TMDB's person search.
+        Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
+        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
+        // (selectable by name) but, as in Jellyfin, has no name search.
+        Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::MusicBrainzArtistSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicAlbum,
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicArtist,
+        )),
+    ];
     // An owned video's parental score follows the ratings its owner gives it.
     item_persistence_impl.set_localization(Arc::clone(&localization));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
@@ -762,7 +755,8 @@ pub async fn build_app_state(
             .with_network(Arc::clone(&network))
             .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
-            .with_profile_image_dir(metadata_root.child("users"))
+            // Upstream `PostUserImage`: `{UserConfigurationDirectoryPath}/{Username}/`.
+            .with_profile_image_dir(paths.user_configuration_directory_path())
             .with_auth_cache(Arc::clone(&auth_cache))
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
@@ -860,7 +854,11 @@ pub async fn build_app_state(
             ),
             Arc::new(ImageCrateEncoder::new()),
         )
-        .with_live_tv(&live_tv),
+        .with_live_tv(&live_tv)
+        .with_generation_concurrency(trickplay_concurrency(
+            config.trickplay_concurrency,
+            image_encoding_limit,
+        )),
     );
     let trickplay: Arc<dyn ferrofin_traits::trickplay::TrickplayManager> = trickplay_impl.clone();
 
@@ -1018,6 +1016,8 @@ pub async fn build_app_state(
             .with_tvdb(Arc::clone(&the_tvdb))
             .with_localization(Arc::clone(&localization))
             .with_people(Arc::clone(&people_repository))
+            // A box set's or playlist's refresh takes its members' rating.
+            .with_linked_children(Arc::clone(&linked_children_service))
             // The SERVER-WIDE per-item-type MetadataOptions. Identify's
             // provider ordering falls back to this array's
             // `MetadataFetcherOrder` for a kind whose library saved no
@@ -1086,8 +1086,8 @@ pub async fn build_app_state(
             .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
-            // 12.1 lists a playlists/boxsets view only when the user can see
-            // a child in it, which needs the user's own visibility rules.
+            // 12.2 lists a playlists/boxsets view only when the user can see
+            // an item of its kind, which needs the user's own visibility rules.
             .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
@@ -1372,13 +1372,16 @@ pub async fn build_app_state(
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
         Arc::clone(&paths) as Arc<_>;
-    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
-        Arc::new(FerrofinCollectionManager::new(
+    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> = Arc::new(
+        FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
             Arc::clone(&collection_paths),
-        ));
+        )
+        // A box set takes its members' rating when they change.
+        .with_visibility(Arc::clone(&item_visibility)),
+    );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
     // The library monitor drives refreshes from two change sources: the
@@ -1779,13 +1782,16 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> =
-        Arc::new(FerrofinPlaylistManager::new(
+    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = Arc::new(
+        FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&item_repository),
             Arc::clone(&collection_paths),
-        ));
+        )
+        // `Playlist.IsVisible`'s parental half, beside the owner/shares.
+        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users)),
+    );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
     // now that every backing manager exists. Once registered, the scheduler
@@ -1854,14 +1860,6 @@ pub async fn build_app_state(
             Arc::clone(&config_trait),
             server_config.log_file_retention_days,
         )));
-        task_manager.register(Arc::new(
-            maint_tasks::CleanupCollectionAndPlaylistPathsTask::new(
-                Arc::clone(&library),
-                Arc::clone(&collections),
-                Arc::clone(&playlists),
-                Arc::clone(&linked_children_service),
-            ),
-        ));
         task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
             Arc::clone(&trickplay_impl),
@@ -2585,6 +2583,24 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     }
 }
 
+/// `FERROFIN_TRICKPLAY_CONCURRENCY` against its auto value, the image-encoding
+/// pool size that already bounds trickplay's ffmpeg processes: unset (auto, or
+/// zero/negative) and anything above it resolve to it.
+fn trickplay_concurrency(configured: Option<u32>, auto: usize) -> usize {
+    match configured.and_then(|n| usize::try_from(n).ok()) {
+        Some(n) if n <= auto => n,
+        Some(n) => {
+            tracing::warn!(
+                configured = n,
+                auto,
+                "trickplay concurrency is above the image-encoding limit; using auto"
+            );
+            auto
+        }
+        None => auto,
+    }
+}
+
 /// C# ImageProcessor / MediaEncoder constructor rule: nonpositive means CPU count.
 fn parallel_image_encoding_limit(setting: i32, processors: u32) -> usize {
     usize::try_from(setting)
@@ -2807,6 +2823,18 @@ mod tests {
         for (setting, cores, expected) in [(-1, 8, 8), (0, 4, 4), (0, 1, 1), (1, 8, 1), (20, 2, 20)]
         {
             assert_eq!(parallel_image_encoding_limit(setting, cores), expected);
+        }
+    }
+
+    #[test]
+    fn trickplay_concurrency_falls_back_to_the_image_encoding_limit() {
+        for (configured, auto, expected) in [
+            (None, 8, 8),
+            (Some(1), 8, 1),
+            (Some(8), 8, 8),
+            (Some(20), 8, 8),
+        ] {
+            assert_eq!(trickplay_concurrency(configured, auto), expected);
         }
     }
 

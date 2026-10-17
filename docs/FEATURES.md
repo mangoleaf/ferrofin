@@ -11,8 +11,10 @@ These tiers were last derived from the v2 parity ledger, retired with the v2 sui
 `crates/ferrofin-api/tests/contract_superset.rs`, where **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
 equivalence** — the Jellyfin release each row was compared against is `UPSTREAM_TAG` /
-`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs`. That record is early:
-**7 of 412 operations** carry a row today, so the tiers below remain the honest picture and
+`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs` (the latest Jellyfin release,
+`v12.2`), except rows listed in `VERIFIED_AGAINST_EARLIER_PIN`. That record is early:
+**7 of 412 operations** carry a row today, all 7 compared against the earlier pin `v12.0-rc7`
+and owed a re-check against `v12.2`, so the tiers below remain the honest picture and
 the `VERIFIED` count is the one that will replace them as it fills in.
 
 Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin
@@ -50,6 +52,8 @@ Deep-verified against a real Jellyfin server:
 
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
+  As in Jellyfin 12, Emby-era credentials (`X-Emby-Authorization`, `X-Emby-Token`) need
+  `EnableLegacyAuthorization`, off by default ([UPGRADING.md](UPGRADING.md)).
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
   path-scoped ingest; virtual folders; item read + write/edit + delete (a delete removes the
   item's files exactly as Jellyfin does — a video's own folder, prefix-matched sidecars —
@@ -67,11 +71,19 @@ Deep-verified against a real Jellyfin server:
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
-  the immutable-tagged-image caching contract.
+  the immutable-tagged-image caching contract. A user's profile image is stored where
+  Jellyfin stores it, `{config}/users/{Username}/profile{ext}`.
+  - **Accepted divergence (a fix, not a gap):** renaming a user moves their profile image
+    to the new name's folder. Jellyfin leaves it, so a new user who takes the old name
+    overwrites the renamed user's image on upload and deletes it on removal.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
+    the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
+    before the moved entry is taken out and lands it one place short when it moves down past
+    a member hidden from that user. Ferrofin puts it at the position asked for.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
@@ -93,8 +105,10 @@ Deep-verified against a real Jellyfin server:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — all 20 of Jellyfin's scheduled tasks (including the Live TV
-  guide refresh and the hidden channel refresh) plus the trigger scheduler.
+- **Scheduled tasks** — 19 of Jellyfin's scheduled tasks (including the Live TV guide
+  refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
+  collections and playlists" is gone, as in Jellyfin 12; Jellyfin 12's "Refresh upcoming
+  and missing episodes (TheMovieDb)" task is not ported yet.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
@@ -159,11 +173,19 @@ Wired and working, with a documented limitation or lighter verification:
     worth the dependency. `.cbz` and `.cbt` are fully read.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
-- **`collection.xml` / `playlist.xml` / `.m3u` playlist files** — the readers and writers are
-  ported and tested, but nothing calls them yet: Ferrofin creates collections and playlists as
-  pathless database rows, and its scanner resolves no collection/playlist *folders*, so there
-  is no on-disk file to read or write. Membership lives in `BaseItems."Data"` (Jellyfin's own
-  source of truth), which is what makes in-place adoption of a Jellyfin database work.
+- **Playlist files are read, never written** — a library scan makes a playlist of each
+  `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
+  named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
+  `playlist.xml` only the members and the media type are read so far — its title, overview,
+  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
+  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
+  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
+  saves XML metadata into the library (a library whose metadata savers are unset), the
+  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
+  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  `collection.xml` is still not read or written: Ferrofin's collections are pathless database
+  rows, with membership in the `LinkedChildren` table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 
@@ -248,12 +270,14 @@ library's folders and processes a change once they have been quiet for
 `LibraryMonitorDelay` seconds. That is a server setting, 60 by default, with no field in
 jellyfin-web: it is set through `POST /System/Configuration`. The `*arr` webhooks
 (`POST /Library/Media/Updated`, `/Library/Series/Updated`, `/Library/Movies/Updated`) wait
-for the same delay, with or without real time monitoring (but see the Sonarr limit below).
+for the same delay, with or without real time monitoring. Sonarr and Radarr send camelCase
+keys (`{"updates":[{"path":…}]}`); request bodies bind in any letter case, as Jellyfin's do.
 Either way, as Jellyfin's `FileRefresher` does, the scan starts at the nearest item already
-in the library and runs **Scan for new and updated files** on it. For a new episode that is
-its season: the episode is added, the season (whose folder changed) is refreshed, the
-season's other episodes are checked but not probed or saved unless they changed too, and
-nothing else in the library is walked. The series' **Date Episode Added** moves at once,
+in the library and runs **Scan for new and updated files** on it. For a new episode in a
+season folder that is its season: the episode is added, the season (whose folder changed)
+is refreshed, the season's other episodes are checked but not probed or saved unless they
+changed too, and nothing else in the library is walked. For an episode in the series
+folder itself (no season folders) it is the series. The series' **Date Episode Added** moves at once,
 where Jellyfin waits for the series' own next refresh. Measured with every Series, Season
 and Episode downloader off: a new episode appears about `LibraryMonitorDelay` seconds after
 its file lands (5.1 s with a 5 s delay), and the scan itself takes about 50 ms. Provider
@@ -262,12 +286,6 @@ the season's folder change asks the season providers.
 
 ### Known limits
 
-- **Sonarr's notification is not read yet.** Sonarr sends camelCase keys
-  (`{"updates":[{"path":…}]}`), and Ferrofin binds only the PascalCase keys of Jellyfin's
-  API schema (`Updates`, `Path`). It answers `204` and scans nothing; Jellyfin binds the
-  keys in any letter case. Radarr shares Sonarr's code and is expected to send the same.
-  Until this is fixed, a library whose changes the watcher cannot see (a network share
-  written to by another host) is updated by scheduled scans only.
 - **A file that disappears takes its item's user data with it.** A deleted, renamed or moved
   file's item is removed with its watched state, resume position and favourite, and a
   renamed or moved file comes back as a new item. Jellyfin keeps that data for when the

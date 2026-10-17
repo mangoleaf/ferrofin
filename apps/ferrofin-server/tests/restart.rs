@@ -35,6 +35,15 @@ const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
 /// failure rather than a test that never ends.
 const REFUSAL_DEADLINE: Duration = Duration::from_mins(1);
 
+/// Serializes the tests that create a backup.
+///
+/// `POST /Backup/Create` holds a process-global single permit
+/// (`BACKUP_IN_FLIGHT`, which bounds concurrent backups' memory), and a
+/// caller that loses the race gets `503`. `nextest` gives each test its own
+/// process and hides that; plain `cargo test` runs these servers as threads
+/// in one process, where the second backup is refused.
+static BACKUP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A port nobody is listening on right now (bind 0, read, release).
 ///
 /// A probe, not a reservation: the listener closes before the server binds, so
@@ -365,6 +374,7 @@ async fn post_json(
 /// `RestoreBackupPath` sequence).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_applies_on_the_in_process_restart() {
+    let _serial = BACKUP_SERIAL.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -468,6 +478,7 @@ async fn backup_restore_applies_on_the_in_process_restart() {
 /// brings the database back starts it again, users and passwords intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_set_up_server_refuses_a_missing_database_until_a_restore_brings_it_back() {
+    let _serial = BACKUP_SERIAL.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)

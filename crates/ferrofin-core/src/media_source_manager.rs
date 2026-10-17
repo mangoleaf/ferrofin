@@ -14,8 +14,7 @@
 //! Injected siblings (`Arc<dyn MediaEncoder>` for probing, `Arc<dyn
 //! ProviderManager>` for the metadata this DTO layer would enrich with) are taken
 //! by dependency injection, never constructed here — they land at the Wave 8
-//! composition root. The `MediaStreamSelector` / `LiveStreamHelper` bitrate and
-//! profile negotiation is deferred; a static source is returned as-is.
+//! composition root.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -320,6 +319,258 @@ impl FerrofinMediaSourceManager {
     /// "everything permitted" (which would over-promise) nor "nothing
     /// permitted" (which would break playback for an id we simply failed to
     /// resolve).
+    /// Port of `MediaSourceManager.NormalizeLanguage`.
+    ///
+    /// Returns a list of name/three-letter-code forms the localization manager
+    /// resolves for `language`, or a singleton `[language]` when unknown.
+    fn normalize_language(&self, language: &str) -> Vec<String> {
+        if language.is_empty() {
+            return Vec::new();
+        }
+        if let Some(loc) = &self.localization
+            && let Some(culture) = loc.find_language_info(language)
+        {
+            return if culture.name.contains('-') {
+                vec![culture.name]
+            } else {
+                culture.three_letter_iso_language_names
+            };
+        }
+        vec![language.to_owned()]
+    }
+
+    /// Resolves the inherited original language for an item.
+    ///
+    /// Port of `BaseItem.GetInheritedOriginalLanguage`: episodes and seasons
+    /// inherit from their series when their own `original_language` is `None`.
+    async fn inherited_original_language(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        if item.original_language.is_some() {
+            return Ok(item.original_language.clone());
+        }
+        let kind = item
+            .type_
+            .as_str()
+            .strip_prefix("Jellyfin.Data.Entities.")
+            .or_else(|| {
+                item.type_
+                    .as_str()
+                    .strip_prefix("MediaBrowser.Controller.Entities.TV.")
+            })
+            .unwrap_or(item.type_.as_str());
+        let is_episode_or_season =
+            kind.eq_ignore_ascii_case("Episode") || kind.eq_ignore_ascii_case("Season");
+        if !is_episode_or_season {
+            return Ok(None);
+        }
+        if let Some(series_id) = item
+            .series_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            && let Some(series) = self.items.retrieve_item(series_id).await?
+        {
+            return Ok(series.original_language);
+        }
+        Ok(None)
+    }
+
+    /// Port of `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices`.
+    ///
+    /// Sets per-user default audio and subtitle stream indices on a source,
+    /// respecting remembered selections, language preferences, the
+    /// `PlayDefaultAudioTrack` flag and `SubtitleMode`.
+    #[allow(clippy::too_many_lines)]
+    async fn set_default_audio_and_subtitle_stream_indices(
+        &self,
+        item: &BaseItemEntity,
+        source: &mut MediaSourceInfo,
+        user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        let media_type = item.media_type.as_deref().unwrap_or("Video");
+
+        if media_type == "Video" {
+            let Some(users) = &self.users else {
+                return Ok(());
+            };
+            let Some(user) = users.get_user_by_id(user_id).await? else {
+                return Ok(());
+            };
+            let (saved_audio, saved_subtitle) = if let Some(user_data) = &self.user_data {
+                let item_id = Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil());
+                user_data.get_stream_default_data(item_id, user_id).await?
+            } else {
+                (None, None)
+            };
+
+            let original_language = self.inherited_original_language(item).await?;
+            self.set_default_audio_stream_index(
+                source,
+                saved_audio,
+                &user,
+                original_language.as_deref(),
+            );
+            self.set_default_subtitle_stream_index(source, saved_subtitle, &user);
+        } else if media_type == "Audio" {
+            let first_audio = source
+                .media_streams
+                .iter()
+                .find(|s| s.stream_type == MediaStreamType::Audio);
+            if let Some(audio) = first_audio {
+                source.default_audio_stream_index = Some(audio.index);
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of `MediaSourceManager.SetDefaultAudioStreamIndex`.
+    fn set_default_audio_stream_index(
+        &self,
+        source: &mut MediaSourceInfo,
+        saved_audio: Option<i32>,
+        user: &ferrofin_db::entities::users::UserEntity,
+        original_language: Option<&str>,
+    ) {
+        use ferrofin_model::media_info::AudioIndexSource;
+
+        if let Some(index) = saved_audio
+            && user.remember_audio_selections
+            && source
+                .media_streams
+                .iter()
+                .any(|s| s.stream_type == MediaStreamType::Audio && s.index == index)
+        {
+            source.default_audio_stream_index = Some(index);
+            source.default_audio_index_source = AudioIndexSource::USER;
+            return;
+        }
+
+        let audio_pref = user.audio_language_preference.as_deref().unwrap_or("");
+        let is_original_language = audio_pref.eq_ignore_ascii_case("OriginalLanguage");
+
+        if is_original_language {
+            if user.play_default_audio_track {
+                let lang = original_language.unwrap_or("");
+                source.default_audio_stream_index =
+                    crate::media_stream_selector::get_default_audio_stream_index(
+                        &source.media_streams,
+                        &self.normalize_language(lang),
+                        user.play_default_audio_track,
+                    );
+                return;
+            }
+
+            let original_index = source
+                .media_streams
+                .iter()
+                .position(|s| s.stream_type == MediaStreamType::Audio && s.is_original);
+
+            if let Some(orig_idx) = original_index {
+                let orig_stream = &source.media_streams[orig_idx];
+                if let Some(orig_lang) = original_language.filter(|l| !l.is_empty()) {
+                    let media_language = orig_stream.language.as_deref().unwrap_or("");
+                    let normalized_media = self.normalize_language(media_language);
+                    let normalized_orig = self.normalize_language(orig_lang);
+                    if normalized_orig.first().is_some_and(|first| {
+                        normalized_media
+                            .iter()
+                            .any(|m| m.eq_ignore_ascii_case(first))
+                    }) {
+                        source.default_audio_stream_index = Some(orig_stream.index);
+                        return;
+                    }
+                } else {
+                    source.default_audio_stream_index = Some(orig_stream.index);
+                    return;
+                }
+            }
+        }
+
+        let preferred_audio =
+            if is_original_language && original_language.is_some_and(|l| !l.is_empty()) {
+                self.normalize_language(original_language.unwrap_or(""))
+            } else {
+                self.normalize_language(audio_pref)
+            };
+
+        source.default_audio_stream_index =
+            crate::media_stream_selector::get_default_audio_stream_index(
+                &source.media_streams,
+                &preferred_audio,
+                user.play_default_audio_track,
+            );
+        if user.play_default_audio_track {
+            source.default_audio_index_source |= AudioIndexSource::DEFAULT;
+        }
+        if !preferred_audio.is_empty() {
+            source.default_audio_index_source |= AudioIndexSource::LANGUAGE;
+        }
+    }
+
+    /// Port of `MediaSourceManager.SetDefaultSubtitleStreamIndex`.
+    ///
+    /// Includes the v12.2 forced-only override fix (`e17ff69`).
+    fn set_default_subtitle_stream_index(
+        &self,
+        source: &mut MediaSourceInfo,
+        saved_subtitle: Option<i32>,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) {
+        use ferrofin_model::configuration::SubtitlePlaybackMode;
+        use ferrofin_model::json::enums::JsonEnum as _;
+
+        let subtitle_mode = SubtitlePlaybackMode::from_discriminant(user.subtitle_mode);
+
+        if let Some(index) = saved_subtitle
+            && user.remember_subtitle_selections
+            && subtitle_mode != SubtitlePlaybackMode::None
+        {
+            if index == -1 {
+                source.default_subtitle_stream_index = Some(-1);
+                return;
+            }
+            let saved_stream = source
+                .media_streams
+                .iter()
+                .find(|s| s.stream_type == MediaStreamType::Subtitle && s.index == index);
+            if let Some(stream) = saved_stream
+                && (subtitle_mode != SubtitlePlaybackMode::OnlyForced || stream.is_forced)
+            {
+                source.default_subtitle_stream_index = Some(index);
+                return;
+            }
+        }
+
+        let preferred_subs =
+            self.normalize_language(user.subtitle_language_preference.as_deref().unwrap_or(""));
+
+        let audio_language = source
+            .default_audio_stream_index
+            .and_then(|idx| {
+                source
+                    .media_streams
+                    .iter()
+                    .find(|s| s.stream_type == MediaStreamType::Audio && s.index == idx)
+            })
+            .and_then(|s| s.language.clone());
+
+        source.default_subtitle_stream_index =
+            crate::media_stream_selector::get_default_subtitle_stream_index(
+                &source.media_streams,
+                &preferred_subs,
+                subtitle_mode,
+                audio_language.as_deref(),
+            );
+
+        crate::media_stream_selector::set_subtitle_stream_scores(
+            &mut source.media_streams,
+            &preferred_subs,
+            subtitle_mode,
+            audio_language.as_deref(),
+        );
+    }
+
     async fn apply_playback_permissions(
         &self,
         sources: &mut [MediaSourceInfo],
@@ -462,20 +713,9 @@ impl FerrofinMediaSourceManager {
         let format = (item.media_type.as_deref() == Some("Video"))
             .then(|| crate::item_data::video_format(item.data.as_deref()));
 
-        // Default audio stream index: the audio stream marked default, else the
-        // first audio stream — the user-agnostic fallback only.
-        //
-        // TODO(12.x parity, open work item): port the user-aware
-        // `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices`
-        // (v12.2 `MediaSourceManager.cs:493-604`). It reads the user's
-        // `AudioLanguagePreference` (including "OriginalLanguage", which picks
-        // the `IsOriginal` audio track or the item's inherited original
-        // language), `PlayDefaultAudioTrack`, `RememberAudioSelections` and the
-        // subtitle mode/preferences. `IsOriginal` is served but steers no
-        // default selection until this lands. Oracle:
-        // `MediaSourceManagerTests.SetDefaultAudioStreamIndex_Index_Correct`
-        // (`tests/Jellyfin.Server.Implementations.Tests/Library/MediaSourceManagerTests.cs:63-148`),
-        // to be transliterated into rstest cases.
+        // User-agnostic audio fallback: the default-flagged audio stream,
+        // else the first. `SetDefaultAudioAndSubtitleStreamIndices` overwrites
+        // this later with the per-user selection when a user is available.
         let default_audio_stream_index = streams
             .iter()
             .filter(|s| s.stream_type == MediaStreamType::Audio)
@@ -1336,6 +1576,15 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
                         .and_then(|id| Uuid::parse_str(id).ok())
                         .is_none_or(|id| id == item_id || visible.contains(&id))
                 });
+            }
+        }
+        // `SetDefaultAudioAndSubtitleStreamIndices` (MediaSourceManager.cs:401):
+        // when a user was supplied, each source gets per-user audio/subtitle
+        // defaults based on their preferences and remembered selections.
+        if let Some(uid) = user_id {
+            for source in &mut sources {
+                self.set_default_audio_and_subtitle_stream_indices(&item, source, uid)
+                    .await?;
             }
         }
         // `GetStaticMediaSources(item, enablePathSubstitution, user)`'s tail
@@ -3258,6 +3507,180 @@ mod tests {
 
         mgr.close_live_stream(&shouted).await.expect("close");
         assert!(mgr.get_live_stream(&id).await.is_err());
+    }
+}
+
+/// Transliteration of `MediaSourceManagerTests.SetDefaultAudioStreamIndex_Index_Correct`
+/// — the 22 upstream `[InlineData]` cases exercising the `OriginalLanguage` path
+/// and regular language-preference fallback in `SetDefaultAudioStreamIndex`.
+///
+/// The fixture uses the same 6-stream layout as the C# test: one video, five
+/// audio tracks (fre/jpn/eng/eng/eng) with varying `is_default`/`is_original`.
+#[cfg(test)]
+mod audio_stream_index_tests {
+    use super::*;
+    use crate::item_repository::FerrofinItemRepository;
+    use crate::item_type_lookup::ItemTypeLookup;
+    use crate::media_attachment_repository::FerrofinMediaAttachmentRepository;
+    use crate::media_stream_repository::FerrofinMediaStreamRepository;
+    use crate::test_support::test_db;
+    use ferrofin_model::entities::MediaStreamType;
+    use rstest::rstest;
+
+    use super::tests::StubEncoder;
+    use super::tests::StubProvider;
+
+    fn test_manager(db: &ferrofin_db::Database) -> FerrofinMediaSourceManager {
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        FerrofinMediaSourceManager::new(
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+            Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
+            Arc::new(StubEncoder),
+            Arc::new(StubProvider),
+        )
+    }
+
+    fn test_user(pref: &str, play_default: bool) -> ferrofin_db::entities::users::UserEntity {
+        ferrofin_db::entities::users::UserEntity {
+            id: Uuid::new_v4().to_string(),
+            audio_language_preference: if pref.is_empty() {
+                None
+            } else {
+                Some(pref.to_owned())
+            },
+            authentication_provider_id: String::new(),
+            cast_receiver_id: None,
+            display_collections_view: false,
+            display_missing_episodes: false,
+            enable_auto_login: false,
+            enable_local_password: false,
+            enable_next_episode_auto_play: false,
+            enable_user_preference_access: true,
+            hide_played_in_latest: false,
+            internal_id: 0,
+            invalid_login_attempt_count: 0,
+            last_activity_date: None,
+            last_login_date: None,
+            login_attempts_before_lockout: None,
+            max_active_sessions: 0,
+            max_parental_rating_score: None,
+            max_parental_rating_sub_score: None,
+            must_update_password: false,
+            password: None,
+            password_reset_provider_id: String::new(),
+            play_default_audio_track: play_default,
+            remember_audio_selections: true,
+            remember_subtitle_selections: true,
+            remote_client_bitrate_limit: None,
+            row_version: 0,
+            subtitle_language_preference: None,
+            subtitle_mode: 0,
+            sync_play_access: 0,
+            username: "test".to_owned(),
+            normalized_username: "TEST".to_owned(),
+        }
+    }
+
+    fn fixture_streams(original_exist: bool) -> Vec<MediaStream> {
+        vec![
+            MediaStream {
+                index: 0,
+                stream_type: MediaStreamType::Video,
+                is_default: true,
+                ..Default::default()
+            },
+            MediaStream {
+                index: 1,
+                stream_type: MediaStreamType::Audio,
+                language: Some("fre".to_owned()),
+                is_default: false,
+                is_original: false,
+                ..Default::default()
+            },
+            MediaStream {
+                index: 2,
+                stream_type: MediaStreamType::Audio,
+                language: Some("jpn".to_owned()),
+                is_default: true,
+                is_original: false,
+                ..Default::default()
+            },
+            MediaStream {
+                index: 3,
+                stream_type: MediaStreamType::Audio,
+                language: Some("eng".to_owned()),
+                is_default: false,
+                is_original: false,
+                ..Default::default()
+            },
+            MediaStream {
+                index: 4,
+                stream_type: MediaStreamType::Audio,
+                language: Some("eng".to_owned()),
+                is_default: false,
+                is_original: original_exist,
+                ..Default::default()
+            },
+            MediaStream {
+                index: 5,
+                stream_type: MediaStreamType::Audio,
+                language: Some("eng".to_owned()),
+                is_default: true,
+                is_original: false,
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[rstest]
+    #[case(5, "eng", Some("eng"), false, true)]
+    #[case(5, "eng", Some("eng"), true, true)]
+    #[case(2, "ger", Some("eng"), false, true)]
+    #[case(2, "ger", Some("eng"), true, true)]
+    #[case(1, "fre", Some("eng"), false, true)]
+    #[case(2, "fre", Some("eng"), true, true)]
+    #[case(5, "OriginalLanguage", Some("eng"), false, false)]
+    #[case(4, "OriginalLanguage", Some("eng"), false, true)]
+    #[case(5, "OriginalLanguage", Some("eng"), true, false)]
+    #[case(5, "OriginalLanguage", Some("eng"), true, true)]
+    #[case(2, "OriginalLanguage", Some("jpn"), true, true)]
+    #[case(2, "OriginalLanguage", Some("jpn"), false, true)]
+    #[case(2, "OriginalLanguage", Some("jpn,eng"), false, true)]
+    #[case(4, "OriginalLanguage", None, false, true)]
+    #[case(2, "OriginalLanguage", None, true, true)]
+    #[case(4, "OriginalLanguage", Some(""), false, true)]
+    #[case(2, "OriginalLanguage", Some(""), false, false)]
+    #[case(2, "OriginalLanguage", Some("ger"), false, true)]
+    #[case(2, "OriginalLanguage", Some("ger"), false, false)]
+    #[case(1, "OriginalLanguage", Some("fre"), false, false)]
+    #[case(2, "OriginalLanguage", Some("fre"), true, true)]
+    #[case(2, "OriginalLanguage", Some("fre"), true, false)]
+    #[tokio::test]
+    async fn audio_index_correct(
+        #[case] expected: i32,
+        #[case] preferred: &str,
+        #[case] original_language: Option<&str>,
+        #[case] play_default: bool,
+        #[case] original_exist: bool,
+    ) {
+        let db = test_db().await;
+        let mgr = test_manager(&db);
+
+        let mut source = MediaSourceInfo {
+            media_streams: fixture_streams(original_exist),
+            ..Default::default()
+        };
+        let user = test_user(preferred, play_default);
+
+        mgr.set_default_audio_stream_index(&mut source, None, &user, original_language);
+
+        assert_eq!(
+            source.default_audio_stream_index,
+            Some(expected),
+            "pref={preferred:?}, orig_lang={original_language:?}, play_default={play_default}, orig_exist={original_exist}"
+        );
     }
 }
 

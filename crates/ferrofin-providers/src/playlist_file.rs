@@ -7,15 +7,13 @@
 //! provider resolves each to a library item; the writer emits the same list back
 //! so a playlist edited in Ferrofin stays readable by the player that wrote it.
 //!
-//! # Not yet reachable from the server
-//!
-//! `PlaylistItemsProvider` runs against a `Playlist` item whose `Path` is the
-//! playlist file, and `SavePlaylistFile` writes back to that same path.
-//! Ferrofin creates playlists as **pathless** DB rows and its scanner resolves
-//! no playlist files, so nothing in the server calls into this module yet —
-//! the deferral `collection_manager` records for `SavePlaylistFile` is about
-//! this same missing path, not about the format handling, which is here and
-//! tested.
+//! The library scan resolves a playlist file in a music or untyped library as
+//! a `Playlist` row (`PlaylistResolver`) and fills its members from
+//! [`read_playlist_file`]. The writer has no caller: upstream runs
+//! `SavePlaylistFile` only from `PlaylistManager.UpdatePlaylistInternal`, and
+//! the playlists controller lets only the owner or an editing share update a
+//! playlist, which a scanned one — owned by nobody, shared with nobody — has
+//! neither of.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -50,6 +48,40 @@ pub fn read_playlist_file(path: &str, contents: &str) -> Vec<PathBuf> {
         .into_iter()
         .map(|entry| make_absolute(dir.as_deref(), &entry))
         .collect()
+}
+
+/// Decodes a playlist file's bytes — port of `PlaylistItemsProvider.
+/// DetectEncoding`, which reads the file in the encoding `UtfUnknown`
+/// detects and in UTF-8 when it detects none.
+///
+/// A BOM decides first; then bytes that are valid UTF-8 are UTF-8, and
+/// anything else is decoded in the legacy encoding [`chardetng`] guesses
+/// (an old Winamp `.m3u` is usually Windows-1252).
+#[must_use]
+pub fn decode_playlist(bytes: &[u8]) -> String {
+    if let Some((encoding, _)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding.decode_with_bom_removal(bytes).0.into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(bytes, true);
+    detector.guess(None, true).decode(bytes).0.into_owned()
+}
+
+/// Where a playlist's `playlist.xml` metadata lives — port of
+/// `PlaylistXmlSaver.GetSavePath`: beside a playlist FILE with its extension
+/// changed to `.xml` (`Road Trip.m3u` → `Road Trip.xml`), inside a playlist
+/// FOLDER as `playlist.xml`. `PlaylistXmlProvider` reads it before the
+/// playlist file itself.
+#[must_use]
+pub fn playlist_xml_path(path: &str, is_file: bool) -> PathBuf {
+    if is_file {
+        Path::new(path).with_extension("xml")
+    } else {
+        Path::new(path).join("playlist.xml")
+    }
 }
 
 /// An `.m3u`/`.m3u8` file: one path per line, `#` lines are directives.
@@ -409,6 +441,33 @@ mod tests {
         assert_eq!(
             paths,
             [PathBuf::from("/m/a & b.flac"), PathBuf::from("/m/c.flac")]
+        );
+    }
+
+    #[test]
+    fn playlist_bytes_decode_by_bom_then_utf8_then_a_legacy_guess() {
+        assert_eq!(decode_playlist("Café.mp3\n".as_bytes()), "Café.mp3\n");
+        assert_eq!(decode_playlist(b"\xEF\xBB\xBFa.mp3"), "a.mp3");
+        assert_eq!(
+            decode_playlist(b"\xFF\xFEa\x00.\x00m\x00p\x003\x00"),
+            "a.mp3"
+        );
+        // Windows-1252, as an old Winamp playlist writes it.
+        assert_eq!(
+            decode_playlist(b"Beyonc\xE9 - D\xE9j\xE0 Vu.mp3\n"),
+            "Beyoncé - Déjà Vu.mp3\n"
+        );
+    }
+
+    #[test]
+    fn the_xml_sits_beside_a_file_and_inside_a_folder() {
+        assert_eq!(
+            playlist_xml_path("/m/Road Trip.m3u", true),
+            PathBuf::from("/m/Road Trip.xml")
+        );
+        assert_eq!(
+            playlist_xml_path("/m/Road Trip [playlist]", false),
+            PathBuf::from("/m/Road Trip [playlist]/playlist.xml")
         );
     }
 

@@ -18,10 +18,15 @@
 //! ids, then cascaded as the C# `UpdateItem` does: a series' name, rating and
 //! tag edits onto its seasons and their episodes, a season's onto its
 //! episodes, an album's onto its tracks (each child's own `LockedFields`
-//! honoured), and a change of `LockData` onto every descendant of a folder.
+//! honoured, and a changed rating only onto the children that followed the
+//! old one), and a change of `LockData` onto every descendant of a folder.
 //!
-//! TODO(parity, open work item): one part of `UpdateItem` is not ported yet —
-//! the `request.People` write (`_libraryManager.UpdatePeople`).
+//! TODO(parity, open work item): two parts of `UpdateItem` are not ported yet —
+//! the `request.People` write (`_libraryManager.UpdatePeople`), and v12.2's
+//! `ep.SeasonName = season.Name` in the season walk
+//! (`ItemUpdateController.cs:365`): a renamed season's episodes keep their
+//! stored `SeasonName` until it is set in [`cascade_to_children`]'s season
+//! branch.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -36,6 +41,7 @@ use ferrofin_model::entities::MetadataField;
 use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
 use crate::handlers::refresh_scan_path;
 use serde::Deserialize;
@@ -82,6 +88,10 @@ pub(crate) async fn update_item(
         && !stored_display_order(&item)
             .unwrap_or_default()
             .eq_ignore_ascii_case(request.display_order.as_deref().unwrap_or_default());
+    // `previousOfficialRating` / `previousCustomRating` (v12.2
+    // `ItemUpdateController.cs:295-296`): the cascade moves only the children
+    // that followed the item's rating before the edit.
+    let previous_ratings = Ratings::of(&item);
     // `item.IsLocked = request.LockData ?? false` (`ItemUpdateController.cs:
     // 418`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
@@ -117,7 +127,7 @@ pub(crate) async fn update_item(
             .update_item_locked_fields(item_id, fields)
             .await?;
     }
-    cascade_to_children(&state, &item, &request, &current_tags).await?;
+    cascade_to_children(&state, &item, &previous_ratings, &request, &current_tags).await?;
     // `if (displayOrderChanged) QueueRefresh(series, FullRefresh/FullRefresh,
     // ReplaceAllMetadata, High)` (`:120-132`): the episodes are renumbered under
     // the new order.
@@ -502,35 +512,104 @@ async fn children_of(
         .await?)
 }
 
-/// The rating and tag half of the cascade on one child, skipping a field in
-/// the child's own `LockedFields` (`ItemUpdateController.cs:321-381`):
+/// A season's episodes for the cascade. Upstream walks `season.Children`,
+/// its `ParentId` children, which misses the episodes of a virtual season:
+/// they are stored under the series (`CreateSeasonsAsync` links them by
+/// `SeasonId` only). ACCEPTED DIVERGENCE (don't-port-bugs): they are reached
+/// here by ancestry, so a season's rating and tag edits reach every episode
+/// it lists.
+async fn season_episodes_of(
+    state: &AppState,
+    season: Uuid,
+) -> Result<Vec<BaseItemEntity>, ApiError> {
+    Ok(state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            ancestor_ids: vec![season],
+            include_item_types: vec![BaseItemKind::Episode],
+            recursive: true,
+            ..InternalItemsQuery::default()
+        })
+        .await?)
+}
+
+/// An item's `OfficialRating` and `CustomRating`, the pair the cascade
+/// passes down.
+struct Ratings {
+    official: Option<String>,
+    custom: Option<String>,
+}
+
+impl Ratings {
+    fn of(item: &BaseItemEntity) -> Self {
+        Self {
+            official: item.official_rating.clone(),
+            custom: item.custom_rating.clone(),
+        }
+    }
+}
+
+/// `GetPropagatedRating` (v12.2 `ItemUpdateController.cs:489`): when the
+/// parent's rating moved from `previous` to `new` (ordinal-ignore-case, null
+/// as empty), a child with no rating or with `previous` follows it to `new`;
+/// a child with a rating of its own, or any child when the parent's rating
+/// did not change, keeps its rating.
+fn propagate_rating(child: &mut Option<String>, previous: Option<&str>, new: Option<&str>) {
+    let previous = previous.unwrap_or_default();
+    if equals_ordinal_ignore_case(previous, new.unwrap_or_default()) {
+        return;
+    }
+    if child
+        .as_deref()
+        .is_none_or(|rating| rating.is_empty() || equals_ordinal_ignore_case(rating, previous))
+    {
+        *child = new.map(ToOwned::to_owned);
+    }
+}
+
+/// The rating and tag half of the cascade on one child, as its parent's
+/// ratings moved from `previous` to `new`, skipping a field in the child's
+/// own `LockedFields` (v12.2 `ItemUpdateController.cs:317-402`):
 /// `OfficialRating` unless locked, `CustomRating` always, the tag edit
 /// unless `Tags` is locked.
 fn cascade_onto(
     child: &mut BaseItemEntity,
     locked: &[MetadataField],
-    official_rating: Option<&String>,
-    custom_rating: Option<&String>,
+    previous: &Ratings,
+    new: &Ratings,
     tags: &TagEdit,
 ) {
     if !locked.contains(&MetadataField::OfficialRating) {
-        child.official_rating = official_rating.cloned();
+        propagate_rating(
+            &mut child.official_rating,
+            previous.official.as_deref(),
+            new.official.as_deref(),
+        );
     }
-    child.custom_rating = custom_rating.cloned();
+    propagate_rating(
+        &mut child.custom_rating,
+        previous.custom.as_deref(),
+        new.custom.as_deref(),
+    );
     if !locked.contains(&MetadataField::Tags) {
         tags.apply(child);
     }
 }
 
-/// Port of the child walks in `ItemUpdateController.UpdateItem`
-/// (`ItemUpdateController.cs:315-381`): a `Series` passes its name, rating
-/// and tag edits to its seasons and their episodes, a `Season` its rating
-/// and tags to its episodes, a `MusicAlbum` its rating and tags to its
-/// children. Each child's `LockedFields` shields its `OfficialRating` and
-/// `Tags`; `SeriesName` and `CustomRating` are always written.
+/// Port of the child walks in `ItemUpdateController.UpdateItem` (v12.2
+/// `ItemUpdateController.cs:317-402`, but for the season walk's `SeasonName`
+/// — see the module TODO): a `Series` passes its name, rating and tag edits
+/// to its seasons, and its name and tag edits to their episodes, which take
+/// their season's own rating change; a `Season` its rating and tags to its
+/// episodes, a `MusicAlbum` its rating and tags to its children.
+/// A rating reaches only the children that followed the item's `previous`
+/// one ([`propagate_rating`]). Each child's `LockedFields` shields its
+/// `OfficialRating` and `Tags`; `SeriesName` and `CustomRating` are never
+/// lock-checked.
 async fn cascade_to_children(
     state: &AppState,
     item: &BaseItemEntity,
+    previous: &Ratings,
     request: &UpdateItemRequest,
     current_tags: &[String],
 ) -> Result<(), ApiError> {
@@ -546,48 +625,72 @@ async fn cascade_to_children(
     };
     let tags = TagEdit::of(current_tags, request);
     // `request.OfficialRating = string.IsNullOrWhiteSpace(...) ? null : ...`
-    // — the same value the item itself took.
-    let official_rating = item.official_rating.as_ref();
-    let custom_rating = request.custom_rating.as_ref();
-    // The direct children the walk visits, then (for a series) the seasons'
-    // episodes.
-    let mut children = match kind {
-        Some(BaseItemKind::Series) => {
-            children_of(state, item_id, Some(BaseItemKind::Season)).await?
+    // — the same values the item itself took.
+    let new = Ratings::of(item);
+    // A series' seasons, each with its episodes; a season's or album's
+    // children sit directly under the item.
+    let (mut seasons, mut groups) = if kind == Some(BaseItemKind::Series) {
+        let seasons = children_of(state, item_id, Some(BaseItemKind::Season)).await?;
+        let mut episodes = Vec::with_capacity(seasons.len());
+        for season in &seasons {
+            episodes.push(match Uuid::parse_str(&season.id) {
+                Ok(season_id) => season_episodes_of(state, season_id).await?,
+                Err(_) => Vec::new(),
+            });
         }
-        Some(BaseItemKind::Season) => {
-            children_of(state, item_id, Some(BaseItemKind::Episode)).await?
-        }
-        _ => children_of(state, item_id, None).await?,
+        (seasons, episodes)
+    } else if kind == Some(BaseItemKind::Season) {
+        (Vec::new(), vec![season_episodes_of(state, item_id).await?])
+    } else {
+        (Vec::new(), vec![children_of(state, item_id, None).await?])
     };
-    if kind == Some(BaseItemKind::Series) {
-        let mut episodes = Vec::new();
-        for season in &children {
-            if let Ok(season_id) = Uuid::parse_str(&season.id) {
-                episodes.extend(children_of(state, season_id, Some(BaseItemKind::Episode)).await?);
-            }
-        }
-        children.extend(episodes);
-    }
-    if children.is_empty() {
-        return Ok(());
-    }
-    let ids: Vec<Uuid> = children
+    let ids: Vec<Uuid> = seasons
         .iter()
+        .chain(groups.iter().flatten())
         .filter_map(|c| Uuid::parse_str(&c.id).ok())
         .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
     let locks = state.library.get_locked_fields_batch(&ids).await?;
-    for child in &mut children {
-        if kind == Some(BaseItemKind::Series) {
-            // `season.SeriesName = rseries.Name` / `ep.SeriesName = ...`.
-            child.series_name.clone_from(&item.name);
-        }
-        let locked = Uuid::parse_str(&child.id)
+    let locked = |child: &BaseItemEntity| {
+        Uuid::parse_str(&child.id)
             .ok()
             .and_then(|id| locks.get(&id))
-            .map_or(&[][..], Vec::as_slice);
-        cascade_onto(child, locked, official_rating, custom_rating, &tags);
+            .map_or(&[][..], Vec::as_slice)
+    };
+    if kind == Some(BaseItemKind::Series) {
+        for (season, episodes) in seasons.iter_mut().zip(&mut groups) {
+            // `season.SeriesName = rseries.Name`.
+            season.series_name.clone_from(&item.name);
+            let season_previous = Ratings::of(season);
+            let season_locked = locked(season);
+            cascade_onto(season, season_locked, previous, &new, &tags);
+            // Episodes follow the season's own change, so a season whose
+            // rating stayed (its own, or locked) leaves theirs alone.
+            let season_new = Ratings::of(season);
+            for episode in episodes {
+                episode.series_name.clone_from(&item.name);
+                let episode_locked = locked(episode);
+                cascade_onto(
+                    episode,
+                    episode_locked,
+                    &season_previous,
+                    &season_new,
+                    &tags,
+                );
+            }
+        }
+    } else {
+        for child in groups.iter_mut().flatten() {
+            let child_locked = locked(child);
+            cascade_onto(child, child_locked, previous, &new, &tags);
+        }
     }
+    let children: Vec<BaseItemEntity> = seasons
+        .into_iter()
+        .chain(groups.into_iter().flatten())
+        .collect();
     state.library.update_items(&children, None).await?;
     for id in ids {
         state
@@ -1084,7 +1187,10 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod tests {
-    use super::{UpdateItemRequest, containing_folder_path, join_distinct, non_empty};
+    use super::{
+        UpdateItemRequest, containing_folder_path, join_distinct, non_empty, propagate_rating,
+    };
+    use rstest::rstest;
 
     /// A string the number cannot be read from is a REFUSAL, not a silent
     /// `None`.
@@ -1192,6 +1298,35 @@ mod tests {
                 .expect("numbers parse");
         assert_eq!(req.production_year, Some(1999));
         assert_eq!(req.community_rating, Some(7.0));
+    }
+
+    /// `GetPropagatedRating(childRating, previousRating, newRating)`.
+    #[rstest]
+    // The parent's rating did not change: every child keeps its own.
+    #[case(Some("TV-14"), Some("TV-PG"), Some("TV-PG"), Some("TV-14"))]
+    #[case(None, Some("TV-PG"), Some("tv-pg"), None)]
+    #[case(Some("TV-14"), None, Some(""), Some("TV-14"))]
+    // It changed: a child with none, or with the old one, follows it.
+    #[case(None, Some("TV-PG"), Some("TV-MA"), Some("TV-MA"))]
+    #[case(Some(""), Some("TV-PG"), Some("TV-MA"), Some("TV-MA"))]
+    #[case(Some("TV-PG"), Some("TV-PG"), Some("TV-MA"), Some("TV-MA"))]
+    #[case(Some("pg-13"), Some("PG-13"), Some("R"), Some("R"))]
+    #[case(Some("TV-PG"), Some("TV-PG"), None, None)]
+    #[case(None, None, Some("TV-MA"), Some("TV-MA"))]
+    // A child with a rating of its own keeps it.
+    #[case(Some("TV-14"), Some("TV-PG"), Some("TV-MA"), Some("TV-14"))]
+    #[case(Some("TV-14"), None, Some("TV-MA"), Some("TV-14"))]
+    // An empty new rating is taken as sent, not as null.
+    #[case(Some("XXX"), Some("XXX"), Some(""), Some(""))]
+    fn a_rating_reaches_only_children_following_the_parent(
+        #[case] child: Option<&str>,
+        #[case] previous: Option<&str>,
+        #[case] new: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut rating = child.map(ToOwned::to_owned);
+        propagate_rating(&mut rating, previous, new);
+        assert_eq!(rating.as_deref(), expected);
     }
 
     #[test]

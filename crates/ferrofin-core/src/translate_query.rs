@@ -2249,14 +2249,16 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
     .collect()
 }
 
-/// A by-name row remains visible only while related media satisfies the
-/// scoped user's parental restrictions (`ApplyItemByNameAccessFiltering`).
-fn append_by_name_rating_access(
+/// A by-name row remains visible only while related media sits in the scoped
+/// user's libraries and satisfies their parental restrictions
+/// (`ApplyItemByNameAccessFiltering`). Skipped when nothing is hidden from the
+/// user, as upstream gates it on `UserHasContentRestrictions`.
+fn append_by_name_access(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     kinds: &[String],
 ) {
-    if !has_parental_restrictions(filter) {
+    if !filter.user_has_content_restrictions {
         return;
     }
     for (kind, values) in [
@@ -2356,7 +2358,7 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
                 &to_guid_strings(&filter.top_parent_ids),
             );
             qb.push("))");
-            append_by_name_rating_access(qb, filter, &by_name);
+            append_by_name_access(qb, filter, &by_name);
         }
     }
     if !filter.ancestor_ids.is_empty() {
@@ -2857,6 +2859,49 @@ mod tests {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// The candidate read behind the Playlists/Collections views
+    /// (`UserViewManager.HasVisibleItem`, see
+    /// [`crate::user_view_manager::visible_item_query`]), as the repository
+    /// runs it once the user's top parents are resolved: a seek on a
+    /// `(Type, TopParentId)` index and no scan. It is on `GET /UserViews`, the
+    /// first call every client makes. The planner picks among the
+    /// `IX_BaseItems_Type_TopParentId_*` family — the shared builder's
+    /// alternate-version probe and `SortName` order keep any of them from
+    /// covering — so the seek is what is pinned.
+    #[tokio::test]
+    async fn visible_item_candidates_seek_the_type_top_parent_index() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5501)).await;
+        for kind in [BaseItemKind::Playlist, BaseItemKind::BoxSet] {
+            let mut filter = crate::user_view_manager::visible_item_query(kind, &user);
+            filter.top_parent_ids =
+                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)];
+            let mut builder = build_query(&filter, QueryShape::IdsOnly);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|d| d.starts_with("SEARCH bi USING")
+                    && d.contains("IX_BaseItems_Type_TopParentId_")
+                    && d.contains("(Type=? AND TopParentId=?)")),
+                "{kind:?}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN")),
+                "{kind:?}: {plan:?}"
+            );
+        }
+    }
 
     /// The statement `GetLatestItemList` sends: grouped-threshold subquery
     /// capped at `limit`, the caller's triple ORDER BY verbatim, and no paging

@@ -26,8 +26,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, StoredImageMetadata, StoredItemLinks,
-    VersionPromotion,
+    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, PlaylistMember, ScannedPlaylist,
+    StoredImageMetadata, StoredItemLinks, VersionPromotion,
 };
 use std::collections::HashMap;
 
@@ -219,11 +219,14 @@ pub(crate) async fn insert_named_item(
         // keyless row (upstream's only ones are guide airings), so it would
         // vanish from the user's own home query behind whichever row the group
         // happened to elect.
+        // `CleanName` is what `searchTerm` and the search hints match
+        // (`BaseItemMapper.cs:279` derives it on every save); without it a
+        // new box set or playlist is never found by name.
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
-            "PresentationUniqueKey", "ParentId", "TopParentId")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6)"#,
+            "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -239,6 +242,7 @@ pub(crate) async fn insert_named_item(
         None,
         None,
     ))
+    .bind(crate::text_util::get_clean_value(name))
     .execute(db.writer())
     .await
     .map_err(db_err)?;
@@ -1215,9 +1219,54 @@ impl FerrofinItemPersistenceService {
             query = query.bind(crate::item_data::date_modified_follows_save(item));
         }
         query.execute(self.db.writer()).await.map_err(db_err)?;
+        if scan {
+            self.push_name_to_children(item).await?;
+        }
+        Ok(())
+    }
+
+    /// `BeforeSaveInternal` names an episode or a season after its parents
+    /// (`FindSeriesName()`, `FindSeasonName()`), and upstream's library scan
+    /// saves every child, so a renamed series' children take its name on the
+    /// next scan. A Ferrofin scan leaves unchanged children alone (the scan
+    /// names the ones it refreshes, `sync_series_name`/`sync_season_name`),
+    /// so a saved series (season) writes its STORED name — a locked one's
+    /// included — onto its seasons and episodes (episodes) here, stamping
+    /// `DateLastSaved` so clients see the change. Like upstream's
+    /// `BeforeSaveInternal`, a child's own lock does not keep a custom
+    /// series (season) name.
+    async fn push_name_to_children(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
+        let sql = match crate::item_type_lookup::kind_from_type_name(&item.type_) {
+            Some(BaseItemKind::Series) => CHILD_SERIES_NAME_SQL,
+            Some(BaseItemKind::Season) => CHILD_SEASON_NAME_SQL,
+            _ => return Ok(()),
+        };
+        sqlx::query(sql)
+            .bind(datetime_to_db(chrono::Utc::now()))
+            .bind(&item.id)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 }
+
+/// [`FerrofinItemPersistenceService::push_name_to_children`] for a series:
+/// its seasons and episodes (the only rows with a `SeriesId`), through
+/// `IX_BaseItems_SeriesId`.
+const CHILD_SERIES_NAME_SQL: &str = r#"UPDATE "BaseItems" SET "SeriesName" = parent."Name", "DateLastSaved" = ?1
+    FROM "BaseItems" AS parent
+    WHERE parent."Id" = ?2 AND "BaseItems"."SeriesId" = ?2
+      AND nullif(parent."Name", '') IS NOT NULL
+      AND "BaseItems"."SeriesName" IS NOT parent."Name""#;
+
+/// [`FerrofinItemPersistenceService::push_name_to_children`] for a season:
+/// its episodes, through `IX_BaseItems_SeasonId`.
+const CHILD_SEASON_NAME_SQL: &str = r#"UPDATE "BaseItems" SET "SeasonName" = parent."Name", "DateLastSaved" = ?1
+    FROM "BaseItems" AS parent
+    WHERE parent."Id" = ?2 AND "BaseItems"."SeasonId" = ?2
+      AND nullif(parent."Name", '') IS NOT NULL
+      AND "BaseItems"."SeasonName" IS NOT parent."Name""#;
 
 /// One `BaseItems` column value as [`FerrofinItemPersistenceService`] binds
 /// it: dates already in [`datetime_to_db`]'s text form, so two values compare
@@ -1928,6 +1977,71 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 released = writes.release.len(),
                 "synced local alternate versions"
             );
+        }
+        Ok(())
+    }
+
+    async fn sync_scanned_playlists(
+        &self,
+        playlists: &[ScannedPlaylist],
+    ) -> Result<(), ServiceError> {
+        for playlist in playlists {
+            let id = guid_to_db(playlist.id);
+            // Resolved on a reader, before the writer is taken: one lookup
+            // per entry, and a long playlist must not hold the writer.
+            let resolved = match &playlist.members {
+                Some(members) => {
+                    let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+                    let mut ids = Vec::with_capacity(members.len());
+                    for member in members {
+                        if let Some(id) = resolve_playlist_member(&mut conn, member)
+                            .await
+                            .map_err(db_err)?
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    // `PlaylistItemsProvider` drops the entries it cannot
+                    // find, and with none left has no metadata: the stored
+                    // members stay as they are. A `playlist.xml` that reads
+                    // has metadata whatever its entries name.
+                    (!playlist.from_file || !ids.is_empty()).then_some(ids)
+                }
+                None => None,
+            };
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
+            // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody
+            // owns it, everybody reads it — and `Shares` is empty. A row an
+            // adoption imported, or an earlier scan wrote, is kept.
+            sqlx::query(
+                r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+                   VALUES (?1, ?2, 1) ON CONFLICT("PlaylistId") DO NOTHING"#,
+            )
+            .bind(&id)
+            .bind(guid_to_db(Uuid::nil()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if let Some(ids) = resolved {
+                let written = write_scanned_members(&mut tx, &id, ids, playlist.replace)
+                    .await
+                    .map_err(db_err)?;
+                if let Some(count) = written {
+                    tracing::debug!(item_id = %playlist.id, members = count, "synced playlist members");
+                }
+                // A reader with metadata makes the refresh a
+                // `MetadataImport`, which upstream saves: the saved stamp
+                // settles the `playlist.xml` change monitor
+                // (`BaseXmlProvider.HasChanged` compares with it).
+                sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = ?2 WHERE "Id" = ?1"#)
+                    .bind(&id)
+                    .bind(datetime_to_db(chrono::Utc::now()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+            tx.commit().await.map_err(db_err)?;
         }
         Ok(())
     }
@@ -2790,13 +2904,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 query = query.bind(guid_to_db(*parent));
             }
             let parse = |id: Option<String>| id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-            for (id, parent, owner, path, extra_type) in
+            for (id, parent, season, owner, path, extra_type) in
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?
             {
                 if let Ok(id) = Uuid::parse_str(&id) {
                     out.push(ItemChildLink {
                         id,
                         parent_id: parse(parent),
+                        season_id: parse(season),
                         owner_id: parse(owner),
                         extra_type,
                         path,
@@ -3262,6 +3377,31 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .await
         .map_err(db_err)?;
         Ok(written.rows_affected() > 0)
+    }
+
+    async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "OfficialRating" = ?2, "UnratedType" = ?3,
+                   "InheritedParentalRatingValue" = ?4,
+                   "InheritedParentalRatingSubValue" = ?5, "DateLastSaved" = ?6
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&item.id)
+        .bind(&item.official_rating)
+        .bind(&item.unrated_type)
+        .bind(item.inherited_parental_rating_value)
+        .bind(item.inherited_parental_rating_sub_value)
+        .bind(datetime_to_db(chrono::Utc::now()))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+            > 0;
+        if written && let Some(changed) = self.changed.get() {
+            changed.record_updated(std::slice::from_ref(item));
+        }
+        Ok(written)
     }
 
     async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
@@ -4619,6 +4759,97 @@ async fn point_version_at(
     Ok(())
 }
 
+/// Writes a scanned playlist's members inside the caller's transaction —
+/// `PlaylistMetadataService.MergeData`: `members` (resolved ids, in order)
+/// replace the stored ones, or — `replace` false and some stored — come
+/// first with the stored ones not among them after, told apart by the item
+/// each resolves to (upstream's `DistinctBy` key; see
+/// `library_scan/playlists.rs` for where it differs).
+/// Returns the member count when it wrote, `None` when the stored members
+/// already were the result.
+async fn write_scanned_members(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: &str,
+    members: Vec<Uuid>,
+    replace: bool,
+) -> Result<Option<usize>, sqlx::Error> {
+    // Manual links (`LinkedChildType.Manual`).
+    let mut ids: Vec<(Uuid, i64)> = members.into_iter().map(|id| (id, 0)).collect();
+    let stored: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "ChildId", "ChildType" FROM "LinkedChildren"
+           WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+    )
+    .bind(playlist)
+    .fetch_all(&mut *conn)
+    .await?;
+    let stored: Vec<(Uuid, i64)> = stored
+        .into_iter()
+        .filter_map(|(id, kind)| Uuid::parse_str(&id).ok().map(|id| (id, kind)))
+        .collect();
+    // `if (replaceData || targetItem.LinkedChildren.Length == 0)` takes the
+    // reader's list whole, its repeats with it.
+    if !replace && !stored.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        ids = ids
+            .into_iter()
+            .chain(stored.iter().copied())
+            .filter(|(id, _)| seen.insert(*id))
+            .collect();
+    }
+    if ids == stored {
+        return Ok(None);
+    }
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+        .bind(playlist)
+        .execute(&mut *conn)
+        .await?;
+    // Dense positions, repeats kept: the key is `(ParentId, SortOrder)`, and
+    // a playlist that lists a track twice plays it twice.
+    for (order, (id, kind)) in (0_i64..).zip(&ids) {
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(playlist)
+        .bind(order)
+        .bind(guid_to_db(*id))
+        .bind(kind)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(Some(ids.len()))
+}
+
+/// The stored item a playlist entry names: the item at its path —
+/// `LibraryManager.FindByPath`, the newest `DateCreated` first — else its id
+/// when that is stored (`ItemPersistenceService` resolves a `LinkedChild` by
+/// `Path` before its `LibraryItemId`).
+async fn resolve_playlist_member(
+    conn: &mut sqlx::SqliteConnection,
+    member: &PlaylistMember,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    if let Some(path) = member.path.as_deref() {
+        let id: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1
+               ORDER BY "DateCreated" DESC LIMIT 1"#,
+        )
+        .bind(path)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(id) = id.and_then(|id| Uuid::parse_str(&id).ok()) {
+            return Ok(Some(id));
+        }
+    }
+    let Some(id) = member.item_id else {
+        return Ok(None);
+    };
+    let stored: Option<i64> = sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(stored.map(|_| id))
+}
+
 /// Writes what [`local_version_writes`] decided for `primary` but its
 /// releases (which the caller writes first, for every group), inside the
 /// caller's transaction: single columns and the primary's version rows
@@ -5582,10 +5813,11 @@ pub(crate) fn local_group_paths_sql(n: usize) -> String {
     )
 }
 
-/// One row of [`child_links_sql`]: `Id`, `ParentId`, `OwnerId`, `Path`,
-/// `ExtraType`.
+/// One row of [`child_links_sql`]: `Id`, `ParentId`, `SeasonId`,
+/// `OwnerId`, `Path`, `ExtraType`.
 type ChildLinkRow = (
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -5595,8 +5827,8 @@ type ChildLinkRow = (
 pub(crate) fn child_links_sql(n: usize) -> String {
     let ids = numbered_placeholders(n);
     format!(
-        r#"SELECT "Id", "ParentId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
-            WHERE "ParentId" IN ({ids}) OR "OwnerId" IN ({ids})"#
+        r#"SELECT "Id", "ParentId", "SeasonId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
+            WHERE "ParentId" IN ({ids}) OR "SeasonId" IN ({ids}) OR "OwnerId" IN ({ids})"#
     )
 }
 
@@ -8953,6 +9185,95 @@ mod tests {
         );
     }
 
+    /// A saved series (season) pushes its stored name onto children the scan
+    /// does not save; a locked parent's stored name wins over the incoming
+    /// one. Editor saves push nothing (the editor has its own cascade).
+    #[tokio::test]
+    async fn a_saved_parent_pushes_its_stored_name_to_its_children() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_db::store::guid_to_db;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (series, season, episode) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let row = |id: Uuid, kind: &str, name: &str| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: format!("MediaBrowser.Controller.Entities.TV.{kind}"),
+            name: Some(name.to_owned()),
+            series_id: (kind != "Series").then(|| guid_to_db(series)),
+            season_id: (kind == "Episode").then(|| guid_to_db(season)),
+            series_name: (kind != "Series").then(|| "Show 2026".to_owned()),
+            season_name: (kind == "Episode").then(|| "Season 1".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        svc.save_items(&[
+            row(series, "Series", "Show 2026"),
+            row(season, "Season", "Season 1"),
+            row(episode, "Episode", "Pilot"),
+        ])
+        .await
+        .expect("seed");
+        let names = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    r#"SELECT "SeriesName", "SeasonName", "DateLastSaved" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+            }
+        };
+        let saved_before = names(episode).await.2;
+
+        // An editor save of the series pushes nothing.
+        svc.save_items(&[row(series, "Series", "Edited")])
+            .await
+            .expect("editor save");
+        assert_eq!(names(episode).await.0.as_deref(), Some("Show 2026"));
+
+        // A provider renames the series: its season and episode follow.
+        svc.save_scanned_items(&[row(series, "Series", "Show")])
+            .await
+            .expect("rename");
+        assert_eq!(names(season).await.0.as_deref(), Some("Show"));
+        let (series_name, _, saved) = names(episode).await;
+        assert_eq!(series_name.as_deref(), Some("Show"));
+        assert_ne!(
+            saved, saved_before,
+            "the pushed rename stamps DateLastSaved"
+        );
+
+        // A renamed season pushes onto its episodes.
+        svc.save_scanned_items(&[row(season, "Season", "Specials")])
+            .await
+            .expect("season rename");
+        assert_eq!(names(episode).await.1.as_deref(), Some("Specials"));
+
+        // A locked series keeps its stored name, and pushes that one.
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(series))
+            .execute(db.writer())
+            .await
+            .expect("lock");
+        svc.save_scanned_items(&[row(series, "Series", "Incoming")])
+            .await
+            .expect("locked save");
+        assert_eq!(names(episode).await.0.as_deref(), Some("Show"));
+
+        // Both pushes stay on their parent-id index.
+        for (sql, index) in [
+            (super::CHILD_SERIES_NAME_SQL, "IX_BaseItems_SeriesId"),
+            (super::CHILD_SEASON_NAME_SQL, "IX_BaseItems_SeasonId"),
+        ] {
+            let plan = query_plan(&db, sql, 2).await;
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
+
     // One test for the whole scan statement: its guards are derived from one
     // text substitution, so they are asserted together.
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
@@ -11012,10 +11333,14 @@ mod tests {
                     .any(|s| s.contains("IX_BaseItems_ParentId") && s.contains("ParentId=?"))
                     && seeks
                         .iter()
+                        .any(|s| s.contains("IX_BaseItems_SeasonId") && s.contains("SeasonId=?"))
+                    && seeks
+                        .iter()
                         .any(|s| s.contains("IX_BaseItems_OwnerId") && s.contains("OwnerId=?"))
                     && seeks.iter().all(|s| s.contains("IX_BaseItems_ParentId")
+                        || s.contains("IX_BaseItems_SeasonId")
                         || s.contains("IX_BaseItems_OwnerId")),
-                "the children by ParentId and OwnerId (n={n}), got: {plan:?}"
+                "the children by ParentId, SeasonId and OwnerId (n={n}), got: {plan:?}"
             );
         }
     }

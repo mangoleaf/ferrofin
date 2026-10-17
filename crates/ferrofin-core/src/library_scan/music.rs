@@ -14,7 +14,10 @@
 //! interval-expired, "Search for missing metadata" or "Replace all
 //! metadata" one runs its providers once (a folder has no `DateModified`
 //! to drift, so a changed directory is no trigger), merged by
-//! `RefreshWithProviders`' rule ([`merge_refresh`]).
+//! `RefreshWithProviders`' rule ([`merge_refresh`]). Every album then
+//! credits its artists as people, as the end of each upstream album refresh
+//! does ([`set_album_people`](LibraryScanner::set_album_people)) — written
+//! only where the credits moved.
 //!
 //! An artist known only by name (a compilation's album artist: no folder, no
 //! library) is never walked. Upstream's `ArtistsValidator` refreshes it after
@@ -27,7 +30,7 @@ use ferrofin_traits::providers::ItemUpdateType;
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::RemoteSearchResult;
@@ -38,7 +41,7 @@ use ferrofin_providers::metadata_merge::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_traits::providers::MetadataRefreshOptions;
 use uuid::Uuid;
 
 use super::{
@@ -49,6 +52,7 @@ use super::{
 use crate::item_type_lookup;
 use crate::refresh_plan::{
     FileFacts, ImageFetch, ItemRefreshPlan, PassOutcome, ProbeKind, RefreshRequest, StoredState,
+    full_refresh,
 };
 
 /// Which music item a [`MusicRefresh`] refreshes, and so which children its
@@ -126,16 +130,6 @@ pub(super) struct MusicRefresh<'r> {
     /// This pass decides whether the item is saved at all (`SaveInternal`):
     /// no walk refreshed it (a by-name artist).
     pub(super) owns_save: bool,
-}
-
-/// Upstream's `isFullRefresh` (`MetadataService.cs:150`): `isFirstRefresh ||
-/// ReplaceAllMetadata || FullRefresh || requiresRefresh || ForceSave`.
-pub(super) fn full_refresh(plan: &ItemRefreshPlan, request: &RefreshRequest<'_>) -> bool {
-    plan.is_first_refresh
-        || plan.requires_refresh
-        || request.options.replace_all_metadata
-        || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
-        || request.force_save
 }
 
 /// Which of the music providers one refresh runs.
@@ -259,6 +253,42 @@ fn provider_row(item: &BaseItemEntity) -> BaseItemEntity {
 /// `AudioDbArtistProvider` mark `"en"` so it does not block a provider that
 /// can serve the requested language (`AudioDbAlbumProvider.cs:122-131`).
 const AUDIODB_LANGUAGE: &str = "en";
+
+/// `AlbumMetadataService.SetPeople` (`:195-227`): an album credits each of
+/// its album artists, then each of its artists — `None` when it has neither,
+/// as upstream then leaves its credits alone. The columns split as
+/// `BaseItemMapper` reads them (`Split('|', RemoveEmptyEntries)`), so an
+/// all-blank entry still counts as an artist for that guard but is never
+/// credited; `update_people` trims and de-duplicates the rest as
+/// `PeopleHelper.AddPerson` does.
+fn album_people(album: &BaseItemEntity) -> Option<Vec<PeopleEntity>> {
+    fn entries(column: Option<&str>) -> Vec<&str> {
+        column
+            .unwrap_or_default()
+            .split('|')
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+    let album_artists = entries(album.album_artists.as_deref());
+    let artists = entries(album.artists.as_deref());
+    if album_artists.is_empty() && artists.is_empty() {
+        return None;
+    }
+    let credits = album_artists
+        .into_iter()
+        .map(|name| (name, "AlbumArtist"))
+        .chain(artists.into_iter().map(|name| (name, "Artist")));
+    Some(
+        credits
+            .filter(|(name, _)| !name.trim().is_empty())
+            .map(|(name, kind)| PeopleEntity {
+                name: name.to_owned(),
+                person_type: Some(kind.to_owned()),
+                ..PeopleEntity::default()
+            })
+            .collect(),
+    )
+}
 
 /// `values` as a `|`-joined list column; `None` when empty.
 fn joined(values: &[String]) -> Option<String> {
@@ -520,12 +550,14 @@ impl LibraryScanner {
     /// (`GetMusicBrainzArtistId`, `AlbumInfoExtensions.cs:50-60`); a by-name
     /// artist is refreshed after the library validation
     /// (`ArtistsValidator`). An item whose decision runs nothing is skipped
-    /// without a read. Between two items the lane's refreshes run; an item
-    /// one of them refreshed as far as this scan would (`served`,
-    /// [`RefreshReach::covers`]) is left alone — it had its own music pass,
-    /// and what this scan decided for it is stale. An item that cannot be
-    /// read or written is skipped and reported once for the pass; it keeps
-    /// what made it due, so the next scan tries it again.
+    /// without a read of its own. Between two items the lane's refreshes
+    /// run; an item one of them refreshed as far as this scan would
+    /// (`served`, [`RefreshReach::covers`]) is left alone — it had its own
+    /// music pass, and what this scan decided for it is stale. An item that
+    /// cannot be read or written is skipped and reported once for the pass;
+    /// it keeps what made it due, so the next scan tries it again. After the
+    /// albums, every album's artist credits are checked in batches
+    /// ([`Self::set_album_people`]), a sweep that does not serve the lane.
     pub(super) async fn refresh_music(
         &self,
         work: &[MusicRefresh<'_>],
@@ -565,8 +597,65 @@ impl LibraryScanner {
                     skipped.note(item.id, &err);
                 }
             }
+            if kind == MusicKind::Album {
+                self.set_album_people(work, run.cancel).await;
+            }
         }
         skipped.report("music");
+    }
+
+    /// `AlbumMetadataService.AfterMetadataRefresh` → `SetPeople`
+    /// (`AlbumMetadataService.cs:62-67,195-227`), which ends every album
+    /// refresh — a quiet one too: `RefreshMetadata` calls it whatever the
+    /// refresh found (`MetadataService.cs:235`). So every album of `work`
+    /// credits its album artists and artists ([`album_people`]) as its row
+    /// now stands, with no lock consulted, as upstream. Written only where
+    /// the stored credits differ: 12.2's `UpdatePeople` returns before its
+    /// write transaction when an item's mappings are unchanged
+    /// (`PeopleRepository.cs:149-161`), so an unchanged library writes
+    /// nothing ([`super::credits_differ`] compares names, types and roles in
+    /// order but not `SortOrder`, which an album credit never carries).
+    /// (Jellyfin 10.11 dropped every artist credit in `UpdatePeople`,
+    /// `PeopleRepository.cs:98,112` at v10.11.8, so an adopted 10.11 database
+    /// has none until this runs.) A window whose read fails is skipped, and a
+    /// cancel stops the sweep before its next write; the next scan credits
+    /// what was left.
+    async fn set_album_people(&self, work: &[MusicRefresh<'_>], cancel: &ScanCancel) {
+        let (Some(items), Some(people)) = (&self.item_repository, &self.people) else {
+            return;
+        };
+        let albums: Vec<Uuid> = work
+            .iter()
+            .filter(|w| w.kind == MusicKind::Album)
+            .map(|w| w.id)
+            .collect();
+        for window in albums.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let read = match items.retrieve_items(window).await {
+                Ok(rows) => people.get_people_batch(window).await.map(|s| (rows, s)),
+                Err(err) => Err(err),
+            };
+            let (rows, mut stored) = match read {
+                Ok(read) => read,
+                Err(err) => {
+                    tracing::warn!(%err, albums = window.len(), "failed to read albums' artist credits");
+                    continue;
+                }
+            };
+            for row in rows {
+                let (Some(credits), Ok(id)) = (album_people(&row), Uuid::parse_str(&row.id)) else {
+                    continue;
+                };
+                if super::credits_differ(&stored.remove(&id).unwrap_or_default(), &credits) {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    self.persist_people(id, Some(credits)).await;
+                }
+            }
+        }
     }
 
     /// Upstream's `ArtistsValidator` (`ArtistsValidator.cs:86-91`), after
@@ -2051,5 +2140,48 @@ mod tests {
                 MusicSource::Dynamic(0)
             ]
         );
+    }
+
+    /// `AlbumMetadataService.SetPeople` (`:195-227`): every album artist as
+    /// `AlbumArtist`, then every artist as `Artist`; a blank entry is never
+    /// credited (`IsNullOrWhiteSpace`), though it still passes the `Any()`
+    /// guard, so it clears the album's credits; an album naming neither has
+    /// no credits to write (`None`).
+    #[test]
+    fn an_album_credits_its_album_artists_then_its_artists() {
+        let credits = |album_artists: Option<&str>, artists: Option<&str>| {
+            super::album_people(&BaseItemEntity {
+                album_artists: album_artists.map(str::to_owned),
+                artists: artists.map(str::to_owned),
+                ..BaseItemEntity::default()
+            })
+            .map(|people| {
+                people
+                    .into_iter()
+                    .map(|p| (p.name, p.person_type.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let owned = |rows: &[(&str, &str)]| Some(pairs(rows));
+        assert_eq!(
+            credits(Some("Synthetic Ensemble"), Some("Synthetic Ensemble")),
+            owned(&[
+                ("Synthetic Ensemble", "AlbumArtist"),
+                ("Synthetic Ensemble", "Artist")
+            ])
+        );
+        assert_eq!(
+            credits(Some("Band|Lead"), Some("Lead|Guest")),
+            owned(&[
+                ("Band", "AlbumArtist"),
+                ("Lead", "AlbumArtist"),
+                ("Lead", "Artist"),
+                ("Guest", "Artist")
+            ])
+        );
+        assert_eq!(credits(None, Some("Solo")), owned(&[("Solo", "Artist")]));
+        assert_eq!(credits(None, None), None);
+        assert_eq!(credits(Some(""), Some("||")), None);
+        assert_eq!(credits(Some(" "), None), owned(&[]));
     }
 }

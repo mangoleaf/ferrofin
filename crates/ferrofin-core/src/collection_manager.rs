@@ -21,11 +21,15 @@
 //! row (created before owner tracking, or by an API key) grants `Owner` to every
 //! caller for back-compat.
 //!
+//! A playlist the library scan resolved from a `.m3u`/`.pls` file is owned by
+//! nobody and open to everyone (`PlaylistResolver`), so every caller reads it
+//! and none may change it — upstream's `isPermitted` is the owner or an
+//! editing share. That is why `SavePlaylistFile`, which upstream runs after
+//! each change to a playlist FILE, has no caller here: ordering lives in the
+//! linked-children rows.
+//!
 //! Deferred (documented, per the unit-8 minimal-manager rule):
-//! - the on-disk `.m3u`/`.pls` *playlist file* writes (`SavePlaylistFile`) — a
-//!   filesystem concern folded away from the trait; not performed here;
-//!   ordering therefore lives purely in the linked-children rows;
-//!   entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
+//! - entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
 //!   entry-id strings) is approximated by the child item id;
 //! - `remove_playlists` (owned-playlist deletion + share transfer on user
 //!   removal) — ownership is recorded now, but the user-deletion cascade is not
@@ -38,6 +42,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -52,7 +57,7 @@ use ferrofin_traits::collections::{
     PlaylistManager,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::LibraryManager;
+use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -63,6 +68,93 @@ use crate::item_type_lookup::stored_type_name;
 /// The manual [`LinkedChildType`](ferrofin_db::enums::LinkedChildType) discriminant
 /// (`0`) used to record a box-set/playlist member.
 const LINKED_CHILD_MANUAL: i32 = 0;
+
+/// How a membership change re-rates its box set or playlist upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rerate {
+    /// `CollectionManager.AddToCollectionAsync` (`:271`) calls
+    /// `UpdateRatingToItems` directly: an `IsLocked` box set — jellyfin-web
+    /// creates them locked unless "search for internet metadata" is ticked —
+    /// still takes its members' rating, and a failure fails the request.
+    Direct,
+    /// The `ForceSave` refresh upstream queues after every other membership
+    /// change (`MetadataService.UpdateOfficialRating`, `:623-635`): a locked
+    /// item keeps its rating, and a failure is logged, never the request's.
+    Refresh,
+}
+
+/// `UpdateRatingToItems` (`BaseItem.cs:2974`) for a box set or playlist whose
+/// membership just changed, then the save upstream always makes, which
+/// re-derives the parental score. A locked `OfficialRating` keeps its rating
+/// on every path: upstream's direct call skips that check, and a field lock a
+/// membership change silently overrides is not ported.
+async fn update_rating_to_items(
+    library_manager: &dyn LibraryManager,
+    visibility: Option<&crate::item_visibility::ItemVisibility>,
+    container: Uuid,
+    how: Rerate,
+) -> Result<(), ServiceError> {
+    let Some(visibility) = visibility else {
+        return Ok(());
+    };
+    let rerate = async {
+        // Only a box set or playlist takes its members' rating. Every caller
+        // has checked the kind already; this keeps any new one honest.
+        let Some(mut row) = library_manager
+            .get_item_by_id(container)
+            .await?
+            .filter(|row| {
+                matches!(
+                    BaseItemKind::from_stored_type_name(&row.type_),
+                    Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+                )
+            })
+        else {
+            return Ok(());
+        };
+        let rating_locked = library_manager
+            .get_locked_fields_batch(&[container])
+            .await?
+            .get(&container)
+            .is_some_and(|fields| {
+                fields.contains(&ferrofin_model::entities::MetadataField::OfficialRating)
+            });
+        let keeps_rating = rating_locked || (how == Rerate::Refresh && row.is_locked);
+        if !keeps_rating {
+            row.official_rating = visibility.rating_to_items(&row).await?;
+        }
+        // The rating columns alone: the rest of `row` is as read above, and
+        // saving it whole would undo a share change made to `Data` since.
+        library_manager.update_item_rating(row).await
+    };
+    match rerate.await {
+        Err(error) if how == Rerate::Refresh => {
+            tracing::warn!(
+                item_id = %container,
+                %error,
+                "could not re-rate a container from its members"
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// The row `id` names when it is an item of `kind`, else `None`: upstream's
+/// `GetItemById(id) is not BoxSet` / `is not Playlist` test, which every
+/// collection and playlist membership change makes before it touches anything.
+/// Without it those writes reach any item the caller names — a movie's name
+/// and its version links included.
+async fn item_of_kind(
+    library_manager: &dyn LibraryManager,
+    id: Uuid,
+    kind: BaseItemKind,
+) -> Result<Option<BaseItemEntity>, ServiceError> {
+    Ok(library_manager
+        .get_item_by_id(id)
+        .await?
+        .filter(|row| BaseItemKind::from_stored_type_name(&row.type_) == Some(kind)))
+}
 
 /// Decides the caller's [`PlaylistAccess`] from the three joined access columns
 /// (C# `Playlist.IsVisible` plus the owner/`CanEdit` split the controller checks
@@ -88,8 +180,13 @@ fn decide_access(
     // A NULL owner in an existing meta row is an API-key playlist: no user
     // owns it, so — like a legacy row — every caller is owner-equivalent.
     // Parse-compare the stored owner GUID so rows written in either case
-    // (legacy lowercase, canonical uppercase) still match.
-    let owner_is_caller = owner.and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
+    // (legacy lowercase, canonical uppercase) still match. The empty GUID is
+    // nobody's: a playlist the library scan found is owned by it
+    // (`PlaylistResolver`), and an API key calls as it — upstream's API-key
+    // edit of such a playlist never gets past `GetPlaylistForUser`, which
+    // asks `IsVisible` of a user it does not have.
+    let owner_is_caller =
+        !user_id.is_nil() && owner.and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
     let level = if owner.is_none() || owner_is_caller {
         PlaylistAccessLevel::Owner
     } else if let Some(can_edit) = can_edit {
@@ -257,6 +354,9 @@ pub struct FerrofinCollectionManager {
     library_manager: Arc<dyn LibraryManager>,
     linked_children: Arc<dyn LinkedChildrenService>,
     paths: Arc<dyn ServerApplicationPaths>,
+    /// Scores the members' ratings a box set takes
+    /// ([`update_rating_to_items`]). `None` in unit tests: the rating stays.
+    visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -280,7 +380,44 @@ impl FerrofinCollectionManager {
             library_manager,
             linked_children,
             paths,
+            visibility: None,
         }
+    }
+
+    /// Lets a box set take its members' rating when they change. Called once
+    /// by the composition root.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.visibility = Some(visibility);
+        self
+    }
+
+    async fn update_rating_to_items(
+        &self,
+        collection_id: Uuid,
+        how: Rerate,
+    ) -> Result<(), ServiceError> {
+        update_rating_to_items(
+            self.library_manager.as_ref(),
+            self.visibility.as_deref(),
+            collection_id,
+            how,
+        )
+        .await
+    }
+
+    /// `AddToCollectionAsync`/`RemoveFromCollectionAsync`: an id that is not
+    /// a box set's is an `ArgumentException` (→ `400`).
+    async fn require_box_set(&self, id: Uuid) -> Result<(), ServiceError> {
+        item_of_kind(self.library_manager.as_ref(), id, BaseItemKind::BoxSet)
+            .await?
+            .map(drop)
+            .ok_or_else(|| {
+                ServiceError::invalid_input(format!("no collection exists with id {id}"))
+            })
     }
 }
 
@@ -309,7 +446,15 @@ impl CollectionManager for FerrofinCollectionManager {
         // but a zero-item create would otherwise leave Data without the
         // LinkedChildren key Jellyfin expects to own).
         item_data::sync_container_data(&self.db, id).await?;
-        Ok(row)
+        if options.item_id_list.is_empty() {
+            return Ok(row);
+        }
+        self.update_rating_to_items(id, Rerate::Direct).await?;
+        Ok(self
+            .library_manager
+            .get_item_by_id(id)
+            .await?
+            .unwrap_or(row))
     }
 
     async fn add_to_collection(
@@ -317,9 +462,19 @@ impl CollectionManager for FerrofinCollectionManager {
         collection_id: Uuid,
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
+        self.require_box_set(collection_id).await?;
+        let current = self
+            .linked_children
+            .get_linked_children_ids(collection_id, None)
+            .await?;
         for item_id in item_ids {
             self.linked_children
                 .upsert_linked_child(collection_id, *item_id, LINKED_CHILD_MANUAL)
+                .await?;
+        }
+        // `AddToCollectionAsync` re-rates only when an item was new.
+        if item_ids.iter().any(|id| !current.contains(id)) {
+            self.update_rating_to_items(collection_id, Rerate::Direct)
                 .await?;
         }
         Ok(())
@@ -330,6 +485,7 @@ impl CollectionManager for FerrofinCollectionManager {
         collection_id: Uuid,
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
+        self.require_box_set(collection_id).await?;
         for item_id in item_ids {
             sqlx::query(
                 r#"DELETE FROM "LinkedChildren"
@@ -342,7 +498,8 @@ impl CollectionManager for FerrofinCollectionManager {
             .map_err(db_err)?;
         }
         item_data::sync_container_data(&self.db, collection_id).await?;
-        Ok(())
+        self.update_rating_to_items(collection_id, Rerate::Refresh)
+            .await
     }
 
     async fn get_collections_containing_item(
@@ -485,6 +642,23 @@ pub struct FerrofinPlaylistManager {
     library_manager: Arc<dyn LibraryManager>,
     items: Arc<dyn ItemRepository>,
     paths: Arc<dyn ServerApplicationPaths>,
+    /// `Playlist.IsVisible` beyond the owner/share check
+    /// ([`Self::require_visible`]) and member visibility for a move, plus the
+    /// users they read. `None` in unit tests: the owner/share check alone then
+    /// decides and every member counts as visible.
+    visibility: Option<(
+        Arc<crate::item_visibility::ItemVisibility>,
+        Arc<dyn UserManager>,
+    )>,
+    /// Held for the whole of an add, remove, move or update: each reads the
+    /// entries and writes them back, so two overlapping edits would both
+    /// start from the same state and lose one of the changes (parallel
+    /// per-track adds do exactly that). Share writes made outside an update
+    /// do not take it (`update_playlist` calls `add_user_to_shares` under the
+    /// guard): the re-rate after an edit saves only its rating columns, never
+    /// `Data`, so it cannot put an older `Shares` back.
+    // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
+    entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -508,15 +682,131 @@ impl FerrofinPlaylistManager {
             library_manager,
             items,
             paths,
+            visibility: None,
+            entry_edits: Arc::default(),
         }
     }
 
-    /// Loads a playlist row or errors with [`ServiceError::NotFound`].
+    /// Adds `Playlist.IsVisible`'s parental half to every access decision.
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+        users: Arc<dyn UserManager>,
+    ) -> Self {
+        self.visibility = Some((visibility, users));
+        self
+    }
+
+    /// The rating refresh after a membership change ([`update_rating_to_items`]).
+    async fn update_rating_to_items(&self, playlist_id: Uuid) -> Result<(), ServiceError> {
+        update_rating_to_items(
+            self.library_manager.as_ref(),
+            self.visibility
+                .as_ref()
+                .map(|(visibility, _)| visibility.as_ref()),
+            playlist_id,
+            Rerate::Refresh,
+        )
+        .await
+    }
+
+    /// The visibility evaluator and the caller, when the evaluator is wired.
+    async fn visibility_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<(&crate::item_visibility::ItemVisibility, UserEntity)>, ServiceError> {
+        let Some((visibility, users)) = &self.visibility else {
+            return Ok(None);
+        };
+        Ok(users
+            .get_user_by_id(user_id)
+            .await?
+            .map(|user| (visibility.as_ref(), user)))
+    }
+
+    /// The rest of `Playlist.IsVisible` after [`decide_access`]'s owner/share
+    /// answer ([`ItemVisibility::playlist_policy`](crate::item_visibility::ItemVisibility::playlist_policy)):
+    /// a user with a maximum parental rating sees a playlist only when it is
+    /// empty or a member passes the rating, and a playlist file also answers
+    /// to its own rating and tags. Invisible is `NotFound`, as the C#
+    /// `GetPlaylistForUser` returns null — and so is an item that is no
+    /// playlist, which that lookup never lists, with or without the evaluator.
+    async fn require_visible(&self, playlist_id: Uuid, user_id: Uuid) -> Result<(), ServiceError> {
+        let playlist = self.require_playlist(playlist_id).await?;
+        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
+            return Ok(());
+        };
+        if visibility
+            .playlist_policy(&[playlist], &user)
+            .await?
+            .contains(&false)
+        {
+            return Err(ServiceError::not_found(format!("playlist {playlist_id}")));
+        }
+        Ok(())
+    }
+
+    /// Which of `entries` are in the caller's member list: a manual link
+    /// (`GET /Playlists/{id}/Items` lists only those) to an existing member
+    /// the caller sees (`IsVisible(user)`). Every manual entry without the
+    /// evaluator.
+    async fn visible_entries(
+        &self,
+        entries: &[Entry],
+        user_id: Uuid,
+    ) -> Result<Vec<bool>, ServiceError> {
+        let manual = |child_type: i64| child_type == i64::from(LINKED_CHILD_MANUAL);
+        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
+            return Ok(entries.iter().map(|(_, t)| manual(*t)).collect());
+        };
+        let ids: Vec<Uuid> = entries
+            .iter()
+            .filter_map(|(child, _)| Uuid::parse_str(child).ok())
+            .collect();
+        let rows = self.items.retrieve_items(&ids).await?;
+        let visible = visibility.visible(&rows, &user, false).await?;
+        let by_id: std::collections::HashMap<Uuid, bool> = rows
+            .iter()
+            .zip(visible)
+            .filter_map(|(row, visible)| Some((Uuid::parse_str(&row.id).ok()?, visible)))
+            .collect();
+        Ok(entries
+            .iter()
+            .map(|(child, child_type)| {
+                manual(*child_type)
+                    && Uuid::parse_str(child)
+                        .ok()
+                        .and_then(|id| by_id.get(&id).copied())
+                        .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    /// Loads a playlist row or errors with [`ServiceError::NotFound`]; an item
+    /// of any other kind is not found either.
     async fn require_playlist(&self, id: Uuid) -> Result<BaseItemEntity, ServiceError> {
-        self.library_manager
-            .get_item_by_id(id)
+        item_of_kind(self.library_manager.as_ref(), id, BaseItemKind::Playlist)
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("playlist {id}")))
+    }
+
+    /// The playlist a membership change names. Upstream's
+    /// `AddToPlaylistInternal`, `RemoveItemFromPlaylistAsync` and
+    /// `MoveItemAsync` throw `ArgumentException` for an id that is no
+    /// playlist's. The controllers' `GetPlaylistForUser` gate answers `404`
+    /// before that, except for an API key's remove, which skips the gate and
+    /// turns the exception into the same `404`.
+    async fn require_playlist_argument(&self, id: &str) -> Result<Uuid, ServiceError> {
+        let no_playlist =
+            || ServiceError::invalid_input(format!("no playlist exists with id {id}"));
+        let uuid = Uuid::parse_str(id).map_err(|_| no_playlist())?;
+        match self.require_playlist(uuid).await {
+            Ok(_) => Ok(uuid),
+            Err(ServiceError::NotFound(_)) => Err(no_playlist()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolves the caller's access to a playlist (C# `Playlist.IsVisible` plus
@@ -524,7 +814,9 @@ impl FerrofinPlaylistManager {
     ///
     /// One LEFT-JOIN query: the base row proves existence, the `FerrofinPlaylists` meta
     /// row carries owner/open-access, and the caller's own `FerrofinPlaylistShares` row
-    /// (if any) carries `CanEdit`. Missing **or invisible** → `NotFound`.
+    /// (if any) carries `CanEdit`. The query reads a row of any kind, so it is the
+    /// unconditional [`Self::require_visible`] that proves the row is a playlist.
+    /// Missing, invisible **or no playlist** → `NotFound`.
     async fn access(
         &self,
         playlist_id: Uuid,
@@ -544,7 +836,10 @@ impl FerrofinPlaylistManager {
         .map_err(db_err)?;
         let not_found = || ServiceError::not_found(format!("playlist {playlist_id}"));
         let (owner, open_access, can_edit) = row.ok_or_else(not_found)?;
-        decide_access(owner.as_deref(), open_access, can_edit, user_id).ok_or_else(not_found)
+        let access = decide_access(owner.as_deref(), open_access, can_edit, user_id)
+            .ok_or_else(not_found)?;
+        self.require_visible(playlist_id, user_id).await?;
+        Ok(access)
     }
 }
 
@@ -624,6 +919,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
             item_data::set_data_key(&self.db, id, "PlaylistMediaType", value).await?;
         }
+        if !request.item_id_list.is_empty() {
+            self.update_rating_to_items(id).await?;
+        }
         Ok(PlaylistCreationResult { id: id.to_string() })
     }
 
@@ -631,10 +929,14 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // Ensure it exists, then apply the name (the only field this leaf row
         // carries); membership changes arrive through `add_item_to_playlist`.
         self.require_playlist(request.id).await?;
+        let _edit = self.entry_edits.lock().await;
         if let Some(name) = &request.name {
-            sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2 WHERE "Id" = ?1"#)
+            // With the `CleanName` the save derives (`BaseItemMapper.cs:279`),
+            // which is what a search by name matches.
+            sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2, "CleanName" = ?3 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(request.id))
                 .bind(name)
+                .bind(crate::text_util::get_clean_value(name))
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
@@ -678,6 +980,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
             write_entries(self.db.writer(), &guid_to_db(request.id), &entries).await?;
         }
         item_data::sync_container_data(&self.db, request.id).await?;
+        if request.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            self.update_rating_to_items(request.id).await?;
+        }
         Ok(())
     }
 
@@ -703,7 +1008,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows)
+        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
+            return Ok(rows);
+        };
+        // `GetPlaylists(userId)`: `.Where(p => p.IsVisible(user))`, whose
+        // parental and file-playlist halves SQL cannot answer.
+        let allowed = visibility.playlist_policy(&rows, &user).await?;
+        Ok(rows
+            .into_iter()
+            .zip(allowed)
+            .filter_map(|(row, allowed)| allowed.then_some(row))
+            .collect())
     }
 
     async fn get_playlist_items(
@@ -715,8 +1030,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // in link order (the same ordering `get_linked_children_ids` applies),
         // each carrying the caller's access columns, so the visibility gate
         // costs no extra query. The C# `Forbid()` branch is unreachable here
-        // because visible ⇔ permitted-to-read; per-member parental-control
-        // filtering stays deferred.
+        // because visible ⇔ permitted-to-read.
         let page = self
             .items
             .get_playlist_items_with_access(playlist_id, user_id, LINKED_CHILD_MANUAL)
@@ -739,6 +1053,10 @@ impl PlaylistManager for FerrofinPlaylistManager {
         {
             return Err(ServiceError::not_found(format!("playlist {playlist_id}")));
         }
+        // Every member (`GetManageableItems`): `GET /Playlists/{id}` lists
+        // them all as `ItemIds`, and the items endpoint drops the ones the
+        // caller may not see itself, as `PlaylistsController` does.
+        self.require_visible(playlist_id, user_id).await?;
         Ok(page.items)
     }
 
@@ -815,6 +1133,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // check — an item already in the playlist gets a second entry — and
         // the new block goes at `position` (≤ 0 prepends, ≥ length appends,
         // otherwise a splice), else at the end.
+        self.require_playlist_argument(&playlist_id.to_string())
+            .await?;
+        let _edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist_id);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
         let added: Vec<Entry> = item_ids
@@ -828,7 +1149,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
         });
         entries.splice(at..at, added);
         write_entries(self.db.writer(), &pid, &entries).await?;
-        item_data::sync_container_data(&self.db, playlist_id).await
+        item_data::sync_container_data(&self.db, playlist_id).await?;
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        self.update_rating_to_items(playlist_id).await
     }
 
     async fn remove_item_from_playlist(
@@ -840,12 +1165,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // wire form is a dashless `Guid('N')` (`GetPlaylistItems` emits
         // `item.id.replace('-', "")`), but `ChildId` is stored in the canonical
         // dashed uppercase form. Parse and re-format via `guid_to_db` to
-        // normalise back to the stored form (same for the playlist id, which
-        // arrives as a caller-formatted string); skip any entry id that isn't a
+        // normalise back to the stored form; skip any entry id that isn't a
         // valid GUID.
         // C# `RemoveItemFromPlaylistAsync` (12.0): every entry whose item id
         // is in the request goes — all occurrences, not the first.
-        let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
+        let playlist = self.require_playlist_argument(playlist_id).await?;
+        let _edit = self.entry_edits.lock().await;
+        let pid = guid_to_db(playlist);
         let removals: Vec<String> = entry_ids
             .iter()
             .filter_map(|e| Uuid::parse_str(e).ok())
@@ -857,10 +1183,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         if entries.len() != before {
             write_entries(self.db.writer(), &pid, &entries).await?;
         }
-        if let Ok(playlist) = Uuid::parse_str(playlist_id) {
-            item_data::sync_container_data(&self.db, playlist).await?;
-        }
-        Ok(())
+        item_data::sync_container_data(&self.db, playlist).await?;
+        self.update_rating_to_items(playlist).await
     }
 
     async fn move_item(
@@ -868,15 +1192,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: &str,
         entry_id: &str,
         new_index: i32,
-        _calling_user_id: Uuid,
+        calling_user_id: Uuid,
     ) -> Result<(), ServiceError> {
         // Port of `Playlist.MoveItem`: pull the current order, relocate the entry,
         // then rewrite the `SortOrder` ordinals. `entry_id` is the `ChildId` (as
         // `remove_item_from_playlist` treats it).
         // Same ordering the read path uses (`get_linked_children_ids`), so the
-        // relocation matches what the client sees. The playlist id arrives as a
-        // caller-formatted string — normalise to the stored canonical form.
-        let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
+        // relocation matches what the client sees.
+        let playlist = self.require_playlist_argument(playlist_id).await?;
+        let _edit = self.entry_edits.lock().await;
+        let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
         // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored in the
@@ -890,17 +1215,29 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let Some(pos) = entries.iter().position(|(c, _)| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
+        // `new_index` counts the members the caller sees — the list
+        // `GET /Playlists/{id}/Items` gave them (`MoveItemAsync`) — so the
+        // entry lands right after the member it must follow in that list,
+        // hidden members keeping their places. Upstream anchors on the list
+        // before the entry is taken out (`DetermineAdjustedIndex`) and lands
+        // one place short when moving down past a hidden member; this keeps
+        // the index the caller asked for. With every member visible it is a
+        // plain move to `new_index`.
+        let mut visible = self.visible_entries(&entries, calling_user_id).await?;
+        let new_index = usize::try_from(new_index.max(0)).unwrap_or(usize::MAX);
+        if visible[pos] && visible[..pos].iter().filter(|v| **v).count() == new_index {
+            return Ok(());
+        }
         let entry = entries.remove(pos);
-        // Clamp to the valid range of the now-shorter list (C# `Math.Clamp`).
-        let target = usize::try_from(new_index.max(0))
-            .unwrap_or(usize::MAX)
-            .min(entries.len());
+        visible.remove(pos);
+        let shown: Vec<usize> = (0..entries.len()).filter(|i| visible[*i]).collect();
+        let target = match new_index {
+            0 => shown.first().copied().unwrap_or(0),
+            n => shown.get(n - 1).map_or(entries.len(), |prior| prior + 1),
+        };
         entries.insert(target, entry);
         write_entries(self.db.writer(), &pid, &entries).await?;
-        if let Ok(playlist) = Uuid::parse_str(playlist_id) {
-            item_data::sync_container_data(&self.db, playlist).await?;
-        }
-        Ok(())
+        item_data::sync_container_data(&self.db, playlist).await
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
@@ -980,6 +1317,29 @@ mod tests {
         COLLECTIONS_FOLDER_DATA, FerrofinCollectionManager, FerrofinPlaylistManager,
         collections_folder,
     };
+
+    /// A playlist owned by the empty GUID — one the library scan found — is
+    /// open to read for every caller, an API key (the empty caller) too, and
+    /// owned by none of them.
+    #[test]
+    fn the_empty_owner_is_nobody() {
+        use ferrofin_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
+        let nil = ferrofin_db::store::guid_to_db(Uuid::nil());
+        for caller in [Uuid::nil(), Uuid::new_v4()] {
+            assert_eq!(
+                super::decide_access(Some(&nil), Some(1), None, caller),
+                Some(PlaylistAccess {
+                    level: PlaylistAccessLevel::Read,
+                    open_access: true,
+                }),
+                "{caller}"
+            );
+            assert_eq!(
+                super::decide_access(Some(&nil), Some(0), None, caller),
+                None
+            );
+        }
+    }
 
     /// Test paths under a temp root, so the provisioned containers land
     /// somewhere harmless.
@@ -1440,6 +1800,14 @@ mod tests {
         let created = mgr.create_collection(&options).await.expect("create");
         assert_eq!(created.name.as_deref(), Some("Favourites"));
         let collection_id = Uuid::parse_str(&created.id).expect("uuid");
+        assert_eq!(
+            crate::test_support::fetch_item(&db, collection_id)
+                .await
+                .clean_name
+                .as_deref(),
+            Some("favourites"),
+            "a new box set is found by name"
+        );
 
         mgr.add_to_collection(collection_id, &[movie_b])
             .await
@@ -1481,6 +1849,209 @@ mod tests {
             .await
             .expect("containing2");
         assert!(containing.is_empty());
+    }
+
+    /// Issue #55: a box set or playlist takes the least restrictive rating of
+    /// its members whenever they change (`UpdateRatingToItems`), and the save
+    /// re-derives its parental score. Unrated members are ignored and removing
+    /// the only rated member keeps the rating. A locked box set still re-rates
+    /// on a direct add (upstream's `AddToCollectionAsync`), but not on an add
+    /// of nothing new or the refresh after a removal; a locked playlist keeps
+    /// its rating; a locked `OfficialRating` keeps it everywhere.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one set of members through every box-set and playlist membership path"
+    )]
+    async fn a_box_set_and_a_playlist_take_their_members_rating() {
+        let db = test_db().await;
+        let (heat, up, unrated) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, rating) in [(heat, Some("R")), (up, Some("PG")), (unrated, None)] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.official_rating = rating.map(str::to_owned);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let items = item_repository_over(db.clone());
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data_dir.path().to_string_lossy().into_owned(),
+        ));
+        let library: Arc<dyn ferrofin_traits::library::LibraryManager> = Arc::new(
+            crate::library_manager::FerrofinLibraryManager::new(
+                items.clone(),
+                Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                    db.clone(),
+                )),
+                Arc::new(
+                    crate::item_persistence_service::FerrofinItemPersistenceService::new(
+                        db.clone(),
+                    ),
+                ),
+                Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                    db.clone(),
+                )),
+            )
+            .with_visibility(Arc::clone(&visibility)),
+        );
+        let rating = |id| {
+            let db = db.clone();
+            async move {
+                let row = crate::test_support::fetch_item(&db, id).await;
+                (row.official_rating, row.inherited_parental_rating_value)
+            }
+        };
+        let set_locked = |id, locked| {
+            let db = db.clone();
+            async move {
+                let mut row = crate::test_support::fetch_item(&db, id).await;
+                row.is_locked = locked;
+                crate::test_support::save_item(&db, &row).await;
+            }
+        };
+        let set_rating = |id, rating: &'static str| {
+            let db = db.clone();
+            async move {
+                let mut row = crate::test_support::fetch_item(&db, id).await;
+                row.official_rating = Some(rating.to_owned());
+                crate::test_support::save_item(&db, &row).await;
+            }
+        };
+        let collections = FerrofinCollectionManager::new(
+            db.clone(),
+            Arc::clone(&library),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths(),
+        )
+        .with_visibility(Arc::clone(&visibility));
+
+        let created = collections
+            .create_collection(&CollectionCreationOptions {
+                name: "Heat Collection".to_owned(),
+                item_id_list: vec![heat, unrated],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        assert_eq!(created.official_rating.as_deref(), Some("R"));
+        let set = Uuid::parse_str(&created.id).expect("uuid");
+        assert_eq!(rating(set).await, (Some("R".to_owned()), Some(17)));
+        collections
+            .add_to_collection(set, &[up])
+            .await
+            .expect("add");
+        assert_eq!(rating(set).await, (Some("PG".to_owned()), Some(10)));
+        collections
+            .remove_from_collection(set, &[up, heat])
+            .await
+            .expect("remove");
+        assert_eq!(
+            rating(set).await,
+            (Some("PG".to_owned()), Some(10)),
+            "no rated member left: the set keeps its rating"
+        );
+        // jellyfin-web creates box sets locked; a direct add still re-rates.
+        set_locked(set, true).await;
+        collections
+            .add_to_collection(set, &[heat])
+            .await
+            .expect("re-add");
+        assert_eq!(rating(set).await.0.as_deref(), Some("R"));
+        set_rating(heat, "G").await;
+        collections
+            .add_to_collection(set, &[heat])
+            .await
+            .expect("add an existing member");
+        assert_eq!(
+            rating(set).await.0.as_deref(),
+            Some("R"),
+            "nothing new was added: no re-rate"
+        );
+        collections
+            .remove_from_collection(set, &[])
+            .await
+            .expect("remove nothing");
+        assert_eq!(
+            rating(set).await.0.as_deref(),
+            Some("R"),
+            "the refresh after a removal leaves a locked set alone"
+        );
+        set_locked(set, false).await;
+        library
+            .update_item_locked_fields(
+                set,
+                &[ferrofin_db::enums::metadata_field::to_i32(
+                    ferrofin_model::entities::MetadataField::OfficialRating,
+                )],
+            )
+            .await
+            .expect("lock the rating");
+        collections
+            .add_to_collection(set, &[up])
+            .await
+            .expect("add");
+        assert_eq!(
+            rating(set).await.0.as_deref(),
+            Some("R"),
+            "a locked rating stays"
+        );
+
+        set_rating(heat, "R").await;
+        // A movie addressed as a collection is refused and keeps its own rating.
+        assert!(matches!(
+            collections.add_to_collection(heat, &[up]).await,
+            Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+        ));
+        assert_eq!(rating(heat).await, (Some("R".to_owned()), None));
+        let playlists = playlist_manager(&db).with_visibility(
+            Arc::clone(&visibility),
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone())),
+        );
+        let playlists = FerrofinPlaylistManager {
+            library_manager: Arc::clone(&library),
+            ..playlists
+        };
+        let created = playlists
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![unrated, heat],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create playlist");
+        let playlist = Uuid::parse_str(&created.id).expect("uuid");
+        assert_eq!(rating(playlist).await, (Some("R".to_owned()), Some(17)));
+        playlists
+            .add_item_to_playlist(playlist, &[up], None, Uuid::nil())
+            .await
+            .expect("add to playlist");
+        assert_eq!(rating(playlist).await.0.as_deref(), Some("PG"));
+        playlists
+            .update_playlist(&PlaylistUpdateRequest {
+                id: playlist,
+                ids: Some(vec![heat]),
+                ..PlaylistUpdateRequest::default()
+            })
+            .await
+            .expect("replace entries");
+        assert_eq!(rating(playlist).await.0.as_deref(), Some("R"));
+        set_locked(playlist, true).await;
+        playlists
+            .add_item_to_playlist(playlist, &[up], None, Uuid::nil())
+            .await
+            .expect("add to a locked playlist");
+        playlists
+            .remove_item_from_playlist(&playlist.to_string(), &[heat.simple().to_string()])
+            .await
+            .expect("remove from playlist");
+        assert_eq!(
+            rating(playlist).await.0.as_deref(),
+            Some("R"),
+            "a locked playlist keeps its rating"
+        );
     }
 
     #[tokio::test]
@@ -2173,6 +2744,53 @@ mod tests {
         );
     }
 
+    /// A re-rate saves only the rating: a share revoked between the re-rate's
+    /// read and its save stays revoked in `Data`, so the boot re-import of the
+    /// shares from `Data` does not bring it back.
+    #[tokio::test]
+    async fn a_rerate_keeps_a_share_change_made_since_its_read() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let bob = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                users: vec![PlaylistUserPermissions::new(bob, true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        // The re-rate's read, then a revoke that lands before its save.
+        let mut read = crate::test_support::fetch_item(&db, playlist_id).await;
+        mgr.remove_user_from_shares(playlist_id, bob, &PlaylistUserPermissions::new(bob, true))
+            .await
+            .expect("revoke");
+        read.official_rating = Some("PG".to_owned());
+        mgr.library_manager
+            .update_item_rating(read)
+            .await
+            .expect("re-rate");
+
+        let stored = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(stored.official_rating.as_deref(), Some("PG"));
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .expect("shares")
+                .is_empty(),
+            "the revoked share stays revoked after a restart"
+        );
+    }
+
     /// Builds a playlist manager over `db` (the repeated three-collaborator
     /// constructor the access tests share).
     fn playlist_manager(db: &ferrofin_db::Database) -> FerrofinPlaylistManager {
@@ -2335,15 +2953,30 @@ mod tests {
         )
         .expect("uuid");
 
+        assert_eq!(
+            crate::test_support::fetch_item(&db, playlist_id)
+                .await
+                .clean_name
+                .as_deref(),
+            Some("mutable"),
+            "a new playlist is found by name"
+        );
         mgr.update_playlist(&PlaylistUpdateRequest {
             id: playlist_id,
             user_id: alice,
+            name: Some("Road Trip!".to_owned()),
             users: Some(vec![PlaylistUserPermissions::new(dave, false)]),
             public: Some(true),
             ..PlaylistUpdateRequest::default()
         })
         .await
         .expect("update");
+        let renamed = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(
+            (renamed.name.as_deref(), renamed.clean_name.as_deref()),
+            (Some("Road Trip!"), Some("road trip")),
+            "a rename is found by its new name"
+        );
 
         // The share list was replaced wholesale (bob is gone, dave read-only).
         assert_eq!(
@@ -2483,6 +3116,131 @@ mod tests {
             .collect()
     }
 
+    /// `Playlist.IsVisible` under a maximum parental rating, everywhere the
+    /// playlist manager answers it: a playlist whose members all exceed the
+    /// rating is missing (12.1 `HasParentalAllowedChild`), while the member
+    /// list stays whole (`GetManageableItems`, which `GET /Playlists/{id}`
+    /// reports as `ItemIds`), and a move counts the members the caller sees
+    /// (`MoveItemAsync`), down past a hidden one too.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one owner, one limited user and their playlists through every access path"
+    )]
+    async fn a_parental_limit_hides_playlists_and_members_beyond_it() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+        use ferrofin_model::playlists::PlaylistCreationResult;
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::library::UserManager;
+        let db = test_db().await;
+        let (owner, kid) = (Uuid::new_v4(), Uuid::new_v4());
+        for (user, name) in [(owner, "owner"), (kid, "kid")] {
+            crate::test_support::seed_named_user(&db, user, name).await;
+            crate::test_support::grant_default_permissions(&db, user).await;
+        }
+        let users: Arc<dyn UserManager> =
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+        let mut limited = users.get_user_by_id(kid).await.expect("read").expect("kid");
+        limited.max_parental_rating_score = Some(13);
+        users.update_user(&limited).await.expect("limit the kid");
+        let (r, pg1, pg2, pg3) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (id, rating) in [(r, "R"), (pg1, "PG"), (pg2, "PG"), (pg3, "PG")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.official_rating = Some(rating.to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let mgr = playlist_manager(&db).with_visibility(
+            Arc::new(crate::item_visibility::ItemVisibility::new(
+                db.clone(),
+                item_repository_over(db.clone()),
+                Arc::new(crate::LocalizationManager::new("US")),
+                "/server/data".to_owned(),
+            )),
+            users,
+        );
+        let create = |name: &str, items: Vec<Uuid>| PlaylistCreationRequest {
+            name: Some(name.to_owned()),
+            item_id_list: items,
+            user_id: owner,
+            users: vec![PlaylistUserPermissions::new(kid, false)],
+            ..PlaylistCreationRequest::default()
+        };
+        let id = |created: PlaylistCreationResult| Uuid::parse_str(&created.id).expect("uuid");
+        let r_only = id(mgr.create_playlist(&create("R", vec![r])).await.expect("R"));
+        let mixed = id(mgr
+            .create_playlist(&create("Mixed", vec![r, pg1, pg2]))
+            .await
+            .expect("mixed"));
+        let empty = id(mgr
+            .create_playlist(&create("Empty", Vec::new()))
+            .await
+            .expect("empty"));
+
+        assert!(matches!(
+            mgr.get_playlist_access(r_only, kid).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.get_playlist_items(r_only, kid).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(
+            mgr.get_playlist_access(r_only, owner).await.is_ok(),
+            "no limit"
+        );
+        assert!(mgr.get_playlist_access(empty, kid).await.is_ok(), "empty");
+        let listed = |rows: Vec<BaseItemEntity>| {
+            let mut ids: Vec<Uuid> = rows
+                .into_iter()
+                .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut expected = vec![mixed, empty];
+        expected.sort();
+        assert_eq!(listed(mgr.get_playlists(kid).await.expect("kid")), expected);
+        assert_eq!(mgr.get_playlists(owner).await.expect("owner").len(), 3);
+
+        let members: Vec<Uuid> = mgr
+            .get_playlist_items(mixed, kid)
+            .await
+            .expect("items")
+            .into_iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
+        assert_eq!(members, [r, pg1, pg2], "the handler drops the R member");
+
+        // The kid sees [pg1, pg2] and moves pg1 to their index 1: after pg2.
+        mgr.move_item(&mixed.to_string(), &pg1.simple().to_string(), 1, kid)
+            .await
+            .expect("move");
+        assert_eq!(rows(&db, mixed).await, [r, pg2, pg1]);
+
+        // Down past a hidden member: [pg1, pg2, R, pg3] shows the kid
+        // [pg1, pg2, pg3]; pg1 to index 2 lands after pg3, not before it.
+        let down = id(mgr
+            .create_playlist(&create("Down", vec![pg1, pg2, r, pg3]))
+            .await
+            .expect("down"));
+        mgr.move_item(&down.to_string(), &pg1.simple().to_string(), 2, kid)
+            .await
+            .expect("move down");
+        assert_eq!(rows(&db, down).await, [pg2, r, pg3, pg1]);
+        // To the top: before the first member the kid sees, the R one kept.
+        mgr.move_item(&down.to_string(), &pg1.simple().to_string(), 0, kid)
+            .await
+            .expect("move up");
+        assert_eq!(rows(&db, down).await, [pg1, pg2, r, pg3]);
+    }
+
     async fn seeded_playlist(
         db: &ferrofin_db::Database,
         items: &[Uuid],
@@ -2541,6 +3299,21 @@ mod tests {
         assert_eq!(rows(&db, set).await, vec![a]);
     }
 
+    /// Overlapping adds to one playlist each keep their entry: none of them
+    /// starts from a list another has not finished rewriting.
+    #[tokio::test]
+    async fn concurrent_adds_to_a_playlist_keep_every_entry() {
+        let db = test_db().await;
+        let a = Uuid::new_v4();
+        let (mgr, playlist, owner) = seeded_playlist(&db, &[a]).await;
+        let item = [a];
+        let adds = (0..8).map(|_| mgr.add_item_to_playlist(playlist, &item, None, owner));
+        for result in futures_util::future::join_all(adds).await {
+            result.expect("add");
+        }
+        assert_eq!(rows(&db, playlist).await.len(), 9);
+    }
+
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
     #[tokio::test]
     async fn remove_item_from_playlist_removes_every_occurrence() {
@@ -2590,6 +3363,127 @@ mod tests {
         .expect("update");
         assert_eq!(rows(&db, playlist).await, vec![b, b]);
     }
+
+    /// A movie named "Movie" with one alternate-version link:
+    /// the item the writes below aim at, and the link they must leave alone.
+    async fn movie_with_a_version(db: &ferrofin_db::Database) -> (Uuid, Uuid) {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let (movie, version) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_named_item(db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_item(db, version, BaseItemKind::Movie).await;
+        FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(
+                movie,
+                version,
+                i32::from(ferrofin_db::enums::LinkedChildType::LocalAlternateVersion),
+            )
+            .await
+            .expect("version link");
+        (movie, version)
+    }
+
+    async fn name_of(db: &ferrofin_db::Database, id: Uuid) -> String {
+        library_manager_over(db.clone())
+            .get_item_by_id(id)
+            .await
+            .expect("read")
+            .expect("row")
+            .name
+            .unwrap_or_default()
+    }
+
+    /// Upstream's `GetPlaylistForUser` lists only playlists, so a movie or a
+    /// box set id is `404` on every playlist route, and the manager's add,
+    /// remove and move throw `ArgumentException`. Before, an item with no
+    /// `FerrofinPlaylists` row read as a legacy playlist every caller owns:
+    /// anyone could rename a movie or rewrite its version links, and read a
+    /// box set's members through the playlist routes.
+    #[tokio::test]
+    async fn playlist_calls_refuse_an_item_that_is_no_playlist() {
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::persistence::LinkedChildrenService;
+
+        let db = test_db().await;
+        let (movie, version) = movie_with_a_version(&db).await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let mgr = playlist_manager(&db);
+        let caller = Uuid::new_v4();
+        let movie_str = movie.to_string();
+
+        let not_found = |result: Result<(), ServiceError>| {
+            assert!(
+                matches!(result, Err(ServiceError::NotFound(_))),
+                "{result:?}"
+            );
+        };
+        not_found(mgr.get_playlist_access(movie, caller).await.map(drop));
+        not_found(mgr.get_playlist_for_user(movie, caller).await.map(drop));
+        not_found(mgr.get_playlist_items(movie, caller).await.map(drop));
+        // A box set's manual member reaches the members-present branch.
+        let box_set = Uuid::new_v4();
+        seed_item(&db, box_set, BaseItemKind::BoxSet).await;
+        FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(box_set, track, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("member");
+        not_found(mgr.get_playlist_items(box_set, caller).await.map(drop));
+        not_found(
+            mgr.update_playlist(&PlaylistUpdateRequest {
+                id: movie,
+                name: Some("Renamed".to_owned()),
+                ids: Some(vec![track]),
+                ..PlaylistUpdateRequest::default()
+            })
+            .await,
+        );
+
+        let invalid = |result: Result<(), ServiceError>| {
+            assert!(
+                matches!(result, Err(ServiceError::InvalidInput(_))),
+                "{result:?}"
+            );
+        };
+        invalid(
+            mgr.add_item_to_playlist(movie, &[track], None, caller)
+                .await,
+        );
+        invalid(
+            mgr.remove_item_from_playlist(&movie_str, &[version.simple().to_string()])
+                .await,
+        );
+        invalid(
+            mgr.move_item(&movie_str, &version.simple().to_string(), 0, caller)
+                .await,
+        );
+        invalid(mgr.remove_item_from_playlist("not-a-guid", &[]).await);
+
+        assert_eq!(name_of(&db, movie).await, "Movie");
+        assert_eq!(rows(&db, movie).await, [version]);
+    }
+
+    /// `AddToCollectionAsync`/`RemoveFromCollectionAsync`: an id that is no
+    /// box set's is an `ArgumentException` (`400`), and nothing changes.
+    #[tokio::test]
+    async fn collection_writes_refuse_an_item_that_is_no_box_set() {
+        let db = test_db().await;
+        let (movie, version) = movie_with_a_version(&db).await;
+        let mgr = collection_manager_over(&db);
+        for result in [
+            mgr.add_to_collection(movie, &[version]).await,
+            mgr.remove_from_collection(movie, &[version]).await,
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+                ),
+                "{result:?}"
+            );
+        }
+        assert_eq!(rows(&db, movie).await, [version]);
+    }
+
     #[tokio::test]
     async fn plain_collection_collapse_uses_visible_folder_children_all_links_and_local_alternates()
     {

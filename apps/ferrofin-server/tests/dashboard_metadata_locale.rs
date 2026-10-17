@@ -3329,7 +3329,9 @@ async fn verify_by_name_metadata_languages(
                     .unwrap()
                     .iter()
                     .any(|uri| uri.starts_with(&format!("/original/locale-{expected_image}.png"))),
-                "automatic acquisition must select the newly requested language"
+                "automatic acquisition must select the newly requested language \
+                 ({language}, {label}): {:?}",
+                requests.lock().unwrap()
             );
             let provider_path = if label == "Person biography" {
                 "/person/"

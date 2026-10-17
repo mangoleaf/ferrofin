@@ -279,6 +279,34 @@ fn extension_routes_have_no_duplicates() {
     );
 }
 
+/// `VERIFIED_AGAINST_EARLIER_PIN` entries must each be a distinct `VERIFIED`
+/// row (`verified`) carrying a release tag other than `UPSTREAM_TAG`.
+fn earlier_pin_problems(verified: &BTreeSet<(&str, &str)>) -> Vec<String> {
+    use ferrofin_api::handlers::{UPSTREAM_TAG, VERIFIED_AGAINST_EARLIER_PIN};
+
+    let mut out = Vec::new();
+    let mut earlier = BTreeSet::new();
+    for &(method, path, tag) in VERIFIED_AGAINST_EARLIER_PIN {
+        let key = (method, path);
+        if !earlier.insert(key) {
+            out.push(format!(
+                "{key:?}: listed twice in VERIFIED_AGAINST_EARLIER_PIN"
+            ));
+        }
+        if !verified.contains(&key) {
+            out.push(format!(
+                "{key:?}: in VERIFIED_AGAINST_EARLIER_PIN but not a VERIFIED row"
+            ));
+        }
+        if !tag.starts_with('v') || tag == UPSTREAM_TAG {
+            out.push(format!(
+                "{key:?}: {tag:?} is not an earlier jellyfin release tag"
+            ));
+        }
+    }
+    out
+}
+
 /// The per-row well-formedness rules of a `VERIFIED` entry (everything except
 /// its membership in the route table). Empty = well-formed.
 fn row_problems(v: &ferrofin_api::handlers::Verified) -> Vec<String> {
@@ -321,18 +349,21 @@ fn row_problems(v: &ferrofin_api::handlers::Verified) -> Vec<String> {
 
 /// **The API-parity record** (`handlers::VERIFIED`) is well-formed, and this
 /// test prints the parity section the README publishes:
-/// `N / <ops> operations deep-verified (K with recorded divergences)` plus the
-/// per-controller table (`--nocapture`). Every row must be a `REAL_ROUTES`
-/// operation (so a verified op is a served op), name the C# file and method it
-/// was compared against (the tag and commit are pinned once, as consts), and
-/// carry a `YYYY-MM-DD` date.
-/// The count moves only when a row is written; a suite rewrite cannot touch it.
+/// `N / <ops> operations deep-verified against <UPSTREAM_TAG>, plus M compared
+/// against an earlier release` plus the per-controller table (`--nocapture`).
+/// Every row must be a `REAL_ROUTES` operation (so a verified op is a served
+/// op), name the C# file and method it was compared against (the tag and commit
+/// are pinned once, as consts, with `VERIFIED_AGAINST_EARLIER_PIN` naming the
+/// rows compared against an earlier tag), and carry a `YYYY-MM-DD` date.
+/// The counts move only when a row is written or re-checked, or the pin moves;
+/// a suite rewrite cannot touch them.
 #[test]
 fn verified_rows_are_real_operations_and_print_the_parity_line() {
     use std::collections::BTreeMap;
 
     use ferrofin_api::handlers::{
         EXTENSION_ROUTES, REAL_ROUTES, UPSTREAM_COMMIT, UPSTREAM_TAG, VERIFIED,
+        VERIFIED_AGAINST_EARLIER_PIN,
     };
 
     assert!(
@@ -357,6 +388,7 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
         }
         problems.extend(row_problems(v).into_iter().map(|p| format!("{key:?}: {p}")));
     }
+    problems.extend(earlier_pin_problems(&seen));
     assert!(
         problems.is_empty(),
         "VERIFIED rows are malformed:\n{}",
@@ -401,10 +433,12 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
         .filter(|v| extension.contains(&(v.method, v.path)))
         .count();
     println!(
-        "\n{} / {total} operations deep-verified against Jellyfin {UPSTREAM_TAG} ({UPSTREAM_COMMIT}) — {with_div} with recorded divergences; {ext_verified} owned by compiled-in extensions\n",
+        "\n{} / {total} operations deep-verified against Jellyfin {UPSTREAM_TAG} ({UPSTREAM_COMMIT}), plus {} compared against an earlier release and owed a re-check — of all {} rows, {with_div} with recorded divergences; {ext_verified} owned by compiled-in extensions\n",
+        VERIFIED.len() - VERIFIED_AGAINST_EARLIER_PIN.len(),
+        VERIFIED_AGAINST_EARLIER_PIN.len(),
         VERIFIED.len()
     );
-    println!("| controller | verified / operations |\n|---|---|");
+    println!("| controller | rows, any pin / operations |\n|---|---|");
     for (tag, (v, n)) in &per {
         println!("| {tag} | {v} / {n} |");
     }

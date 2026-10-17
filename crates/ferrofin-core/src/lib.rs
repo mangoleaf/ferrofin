@@ -210,6 +210,7 @@ pub mod media_info_resolver;
 pub mod media_segment_manager;
 pub mod media_source_manager;
 pub mod media_stream_repository;
+mod media_stream_selector;
 pub mod mount_table;
 pub mod music_manager;
 pub mod next_up_service;

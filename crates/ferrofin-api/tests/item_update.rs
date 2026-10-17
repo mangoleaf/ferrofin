@@ -409,7 +409,10 @@ impl LibraryManager for OkLibrary {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        if query.recursive && query.ancestor_ids == [self.item_id] {
+        if query.recursive
+            && query.ancestor_ids == [self.item_id]
+            && !self.tree.descendants.is_empty()
+        {
             return Ok(self.tree.descendants.clone());
         }
         // `RefreshArtist`'s query: the albums crediting the artist, which
@@ -428,6 +431,17 @@ impl LibraryManager for OkLibrary {
             .iter()
             .filter_map(|k| k.stored_type_name())
             .collect();
+        // The cascade queries a season's episodes by ancestor_ids.
+        if !query.ancestor_ids.is_empty() {
+            return Ok(query
+                .ancestor_ids
+                .iter()
+                .filter_map(|id| self.tree.children.get(id))
+                .flatten()
+                .filter(|c| kinds.is_empty() || kinds.contains(&c.type_.as_str()))
+                .cloned()
+                .collect());
+        }
         Ok(self
             .tree
             .children
@@ -1064,10 +1078,10 @@ fn child(id: u128, kind: &str, parent: Uuid, tags: Option<&str>) -> BaseItemEnti
     }
 }
 
-/// `ItemUpdateController.UpdateItem`'s series walk (`:315-356`): the
-/// series' name, rating, custom rating and tag edit reach its seasons and
-/// their episodes, and each child's own `LockedFields` shields its
-/// `OfficialRating` and `Tags`.
+/// `ItemUpdateController.UpdateItem`'s series walk: the series' name,
+/// rating, custom rating and tag edit reach its seasons and their episodes
+/// (every child here follows the series' ratings), and each child's own
+/// `LockedFields` shields its `OfficialRating` and `Tags`.
 #[tokio::test]
 async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() {
     let series_id = Uuid::from_u128(0x5E);
@@ -1080,6 +1094,8 @@ async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() 
             type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
             is_folder: true,
             tags: Some("Old|Keep".into()),
+            official_rating: Some("Old rating".into()),
+            custom_rating: Some("Old custom".into()),
             ..base_item_entity(series_id)
         }),
         children: std::collections::HashMap::from([
@@ -1135,6 +1151,218 @@ async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() 
     let open = by_id(0xE2);
     assert_eq!(open.official_rating.as_deref(), Some("TV-MA"));
     assert_eq!(open.tags.as_deref(), Some("Keep|New"));
+}
+
+/// The last row `update_items` was given for `id`.
+fn written(library: &OkLibrary, id: u128) -> BaseItemEntity {
+    library
+        .updated
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e.id == Uuid::from_u128(id).to_string())
+        .cloned()
+        .expect("row written")
+}
+
+/// A row of `kind` under `parent` rated `rating`.
+fn rated(id: u128, kind: &str, parent: Uuid, rating: Option<&str>) -> BaseItemEntity {
+    BaseItemEntity {
+        official_rating: rating.map(ToOwned::to_owned),
+        custom_rating: None,
+        ..child(id, kind, parent, None)
+    }
+}
+
+/// Upstream `ItemUpdateControllerTests.CreateSeries(seriesRating,
+/// episodeRatings)`: a series (`0x5E`) and its season (`0x51`) both rated
+/// `series_rating`, the season's episodes (`0xE0`, `0xE1`, …) rated
+/// `episode_ratings`.
+fn rated_series(series_rating: &str, episode_ratings: &[Option<&str>]) -> Tree {
+    let series_id = Uuid::from_u128(0x5E);
+    let season_id = Uuid::from_u128(0x51);
+    let episodes = (0u128..)
+        .zip(episode_ratings)
+        .map(|(i, rating)| rated(0xE0 + i, "TV.Episode", season_id, *rating))
+        .collect();
+    Tree {
+        root: Some(BaseItemEntity {
+            is_folder: true,
+            ..rated(0x5E, "TV.Series", series_id, Some(series_rating))
+        }),
+        children: std::collections::HashMap::from([
+            (
+                series_id,
+                vec![rated(0x51, "TV.Season", series_id, Some(series_rating))],
+            ),
+            (season_id, episodes),
+        ]),
+        ..Tree::default()
+    }
+}
+
+/// `UpdateItem_SeriesRatingUnchanged_KeepsEpisodeRatings` (jellyfin#18241):
+/// saving a series without changing its rating leaves every child's alone.
+#[tokio::test]
+async fn a_series_edit_that_keeps_its_rating_leaves_the_children_alone() {
+    let library = post_update(
+        tree_library(
+            Uuid::from_u128(0x5E),
+            rated_series("TV-PG", &[Some("TV-PG"), Some("TV-14"), None]),
+        ),
+        r#"{"Overview":"New overview","OfficialRating":"TV-PG"}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(
+        written(&library, 0x51).official_rating.as_deref(),
+        Some("TV-PG")
+    );
+    assert_eq!(
+        written(&library, 0xE1).official_rating.as_deref(),
+        Some("TV-14")
+    );
+    assert_eq!(written(&library, 0xE2).official_rating, None);
+}
+
+/// `UpdateItem_SeriesRatingChanged_PropagatesOnlyToChildrenFollowingIt`: a
+/// changed series rating reaches the season and the episodes that had the
+/// old one or none, not an episode with its own or a locked one.
+#[tokio::test]
+async fn a_changed_series_rating_reaches_only_the_children_following_it() {
+    let mut tree = rated_series("TV-PG", &[Some("TV-PG"), Some("TV-14"), None]);
+    let season_id = Uuid::from_u128(0x51);
+    tree.children.get_mut(&season_id).unwrap().push(rated(
+        0xEF,
+        "TV.Episode",
+        season_id,
+        Some("TV-PG"),
+    ));
+    tree.locked = std::collections::HashMap::from([(
+        Uuid::from_u128(0xEF),
+        vec![MetadataField::OfficialRating],
+    )]);
+    let library = post_update(
+        tree_library(Uuid::from_u128(0x5E), tree),
+        r#"{"OfficialRating":"TV-MA"}"#.to_owned(),
+    )
+    .await;
+    for (id, expected) in [
+        (0x51, "TV-MA"),
+        (0xE0, "TV-MA"),
+        (0xE1, "TV-14"),
+        (0xE2, "TV-MA"),
+        (0xEF, "TV-PG"),
+    ] {
+        assert_eq!(
+            written(&library, id).official_rating.as_deref(),
+            Some(expected),
+            "{id:#x}"
+        );
+    }
+}
+
+/// `UpdateItem_SeriesCustomRatingChanged_PropagatesIt`: `CustomRating`
+/// follows the same rule, and the unchanged official rating stays put.
+#[tokio::test]
+async fn a_changed_series_custom_rating_reaches_the_children_following_it() {
+    let mut tree = rated_series("TV-PG", &[Some("TV-PG"), Some("TV-14"), None]);
+    tree.children.get_mut(&Uuid::from_u128(0x51)).unwrap()[0].custom_rating = Some("TV-Y".into());
+    let library = post_update(
+        tree_library(Uuid::from_u128(0x5E), tree),
+        r#"{"OfficialRating":"TV-PG","CustomRating":"XXX"}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(
+        written(&library, 0x51).custom_rating.as_deref(),
+        Some("XXX")
+    );
+    assert_eq!(
+        written(&library, 0xE0).custom_rating.as_deref(),
+        Some("TV-Y")
+    );
+    let open = written(&library, 0xE1);
+    assert_eq!(open.custom_rating.as_deref(), Some("XXX"));
+    assert_eq!(open.official_rating.as_deref(), Some("TV-14"));
+}
+
+/// A series' episodes follow their SEASON's change: a season with a
+/// rating of its own keeps it, and so do the episodes that followed it.
+#[tokio::test]
+async fn series_episodes_follow_their_seasons_rating_change() {
+    let mut tree = rated_series("TV-PG", &[Some("TV-Y7"), None]);
+    tree.children.get_mut(&Uuid::from_u128(0x5E)).unwrap()[0].official_rating =
+        Some("TV-Y7".into());
+    let library = post_update(
+        tree_library(Uuid::from_u128(0x5E), tree),
+        r#"{"OfficialRating":"TV-MA"}"#.to_owned(),
+    )
+    .await;
+    for (id, expected) in [(0x51, Some("TV-Y7")), (0xE0, Some("TV-Y7")), (0xE1, None)] {
+        assert_eq!(
+            written(&library, id).official_rating.as_deref(),
+            expected,
+            "{id:#x}"
+        );
+    }
+}
+
+/// `UpdateItem_SeasonRatingChanged_KeepsEpisodesWithTheirOwnRating`, and the
+/// album walk by the same rule, matching the old rating case-insensitively.
+#[tokio::test]
+async fn season_and_album_rating_changes_reach_only_the_children_following_them() {
+    for (kind, child_kind, previous, new, kids) in [
+        (
+            "TV.Season",
+            "TV.Episode",
+            "TV-PG",
+            "TV-MA",
+            [
+                (Some("TV-PG"), Some("TV-MA")),
+                (Some("TV-14"), Some("TV-14")),
+                (None, Some("TV-MA")),
+            ],
+        ),
+        (
+            "Audio.MusicAlbum",
+            "Audio.Audio",
+            "PG-13",
+            "R",
+            [
+                (Some("pg-13"), Some("R")),
+                (Some("PG"), Some("PG")),
+                (Some(""), Some("R")),
+            ],
+        ),
+    ] {
+        let parent = Uuid::from_u128(0x70);
+        let tree = Tree {
+            root: Some(BaseItemEntity {
+                is_folder: true,
+                ..rated(0x70, kind, parent, Some(previous))
+            }),
+            children: std::collections::HashMap::from([(
+                parent,
+                (0u128..)
+                    .zip(&kids)
+                    .map(|(i, (rating, _))| rated(0x71 + i, child_kind, parent, *rating))
+                    .collect(),
+            )]),
+            ..Tree::default()
+        };
+        let library = post_update(
+            tree_library(parent, tree),
+            format!(r#"{{"OfficialRating":"{new}"}}"#),
+        )
+        .await;
+        for (i, (_, expected)) in (0u128..).zip(&kids) {
+            assert_eq!(
+                written(&library, 0x71 + i).official_rating.as_deref(),
+                *expected,
+                "{kind} child {i}"
+            );
+        }
+    }
 }
 
 /// `IHasDisplayOrder.DisplayOrder = request.DisplayOrder` (`:412-415`): a box
@@ -1232,8 +1460,8 @@ async fn a_display_order_edit_is_stored_and_a_series_one_refreshes_it() {
     }
 }
 
-/// The season and album walks (`:357-381`): episodes / tracks take the
-/// rating and tag edit, not the series name.
+/// The season and album walks: episodes / tracks that followed the
+/// parent's rating take the rating and tag edit, not the series name.
 #[tokio::test]
 async fn season_and_album_edits_cascade_to_their_children() {
     for (kind, child_kind) in [
@@ -1246,6 +1474,7 @@ async fn season_and_album_edits_cascade_to_their_children() {
             root: Some(BaseItemEntity {
                 type_: format!("MediaBrowser.Controller.Entities.{kind}"),
                 is_folder: true,
+                official_rating: Some("Old rating".into()),
                 ..base_item_entity(parent)
             }),
             children: std::collections::HashMap::from([(parent, vec![kid])]),

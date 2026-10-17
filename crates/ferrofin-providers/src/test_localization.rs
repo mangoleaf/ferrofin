@@ -1,7 +1,8 @@
 //! A small culture table shared by unit tests that need a
 //! `LocalizationManager` resolving English and French tokens.
 
-/// A culture table holding English (`eng`) and French (`fre`, `fra`).
+/// A culture table holding English (`eng`) and French (`fre`, `fra`), and
+/// the US ratings `G`, `PG` and `R`.
 pub(crate) struct EnglishAndFrench;
 
 impl ferrofin_traits::localization::LocalizationManager for EnglishAndFrench {
@@ -55,9 +56,18 @@ impl ferrofin_traits::localization::LocalizationManager for EnglishAndFrench {
     }
     fn get_rating_score(
         &self,
-        _rating: &str,
+        rating: &str,
         _country_code: Option<&str>,
     ) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
-        unimplemented!()
+        let score = match rating {
+            "G" => 0,
+            "PG" => 10,
+            "R" => 17,
+            _ => return None,
+        };
+        Some(ferrofin_model::entities_media::ParentalRatingScore {
+            score,
+            sub_score: None,
+        })
     }
 }

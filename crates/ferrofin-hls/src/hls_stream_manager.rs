@@ -455,6 +455,7 @@ where
         segment_path: &Path,
         ext: &str,
         ending_ticks: i64,
+        segment_index: i64,
     ) -> Option<ServedFile> {
         if !segment_path.exists() {
             return None;
@@ -464,12 +465,15 @@ where
             .manager
             .begin_request_guard(playlist_key, TranscodingJobType::Hls);
         let mut file = served(segment_path, ext);
-        file.progress = self.manager.segment_progress(playlist_key, ending_ticks);
+        file.progress = self
+            .manager
+            .segment_progress(playlist_key, ending_ticks, segment_index);
         Some(file)
     }
 
     /// Starts (or reuses) the transcode for `request` and resolves segment
     /// `segment_id` on disk. Port of `GetDynamicSegment`.
+    #[allow(clippy::too_many_lines)]
     async fn resolve_dynamic_segment(
         &self,
         request: &HlsStreamRequest,
@@ -502,7 +506,13 @@ where
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext, ending_ticks) {
+        if let Some(file) = self.serve_if_present(
+            &playlist_key,
+            &segment_path,
+            ext,
+            ending_ticks,
+            i64::from(segment_id),
+        ) {
             return Ok(file);
         }
 
@@ -517,7 +527,13 @@ where
         // it open-coded the check without the keep-alive it left
         // `last_activity` stale and the idle reaper free to kill a job that was
         // actively being consumed.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext, ending_ticks) {
+        if let Some(file) = self.serve_if_present(
+            &playlist_key,
+            &segment_path,
+            ext,
+            ending_ticks,
+            i64::from(segment_id),
+        ) {
             return Ok(file);
         }
 
@@ -552,7 +568,11 @@ where
                 {
                     self.clear_restart_failures(&playlist_key);
                     let mut file = served(&segment_path, ext);
-                    file.progress = self.manager.segment_progress(&playlist_key, ending_ticks);
+                    file.progress = self.manager.segment_progress(
+                        &playlist_key,
+                        ending_ticks,
+                        i64::from(segment_id),
+                    );
                     return Ok(file);
                 }
             }
@@ -612,7 +632,9 @@ where
         {
             self.clear_restart_failures(&playlist_key);
             let mut file = served(&segment_path, ext);
-            file.progress = self.manager.segment_progress(&playlist_key, ending_ticks);
+            file.progress =
+                self.manager
+                    .segment_progress(&playlist_key, ending_ticks, i64::from(segment_id));
             Ok(file)
         } else {
             // A 5xx, not a 404: HLS clients skip past a 404'd segment and walk
@@ -681,6 +703,7 @@ where
                 request
                     .current_runtime_ticks
                     .wrapping_add(request.actual_segment_length_ticks),
+                -1,
             );
             return Ok(file);
         }
@@ -755,6 +778,7 @@ where
                 request
                     .current_runtime_ticks
                     .wrapping_add(request.actual_segment_length_ticks),
+                -1,
             );
             Ok(file)
         } else {

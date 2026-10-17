@@ -568,8 +568,8 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/ScheduledTasks/{taskId}"),
     ("post", "/ScheduledTasks/Running/{taskId}"),
     // Batch 16 — the last portable stubs.
-    // Similar-items aliases (`LibraryController.GetSimilarItems`); `Shows/…/Similar`
-    // is already real in Batch 8.
+    // Similar-items aliases (`LibraryController.GetSimilarItems`); the
+    // `Shows/…/Similar` row sits in Batch 8, though `handlers::similar` serves it.
     ("get", "/Albums/{itemId}/Similar"),
     ("get", "/Artists/{itemId}/Similar"),
     ("get", "/Items/{itemId}/Similar"),
@@ -804,14 +804,34 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The upstream Jellyfin release every [`VERIFIED`] row was compared against —
-/// one fact for the whole record, so no row can carry a wrong tag or commit.
-/// Owner decision (2026-09-02): Jellyfin 12 (10.12 in all but name) is the source
-/// of truth; where 10.11.8 differs from it, 10.11.8 is the one that is wrong.
-/// The vendored OpenAPI contract stays 10.11.8 — the API surface did not move.
-pub const UPSTREAM_TAG: &str = "v12.0-rc7";
+/// The upstream Jellyfin release behaviour is ported from and every [`VERIFIED`]
+/// row is compared against, except the rows in [`VERIFIED_AGAINST_EARLIER_PIN`].
+/// It is one fact for the whole record, so no row can carry a wrong tag or commit.
+/// Owner decisions: Jellyfin 12 (10.12 in all but name) is the source of truth,
+/// and where 10.11.8 differs from it, 10.11.8 is the one that is wrong
+/// (2026-09-02). The pin is always the **latest Jellyfin release**, never a
+/// release candidate: when a newer one ships, move this tag and commit to it and
+/// list every row not already listed in [`VERIFIED_AGAINST_EARLIER_PIN`] under
+/// the old tag (2026-10-16). The vendored OpenAPI contract stays 10.11.8: that is
+/// the API clients speak, even though Jellyfin 12 dropped operations from it.
+pub const UPSTREAM_TAG: &str = "v12.2";
 /// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
-pub const UPSTREAM_COMMIT: &str = "4910aafa1a";
+pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
+
+/// [`VERIFIED`] rows last compared against an earlier pin, as
+/// `(method, path, tag compared against)`. They are completed verification work,
+/// but not against [`UPSTREAM_TAG`], and the parity line counts them apart.
+/// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
+/// from this list. `v12.0-rc7` is commit `4910aafa1a`.
+pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
+    ("get", "/Shows/NextUp", "v12.0-rc7"),
+    ("get", "/Artists", "v12.0-rc7"),
+    ("get", "/Artists/AlbumArtists", "v12.0-rc7"),
+    ("get", "/Genres", "v12.0-rc7"),
+    ("get", "/MusicGenres", "v12.0-rc7"),
+    ("get", "/Studios", "v12.0-rc7"),
+    ("get", "/UserItems/Resume", "v12.0-rc7"),
+];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -841,20 +861,26 @@ pub struct Verified {
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
-/// ([`UPSTREAM_TAG`]) for behavioral equivalence: parameters honored and their
+/// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
+/// names for that row) for behavioral equivalence: parameters honored and their
 /// defaults, filters, sort, paging, DTO field set and nullability, status
 /// codes, side effects, auth rules.
 ///
 /// Rules, in full:
-/// - a row exists ⇔ the operation is deep-verified; there is no other state and
-///   no other published count (runtime probes are supporting evidence only);
+/// - a row exists ⇔ the operation is deep-verified; the only other state is
+///   being listed in [`VERIFIED_AGAINST_EARLIER_PIN`] (verified against an
+///   earlier pin, owed a re-check), and there is no other published count
+///   (runtime probes are supporting evidence only);
 /// - rows are only ever added or amended — removing one is a visible deletion
 ///   in review, and a benchmark-suite rewrite cannot touch this file;
 /// - `tests/contract_superset.rs` checks every row is a [`REAL_ROUTES`]
-///   operation with a well-formed `upstream_file`/`upstream_method`/`date`, and prints
-///   `N / 412 operations deep-verified` plus the per-controller table — that
-///   printout is the README parity section, it moves only when a row is
-///   written, and it reaches 100 % when the work is done.
+///   operation with a well-formed `upstream_file`/`upstream_method`/`date`,
+///   checks every [`VERIFIED_AGAINST_EARLIER_PIN`] entry is a distinct row with
+///   a tag other than [`UPSTREAM_TAG`], and prints `N / 412 operations
+///   deep-verified against <UPSTREAM_TAG>, plus M compared against an earlier
+///   release` plus the per-controller table — that printout is the README
+///   parity section. N moves when a row is written or re-checked, and when the
+///   pin moves (its rows then become M); N reaches 100 % when the work is done.
 pub const VERIFIED: &[Verified] = &[
     Verified {
         method: "get",
@@ -906,10 +932,11 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Genres",
         upstream_file: "Jellyfin.Api/Controllers/GenresController.cs",
         upstream_method: "GetGenres",
-        ferrofin: "handlers/genres.rs get_genres → handlers/by_name.rs → ferrofin-core \
+        ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
+               get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-09-03",
-        divergences: GENRES_DIVERGENCES,
+        date: "2026-10-16",
+        divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
     },
     Verified {
         method: "get",
@@ -954,6 +981,7 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
+    UNKNOWN_PARENT_ID_DIVERGENCE,
     "/Artists is the performer (ItemValueType.Artist) tab, and its rows are the \
      MusicArtist items that exist: Jellyfin's ArtistsValidator materializes a MusicArtist \
      item for every artist name, Ferrofin's scanner only for album artists \
@@ -991,6 +1019,7 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
      one gets a narrowed or re-ordered list here and the full SortName-ordered list there.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
+    UNKNOWN_PARENT_ID_DIVERGENCE,
     "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
      inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
      alternate-version / owned-item exclusion is.",
@@ -999,27 +1028,14 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
      append_by_name_filters.",
 ];
 
-/// `/Genres` on top of [`BY_NAME_DIVERGENCES_GENRES_STUDIOS`].
-const GENRES_DIVERGENCES: &[&str] = &[
-    "v12 answers /Genres?parentId=<music or musicvideos collection folder> from \
-     GetMusicGenres (MusicGenre rows, GenresController.cs:141-149); Ferrofin always \
-     answers from the Genre rows. Un-defer path: read the parent's CollectionType \
-     (collection_type_of) in handlers/genres.rs and branch as the controller does.",
-    "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
-     user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
-     ported.",
-    "The shared query struct honors `filters`, `mediaTypes`, `genres`, `tags`, `years`, \
-     `officialRatings`, `genreIds`, `studioIds`, which GenresController does not declare \
-     (ASP.NET ignores them). A client sending one gets a narrowed list here.",
-    "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
-     AncestorIds in every case, so a non-folder parent answers with nothing.",
-    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
-     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
-     alternate-version / owned-item exclusion is.",
-    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
-     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
-     append_by_name_filters.",
-];
+/// Included in the divergence lists of the five by-name VERIFIED rows; the
+/// text also names `/Years` and `/Items/Filters`, which have no row to carry it.
+const UNKNOWN_PARENT_ID_DIVERGENCE: &str = "A `parentId` naming no item: v12's GetParentItem \
+     throws ArgumentException (400 via ExceptionMiddleware); Ferrofin answers 200 with an \
+     empty list. The same holds on /Genres, /MusicGenres, /Studios, /Artists, \
+     /Artists/AlbumArtists, /Years, and /Items/Filters unless includeItemTypes is a lone \
+     Trailer/Program (there the answer is empty filters). Fix path: answer \
+     ApiError::BadRequest(\"Invalid parent id: …\") as items.rs does.";
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the

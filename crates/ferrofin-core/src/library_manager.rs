@@ -138,6 +138,19 @@ pub struct FerrofinLibraryManager {
     external_data: std::sync::OnceLock<Arc<dyn ferrofin_traits::system::ExternalDataManager>>,
 }
 
+/// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
+/// user's recursive query for box sets and/or playlists only. Their per-user
+/// access (shares, open access, owner) lives in the item data, so SQL cannot
+/// decide it.
+fn post_filters_containers(query: &InternalItemsQuery) -> bool {
+    query.user.is_some()
+        && !query.include_item_types.is_empty()
+        && query
+            .include_item_types
+            .iter()
+            .all(|kind| matches!(kind, BaseItemKind::BoxSet | BaseItemKind::Playlist))
+}
+
 /// Port of Folder.CollapseBoxSetItems / AllowBoxSetCollapsing, not HasFilters:
 /// only the upstream allow-list disables this display transformation.
 fn folder_should_collapse(query: &InternalItemsQuery, movies: bool, shows: bool) -> bool {
@@ -1213,6 +1226,7 @@ impl FerrofinLibraryManager {
             && !movies
             && !shows
             && query.user.is_some()
+            && !post_filters_containers(query)
         {
             return Ok(None);
         }
@@ -1296,6 +1310,9 @@ impl FerrofinLibraryManager {
             }
             // Pinned QueryRecursive does not clear an explicit true when its
             // auto-collapse gate fails, or when ForceDirect bypasses that gate.
+            if post_filters_containers(&resolved) {
+                return self.query_with_post_filtering(&resolved).await.map(Some);
+            }
             return self.items.get_items(&resolved).await.map(Some);
         }
         // Plain Folder.GetItemsInternal filters visible unpaged children even
@@ -1573,6 +1590,45 @@ impl FerrofinLibraryManager {
             .await?;
         items.extend(remaining);
         Ok(items)
+    }
+
+    /// `Folder.QueryWithPostFiltering` (v12.2 Folder.cs:1019-1062): the whole
+    /// unpaged list, kept to what the user may open (`IsVisibleStandalone`),
+    /// then counted and paged in memory. The total is 0 when the caller did
+    /// not ask for it, as upstream.
+    async fn query_with_post_filtering(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let unpaged = InternalItemsQuery {
+            start_index: None,
+            limit: None,
+            ..query.clone()
+        };
+        let mut items = self.items.get_item_list(&unpaged).await?;
+        if let Some(user) = &query.user {
+            let visibility = self
+                .visibility
+                .as_ref()
+                .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+            let mut visible = visibility.visible(&items, user, true).await?.into_iter();
+            items.retain(|_| visible.next().unwrap_or(false));
+        }
+        let total = if query.enable_total_record_count {
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
+        } else {
+            0
+        };
+        let start_index = query.start_index.unwrap_or(0);
+        let start = usize::try_from(start_index.max(0)).unwrap_or(usize::MAX);
+        let limit = query
+            .limit
+            .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
+        Ok(QueryResult::new(
+            Some(start_index),
+            Some(total),
+            items.into_iter().skip(start).take(limit).collect(),
+        ))
     }
 
     /// Apply Folder name rechecks, stable sorting, adjacency, counts and paging.
@@ -2351,6 +2407,13 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.retrieve_item(id).await
     }
 
+    async fn build_access_filter(
+        &self,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        self.items.build_access_filter(user).await
+    }
+
     async fn is_item_visible(
         &self,
         item: &BaseItemEntity,
@@ -2756,6 +2819,16 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
+    async fn update_item_rating(&self, mut item: BaseItemEntity) -> Result<(), ServiceError> {
+        if let Some(visibility) = &self.visibility {
+            visibility
+                .update_rating_scores(std::slice::from_mut(&mut item))
+                .await?;
+        }
+        self.persistence.update_rating(&item).await?;
+        Ok(())
+    }
+
     async fn update_item_provider_ids(
         &self,
         item_id: Uuid,
@@ -3028,6 +3101,13 @@ impl LibraryManager for FerrofinLibraryManager {
         query: &InternalPeopleQuery,
     ) -> Result<Vec<PeopleEntity>, ServiceError> {
         Ok(self.people.get_people(query).await?.items)
+    }
+
+    async fn get_people_page(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
+        self.people.get_people(query).await
     }
 
     async fn get_people_batch(
@@ -6591,6 +6671,202 @@ mod tests {
                 ..Default::default()
             }
         ));
+    }
+
+    /// `Folder.QueryRecursive` post-filters a user's playlist-only listing
+    /// through `Playlist.IsVisible` (v12.2 Folder.cs:1008-1062): owner, share
+    /// member or open access, and no administrator exception: Jellyfin 12.2
+    /// counts only the open playlists for an administrator who owns and
+    /// shares none (`Recursive=true&IncludeItemTypes=Playlist&Limit=0`, issue
+    /// #53).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture, three readers, then paging
+    async fn a_recursive_playlist_listing_shows_only_playlists_the_user_may_open() {
+        use crate::user_entity_ext::set_permission;
+        use ferrofin_db::enums::PermissionKind;
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base
+            .with_dashboard_configuration(Arc::new(CollapsingConfiguration::default()))
+            .with_visibility(visibility);
+        let folder = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let [owner, member, admin] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let mut users = Vec::new();
+        for (id, name) in [(owner, "owner"), (member, "member"), (admin, "admin")] {
+            users.push(crate::test_support::seed_named_user(&db, id, name).await);
+            crate::test_support::grant_default_permissions(&db, id).await;
+        }
+        set_permission(
+            db.pool(),
+            &users[2].id,
+            PermissionKind::IsAdministrator,
+            true,
+        )
+        .await
+        .expect("admin");
+        let share = serde_json::json!([{"UserId": member, "CanEdit": false}]);
+        for (name, shares, open) in [
+            ("Private", serde_json::json!([]), false),
+            ("Shared", share, false),
+            ("Open", serde_json::json!([]), true),
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_child_item(&db, id, BaseItemKind::Playlist, name, folder)
+                .await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.top_parent_id.clone_from(&row.parent_id);
+            row.path = Some(
+                data.path()
+                    .join("playlists")
+                    .join(name)
+                    .display()
+                    .to_string(),
+            );
+            row.data = Some(
+                serde_json::json!({"OwnerUserId": owner, "OpenAccess": open, "Shares": shares})
+                    .to_string(),
+            );
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let listing = |user: &ferrofin_db::entities::users::UserEntity, limit| InternalItemsQuery {
+            user: Some(user.clone()),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Playlist],
+            apply_folder_display_options: true,
+            limit,
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            let mut names: Vec<_> = result.items.into_iter().filter_map(|i| i.name).collect();
+            names.sort();
+            names
+        };
+
+        let probe = library
+            .query_items(&listing(&users[2], Some(0)))
+            .await
+            .expect("admin count");
+        assert_eq!((probe.total_record_count, probe.items.len()), (1, 0));
+        for (user, expected) in [
+            (&users[0], vec!["Open", "Private", "Shared"]),
+            (&users[1], vec!["Open", "Shared"]),
+            (&users[2], vec!["Open"]),
+        ] {
+            let result = library
+                .query_items(&listing(user, None))
+                .await
+                .expect("listing");
+            assert_eq!(
+                result.total_record_count,
+                i32::try_from(expected.len()).unwrap()
+            );
+            assert_eq!(names(result), expected);
+        }
+        let page = library
+            .query_items(&InternalItemsQuery {
+                start_index: Some(1),
+                ..listing(&users[0], Some(1))
+            })
+            .await
+            .expect("page");
+        assert_eq!(
+            (page.start_index, page.total_record_count, page.items.len()),
+            (1, 3, 1)
+        );
+        let uncounted = library
+            .query_items(&InternalItemsQuery {
+                enable_total_record_count: false,
+                ..listing(&users[0], None)
+            })
+            .await
+            .expect("uncounted");
+        assert_eq!(
+            (uncounted.total_record_count, uncounted.items.len()),
+            (0, 3),
+            "QueryWithPostFiltering reports 0 when no total was asked for"
+        );
+    }
+
+    /// The same post-filter applies to a box-set-only listing (the Collections
+    /// tab): `BoxSet.IsVisibleStandalone` hides a set whose members all sit in
+    /// libraries the user cannot open, and keeps an empty one.
+    #[tokio::test]
+    async fn a_recursive_box_set_listing_hides_sets_from_blocked_libraries() {
+        use crate::test_support::seed_child_item;
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base
+            .with_dashboard_configuration(Arc::new(CollapsingConfiguration::default()))
+            .with_visibility(visibility);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let [shown_library, blocked_library, collections] =
+            [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for (id, name) in [
+            (shown_library, "Shown"),
+            (blocked_library, "Blocked"),
+            (collections, "Collections"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::CollectionFolder, name).await;
+        }
+        let links = crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone());
+        for (name, member_library) in [
+            ("Hidden set", Some(blocked_library)),
+            ("Shown set", Some(shown_library)),
+            ("Empty set", None),
+        ] {
+            let set = Uuid::new_v4();
+            seed_child_item(&db, set, BaseItemKind::BoxSet, name, collections).await;
+            let mut row = crate::test_support::fetch_item(&db, set).await;
+            row.top_parent_id.clone_from(&row.parent_id);
+            crate::test_support::save_item(&db, &row).await;
+            if let Some(member_library) = member_library {
+                let movie = Uuid::new_v4();
+                seed_child_item(&db, movie, BaseItemKind::Movie, name, member_library).await;
+                links
+                    .upsert_linked_child(set, movie, 0)
+                    .await
+                    .expect("link");
+            }
+        }
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
+            &[ferrofin_db::store::guid_to_db(blocked_library)],
+        )
+        .await
+        .expect("block");
+
+        let result = library
+            .query_items(&InternalItemsQuery {
+                user: Some(user),
+                recursive: true,
+                include_item_types: vec![BaseItemKind::BoxSet],
+                apply_folder_display_options: true,
+                ..Default::default()
+            })
+            .await
+            .expect("listing");
+        let mut names: Vec<_> = result.items.into_iter().filter_map(|i| i.name).collect();
+        names.sort();
+        assert_eq!(result.total_record_count, 2);
+        assert_eq!(names, ["Empty set", "Shown set"]);
     }
 
     /// `BoxSet.GetChildren` sorts the set's direct members by its

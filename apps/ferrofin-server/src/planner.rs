@@ -36,10 +36,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoder::split_args;
 use ferrofin_mediaencoding::encoding_helper::helper::{
     shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
 };
-use ferrofin_mediaencoding::encoding_helper::hw;
+use ferrofin_mediaencoding::encoding_helper::{bitstream, hw};
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
 };
@@ -55,7 +56,6 @@ use ferrofin_traits::media_encoding::{
     HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths as _;
-use uuid::Uuid;
 
 /// The default HLS segment length, in seconds.
 ///
@@ -245,50 +245,20 @@ impl FerrofinStreamStatePlanner {
         self.config.get_encoding_options().await.unwrap_or_default()
     }
 
-    /// Resolves the [`MediaSourceInfo`] for `request`.
-    ///
-    /// Port of the media-source resolution in `StreamingHelpers.GetStreamingState`:
-    /// an open live stream (`live_stream_id`) wins outright and is returned as
-    /// its own source; otherwise fetch the item's static media sources and
-    /// select the one matching the request's `media_source_id` (defaulting to
-    /// the first when unspecified).
+    /// Resolves the [`MediaSourceInfo`] for `request` through
+    /// [`MediaSourceManager::get_stream_media_source`], the selection the
+    /// direct-play routes share.
     async fn resolve_media_source(
         &self,
         request: &HlsStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        // `StreamingHelpers.GetStreamingState`: an open live stream wins over
-        // everything — its source is the buffered copy of the tuner, and going
-        // back to the static sources here would dial the tuner a second time.
-        if let Some(live_stream_id) = request
-            .live_stream_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            return self.media_sources.get_live_stream(live_stream_id).await;
-        }
-
-        let sources = self
-            .media_sources
-            .get_static_media_sources(request.item_id, false, None)
-            .await?;
-
-        // Match the requested id, else when the "media source id" is really the
-        // item id, the first source.
-        let chosen = match request.media_source_id.as_deref() {
-            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
-                Some(i) => sources.into_iter().nth(i),
-                None if Uuid::parse_str(id).is_ok_and(|g| g == request.item_id) => {
-                    sources.into_iter().next()
-                }
-                None => None,
-            },
-            None => sources.into_iter().next(),
-        };
-
-        chosen.ok_or_else(|| {
-            ServiceError::NotFound(format!("no media source for item {}", request.item_id))
-        })
+        self.media_sources
+            .get_stream_media_source(
+                request.item_id,
+                request.media_source_id.as_deref(),
+                request.live_stream_id.as_deref(),
+            )
+            .await
     }
 }
 
@@ -573,6 +543,19 @@ fn segment_file_extension(segment_container: &str) -> &'static str {
 /// decode in browser MSE. Port of `EncodingHelper.IsH265`.
 fn is_hevc(codec: &str) -> bool {
     codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265")
+}
+
+/// Selects the HEVC Dolby Vision MP4 sample entry tag.
+///
+/// Profile 8 uses `hvc1` (what Dolby's official streams use; `dvh1` breaks
+/// strict-tag players like Safari). All other profiles use `dvh1`. Port of
+/// `DynamicHlsController.GetDolbyVisionHevcCodecTag`.
+fn dolby_vision_hevc_codec_tag(stream: Option<&MediaStream>) -> &'static str {
+    if stream.and_then(|s| s.dv_profile) == Some(8) {
+        "hvc1"
+    } else {
+        "dvh1"
+    }
 }
 
 /// The HLS `-hls_segment_type` token for `segment_container`.
@@ -1410,11 +1393,16 @@ impl FerrofinStreamStatePlanner {
         }
         // The device graph and the hardware decoder, straight from the ported
         // matrix — `-init_hw_device`, `-filter_hw_device`, `-hwaccel` and
-        // `-hwaccel_output_format` in upstream's order. Splitting on whitespace
-        // is safe because nothing it produces contains any: the device
-        // arguments phase 4 adds do carry paths, but they are render nodes
-        // (`/dev/dri/renderD*`), which cannot contain a space.
-        push_split(&mut args, &hwaccel_input.args);
+        // `-hwaccel_output_format` in upstream's order. The string is
+        // shell-quoted like every other ffmpeg command line (AMD's OpenCL
+        // device is `device_vendor="Advanced Micro Devices"`), so it takes the
+        // shared splitter, with the same one-token fallback as the input. Only
+        // a configured render-node path containing a quote can reach it, and
+        // ffmpeg then rejects the string, so say why.
+        args.extend(split_args(&hwaccel_input.args).unwrap_or_else(|error| {
+            tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
+            vec![hwaccel_input.args.clone()]
+        }));
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
         args.push("200M".to_owned());
@@ -1443,12 +1431,17 @@ impl FerrofinStreamStatePlanner {
         input_source.protocol =
             ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state);
         let input = self.encoder.get_input_argument(media_path, &input_source);
-        // `get_input_argument` shell-quotes the path (`file:"…"`, inner quotes
-        // `\"`-escaped) for the string-command probe path. The segment transcoder
+        // `get_input_argument` shell-quotes the path (`file:"…"`, inner `\` and
+        // `"` escaped) for the string-command probe path. The segment transcoder
         // spawns ffmpeg via argv (no shell), so those quotes would become part of
         // the filename and ffmpeg would fail to open it (exit 254) for any path
-        // containing a space. Unquote it back into a single argv token with shlex.
-        args.extend(shlex::split(&input).unwrap_or_else(|| vec![input]));
+        // containing a space. Unquote it back into a single argv token. `quote`
+        // always balances, and the fallback is one token, which can never add an
+        // option.
+        args.extend(split_args(&input).unwrap_or_else(|error| {
+            tracing::debug!(%error, "input argument does not split; passing it as one");
+            vec![input]
+        }));
 
         // ---- hardware video filters ------------------------------------------
         // The ported vendor chain owns the whole graph on the hardware path —
@@ -1617,19 +1610,37 @@ impl FerrofinStreamStatePlanner {
         // ---- video -----------------------------------------------------------
         push_split(&mut args, "-c:v");
         args.push(video_encoder.clone());
-        // HEVC output needs the `hvc1` codec tag to decode in browser MSE (only
-        // meaningful in fMP4). Keyed on the *output* codec: the source codec when
-        // copying, else the negotiated target (so `hevc_nvenc` tags too). Port of
-        // `DynamicHlsController`'s `-tag:v:0 hvc1`.
+        // Port of `DynamicHlsController.GetVideoArguments` tag selection:
+        // fMP4 HEVC/AV1 needs a codec tag so players can decode it.
         let output_codec = if copying_video {
             state.video_stream.as_ref().and_then(|s| s.codec.as_deref())
         } else {
             state.output_video_codec.as_deref()
         };
         let output_is_hevc = output_codec.is_some_and(is_hevc);
-        if output_is_hevc && segment_container.eq_ignore_ascii_case("mp4") {
-            push_split(&mut args, "-tag:v:0");
-            args.push("hvc1".to_owned());
+        let output_is_av1 = output_codec.is_some_and(|c| c.eq_ignore_ascii_case("av1"));
+        if (output_is_hevc || output_is_av1) && segment_container.eq_ignore_ascii_case("mp4") {
+            let video_is_dovi = hw::tonemap::is_dovi(state.video_stream.as_ref());
+            let actual_codec = state.actual_output_video_codec();
+            let client_supports_dovi = actual_codec
+                .map(|c| state.requested_range_types(c))
+                .is_some_and(|r| r.iter().any(|s| s.eq_ignore_ascii_case("DOVI")));
+            if copying_video
+                && video_is_dovi
+                && client_supports_dovi
+                && !bitstream::is_dovi_removed(caps, state)
+            {
+                push_split(&mut args, "-tag:v:0");
+                if output_is_hevc {
+                    args.push(dolby_vision_hevc_codec_tag(state.video_stream.as_ref()).to_owned());
+                } else {
+                    args.push("dav1".to_owned());
+                }
+                push_split(&mut args, "-strict -2");
+            } else if output_is_hevc {
+                push_split(&mut args, "-tag:v:0");
+                args.push("hvc1".to_owned());
+            }
         }
         // ---- bitstream filters -----------------------------------------------
         // Only on a stream copy: a re-encode produces a fresh bitstream that
@@ -2180,8 +2191,25 @@ mod tests {
     use ferrofin_model::configuration::HlsAudioSeekStrategy;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case(Some(8), "hvc1")]
+    #[case(Some(5), "dvh1")]
+    #[case(Some(7), "dvh1")]
+    #[case(None, "dvh1")]
+    fn dolby_vision_hevc_codec_tag_selects_tag_for_profile(
+        #[case] profile: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let stream = MediaStream {
+            dv_profile: profile,
+            ..MediaStream::default()
+        };
+        assert_eq!(dolby_vision_hevc_codec_tag(Some(&stream)), expected);
+    }
 
     #[test]
     fn raw_query_params_match_keys_ignoring_case() {
@@ -2318,8 +2346,13 @@ mod tests {
             Ok(String::new())
         }
         fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
-            // Mirror the real encoder, which shell-quotes the path.
-            format!("file:\"{input_file}\"")
+            // The real encoder's quoting, so the planner's unquoting is tested
+            // against it.
+            ferrofin_mediaencoding::encoder::get_input_argument(
+                "file",
+                input_file,
+                ferrofin_model::media_info::MediaProtocol::File,
+            )
         }
         fn get_time_parameter(&self, ticks: i64) -> String {
             format!("-ss {ticks}")
@@ -4616,16 +4649,7 @@ mod tests {
     /// planner's VAAPI prober at it.
     fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
         let path = dir.join("stub-ffmpeg");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::stub_script(&path, &format!("echo 'VAAPI driver: {driver}' >&2\n"));
         FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
     }
 
@@ -4763,6 +4787,41 @@ mod tests {
         );
         // Intel's low-power encoder block, which only iHD/i965 have.
         assert!(args.contains("-low_power 1"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn the_amd_opencl_vendor_reaches_ffmpeg_as_one_argument() {
+        // The device graph is one string, and AMD's OpenCL tonemap names its
+        // vendor with spaces in it. A whitespace split handed ffmpeg
+        // `device_vendor="Advanced`, `Micro` and `Devices"` as three arguments.
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Mesa Gallium driver 24.0.0 for AMD Radeon");
+        let mut video = hdr_4k_video_stream("hevc");
+        video.pixel_format = Some("yuv420p10le".to_owned());
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                enable_tonemapping: true,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|a| a == "opencl=ocl:.0,device_vendor=Advanced Micro Devices"),
+            "{:?}",
+            plan.arguments
+        );
     }
 
     #[tokio::test]
@@ -5237,8 +5296,10 @@ mod tests {
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
-    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
-    /// under the harness query. `GetStreamingState` yields
+    /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono
+    /// aac) under the harness query. The bit depth matters: an unknown or 10-bit
+    /// source gets `GetBitDepthCompensatedBitrate`'s factor (×1.2 here).
+    /// `GetStreamingState` yields
     /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
     /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
     /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
@@ -5250,6 +5311,7 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
+        video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);
         let src = source("abc", vec![video, audio]);
@@ -5851,8 +5913,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.state.output_audio_codec.as_deref(),
-            Some(format!("/audio/{}/stream", request.item_id).as_str()),
-            "native inference reads the literal bare URL rather than the Container query"
+            Some("aac"),
+            "extensionless URL falls back to aac rather than passing the URL as a codec"
         );
         request.audio_codec = Some("mp3".to_owned());
         let plan = planner

@@ -149,6 +149,11 @@ const MIXED: &[&str] = &[
     "Notes/season.nfo",
     "Notes/A.mkv",
     "song.mp3",
+    "Mix.m3u",
+    "Folder/list.m3u8",
+    "Mixes/list.m3u8",
+    "Show/Season 1/show.pls",
+    "Road [Playlist]/a.mkv",
 ];
 
 /// One fixture tree per library type — each shape a resolver treats
@@ -178,6 +183,9 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "Flat Show/bonus/Flat Show S01E05.mkv",
         "Other Show/Season 1/Other Show 1x01.mkv",
         "S.W.A.T. (2017)/Season 01/S.W.A.T. (2017) S01E01.mkv",
+        "Mixtape [playlist]/a.mkv",
+        "Firefly (2002)/Season 01/Gag Reel [playlist]/a.mkv",
+        "Flat Show/bonus/deeper [playlist]/b.mkv",
     ] {
         touch(&tv, rel);
     }
@@ -195,6 +203,17 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "Compilations/Various/01 - Mix.mp3",
         "Compilations/Various/CD1/02 - Mix.mp3",
         "Just An Album/01 - Only.ogg",
+        "Artist A/Album 1/Album 1.m3u",
+        "Artist A/Album 1/Mix.pls",
+        "Artist A/Album 2/CD2/disc.wpl",
+        "Artist A/artist mix.m3u8",
+        "Compilations/top.zpl",
+        "Mixtapes/side.m3u",
+        "root list.m3u",
+        "Road Trip [playlist]/x.mp3",
+        "Lists/playlist.xml",
+        "Lists/y.mp3",
+        "Artist A/Album 1/Best Of [playlist]/z.mp3",
     ] {
         touch(&music, rel);
     }
@@ -208,6 +227,7 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "Series/book2.epub",
         "Cued/rip.m4b",
         "Cued/rip.cue",
+        "Reading [playlist]/novel.epub",
     ] {
         touch(&books, rel);
     }
@@ -221,6 +241,7 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "Trip 2024/img1.jpg",
         "Trip 2024/day2/img2.jpg",
         "Trip 2024/day2/movie.mkv",
+        "Trip 2024/Best [playlist]/img3.jpg",
         "No Photos/Sub/x.png",
     ] {
         touch(&home, rel);
@@ -301,7 +322,8 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
     let parents: std::collections::HashSet<String> = full
         .iter()
         .filter(|p| by_path(p))
-        .filter_map(|p| p.entity.parent_id.clone())
+        .flat_map(|p| [p.entity.parent_id.clone(), p.entity.season_id.clone()])
+        .flatten()
         .collect();
     let owners: std::collections::HashMap<&str, &str> = full
         .iter()
@@ -397,6 +419,7 @@ async fn plan_paths_matches_the_filtered_full_plan() {
         "Entities.AudioBook",
         "Entities.Photo",
         "Entities.PhotoAlbum",
+        "Playlists.Playlist",
     ] {
         assert!(
             full.iter().any(|p| p.entity.type_.ends_with(kind)),
@@ -448,7 +471,16 @@ async fn plan_paths_matches_the_filtered_full_plan() {
         "books/Series",
         "home/No Photos",
         "home/Trip 2024/day2",
+        "home/Trip 2024/Best [playlist]/img3.jpg",
         "mixed/Folder",
+        "music/Road Trip [playlist]/x.mp3",
+        "music/Artist A/Album 1/Best Of [playlist]/z.mp3",
+        "books/Reading [playlist]/novel.epub",
+        "music/Lists/y.mp3",
+        "tv/Mixtape [playlist]/a.mkv",
+        "tv/Firefly (2002)/Season 01/Gag Reel [playlist]/a.mkv",
+        "tv/Flat Show/bonus/deeper [playlist]/b.mkv",
+        "mixed/Road [Playlist]/a.mkv",
     ] {
         paths.push(format!("{root}/{extra}"));
     }
@@ -487,6 +519,104 @@ async fn plan_paths_matches_the_filtered_full_plan() {
     );
 }
 
+/// `PlaylistResolver` answers first in every walk (priority First): each
+/// playlist folder is a `Playlist` under the item around it — or the
+/// library, where the walk plans no row for the folder holding it — with
+/// nothing planned inside it, and each playlist file of a music or untyped
+/// library is one, a `.pls` too.
+#[tokio::test]
+async fn playlists_resolve_before_every_other_resolver() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folders = fixture(tmp.path());
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default())).await;
+    let full = scanner.plan(&folders);
+    let root = tmp.path().to_string_lossy().into_owned();
+    let at = |rel: &str| {
+        let path = format!("{root}/{rel}");
+        full.iter()
+            .find(|p| p.entity.path.as_deref() == Some(path.as_str()))
+            .unwrap_or_else(|| panic!("nothing planned at {rel}"))
+    };
+    let library = |n: u128| Uuid::from_u128(0xF000 + n);
+    let db = |id: Uuid| Some(ferrofin_db::store::guid_to_db(id));
+    for (rel, parent) in [
+        // TV: a series-level folder, a season's subfolder, a nested one.
+        ("tv/Mixtape [playlist]", library(2)),
+        (
+            "tv/Firefly (2002)/Season 01/Gag Reel [playlist]",
+            at("tv/Firefly (2002)/Season 01").id,
+        ),
+        (
+            "tv/Flat Show/bonus/deeper [playlist]",
+            at("tv/Flat Show").id,
+        ),
+        // Music: folders by name and by `playlist.xml`, an album's subfolder.
+        ("music/Road Trip [playlist]", library(3)),
+        ("music/Lists", library(3)),
+        (
+            "music/Artist A/Album 1/Best Of [playlist]",
+            at("music/Artist A/Album 1").id,
+        ),
+        // Music files: in an album, a disc folder, an artist (`Compilations`
+        // holds an album), a folder that is neither, the root.
+        (
+            "music/Artist A/Album 1/Album 1.m3u",
+            at("music/Artist A/Album 1").id,
+        ),
+        (
+            "music/Artist A/Album 1/Mix.pls",
+            at("music/Artist A/Album 1").id,
+        ),
+        (
+            "music/Artist A/Album 2/CD2/disc.wpl",
+            at("music/Artist A/Album 2").id,
+        ),
+        ("music/Artist A/artist mix.m3u8", at("music/Artist A").id),
+        ("music/Compilations/top.zpl", at("music/Compilations").id),
+        ("music/Mixtapes/side.m3u", library(3)),
+        ("music/root list.m3u", library(3)),
+        // Books, home videos (inside a photo album), untyped.
+        ("books/Reading [playlist]", library(4)),
+        ("home/Trip 2024/Best [playlist]", at("home/Trip 2024").id),
+        ("mixed/Road [Playlist]", library(6)),
+        ("mixed/Mix.m3u", library(6)),
+        ("mixed/Mixes/list.m3u8", at("mixed/Mixes").id),
+        ("mixed/Show/Season 1/show.pls", at("mixed/Show/Season 1").id),
+    ] {
+        let playlist = at(rel);
+        assert!(
+            playlist.entity.type_.ends_with("Playlists.Playlist"),
+            "{rel}: {}",
+            playlist.entity.type_
+        );
+        assert_eq!(playlist.entity.parent_id, db(parent), "{rel}");
+        assert_eq!(playlist.ancestors.last(), Some(&parent), "{rel}");
+        let inside = format!("{root}/{rel}/");
+        assert!(
+            !full.iter().any(|p| p
+                .entity
+                .path
+                .as_deref()
+                .is_some_and(|path| path.starts_with(&inside))),
+            "something is planned inside {rel}"
+        );
+    }
+    // Beside a movie in its own folder nothing resolves (upstream's movie is
+    // no folder): no playlist there.
+    let own = format!("{root}/mixed/Folder/list.m3u8");
+    assert!(
+        !full
+            .iter()
+            .any(|p| p.entity.path.as_deref() == Some(own.as_str())),
+        "a playlist beside a movie in its own folder"
+    );
+    // The folder-arm names: the marker cut, any case.
+    assert_eq!(
+        at("mixed/Road [Playlist]").entity.name.as_deref(),
+        Some("Road")
+    );
+}
+
 /// A loose episode of a series with no season folders brings its virtual
 /// season (no path of its own) along in a scoped plan: the row the full plan
 /// groups it under, parent of the episode — never a dangling parent id —
@@ -513,9 +643,17 @@ async fn plan_paths_plans_a_loose_episodes_virtual_season() {
         .iter()
         .find(|p| p.entity.path.as_deref() == Some(loose.as_str()))
         .expect("the episode");
+    let series = scoped
+        .iter()
+        .find(|p| p.entity.type_.ends_with("TV.Series"))
+        .expect("the series");
     assert_eq!(
         episode.entity.parent_id.as_deref(),
-        Some(season.entity.id.as_str())
+        Some(series.entity.id.as_str()),
+    );
+    assert_eq!(
+        episode.entity.season_id.as_deref(),
+        Some(season.entity.id.as_str()),
     );
     assert!(episode.ancestors.contains(&season.id));
     assert_eq!(

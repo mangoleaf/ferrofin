@@ -283,14 +283,15 @@ struct RunningJob {
     /// Known source runtime and the current job's seek offset.
     run_time_ticks: Option<i64>,
     start_time_ticks: Option<i64>,
-    /// Exact segment duration for download tracking and cleanup.
-    segment_length_secs: i32,
     /// The rolling deletion timer, canceled when this job is removed.
     segment_cleaner: Option<super::segment_cleaner::SegmentCleanerTask>,
     /// Dashboard details updated by stderr statistics.
     info: TranscodingInfo,
     /// Dynamic segment paths waiting for response completion.
     segment_endings: std::collections::HashMap<PathBuf, i64>,
+    /// Per-segment end-position tracking for the segment cleaner (replaces the
+    /// old division-by-segment-length estimate that deleted ahead on MKV remux).
+    served_segments: std::sync::Arc<Mutex<std::collections::HashMap<i64, i64>>>,
     /// The segment cache directory to purge on kill (`DeleteHlsPartialStreamFiles`).
     output_dir: PathBuf,
     /// The `.m3u8`/output path whose stem selects the files to delete.
@@ -328,10 +329,10 @@ impl RunningJob {
             })),
             run_time_ticks: state.run_time_ticks,
             start_time_ticks: state.base_request.start_time_ticks,
-            segment_length_secs: state.segment_length_secs,
             segment_cleaner: None,
             info: transcoding_info(state, hardware_acceleration_type),
             segment_endings: std::collections::HashMap::new(),
+            served_segments: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             output_dir,
             playlist_path,
             segment_extension,
@@ -356,6 +357,8 @@ struct DownloadObserver<S: SessionReporter, C: FileCleaner> {
     child: std::sync::Arc<dyn TranscodeChild>,
     progress: std::sync::Arc<Mutex<super::throttler::ThrottleProgress>>,
     ending_ticks: Option<i64>,
+    segment_index: Option<i64>,
+    served_segments: std::sync::Arc<Mutex<std::collections::HashMap<i64, i64>>>,
     completed: std::sync::atomic::AtomicBool,
 }
 
@@ -384,6 +387,14 @@ impl<S: SessionReporter, C: FileCleaner> ferrofin_traits::media_encoding::Transc
                     .unwrap_or(ending_ticks)
                     .max(ending_ticks),
             );
+            if let Some(idx) = self.segment_index
+                && idx >= 0
+            {
+                self.served_segments
+                    .lock()
+                    .expect("served_segments lock poisoned")
+                    .insert(idx, ending_ticks);
+            }
         }
     }
 
@@ -568,6 +579,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
             ending_ticks: running.segment_endings.get(file).copied(),
+            segment_index: None,
+            served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
         };
         job.active_request_count += 1;
@@ -578,6 +591,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Binds a dynamic segment response to its current producing job atomically.
     /// The result owns the old job's progress even after a seek replaces it.
     ///
+    /// `segment_index` is the zero-based index of the segment being served
+    /// (or negative for init segments, which are not tracked).
+    ///
     /// # Panics
     /// Panics if the registry lock is poisoned.
     #[must_use]
@@ -585,6 +601,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self: &std::sync::Arc<Self>,
         playlist: &str,
         ending_ticks: i64,
+        segment_index: i64,
     ) -> Option<std::sync::Arc<dyn ferrofin_traits::media_encoding::TranscodeStreamProgress>>
     where
         S: 'static,
@@ -602,6 +619,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
             ending_ticks: Some(ending_ticks),
+            segment_index: Some(segment_index),
+            served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
         };
         job.active_request_count += 1;
@@ -972,13 +991,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     std::sync::Arc::clone(&running.child),
                     std::sync::Arc::clone(config),
                     running.playlist_path.clone(),
-                    running.segment_length_secs,
                     std::sync::Arc::new(move || {
                         progress
                             .lock()
                             .expect("progress lock poisoned")
                             .download_position_ticks
                     }),
+                    std::sync::Arc::clone(&running.served_segments),
                 ));
             }
         }

@@ -542,6 +542,9 @@ async fn get_items(
     // only source consumers that call Folder's policy inherit global flags.
     internal.apply_folder_display_options = folder_policy;
     redirect_container_browse(&state, &mut internal).await;
+    // After the re-root, as upstream: it decides on the requested types and
+    // this rewrite on the folder that results.
+    list_playlists_folder_as_playlists(&mut internal);
     if !internal.item_ids.is_empty() {
         // ItemsController clears query.Parent immediately before GetItems.
         // Keep any linked-child ancestor constraint established by the
@@ -581,6 +584,34 @@ async fn get_items(
         Some(result.total_record_count),
         dtos,
     )))
+}
+
+/// `if (collectionType == CollectionType.playlists) { recursive = true;
+/// includeItemTypes = [Playlist]; }` (v12.2 ItemsController.cs:321-325): a
+/// playlists folder, or the Playlists view that displays one, lists its
+/// playlists recursively, so the user's post-filter (only playlists they may
+/// open) applies whatever the request asked for.
+///
+/// Every playlist the user may open, wherever it is: Jellyfin 12.2 lists a
+/// playlist file inside a music album in its Playlists view (measured, for
+/// the plain `parentId=<view>` browse jellyfin-web sends and the
+/// `IncludeItemTypes=Playlist` one), not only the playlists the folder holds.
+/// So the listing is re-rooted at the user root, as the typed browse is
+/// ([`redirect_container_browse`]). With no user (an API key without
+/// `userId`, which this route answers with a `400` first, [`resolve_user`])
+/// upstream lists the folder's own children only.
+fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
+    if matches!(
+        internal.parent_type,
+        Some(BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder)
+    ) {
+        internal.recursive = true;
+        internal.include_item_types = vec![BaseItemKind::Playlist];
+        internal.user_root_children = false;
+        if internal.user.is_some() {
+            reroot_to_user_root(internal);
+        }
+    }
 }
 
 /// Convert HTTP query fields once, retaining the resolved user for DTO projection.
@@ -1604,15 +1635,17 @@ fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::Collectio
     )
 }
 
-/// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
-/// linked-child-ancestor constraint (port of `ItemsController.GetItems`'s
-/// `linkedChildAncestorIds` block).
+/// Re-roots a BoxSet/Playlist-typed browse onto the user root (port of
+/// `ItemsController.GetItems`'s `linkedChildAncestorIds` block): from a normal
+/// library parent with a linked-child-ancestor constraint, from the Playlists
+/// view without one (its collection type is the target's own).
 ///
 /// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
-/// a parent is set, and that parent is neither itself a box set/playlist nor
-/// the matching `boxsets`/`playlists` library. Best-effort: an unresolvable
-/// parent leaves the query untouched (the plain parent scoping then returns
-/// empty, as before).
+/// a parent is set, and that parent is neither itself a box set/playlist (nor,
+/// for a playlist browse, the playlists folder) nor the matching `boxsets`
+/// library. A re-rooted query takes the user root's folder policy. Best-effort:
+/// an unresolvable parent leaves the query untouched (the plain parent scoping
+/// then returns empty, as before).
 async fn redirect_container_browse(
     state: &AppState,
     internal: &mut ferrofin_traits::options::InternalItemsQuery,
@@ -1637,7 +1670,21 @@ async fn redirect_container_browse(
     // The parent is itself a container of the requested kind → a direct
     // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
     let short = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
-    if is_direct_children_browse(short) {
+    // The playlists folder only answers a playlist browse; a box-set browse
+    // of it re-roots like any other parent.
+    if is_direct_children_browse(short)
+        && (target_collection_type.is_none() || matches!(short, "BoxSet" | "Playlist"))
+    {
+        return;
+    }
+    // The Playlists view's collection type is `playlists`, the target's own,
+    // so a playlist browse of it re-roots with no linked-ancestor constraint.
+    if target_collection_type.is_none()
+        && short == "UserView"
+        && user_view_browse_context(&parent).0
+            == Some(ferrofin_model::data::CollectionType::playlists)
+    {
+        reroot_to_user_root(internal);
         return;
     }
     // A browse of the boxsets/playlists library itself keeps plain parent
@@ -1661,7 +1708,15 @@ async fn redirect_container_browse(
         return;
     }
     internal.linked_child_ancestor_ids = vec![internal.parent_id];
+    reroot_to_user_root(internal);
+}
+
+/// The re-rooted folder is the user root, which always takes Folder's policy
+/// (and with it the per-user container post-filter), whatever the original
+/// parent's was.
+fn reroot_to_user_root(internal: &mut ferrofin_traits::options::InternalItemsQuery) {
     internal.set_parent(None);
+    internal.apply_folder_display_options = true;
 }
 
 /// Registers this controller's real routes onto `router`.
@@ -1787,6 +1842,49 @@ mod tests {
 
     use super::*;
 
+    /// A browse under either spelling of the playlists folder becomes a
+    /// recursive `[Playlist]` listing from the user root (so it is
+    /// post-filtered per user); any other parent is left as asked.
+    #[test]
+    fn a_playlists_folder_browse_lists_its_playlists_recursively() {
+        for (parent, rewritten) in [
+            (Some(BaseItemKind::PlaylistsFolder), true),
+            (Some(BaseItemKind::ManualPlaylistsFolder), true),
+            (Some(BaseItemKind::CollectionFolder), false),
+            (None, false),
+        ] {
+            let parent_id = Uuid::new_v4();
+            let mut query = InternalItemsQuery {
+                user: Some(crate::test_support::sample_user()),
+                parent_id,
+                parent_type: parent,
+                include_item_types: vec![BaseItemKind::Audio],
+                user_root_children: true,
+                ..InternalItemsQuery::default()
+            };
+            list_playlists_folder_as_playlists(&mut query);
+            assert_eq!(
+                (
+                    query.recursive,
+                    query.include_item_types == [BaseItemKind::Playlist],
+                    query.user_root_children,
+                    // Every playlist the user may open, not only the folder's.
+                    query.parent_id.is_nil(),
+                ),
+                (rewritten, rewritten, !rewritten, rewritten),
+                "{parent:?}"
+            );
+            // With no user the folder keeps its own playlists only.
+            let mut anonymous = InternalItemsQuery {
+                parent_id,
+                parent_type: parent,
+                ..InternalItemsQuery::default()
+            };
+            list_playlists_folder_as_playlists(&mut anonymous);
+            assert_eq!(anonymous.parent_id, parent_id, "{parent:?}");
+        }
+    }
+
     /// Both stored spellings of the playlists plugin folder are a direct-children
     /// browse. `PlaylistsFolder` is the FQN 10.11.8 persists;
     /// `ManualPlaylistsFolder` is `GetClientTypeName()`, which an older Ferrofin
@@ -1868,7 +1966,7 @@ mod tests {
     ];
 
     /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
-    /// route gate's pin, and 12.1.0, the latest Jellyfin (whose additions,
+    /// route gate's pin, and 12.1.0, the newest vendored Jellyfin spec (whose additions,
     /// `audioLanguages` and `subtitleLanguages`, are bound) — is bound by
     /// [`ItemsQuery`] or listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
     /// without a word, so a missing field is a filter the client asked for and

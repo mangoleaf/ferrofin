@@ -32,7 +32,7 @@ use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use uuid::Uuid;
 
-use crate::auth::FirstTimeSetupOrAuth;
+use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
@@ -100,7 +100,7 @@ async fn library_id_by_name(state: &AppState, name: &str) -> Option<Uuid> {
 )]
 async fn get_virtual_folders(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
 ) -> Result<Json<Vec<VirtualFolderInfo>>, ApiError> {
     Ok(Json(state.virtual_folders.get_virtual_folders().await?))
 }
@@ -160,7 +160,7 @@ struct AddVirtualFolderQuery {
 )]
 async fn add_virtual_folder(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<AddVirtualFolderQuery>,
     body: Option<JsonBody<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
@@ -213,8 +213,10 @@ struct RemoveVirtualFolderQuery {
 
 /// `DELETE /Library/VirtualFolders` — remove a virtual folder.
 ///
-/// Port of `LibraryStructureController.RemoveVirtualFolder`: a missing folder is
-/// a `404` (mirroring the C# `FileNotFoundException`).
+/// Port of `LibraryStructureController.RemoveVirtualFolder`: a blank `name` is a
+/// `400` (C# `ArgumentNullException`), and a name that is not an existing
+/// folder directly under the libraries root (`GetChildPath`) is a `404`
+/// (mirroring the C# `FileNotFoundException`).
 #[utoipa::path(
     delete,
     path = "/Library/VirtualFolders",
@@ -224,13 +226,14 @@ struct RemoveVirtualFolderQuery {
     ),
     responses(
         (status = 204, description = "Folder removed"),
+        (status = 400, description = "Missing name"),
         (status = 404, description = "Folder not found")
     ),
     tag = "ferrofin"
 )]
 async fn remove_virtual_folder(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<RemoveVirtualFolderQuery>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
@@ -257,8 +260,10 @@ struct RenameVirtualFolderQuery {
 /// `POST /Library/VirtualFolders/Name` — rename a virtual folder.
 ///
 /// Port of `LibraryStructureController.RenameVirtualFolder`: a missing `name`/
-/// `newName` is a `400` (C# `ArgumentNullException`), a missing source folder is
-/// a `404`, and a target name that already exists is a `409`.
+/// `newName` is a `400` (C# `ArgumentNullException`), as is a `newName` that is
+/// not a single folder under the libraries root (`GetChildPath`); a `name` that
+/// is not an existing such folder is a `404`, and a target name that already
+/// exists is a `409`.
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/Name",
@@ -269,6 +274,7 @@ struct RenameVirtualFolderQuery {
     ),
     responses(
         (status = 204, description = "Folder renamed"),
+        (status = 400, description = "Missing or invalid name"),
         (status = 404, description = "Library does not exist"),
         (status = 409, description = "Library already exists")
     ),
@@ -276,7 +282,7 @@ struct RenameVirtualFolderQuery {
 )]
 async fn rename_virtual_folder(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<RenameVirtualFolderQuery>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
@@ -353,7 +359,7 @@ struct MediaPathQuery {
 )]
 async fn add_media_path(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<MediaPathQuery>,
     JsonBody(body): JsonBody<MediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
@@ -408,7 +414,7 @@ struct UpdateMediaPathBody {
 )]
 async fn update_media_path(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     JsonBody(body): JsonBody<UpdateMediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
     let name = body.name.unwrap_or_default();
@@ -446,7 +452,7 @@ async fn update_media_path(
 )]
 async fn remove_media_path(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<MediaPathQuery>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
@@ -513,7 +519,7 @@ struct UpdateLibraryOptionsBody {
 )]
 async fn update_library_options(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     JsonBody(body): JsonBody<UpdateLibraryOptionsBody>,
 ) -> Result<StatusCode, ApiError> {
     let options = body.library_options.unwrap_or_default();
