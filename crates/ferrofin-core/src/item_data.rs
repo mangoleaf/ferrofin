@@ -1,6 +1,7 @@
-//! `BaseItems.Data` JSON — Jellyfin 10.11.8's serialized-item payload, the
-//! **source of truth** for playlist/collection membership, ownership, and
-//! shares.
+//! `BaseItems.Data` JSON — Jellyfin's serialized-item payload, the **source of
+//! truth** for a playlist's ownership and shares. Membership lives in the
+//! `LinkedChildren` table since 12.0 (`Folder.LinkedChildren` is
+//! `[JsonIgnore]`); a 10.11 `Data` copy of it is imported once, on adoption.
 //!
 //! Jellyfin serializes the whole runtime item object into the `Data` column
 //! (`BaseItemRepository`: `entity.Data = JsonSerializer.Serialize(dto, dtoType,
@@ -17,16 +18,14 @@
 //!    {"Path":"/media/…/M.mkv","Type":"Manual"}], …}
 //! ```
 //!
-//! Ferrofin's query paths keep using the `LinkedChildren` /
-//! `FerrofinPlaylists` / `FerrofinPlaylistShares` tables as a **derived cache**;
-//! every membership/ownership mutation writes through to `Data` via
-//! [`sync_container_data`], and [`reconcile_playlist_permissions`] rebuilds the
-//! cache from `Data` (adopted Jellyfin databases) or backfills `Data` from the
-//! cache (databases created before this module existed) at startup.
+//! Ferrofin's query paths keep using the `FerrofinPlaylists` /
+//! `FerrofinPlaylistShares` tables as a **derived cache**; every ownership or
+//! share mutation writes through to `Data` via [`sync_container_data`], and
+//! [`reconcile_playlist_permissions`] rebuilds the cache from `Data` at startup.
 //!
 //! Writes are **read-modify-write** over the raw JSON object: keys Ferrofin does
 //! not model (`DisplayOrder`, `DateLastSaved`, `IsHD`, …) are preserved
-//! byte-for-byte so a round trip back to Jellyfin loses nothing.
+//! byte-for-byte, so they survive Ferrofin's writes.
 
 use ferrofin_db::Database;
 use ferrofin_db::store::guid_to_db;
@@ -547,7 +546,8 @@ fn data_to_string(data: &Map<String, Value>) -> Result<String, ServiceError> {
         .map_err(|e| ServiceError::Backend(format!("serialize Data JSON: {e}")))
 }
 
-/// The container kinds whose `Data` JSON carries membership.
+/// The stored type names of playlists and box sets (the containers whose
+/// 10.11 `Data` JSON carried membership).
 fn container_type_names() -> [&'static str; 2] {
     [
         stored_type_name(BaseItemKind::Playlist)
@@ -562,15 +562,32 @@ fn container_type_names() -> [&'static str; 2] {
 /// still stores those in `Data`; membership it does not — see the body). A
 /// missing row or a non-playlist type is a no-op (deletions race here harmlessly).
 ///
+/// The reads and the write share one writer transaction, so each sync reflects
+/// the tables at its own point in the writer's order: a sync that read before a
+/// share change committed cannot write its older `Shares` after that change's
+/// own sync, where the next boot's [`reconcile_playlist_permissions`] would
+/// bring a revoked share back.
+///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    sync_container_data_in(&mut tx, container).await?;
+    tx.commit().await.map_err(db_err)
+}
+
+/// [`sync_container_data`] on a connection the caller holds, normally a writer
+/// transaction, so a table change and its `Data` sync commit together.
+pub(crate) async fn sync_container_data_in(
+    conn: &mut sqlx::SqliteConnection,
+    container: Uuid,
+) -> Result<(), ServiceError> {
     let [playlist_type, _] = container_type_names();
     let container_db = guid_to_db(container);
     let Some((type_, data)): Option<(String, Option<String>)> =
         sqlx::query_as(r#"SELECT "Type", "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
             .bind(&container_db)
-            .fetch_optional(db.pool())
+            .fetch_optional(&mut *conn)
             .await
             .map_err(db_err)?
     else {
@@ -590,13 +607,13 @@ pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), S
     let mut map = parse_data(data.as_deref());
 
     if is_playlist {
-        sync_playlist_meta(db, &container_db, &mut map).await?;
+        sync_playlist_meta(conn, &container_db, &mut map).await?;
     }
 
     sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
         .bind(&container_db)
         .bind(data_to_string(&map)?)
-        .execute(db.writer())
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
     Ok(())
@@ -605,7 +622,7 @@ pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), S
 /// Folds a playlist's owner / open-access / shares cache rows into its parsed
 /// `Data` object (the `OwnerUserId` / `OpenAccess` / `Shares` keys).
 async fn sync_playlist_meta(
-    db: &Database,
+    conn: &mut sqlx::SqliteConnection,
     container_db: &str,
     map: &mut Map<String, Value>,
 ) -> Result<(), ServiceError> {
@@ -613,7 +630,7 @@ async fn sync_playlist_meta(
         r#"SELECT "OwnerUserId", "OpenAccess" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
     )
     .bind(container_db)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *conn)
     .await
     .map_err(db_err)?;
     if let Some((owner, open_access)) = meta {
@@ -627,7 +644,7 @@ async fn sync_playlist_meta(
            WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
     )
     .bind(container_db)
-    .fetch_all(db.pool())
+    .fetch_all(&mut *conn)
     .await
     .map_err(db_err)?;
     let shares: Vec<ShareJson> = shares
@@ -1170,6 +1187,70 @@ mod tests {
         // 12.0 marks Folder.LinkedChildren [JsonIgnore]: membership is table-only.
         assert!(!has_linked_children_key(&map));
         let _ = child;
+    }
+
+    /// An entry edit's `Data` sync that starts while a share revoke holds the
+    /// writer must not write the pre-revoke `Shares` after the revoke's own
+    /// sync: the next boot rebuilds the shares from `Data` and would give the
+    /// access back.
+    #[tokio::test]
+    async fn a_sync_waiting_on_a_revoke_does_not_bring_the_share_back() {
+        // File-backed: an in-memory database shares one connection between the
+        // reader and writer pools, which hides the window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}", dir.path().join("sync.db").display());
+        let db = Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let playlist = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mix").await;
+        seed_playlist_owner(&db, playlist, Uuid::new_v4()).await;
+        sqlx::query(
+            r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
+               VALUES (?1, ?2, 1)"#,
+        )
+        .bind(guid_to_db(playlist))
+        .bind(guid_to_db(bob))
+        .execute(db.writer())
+        .await
+        .expect("share");
+        sync_container_data(&db, playlist).await.expect("sync");
+
+        let mut revoke = db.writer().acquire().await.expect("writer");
+        let edit_sync = tokio::spawn({
+            let db = db.clone();
+            async move { sync_container_data(&db, playlist).await }
+        });
+        // Long enough for a sync that reads outside the writer to read the
+        // pre-revoke shares; the fixed sync waits for the writer whatever it is.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .execute(&mut *revoke)
+            .await
+            .expect("revoke");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "Data" = json_set("Data", '$.Shares', json('[]'))
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(playlist))
+        .execute(&mut *revoke)
+        .await
+        .expect("revoke sync");
+        drop(revoke);
+        edit_sync.await.expect("join").expect("edit sync");
+
+        reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot reconcile");
+        let shares: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#,
+        )
+        .bind(guid_to_db(playlist))
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(shares, 0, "the revoked share came back on boot");
     }
 
     #[tokio::test]

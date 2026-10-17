@@ -167,6 +167,9 @@ ferrofin:
     # How long TheTVDB lookups (episode ids, a series' season list) are reused,
     # in whole hours (default 1, the TVDB plugin's CacheDurationInHours).
     # FERROFIN_TVDB_CACHE_HOURS: "1"
+    # How many days TheTVDB's sign-in token is reused before signing in again
+    # (default 25, the TVDB plugin's value; 1 to 29, as tokens expire after a month).
+    # FERROFIN_TVDB_TOKEN_DAYS: "25"
 
     # Export sampled request traces over OTLP gRPC to your collector (→ Tempo/Jaeger).
     # Off unless set; stdout stays structured JSON with a trace_id on each line.

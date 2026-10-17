@@ -656,7 +656,8 @@ pub struct FerrofinPlaylistManager {
     /// per-track adds do exactly that). Share writes made outside an update
     /// do not take it (`update_playlist` calls `add_user_to_shares` under the
     /// guard): the re-rate after an edit saves only its rating columns, never
-    /// `Data`, so it cannot put an older `Shares` back.
+    /// `Data`, and every `Data` sync reads and writes in one writer
+    /// transaction, so neither can put an older `Shares` back.
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
@@ -1064,7 +1065,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         request: &PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
-        // Upsert the share row (POST is idempotent — re-sharing updates CanEdit).
+        // Upsert the share row (POST is idempotent — re-sharing updates CanEdit),
+        // committed with its `Data` sync: each boot rebuilds the shares from `Data`.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
                ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
@@ -1072,11 +1075,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
         .bind(guid_to_db(request.id))
         .bind(guid_to_db(request.user_id))
         .bind(i64::from(request.can_edit.unwrap_or(false)))
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        item_data::sync_container_data(&self.db, request.id).await?;
-        Ok(())
+        item_data::sync_container_data_in(&mut tx, request.id).await?;
+        tx.commit().await.map_err(db_err)
     }
 
     async fn remove_user_from_shares(
@@ -1085,16 +1088,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         user_id: Uuid,
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
         )
         .bind(guid_to_db(playlist_id))
         .bind(guid_to_db(user_id))
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        item_data::sync_container_data(&self.db, playlist_id).await?;
-        Ok(())
+        item_data::sync_container_data_in(&mut tx, playlist_id).await?;
+        tx.commit().await.map_err(db_err)
     }
 
     async fn get_playlist_shares(
