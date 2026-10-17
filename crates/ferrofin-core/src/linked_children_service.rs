@@ -26,7 +26,6 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::LinkedChildrenService;
 
 use crate::db_error::db_err;
-use crate::item_data;
 use crate::item_type_lookup::stored_type_name;
 
 /// The stored `LinkedChildren.ChildType` discriminant for a manually linked
@@ -222,16 +221,11 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         .map_err(db_err)?;
 
         tx.commit().await.map_err(db_err)?;
-        let affected: Vec<Uuid> = affected
+        // No `Data` sync: 12.0 keeps membership out of `Data` (`[JsonIgnore]`).
+        Ok(affected
             .iter()
             .filter_map(|s| Uuid::parse_str(s).ok())
-            .collect();
-        // Membership changed for every affected container — write the new
-        // truth through to each `BaseItems.Data` blob.
-        for parent in &affected {
-            item_data::sync_container_data(&self.db, *parent).await?;
-        }
-        Ok(affected)
+            .collect())
     }
 
     async fn upsert_linked_child(
@@ -275,9 +269,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
             .await
             .map_err(db_err)?;
         }
-        tx.commit().await.map_err(db_err)?;
-        item_data::sync_container_data(&self.db, parent_id).await?;
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 }
 
@@ -381,6 +373,36 @@ mod tests {
                 .expect("new")
                 .len(),
             2
+        );
+    }
+
+    /// A link upsert or reroute changes membership only, which 12.0 keeps out
+    /// of `Data`, so it never writes a parent's `Data` and a `Data` write that
+    /// would fail cannot fail the committed change.
+    #[tokio::test]
+    async fn membership_writes_never_write_data() {
+        let db = test_db().await;
+        let (playlist, from_child, to_child) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, playlist, BaseItemKind::Playlist).await;
+        seed_item(&db, from_child, BaseItemKind::Movie).await;
+        seed_item(&db, to_child, BaseItemKind::Movie).await;
+        crate::item_data::fail_data_writes_of(&db, playlist).await;
+        let svc = FerrofinLinkedChildrenService::new(db);
+
+        svc.upsert_linked_child(playlist, from_child, MANUAL_CHILD_TYPE)
+            .await
+            .expect("upsert");
+        assert_eq!(
+            svc.reroute_linked_children(from_child, to_child)
+                .await
+                .expect("reroute"),
+            vec![playlist]
+        );
+        assert_eq!(
+            svc.get_manual_linked_parent_ids(to_child, None)
+                .await
+                .expect("parents"),
+            vec![playlist]
         );
     }
 

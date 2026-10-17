@@ -351,18 +351,7 @@ impl DynamicImageProviders {
             }
         }
 
-        // TODO(parity, open work item — NOT an accepted divergence): left from
-        // when one `Genre` row served both tabs, before music genres got
-        // `MusicGenre` rows of their own: a genre with no video sources falls
-        // through to the music sampling. Upstream's `GenreImageProvider`
-        // samples Series/Movie only and draws nothing here; the fix is to drop
-        // this fall-through.
-        let mut sources = self.sources_for(kind, item, item_id).await?;
-        if sources.is_empty() && kind == DynamicImageKind::Genre {
-            sources = self
-                .sources_for(DynamicImageKind::MusicGenre, item, item_id)
-                .await?;
-        }
+        let sources = self.sources_for(kind, item, item_id).await?;
         if sources.is_empty() {
             // `CreateImage` returns null for an empty set → `ItemUpdateType.None`.
             return Ok(ItemUpdateType::None);
@@ -1044,6 +1033,34 @@ mod tests {
         let decoded = image::open(&primary.path).expect("png");
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
         assert_eq!(decoded.to_rgb8().get_pixel(10, 10).0, [10, 160, 10]);
+    }
+
+    /// `GenreImageProvider` samples Series/Movie only: a `Genre` row whose
+    /// videos have no art draws nothing, even when same-named music items
+    /// carry covers — those belong to the `MusicGenre` row's collage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genre_without_video_art_does_not_borrow_music_covers() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let cover = write_png(&media, "cover.png", [10, 160, 10]);
+        fx.seed(BaseItemKind::Movie, "Whiplash", Some("Jazz"), None)
+            .await;
+        fx.seed(
+            BaseItemKind::MusicAlbum,
+            "Kind of Blue",
+            Some("Jazz"),
+            Some(&cover),
+        )
+        .await;
+
+        let report = fx.providers.refresh_all().await.expect("pass");
+        assert_eq!(report.generated, 1, "{report:?}");
+        let genre = fx.by_name(BaseItemKind::Genre, "Jazz").await;
+        let genre_id = Uuid::parse_str(&genre.id).expect("id");
+        assert!(fx.primary_of(genre_id).await.is_none());
+        let music = fx.by_name(BaseItemKind::MusicGenre, "Jazz").await;
+        let music_id = Uuid::parse_str(&music.id).expect("id");
+        assert!(fx.primary_of(music_id).await.is_some());
     }
 
     /// The genre query honours `ImageTypes = [Primary]`: a movie without a
