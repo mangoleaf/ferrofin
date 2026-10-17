@@ -581,6 +581,25 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
+    /// Saves only `item`'s rating: its `OfficialRating` and the parental score
+    /// [`update_items`](Self::update_items) would re-derive from it, leaving
+    /// the rest of the stored row as it is. A box set or playlist re-rated
+    /// from its members (`BaseItem.UpdateRatingToItems`) saves through this,
+    /// so the rest of a row it read earlier never overwrites a concurrent
+    /// write — a share change to `Data` above all.
+    ///
+    /// The default is a no-op so the API-layer test doubles keep compiling;
+    /// the real manager writes through the item repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the score cannot be derived or the row
+    /// cannot be written.
+    async fn update_item_rating(&self, item: BaseItemEntity) -> Result<(), ServiceError> {
+        let _ = item;
+        Ok(())
+    }
+
     /// The locked metadata fields (upstream's `BaseItem.LockedFields`) of
     /// each of `item_ids`; an item with none is absent.
     ///

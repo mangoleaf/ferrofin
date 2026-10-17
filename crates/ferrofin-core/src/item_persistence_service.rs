@@ -219,11 +219,14 @@ pub(crate) async fn insert_named_item(
         // keyless row (upstream's only ones are guide airings), so it would
         // vanish from the user's own home query behind whichever row the group
         // happened to elect.
+        // `CleanName` is what `searchTerm` and the search hints match
+        // (`BaseItemMapper.cs:279` derives it on every save); without it a
+        // new box set or playlist is never found by name.
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
-            "PresentationUniqueKey", "ParentId", "TopParentId")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6)"#,
+            "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -239,6 +242,7 @@ pub(crate) async fn insert_named_item(
         None,
         None,
     ))
+    .bind(crate::text_util::get_clean_value(name))
     .execute(db.writer())
     .await
     .map_err(db_err)?;
@@ -3373,6 +3377,31 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .await
         .map_err(db_err)?;
         Ok(written.rows_affected() > 0)
+    }
+
+    async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "OfficialRating" = ?2, "UnratedType" = ?3,
+                   "InheritedParentalRatingValue" = ?4,
+                   "InheritedParentalRatingSubValue" = ?5, "DateLastSaved" = ?6
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&item.id)
+        .bind(&item.official_rating)
+        .bind(&item.unrated_type)
+        .bind(item.inherited_parental_rating_value)
+        .bind(item.inherited_parental_rating_sub_value)
+        .bind(datetime_to_db(chrono::Utc::now()))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+            > 0;
+        if written && let Some(changed) = self.changed.get() {
+            changed.record_updated(std::slice::from_ref(item));
+        }
+        Ok(written)
     }
 
     async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
