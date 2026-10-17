@@ -1968,6 +1968,49 @@ pub trait MediaSourceManager: Send + Sync {
     /// Gets an already-open live stream's media source by id.
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError>;
 
+    /// Resolves the media source a stream request reads, for direct play and
+    /// transcoding alike.
+    ///
+    /// Port of the selection in `StreamingHelpers.GetStreamingState`: an open
+    /// live stream (`live_stream_id`) wins outright, since its source is the
+    /// buffered copy of the tuner and the static sources would dial it again.
+    /// Otherwise the item's static sources (unsubstituted: the server reads
+    /// the file itself), taking the one `media_source_id` names, the first when
+    /// none is named, and the first when the named id is the item's own. An id
+    /// naming no source is `NotFound`, a deliberate divergence: upstream fails
+    /// the request by accident, `400` for an unknown GUID (a null-source
+    /// `ArgumentNullException`) and `500` for a non-GUID (`Guid.Parse`).
+    ///
+    /// TODO: two upstream steps are not ported. Upstream picks from
+    /// `GetPlaybackMediaSources`, whose list has symlinked paths resolved and is
+    /// ordered by `SortMediaSources` (placeholders dropped, widest first after
+    /// the preferred version). It also first reuses the source of the
+    /// `PlaySessionId`'s running transcode job. Fix path: select from
+    /// [`Self::get_playback_media_sources`] once it can be called without a
+    /// user, and look the job up through the transcode manager.
+    async fn get_stream_media_source(
+        &self,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+        live_stream_id: Option<&str>,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        if let Some(live_stream_id) = live_stream_id.map(str::trim).filter(|id| !id.is_empty()) {
+            return self.get_live_stream(live_stream_id).await;
+        }
+        let sources = self.get_static_media_sources(item_id, false, None).await?;
+        let chosen = match media_source_id.filter(|id| !id.is_empty()) {
+            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
+                Some(i) => sources.into_iter().nth(i),
+                None if Uuid::parse_str(id).is_ok_and(|g| g == item_id) => {
+                    sources.into_iter().next()
+                }
+                None => None,
+            },
+            None => sources.into_iter().next(),
+        };
+        chosen.ok_or_else(|| ServiceError::NotFound(format!("no media source for item {item_id}")))
+    }
+
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
 }
