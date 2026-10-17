@@ -654,8 +654,8 @@ pub struct FerrofinPlaylistManager {
     /// entries and writes them back, so two overlapping edits would both
     /// start from the same state and lose one of the changes (parallel
     /// per-track adds do exactly that). Share writes made outside an update
-    /// do not take it (`update_playlist` calls `add_user_to_shares` under the
-    /// guard): the re-rate after an edit saves only its rating columns, never
+    /// do not take it (`update_playlist` writes its shares under the guard):
+    /// the re-rate after an edit saves only its rating columns, never
     /// `Data`, and every `Data` sync reads and writes in one writer
     /// transaction, so neither can put an older `Shares` back.
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
@@ -927,10 +927,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
     }
 
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError> {
-        // Ensure it exists, then apply the name (the only field this leaf row
-        // carries); membership changes arrive through `add_item_to_playlist`.
         self.require_playlist(request.id).await?;
         let _edit = self.entry_edits.lock().await;
+        // C# `UpdatePlaylist` saves the name, shares and open access together
+        // (the last `UpdatePlaylistInternal`). Every change here commits with
+        // the `Data` sync in one writer transaction, so a failed update
+        // applies none of them: a share or open-access change committed
+        // without its sync would be undone by the next boot's re-import. A
+        // playlist no boot has imported yet is imported first, so its
+        // open-access and share changes land on its own rows.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         if let Some(name) = &request.name {
             // With the `CleanName` the save derives (`BaseItemMapper.cs:279`),
             // which is what a search by name matches.
@@ -938,18 +945,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .bind(guid_to_db(request.id))
                 .bind(name)
                 .bind(crate::text_util::get_clean_value(name))
-                .execute(self.db.writer())
+                .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
         }
         if let Some(public) = request.public {
-            // A legacy playlist has no meta row; updating 0 rows is harmless.
             sqlx::query(
                 r#"UPDATE "FerrofinPlaylists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#,
             )
             .bind(guid_to_db(request.id))
             .bind(i64::from(public))
-            .execute(self.db.writer())
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         }
@@ -957,16 +963,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
             // C# replaces `Shares` wholesale on update.
             sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
                 .bind(guid_to_db(request.id))
-                .execute(self.db.writer())
+                .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
             for share in users {
-                self.add_user_to_shares(&PlaylistUserUpdateRequest {
-                    id: request.id,
-                    user_id: share.user_id,
-                    can_edit: Some(share.can_edit),
-                })
-                .await?;
+                upsert_share(&mut tx, request.id, share.user_id, share.can_edit).await?;
             }
         }
         if let Some(ids) = &request.ids {
@@ -978,9 +979,10 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .iter()
                 .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
                 .collect();
-            write_entries(self.db.writer(), &guid_to_db(request.id), &entries).await?;
+            write_entries_in(&mut tx, &guid_to_db(request.id), &entries).await?;
         }
-        item_data::sync_container_data(&self.db, request.id).await?;
+        item_data::sync_container_data_in(&mut tx, request.id).await?;
+        tx.commit().await.map_err(db_err)?;
         if request.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
             self.update_rating_to_items(request.id).await?;
         }
@@ -1065,20 +1067,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         request: &PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
-        // Upsert the share row (POST is idempotent — re-sharing updates CanEdit),
-        // committed with its `Data` sync: each boot rebuilds the shares from `Data`.
+        // The share row, committed with its `Data` sync: each boot rebuilds
+        // the shares from `Data`.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
-        sqlx::query(
-            r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
-               ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
+        upsert_share(
+            &mut tx,
+            request.id,
+            request.user_id,
+            request.can_edit.unwrap_or(false),
         )
-        .bind(guid_to_db(request.id))
-        .bind(guid_to_db(request.user_id))
-        .bind(i64::from(request.can_edit.unwrap_or(false)))
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        .await?;
         item_data::sync_container_data_in(&mut tx, request.id).await?;
         tx.commit().await.map_err(db_err)
     }
@@ -1276,16 +1275,29 @@ async fn read_entries(
 /// Replaces a playlist's entries wholesale with `entries`, `SortOrder`
 /// dense from 0 in the given order, in one transaction — what 12.0's
 /// `ItemPersistenceService` does on every folder save (delete the parent's
-/// rows, re-insert the array). Shared by add, remove, move and replace.
+/// rows, re-insert the array). Shared by create, add, remove and move; an
+/// update's replace runs [`write_entries_in`] inside the update's writer
+/// transaction.
 async fn write_entries(
     pool: &sqlx::SqlitePool,
     playlist_id: &str,
     entries: &[Entry],
 ) -> Result<(), ServiceError> {
     let mut tx = pool.begin().await.map_err(db_err)?;
+    write_entries_in(&mut tx, playlist_id, entries).await?;
+    tx.commit().await.map_err(db_err)
+}
+
+/// [`write_entries`] on a connection the caller holds, normally a writer
+/// transaction that commits more than the entries.
+async fn write_entries_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist_id: &str,
+    entries: &[Entry],
+) -> Result<(), ServiceError> {
     sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
         .bind(playlist_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
     for (ordinal, (child, child_type)) in entries.iter().enumerate() {
@@ -1297,11 +1309,32 @@ async fn write_entries(
         .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
         .bind(child)
         .bind(child_type)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
     }
-    tx.commit().await.map_err(db_err)
+    Ok(())
+}
+
+/// Upserts one share row (POST is idempotent: re-sharing updates `CanEdit`),
+/// on a connection the caller holds, so it commits with its `Data` sync.
+async fn upsert_share(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    user: Uuid,
+    can_edit: bool,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
+           ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
+    )
+    .bind(guid_to_db(playlist))
+    .bind(guid_to_db(user))
+    .bind(i64::from(can_edit))
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2885,6 +2918,100 @@ mod tests {
                 .is_empty(),
             "the revoked share stays revoked after a restart"
         );
+    }
+
+    /// An update that fails part-way applies none of its changes: its share
+    /// and open-access writes never commit without their `Data` sync, so the
+    /// tables and the boot re-import from `Data` agree.
+    #[tokio::test]
+    async fn a_failed_update_applies_none_of_its_changes() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let (bob, carol) = (Uuid::new_v4(), Uuid::new_v4());
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                users: vec![PlaylistUserPermissions::new(bob, true)],
+                public: Some(true),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        // `Ids` naming no item fails the entry rewrite (the
+        // `LinkedChildren.ChildId` foreign key) after the other changes.
+        // Upstream drops such ids (`GetPlaylistItems`); once that is ported
+        // this update succeeds, and the test needs another failing write.
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist_id,
+            name: Some("Renamed".to_owned()),
+            users: Some(Vec::new()),
+            public: Some(false),
+            ids: Some(vec![Uuid::new_v4()]),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect_err("an id of no item fails the update");
+
+        for moment in ["after the failed update", "after a restart"] {
+            assert_eq!(
+                mgr.get_playlist_shares(playlist_id).await.expect("shares"),
+                vec![PlaylistUserPermissions::new(bob, true)],
+                "the share stays {moment}"
+            );
+            assert!(
+                mgr.get_playlist_access(playlist_id, carol).await.is_ok(),
+                "the playlist stays public {moment}"
+            );
+            crate::item_data::reconcile_playlist_permissions(&db)
+                .await
+                .expect("boot re-import");
+        }
+        let stored = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(stored.name.as_deref(), Some("Shared"));
+    }
+
+    /// An update of a playlist no boot has imported yet (no
+    /// `FerrofinPlaylists` row) imports it first, so its open access applies
+    /// and its shares are replaced, not merged with the imported ones.
+    #[tokio::test]
+    async fn an_update_of_an_unimported_playlist_applies_on_its_own_rows() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let (playlist_id, bob, dave) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_item_with_data(
+            &db,
+            playlist_id,
+            BaseItemKind::Playlist,
+            "Unimported",
+            &serde_json::json!({ "Shares": [{ "UserId": bob, "CanEdit": true }] }).to_string(),
+        )
+        .await;
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist_id,
+            users: Some(vec![PlaylistUserPermissions::new(dave, false)]),
+            public: Some(true),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("update");
+
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.expect("shares"),
+            vec![PlaylistUserPermissions::new(dave, false)]
+        );
+        let access = mgr
+            .get_playlist_access(playlist_id, bob)
+            .await
+            .expect("access");
+        assert!(access.open_access, "IsPublic applies");
     }
 
     /// Builds a playlist manager over `db` (the repeated three-collaborator
