@@ -1657,7 +1657,11 @@ pub trait UserDataManager: Send + Sync {
     ///
     /// Port of `BaseItem.MarkPlayed`: sets `Played`, resets the resume position,
     /// stamps `LastPlayedDate` (defaulting to now), and — when `date_played` is
-    /// supplied — increments `PlayCount` (always at least one).
+    /// supplied — increments `PlayCount` (always at least one). A container (a
+    /// series, season, album, box set, playlist or folder) is not marked
+    /// itself: the `Folder`/`BoxSet` overrides mark the items under it. The DTO
+    /// is the container's user data, with its played state rolled up from
+    /// those items where the kind takes it from its children.
     async fn mark_played(
         &self,
         user_id: Uuid,
@@ -1668,7 +1672,9 @@ pub trait UserDataManager: Send + Sync {
     /// Marks an item as unplayed for a user, returning the refreshed data DTO.
     ///
     /// Port of `BaseItem.MarkUnplayed` / `ResetPlayedState`: clears `Played`,
-    /// the play count, the resume position, and `LastPlayedDate`.
+    /// the play count, the resume position, and `LastPlayedDate`. A container
+    /// resets the items under it instead, as [`Self::mark_played`] describes,
+    /// and drops any play state left on its own row.
     async fn mark_unplayed(
         &self,
         user_id: Uuid,

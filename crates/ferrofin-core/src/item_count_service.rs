@@ -2,10 +2,21 @@
 //!
 //! Port of `ItemCountService`. Counts items matching an [`InternalItemsQuery`]
 //! and rolls the per-`Type` counts up into an [`ItemCounts`] the same way C#
-//! `GetItemCounts` does. The played/total *descendant* counts in C# recurse the
-//! `AncestorIds`/`LinkedChildren` closure through the library manager; here the
-//! descendant methods use the `AncestorIds` closure table directly for the
-//! common hierarchical case, and the deeper linked-folder roll-up is deferred.
+//! `GetItemCounts` does. The linked-children count follows a box set's or
+//! playlist's links through the `DescendantOfId` closure, as v12.2 does.
+//!
+//! TODO: the per-page batch (`get_played_and_total_count_batch`) counts the
+//! `AncestorIds` closure only, so a box set's or playlist's list DTO reads every
+//! member as absent. Un-defer path: add v12.2's `linkedLeaves` and
+//! `linkedFolderLeaves` unions (`ItemCountService.cs:597-690`) to its SQL, with an
+//! `EXPLAIN QUERY PLAN` pin.
+//!
+//! TODO: the per-ancestor counts (`get_played_count`, `get_total_count`,
+//! `get_played_and_total_count`, all through `descendant_counts`) have no
+//! production caller and still read the bare `AncestorIds` closure: no link
+//! following, no presentation-key group, no `IsCountableLeaf`. Un-defer path:
+//! port v12.2 `BuildGroupedDescendantsQuery` (`ItemCountService.cs:440-451`)
+//! the way `get_played_and_total_count_from_linked_children` ports its sibling.
 
 use std::collections::{HashMap, HashSet};
 
@@ -114,6 +125,19 @@ impl FerrofinItemCountService {
     pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
         self.roots = Some(roots);
         self
+    }
+
+    /// `COUNT(*)` over the rows an already-resolved `filter` matches (its
+    /// preferences and `DescendantOfId` roots loaded) — ungrouped, and with no
+    /// library scope added (unlike [`ItemCountService::get_count`]).
+    async fn count_rows(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
+        let mut qb = build_query(filter, QueryShape::Count);
+        let count: i64 = qb
+            .build_query_scalar::<i64>()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(i32::try_from(count).unwrap_or(i32::MAX))
     }
 
     /// Counts descendants of `ancestor_id` (via the `AncestorIds` closure) that
@@ -575,63 +599,49 @@ impl ItemCountService for FerrofinItemCountService {
         self.descendant_counts(filter, ancestor_id).await
     }
 
+    /// Port of v12.2 `GetPlayedAndTotalCountFromLinkedChildren`
+    /// (`ItemCountService.cs:454-467`): every item below `parent_id`'s links and
+    /// below what they link (`GetAllDescendantIdsBatch`, the `DescendantOfId`
+    /// closure), kept to the countable leaves (`IsCountableLeaf`: neither a
+    /// folder nor virtual) and access-filtered for the filter's user. Rows, not
+    /// titles, and no library scope: the caller's `InternalItemsQuery(user)`
+    /// names no top parents. Played is the leaf `IsPlayed` predicate (the port
+    /// of `BuildLeafIsPlayedFilter`), where upstream's per-item path uses
+    /// `IsPlayedBy`: the two agree on primary versions, but an alternate
+    /// version listed on its own (its primary in another library, or gone)
+    /// also counts as played here through its primary or a sibling.
     async fn get_played_and_total_count_from_linked_children(
         &self,
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
-        let filter = preferences.as_ref().unwrap_or(filter);
-        let descendants =
-            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
-        let filter = descendants.as_ref().unwrap_or(filter);
-        // Linked-children played/total: count the parent's LinkedChildren that
-        // match the filter and are played. Only the direct linked children are
-        // counted; recursive linked-folder descent is deferred.
-        let matching = {
-            let mut qb = build_query(filter, QueryShape::IdsOnly);
-            qb.build_query_scalar::<String>()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?
+        let leaves = InternalItemsQuery {
+            descendant_of_id: Some(parent_id),
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            ..filter.clone()
         };
-        if matching.is_empty() {
-            return Ok(PlayedAndTotal::default());
-        }
-        let mut sql = String::from(
-            r#"SELECT lc."ChildId" FROM "LinkedChildren" lc WHERE lc."ParentId" = ? AND lc."ChildId" IN ("#,
-        );
-        sql.push_str(&placeholders(matching.len()));
-        sql.push(')');
-        let mut query =
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(parent_id));
-        for id in &matching {
-            query = query.bind(id.as_str());
-        }
-        let children = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-        let total = i32::try_from(children.len()).unwrap_or(i32::MAX);
-        let Some(user_id) = filter.user_id() else {
+        // Resolved once for both counts.
+        let leaves = match crate::query_restrictions::resolve(&self.db, &leaves).await? {
+            Some(resolved) => resolved,
+            None => leaves,
+        };
+        let leaves =
+            match crate::item_repository::resolve_descendant_query(&self.db, &leaves).await? {
+                Some(resolved) => resolved,
+                None => leaves,
+            };
+        let total = self.count_rows(&leaves).await?;
+        if leaves.user.is_none() {
             return Ok(PlayedAndTotal { played: 0, total });
-        };
-        if children.is_empty() {
-            return Ok(PlayedAndTotal::default());
         }
-        let mut sql = String::from(
-            r#"SELECT COUNT(DISTINCT ud."ItemId") FROM "UserData" ud
-               WHERE ud."UserId" = ? AND ud."Played" = 1 AND ud."ItemId" IN ("#,
-        );
-        sql.push_str(&placeholders(children.len()));
-        sql.push(')');
-        let mut query =
-            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(user_id));
-        for id in &children {
-            query = query.bind(id.as_str());
-        }
-        let played = query.fetch_one(self.db.pool()).await.map_err(db_err)?;
-        Ok(PlayedAndTotal {
-            played: i32::try_from(played).unwrap_or(i32::MAX),
-            total,
-        })
+        let played = self
+            .count_rows(&InternalItemsQuery {
+                is_played: Some(true),
+                ..leaves
+            })
+            .await?;
+        Ok(PlayedAndTotal { played, total })
     }
 
     async fn get_played_and_total_count_batch(
@@ -1974,6 +1984,62 @@ mod tests {
             .await
             .expect("no linked");
         assert_eq!(none.total, 0);
+    }
+
+    /// `GetPlayedAndTotalCountFromLinkedChildren` descends through a linked
+    /// folder (a series in a collection counts its episodes, not itself),
+    /// leaves virtual items out (`IsCountableLeaf`), and does not scope to the
+    /// user's libraries: a member in a library the user cannot open still
+    /// counts, as upstream's `InternalItemsQuery(user)` names no top parents.
+    #[tokio::test]
+    async fn linked_children_count_descends_through_linked_folders() {
+        use ferrofin_traits::persistence::{
+            ItemPersistenceService as _, LinkedChildrenService as _,
+        };
+        let db = test_db().await;
+        let service = svc(&db);
+        let (boxset, movie, series, episode, missing) = (
+            Uuid::from_u128(0xAB01),
+            Uuid::from_u128(0xAB02),
+            Uuid::from_u128(0xAB03),
+            Uuid::from_u128(0xAB04),
+            Uuid::from_u128(0xAB05),
+        );
+        seed_item(&db, boxset, BaseItemKind::BoxSet).await;
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        crate::test_support::seed_folder_item(&db, series, BaseItemKind::Series, "Show", None)
+            .await;
+        crate::test_support::seed_episode(&db, episode, "show", 1, 1, false, None).await;
+        crate::test_support::seed_episode(&db, missing, "show", 1, 2, true, None).await;
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        for child in [episode, missing] {
+            persistence.set_ancestors(child, &[series]).await.unwrap();
+        }
+        // The user may open no library at all.
+        crate::test_support::seed_library_over(&db, &[movie, episode, missing]).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        for child in [movie, series] {
+            links.upsert_linked_child(boxset, child, 0).await.unwrap();
+        }
+        let user = Uuid::from_u128(0xAB0D);
+        let user_entity = seed_user(&db, user).await;
+        seed_user_data(&db, user, episode, true, None).await;
+
+        let res = service
+            .get_played_and_total_count_from_linked_children(
+                &InternalItemsQuery {
+                    user: Some(user_entity),
+                    ..Default::default()
+                },
+                boxset,
+            )
+            .await
+            .expect("linked");
+        assert_eq!(
+            (res.played, res.total),
+            (1, 2),
+            "the movie and the aired episode"
+        );
     }
 
     /// A `Year` is not an `ItemValues` row, so the CleanName path counted zero

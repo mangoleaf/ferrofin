@@ -33,7 +33,10 @@ use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{ContentPermissions, UserDataManager, UserDataSaveListener};
+use ferrofin_traits::library::{
+    ContentPermissions, LibraryManager, UserDataManager, UserDataSaveListener,
+};
+use ferrofin_traits::persistence::ItemCountService;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
@@ -87,6 +90,19 @@ pub struct FerrofinUserDataManager {
     /// once the session manager exists ([`Self::set_user_data_changed_sink`]).
     /// Unset (unit tests), they are announced nowhere.
     changed: Arc<std::sync::OnceLock<Arc<dyn UserDataChangedSink>>>,
+    /// Where a played mark on a container finds the items it applies to,
+    /// set by the composition root once the library manager exists
+    /// ([`Self::set_container_members`]). Unset (unit tests), every mark is
+    /// the requested item's own.
+    members: Arc<OnceLock<ContainerMembers>>,
+}
+
+/// What a container's played mark reads: the library manager that lists its
+/// members (held weakly: the composition root owns it) and the counts its
+/// rolled-up played state comes from.
+struct ContainerMembers {
+    library: Weak<dyn LibraryManager>,
+    counts: Arc<dyn ItemCountService>,
 }
 
 impl std::fmt::Debug for FerrofinUserDataManager {
@@ -105,7 +121,20 @@ impl FerrofinUserDataManager {
             config,
             save_listener: Arc::new(OnceLock::new()),
             changed: Arc::new(std::sync::OnceLock::new()),
+            members: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Lets a played mark on a container (a series, season, album, box set,
+    /// playlist or folder) reach the items under it, as `Folder.MarkPlayed`
+    /// and `BoxSet.MarkPlayed` do: `library` lists them and `counts` answers
+    /// the container's rolled-up played state. The first call wins.
+    pub fn set_container_members(
+        &self,
+        library: Weak<dyn LibraryManager>,
+        counts: Arc<dyn ItemCountService>,
+    ) {
+        let _ = self.members.set(ContainerMembers { library, counts });
     }
 
     /// Sets where the user data this manager saves on its own (the other
@@ -415,9 +444,16 @@ impl FerrofinUserDataManager {
                 .await;
             saved.push(to_dto(&row, version));
         }
-        // Each save is a `UserDataSaved` upstream, which the user's sessions
-        // hear as `UserDataChanged` — the request path announces only the
-        // video it saved, so the versions are announced here, together.
+        // The request path announces only the video it saved, so the
+        // versions are announced here, together.
+        self.announce(user_id, saved).await;
+        Ok(())
+    }
+
+    /// Announces user data this manager saved on its own as one
+    /// `UserDataChanged` message. Each save is a `UserDataSaved` upstream,
+    /// which the user's sessions hear as `UserDataChanged`.
+    async fn announce(&self, user_id: Uuid, saved: Vec<UserItemDataDto>) {
         if let Some(sink) = self.changed.get()
             && !saved.is_empty()
         {
@@ -429,8 +465,343 @@ impl FerrofinUserDataManager {
                 sink.user_data_changed(user_id, &data).await;
             }
         }
+    }
+
+    /// The items a played mark on `item_id` applies to, or `None` when it is
+    /// no container and the mark is the item's own.
+    ///
+    /// Port of the container overrides of `MarkPlayed`/`MarkUnplayed`: a box
+    /// set marks each of its members (`BoxSet.cs:205-232`, a member that is
+    /// itself a container in turn), any other folder the recursive non-folder
+    /// items its own `GetItemsInternal` lists for the user (`Folder.cs:
+    /// 1956-2012`): a season its episodes, a series every episode under its
+    /// key, a playlist or library what is under it. A virtual item is left
+    /// out of a played mark unless the user displays missing episodes, and
+    /// an unaired virtual episode always is. A legacy (folder-backed) box
+    /// set's members are its children on disk, which reach the same items
+    /// as its `base.MarkPlayed` does.
+    async fn container_members(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        played: bool,
+    ) -> Result<Option<Container>, ServiceError> {
+        let Some(members) = self.members.get() else {
+            return Ok(None);
+        };
+        let Some(library) = members.library.upgrade() else {
+            tracing::warn!(%item_id, "library manager gone: the played mark is the item's own");
+            return Ok(None);
+        };
+        let Some(root) = library.get_item_by_id(item_id).await? else {
+            return Ok(None);
+        };
+        // `item is Folder`: the C# class decides, not the stored `IsFolder`
+        // (a by-name artist row stores false).
+        if !is_container(&root) {
+            return Ok(None);
+        }
+        let Some(user) = crate::item_repository::query_user(&self.db, user_id).await? else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::from([item_id]);
+        let mut leaves = Vec::new();
+        // A box set inside a box set (or a cycle of them) is walked once.
+        let mut folders = vec![(item_id, root.clone())];
+        while let Some((id, folder)) = folders.pop() {
+            let box_set = kind_from_type_name(&folder.type_) == Some(BaseItemKind::BoxSet);
+            let query = member_query(id, &folder, &user, played);
+            for child in library.query_items(&query).await?.items {
+                let Ok(child_id) = Uuid::parse_str(&child.id) else {
+                    continue;
+                };
+                if !seen.insert(child_id) {
+                    continue;
+                }
+                if is_container(&child) {
+                    folders.push((child_id, child));
+                } else if box_set
+                    || !(played && child.is_virtual_item && is_unaired_episode(&child))
+                {
+                    leaves.push(child_id);
+                }
+            }
+        }
+        Ok(Some(Container {
+            id: item_id,
+            root,
+            user,
+            leaves,
+        }))
+    }
+
+    /// Marks a container's members played or unplayed and answers with the
+    /// container's user data: `UpdatePlayedStatus` → `item.MarkPlayed`/
+    /// `MarkUnplayed`, then `GetUserDataDto(item, user)`.
+    ///
+    /// One write per member, as upstream's per-item `SaveUserData` — not one
+    /// transaction around them all, which would hold the single writer for a
+    /// whole library's mark and stall every playback report meanwhile. The
+    /// members saved are announced together, even when a later one failed.
+    async fn mark_container(
+        &self,
+        user_id: Uuid,
+        container: &Container,
+        played: bool,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        let mut saved = Vec::with_capacity(container.leaves.len());
+        let mut failed = None;
+        for &leaf in &container.leaves {
+            let marked = if played {
+                self.mark_item_played(user_id, leaf, date_played).await
+            } else {
+                self.mark_item_unplayed(user_id, leaf).await
+            };
+            match marked {
+                Ok(dto) => saved.push(dto),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        self.announce(user_id, saved).await;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        if !played {
+            self.clear_own_play_state(user_id, container.id).await?;
+        }
+        self.container_dto(user_id, container).await
+    }
+
+    /// Resets the play state a container's own rows carry, under every key,
+    /// when the container is marked unplayed.
+    ///
+    /// Upstream's container mark never writes those rows, but earlier
+    /// Ferrofin builds marked the container itself. Where a kind's played
+    /// state IS its own row (a music album, a library) that stale state would
+    /// otherwise show for good. Divergence: upstream's `MarkUnplayed` leaves
+    /// the row alone, so a `Played` set on a container through the UserData
+    /// API survives it there; here the user's unmark clears it. A played mark
+    /// clears nothing: the row then agrees with it. Favourite and rating are
+    /// kept, and a row with no play state is not written.
+    ///
+    /// TODO: the SQL `IsPlayed` filter and sort (`translate_query`'s
+    /// `push_is_played`) still read a folder's own row. A container marked
+    /// played from now on (its row unwritten) therefore never matches
+    /// `IsPlayed = true`, and one an earlier build marked and never unmarked
+    /// still matches it. Un-defer path: port the folder arm of v12
+    /// `BuildIsPlayedFilter` (a roll-up over the folder's countable
+    /// descendants that ignores its row) for the filter and the sort keys.
+    async fn clear_own_play_state(&self, user_id: Uuid, item_id: Uuid) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"UPDATE "UserData"
+               SET "Played" = 0, "PlayCount" = 0, "PlaybackPositionTicks" = 0,
+                   "LastPlayedDate" = NULL
+               WHERE "ItemId" = ?1 AND "UserId" = ?2
+                 AND ("Played" = 1 OR "PlayCount" <> 0 OR "PlaybackPositionTicks" <> 0
+                      OR "LastPlayedDate" IS NOT NULL)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(guid_to_db(user_id))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
+
+    /// `GetUserDataDto(container, user)`: the container's own user data (its
+    /// key derived as the item DTO derives it), whose played numbers
+    /// `Folder.FillUserDataDtoValues` takes from its leaves.
+    async fn container_dto(
+        &self,
+        user_id: Uuid,
+        container: &Container,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        // Providers hydrated: the controller loads the item by id.
+        let mut dto = self
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&container.root), user_id, true)
+            .await?
+            .remove(&container.id)
+            .unwrap_or_else(|| to_dto(&Self::empty_row(container.id, user_id), container.id));
+        if let Some(members) = self.members.get()
+            && kind_from_type_name(&container.root.type_).is_some_and(|kind| {
+                crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)
+            })
+        {
+            let counts = self.container_counts(container, &members.counts).await?;
+            crate::dto_service::fill_folder_played(&mut dto, counts);
+        }
+        Ok(dto)
+    }
+
+    /// `Folder.FillUserDataDtoValues`' counts for one container, with no
+    /// precomputed batch (v12.2 Folder.cs:2048-2059): a folder with linked
+    /// children (a box set, a playlist) counts through
+    /// `GetPlayedAndTotalCountFromLinkedChildren`, any other its descendants.
+    async fn container_counts(
+        &self,
+        container: &Container,
+        counts: &Arc<dyn ItemCountService>,
+    ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
+        if counts
+            .get_linked_children_count_batch(&[container.id])
+            .await?
+            .contains_key(&container.id)
+        {
+            let query = ferrofin_traits::options::InternalItemsQuery {
+                user: Some(container.user.clone()),
+                ..ferrofin_traits::options::InternalItemsQuery::default()
+            };
+            return counts
+                .get_played_and_total_count_from_linked_children(&query, container.id)
+                .await;
+        }
+        Ok(counts
+            .get_played_and_total_count_batch(&[container.id], &container.user)
+            .await?
+            .remove(&container.id)
+            .unwrap_or_default())
+    }
+
+    /// Port of `BaseItem.MarkPlayed(user, datePlayed, resetPosition: true)`
+    /// for one item that is no container.
+    async fn mark_item_played(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+
+        // A supplied date is a fresh play → increment the count.
+        if date_played.is_some() {
+            row.play_count += 1;
+        }
+        // Ensure it is at least one.
+        row.play_count = row.play_count.max(1);
+        // `resetPosition` is always true from the controller.
+        row.playback_position_ticks = 0;
+        row.last_played_date = Some(
+            date_played
+                .or(row.last_played_date)
+                .unwrap_or_else(chrono::Utc::now),
+        );
+        row.played = true;
+
+        self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, UserDataSaveReason::TogglePlayed)
+            .await;
+        // `Video.MarkPlayed` → `PropagatePlayedState(user, true, resetPosition)`.
+        self.propagate_played_state(user_id, item_id, true, true)
+            .await?;
+        Ok(to_dto(&row, item_id))
+    }
+
+    /// Port of `BaseItem.MarkUnplayed` → `ResetPlayedState` for one item
+    /// that is no container.
+    async fn mark_item_unplayed(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+
+        row.play_count = 0;
+        row.playback_position_ticks = 0;
+        row.last_played_date = None;
+        row.played = false;
+
+        self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, UserDataSaveReason::TogglePlayed)
+            .await;
+        // `Video.MarkUnplayed` → `PropagatePlayedState(user, false, true)`.
+        self.propagate_played_state(user_id, item_id, false, true)
+            .await?;
+        Ok(to_dto(&row, item_id))
+    }
+}
+
+/// A container a played mark applies to through its members.
+struct Container {
+    id: Uuid,
+    root: BaseItemEntity,
+    user: ferrofin_db::entities::users::UserEntity,
+    /// The items the mark is written on, in the order they were found.
+    leaves: Vec<Uuid>,
+}
+
+/// Whether a played mark on this item goes to its members: a `Folder`
+/// subclass upstream, whatever its stored `IsFolder`.
+fn is_container(item: &BaseItemEntity) -> bool {
+    kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_folder)
+}
+
+/// The query listing a container's members for a played mark (see
+/// [`FerrofinUserDataManager::container_members`]).
+fn member_query(
+    id: Uuid,
+    folder: &BaseItemEntity,
+    user: &ferrofin_db::entities::users::UserEntity,
+    played: bool,
+) -> ferrofin_traits::options::InternalItemsQuery {
+    use ferrofin_traits::options::InternalItemsQuery;
+    let user_entity = Some(user.clone());
+    match kind_from_type_name(&folder.type_) {
+        // `BoxSet.GetLinkedChildren(user)`: the parent query merges the
+        // manual links (a legacy set's children are its rows on disk).
+        Some(BaseItemKind::BoxSet) => InternalItemsQuery {
+            parent_id: id,
+            user: user_entity,
+            enable_total_record_count: false,
+            ..InternalItemsQuery::default()
+        },
+        // `Series.GetItemsInternal`'s recursive branch: everything under the
+        // series key, never a virtual item.
+        Some(BaseItemKind::Series) => InternalItemsQuery {
+            recursive: true,
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            series_presentation_unique_key: Some(crate::library_manager::episode_presentation_key(
+                folder,
+            )),
+            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
+            user: user_entity,
+            enable_total_record_count: false,
+            ..InternalItemsQuery::default()
+        },
+        // `Folder.MarkPlayed`'s query, through the folder's own
+        // `GetItemsInternal` (a season's `GetEpisodes`, a playlist's links,
+        // a library's top parents).
+        kind => InternalItemsQuery {
+            parent_id: id,
+            parent_type: kind,
+            recursive: true,
+            is_folder: Some(false),
+            is_virtual_item: (played && !user.display_missing_episodes).then_some(false),
+            user: user_entity,
+            apply_folder_display_options: true,
+            enable_total_record_count: false,
+            ..InternalItemsQuery::default()
+        },
+    }
+}
+
+/// `item is Episode { IsUnaired: true }` — `BaseItem.IsUnaired`
+/// (BaseItem.cs:213): it premieres today or later, by the server's date.
+fn is_unaired_episode(item: &BaseItemEntity) -> bool {
+    kind_from_type_name(&item.type_) == Some(BaseItemKind::Episode)
+        && item.premiere_date.is_some_and(|date| {
+            date.with_timezone(&chrono::Local).date_naive() >= chrono::Local::now().date_naive()
+        })
 }
 
 /// The synthetic `UserData.Key` for an item that has **no** stored row.
@@ -887,34 +1258,13 @@ impl UserDataManager for FerrofinUserDataManager {
         item_id: Uuid,
         date_played: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<UserItemDataDto, ServiceError> {
-        // Port of `BaseItem.MarkPlayed(user, datePlayed, resetPosition: true)`.
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
-
-        // A supplied date is a fresh play → increment the count.
-        if date_played.is_some() {
-            row.play_count += 1;
+        match self.container_members(user_id, item_id, true).await? {
+            Some(container) => {
+                self.mark_container(user_id, &container, true, date_played)
+                    .await
+            }
+            None => self.mark_item_played(user_id, item_id, date_played).await,
         }
-        // Ensure it is at least one.
-        row.play_count = row.play_count.max(1);
-        // `resetPosition` is always true from the controller.
-        row.playback_position_ticks = 0;
-        row.last_played_date = Some(
-            date_played
-                .or(row.last_played_date)
-                .unwrap_or_else(chrono::Utc::now),
-        );
-        row.played = true;
-
-        self.upsert_row(&row).await?;
-        self.notify_saved(user_id, item_id, UserDataSaveReason::TogglePlayed)
-            .await;
-        // `Video.MarkPlayed` → `PropagatePlayedState(user, true, resetPosition)`.
-        self.propagate_played_state(user_id, item_id, true, true)
-            .await?;
-        Ok(to_dto(&row, item_id))
     }
 
     async fn mark_unplayed(
@@ -922,24 +1272,10 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
         item_id: Uuid,
     ) -> Result<UserItemDataDto, ServiceError> {
-        // Port of `BaseItem.MarkUnplayed` → `ResetPlayedState`.
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
-
-        row.play_count = 0;
-        row.playback_position_ticks = 0;
-        row.last_played_date = None;
-        row.played = false;
-
-        self.upsert_row(&row).await?;
-        self.notify_saved(user_id, item_id, UserDataSaveReason::TogglePlayed)
-            .await;
-        // `Video.MarkUnplayed` → `PropagatePlayedState(user, false, true)`.
-        self.propagate_played_state(user_id, item_id, false, true)
-            .await?;
-        Ok(to_dto(&row, item_id))
+        match self.container_members(user_id, item_id, false).await? {
+            Some(container) => self.mark_container(user_id, &container, false, None).await,
+            None => self.mark_item_unplayed(user_id, item_id).await,
+        }
     }
 
     async fn reset_playback_stream_selections(
@@ -3800,5 +4136,343 @@ mod tests {
         let last = sink.0.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.0, other);
         assert_eq!(last.1["UserDataList"].as_array().map(Vec::len), Some(4));
+    }
+
+    /// A user-data manager whose container marks reach their members through
+    /// a library manager wired as the composition root wires it (with the
+    /// dashboard configuration, so a season lists its episodes through
+    /// `Season.GetItemsInternal`), kept alive by the caller.
+    fn container_manager(
+        db: &Database,
+    ) -> (
+        FerrofinUserDataManager,
+        Arc<dyn ferrofin_traits::library::LibraryManager>,
+    ) {
+        let counts: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
+            Arc::new(crate::FerrofinItemCountService::new(db.clone()));
+        let library: Arc<dyn ferrofin_traits::library::LibraryManager> = Arc::new(
+            crate::FerrofinLibraryManager::new(
+                Arc::new(crate::FerrofinItemRepository::new(
+                    db.clone(),
+                    Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+                )),
+                Arc::clone(&counts),
+                Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
+                Arc::new(crate::FerrofinPeopleRepository::new(db.clone())),
+            )
+            .with_dashboard_configuration(config()),
+        );
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.set_container_members(Arc::downgrade(&library), counts);
+        (mgr, library)
+    }
+
+    /// A show as a scan stores it: a series, its season 1 and the episodes
+    /// `(id, is_virtual, premiere)` under it, keyed and parented the way
+    /// `Season.GetItemsInternal` and the series-key query read them.
+    async fn seed_show(
+        db: &Database,
+        series: Uuid,
+        season: Uuid,
+        episodes: &[(Uuid, bool, Option<chrono::DateTime<chrono::Utc>>)],
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let key = format!("show-{series}");
+        let mut rows = vec![
+            BaseItemEntity {
+                id: guid_to_db(series),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                name: Some("Show".into()),
+                is_folder: true,
+                presentation_unique_key: Some(key.clone()),
+                ..Default::default()
+            },
+            BaseItemEntity {
+                id: guid_to_db(season),
+                type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                name: Some("Season 1".into()),
+                index_number: Some(1),
+                parent_id: Some(guid_to_db(series)),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.clone()),
+                presentation_unique_key: Some(format!("{key}-season-1")),
+                is_folder: true,
+                ..Default::default()
+            },
+        ];
+        for (number, &(id, is_virtual, premiere)) in (1..).zip(episodes) {
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                name: Some(format!("Episode {number}")),
+                parent_id: Some(guid_to_db(season)),
+                season_id: Some(guid_to_db(season)),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.clone()),
+                parent_index_number: Some(1),
+                index_number: Some(number),
+                media_type: Some("Video".into()),
+                is_virtual_item: is_virtual,
+                path: (!is_virtual).then(|| format!("/media/show/s01e{number:02}.mkv")),
+                premiere_date: premiere,
+                ..Default::default()
+            });
+        }
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        persistence.save_items(&rows).await.unwrap();
+        persistence.set_ancestors(season, &[series]).await.unwrap();
+        for &(id, _, _) in episodes {
+            persistence
+                .set_ancestors(id, &[season, series])
+                .await
+                .unwrap();
+        }
+    }
+
+    /// `Folder.MarkPlayed`/`MarkUnplayed` (v12.2 Folder.cs:1956-2012) through
+    /// `Series.GetItemsInternal`: marking a series marks its episodes —
+    /// never a virtual one — and writes nothing on the series itself. The
+    /// answer is `GetUserDataDto(series)`, whose played state comes from the
+    /// episodes (`Folder.FillUserDataDtoValues`).
+    #[tokio::test]
+    async fn marking_a_series_marks_its_episodes_not_the_series() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (series, season) = (Uuid::from_u128(0x5E0), Uuid::from_u128(0x5E1));
+        let (ep1, ep2, missing) = (
+            Uuid::from_u128(0xE1),
+            Uuid::from_u128(0xE2),
+            Uuid::from_u128(0xE3),
+        );
+        seed_show(
+            &db,
+            series,
+            season,
+            &[
+                (ep1, false, None),
+                (ep2, false, None),
+                (missing, true, None),
+            ],
+        )
+        .await;
+        seed_provider_id(&db, series, "Tvdb", "73739").await;
+        let (mgr, _library) = container_manager(&db);
+        let sink = Arc::new(RecordingSink::default());
+        mgr.set_user_data_changed_sink(sink.clone());
+
+        let dto = mgr.mark_played(user, series, None).await.unwrap();
+        assert!(data(&mgr, ep1, user).await.played);
+        assert!(data(&mgr, ep2, user).await.played);
+        assert!(
+            !data(&mgr, missing, user).await.played,
+            "never a virtual episode"
+        );
+        assert!(
+            mgr.read_row(series, user).await.unwrap().is_none(),
+            "the series' own data is never written"
+        );
+        assert!(dto.played, "both episodes are played");
+        assert_eq!(dto.unplayed_item_count, Some(0));
+        assert_eq!(dto.played_percentage, Some(100.0));
+        assert_eq!(
+            dto.key, "73739",
+            "the series' first user-data key, as its item DTO derives it, not its guid"
+        );
+        let sent = sink.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one message for the episodes");
+        assert_eq!(sent[0].1["UserDataList"].as_array().map(Vec::len), Some(2));
+
+        let dto = mgr.mark_unplayed(user, series).await.unwrap();
+        assert!(!data(&mgr, ep1, user).await.played);
+        assert!(!data(&mgr, ep2, user).await.played);
+        assert!(mgr.read_row(series, user).await.unwrap().is_none());
+        assert!(!dto.played);
+        assert_eq!(dto.unplayed_item_count, Some(2));
+    }
+
+    /// `Folder.MarkPlayed` on a season, through `Season.GetItemsInternal`:
+    /// a virtual episode is marked only when the user displays missing
+    /// episodes, an unaired one never (`BaseItem.IsUnaired`), and
+    /// `Folder.MarkUnplayed` resets every episode, virtual ones included. A
+    /// series always leaves virtual episodes out (`Series.GetItemsInternal`
+    /// sets `IsVirtualItem = false`), whatever the user displays.
+    #[tokio::test]
+    async fn marking_a_season_follows_display_missing_episodes() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (series, season) = (Uuid::from_u128(0x5E0), Uuid::from_u128(0x5E1));
+        let (aired, missing, unaired) = (
+            Uuid::from_u128(0xE1),
+            Uuid::from_u128(0xE2),
+            Uuid::from_u128(0xE3),
+        );
+        let now = chrono::Utc::now();
+        seed_show(
+            &db,
+            series,
+            season,
+            &[
+                (aired, false, Some(now - chrono::Duration::days(30))),
+                (missing, true, Some(now - chrono::Duration::days(30))),
+                (unaired, true, Some(now + chrono::Duration::days(30))),
+            ],
+        )
+        .await;
+        let (mgr, _library) = container_manager(&db);
+        let played = |id| {
+            let mgr = &mgr;
+            async move { data(mgr, id, user).await.played }
+        };
+
+        mgr.mark_played(user, season, None).await.unwrap();
+        assert!(played(aired).await);
+        assert!(!played(missing).await, "missing episodes are not displayed");
+        assert!(!played(unaired).await);
+
+        mgr.mark_played(user, missing, None).await.unwrap();
+        mgr.mark_unplayed(user, season).await.unwrap();
+        assert!(!played(aired).await);
+        assert!(!played(missing).await, "unplayed resets virtual ones too");
+
+        sqlx::query(r#"UPDATE "Users" SET "DisplayMissingEpisodes" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        mgr.mark_played(user, season, None).await.unwrap();
+        assert!(played(aired).await);
+        assert!(
+            played(missing).await,
+            "displayed missing episodes are marked"
+        );
+        assert!(!played(unaired).await, "never an unaired one");
+
+        mgr.mark_unplayed(user, season).await.unwrap();
+        mgr.mark_played(user, series, None).await.unwrap();
+        assert!(played(aired).await);
+        assert!(!played(missing).await, "a series never marks a virtual one");
+        assert!(!played(unaired).await, "nor an unaired one");
+    }
+
+    /// `BoxSet.MarkPlayed` (v12.2 BoxSet.cs:205-232, jellyfin#16062): a box
+    /// set marks each of its linked children — a movie directly, a linked
+    /// series through its own `Folder.MarkPlayed`, a box set inside it once
+    /// even when it links back — never itself. A playlist reaches its
+    /// members through `Folder.MarkPlayed`'s recursive query.
+    #[tokio::test]
+    async fn marking_a_box_set_or_playlist_marks_its_linked_children() {
+        use crate::test_support::seed_folder_item;
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let (boxset, inner, movie, series, season, episode) = (
+            Uuid::from_u128(0xB0),
+            Uuid::from_u128(0xB4),
+            Uuid::from_u128(0xB1),
+            Uuid::from_u128(0xB2),
+            Uuid::from_u128(0xB5),
+            Uuid::from_u128(0xB3),
+        );
+        let (playlist, track) = (Uuid::from_u128(0xC0), Uuid::from_u128(0xC1));
+        seed_folder_item(&db, boxset, BaseItemKind::BoxSet, "Set", None).await;
+        seed_folder_item(&db, inner, BaseItemKind::BoxSet, "Inner", None).await;
+        seed_folder_item(&db, playlist, BaseItemKind::Playlist, "Mix", None).await;
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        seed_show(&db, series, season, &[(episode, false, None)]).await;
+        // Linked members are scoped to the user's libraries.
+        crate::test_support::seed_library_over(&db, &[movie, episode, track]).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        // 0 = `LinkedChildType.Manual`.
+        for (parent, child) in [
+            (boxset, movie),
+            (boxset, series),
+            (boxset, inner),
+            (inner, boxset),
+        ] {
+            links.upsert_linked_child(parent, child, 0).await.unwrap();
+        }
+        let (mgr, _library) = container_manager(&db);
+
+        let dto = mgr.mark_played(user, boxset, None).await.unwrap();
+        assert!(data(&mgr, movie, user).await.played);
+        assert!(data(&mgr, episode, user).await.played);
+        assert_eq!(data(&mgr, movie, user).await.play_count, 1, "marked once");
+        for container in [boxset, inner, series] {
+            assert!(mgr.read_row(container, user).await.unwrap().is_none());
+        }
+        // `GetPlayedAndTotalCountFromLinkedChildren`: the leaves below the
+        // links, the linked series' episode included.
+        assert!(dto.played);
+        assert_eq!(dto.unplayed_item_count, Some(0));
+        assert_eq!(dto.played_percentage, Some(100.0));
+        let dto = mgr.mark_unplayed(user, boxset).await.unwrap();
+        assert!(!data(&mgr, movie, user).await.played);
+        assert!(!dto.played, "the answer follows the members it just reset");
+        assert_eq!(dto.unplayed_item_count, Some(2));
+
+        links.upsert_linked_child(playlist, track, 0).await.unwrap();
+        mgr.mark_played(user, playlist, None).await.unwrap();
+        assert!(data(&mgr, track, user).await.played);
+        assert!(mgr.read_row(playlist, user).await.unwrap().is_none());
+    }
+
+    /// Earlier builds wrote a container's own row when it was marked.
+    /// Marking that container unplayed now clears the row's play state under
+    /// every key (keeping the favourite), so a kind whose played state is its
+    /// own row — here a music album — stops answering `Played` for good.
+    #[tokio::test]
+    async fn marking_a_container_clears_its_own_stale_play_state() {
+        use crate::test_support::seed_folder_item;
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (album, track) = (Uuid::from_u128(0xA0), Uuid::from_u128(0xA1));
+        seed_folder_item(&db, album, BaseItemKind::MusicAlbum, "Album", None).await;
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        crate::FerrofinItemPersistenceService::new(db.clone())
+            .set_ancestors(track, &[album])
+            .await
+            .unwrap();
+        // The rows an earlier build left: played and a favourite, plus a
+        // played row under a key the album no longer derives.
+        let leaf_only = FerrofinUserDataManager::new(db.clone(), config());
+        leaf_only.mark_played(user, album, None).await.unwrap();
+        leaf_only
+            .save_user_data(user, album, &favorite_dto())
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+                   "PlayCount", "PlaybackPositionTicks", "Played")
+               VALUES (?1, ?2, 'stale-key', 0, 1, 0, 1)"#,
+        )
+        .bind(guid_to_db(album))
+        .bind(guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        leaf_only.mark_played(user, track, None).await.unwrap();
+        let (mgr, _library) = container_manager(&db);
+
+        let dto = mgr.mark_unplayed(user, album).await.unwrap();
+        assert!(!dto.played, "the album's own row no longer says played");
+        assert!(dto.is_favorite, "the favourite is kept");
+        assert!(!data(&mgr, track, user).await.played, "the walk reset it");
+        let row = mgr.read_row(album, user).await.unwrap().unwrap();
+        assert_eq!((row.played, row.play_count), (false, 0));
+        assert!(row.last_played_date.is_none());
+        let played_rows: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1"#,
+        )
+        .bind(guid_to_db(album))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(played_rows, 0, "no key keeps the album played");
     }
 }

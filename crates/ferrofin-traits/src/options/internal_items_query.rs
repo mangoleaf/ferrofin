@@ -330,8 +330,10 @@ pub struct InternalItemsQuery {
     /// the repository ignores it unless the parent really does resolve to the
     /// user root.
     pub user_root_children: bool,
-    /// Apply the Folder display policy on an ItemsController browse. Internal
-    /// repository queries and latest/resume queries leave this false.
+    /// Apply the Folder display policy on an ItemsController browse, and on
+    /// the internal query that lists a folder's members for a played mark
+    /// (`Folder.MarkPlayed` → `GetItemList` runs the same policy). Other
+    /// internal repository queries and latest/resume queries leave this false.
     pub apply_folder_display_options: bool,
     /// The source movie/TV base UserView directly calls Folder.QueryRecursive,
     /// bypassing its parent's Series/Season/Channel GetItemsInternal override.
