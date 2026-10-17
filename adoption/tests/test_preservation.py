@@ -4,6 +4,7 @@ from contextlib import closing
 import copy
 import json
 from pathlib import Path
+import posixpath
 import shutil
 import sqlite3
 import sys
@@ -212,9 +213,18 @@ def guid(number):
 MOVIE = 'MediaBrowser.Controller.Entities.Movies.Movie'
 EPISODE = 'MediaBrowser.Controller.Entities.TV.Episode'
 MOVIES = ('allowed_movie', 'rated_movie', 'locked_movie', 'versions_movie', 'private_movie')
+AUDIO = 'MediaBrowser.Controller.Entities.Audio.Audio'
+BOXSET = 'MediaBrowser.Controller.Entities.Movies.BoxSet'
+PLAYLIST = 'MediaBrowser.Controller.Playlists.Playlist'
+TRACKS = {0xa1: ('track 1', '/media/music/Artist/Album/1-01 Track.flac'),
+          0xa2: ('track 2', '/media/music/Artist/Album/1-02 Track.flac')}
 ADULT, CHILD = guid(0xad), guid(0xc1)
 # What Jellyfin 12.2 scores the seeded ratings (the oracle's InheritedParentalRating*).
 SCORES = {'SAM 13': (13, None), 'FSK 16': (16, None), '-12': (12, None), 'MA15+': (15, 3), '12A': (12, 0)}
+
+
+def movie_path(key):
+    return f'/media/movies/{key}/{key}.mkv'
 
 
 def canned_10_11_8(path):
@@ -222,7 +232,7 @@ def canned_10_11_8(path):
     manifest = {'users': {USERS[1]: uuid.UUID(ADULT).hex, USERS[2]: uuid.UUID(CHILD).hex}}
     with closing(sqlite3.connect(path)) as conn, conn:
         conn.executescript(f'''
-            CREATE TABLE BaseItems (Id TEXT PRIMARY KEY, Type TEXT, Name TEXT, Path TEXT,
+            CREATE TABLE BaseItems (Id TEXT PRIMARY KEY, Type TEXT, Name TEXT, Path TEXT, Data TEXT,
                 ParentId TEXT REFERENCES BaseItems (Id),
                 OwnerId TEXT, TopParentId TEXT, SeriesId TEXT, SeasonId TEXT, PresentationUniqueKey TEXT,
                 OfficialRating TEXT, InheritedParentalRatingValue INTEGER, InheritedParentalRatingSubValue INTEGER);
@@ -239,8 +249,22 @@ def canned_10_11_8(path):
         ''')
         for number, key in enumerate(MOVIES, 1):
             manifest[key] = uuid.UUID(guid(number)).hex
-            conn.execute("INSERT INTO BaseItems (Id, Type, Name, OfficialRating, InheritedParentalRatingValue) "
-                         "VALUES (?, ?, ?, 'G', 0)", (guid(number), MOVIE, key))
+            conn.execute("INSERT INTO BaseItems (Id, Type, Name, Path, OfficialRating, InheritedParentalRatingValue) "
+                         "VALUES (?, ?, ?, ?, 'G', 0)", (guid(number), MOVIE, key, movie_path(key)))
+        conn.executemany('INSERT INTO BaseItems (Id, Type, Name, Path) VALUES (?, ?, ?, ?)',
+                         [(guid(number), AUDIO, name, path) for number, (name, path) in TRACKS.items()])
+        # The linked containers as 10.11.8 wrote them: one live member each.
+        for number, kind, key, path, member, member_path in (
+                (0xb0, BOXSET, 'linked_collection', '%AppDataPath%/collections/Synthetic linked collection [boxset]',
+                 guid(MOVIES.index('rated_movie') + 1), movie_path('rated_movie')),
+                (0xb1, PLAYLIST, 'linked_playlist', '%AppDataPath%/playlists/Synthetic linked playlist',
+                 guid(0xa2), TRACKS[0xa2][1]),
+                (0xb2, PLAYLIST, 'linked_pathless', '%AppDataPath%/playlists/Synthetic path-less playlist',
+                 guid(0xa1), TRACKS[0xa1][1])):
+            manifest[key] = uuid.UUID(guid(number)).hex
+            data = {'LinkedChildren': [{'Path': member_path, 'Type': 'Manual', 'ItemId': uuid.UUID(member).hex}]}
+            conn.execute('INSERT INTO BaseItems (Id, Type, Name, Path, Data) VALUES (?, ?, ?, ?, ?)',
+                         (guid(number), kind, key, path, json.dumps(data)))
         locked = guid(MOVIES.index('locked_movie') + 1)
         conn.executemany('INSERT INTO BaseItemProviders VALUES (?, ?, ?)',
                          [(locked, 'Tmdb', '999999991'), (locked, 'Imdb', 'tt99999991')])
@@ -253,7 +277,8 @@ def canned_10_11_8(path):
 
 def jellyfin_12_2(path, seeds):
     """What Jellyfin 12.2 (and, by contract, Ferrofin) makes of the seeds: scored ratings,
-    harmonized rows, and the orphaned chain gone with its history on the placeholder."""
+    harmonized rows, the orphaned chain gone with its history on the placeholder, and the
+    linked containers' entries migrated into LinkedChildren rows."""
     with closing(sqlite3.connect(path)) as conn, conn:
         for movie, rating in seeds['ratings'].items():
             conn.execute('UPDATE BaseItems SET InheritedParentalRatingValue = ?, InheritedParentalRatingSubValue = ? '
@@ -266,6 +291,11 @@ def jellyfin_12_2(path, seeds):
         conn.execute("UPDATE UserData SET ItemId = '00000000-0000-0000-0000-000000000001', "
                      "RetentionDate = '2026-10-12 08:00:00.0000000' WHERE ItemId IN (?, ?)", orphans)
         conn.execute('DELETE FROM BaseItems WHERE Id IN (?, ?)', orphans)
+        conn.execute('CREATE TABLE LinkedChildren (ParentId TEXT, ChildId TEXT, ChildType INTEGER, SortOrder INTEGER)')
+        for seed in seeds['linked_children'].values():
+            conn.executemany('INSERT INTO LinkedChildren VALUES (?, ?, 0, ?)', [
+                (str(uuid.UUID(seed['id'])).upper(), str(uuid.UUID(child)).upper(), order)
+                for order, child in enumerate(seed['members'])])
 
 
 class OracleExpectationTest(unittest.TestCase):
@@ -320,8 +350,12 @@ class SeededAdoptionTest(unittest.TestCase):
         child = sorted(movie for movie, rating in self.seeds['ratings'].items() if SCORES[rating][0] <= 13)
         # The child resumes the allowed movie; harmonized, the adult's conflict is played.
         allowed = self.manifest['allowed_movie']
+        linked = self.seeds['linked_children']
         self.oracle = {'visibility': {USERS[1]: sorted(self.seeds['ratings']), USERS[2]: child},
-                       'views': {USERS[1]: {'resume': ['episode']}, USERS[2]: {'resume': [allowed]}}}
+                       'views': {USERS[1]: {'resume': ['episode']}, USERS[2]: {'resume': [allowed]}},
+                       'linked_children': {'collection': sorted(linked['collection']['members']),
+                                           'playlist': linked['playlist']['members'],
+                                           'pathless': linked['pathless']['members']}}
         self.actual = copy.deepcopy(self.oracle)
         # What the 10.11.8 fixture itself still holds: the chain, with its history.
         self.state = seed_state(self.source, self.seeds)
@@ -356,6 +390,98 @@ class SeededAdoptionTest(unittest.TestCase):
         self.assertEqual(chain[1][1], chain[0][0])
         self.assertTrue(chain[0][0].isupper() and '-' in chain[0][0], 'ids are spelled like the source rows')
         self.assertEqual(history, [(chain[1][0], self.seeds['orphan_history']['key'], 1, 3)])
+
+    def test_linked_children_seeds_land_beside_the_live_member(self):
+        linked = self.seeds['linked_children']
+        rated, allowed, locked, versions = (uuid.UUID(guid(MOVIES.index(key) + 1)).hex for key in (
+            'rated_movie', 'allowed_movie', 'locked_movie', 'versions_movie'))
+        first, second = (uuid.UUID(guid(number)).hex for number in TRACKS)
+        with closing(sqlite3.connect(self.source)) as conn:
+            stored = {role: json.loads(conn.execute('SELECT Data FROM BaseItems WHERE Id = ?', (
+                str(uuid.UUID(seed['id'])).upper(),)).fetchone()[0])['LinkedChildren'] for role, seed in linked.items()}
+            items = {row[0] for row in conn.execute("SELECT lower(replace(Id, '-', '')) FROM BaseItems")}
+        self.assertEqual(stored, {role: seed['entries'] for role, seed in linked.items()})
+        collection, playlist, pathless = (linked[role]['entries'] for role in ('collection', 'playlist', 'pathless'))
+        self.assertEqual(collection[0], {'Path': movie_path('rated_movie'), 'Type': 'Manual', 'ItemId': rated})
+        # Only the live members' cached ItemIds have rows; the unindexed path is the member's subtitle.
+        cached = [entry['ItemId'] for entry in collection + playlist + pathless if 'ItemId' in entry]
+        self.assertEqual([item in items for item in cached], [True, False, False, False, True, False, True, True])
+        self.assertEqual(collection[3]['Path'], '/media/movies/rated_movie/rated_movie.eng.srt')
+        self.assertEqual(collection[4], {'Path': collection[3]['Path'], 'Type': 'Manual', 'LibraryItemId': locked})
+        # The path outranks LibraryItemId, so the versions movie never becomes a member.
+        self.assertEqual(collection[5], {'Path': movie_path('allowed_movie'), 'Type': 'Manual', 'LibraryItemId': versions})
+        # From the container's folder one relative entry reaches the other track and one no
+        # item; from "/" (where 10.11's clean-up looks) both reach it.
+        folder = '/config/data/playlists/Synthetic linked playlist'
+        for entry, from_folder in ((playlist[2], TRACKS[0xa1][1]), (playlist[3], '/config/media/music/Artist/Album/'
+                                                                   '1-01 Track.flac')):
+            self.assertFalse(posixpath.isabs(entry['Path']))
+            self.assertEqual(posixpath.normpath(posixpath.join(folder, entry['Path'])), from_folder)
+            self.assertEqual(posixpath.normpath(posixpath.join('/', entry['Path'])), TRACKS[0xa1][1])
+        self.assertEqual(playlist[2]['LibraryItemId'], second, 'the relative path outranks LibraryItemId')
+        self.assertEqual(playlist[4], {'Path': TRACKS[0xa1][1], 'Type': 'Manual', 'ItemId': second})
+        self.assertEqual([sorted(entry) for entry in pathless[1:]], [['LibraryItemId', 'Type']] * 2)
+        self.assertEqual([entry['LibraryItemId'] in items for entry in pathless[1:]], [True, False])
+        self.assertEqual(linked['collection']['members'], [rated, allowed, locked])
+        self.assertEqual(linked['playlist']['members'], [second, second, first, second])
+        self.assertEqual(linked['pathless']['members'], [first, second])
+
+    def test_a_linked_container_without_its_live_member_cannot_be_seeded(self):
+        # A collection's first refresh can reload an empty collection.xml.
+        source = self.dir / 'empty.db'
+        manifest = canned_10_11_8(source)
+        self.sql(source, "UPDATE BaseItems SET Data = '{\"LinkedChildren\":[]}' WHERE Name = 'linked_collection'")
+        with self.assertRaisesRegex(CheckError, 'the linked collection has no live member'):
+            seed_database(source, manifest)
+
+    def test_a_linked_container_is_checked_only_where_the_source_held_its_seeds(self):
+        pathless = self.seeds['linked_children']['pathless']
+        # 10.11.9+'s startup clean-up dropped the path-less entries before Ferrofin saw them,
+        # and its save of the container left the live entry without its cached id.
+        dropped = copy.deepcopy(self.state)
+        dropped['linked_children']['pathless'] = [{'Path': pathless['entries'][0]['Path'], 'Type': 'Manual'}]
+        validate_seed_state(dropped, self.seeds, '10.11.9')
+        with self.assertRaisesRegex(CheckError, 'did not keep the seeded pathless LinkedChildren'):
+            validate_seed_state(self.state, self.seeds, '10.11.9')
+        # Elsewhere a re-cached id still fails: only the container the clean-up saves is spared.
+        recached = copy.deepcopy(dropped)
+        del recached['linked_children']['playlist'][1]['ItemId']
+        with self.assertRaisesRegex(CheckError, 'did not keep the seeded playlist LinkedChildren'):
+            validate_seed_state(recached, self.seeds, '10.11.9')
+        with self.assertRaisesRegex(CheckError, 'did not keep the seeded pathless LinkedChildren'):
+            validate_seed_state(dropped, self.seeds, '10.11.8')
+        self.sql(self.adopted, 'DELETE FROM LinkedChildren WHERE ParentId = ? AND SortOrder = 1',
+                 str(uuid.UUID(pathless['id'])).upper())
+        self.actual['linked_children']['pathless'] = pathless['members'][:1]
+        self.assertEqual(self.failures(), ['seeded pathless LinkedChildren differ from Jellyfin 12.2',
+                                           'seeded pathless LinkedChildren are served differently from Jellyfin 12.2'])
+        self.state = dropped
+        self.assertEqual(self.failures(), [])
+        # A 12.x source holds the migrated members, so the container is checked there too.
+        self.state = seed_state(self.oracle_db, self.seeds)
+        self.assertEqual(self.failures(), ['seeded pathless LinkedChildren differ from Jellyfin 12.2',
+                                           'seeded pathless LinkedChildren are served differently from Jellyfin 12.2'])
+
+    def test_a_linked_child_resolved_unlike_jellyfin_12_2_fails(self):
+        collection, playlist = (str(uuid.UUID(self.seeds['linked_children'][role]['id'])).upper()
+                                for role in ('collection', 'playlist'))
+        locked = guid(MOVIES.index('locked_movie') + 1)
+        # The LibraryItemId fallback ignored, and the playlist's repeat collapsed.
+        for statement, args, failure in (
+                ('DELETE FROM LinkedChildren WHERE ParentId = ? AND ChildId = ?', (collection, locked), 'collection'),
+                ('DELETE FROM LinkedChildren WHERE ParentId = ? AND SortOrder = ?', (playlist, 1), 'playlist')):
+            with self.subTest(failure=failure):
+                self.adopted.unlink()
+                shutil.copyfile(self.oracle_db, self.adopted)
+                self.sql(self.adopted, statement, *args)
+                self.assertEqual(self.failures(), [f'seeded {failure} LinkedChildren differ from Jellyfin 12.2'])
+        shutil.copyfile(self.oracle_db, self.adopted)
+        # Order is membership for a playlist.
+        self.sql(self.adopted, 'UPDATE LinkedChildren SET SortOrder = 3 - SortOrder WHERE ParentId = ?', playlist)
+        self.assertEqual(self.failures(), ['seeded playlist LinkedChildren differ from Jellyfin 12.2'])
+        shutil.copyfile(self.oracle_db, self.adopted)
+        self.actual['linked_children']['playlist'] = self.actual['linked_children']['playlist'][1:]
+        self.assertEqual(self.failures(), ['seeded playlist LinkedChildren are served differently from Jellyfin 12.2'])
 
     def test_seeding_twice_changes_nothing(self):
         with closing(sqlite3.connect(self.source)) as conn:
@@ -454,9 +580,12 @@ class SeededAdoptionTest(unittest.TestCase):
         self.assertEqual(sorted(self.state['conflict']), sorted(self.seeds['conflict']['keys']))
         self.assertEqual(self.state['orphans'], sorted(self.seeds['orphans']))
         self.assertEqual(self.state['history'], 'item')
+        linked = self.seeds['linked_children']
+        self.assertEqual(self.state['linked_children'], {role: seed['entries'] for role, seed in linked.items()})
         validate_seed_state(self.state, self.seeds, '10.11.8')
         oracle = seed_state(self.oracle_db, self.seeds)
         self.assertEqual((oracle['orphans'], oracle['history']), ([], 'placeholder'))
+        self.assertEqual(oracle['linked_children'], {role: seed['members'] for role, seed in linked.items()})
         validate_seed_state(oracle, self.seeds, '12.2')
         # The state survives its JSON file unchanged.
         self.assertEqual(json.loads(json.dumps(oracle)), oracle)
@@ -471,6 +600,13 @@ class SeededAdoptionTest(unittest.TestCase):
             ('12.1', harmonized, 'changed the seeded conflicting user data'),
             ('12.2', self.state, 'did not harmonize'),
         ]
+        # A 10.11 save that re-caches a stale id from its path, and a 12.x that dropped a member.
+        recached = copy.deepcopy(self.state)
+        recached['linked_children']['collection'][1]['ItemId'] = recached['linked_children']['collection'][0]['ItemId']
+        unresolved = copy.deepcopy(harmonized)
+        unresolved['linked_children']['playlist'].pop()
+        cases += [('10.11.10', recached, 'did not keep the seeded collection LinkedChildren'),
+                  ('12.2', unresolved, 'did not resolve the seeded playlist LinkedChildren')]
         for version, state, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(CheckError, message):
                 validate_seed_state(state, self.seeds, version)
@@ -519,8 +655,12 @@ class SeededAdoptionTest(unittest.TestCase):
         actual = {'visibility': {USERS[2]: ['other']},
                   'views': {USERS[1]: {'resume': ['episode']}, USERS[2]: {'resume': [allowed]}},
                   'relationships': {movie: {'Type': 'Movie'}}}
+        # The linked containers follow Jellyfin 12.2, never the source release.
+        expected['linked_children'] = {'playlist': ['as 10.11 serves them']}
+        actual['linked_children'] = {'playlist': ['as 12.2 resolves them']}
         orphans = set(self.seeds['orphans'])
         self.assertEqual(compare(comparable(expected, self.seeds, orphans), comparable(actual, self.seeds, orphans)), [])
+        self.assertIn('linked_children', expected, 'the snapshot itself is not modified')
         # The seeded movie itself must survive; only its visibility follows Jellyfin 12.2.
         del actual['relationships'][movie]
         self.assertEqual(compare(comparable(expected, self.seeds, orphans), comparable(actual, self.seeds, orphans)),

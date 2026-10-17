@@ -4,10 +4,11 @@
 All media and accounts are invented. Jellyfin creates the source state through its
 API; each supported release supplies its own expected responses before adoption.
 A few states no API produces (non-US ratings, conflicting user data, a dangling parent
-chain) are written into the stopped 10.11.8 fixture and inherited by every later one,
-except that the 12.0 lineage (12.0, 12.1-from-12, 12.2-from-12, 12.2-from-121) starts
-without the dangling chain, which Jellyfin 12.0 cannot migrate (NO_ORPHAN_CLEANUP);
-for those, Jellyfin 12.2's own result is the expectation on every path.
+chain, legacy LinkedChildren entries) are written into the stopped 10.11.8 fixture and
+inherited by every later one, except that the 12.0 lineage (12.0, 12.1-from-12,
+12.2-from-12, 12.2-from-121) starts without the dangling chain, which Jellyfin 12.0
+cannot migrate (NO_ORPHAN_CLEANUP); for those, Jellyfin 12.2's own result is the
+expectation on every path.
 """
 
 import argparse

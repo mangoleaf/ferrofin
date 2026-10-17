@@ -322,7 +322,7 @@ distinct generated avatar.
 | Category | Checks |
 |---|---|
 | User permissions | Compare complete policies/configuration and stored account rows; compare adult/child browse visibility; reject cross-user history reads/writes, disabled downloads, and disabled deletion. |
-| Playlists and collections | Compare exact membership, playlist order, owner and sharing; verify a shared reader can read but cannot edit, and cannot read a private playlist. |
+| Playlists and collections | Compare exact membership, playlist order, owner and sharing; verify a shared reader can read but cannot edit, and cannot read a private playlist. Legacy `LinkedChildren` entries seeded into 10.11.8 (stale and live cached ids, unindexed and container-relative paths, `LibraryItemId` with and without a path, repeats) must resolve as Jellyfin 12.2's migration resolves them. |
 | Manual metadata | Preserve a changed title, description, sort title, genres, chosen provider IDs, whole-item/field locks, and uploaded artwork. |
 | Settings | Preserve audio/subtitle preferences, subtitle download languages and skip rules, provider selections and ordering, and library options. |
 | Relationships | Preserve series/season/episode links, alternate media sources, extras, artist/album/track links, and disc/track numbers. |

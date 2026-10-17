@@ -5,6 +5,7 @@ import base64
 from contextlib import closing
 from io import BytesIO
 import json
+from pathlib import PurePosixPath
 import re
 import sqlite3
 import time
@@ -19,6 +20,9 @@ from metadata import Api as MetadataApi, CheckError
 
 
 EPISODE_TYPE = "MediaBrowser.Controller.Entities.TV.Episode"
+AUDIO_TYPE = "MediaBrowser.Controller.Entities.Audio.Audio"
+# What %AppDataPath% expands to in the official image (JELLYFIN_DATA_DIR=/config).
+APP_DATA_PATH = "/config/data"
 # Ratings found only in other countries' tables (the library is US). Jellyfin 12.2 changed
 # two: "-12" scored -12 before it and 12 since, and "SAM 13" is new in its ar.json.
 SEEDED_RATINGS = (("allowed_movie", "SAM 13"), ("rated_movie", "FSK 16"), ("locked_movie", "-12"),
@@ -210,6 +214,13 @@ def seed(base):
     # The initial full collection refresh can reload an empty collection.xml.
     # The normal add-members action settles membership after creation finishes.
     api.post(f"/Collections/{collection}/Items", ids=",".join([movies["Amber Harbor"]["Id"], movie]))
+    # Containers whose LinkedChildren seed_database rewrites; each starts with one live member.
+    linked_playlist, linked_pathless = (api.post("/Playlists", {"Name": name, "MediaType": "Audio",
+        "Ids": [tracks[index]["Id"]], "UserId": adult, "IsPublic": False})["Id"]
+        for name, index in (("Synthetic linked playlist", 1), ("Synthetic path-less playlist", 2)))
+    linked_collection = api.post("/Collections", name="Synthetic linked collection",
+                                 ids=movies["Crimson Signal"]["Id"], isLocked="true")["Id"]
+    api.post(f"/Collections/{linked_collection}/Items", ids=movies["Crimson Signal"]["Id"])
     api.idle()
     manifest = {"version": 1, "users": {name: users[name]["Id"] for name in USERS},
             "libraries": {name: row["ItemId"] for name, row in libraries.items()},
@@ -217,7 +228,9 @@ def seed(base):
             "rated_movie": movies["Crimson Signal"]["Id"],
             "private_movie": movies["Hidden Meadow"]["Id"],
             "versions_movie": movies["Twin Horizon"]["Id"],
-            "playlist": playlist, "private_playlist": private_playlist, "collection": collection}
+            "playlist": playlist, "private_playlist": private_playlist, "collection": collection,
+            "linked_playlist": linked_playlist, "linked_collection": linked_collection,
+            "linked_pathless": linked_pathless}
 
     from user_accounts import seed as seed_accounts
     seed_accounts(api, manifest)
@@ -245,6 +258,12 @@ def seed_database(db, manifest):
        or top parent and no real path, so no browse list treats them as library content.
        Jellyfin 12.0 cannot migrate the chain, so its lineage drops it first
        (drop_dangling_chain); only 10.11.x, 12.1-from-10 and 12.2-from-10 carry it.
+    4. Legacy LinkedChildren entries on the three "linked" containers, beside the live member
+       10.11.8 wrote (collection_entries, playlist_entries, pathless_entries). 12.x's
+       MigrateLinkedChildren.ResolveChildId and Ferrofin's membership import must resolve
+       each the same way; "members" is what they resolve to. Every entry of the first two
+       has a Path that exists on disk, so 10.11.9+'s startup
+       CleanupCollectionAndPlaylistPathsTask keeps it; it drops the path-less ones.
     """
     adult = uuid.UUID(manifest["users"][USERS[1]])
     with closing(sqlite3.connect(db)) as conn:
@@ -309,11 +328,109 @@ def seed_database(db, manifest):
                          '"LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played") '
                          'VALUES (?, ?, ?, 0, ?, ?, ?, ?)',
                          (spelled(source[0], second), user, history, *ORPHAN_PLAY.values()))
+
+            linked = {}
+            for role, entries_of in (("collection", collection_entries), ("playlist", playlist_entries),
+                                     ("pathless", pathless_entries)):
+                container = stored("BaseItems", uuid.UUID(manifest["linked_" + role]))
+                path, data = conn.execute('SELECT "Path", "Data" FROM "BaseItems" WHERE "Id" = ?',
+                                          (container,)).fetchone()
+                children = json.loads(data or "{}").get("LinkedChildren")
+                if not children or not children[0].get("ItemId") or not children[0].get("Path"):
+                    raise CheckError(f"synthetic seed: the linked {role} has no live member")
+                folder = PurePosixPath(path.replace("%AppDataPath%", APP_DATA_PATH))
+                entries, members = entries_of(conn, manifest, folder, children[0])
+                conn.execute('UPDATE "BaseItems" SET "Data" = json_set("Data", \'$.LinkedChildren\', json(?)) '
+                             'WHERE "Id" = ?', (json.dumps(entries), container))
+                linked[role] = {"id": uuid.UUID(manifest["linked_" + role]).hex, "entries": entries, "members": members}
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return {"ratings": ratings,
             "conflict": {"item": locked.hex, "user": adult.hex, "keys": keys},
             "orphans": [first.hex, second.hex],
-            "orphan_history": {"user": adult.hex, "key": history, **ORPHAN_PLAY}}
+            "orphan_history": {"user": adult.hex, "key": history, **ORPHAN_PLAY},
+            "linked_children": linked}
+
+
+def stale_id(role, name):
+    """A cached ItemId no row has, fixed so a rerun writes the same entries."""
+    return seed_id(f"linked-{role}-{name}").hex
+
+
+def item_path(conn, item):
+    row = conn.execute('SELECT "Path" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                       (item,)).fetchone()
+    if row is None:
+        raise CheckError("synthetic seed: no BaseItems row for a linked member")
+    return row[0]
+
+
+def other_track(conn, live):
+    """The first track (by path) other than the container's live member: (id, path)."""
+    row = conn.execute('SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ? AND "Path" <> ? ORDER BY "Path"',
+                       (AUDIO_TYPE, live["Path"])).fetchone()
+    if row is None:
+        raise CheckError("synthetic seed: no second track to link")
+    return uuid.UUID(row[0]).hex, row[1]
+
+
+def collection_entries(conn, manifest, folder, live):
+    """The linked box set's entries, its `live` one first, and the member ids ResolveChildId
+    makes of them, in order: one row per child.
+
+    10.11 resolves no LibraryItemId beside a Path, so its children stay the live member and
+    the by-path movie, both in the movie library: a child from another library would change
+    the box set's LibraryFolderIds, and 10.11's scan would save it with every id re-cached
+    (BoxSetMetadataService.BeforeSaveInternal)."""
+    member = uuid.UUID(live["ItemId"]).hex
+    by_path, by_library_id, outranked = (uuid.UUID(manifest[key]).hex
+                                         for key in ("allowed_movie", "locked_movie", "versions_movie"))
+    by_path_file = item_path(conn, by_path)
+    # On disk, but no item's path: the member's subtitle file.
+    unindexed = str(PurePosixPath(live["Path"]).with_suffix(".eng.srt"))
+    return [live,
+            # A stale id beside the member's own path collapses into it.
+            {"Path": live["Path"], "Type": "Manual", "ItemId": stale_id("collection", "repeat")},
+            {"Path": by_path_file, "Type": "Manual", "ItemId": stale_id("collection", "by-path")},
+            {"Path": unindexed, "Type": "Manual", "ItemId": stale_id("collection", "unindexed")},
+            {"Path": unindexed, "Type": "Manual", "LibraryItemId": by_library_id},
+            # A path that resolves outranks LibraryItemId: this collapses into the by-path
+            # movie, where taking LibraryItemId first would add the versions movie.
+            {"Path": by_path_file, "Type": "Manual", "LibraryItemId": outranked},
+            ], [member, by_path, by_library_id]
+
+
+def playlist_entries(conn, manifest, folder, live):
+    """The linked playlist's entries, its `live` one first, and the member ids ResolveChildId
+    makes of them, in order: a playlist keeps repeats."""
+    member = uuid.UUID(live["ItemId"]).hex
+    other, other_path = other_track(conn, live)
+    # Relative paths climb from the container's folder: all the way to "/" reaches the
+    # other track; one level short reaches no item, though from any shallower base (the
+    # working directory, the folder's parent, an unexpanded %AppDataPath%) it would. Both
+    # reach the track from "/", the official image's working directory, which is where
+    # 10.11.9+'s startup CleanupCollectionAndPlaylistPathsTask looks, so it keeps them.
+    climb = len(folder.parts) - 1
+    return [live,
+            {"Path": live["Path"], "Type": "Manual", "ItemId": stale_id("playlist", "repeat")},
+            # A relative path that resolves outranks LibraryItemId.
+            {"Path": "../" * climb + other_path.lstrip("/"), "Type": "Manual", "LibraryItemId": member},
+            {"Path": "../" * (climb - 1) + other_path.lstrip("/"), "Type": "Manual"},
+            # A cached ItemId whose row exists outranks the path.
+            {"Path": other_path, "Type": "Manual", "ItemId": member},
+            ], [member, member, other, member]
+
+
+def pathless_entries(conn, manifest, folder, live):
+    """The path-less playlist's entries, its `live` one first: LibraryItemId alone, the shape
+    10.11's BaseItemXmlParser reads from a playlist.xml or collection.xml entry with no path.
+    10.11.9+'s startup clean-up drops every entry without a Path (File.Exists(null) is
+    false), so only the 10.11.8 fixture and the 12.x ones built from it still hold them."""
+    member = uuid.UUID(live["ItemId"]).hex
+    other, _ = other_track(conn, live)
+    return [live,
+            {"Type": "Manual", "LibraryItemId": other},
+            {"Type": "Manual", "LibraryItemId": stale_id("pathless", "stale")},
+            ], [member, other]
 
 
 def drop_dangling_chain(db, seeds):
