@@ -129,7 +129,10 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   metadata_check "after adoption" check
   docker restart "$name" >/dev/null; wait_ready "$port" || why+=("second boot never ready")
   settle "$port" "$AUTH"
-  docker logs --since "$(date -u -d '-90 seconds' +%Y-%m-%dT%H:%M:%S)" "$name" > "$dst.boot2.log" 2>&1
+  # From the daemon's own start time for the restarted container, so the log holds this boot
+  # only; a log with no server start must fail, never pass as "no repairs".
+  docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' "$name")" "$name" > "$dst.boot2.log" 2>&1
+  grep -q '"ferrofin-server starting"' "$dst.boot2.log" || why+=("second boot log has no server start")
   second=$(adoption_second_boot_repairs "$dst.boot2.log")
   [ -z "$second" ] || why+=("second boot repaired again: $second")
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke2.txt" 2>&1
