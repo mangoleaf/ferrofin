@@ -4,9 +4,10 @@
 //! `IAuthorizationContext` implementation) and the trivial `IAuthService`
 //! wrapper that promotes an unauthenticated request into an error.
 //!
-//! The context parses the `MediaBrowser`/`Emby` authorization header (and the
-//! legacy `X-Emby-Token` / `X-MediaBrowser-Token` headers and `ApiKey`/`api_key`
-//! query parameters when legacy authorization is enabled), then resolves the
+//! The context parses the `MediaBrowser` authorization header and the `ApiKey`
+//! query parameter (plus the `Emby` scheme, the `X-Emby-Authorization`,
+//! `X-Emby-Token` / `X-MediaBrowser-Token` headers and the `api_key` query
+//! parameter when legacy authorization is enabled), then resolves the
 //! token against the `Devices` and `ApiKeys` tables, filling in the client /
 //! device / version fields the client omitted.
 //!
