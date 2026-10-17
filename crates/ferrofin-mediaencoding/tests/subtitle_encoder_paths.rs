@@ -268,6 +268,50 @@ async fn extract_all_records_ffmpeg_args() {
     assert!(outputs.iter().any(|o| o.ends_with("/1.srt")));
 }
 
+/// File names come from the library. One built to close the quote must reach
+/// ffmpeg as the single `-i` value, in both the extraction and the conversion
+/// command, never as extra options.
+#[rstest::rstest]
+#[case::quote(r#"/media/a" -y -i /etc/passwd ""#)]
+#[case::backslash_quote(r#"/media/a\" -y -i /etc/passwd \""#)]
+#[tokio::test]
+async fn a_hostile_path_stays_one_input(#[case] stem: &str) {
+    use ferrofin_mediaencoding::encoder::split_args;
+
+    let source_path = format!("{stem}.mkv");
+    let subtitle_path = format!("{stem}.sub");
+    let embedded = sub_stream(0, "ass", None, false);
+    let external = sub_stream(3, "microdvd", Some(&subtitle_path), true);
+    let source = source_with("guid8", &source_path, vec![embedded, external.clone()]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    recorder
+        .files
+        .lock()
+        .unwrap()
+        .insert(subtitle_path.clone(), b"{1}{50}Hello".to_vec());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+    encoder.get_readable_file(&source, &external).await.unwrap();
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 2, "one extraction, one conversion");
+    for ((args, _), input) in calls
+        .iter()
+        .zip([format!("file:{source_path}"), subtitle_path])
+    {
+        let tokens = split_args(args).unwrap();
+        let at = tokens.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(tokens[at + 1], input, "{args}");
+        assert_eq!(
+            tokens.iter().filter(|a| *a == "-i").count(),
+            1,
+            "{tokens:?}"
+        );
+        assert!(!tokens.iter().skip(1).any(|a| a == "-y"), "{tokens:?}");
+    }
+}
+
 #[tokio::test]
 async fn extract_all_noop_when_nothing_extractable() {
     // A pure audio stream is not an extractable subtitle.

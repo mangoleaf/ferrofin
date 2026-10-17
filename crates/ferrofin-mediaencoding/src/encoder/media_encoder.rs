@@ -27,7 +27,7 @@ use ferrofin_model::media_info::{MediaInfo, MediaProtocol};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-use super::encoding_utils::get_input_argument;
+use super::encoding_utils::{get_input_argument, quote};
 use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::probing::dtos::InternalMediaInfoResult;
 use crate::probing::localization::{
@@ -170,7 +170,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         }
 
         if let Some(user_agent) = source.required_http_headers.get("User-Agent") {
-            let _ = write!(extra_args, " -user_agent \"{user_agent}\"");
+            let _ = write!(extra_args, " -user_agent {}", quote(user_agent));
         }
 
         if source.protocol == MediaProtocol::Rtsp {
@@ -289,7 +289,8 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
         let resolution = image_resolution_parameter(image_resolution);
         let mut args = format!(
-            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 \"{output_path}\""
+            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 {output}",
+            output = quote(output_path),
         );
 
         if let Some(offset) = offset_ticks {
@@ -434,7 +435,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .to_string_lossy()
             .into_owned();
         let args = Self::extract_image_arguments(
-            &format!("file:\"{path}\""),
+            &get_input_argument("file", path, MediaProtocol::File),
             "",
             None,
             image_stream_index,
@@ -775,6 +776,23 @@ mod tests {
         assert!(extra_arg.contains(&format!("-user_agent \"{user_agent}\"")));
     }
 
+    /// Upstream interpolates the tuner User-Agent raw; a value that closes the
+    /// quote must stay the one `-user_agent` argument instead.
+    #[test]
+    fn a_hostile_user_agent_stays_one_argument() {
+        let user_agent = r#"x\" -y -i /etc/passwd ""#;
+        let request = MediaInfoRequest {
+            media_source: http_source_with_user_agent(user_agent),
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let extra = encoder().get_extra_arguments(&request);
+        let tokens = crate::encoder::split_args(&extra).unwrap();
+        let at = tokens.iter().position(|a| a == "-user_agent").unwrap();
+        assert_eq!(tokens[at + 1], user_agent);
+        assert!(!tokens.iter().any(|a| a == "-y"), "{tokens:?}");
+    }
+
     #[test]
     fn rtsp_source_adds_transport_flags() {
         let enc = encoder();
@@ -849,9 +867,10 @@ mod tests {
         assert!(enc.set_ffmpeg_path().await.unwrap());
     }
 
-    /// A [`Transcoder`] fake that "extracts a frame": it parses the quoted
-    /// output path off the argument tail (the shape `extract_image_arguments`
-    /// emits) and writes a stub file there, like a successful ffmpeg run.
+    /// A [`Transcoder`] fake that "extracts a frame": it splits the arguments
+    /// as the real spawn does, takes the output path off the tail (the shape
+    /// `extract_image_arguments` emits) and writes a stub file there, like a
+    /// successful ffmpeg run.
     struct FrameWritingTranscoder;
 
     #[async_trait]
@@ -864,10 +883,8 @@ mod tests {
             _test_key: Option<&str>,
             _env: &[(String, String)],
         ) -> Result<ProcessOutput, String> {
-            let out = arguments
-                .rsplit('"')
-                .nth(1)
-                .expect("quoted output path is the last argument");
+            let argv = crate::encoder::split_args(arguments)?;
+            let out = argv.last().expect("the output path is the last argument");
             std::fs::write(out, b"jpg").expect("write frame");
             Ok(ProcessOutput {
                 output: String::new(),
@@ -904,7 +921,8 @@ mod tests {
                 calls.len() - 1
             };
             if attempt >= self.succeed_on {
-                let out = arguments.rsplit('"').nth(1).expect("output path");
+                let argv = crate::encoder::split_args(arguments)?;
+                let out = argv.last().expect("output path");
                 std::fs::write(out, b"png").expect("write picture");
             }
             Ok(ProcessOutput {
@@ -1370,7 +1388,7 @@ mod tests {
         ) -> Result<ProcessOutput, String> {
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
-            let args = shlex::split(arguments).unwrap();
+            let args = crate::encoder::split_args(arguments)?;
             let path = args.last().unwrap().replace("%08d", "00000001");
             std::fs::write(path, b"jpg").unwrap();
             Ok(ProcessOutput {
@@ -1555,6 +1573,31 @@ mod tests {
                 .unwrap()
                 .contains(" -s ")
         );
+    }
+
+    /// Cover art is extracted unprompted during a music scan, so a track named
+    /// to close the quote must not inject options: the whole name stays the
+    /// one `-i` value, as upstream's `GetInputArgument` keeps it.
+    #[tokio::test]
+    async fn audio_image_keeps_a_hostile_path_as_one_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(RecordingFrames(std::sync::Mutex::new(Vec::new())));
+        let encoder = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "ffmpeg",
+            "ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.path().to_path_buf().into(),
+                ..Default::default()
+            },
+        );
+        let path = r#"/m/a" -y -f mjpeg /data/ferrofin.db ".flac"#;
+        let image = encoder.extract_audio_image(path, Some(1)).await.unwrap();
+        std::fs::remove_file(image).unwrap();
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        let tokens = crate::encoder::split_args(&arguments).unwrap();
+        assert_eq!(tokens[..2], ["-i".to_owned(), format!("file:{path}")]);
+        assert!(!tokens.iter().any(|a| a == "-y"), "{tokens:?}");
     }
 
     #[test]

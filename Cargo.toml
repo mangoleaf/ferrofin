@@ -161,6 +161,7 @@ unicode-normalization = "0.1.25"
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.35"
 chardetng = "0.1.17"
+shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }

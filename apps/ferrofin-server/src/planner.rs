@@ -36,6 +36,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoder::split_args;
 use ferrofin_mediaencoding::encoding_helper::helper::{
     shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
 };
@@ -1392,11 +1393,16 @@ impl FerrofinStreamStatePlanner {
         }
         // The device graph and the hardware decoder, straight from the ported
         // matrix — `-init_hw_device`, `-filter_hw_device`, `-hwaccel` and
-        // `-hwaccel_output_format` in upstream's order. Splitting on whitespace
-        // is safe because nothing it produces contains any: the device
-        // arguments phase 4 adds do carry paths, but they are render nodes
-        // (`/dev/dri/renderD*`), which cannot contain a space.
-        push_split(&mut args, &hwaccel_input.args);
+        // `-hwaccel_output_format` in upstream's order. The string is
+        // shell-quoted like every other ffmpeg command line (AMD's OpenCL
+        // device is `device_vendor="Advanced Micro Devices"`), so it takes the
+        // shared splitter, with the same one-token fallback as the input. Only
+        // a configured render-node path containing a quote can reach it, and
+        // ffmpeg then rejects the string, so say why.
+        args.extend(split_args(&hwaccel_input.args).unwrap_or_else(|error| {
+            tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
+            vec![hwaccel_input.args.clone()]
+        }));
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
         args.push("200M".to_owned());
@@ -1425,12 +1431,17 @@ impl FerrofinStreamStatePlanner {
         input_source.protocol =
             ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state);
         let input = self.encoder.get_input_argument(media_path, &input_source);
-        // `get_input_argument` shell-quotes the path (`file:"…"`, inner quotes
-        // `\"`-escaped) for the string-command probe path. The segment transcoder
+        // `get_input_argument` shell-quotes the path (`file:"…"`, inner `\` and
+        // `"` escaped) for the string-command probe path. The segment transcoder
         // spawns ffmpeg via argv (no shell), so those quotes would become part of
         // the filename and ffmpeg would fail to open it (exit 254) for any path
-        // containing a space. Unquote it back into a single argv token with shlex.
-        args.extend(shlex::split(&input).unwrap_or_else(|| vec![input]));
+        // containing a space. Unquote it back into a single argv token. `quote`
+        // always balances, and the fallback is one token, which can never add an
+        // option.
+        args.extend(split_args(&input).unwrap_or_else(|error| {
+            tracing::debug!(%error, "input argument does not split; passing it as one");
+            vec![input]
+        }));
 
         // ---- hardware video filters ------------------------------------------
         // The ported vendor chain owns the whole graph on the hardware path —
@@ -2335,8 +2346,13 @@ mod tests {
             Ok(String::new())
         }
         fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
-            // Mirror the real encoder, which shell-quotes the path.
-            format!("file:\"{input_file}\"")
+            // The real encoder's quoting, so the planner's unquoting is tested
+            // against it.
+            ferrofin_mediaencoding::encoder::get_input_argument(
+                "file",
+                input_file,
+                ferrofin_model::media_info::MediaProtocol::File,
+            )
         }
         fn get_time_parameter(&self, ticks: i64) -> String {
             format!("-ss {ticks}")
@@ -4771,6 +4787,41 @@ mod tests {
         );
         // Intel's low-power encoder block, which only iHD/i965 have.
         assert!(args.contains("-low_power 1"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn the_amd_opencl_vendor_reaches_ffmpeg_as_one_argument() {
+        // The device graph is one string, and AMD's OpenCL tonemap names its
+        // vendor with spaces in it. A whitespace split handed ffmpeg
+        // `device_vendor="Advanced`, `Micro` and `Devices"` as three arguments.
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Mesa Gallium driver 24.0.0 for AMD Radeon");
+        let mut video = hdr_4k_video_stream("hevc");
+        video.pixel_format = Some("yuv420p10le".to_owned());
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                enable_tonemapping: true,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|a| a == "opencl=ocl:.0,device_vendor=Advanced Micro Devices"),
+            "{:?}",
+            plan.arguments
+        );
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ uuid.workspace = true
 quick-xml.workspace = true
 encoding_rs.workspace = true
 chardetng.workspace = true
-shlex = "1"
+shlex.workspace = true
 tracing.workspace = true
 notify.workspace = true
 

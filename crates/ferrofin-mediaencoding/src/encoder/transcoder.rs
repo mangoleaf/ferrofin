@@ -55,7 +55,8 @@ pub trait Transcoder: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the process cannot be spawned or fails.
+    /// Returns an error string if `arguments` does not split into argv
+    /// (unbalanced quoting), or the process cannot be spawned or fails.
     async fn get_process_output(
         &self,
         path: &str,

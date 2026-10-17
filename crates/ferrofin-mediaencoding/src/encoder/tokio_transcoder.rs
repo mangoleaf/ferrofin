@@ -16,13 +16,15 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt as _;
 
+use super::encoding_utils::split_args;
 use super::transcoder::{ProcessOutput, Transcoder};
 
 /// The production [`Transcoder`]: spawns ffmpeg/ffprobe with `tokio::process`.
 ///
 /// Splits the caller-supplied `arguments` string into argv with [`split_args`],
 /// which respects the shell quoting the argument builders emit (`file:"…"`) so
-/// paths containing spaces survive as a single token.
+/// paths containing spaces survive as a single token. A string whose quoting
+/// does not balance is refused, never run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokioTranscoder;
 
@@ -32,16 +34,6 @@ impl TokioTranscoder {
     pub fn new() -> Self {
         Self
     }
-}
-
-/// Splits a command-line argument string into argv, honoring the shell quoting
-/// the encoder's argument builders emit — `-i file:"/path/with spaces/f.mkv"`
-/// must reach ffmpeg as one `-i` value, not four. A plain `split_whitespace`
-/// shatters any spaced path (most real media) and hands ffmpeg/ffprobe a broken
-/// input, so it is used only as the fallback when the quoting is malformed.
-fn split_args(arguments: &str) -> Vec<String> {
-    shlex::split(arguments)
-        .unwrap_or_else(|| arguments.split_whitespace().map(str::to_owned).collect())
 }
 
 #[async_trait]
@@ -56,7 +48,7 @@ impl Transcoder for TokioTranscoder {
     ) -> Result<ProcessOutput, String> {
         let mut command = tokio::process::Command::new(path);
         command
-            .args(split_args(arguments))
+            .args(split_args(arguments)?)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -98,8 +90,15 @@ impl Transcoder for TokioTranscoder {
     }
 
     async fn get_process_exit_code(&self, path: &str, arguments: &str) -> bool {
+        let args = match split_args(arguments) {
+            Ok(args) => args,
+            Err(error) => {
+                tracing::debug!(%error, "not running a command whose quoting does not balance");
+                return false;
+            }
+        };
         tokio::process::Command::new(path)
-            .args(split_args(arguments))
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -112,7 +111,7 @@ impl Transcoder for TokioTranscoder {
 
 #[cfg(test)]
 mod tests {
-    use super::split_args;
+    use crate::encoder::split_args;
 
     /// Whether some live (non-zombie) process has exactly this argv.
     #[cfg(target_os = "linux")]
@@ -217,7 +216,7 @@ mod tests {
         let args =
             r#"-i file:"/tmp/movies/Big Buck Bunny (2008).mp4" -threads 0 -print_format json"#;
         assert_eq!(
-            split_args(args),
+            split_args(args).unwrap(),
             vec![
                 "-i",
                 "file:/tmp/movies/Big Buck Bunny (2008).mp4",
@@ -232,8 +231,29 @@ mod tests {
     #[test]
     fn unquoted_args_split_on_whitespace() {
         assert_eq!(
-            split_args("-v warning -show_streams"),
+            split_args("-v warning -show_streams").unwrap(),
             vec!["-v", "warning", "-show_streams"]
+        );
+    }
+
+    /// Unbalanced quoting is refused before anything is spawned, rather than
+    /// guessed at with a whitespace split that could turn path text into
+    /// options.
+    #[tokio::test]
+    async fn unbalanced_quoting_is_not_run() {
+        use super::TokioTranscoder;
+        use crate::encoder::Transcoder as _;
+
+        let err = TokioTranscoder
+            .get_process_output("sh", r#"-c "exit 0"#, false, None, &[])
+            .await
+            .expect_err("unbalanced quoting must not spawn");
+        assert!(err.contains("unbalanced quoting"), "{err}");
+        // The old whitespace fallback ran this as `sh -c true '"'`, exit 0.
+        assert!(
+            !TokioTranscoder
+                .get_process_exit_code("sh", r#"-c true ""#)
+                .await
         );
     }
 }
