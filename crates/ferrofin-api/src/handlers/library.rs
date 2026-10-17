@@ -583,8 +583,9 @@ fn representative_item_types(
 )]
 async fn get_available_options(
     State(state): State<AppState>,
-    // `[Authorize(FirstTimeSetupOrElevated)]` (method-level): the setup wizard's
-    // add-library step reads this before login.
+    // `[Authorize(Policy = Policies.FirstTimeSetupOrDefault)]` (method-level,
+    // LibraryController.cs:865): the setup wizard's add-library step reads this
+    // before login, and any signed-in user may read it afterwards.
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
     Query(query): Query<AvailableOptionsQuery>,
 ) -> Result<Json<LibraryOptionsResultDto>, ApiError> {
