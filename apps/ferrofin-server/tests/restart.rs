@@ -7,6 +7,11 @@ use std::time::Duration;
 
 use ferrofin_server::config::Config;
 
+#[path = "support/boot.rs"]
+mod boot;
+
+use boot::{STARTUP_DEADLINE, free_port, is_up, spawn_server};
+
 const ADMIN_USER: &str = "restart-admin";
 const ADMIN_PASSWORD: &str = "restart-pw";
 const CLIENT: &str =
@@ -23,12 +28,6 @@ const CLIENT: &str =
 /// instead of catching a bug. Do not tighten this to "something reasonable".
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// How long a server gets to bind and finish booting, for the same reason: the
-/// admin seed hashes a password before the listener opens, so "booting" is
-/// seconds of CPU, and a poll budget sized for a quiet laptop is exactly what
-/// fails on a loaded runner.
-const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
-
 /// How long a set-up server gets to refuse a boot without its database. The
 /// refusal comes before the database, ffmpeg or the listener are touched, so
 /// it is quick; the bound only turns a regression that serves instead into a
@@ -44,42 +43,6 @@ const REFUSAL_DEADLINE: Duration = Duration::from_mins(1);
 /// in one process, where the second backup is refused.
 static BACKUP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// A port nobody is listening on right now (bind 0, read, release).
-///
-/// A probe, not a reservation: the listener closes before the server binds, so
-/// a test starting at the same moment can be handed the same port.
-/// [`spawn_server`] is what makes that survivable.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
-/// The `ServerName` whoever is listening on `base` reports, if anyone is.
-async fn server_name_at(client: &reqwest::Client, base: &str) -> Option<String> {
-    let body: serde_json::Value = client
-        .get(format!("{base}/System/Info/Public"))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    body["ServerName"].as_str().map(str::to_owned)
-}
-
-/// Whether *this* test's server — not merely *a* server — answers on `base`.
-///
-/// The identity check carries real weight: the tests in this file share an
-/// admin user, password and client id, so a sibling that won the race for the
-/// port would answer every request happily and the run would only fall over
-/// later, somewhere unrelated.
-async fn is_up(client: &reqwest::Client, base: &str, name: &str) -> bool {
-    server_name_at(client, base).await.as_deref() == Some(name)
-}
-
 async fn wait_until(client: &reqwest::Client, base: &str, name: &str, up: bool) {
     let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
     while std::time::Instant::now() < deadline {
@@ -92,54 +55,6 @@ async fn wait_until(client: &reqwest::Client, base: &str, name: &str, up: bool) 
         "server never became {}",
         if up { "reachable" } else { "unreachable" }
     );
-}
-
-/// Start `run` on a free port and wait until this server answers there.
-///
-/// If the port went to somebody else between the probe and the bind, `run`
-/// returns an address-in-use error straight away; take another port rather than
-/// poll one that now belongs to another test.
-async fn spawn_server(
-    client: &reqwest::Client,
-    make_config: impl Fn(u16) -> Config,
-) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, String) {
-    for _ in 0..5 {
-        let port = free_port();
-        let config = make_config(port);
-        let name = config.server_name.clone();
-        // `run`'s future trips rustc's higher-ranked `Send` inference under
-        // `tokio::spawn`; the binary drives it from `main`, so give it its own
-        // thread and runtime here too.
-        let server = std::thread::spawn(move || {
-            tokio::runtime::Runtime::new()
-                .expect("server runtime")
-                .block_on(ferrofin_server::run(config))
-        });
-        let base = format!("http://127.0.0.1:{port}");
-        let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
-        let mut lost_the_port = false;
-        while std::time::Instant::now() < deadline {
-            if is_up(client, &base, &name).await {
-                return (server, base, name);
-            }
-            if server.is_finished() {
-                // Only a lost port is worth another try; any other exit (a
-                // refused boot, a panic) is the failure to report.
-                let outcome = server.join();
-                let port_taken = matches!(&outcome, Ok(Err(error)) if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
-                }));
-                assert!(port_taken, "the server exited before serving: {outcome:?}");
-                lost_the_port = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(lost_the_port, "server never became reachable on {base}");
-    }
-    panic!("no free port survived long enough to bind");
 }
 
 async fn token(client: &reqwest::Client, base: &str) -> String {
@@ -181,7 +96,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         .expect("reserve discovery endpoint")
         .local_addr()
         .expect("discovery address");
-    let (server, base, name) = spawn_server(&client, |port| Config {
+    let (server, base, config) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restart".to_owned(),
         discovery_bind_addr: Some(discovery_addr),
         admin_user: ADMIN_USER.to_owned(),
@@ -192,6 +107,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         ..Config::test_stub(tmp.path())
     })
     .await;
+    let name = config.server_name;
     let metrics = |client: &reqwest::Client| {
         let url = format!("{base}/metrics");
         let client = client.clone();
@@ -380,7 +296,7 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("client");
-    let (server, base, name) = spawn_server(&client, |port| Config {
+    let (server, base, config) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restore".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
@@ -388,6 +304,7 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         ..Config::test_stub(tmp.path())
     })
     .await;
+    let name = config.server_name;
     let tok = token(&client, &base).await;
 
     // A distinctive config value, backed up, then overwritten.
@@ -564,4 +481,55 @@ async fn a_set_up_server_refuses_a_missing_database_until_a_restore_brings_it_ba
         .expect("join task")
         .expect("server thread did not panic")
         .expect("run exits cleanly");
+}
+
+/// The shared boot helper (`support/boot.rs`) every real-server test uses: two
+/// servers configured alike, the second handed the port the first holds, and
+/// it comes up on another port rather than taking the first for its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_loses_its_port_retries_instead_of_attaching_to_the_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (first, first_base, first_config) = spawn_server(&client, |port| Config {
+        port,
+        ..Config::test_stub(&tmp.path().join("first"))
+    })
+    .await;
+    let handed_the_taken_port = std::sync::atomic::AtomicBool::new(false);
+    let (second, second_base, _) = spawn_server(&client, |port| Config {
+        port: if handed_the_taken_port.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            port
+        } else {
+            first_config.port
+        },
+        ..Config::test_stub(&tmp.path().join("second"))
+    })
+    .await;
+    assert_ne!(
+        second_base, first_base,
+        "attached to the server holding the port"
+    );
+
+    for (base, server) in [(first_base, first), (second_base, second)] {
+        let login: serde_json::Value = client
+            .post(format!("{base}/Users/AuthenticateByName"))
+            .header("Authorization", CLIENT)
+            .json(&serde_json::json!({"Username": "admin", "Pw": ""}))
+            .send()
+            .await
+            .expect("auth request")
+            .json()
+            .await
+            .expect("auth json");
+        let tok = login["AccessToken"].as_str().expect("access token");
+        assert_eq!(post(&client, &base, "/System/Shutdown", tok).await, 204);
+        tokio::task::spawn_blocking(move || server.join())
+            .await
+            .expect("join task")
+            .expect("server thread did not panic")
+            .expect("run exits cleanly");
+    }
 }
