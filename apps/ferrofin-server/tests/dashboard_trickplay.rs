@@ -1,5 +1,7 @@
 //! Dashboard library trickplay settings through the real server and tile routes.
 
+#[path = "support/boot.rs"]
+mod boot;
 #[path = "support/trickplay.rs"]
 mod fixture;
 

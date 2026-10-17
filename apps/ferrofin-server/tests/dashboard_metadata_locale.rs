@@ -12,6 +12,9 @@ use axum::{
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
 const POSTER: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0,
     0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 68, 12,
@@ -303,15 +306,16 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     let mock = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = Config {
+    let ffmpeg = probe_stub(tmp.path(), "ffmpeg");
+    let ffprobe = probe_stub(tmp.path(), "ffprobe");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let (server, base, config) = boot::spawn_server(&client, |port| Config {
         port,
-        ffmpeg_path: Some(probe_stub(tmp.path(), "ffmpeg")),
-        ffprobe_path: Some(probe_stub(tmp.path(), "ffprobe")),
+        ffmpeg_path: Some(ffmpeg.clone()),
+        ffprobe_path: Some(ffprobe.clone()),
         provider_endpoints: ProviderEndpoints {
             tmdb: Some(endpoint.clone()),
             tmdb_images: Some(endpoint.clone()),
@@ -323,39 +327,16 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             lrclib: Some(endpoint.clone()),
         },
         studios_repo_url: endpoint.clone(),
-        musicbrainz_base_url: endpoint,
+        musicbrainz_base_url: endpoint.clone(),
         ..Config::test_stub(tmp.path())
-    };
-    let database_url = config.database_url();
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ferrofin_server::run(config))
-            .unwrap();
-    });
+    })
+    .await;
     let mut api = Api {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap(),
-        base: format!("http://127.0.0.1:{port}"),
+        client,
+        base,
         auth: CLIENT.to_owned(),
-        database_url,
+        database_url: config.database_url(),
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if api
-            .client
-            .get(format!("{}/System/Info/Public", api.base))
-            .send()
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "server readiness");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let login: Value = api
         .client
         .post(format!("{}/Users/AuthenticateByName", api.base))
@@ -614,7 +595,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_date_added_policy(&api, tmp.path()).await;
     verify_root_library_location(&api).await;
     api.post("/System/Shutdown", &Value::Null).await;
-    tokio::task::spawn_blocking(move || server.join().unwrap())
+    tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())
         .await
         .unwrap();
     mock.abort();
