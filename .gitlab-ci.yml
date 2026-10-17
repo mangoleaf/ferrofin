@@ -381,6 +381,11 @@ coverage:
   extends: .sccache
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    # Same 12Gi OOM as `lint` (see its variables): full-debuginfo links of the
+    # instrumented test binaries, many at once. Line coverage reads the coverage
+    # mapping sections, not DWARF, so dropping debuginfo changes no percentage.
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_BUILD_JOBS: "4"
   before_script:
     - !reference [.sccache-setup, script]
   script:
