@@ -1619,8 +1619,30 @@ impl FerrofinSyncPlayManager {
         out
     }
 
+    /// The registry guard. A panic while it was held poisons the mutex, and
+    /// panicking on every later call would turn one bad request into a
+    /// server-wide SyncPlay outage until restart. So recover instead: this
+    /// trades a possibly half-applied mutation for keeping SyncPlay up, and the
+    /// poison is cleared so the error is logged once per panic, not per call.
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
-        self.registry.lock().expect("sync-play registry poisoned")
+        self.registry.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("sync-play registry lock was poisoned by a panic; recovering");
+            self.registry.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
+    /// Delivers the plan from [`leave_locked_with_notices`] (after unlocking):
+    /// the state hook's broadcast, `GroupLeft` to the leaver, `UserLeft` to the
+    /// rest — the order `Group.SessionLeave` sends them in.
+    fn deliver_leave(&self, session_id: &str, notices: LeaveNotices) {
+        // The state hook runs (and broadcasts) BEFORE the member is removed,
+        // so the leaver still receives the group-wide resume it triggered.
+        self.deliver(&notices.targets, session_id, &notices.outbound);
+        self.bus.send(session_id, notices.left_env);
+        for sid in notices.others {
+            self.bus.send(&sid, notices.user_left_env.clone());
+        }
     }
 
     /// Delivers `outbound` to the resolved target sessions. Called after the
@@ -1660,10 +1682,11 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         group_name: &str,
     ) -> Result<GroupInfoDto, ServiceError> {
         let now = Utc::now();
-        let (info, joined_env, targets, outbound) = {
+        let (info, joined_env, targets, outbound, left) = {
             let mut reg = self.lock();
-            // A session may be in at most one group — leave the old one first.
-            leave_locked(&mut reg, session);
+            // A session may be in at most one group — leave the old one first,
+            // with the full `LeaveGroup` (state hook + GroupLeft/UserLeft).
+            let left = leave_locked_with_notices(&mut reg, session, now);
             let group_id = Uuid::new_v4();
             let mut group = Group::new(group_id, group_name.trim().to_owned(), now);
             group.add_member(session);
@@ -1687,8 +1710,11 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             reg.session_to_group
                 .insert(session.session_id.clone(), group_id);
             *reg.active_users.entry(session.user_id).or_insert(0) += 1;
-            (info, joined, targets, outbound)
+            (info, joined, targets, outbound, left)
         };
+        if let Some(n) = left {
+            self.deliver_leave(&session.session_id, n);
+        }
         self.bus.send(&session.session_id, joined_env);
         self.deliver(&targets, &session.session_id, &outbound);
         Ok(info)
@@ -1705,6 +1731,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         let others: Vec<String>;
         let targets: Vec<(String, bool)>;
         let outbound: Vec<Outbound>;
+        let left: Option<LeaveNotices>;
         // The joiner must be able to see what the group is already playing (C#
         // `JoinGroup` -> `HasAccessToPlayQueue`). Read the queue under the lock,
         // then check without holding it.
@@ -1728,14 +1755,10 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         {
             let mut reg = self.lock();
             if !reg.groups.contains_key(&group_id) {
-                let env = envelope(
-                    MSG_GROUP_UPDATE,
-                    serde_json::to_value(GroupUpdate::GroupDoesNotExist(GroupDoesNotExistUpdate {
-                        group_id,
-                        data: group_id.to_string(),
-                    }))
-                    .unwrap_or(json!({})),
-                );
+                let env = render_update(GroupUpdate::GroupDoesNotExist(GroupDoesNotExistUpdate {
+                    group_id,
+                    data: group_id.to_string(),
+                }));
                 drop(reg);
                 self.bus.send(&session.session_id, env);
                 return Ok(());
@@ -1763,9 +1786,23 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 self.bus.send(&session.session_id, env);
                 return Ok(());
             }
-            leave_locked(&mut reg, session);
+            // `JoinGroup`'s "Restore session" branch: a join to the group the
+            // session is already in re-runs `SessionJoin` without leaving it
+            // (leaving would drop a sole member's group mid-join) and without
+            // counting the session a second time.
+            let restore = reg.session_to_group.get(&session.session_id) == Some(&group_id);
+            left = if restore {
+                None
+            } else {
+                leave_locked_with_notices(&mut reg, session, now)
+            };
             let user_name = session.user_name.clone();
-            let group = reg.groups.get_mut(&group_id).expect("group present");
+            let Some(group) = reg.groups.get_mut(&group_id) else {
+                // Unreachable: leaving another group cannot remove this one.
+                return Err(ServiceError::backend(
+                    "sync-play group vanished during join",
+                ));
+            };
             group.add_member(session);
             let info = group.info(now);
             joined_env = render_update(GroupUpdate::GroupJoined(GroupJoinedUpdate {
@@ -1785,9 +1822,14 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             // `Group.SessionJoin` ends with the state hook, after both envelopes.
             outbound = group.session_joined(&session.session_id, now);
             targets = member_targets(group);
-            reg.session_to_group
-                .insert(session.session_id.clone(), group_id);
-            *reg.active_users.entry(session.user_id).or_insert(0) += 1;
+            if !restore {
+                reg.session_to_group
+                    .insert(session.session_id.clone(), group_id);
+                *reg.active_users.entry(session.user_id).or_insert(0) += 1;
+            }
+        }
+        if let Some(n) = left {
+            self.deliver_leave(&session.session_id, n);
         }
         self.bus.send(&session.session_id, joined_env);
         for sid in others {
@@ -1804,13 +1846,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             leave_locked_with_notices(&mut reg, session, now)
         };
         if let Some(n) = notices {
-            // The state hook runs (and broadcasts) BEFORE the member is removed,
-            // so the leaver still receives the group-wide resume it triggered.
-            self.deliver(&n.targets, &session.session_id, &n.outbound);
-            self.bus.send(&session.session_id, n.left_env);
-            for sid in n.others {
-                self.bus.send(&sid, n.user_left_env.clone());
-            }
+            self.deliver_leave(&session.session_id, n);
         } else {
             // Not in a group: tell the caller so its client can reset.
             let env = envelope(
@@ -1948,7 +1984,10 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 self.bus.send(&session.session_id, env);
                 return Ok(());
             };
-            let group = reg.groups.get_mut(&group_id).expect("mapped group present");
+            let Some(group) = reg.groups.get_mut(&group_id) else {
+                // Unreachable: a group is only dropped once it has no members.
+                return Err(ServiceError::backend("sync-play mapped group missing"));
+            };
             // Closes the window between the off-lock access check and this
             // mutation: if the membership changed, the items were not checked
             // against whoever is in the group *now*, so refuse rather than
@@ -1996,20 +2035,6 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
     }
 }
 
-/// Removes a session from any group it is in (registry pre-locked), decrementing
-/// the user counter and dropping the group if it becomes empty. No broadcasts.
-fn leave_locked(reg: &mut Registry, session: &SyncPlaySession) {
-    if let Some(group_id) = reg.session_to_group.remove(&session.session_id) {
-        if let Some(group) = reg.groups.get_mut(&group_id) {
-            group.remove_member(&session.session_id);
-            if group.is_empty() {
-                reg.groups.remove(&group_id);
-            }
-        }
-        decrement_user(reg, session.user_id);
-    }
-}
-
 /// The broadcast plan a leave produces: whatever the group-state `SessionLeaving`
 /// hook emitted (addressed against the membership as it was BEFORE the removal),
 /// then `GroupLeft` to the leaver and `UserLeft` to everyone else.
@@ -2021,14 +2046,20 @@ struct LeaveNotices {
     others: Vec<String>,
 }
 
-/// Like [`leave_locked`] but returns the broadcast plan, or `None` if the session
-/// was not in a group.
+/// Removes a session from any group it is in (registry pre-locked): unmaps it
+/// and decrements the user counter, then runs the state hook and drops the
+/// group if it becomes empty. Returns the broadcast plan to deliver after
+/// unlocking, or `None` if the session was not mapped to a live group.
 fn leave_locked_with_notices(
     reg: &mut Registry,
     session: &SyncPlaySession,
     now: DateTime<Utc>,
 ) -> Option<LeaveNotices> {
     let group_id = reg.session_to_group.remove(&session.session_id)?;
+    // Uncounted with the unmapping, before the group is touched — upstream's
+    // `TryRemove` then `UpdateSessionsCounter(-1)` order — so even a stale
+    // mapping cannot leave the user counted as active.
+    decrement_user(reg, session.user_id);
     let group = reg.groups.get_mut(&group_id)?;
     // `Group.SessionLeave` runs the state hook first, while the leaver is still
     // a participant — so the targets it broadcasts to include it.
@@ -2047,7 +2078,6 @@ fn leave_locked_with_notices(
     if group.is_empty() {
         reg.groups.remove(&group_id);
     }
-    decrement_user(reg, session.user_id);
     Some(LeaveNotices {
         outbound,
         targets,
@@ -3501,6 +3531,118 @@ mod tests {
         // The first group is now empty and dropped.
         assert!(m.get_group(&a, first.group_id).await.is_err());
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
+    }
+
+    /// `JoinGroup`'s "Restore session" branch. Re-joining the group you are the
+    /// only member of used to leave it first, which dropped the group and then
+    /// panicked under the registry lock, poisoning SyncPlay server-wide.
+    #[tokio::test]
+    async fn rejoining_your_own_group_as_its_only_member_restores_the_session() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        let before = bus.count_for("s1");
+
+        m.join_group(&a, info.group_id).await.unwrap();
+
+        let group = m.get_group(&a, info.group_id).await.unwrap();
+        assert_eq!(group.participants, vec!["alice".to_string()]);
+        let after = &bus.bodies_for("s1")[before..];
+        assert!(after.iter().any(|x| x.contains("GroupJoined")), "{after:?}");
+        assert!(!after.iter().any(|x| x.contains("GroupLeft")), "{after:?}");
+        // Counted once: a single leave makes the user inactive again.
+        m.leave_group(&a).await.unwrap();
+        assert!(!m.is_user_active(a.user_id).await.unwrap());
+        assert!(m.get_group(&a, info.group_id).await.is_err());
+    }
+
+    /// A restore keeps the member where it was (`Group.AddSession` is a
+    /// `TryAdd`); leaving and re-adding would move bob behind carol.
+    #[tokio::test]
+    async fn rejoining_a_shared_group_keeps_one_membership() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let c = session("s3", "carol");
+        m.join_group(&c, info.group_id).await.unwrap();
+        let before = bus.count_for("s1");
+
+        m.join_group(&b, info.group_id).await.unwrap();
+
+        let group = m.get_group(&a, info.group_id).await.unwrap();
+        assert_eq!(
+            group.participants,
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+        let alice_after = &bus.bodies_for("s1")[before..];
+        assert!(alice_after.iter().any(|x| x.contains("UserJoined")));
+        assert!(!alice_after.iter().any(|x| x.contains("UserLeft")));
+        m.leave_group(&b).await.unwrap();
+        assert!(!m.is_user_active(b.user_id).await.unwrap());
+    }
+
+    /// Switching groups runs the full `LeaveGroup` on the old one: the group
+    /// that was waiting on the leaver resumes, its members get `UserLeft`, and
+    /// the leaver gets `GroupLeft` — for both `NewGroup` and `JoinGroup`.
+    #[rstest::rstest]
+    #[case::new_group(true)]
+    #[case::join_group(false)]
+    #[tokio::test]
+    async fn switching_groups_while_waiting_resumes_the_old_group(#[case] via_new: bool) {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let old = m.new_group(&a, "old").await.unwrap();
+        start_playing(&m, &bus, &[&a], 2).await;
+        let b = session("s2", "bob");
+        m.join_group(&b, old.group_id).await.unwrap(); // -> Waiting on bob
+        let alice_before = bus.count_for("s1");
+        let bob_before = bus.count_for("s2");
+
+        if via_new {
+            m.new_group(&b, "new").await.unwrap();
+        } else {
+            let c = session("s3", "carol");
+            let other = m.new_group(&c, "other").await.unwrap();
+            m.join_group(&b, other.group_id).await.unwrap();
+        }
+
+        assert_eq!(
+            m.get_group(&a, old.group_id).await.unwrap().state,
+            GroupStateType::Playing
+        );
+        let alice_after = &bus.bodies_for("s1")[alice_before..];
+        assert!(
+            alice_after
+                .iter()
+                .any(|x| x.contains("SyncPlayCommand") && x.contains("Unpause")),
+            "{alice_after:?}"
+        );
+        assert!(alice_after.iter().any(|x| x.contains("UserLeft")));
+        let bob_after = &bus.bodies_for("s2")[bob_before..];
+        let left = bob_after.iter().position(|x| x.contains("GroupLeft"));
+        let joined = bob_after.iter().position(|x| x.contains("GroupJoined"));
+        assert!(left.is_some() && left < joined, "{bob_after:?}");
+        // One group, one count: leaving the new group makes bob inactive.
+        m.leave_group(&b).await.unwrap();
+        assert!(!m.is_user_active(b.user_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_registry_recovers_instead_of_panicking_every_call() {
+        let (m, _bus) = mgr();
+        let s = session("s1", "alice");
+        m.new_group(&s, "g").await.unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.registry.lock().unwrap();
+            panic!("poison the sync-play registry");
+        }));
+        assert!(poisoned.is_err());
+        assert!(m.registry.is_poisoned());
+
+        assert!(m.is_user_active(s.user_id).await.unwrap());
+        assert!(!m.registry.is_poisoned());
     }
 
     // ── library access (C# `Group.HasAccessToPlayQueue`) ───────────────────
