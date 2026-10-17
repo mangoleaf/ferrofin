@@ -283,15 +283,7 @@ pub async fn build_app_state(
     shutdown: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<WiredApp> {
     // ---- paths (concrete) -------------------------------------------------
-    // Sub-directory layout under the program-data root, ported from
-    // `ServerApplicationPaths`: {data}/log, {config}, {cache}, {web}.
-    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-        &config.data_dir,
-        config.data_dir.join("log"),
-        &config.config_dir,
-        &config.cache_dir,
-        &config.web_dir,
-    ));
+    let paths = Arc::new(crate::bootstrap::application_paths(config));
     // The file actually opened (an adopted `jellyfin.db` may live elsewhere) —
     // what a backup archives and a restore writes.
     paths.set_database_path(config.database_path());

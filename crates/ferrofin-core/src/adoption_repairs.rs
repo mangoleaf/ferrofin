@@ -25,7 +25,10 @@ use ferrofin_traits::persistence::{ItemRekey, ItemUserWeight};
 use ferrofin_traits::system::PathManager;
 
 use crate::db_error::db_err;
-use crate::item_data::{import_membership, parse_data, read_linked_children};
+use crate::item_data::{
+    LINKED_ALTERNATE_VERSION, LOCAL_ALTERNATE_VERSION, import_membership, item_by_path, parse_data,
+    read_linked_children, resolve_linked_child,
+};
 use crate::item_folders::{MovedFolders, move_item_folders};
 use crate::item_persistence_service::{
     FerrofinItemPersistenceService, REPAIR_PARTITION, RekeyKind, alternate_version_child_type,
@@ -36,12 +39,9 @@ use crate::item_type_lookup::{
     stored_type_name, virtual_season_id,
 };
 use crate::library_scan::{SeasonNames, rekey_source};
+use crate::virtual_paths::VirtualPathExpander;
 use ferrofin_traits::persistence::ItemPersistenceService;
 
-/// `LinkedChildType::LocalAlternateVersion`.
-const LOCAL_ALTERNATE_VERSION: i64 = 2;
-/// `LinkedChildType::LinkedAlternateVersion`.
-const LINKED_ALTERNATE_VERSION: i64 = 3;
 /// The placeholder item 12.0's `AddForeignKeyToOwnerId` re-points dangling
 /// owners at, and `CleanupOrphanedExtras` then deletes the owned rows of.
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -50,8 +50,8 @@ const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 ///
 /// # Errors
 /// Returns [`ServiceError`] if a repair's queries fail.
-pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
-    let imported = import_membership_once(db).await?;
+pub async fn run_all(db: &Database, paths: &VirtualPathExpander) -> Result<(), ServiceError> {
+    let imported = import_membership_once(db, paths).await?;
     if imported > 0 {
         tracing::info!(
             rows = imported,
@@ -178,6 +178,9 @@ async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
     db.meta_set(key, "1").await.map_err(meta_err)
 }
 
+/// A row [`import_membership_once`] reads: `Id`, `Type`, `Path`, `IsFolder`, `Data`.
+type ImportRow = (String, String, Option<String>, bool, Option<String>);
+
 /// The one-shot port of `MigrateLinkedChildren`'s data move for a database
 /// **newly adopted from 10.11.8** — the only case where the `Data` JSON is the
 /// truth about membership. It reads `LinkedChildren` from every playlist/box
@@ -186,12 +189,17 @@ async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
 /// transaction. Runs for every 10.11.x generation (10.11.8 through
 /// 10.11.11). A 12.0 adoption, a Ferrofin-native database and an install
 /// adopted before the record existed have no such record and are skipped.
+/// `paths` expands a container's stored `%AppDataPath%` path, which entries
+/// relative to the container resolve against.
 ///
 /// Returns the number of rows written.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
-pub async fn import_membership_once(db: &Database) -> Result<usize, ServiceError> {
+pub async fn import_membership_once(
+    db: &Database,
+    paths: &VirtualPathExpander,
+) -> Result<usize, ServiceError> {
     let Some(state) = db.adoption_state().await.map_err(meta_err)? else {
         return Ok(0);
     };
@@ -207,8 +215,8 @@ pub async fn import_membership_once(db: &Database) -> Result<usize, ServiceError
         stored_type_name(BaseItemKind::Movie).unwrap_or_default(),
         stored_type_name(BaseItemKind::Episode).unwrap_or_default(),
     ];
-    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Type", "Path", "Data" FROM "BaseItems"
+    let rows: Vec<ImportRow> = sqlx::query_as(
+        r#"SELECT "Id", "Type", "Path", "IsFolder", "Data" FROM "BaseItems"
            WHERE "Data" IS NOT NULL AND "Type" IN (?1, ?2, ?3, ?4, ?5)"#,
     )
     .bind(playlist)
@@ -222,14 +230,31 @@ pub async fn import_membership_once(db: &Database) -> Result<usize, ServiceError
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
     let mut written = 0usize;
-    for (id, type_, path, data) in rows {
+    let mut dropped = 0usize;
+    for (id, type_, path, is_folder, data) in rows {
         let map = parse_data(data.as_deref());
         if type_ == playlist || type_ == boxset {
             if map.contains_key("LinkedChildren") {
-                written += import_membership(&mut tx, &id, &map).await?;
+                // Relative entries resolve against the container's real
+                // location: its own folder, or a file's directory.
+                let path = path.map(|p| paths.expand(&p));
+                let folder = if is_folder {
+                    path
+                } else {
+                    path.and_then(|p| {
+                        Path::new(&p)
+                            .parent()
+                            .map(|d| d.to_string_lossy().into_owned())
+                    })
+                };
+                let done =
+                    import_membership(&mut tx, &id, folder.as_deref(), type_ == playlist, &map)
+                        .await?;
+                written += done.written;
+                dropped += done.dropped;
             }
         } else {
-            written += import_video_alternate_versions(&mut tx, &id, path.as_deref(), &map).await?;
+            written += import_video_alternate_versions(&mut tx, &id, &map).await?;
         }
     }
     sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
@@ -237,18 +262,21 @@ pub async fn import_membership_once(db: &Database) -> Result<usize, ServiceError
         .await
         .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
+    if dropped > 0 {
+        tracing::warn!(dropped, "dropped unresolvable LinkedChildren entries");
+    }
     Ok(written)
 }
 
 /// `MigrateLinkedChildren.ProcessVideoAlternateVersions`: `LocalAlternateVersions`
 /// (path strings → `ChildType 2`) then `LinkedAlternateVersions` (linked-child
-/// objects → `ChildType 3`), one shared ordinal counter; a pair already
-/// present is left alone (local beats linked), a linked version pointing at an
-/// item the parent owns is skipped.
+/// objects → `ChildType 3`, resolved by [`resolve_linked_child`] with no
+/// containing folder), one shared ordinal counter; a pair already present is
+/// left alone (local beats linked), a linked version pointing at an item the
+/// parent owns is skipped.
 async fn import_video_alternate_versions(
     tx: &mut sqlx::SqliteConnection,
     parent_db: &str,
-    _parent_path: Option<&str>,
     map: &Map<String, Value>,
 ) -> Result<usize, ServiceError> {
     let mut candidates: Vec<(String, i64)> = Vec::new();
@@ -257,12 +285,12 @@ async fn import_video_alternate_versions(
             if path.is_empty() {
                 continue;
             }
-            if let Some(child) = id_by_path(tx, path).await? {
+            if let Some(child) = item_by_path(tx, path).await? {
                 candidates.push((child, LOCAL_ALTERNATE_VERSION));
             } else {
                 tracing::warn!(
                     path,
-                    parent = parent_db,
+                    item_id = %parent_db.to_ascii_lowercase(),
                     "could not resolve LocalAlternateVersion path"
                 );
             }
@@ -273,22 +301,11 @@ async fn import_video_alternate_versions(
         linked_map.insert("LinkedChildren".to_owned(), v.clone());
     }
     for child in read_linked_children(&linked_map) {
-        let resolved = match child
-            .item_id
-            .as_deref()
-            .and_then(|i| Uuid::parse_str(i).ok())
-        {
-            Some(id) => Some(guid_to_db(id)),
-            None => match child.path.as_deref() {
-                Some(p) => id_by_path(tx, p).await?,
-                None => None,
-            },
-        };
-        if let Some(child_db) = resolved {
+        if let Some(child_db) = resolve_linked_child(tx, &child, None).await? {
             candidates.push((child_db, LINKED_ALTERNATE_VERSION));
         } else {
             tracing::warn!(
-                parent = parent_db,
+                item_id = %parent_db.to_ascii_lowercase(),
                 "could not resolve LinkedAlternateVersion child"
             );
         }
@@ -319,30 +336,10 @@ async fn import_video_alternate_versions(
         if exists.is_some() {
             continue;
         }
-        let child_exists: Option<i64> =
-            sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&child_db)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        if child_exists.is_none() {
-            continue;
-        }
         append_link(tx, parent_db, &child_db, child_type).await?;
         written += 1;
     }
     Ok(written)
-}
-
-async fn id_by_path(
-    tx: &mut sqlx::SqliteConnection,
-    path: &str,
-) -> Result<Option<String>, ServiceError> {
-    sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY "Id" LIMIT 1"#)
-        .bind(path)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)
 }
 
 async fn append_link(
@@ -2553,7 +2550,9 @@ mod tests {
         )
         .await;
 
-        let written = import_membership_once(&db).await.expect("import");
+        let written = import_membership_once(&db, &VirtualPathExpander::identity())
+            .await
+            .expect("import");
         assert_eq!(written, 5);
         assert_eq!(
             links(&db)
@@ -2582,8 +2581,139 @@ mod tests {
             .execute(db.writer())
             .await
             .expect("empty");
-        assert_eq!(import_membership_once(&db).await.expect("again"), 0);
+        assert_eq!(
+            import_membership_once(&db, &VirtualPathExpander::identity())
+                .await
+                .expect("again"),
+            0
+        );
         assert!(links(&db).await.is_empty());
+    }
+
+    /// `MigrateLinkedChildren.ResolveChildId`: a cached `ItemId` counts only
+    /// while its row exists, then the exact path, a path relative to the
+    /// container's expanded folder, and `LibraryItemId`. An entry that
+    /// resolves to nothing is dropped and the import (the first boot of an
+    /// adopted 10.11 database) still completes.
+    #[rstest::rstest]
+    #[case::stale_id_falls_back_to_the_path(r#""ItemId":"{stale}","Path":"/pd/m/live.mkv""#, true)]
+    #[case::stale_id_and_dead_path_is_dropped(
+        r#""ItemId":"{stale}","Path":"/pd/m/gone.mkv""#,
+        false
+    )]
+    #[case::library_item_id(r#""LibraryItemId":"{live}""#, true)]
+    #[case::stale_library_item_id_is_dropped(r#""LibraryItemId":"{stale}""#, false)]
+    #[case::path_relative_to_the_container(r#""Path":"../../../m/live.mkv""#, true)]
+    #[case::live_id_wins(r#""ItemId":"{live}","Path":"/pd/m/gone.mkv""#, true)]
+    #[tokio::test]
+    async fn a_10_11_linked_child_resolves_like_upstream(
+        #[case] entry: &str,
+        #[case] resolves: bool,
+    ) {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let (boxset, live) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, boxset, BaseItemKind::BoxSet, "Set", None).await;
+        set_path(&db, boxset, "%AppDataPath%/collections/Set [boxset]").await;
+        seed_item(&db, live, BaseItemKind::Movie).await;
+        set_path(&db, live, "/pd/m/live.mkv").await;
+        let entry = entry
+            .replace("{stale}", &Uuid::new_v4().simple().to_string())
+            .replace("{live}", &live.simple().to_string());
+        set_data(
+            &db,
+            boxset,
+            &format!(r#"{{"LinkedChildren":[{{"Type":"Manual",{entry}}}]}}"#),
+        )
+        .await;
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new("/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w"),
+        ));
+
+        let written = import_membership_once(&db, &paths).await.expect("import");
+
+        let expected = if resolves {
+            vec![(guid_to_db(boxset), guid_to_db(live), 0, 0)]
+        } else {
+            vec![]
+        };
+        assert_eq!(written, expected.len());
+        assert_eq!(links(&db).await, expected);
+        assert!(
+            db.adoption_state()
+                .await
+                .expect("state")
+                .expect("record")
+                .membership_import_done
+        );
+    }
+
+    /// Only a playlist keeps a repeated child; a box set keeps one row per
+    /// child, a `LinkedAlternateVersion` entry over a `Manual` one, each at
+    /// the ordinal it resolved at.
+    #[tokio::test]
+    async fn a_box_set_keeps_one_row_per_child() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let (boxset, a, b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, boxset, BaseItemKind::BoxSet, "Set", None).await;
+        for id in [a, b] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let (a_id, b_id) = (a.simple(), b.simple());
+        set_data(
+            &db,
+            boxset,
+            &format!(
+                r#"{{"LinkedChildren":[{{"Type":"Manual","ItemId":"{a_id}"}},{{"Type":"Manual","ItemId":"{b_id}"}},{{"Type":"LinkedAlternateVersion","ItemId":"{a_id}"}},{{"Type":"Manual","ItemId":"{b_id}"}}]}}"#
+            ),
+        )
+        .await;
+
+        let written = import_membership_once(&db, &VirtualPathExpander::identity())
+            .await
+            .expect("import");
+
+        assert_eq!(written, 2);
+        assert_eq!(
+            links(&db).await,
+            vec![
+                (guid_to_db(boxset), guid_to_db(b), 0, 1),
+                (guid_to_db(boxset), guid_to_db(a), 3, 2),
+            ]
+        );
+    }
+
+    /// A video's `LinkedAlternateVersions` entry resolves like a container's:
+    /// a stale cached id falls through to the path.
+    #[tokio::test]
+    async fn a_linked_alternate_version_with_a_stale_id_resolves_by_path() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let (primary, alt) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [primary, alt] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        set_path(&db, alt, "/m/alt.mkv").await;
+        set_data(
+            &db,
+            primary,
+            &format!(
+                r#"{{"LinkedAlternateVersions":[{{"Type":"Manual","ItemId":"{}","Path":"/m/alt.mkv"}}]}}"#,
+                Uuid::new_v4().simple()
+            ),
+        )
+        .await;
+
+        let written = import_membership_once(&db, &VirtualPathExpander::identity())
+            .await
+            .expect("import");
+
+        assert_eq!(written, 1);
+        assert_eq!(
+            links(&db).await,
+            vec![(guid_to_db(primary), guid_to_db(alt), 3, 0)]
+        );
     }
 
     async fn link(db: &Database, parent: Uuid, child: Uuid, child_type: i64, order: i64) {
@@ -3839,7 +3969,12 @@ mod tests {
             )
             .await;
             for _ in 0..2 {
-                assert_eq!(import_membership_once(&db).await.expect("import"), 0);
+                assert_eq!(
+                    import_membership_once(&db, &VirtualPathExpander::identity())
+                        .await
+                        .expect("import"),
+                    0
+                );
                 assert!(links(&db).await.is_empty(), "record {record:?}");
             }
         }
@@ -4374,7 +4509,9 @@ mod tests {
         let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa), Uuid::from_u128(0xbbbb)]).await;
         insert_play(&db, &ids[0], RECENT).await;
         insert_play(&db, &ids[0], FOSSIL).await;
-        run_all(&db).await.unwrap();
+        run_all(&db, &VirtualPathExpander::identity())
+            .await
+            .unwrap();
         assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
         assert_eq!(plays(&db, &ids[0]).await[1].play_count, 9);
 

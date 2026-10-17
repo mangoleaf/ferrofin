@@ -32,18 +32,22 @@ pub fn get_safe_leaf_file_name(file_name: Option<&str>) -> Option<String> {
 
 /// Lexically resolves a path: collapses `.` and `..` segments without consulting
 /// the filesystem (unlike `std::fs::canonicalize`, which requires existence).
-fn get_full_path(path: &str) -> PathBuf {
+#[must_use]
+pub fn get_full_path(path: &str) -> PathBuf {
     let input = Path::new(path);
     let mut resolved = PathBuf::new();
     for component in input.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !resolved.pop() {
-                    // Preserve leading `..` on relative paths.
-                    resolved.push("..");
+            // `..` cancels a name, stays put at the root, and piles up at
+            // the start of a relative path.
+            Component::ParentDir => match resolved.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    resolved.pop();
                 }
-            }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => resolved.push(".."),
+            },
             other => resolved.push(other.as_os_str()),
         }
     }
@@ -53,8 +57,9 @@ fn get_full_path(path: &str) -> PathBuf {
 /// Returns whether `candidate` resolves to a path that equals or is contained
 /// inside `root`.
 ///
-/// Both arguments are lexically resolved so `..` segments are collapsed before
-/// the comparison. The root is compared with a trailing separator to prevent
+/// Both arguments are anchored at the working directory when relative and
+/// lexically resolved, as `Path.GetFullPath` does, so `..` segments are
+/// collapsed before the comparison. The root is compared with a trailing separator to prevent
 /// prefix collisions (e.g. `/var/data` must not be accepted as a parent of
 /// `/var/dataset`).
 ///
@@ -67,8 +72,12 @@ pub fn is_contained_in(root: &str, candidate: &str) -> bool {
     assert!(!root.is_empty(), "root must not be null or empty");
     assert!(!candidate.is_empty(), "candidate must not be null or empty");
 
-    let full_root = get_full_path(root);
-    let full_candidate = get_full_path(candidate);
+    let (Ok(root), Ok(candidate)) = (std::path::absolute(root), std::path::absolute(candidate))
+    else {
+        return false;
+    };
+    let full_root = get_full_path(&root.to_string_lossy());
+    let full_candidate = get_full_path(&candidate.to_string_lossy());
 
     if full_candidate == full_root {
         return true;
@@ -116,6 +125,22 @@ mod tests {
             p.push(part);
         }
         p.to_string_lossy().into_owned()
+    }
+
+    #[rstest]
+    #[case("/a/../../m/x", "/m/x")]
+    #[case("/a/./b/../c", "/a/c")]
+    #[case("../a/../b", "../b")]
+    #[case("../../x", "../../x")]
+    #[case("a/../../../b", "../../b")]
+    fn get_full_path_resolves_lexically(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(get_full_path(input), PathBuf::from(expected));
+    }
+
+    #[test]
+    fn is_contained_in_anchors_relative_paths() {
+        assert!(!is_contained_in("..", "../../x"));
+        assert!(is_contained_in("a", "a/b/../c"));
     }
 
     #[test]
