@@ -594,6 +594,27 @@ fn folder_emits_counts(item: &BaseItemEntity) -> bool {
     }
 }
 
+/// A folder's played numbers from its leaf counts — the `SupportsPlayedStatus`
+/// half of `Folder.FillUserDataDtoValues` (v12.2 Folder.cs:2067-2081).
+///
+/// The played state is derived from the COUNTS, with no field gate (10.11.8
+/// keyed it off the `RecursiveItemCount` DTO field, which is why a seasons
+/// page without that field lost its `PlayedPercentage`):
+///   `if (totalCount > 0) { PlayedPercentage = playedCount / (double)totalCount * 100;
+///    Played = playedCount >= totalCount; } else { Played = true; }`
+pub(crate) fn fill_folder_played(
+    ud: &mut UserItemDataDto,
+    c: ferrofin_traits::persistence::PlayedAndTotal,
+) {
+    ud.unplayed_item_count = Some(c.total - c.played);
+    if c.total > 0 {
+        ud.played_percentage = Some(f64::from(c.played) / f64::from(c.total) * 100.0);
+        ud.played = c.played >= c.total;
+    } else {
+        ud.played = true;
+    }
+}
+
 /// `100 × position ÷ runtime` as the C# double division (both counts are tick
 /// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact
 /// enough for a display percentage).
@@ -2294,27 +2315,11 @@ impl FerrofinDtoService {
                         dto.recursive_item_count = Some(c.total);
                     }
                     if kinds::supports_played_status(kind) {
-                        let unplayed = c.total - c.played;
-                        let ud = dto
-                            .user_data
-                            .get_or_insert_with(|| empty_user_data_dto(item_id));
-                        ud.unplayed_item_count = Some(unplayed);
-                        // Folder.cs:1983-1990 — the played state is derived from
-                        // the COUNTS, with no field gate (10.11.8 keyed it off
-                        // the `RecursiveItemCount` DTO field, which is why a
-                        // seasons page without that field lost its
-                        // `PlayedPercentage`):
-                        //   if (totalCount > 0) {
-                        //     PlayedPercentage = playedCount / (double)totalCount * 100;
-                        //     Played = playedCount >= totalCount;
-                        //   } else { Played = true; }
-                        if c.total > 0 {
-                            ud.played_percentage =
-                                Some(f64::from(c.played) / f64::from(c.total) * 100.0);
-                            ud.played = c.played >= c.total;
-                        } else {
-                            ud.played = true;
-                        }
+                        fill_folder_played(
+                            dto.user_data
+                                .get_or_insert_with(|| empty_user_data_dto(item_id)),
+                            c,
+                        );
                     }
                 }
             }

@@ -1831,7 +1831,9 @@ pub trait ItemCountService: Send + Sync {
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError>;
 
-    /// Gets played/total counts from the linked-children of `parent_id`.
+    /// Gets played/total counts of the countable leaves below the links of
+    /// `parent_id` (a box set or playlist), following linked folders down
+    /// (`GetPlayedAndTotalCountFromLinkedChildren`).
     async fn get_played_and_total_count_from_linked_children(
         &self,
         filter: &InternalItemsQuery,

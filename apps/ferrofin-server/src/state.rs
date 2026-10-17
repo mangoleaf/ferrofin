@@ -1373,6 +1373,9 @@ pub async fn build_app_state(
         .with_app_paths(Arc::clone(&paths)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
+    // Marking a series, season, box set or folder played marks the items
+    // under it (`Folder.MarkPlayed`/`BoxSet.MarkPlayed`), listed through here.
+    user_data_impl.set_container_members(Arc::downgrade(&library), Arc::clone(&item_count_service));
     let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
         Arc::clone(&paths) as Arc<_>;
     let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> = Arc::new(

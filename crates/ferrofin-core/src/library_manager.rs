@@ -260,7 +260,9 @@ fn episode_relation_id(value: Option<&str>) -> Option<Uuid> {
         .filter(|id| !id.is_nil())
 }
 
-fn episode_presentation_key(item: &BaseItemEntity) -> String {
+/// A series' or season's `GetPresentationUniqueKey()`: its stored key, else
+/// its id — the key its episodes are queried under.
+pub(crate) fn episode_presentation_key(item: &BaseItemEntity) -> String {
     item.presentation_unique_key
         .as_ref()
         .filter(|key| !key.is_empty())
