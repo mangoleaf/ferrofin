@@ -1,9 +1,8 @@
-//! `LibraryController` similar-items surface (the non-`/Shows` aliases).
+//! `LibraryController` similar-items surface.
 //!
 //! Ports Jellyfin's `LibraryController.GetSimilarItems`, which serves one handler
 //! body across six routes: `Albums`, `Artists`, `Items`, `Movies`, `Trailers`,
-//! and `Shows`. The `Shows` alias already lives in [`super::tv_shows`]; this
-//! module registers the other five, all delegating to the same
+//! and `Shows`. This module registers all six, delegating to the same
 //! [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 //!
 //! The C# body resolves the seed item (a nil id falls back to the root folder),
@@ -13,7 +12,7 @@
 //! similar-items manager for the ranked rows, and returns a
 //! `QueryResult<BaseItemDto>` with `startIndex = 0` and `totalRecordCount` equal
 //! to the number of rows. The transform is identical for every alias — only the
-//! route path differs — so one handler backs all five.
+//! route path differs — so one handler backs all six.
 
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -60,19 +59,16 @@ struct SimilarParams {
 /// Port of the `LibraryController.GetSimilarItems` first two lines: a nil
 /// `itemId` is not an error but a fallback to the root folder
 /// (`itemId.IsEmpty() ? (user is null ? RootFolder : GetUserRootFolder()) :
-/// GetItemById(itemId, user)`). A non-nil id passes through untouched and its
-/// existence is checked by the manager, which reports the miss so the handler
-/// can `404`.
+/// GetItemById(itemId, user)`). A non-nil id passes through untouched: the
+/// handler has already checked it is visible to the user, and the manager's
+/// miss only backstops a seed deleted in between, still as a `404`.
 ///
 /// C#'s two roots (`AggregateFolder` without a user, `UserRootFolder` with one)
 /// collapse to one here: neither is a kind any similarity provider serves, so
 /// both answer with the same empty `QueryResult`, and Ferrofin only persists the
 /// user root. `Ok(None)` — a nil id on a server with no root row at all — takes
 /// that same empty answer.
-pub(crate) async fn resolve_similar_seed(
-    state: &AppState,
-    item_id: Uuid,
-) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_similar_seed(state: &AppState, item_id: Uuid) -> Result<Option<Uuid>, ApiError> {
     if !item_id.is_nil() {
         return Ok(Some(item_id));
     }
@@ -83,7 +79,8 @@ pub(crate) async fn resolve_similar_seed(
 /// Shared body of every `/{kind}/{itemId}/Similar` route.
 ///
 /// Port of `LibraryController.GetSimilarItems`. Resolves the (optional) user,
-/// parses `excludeArtistIds`/`fields`, and delegates to the
+/// answers `404` for a seed that user cannot see (C# `GetItemById(itemId,
+/// user)`), parses `excludeArtistIds`/`fields`, and delegates to the
 /// [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager), whose
 /// `get_similar_items` answers empty for an `Episode` or a by-name seed other
 /// than a `MusicArtist` — the C# `if (item is Episode || (item is IItemByName
@@ -140,7 +137,7 @@ async fn similar_items(
 
 /// Builds a similar-items handler for one `/{kind}/{itemId}/Similar` route.
 ///
-/// Each alias (`Albums`, `Artists`, `Items`, `Movies`, `Trailers`) has an
+/// Each alias (`Albums`, `Artists`, `Items`, `Movies`, `Shows`, `Trailers`) has an
 /// identical handler; this macro emits one per route so they share the single
 /// [`similar_items`] body instead of copying it, matching the C# multi-`[HttpGet]`
 /// fan-in onto one method.
@@ -172,6 +169,7 @@ similar_handler!(get_similar_albums, "/Albums/{itemId}/Similar");
 similar_handler!(get_similar_artists, "/Artists/{itemId}/Similar");
 similar_handler!(get_similar_generic_items, "/Items/{itemId}/Similar");
 similar_handler!(get_similar_movies, "/Movies/{itemId}/Similar");
+similar_handler!(get_similar_shows, "/Shows/{itemId}/Similar");
 similar_handler!(get_similar_trailers, "/Trailers/{itemId}/Similar");
 
 /// Registers this controller's real routes onto `router`.
@@ -181,11 +179,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Artists/{itemId}/Similar", get(get_similar_artists))
         .route("/Items/{itemId}/Similar", get(get_similar_generic_items))
         .route("/Movies/{itemId}/Similar", get(get_similar_movies))
+        .route("/Shows/{itemId}/Similar", get(get_similar_shows))
         .route("/Trailers/{itemId}/Similar", get(get_similar_trailers))
 }
 crate::query::query_parameters! {
     SimilarParams {
         "excludeArtistIds" => ',',
         "fields" => ',',
-    } => [("get", "/Items/{itemId}/Similar"), ("get", "/Artists/{itemId}/Similar"), ("get", "/Albums/{itemId}/Similar"), ("get", "/Movies/{itemId}/Similar"), ("get", "/Trailers/{itemId}/Similar")];
+    } => [("get", "/Items/{itemId}/Similar"), ("get", "/Artists/{itemId}/Similar"), ("get", "/Albums/{itemId}/Similar"), ("get", "/Movies/{itemId}/Similar"), ("get", "/Shows/{itemId}/Similar"), ("get", "/Trailers/{itemId}/Similar")];
 }

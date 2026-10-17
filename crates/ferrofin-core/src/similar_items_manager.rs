@@ -190,6 +190,37 @@ struct CachedReference {
     score: Option<f32>,
 }
 
+/// The best reference per lowercased (provider, id): higher score wins, and at
+/// equal score the earlier position does — C# `ResolveRemoteReferences`'
+/// `providerLookup`.
+fn best_reference_per_id(
+    references: &[SimilarItemReference],
+) -> HashMap<(String, String), (Option<f32>, usize)> {
+    let mut best: HashMap<(String, String), (Option<f32>, usize)> = HashMap::new();
+    for (position, reference) in references.iter().enumerate() {
+        let key = (
+            reference.provider_name.to_lowercase(),
+            reference.provider_id.to_lowercase(),
+        );
+        // C#'s `match.Score > existing.Score` is a *lifted* float comparison:
+        // it is false whenever either side is null, so an unscored reference
+        // never displaces a scored one and vice versa. `Option`'s own
+        // ordering ranks `Some` above `None`, which would diverge — hence
+        // the explicit both-present check.
+        let better = match best.get(&key) {
+            None => true,
+            Some((score, at)) => match (reference.score, *score) {
+                (Some(new), Some(old)) if new > old => true,
+                _ => reference.score == *score && position < *at,
+            },
+        };
+        if better {
+            best.insert(key, (reference.score, position));
+        }
+    }
+    best
+}
+
 /// The [`BaseItemKind`] of a row, defaulting to `Folder` for an unrecognized
 /// stored `Type` (the crate-wide conservative default).
 fn kind_of(entity: &BaseItemEntity) -> BaseItemKind {
@@ -834,43 +865,63 @@ impl FerrofinSimilarItemsManager {
         )
     }
 
+    /// The rows of `ids` that are of `kind` and that `user_id` may see, keyed
+    /// by id: C#'s `InternalItemsQuery(user) { IncludeItemTypes = [kind] }`.
+    ///
+    /// With a user, a kind that has versions is grouped by presentation key
+    /// (C# `EnableGroupByPresentationUniqueKey`), so the copies of one film
+    /// come back as their group head alone — as upstream's `GetItemList` does.
+    async fn visible_rows(
+        &self,
+        ids: Vec<Uuid>,
+        kind: BaseItemKind,
+        user_id: Option<Uuid>,
+    ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError> {
+        // An empty `item_ids` is no filter at all: it would load every row.
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut query = InternalItemsQuery {
+            item_ids: ids,
+            include_item_types: vec![kind],
+            ..InternalItemsQuery::default()
+        };
+        if let Some(user_id) = user_id
+            && !self.configure_user_access(&mut query, user_id).await?
+        {
+            return Ok(HashMap::new());
+        }
+        Ok(self
+            .items
+            .get_item_list(&query)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect())
+    }
+
     /// Resolves a provider's references to library items of `kind`, scoring
     /// each and skipping anything already accounted for.
     ///
     /// Port of `SimilarItemsManager.ResolveRemoteReferences`: a reference is
     /// matched by looking its provider id up in `BaseItemProviders`, and the
-    /// best (highest-scoring, else earliest) reference per id wins.
+    /// best (highest-scoring, else earliest) reference per id wins. The matched
+    /// rows are then loaded through ONE `InternalItemsQuery(user) {
+    /// IncludeItemTypes = [kind] }`, so the user's libraries, parental rating
+    /// and tag policy apply exactly as on the local path.
+    ///
+    /// C#'s closing `FilterByLibraryAccessAsync` pass over the merged results
+    /// is not repeated: both the local and this remote path already resolve
+    /// through the user-scoped query, so it could drop nothing.
     async fn resolve_remote_references(
         &self,
         references: &[SimilarItemReference],
         provider_order: usize,
         kind: BaseItemKind,
+        user_id: Option<Uuid>,
         claimed: &mut Seen,
     ) -> Vec<(BaseItemEntity, f32)> {
-        // Best reference per (provider, id): higher score wins, and at equal
-        // score the earlier position does.
-        let mut best: HashMap<(String, String), (Option<f32>, usize)> = HashMap::new();
-        for (position, reference) in references.iter().enumerate() {
-            let key = (
-                reference.provider_name.to_lowercase(),
-                reference.provider_id.to_lowercase(),
-            );
-            // C#'s `match.Score > existing.Score` is a *lifted* float comparison:
-            // it is false whenever either side is null, so an unscored reference
-            // never displaces a scored one and vice versa. `Option`'s own
-            // ordering ranks `Some` above `None`, which would diverge — hence
-            // the explicit both-present check.
-            let better = match best.get(&key) {
-                None => true,
-                Some((score, at)) => match (reference.score, *score) {
-                    (Some(new), Some(old)) if new > old => true,
-                    _ => reference.score == *score && position < *at,
-                },
-            };
-            if better {
-                best.insert(key, (reference.score, position));
-            }
-        }
+        let best = best_reference_per_id(references);
 
         // Keyed in first-seen order, not `HashMap` order: scores saturate at
         // 1.0 for the first few positions, so an arbitrary iteration order
@@ -889,12 +940,8 @@ impl FerrofinSimilarItemsManager {
             }
         }
 
-        // C# collects into `resolvedByKey`, a presentation-key-keyed map that
-        // keeps the HIGHEST-scoring row per key, and only writes the winners
-        // into the exclude sets once the whole batch is resolved. Claiming as
-        // rows arrive instead would let an arbitrary DB row order decide which
-        // copy of a film represents it.
-        let mut resolved: Vec<(String, Uuid, BaseItemEntity, f32)> = Vec::new();
+        // Every (item, best reference) match, in provider-then-row order.
+        let mut matches: Vec<(Uuid, Option<f32>, usize)> = Vec::new();
         for (provider_key, values) in by_provider {
             let rows = match self
                 .repo
@@ -916,35 +963,61 @@ impl FerrofinSimilarItemsManager {
                 let Some(&(score, position)) = best.get(&key) else {
                     continue;
                 };
-                if claimed.ids.contains(&item_id) {
-                    continue;
-                }
-                let Ok(Some(entity)) = self.items.retrieve_item(item_id).await else {
-                    continue;
-                };
-                if kind_of(&entity) != kind {
-                    continue;
-                }
-                // C# `GetPresentationUniqueKey()` falls back to the item id, so
-                // a keyless row is its own bucket rather than colliding with
-                // every other keyless row.
-                let key = entity
-                    .presentation_unique_key
-                    .as_deref()
-                    .map_or_else(|| item_id.to_string(), presentation_key);
-                if claimed.keys.contains(&key) {
-                    continue;
-                }
-                let score = calculate_score(score, provider_order, position);
-                match resolved.iter_mut().find(|(seen, ..)| *seen == key) {
-                    Some(entry) if entry.3 < score => *entry = (key, item_id, entity, score),
-                    Some(_) => {}
-                    None => resolved.push((key, item_id, entity, score)),
+                if !claimed.ids.contains(&item_id) {
+                    matches.push((item_id, score, position));
                 }
             }
         }
+        let ids: Vec<Uuid> = matches.iter().map(|(id, ..)| *id).collect();
+        let mut rows = match self.visible_rows(ids, kind, user_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    kind = ?kind,
+                    user_id = user_id.map(tracing::field::display),
+                    "loading similar-item references failed"
+                );
+                return Vec::new();
+            }
+        };
+
+        // C# collects into `resolvedByKey`, a presentation-key-keyed map that
+        // keeps the HIGHEST-scoring row per key, and only writes the winners
+        // into the exclude sets once the whole batch is resolved. Claiming as
+        // rows arrive instead would let an arbitrary DB row order decide which
+        // copy of a film represents it. Only rows the user may see take part,
+        // so a hidden copy never claims the key of a visible one. (For a
+        // user, `visible_rows` has already collapsed copies to their group
+        // head, so the choice between copies only arises without one.)
+        let mut resolved: Vec<(String, Uuid, f32)> = Vec::new();
+        for (item_id, score, position) in matches {
+            let Some(entity) = rows.get(&item_id) else {
+                continue;
+            };
+            // C# `GetPresentationUniqueKey()` falls back to the item id, so
+            // a keyless row is its own bucket rather than colliding with
+            // every other keyless row.
+            let key = entity
+                .presentation_unique_key
+                .as_deref()
+                .map_or_else(|| item_id.to_string(), presentation_key);
+            if claimed.keys.contains(&key) {
+                continue;
+            }
+            let score = calculate_score(score, provider_order, position);
+            match resolved.iter_mut().find(|(seen, ..)| *seen == key) {
+                Some(entry) if entry.2 < score => *entry = (key, item_id, score),
+                Some(_) => {}
+                None => resolved.push((key, item_id, score)),
+            }
+        }
         let mut out = Vec::with_capacity(resolved.len());
-        for (key, item_id, entity, score) in resolved {
+        for (key, item_id, score) in resolved {
+            // Each id has exactly one key, so it wins at most one bucket.
+            let Some(entity) = rows.remove(&item_id) else {
+                continue;
+            };
             claimed.ids.insert(item_id);
             claimed.keys.insert(key);
             out.push((entity, score));
@@ -1154,7 +1227,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 continue;
             }
             scored.extend(
-                self.resolve_remote_references(&references, order, kind, &mut claimed)
+                self.resolve_remote_references(&references, order, kind, user_id, &mut claimed)
                     .await,
             );
         }
@@ -2028,6 +2101,105 @@ mod tests {
             .filter_map(|r| r.name.clone())
             .collect();
         assert_eq!(names, ["Aliens UHD"], "the higher-scoring copy must win");
+    }
+
+    #[tokio::test]
+    async fn remote_matches_in_a_library_the_user_cannot_access_are_dropped() {
+        // C# `ResolveRemoteReferences` loads the matches through
+        // `InternalItemsQuery(user)`, so a remote reference never surfaces a
+        // row the user's library access hides — and a hidden copy of a film
+        // must not claim the presentation key of the copy the user can see.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x9ac_001)).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let mine = Uuid::from_u128(0x9ac_0a1);
+        let theirs = Uuid::from_u128(0x9ac_0a2);
+        restrict_to_folders(&db, &user, &[mine]).await;
+        let seed = Uuid::from_u128(0x9ac_002);
+        let visible = Uuid::from_u128(0x9ac_003);
+        let hidden_copy = Uuid::from_u128(0x9ac_004);
+        let hidden = Uuid::from_u128(0x9ac_005);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(mine)).await;
+        seed_movie_keyed(
+            &db,
+            visible,
+            "Aliens HD",
+            "Drama",
+            Some(mine),
+            Some("aliens"),
+        )
+        .await;
+        seed_movie_keyed(
+            &db,
+            hidden_copy,
+            "Aliens UHD",
+            "Drama",
+            Some(theirs),
+            Some("aliens"),
+        )
+        .await;
+        seed_movie_in(&db, hidden, "Solaris", "Drama", Some(theirs)).await;
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        for (id, tmdb) in [
+            (visible, "679-hd"),
+            (hidden_copy, "679-uhd"),
+            (hidden, "348"),
+        ] {
+            persistence
+                .save_provider_id(id, "Tmdb", tmdb)
+                .await
+                .expect("save id");
+        }
+        let reference = |id: &str, score| SimilarItemReference {
+            provider_name: "Tmdb".to_owned(),
+            provider_id: id.to_owned(),
+            score: Some(score),
+        };
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                references: vec![
+                    reference("348", 0.95),
+                    reference("679-hd", 0.2),
+                    reference("679-uhd", 0.9),
+                ],
+                cache: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            Arc::new(FakeFolders {
+                library_id: mine,
+                providers: vec!["TheMovieDb".to_owned()],
+            }),
+        );
+
+        let for_user = mgr
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), Some(10))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&for_user), vec!["Aliens HD".to_owned()]);
+
+        let admin = seed_named_user(&db, Uuid::from_u128(0x9ac_006), "admin").await;
+        grant_all_folders(&db, &admin).await;
+        let for_admin = mgr
+            .get_similar_items(
+                seed,
+                &[],
+                Uuid::parse_str(&admin.id).ok(),
+                &DtoOptions::default(),
+                Some(10),
+            )
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        // A user-scoped query groups by presentation key (C#
+        // `EnableGroupByPresentationUniqueKey`), so the two copies of "Aliens"
+        // arrive as one row — the group head, not the better-scored copy.
+        let names = names(&for_admin);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(names[0], "Solaris");
+        assert!(names[1].starts_with("Aliens "), "{names:?}");
     }
 
     #[tokio::test]
