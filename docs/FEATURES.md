@@ -90,7 +90,8 @@ Deep-verified against a real Jellyfin server:
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from
   configuration. NVENC is verified on real hardware; VAAPI and QSV are verified against
-  the upstream argument shapes but **have not yet been run on an Intel or AMD GPU**.
+  the upstream argument shapes (except QSV's HLS keyframes, forced as IDR frames like
+  NVENC's) but **have not yet been run on an Intel or AMD GPU**.
   **AMF, VideoToolbox, RKMPP and V4L2M2M are not supported** — see the note in
   `CLAUDE.md`; selecting one falls back to a software transcode and logs a warning.
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed

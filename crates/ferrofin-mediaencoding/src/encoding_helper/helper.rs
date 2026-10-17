@@ -1229,6 +1229,113 @@ pub fn video_sync_option(video_sync: &str, ffmpeg_version: Option<FfmpegVersion>
     format!(" -vsync {video_sync}")
 }
 
+/// The GOP-only encoders that can force keyframes after all, once a forced
+/// I-frame is made an IDR frame, and the option that does it.
+const FORCED_IDR_ENCODERS: [(&str, &str); 6] = [
+    ("h264_nvenc", "-forced-idr:v:0"),
+    ("hevc_nvenc", "-forced-idr:v:0"),
+    ("av1_nvenc", "-forced-idr:v:0"),
+    ("h264_qsv", "-forced_idr:v:0"),
+    ("hevc_qsv", "-forced_idr:v:0"),
+    ("av1_qsv", "-forced_idr:v:0"),
+];
+
+/// Upstream's encoders that cannot force a keyframe, so only a pinned GOP
+/// cuts segments. Kept verbatim; [`FORCED_IDR_ENCODERS`] is checked first and
+/// takes its NVENC and QSV entries.
+const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 11] = [
+    "h264_qsv",
+    "h264_nvenc",
+    "h264_amf",
+    "h264_rkmpp",
+    "hevc_qsv",
+    "hevc_nvenc",
+    "hevc_rkmpp",
+    "av1_qsv",
+    "av1_nvenc",
+    "av1_amf",
+    "libsvtav1",
+];
+
+/// Encoders that honour `-force_key_frames` and need no pinned GOP.
+const FORCED_KEYFRAME_ENCODERS: [&str; 5] = [
+    "libx264",
+    "libx265",
+    "h264_vaapi",
+    "hevc_vaapi",
+    "av1_vaapi",
+];
+
+/// The arguments that put a keyframe at every HLS segment boundary, so the
+/// muxer cuts on `-hls_time` and segment N holds the time range the playlist
+/// says it does.
+///
+/// Port of `EncodingHelper.GetHlsVideoKeyFrameArguments`. Some encoders
+/// cannot force a keyframe, so they get a GOP of one segment instead; the
+/// rest get the forced-keyframe expression, and an unknown encoder gets both.
+/// `frame_rate` sizes the GOP in output frames; `None` pins no GOP, as
+/// upstream does without a frame rate. A zero, negative or non-finite rate (a
+/// probed `0/1`) counts as none here, where upstream would emit an all-intra
+/// `-g 0` or an unparseable `NaN`.
+///
+/// Divergence: upstream gives NVENC and QSV the GOP alone, because their
+/// forced I-frames are not IDR frames. Their `forced-idr` (NVENC) or
+/// `forced_idr` (QSV) option makes them so, and a keyframe forced on time
+/// then cuts every segment, where a GOP needs the rate ffmpeg encodes at,
+/// which ffprobe's rates misstate on VFR, doubled-`tbr` and millisecond-grid
+/// sources. NVENC is verified on real hardware; the QSV half rests on
+/// qsvenc's source (`forced_idr` marks a forced frame IDR) and has not yet
+/// been run on an Intel GPU.
+///
+/// The expression is unquoted because the result is split on whitespace into
+/// argv, not handed to a shell. Returns the arguments **with a leading
+/// space**, or the empty string.
+#[must_use]
+pub fn hls_video_key_frame_arguments(
+    caps: &super::hw::capabilities::FfmpegCapabilities,
+    codec: &str,
+    segment_length: i32,
+    frame_rate: Option<f32>,
+) -> String {
+    let key_frame_arg = format!(" -force_key_frames:0 expr:gte(t,n_forced*{segment_length})");
+    // Forcing keyframes is not enough on its own: a scene cut can put a
+    // keyframe mid-segment and push the next forced one past the boundary.
+    let gop_arg = frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .map_or_else(String::new, |rate| {
+            let gop = (f64::from(segment_length) * f64::from(rate)).ceil();
+            format!(" -g:v:0 {gop} -keyint_min:v:0 {gop}")
+        });
+    let is_one_of = |encoders: &[&str]| encoders.iter().any(|e| e.eq_ignore_ascii_case(codec));
+
+    let forced_idr = FORCED_IDR_ENCODERS
+        .iter()
+        .find(|(encoder, _)| encoder.eq_ignore_ascii_case(codec));
+
+    let mut args = if let Some((_, option)) = forced_idr {
+        format!(" {option} 1{key_frame_arg}")
+    } else if is_one_of(&GOP_ONLY_KEYFRAME_ENCODERS) {
+        gop_arg
+    } else if is_one_of(&FORCED_KEYFRAME_ENCODERS) {
+        if codec.eq_ignore_ascii_case("libx264") {
+            // Stops libx264's scene-cut detection from breaking the forced keyframes.
+            key_frame_arg + " -sc_threshold:v:0 0"
+        } else {
+            key_frame_arg
+        }
+    } else {
+        key_frame_arg + &gop_arg
+    };
+
+    // The AMD HEVC VA-API encoder's in-band parameter sets disagree with the
+    // extradata ffmpeg writes, which breaks decoding as `hvc1`; extracting the
+    // extradata from the in-band sets works around it.
+    if codec.eq_ignore_ascii_case("hevc_vaapi") && caps.is_vaapi_device_amd() {
+        args.push_str(" -flags:v -global_header -bsf:v extract_extradata=remove=0");
+    }
+    args
+}
+
 /// The `setparams` filter tagging input frames with their HDR colour metadata,
 /// emitted ahead of a `tonemapx` so untagged streams still tonemap correctly.
 ///
@@ -2877,6 +2984,96 @@ mod tests {
         assert_eq!(video_sync_option("", v(7, 0)), "");
         // Below the gate the number is passed through unexamined.
         assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
+    }
+
+    const FORCED_3S: &str = " -force_key_frames:0 expr:gte(t,n_forced*3)";
+
+    #[rstest]
+    // NVENC and QSV force their keyframes as IDR frames, whatever the rate.
+    #[case(
+        "h264_qsv",
+        Some(23.976),
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "HEVC_QSV",
+        None,
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "av1_qsv",
+        Some(25.0),
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "h264_nvenc",
+        Some(25.0),
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "hevc_nvenc",
+        Some(25.0),
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "av1_nvenc",
+        None,
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    // Unable to force keyframes: the GOP alone, ceil(3 × 23.976) = 72.
+    #[case("libsvtav1", Some(23.976), false, " -g:v:0 72 -keyint_min:v:0 72")]
+    #[case("h264_amf", Some(30.0), false, " -g:v:0 90 -keyint_min:v:0 90")]
+    // No frame rate, no GOP: nothing at all for these encoders.
+    #[case("libsvtav1", None, false, "")]
+    // Nor from a rate that is no rate: never `-g:v:0 0` or `NaN`.
+    #[case("libsvtav1", Some(0.0), false, "")]
+    #[case("libsvtav1", Some(f32::NAN), false, "")]
+    #[case("mpeg4", Some(f32::INFINITY), false, FORCED_3S)]
+    // Forced keyframes, and libx264 also loses its scene-cut detection.
+    #[case(
+        "libx264",
+        Some(25.0),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -sc_threshold:v:0 0"
+    )]
+    #[case("libx265", Some(25.0), false, FORCED_3S)]
+    #[case("h264_vaapi", Some(25.0), true, FORCED_3S)]
+    #[case("hevc_vaapi", Some(25.0), false, FORCED_3S)]
+    // The AMD HEVC VA-API parameter-set workaround.
+    #[case(
+        "hevc_vaapi",
+        Some(25.0),
+        true,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -flags:v -global_header -bsf:v extract_extradata=remove=0"
+    )]
+    // Any other encoder gets both.
+    #[case(
+        "mpeg4",
+        Some(25.0),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -g:v:0 75 -keyint_min:v:0 75"
+    )]
+    #[case("mpeg4", None, false, FORCED_3S)]
+    fn hls_keyframe_arguments_follow_the_encoder(
+        #[case] codec: &str,
+        #[case] frame_rate: Option<f32>,
+        #[case] amd: bool,
+        #[case] expected: &str,
+    ) {
+        // Not AMD means an Intel iHD device, the other common VA-API driver.
+        let caps = super::super::hw::capabilities::FfmpegCapabilities::builder()
+            .vaapi_driver(amd, !amd, false)
+            .build();
+        assert_eq!(
+            hls_video_key_frame_arguments(&caps, codec, 3, frame_rate),
+            expected
+        );
     }
 
     fn codecs(list: &str) -> Vec<String> {
