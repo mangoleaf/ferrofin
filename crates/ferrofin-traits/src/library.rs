@@ -2085,6 +2085,15 @@ fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 /// is independent of the DB-backed item tree, so a concrete impl only needs the
 /// root user-views path and is fully testable over a temp directory.
 ///
+/// Every caller-supplied library name must denote one directory directly under
+/// that root, as upstream's `FileSystemHelper.GetChildPath` enforces: a blank
+/// name, `.`/`..`, an absolute path or anything with a separator never reaches
+/// the filesystem. A blank name to remove or rename is a
+/// [`ServiceError::InvalidInput`], as is a rename's new name that is not such a
+/// folder (checked before the current name); any other such name is a
+/// [`ServiceError::NotFound`] for the library being looked up. Adding a library
+/// named `.` or `..` de-duplicates it to `.2`/`..2`, as upstream does.
+///
 /// The `refresh_library` flag and the C# `ILibraryMonitor` stop/start dance are
 /// dropped: the scan pipeline and filesystem watcher are later-wave subsystems,
 /// so mutations take effect on disk immediately and the caller-requested refresh

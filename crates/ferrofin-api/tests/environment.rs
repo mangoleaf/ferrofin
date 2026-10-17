@@ -15,11 +15,11 @@ use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeDevices,
-    FakeDisplayPreferences, FakeDto, FakeLibrary, FakeLyrics, FakeMediaSegments, FakeMediaSources,
-    FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData,
-    FakeUserViews, FakeUsers,
+    ApiKeyAuthService, AuthedAuthService, FakeApiKeys, FakeAppHost, FakeClientEventLogger,
+    FakeCollections, FakeDevices, FakeDisplayPreferences, FakeDto, FakeLibrary, FakeLyrics,
+    FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect,
+    FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles, FakeTasks, FakeTrickplay,
+    FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers, setup_complete_state,
 };
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::activity::{ActivityLogEntry, LogLevel};
@@ -465,4 +465,40 @@ async fn environment_drives_parent_and_default_browser() {
     let (ns, nsb) = get(full_state(), "/Environment/NetworkShares").await;
     assert_eq!(ns, StatusCode::OK);
     assert!(json(&nsb).as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn environment_routes_require_an_administrator_once_setup_is_complete() {
+    // Upstream gates the whole controller `FirstTimeSetupOrElevated`
+    // (EnvironmentController.cs:20): after the wizard, browsing and probing the
+    // server's filesystem is for administrators only.
+    let routes = [
+        ("GET", "/Environment/DirectoryContents?path=/", ""),
+        ("POST", "/Environment/ValidatePath", r#"{"Path":"/"}"#),
+        ("GET", "/Environment/Drives", ""),
+        ("GET", "/Environment/NetworkShares", ""),
+        ("GET", "/Environment/ParentPath?path=/a/b", ""),
+        ("GET", "/Environment/DefaultDirectoryBrowser", ""),
+    ];
+    for (method, uri, body) in routes {
+        let state = setup_complete_state(Arc::new(AuthedAuthService));
+        let (status, _) = send(
+            state,
+            method,
+            uri,
+            Body::from(body),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+
+    // An administrator still gets through (an API key is elevated upstream).
+    let (status, body) = get(
+        setup_complete_state(Arc::new(ApiKeyAuthService)),
+        "/Environment/NetworkShares",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json(&body).as_array().unwrap().is_empty());
 }
