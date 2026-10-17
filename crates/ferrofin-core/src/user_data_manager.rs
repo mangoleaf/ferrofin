@@ -587,14 +587,6 @@ impl FerrofinUserDataManager {
     /// API survives it there; here the user's unmark clears it. A played mark
     /// clears nothing: the row then agrees with it. Favourite and rating are
     /// kept, and a row with no play state is not written.
-    ///
-    /// TODO: the SQL `IsPlayed` filter and sort (`translate_query`'s
-    /// `push_is_played`) still read a folder's own row. A container marked
-    /// played from now on (its row unwritten) therefore never matches
-    /// `IsPlayed = true`, and one an earlier build marked and never unmarked
-    /// still matches it. Un-defer path: port the folder arm of v12
-    /// `BuildIsPlayedFilter` (a roll-up over the folder's countable
-    /// descendants that ignores its row) for the filter and the sort keys.
     async fn clear_own_play_state(&self, user_id: Uuid, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(
             r#"UPDATE "UserData"
