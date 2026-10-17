@@ -55,7 +55,6 @@ use ferrofin_traits::media_encoding::{
     HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths as _;
-use uuid::Uuid;
 
 /// The default HLS segment length, in seconds.
 ///
@@ -245,50 +244,20 @@ impl FerrofinStreamStatePlanner {
         self.config.get_encoding_options().await.unwrap_or_default()
     }
 
-    /// Resolves the [`MediaSourceInfo`] for `request`.
-    ///
-    /// Port of the media-source resolution in `StreamingHelpers.GetStreamingState`:
-    /// an open live stream (`live_stream_id`) wins outright and is returned as
-    /// its own source; otherwise fetch the item's static media sources and
-    /// select the one matching the request's `media_source_id` (defaulting to
-    /// the first when unspecified).
+    /// Resolves the [`MediaSourceInfo`] for `request` through
+    /// [`MediaSourceManager::get_stream_media_source`], the selection the
+    /// direct-play routes share.
     async fn resolve_media_source(
         &self,
         request: &HlsStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        // `StreamingHelpers.GetStreamingState`: an open live stream wins over
-        // everything — its source is the buffered copy of the tuner, and going
-        // back to the static sources here would dial the tuner a second time.
-        if let Some(live_stream_id) = request
-            .live_stream_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            return self.media_sources.get_live_stream(live_stream_id).await;
-        }
-
-        let sources = self
-            .media_sources
-            .get_static_media_sources(request.item_id, false, None)
-            .await?;
-
-        // Match the requested id, else when the "media source id" is really the
-        // item id, the first source.
-        let chosen = match request.media_source_id.as_deref() {
-            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
-                Some(i) => sources.into_iter().nth(i),
-                None if Uuid::parse_str(id).is_ok_and(|g| g == request.item_id) => {
-                    sources.into_iter().next()
-                }
-                None => None,
-            },
-            None => sources.into_iter().next(),
-        };
-
-        chosen.ok_or_else(|| {
-            ServiceError::NotFound(format!("no media source for item {}", request.item_id))
-        })
+        self.media_sources
+            .get_stream_media_source(
+                request.item_id,
+                request.media_source_id.as_deref(),
+                request.live_stream_id.as_deref(),
+            )
+            .await
     }
 }
 
