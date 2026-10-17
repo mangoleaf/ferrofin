@@ -40,11 +40,13 @@ pub struct M3uChannel {
 ///
 /// Lines that are not `#EXTINF`/URL pairs (including `#EXTM3U`, blank lines and
 /// unknown `#`-directives) are skipped, matching Jellyfin's lenient parsing. An
-/// `#EXTINF` with no following URL line is dropped.
+/// `#EXTINF` with no following URL line is dropped, and so is an entry whose
+/// URL line fails [`is_valid_channel_url`].
 #[must_use]
 pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
     let mut channels = Vec::new();
     let mut pending: Option<M3uChannel> = None;
+    let mut skipped = 0usize;
 
     for raw in content.lines() {
         let line = raw.trim();
@@ -56,13 +58,55 @@ pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
         } else if line.starts_with('#') {
             // #EXTM3U / #EXTVLCOPT / #EXTGRP / other directives — ignored.
         } else if let Some(mut channel) = pending.take() {
+            // `M3uParser.GetChannelsAsync` drops the entry and clears the
+            // pending `#EXTINF` (`take` already did). Upstream warns per entry;
+            // that volume scales with the playlist, so one count is warned below.
+            if !is_valid_channel_url(line) {
+                tracing::debug!(
+                    path = line,
+                    "live tv: skipping M3U channel entry with an invalid stream URL"
+                );
+                skipped += 1;
+                continue;
+            }
             line.clone_into(&mut channel.url);
             channels.push(channel);
         }
         // A bare URL with no preceding #EXTINF is ignored (no metadata).
     }
 
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "live tv: skipped M3U channel entries with invalid stream URLs"
+        );
+    }
     channels
+}
+
+/// Whether an M3U entry's URL line is one a channel may play from.
+///
+/// Port of `M3uParser.IsValidChannelUrl` (upstream fix for
+/// GHSA-8fw7-f233-ffr8): an absolute `http`, `https`, `rtsp`, `rtp` or `udp`
+/// URL, scheme compared case-insensitively. Anything else (a local path,
+/// `file://`, a relative path) would be read as a file and served by the
+/// anonymous stream routes.
+///
+/// Two checks are stricter than .NET's `Uri.TryCreate`, and neither drops a
+/// real stream URL. The line must start with `scheme://`, so
+/// [`path_protocol`](crate::stream::path_protocol) never reads an accepted line
+/// as a file path. It must also hold no `"`, `\` or control character (never
+/// valid unescaped in a URL), because the raw line reaches ffmpeg inside a
+/// quoted argument.
+#[must_use]
+pub fn is_valid_channel_url(url: &str) -> bool {
+    url.split_once("://").is_some_and(|(scheme, _)| {
+        ["http", "https", "rtsp", "rtp", "udp"]
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    }) && !url.contains(['"', '\\'])
+        && !url.contains(|c: char| c.is_control())
+        && reqwest::Url::parse(url).is_ok()
 }
 
 /// Parses the portion of an `#EXTINF:` line after the `#EXTINF:` prefix: the
@@ -199,6 +243,40 @@ mod tests {
     #[test]
     fn skips_extinf_without_url_and_bare_urls() {
         let m3u = "#EXTINF:-1,Dangling\n#EXTINF:-1,Real\nhttp://tuner/real\nhttp://tuner/orphan\n";
+        let channels = parse_m3u(m3u);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "Real");
+        assert_eq!(channels[0].url, "http://tuner/real");
+    }
+
+    #[rstest::rstest]
+    #[case("http://tuner/bbc1.ts", true)]
+    #[case("HTTPS://tuner/bbc1.ts", true)]
+    #[case("rtsp://10.0.0.5:554/ch1", true)]
+    #[case("RTP://@239.0.0.1:5000", true)]
+    #[case("udp://@239.0.0.1:1234", true)]
+    #[case("/var/lib/ferrofin/jellyfin.db", false)]
+    #[case("file:///etc/passwd", false)]
+    #[case("data/jellyfin.db", false)]
+    #[case(r"C:\ProgramData\jellyfin.db", false)]
+    #[case("concat:/etc/passwd|/etc/hosts", false)]
+    #[case("http:/etc/passwd", false)]
+    #[case("rtmp://server/live", false)]
+    #[case("ftp://server/ch1.ts", false)]
+    #[case("http://", false)]
+    #[case("http://tuner/a\" -i \"/etc/passwd", false)]
+    #[case(r"http://tuner/a\b", false)]
+    #[case("http://tuner/a\tb", false)]
+    fn only_absolute_stream_urls_are_channel_urls(#[case] url: &str, #[case] valid: bool) {
+        assert_eq!(is_valid_channel_url(url), valid, "{url}");
+    }
+
+    #[test]
+    fn drops_entries_whose_url_is_not_a_stream_url() {
+        // The rejected line also clears the pending #EXTINF, so the next bare
+        // line does not inherit its metadata.
+        let m3u = "#EXTINF:-1,Leak\n/var/lib/ferrofin/jellyfin.db\nhttp://tuner/orphan\n\
+            #EXTINF:-1,Real\nhttp://tuner/real\n";
         let channels = parse_m3u(m3u);
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].name, "Real");
