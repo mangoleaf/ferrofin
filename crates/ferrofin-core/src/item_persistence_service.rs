@@ -1199,6 +1199,14 @@ impl FerrofinItemPersistenceService {
     /// ([`crate::item_data::date_modified_follows_save`]: a directory's,
     /// which clears a stored one (D2), or a path-less item's); `scan` says
     /// which statement `sql` is.
+    ///
+    /// A playlist's save also rewrites the `OwnerUserId` / `OpenAccess` /
+    /// `Shares` keys of its `Data` from the permission tables when those hold
+    /// its permissions, in the same writer transaction
+    /// ([`crate::item_data::sync_saved_playlist_in`]): the
+    /// row the caller saves was read earlier, and its copy of those keys must
+    /// not undo a share change committed since, which the next boot's
+    /// re-import from `Data` would make real.
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
@@ -1218,7 +1226,18 @@ impl FerrofinItemPersistenceService {
         if scan {
             query = query.bind(crate::item_data::date_modified_follows_save(item));
         }
-        query.execute(self.db.writer()).await.map_err(db_err)?;
+        let playlist = Uuid::parse_str(&item.id).ok().filter(|_| {
+            crate::item_type_lookup::kind_from_type_name(&item.type_)
+                == Some(BaseItemKind::Playlist)
+        });
+        if let Some(playlist) = playlist {
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            query.execute(&mut *tx).await.map_err(db_err)?;
+            crate::item_data::sync_saved_playlist_in(&mut tx, playlist).await?;
+            tx.commit().await.map_err(db_err)?;
+        } else {
+            query.execute(self.db.writer()).await.map_err(db_err)?;
+        }
         if scan {
             self.push_name_to_children(item).await?;
         }

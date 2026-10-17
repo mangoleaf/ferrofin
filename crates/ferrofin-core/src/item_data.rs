@@ -20,8 +20,10 @@
 //!
 //! Ferrofin's query paths keep using the `FerrofinPlaylists` /
 //! `FerrofinPlaylistShares` tables as a **derived cache**; every ownership or
-//! share mutation writes through to `Data` via [`sync_container_data`], and
-//! [`reconcile_playlist_permissions`] rebuilds the cache from `Data` at startup.
+//! share mutation writes through to `Data` via [`sync_container_data`], a
+//! whole-row save of a playlist the cache holds rewrites those keys from it in
+//! the save's transaction, and [`reconcile_playlist_permissions`] rebuilds the
+//! cache from `Data` at startup.
 //!
 //! Writes are **read-modify-write** over the raw JSON object: keys Ferrofin does
 //! not model (`DisplayOrder`, `DateLastSaved`, `IsHD`, …) are preserved
@@ -617,6 +619,58 @@ pub(crate) async fn sync_container_data_in(
         .await
         .map_err(db_err)?;
     Ok(())
+}
+
+/// [`sync_container_data_in`] after a whole-row save of `playlist`, when the
+/// permission tables hold its permissions (it has a `FerrofinPlaylists` row):
+/// the saved row was read earlier, and its copy of the keys must not undo a
+/// share change committed since. Without that row the playlist has no share
+/// rows either (a share change imports it first,
+/// [`import_playlist_meta_if_missing_in`]), and `Data` is the only record of
+/// its permissions (visibility reads them there), so it keeps what the save
+/// wrote.
+pub(crate) async fn sync_saved_playlist_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+) -> Result<(), ServiceError> {
+    let cached: Option<i64> =
+        sqlx::query_scalar(r#"SELECT 1 FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    if cached.is_none() {
+        return Ok(());
+    }
+    sync_container_data_in(conn, playlist).await
+}
+
+/// Imports a playlist's owner / open-access / shares from its `Data` keys
+/// when it has no `FerrofinPlaylists` row yet, as the next boot's
+/// [`reconcile_playlist_permissions`] would: call before a share change, so
+/// the change lands in tables that hold all of the playlist's permissions,
+/// which a later whole-row save re-derives `Data` from
+/// ([`sync_saved_playlist_in`]). A playlist with that row, or no playlist, is
+/// a no-op.
+pub(crate) async fn import_playlist_meta_if_missing_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+) -> Result<(), ServiceError> {
+    let [playlist_type, _] = container_type_names();
+    let container_db = guid_to_db(playlist);
+    let pending: Option<Option<String>> = sqlx::query_scalar(
+        r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1 AND "Type" = ?2
+           AND NOT EXISTS (SELECT 1 FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1)"#,
+    )
+    .bind(&container_db)
+    .bind(playlist_type)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let Some(data) = pending else {
+        return Ok(());
+    };
+    import_playlist_meta(conn, &container_db, &parse_data(data.as_deref())).await
 }
 
 /// Folds a playlist's owner / open-access / shares cache rows into its parsed

@@ -1068,6 +1068,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // Upsert the share row (POST is idempotent — re-sharing updates CanEdit),
         // committed with its `Data` sync: each boot rebuilds the shares from `Data`.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         sqlx::query(
             r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
                ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
@@ -1089,6 +1090,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        item_data::import_playlist_meta_if_missing_in(&mut tx, playlist_id).await?;
         sqlx::query(
             r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
         )
@@ -2783,6 +2785,96 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.official_rating.as_deref(), Some("PG"));
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .expect("shares")
+                .is_empty(),
+            "the revoked share stays revoked after a restart"
+        );
+    }
+
+    /// A whole-row save (the metadata editor's `POST /Items/{id}`) built from a
+    /// row read before a share revoke keeps the revoke in `Data`, so the boot
+    /// re-import of the shares from `Data` does not bring it back.
+    #[tokio::test]
+    async fn a_whole_row_save_keeps_a_share_change_made_since_its_read() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let bob = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                users: vec![PlaylistUserPermissions::new(bob, true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        // The editor's read, then a revoke that lands before its save.
+        let mut read = crate::test_support::fetch_item(&db, playlist_id).await;
+        mgr.remove_user_from_shares(playlist_id, bob, &PlaylistUserPermissions::new(bob, true))
+            .await
+            .expect("revoke");
+        read.overview = Some("Edited".to_owned());
+        mgr.library_manager
+            .update_items(std::slice::from_ref(&read), None)
+            .await
+            .expect("save");
+
+        let stored = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(stored.overview.as_deref(), Some("Edited"));
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .expect("shares")
+                .is_empty(),
+            "the revoked share stays revoked after a restart"
+        );
+    }
+
+    /// The same for a playlist no boot has imported yet (no
+    /// `FerrofinPlaylists` row) that loses its last share: its first share
+    /// change imports it, so its shares are the tables' too.
+    #[tokio::test]
+    async fn a_whole_row_save_keeps_a_share_change_without_an_owner_row() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+        use ferrofin_model::playlists::PlaylistUserUpdateRequest;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let (playlist_id, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, playlist_id, BaseItemKind::Playlist).await;
+        mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
+            id: playlist_id,
+            user_id: bob,
+            can_edit: Some(false),
+        })
+        .await
+        .expect("share");
+        let mut read = crate::test_support::fetch_item(&db, playlist_id).await;
+        mgr.remove_user_from_shares(playlist_id, bob, &PlaylistUserPermissions::new(bob, false))
+            .await
+            .expect("revoke");
+        read.overview = Some("Edited".to_owned());
+        mgr.library_manager
+            .update_items(std::slice::from_ref(&read), None)
+            .await
+            .expect("save");
+
+        let stored = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(stored.overview.as_deref(), Some("Edited"));
         crate::item_data::reconcile_playlist_permissions(&db)
             .await
             .expect("boot re-import");
