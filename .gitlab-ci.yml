@@ -31,6 +31,19 @@
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
 stages: [test, tag, build, release, chart]
 
+# A new push to a merge request replaces its still-running test jobs: the test-stage
+# jobs and their .pre helpers set `interruptible: true` on their merge-request rule
+# only, and `on_new_commit: interruptible` cancels exactly the interruptible jobs.
+# (The default, `conservative`, would cancel nothing once any non-interruptible job
+# had started, and a merge request that edits .gitlab-ci.yml or ci/*Dockerfile starts
+# ci-image, web-image and runtime-image.) Those image jobs, docker-image and the
+# release and chart jobs stay non-interruptible on purpose, so a new commit never
+# kills an image build mid-upload. main and tag pipelines never set it, so a newer
+# commit can never cancel them.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
 # Pinned jellyfin-web version — single source of truth. web-image builds
 # ci:web-$JELLYFIN_WEB_VERSION; the service image pulls it via WEB_IMAGE.
 variables:
@@ -256,6 +269,7 @@ sccache-creds:
     SCCACHE_VAULT_PATH: "secret/data/gitlab/sccache"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
   script:
@@ -335,6 +349,7 @@ lint:
     - cargo test --workspace --doc   # nextest can't run doctests
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
@@ -352,6 +367,7 @@ shell-tests:
     - bats scripts/tests adoption/tests
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # Per-crate 80% line-coverage gate. Gate EACH crate independently: a merged
@@ -385,6 +401,7 @@ coverage:
       exit $fail
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # ---------------------------------------------------------------------------
@@ -420,6 +437,7 @@ image-version:
     # A release/* MR is always build-worthy: its diff against main may be only
     # docs and CI, but the branch carries all of main's code. No `changes:`.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^release\//'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - crates/**/*
@@ -428,6 +446,7 @@ image-version:
         - Cargo.lock
         - Dockerfile
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
       changes:
         - crates/**/*
         - apps/**/*

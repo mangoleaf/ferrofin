@@ -7,6 +7,14 @@ on:
 
 permissions: {} # each job grants only what it needs
 
+# A new push to a PR replaces its still-running CI. A push run (main) gets a group
+# of its own, so it is never cancelled, nor dropped while queued behind another
+# (GitHub replaces a pending run in a shared group even without cancel-in-progress):
+# two quick merges must each report their own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
