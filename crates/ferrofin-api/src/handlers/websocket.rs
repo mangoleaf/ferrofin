@@ -147,11 +147,14 @@ async fn websocket_upgrade(
 }
 
 /// The resolved identity of an authenticated socket: its session id (the bus
-/// sink key) and the signed-in user (who the subscription streams answer for).
+/// sink key), the signed-in user (who the subscription streams answer for), and
+/// whether that caller is an administrator. The role is read once, at connect,
+/// as upstream reads the connection's `AuthorizationInfo` captured at upgrade.
 #[derive(Clone)]
 struct SocketCaller {
     session_id: String,
     user_id: uuid::Uuid,
+    is_admin: bool,
 }
 
 /// Why an authenticated socket carries no session — kept distinct so the logs
@@ -216,10 +219,38 @@ async fn resolve_caller(
             SessionlessReason::TokenUnresolved
         })?;
     let session_id = session.id.ok_or(SessionlessReason::SessionWithoutId)?;
+    // A failed policy lookup leaves the caller without the role: fail closed.
+    let is_admin = crate::auth::is_administrator_identity(state, info)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "websocket caller's role did not resolve");
+            false
+        });
     Ok(SocketCaller {
         session_id,
         user_id: session.user_id,
+        is_admin,
     })
+}
+
+/// Whether `caller` may start the subscription `inbound` asks for.
+///
+/// Port of `ActivityLogWebSocketListener.Start`, which throws
+/// `AuthenticationException("Only admin users can retrieve the activity log.")`
+/// unless the caller is an API key or an administrator, the same role
+/// `GET /System/ActivityLog/Entries` demands. Upstream's connection logs the
+/// throw as a warning and stays open with the stream unarmed, as here. The
+/// other streams need only a session (`SessionInfoWebSocketListener` scopes
+/// what it sends; `ScheduledTasksWebSocketListener` has no check).
+fn may_subscribe(caller: &SocketCaller, inbound: Inbound) -> bool {
+    if matches!(inbound, Inbound::ActivityStart(_)) && !caller.is_admin {
+        tracing::warn!(
+            user_id = %caller.user_id,
+            "only admin users can retrieve the activity log"
+        );
+        return false;
+    }
+    true
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -511,7 +542,8 @@ async fn handle_socket(
 
     // The dashboard's periodic streams, armed by *Start subscription messages
     // (each is `None` until subscribed). Only a socket with a session may
-    // subscribe — the streams answer as the socket's user.
+    // subscribe — the streams answer as the socket's user — and the activity
+    // stream is an administrator's alone (`may_subscribe`).
     let mut streams = Streams::default();
     let mut task_updates = None;
 
@@ -538,7 +570,7 @@ async fn handle_socket(
                     }
                     Action::Inbound(inbound) => {
                         log_task_subscription(inbound, caller.is_some());
-                        if caller.is_some() {
+                        if caller.as_ref().is_some_and(|c| may_subscribe(c, inbound)) {
                             let message = update_task_subscription(&state, inbound, &mut task_updates).await;
                             if !send_optional(&mut socket, message, &overflowed).await {
                                 break;
@@ -973,8 +1005,9 @@ fn force_keep_alive_message() -> String {
 mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
-        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, action_for, force_keep_alive_message,
-        keep_alive_ack, keep_alive_action, parse_inbound, push_sink, visible_tasks,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, action_for,
+        force_keep_alive_message, keep_alive_ack, keep_alive_action, may_subscribe, parse_inbound,
+        push_sink, visible_tasks,
     };
     use axum::extract::ws::Message;
     use tokio::sync::mpsc;
@@ -1069,6 +1102,33 @@ mod tests {
                 .is_err(),
             "a closed socket is not an overflow",
         );
+    }
+
+    /// Only the activity stream is an administrator's (`ActivityLogWebSocketListener`
+    /// is the one listener whose `Start` demands a role); the gate must not reach wider.
+    #[test]
+    fn only_the_activity_stream_needs_an_administrator() {
+        let caller = |is_admin| SocketCaller {
+            session_id: "s".to_owned(),
+            user_id: uuid::Uuid::nil(),
+            is_admin,
+        };
+        let period = std::time::Duration::from_secs(1);
+        assert!(!may_subscribe(
+            &caller(false),
+            Inbound::ActivityStart(period)
+        ));
+        for inbound in [
+            Inbound::ActivityStart(period),
+            Inbound::ActivityStop,
+            Inbound::SessionsStart(period),
+            Inbound::TasksStart(period),
+        ] {
+            assert!(may_subscribe(&caller(true), inbound), "{inbound:?}");
+            if inbound != Inbound::ActivityStart(period) {
+                assert!(may_subscribe(&caller(false), inbound), "{inbound:?}");
+            }
+        }
     }
 
     #[test]

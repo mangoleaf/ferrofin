@@ -22,6 +22,7 @@ webp.workspace = true
 jpeg-encoder.workspace = true
 blurhash.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 

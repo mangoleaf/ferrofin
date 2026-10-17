@@ -11,8 +11,10 @@ These tiers were last derived from the v2 parity ledger, retired with the v2 sui
 `crates/ferrofin-api/tests/contract_superset.rs`, where **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
 equivalence** — the Jellyfin release each row was compared against is `UPSTREAM_TAG` /
-`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs`. That record is early:
-**7 of 412 operations** carry a row today, so the tiers below remain the honest picture and
+`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs` (the latest Jellyfin release,
+`v12.2`), except rows listed in `VERIFIED_AGAINST_EARLIER_PIN`. That record is early:
+**7 of 412 operations** carry a row today, all 7 compared against the earlier pin `v12.0-rc7`
+and owed a re-check against `v12.2`, so the tiers below remain the honest picture and
 the `VERIFIED` count is the one that will replace them as it fills in.
 
 Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin

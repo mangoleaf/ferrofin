@@ -397,6 +397,21 @@ fn extension_of(path: &str) -> String {
     }
 }
 
+/// Whether an encode failure is logged at `debug` rather than `warn`.
+///
+/// `InvalidInput` is the requested size or the file's content as the encoder
+/// sees it: a size that rounds an axis to 0, a source the decoder rejects
+/// (corrupt, truncated, a read error mid-decode, over the `image` crate's
+/// allocation limit), or a JPEG output past 65535 px. A failed encode writes no
+/// cache file, so it recurs on every request for that image and its volume
+/// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
+/// Everything else (cache-dir I/O, an unreadable or removed source, codec or
+/// encoder faults) is a degradation an operator can act on: `warn`, as a
+/// fallback was taken.
+fn encode_failure_logs_at_debug(err: &ServiceError) -> bool {
+    matches!(err, ServiceError::InvalidInput(_))
+}
+
 #[async_trait]
 impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
     /// Port of `SupportedInputFormats` — the 25-entry set.
@@ -598,12 +613,31 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
             Ok(Some(processed)) => Ok(processed),
             // `resultPath == originalPath` short-circuit (`Ok(None)`) and the C#
             // catch-all that returns the original on any encode error (`Err`)
-            // both fall through to the same original-file passthrough.
-            Ok(None) | Err(_) => Ok(ProcessedImage {
-                path: original_image_path.clone(),
-                mime_type: Some(get_mime_type(&original_image_path).to_owned()),
-                date_modified,
-            }),
+            // both fall through to the same original-file passthrough. Upstream
+            // logs the catch at Error; see `encode_failure_logs_at_debug` for
+            // why the level depends on the failure here.
+            result => {
+                if let Err(e) = result {
+                    if encode_failure_logs_at_debug(&e) {
+                        tracing::debug!(
+                            error = %e,
+                            path = %original_image_path,
+                            "image encode rejected; serving the original"
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            path = %original_image_path,
+                            "error encoding image; serving the original"
+                        );
+                    }
+                }
+                Ok(ProcessedImage {
+                    path: original_image_path.clone(),
+                    mime_type: Some(get_mime_type(&original_image_path).to_owned()),
+                    date_modified,
+                })
+            }
         }
     }
 
@@ -686,6 +720,7 @@ mod tests {
     //! option and carries `v=3`; default options pass the original through; a
     //! resize produces then hits the cache.
     use super::*;
+    use crate::error::DrawingError;
     use crate::image_encoder::ImageCrateEncoder;
     use chrono::TimeZone;
     use image::{DynamicImage, Rgba, RgbaImage};
@@ -1014,6 +1049,49 @@ mod tests {
         assert_eq!(processed.path, input);
         // No encode happened.
         assert_eq!(encoder.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::bad_size_or_source(ServiceError::invalid_input("cannot resize to 0x1"), true)]
+    #[case::cache_write(DrawingError::io("mkdir", std::io::Error::other("full")).into(), false)]
+    #[case::encoder_backend(ServiceError::backend("encoder panicked"), false)]
+    #[case::vanished_source(ServiceError::not_found("image file not found: /x.png"), false)]
+    fn encode_failure_level_policy(#[case] err: ServiceError, #[case] at_debug: bool) {
+        assert_eq!(encode_failure_logs_at_debug(&err), at_debug);
+    }
+
+    #[tokio::test]
+    async fn cache_write_failure_serves_original() {
+        // The warn arm: a file where the resized-images directory belongs makes
+        // the encoder's mkdir fail (ENOTDIR, even as root), and the C#
+        // catch-all serves the original.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        std::fs::write(cache.path().join("resized-images"), b"").expect("blocker");
+        let input = fixture(&dir, "orig.png", 60, 40);
+        let proc = processor_with(
+            Arc::new(ImageCrateEncoder::new()),
+            &cache,
+            FakeFs::with(&[&input]),
+        );
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 60,
+                height: 40,
+                ..Default::default()
+            },
+            max_width: Some(30),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
+
+        // The blocker was the only cause: without it the same request encodes.
+        std::fs::remove_file(cache.path().join("resized-images")).expect("unblock");
+        let processed = proc.process_image(&options).await.expect("process");
+        assert!(processed.path.contains("resized-images"));
     }
 
     #[tokio::test]

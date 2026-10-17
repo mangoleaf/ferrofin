@@ -21,7 +21,7 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
 
 ## `jellyfin-openapi-12.1.0.json`
 
-- **What:** the spec of the latest Jellyfin, **12.1.0** (OpenAPI 3.0.4, 294 paths,
+- **What:** the spec of Jellyfin **12.1.0**, the latest release when captured (OpenAPI 3.0.4, 294 paths,
   364 operations), as published at
   `https://api.jellyfin.org/openapi/jellyfin-openapi-stable.json` (Jellyfin's own
   generated spec for the stable release; `info.version` is `12.1.0`).
@@ -42,11 +42,12 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
 ## Why 10.11.8 and not 12.0
 
 Two different pins, both deliberate. The **contract** is 10.11.8 because that is the API
-the clients speak; 12.0-rc7's surface is smaller (364 operations — it drops the
+the clients speak; Jellyfin 12's surface is smaller (364 operations in 12.0-rc7 and 12.1.0 — it drops the
 `DynamicHls` family, `/MusicGenres`, `/CriticReviews` and more), so implementing it
-instead would break clients. The **C# that behaviour is ported from** is `v12.0-rc7`
-(`UPSTREAM_TAG` in `crates/ferrofin-api/src/handlers/mod.rs`) because it is the fixed,
-corrected version of 10.11's logic. Where the two disagree on shape, the contract wins.
+instead would break clients. The **C# that behaviour is ported from** is `v12.2`
+(`UPSTREAM_TAG` in `crates/ferrofin-api/src/handlers/mod.rs`) because Jellyfin 12 is the
+fixed, corrected version of 10.11's logic, and that pin always follows the latest Jellyfin
+release. Where the two disagree on shape, the contract wins.
 
 ## Re-pinning
 
