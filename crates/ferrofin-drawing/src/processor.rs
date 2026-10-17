@@ -1017,6 +1017,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_axis_resize_serves_original() {
+        // The encoder fails on a size that rounds one axis to 0 (Skia's empty
+        // surface), and the C# catch-all serves the original.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let input = fixture(&dir, "orig.png", 60, 40);
+        let proc = processor_with(
+            Arc::new(ImageCrateEncoder::new()),
+            &cache,
+            FakeFs::with(&[&input]),
+        );
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 60,
+                height: 40,
+                ..Default::default()
+            },
+            width: Some(1),
+            height: Some(i32::MAX),
+            max_height: Some(1_000_000_000),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
+    }
+
+    #[tokio::test]
     async fn gif_passthrough_returns_original() {
         let cache = TempDir::new().expect("cache");
         let encoder = Arc::new(CountingEncoder {

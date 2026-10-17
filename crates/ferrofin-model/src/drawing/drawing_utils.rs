@@ -88,6 +88,31 @@ pub fn resize_fill(
     ImageDimensions::new(new_width, new_height)
 }
 
+/// Scales `size` down uniformly until it fits inside `bounding_box`, returning
+/// `size` unchanged if it already fits, so this never upscales.
+///
+/// Mirrors `DrawingUtils.ScaleDownToFit`.
+#[must_use]
+pub fn scale_down_to_fit(size: ImageDimensions, bounding_box: ImageDimensions) -> ImageDimensions {
+    if size.width <= 0 || size.height <= 0 || bounding_box.width <= 0 || bounding_box.height <= 0 {
+        return size;
+    }
+
+    let width_ratio = f64::from(size.width) / f64::from(bounding_box.width);
+    let height_ratio = f64::from(size.height) / f64::from(bounding_box.height);
+    let scale_ratio = width_ratio.max(height_ratio);
+
+    if scale_ratio <= 1.0 {
+        return size;
+    }
+
+    // C# `Math.Round` defaults to round-half-to-even, like `round_to_i32`.
+    ImageDimensions::new(
+        round_to_i32(f64::from(size.width) / scale_ratio).clamp(1, bounding_box.width),
+        round_to_i32(f64::from(size.height) / scale_ratio).clamp(1, bounding_box.height),
+    )
+}
+
 /// Gets the new width when scaling to a target height.
 fn get_new_width(current_height: i32, current_width: i32, new_height: i32) -> i32 {
     round_to_i32(f64::from(new_height) / f64::from(current_height) * f64::from(current_width))
@@ -122,6 +147,7 @@ fn round_to_i32(value: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn resize_fixed_width_and_height() {
@@ -164,6 +190,38 @@ mod tests {
     fn resize_fill_clamps_when_smaller_than_fill() {
         let size = ImageDimensions::new(100, 100);
         assert_eq!(size, resize_fill(size, Some(200), Some(200)));
+    }
+
+    /// Transliterated from upstream `DrawingUtilsTests.ScaleDownToFit_Bounds_WithoutUpscaling`.
+    #[rstest]
+    // Already inside the box, returned untouched.
+    #[case(600, 336, 1920, 1080, 600, 336)]
+    #[case(1920, 1080, 1920, 1080, 1920, 1080)]
+    // Scaled down uniformly, requested aspect ratio preserved.
+    #[case(23100, 23100, 1920, 1080, 1080, 1080)]
+    #[case(3840, 2160, 1920, 1080, 1920, 1080)]
+    #[case(1200, 400, 600, 336, 600, 200)]
+    // Extreme ratios still produce at least one pixel per axis.
+    #[case(10000, 1, 100, 100, 100, 1)]
+    // Degenerate inputs are passed through rather than dividing by zero.
+    #[case(600, 336, 0, 0, 600, 336)]
+    #[case(0, 0, 1920, 1080, 0, 0)]
+    fn scale_down_to_fit_bounds_without_upscaling(
+        #[case] width: i32,
+        #[case] height: i32,
+        #[case] box_width: i32,
+        #[case] box_height: i32,
+        #[case] expected_width: i32,
+        #[case] expected_height: i32,
+    ) {
+        let scaled = scale_down_to_fit(
+            ImageDimensions::new(width, height),
+            ImageDimensions::new(box_width, box_height),
+        );
+        assert_eq!(
+            ImageDimensions::new(expected_width, expected_height),
+            scaled
+        );
     }
 
     #[test]
