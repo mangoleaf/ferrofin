@@ -1966,7 +1966,7 @@ mod tests {
     ];
 
     /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
-    /// route gate's pin, and 12.1.0, the latest Jellyfin (whose additions,
+    /// route gate's pin, and 12.1.0, the newest vendored Jellyfin spec (whose additions,
     /// `audioLanguages` and `subtitleLanguages`, are bound) — is bound by
     /// [`ItemsQuery`] or listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
     /// without a word, so a missing field is a filter the client asked for and

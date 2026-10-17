@@ -96,7 +96,7 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
 /// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
-/// (12.2.0; handlers are verified against `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// (12.2.0; handlers are ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
 /// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`

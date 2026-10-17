@@ -34,7 +34,7 @@ identified this gap but needs two corrections:
 
 ## Baseline evidence
 
-Source oracle: the repository's `UPSTREAM_TAG`, **v12.0-rc7**, commit
+Source oracle: the repository's then-current `UPSTREAM_TAG`, **v12.0-rc7**, commit
 `4910aafa1a8227a65a037d3d2d299a32691e4de3`, inspected in the local Jellyfin checkout.
 Live oracle: the available **Jellyfin 12.1.0** binary. These are separate evidence
 sources; the runtime tests are not represented as a run of rc7.
