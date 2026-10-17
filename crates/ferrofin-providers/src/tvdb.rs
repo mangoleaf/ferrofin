@@ -8,7 +8,8 @@
 //! episodes, and people, and lists series artwork.
 //!
 //! Auth: `POST /login` with `{ apikey, pin }` returns a bearer token; the token
-//! is cached and re-fetched on demand. Every other call sends
+//! is cached and fetched again once it is older than the token max age
+//! ([`DEFAULT_TOKEN_MAX_AGE`]). Every other call sends
 //! `Authorization: Bearer <token>`.
 //!
 //! Faithful port notes (the C# is the oracle):
@@ -99,6 +100,13 @@ pub fn episode_lookup(
 /// `GetSeriesExtendedByIdAsync` the series record a season's id is read
 /// from (`:251-271`).
 pub const DEFAULT_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// How old the bearer token may get before the client logs in again, unless
+/// configured otherwise ([`TvdbClient::with_token_max_age`], the server's
+/// `FERROFIN_TVDB_TOKEN_DAYS`): the plugin's 25 days
+/// (`TvdbClientManager.LoginAsync`'s `IsTokenInvalid`), inside the month a
+/// TVDB v4 token is valid for.
+pub const DEFAULT_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(25 * 24);
 
 /// `(series id, season type, season, episode)` → the episode's TVDB id and
 /// when it was resolved.
@@ -675,7 +683,14 @@ pub struct TvdbClient {
     limiter: RateLimiter,
     api_key: SecretString,
     pin: Option<String>,
-    token: Mutex<Option<String>>,
+    /// The bearer token and when it was obtained, by the wall clock as the
+    /// plugin's `DateTime.UtcNow` (TheTVDB expires it by wall time, which a
+    /// monotonic clock stops counting while the host is suspended). A tokio
+    /// mutex, held across the `/login` request, so concurrent callers share
+    /// one login.
+    token: tokio::sync::Mutex<Option<(std::time::SystemTime, String)>>,
+    /// How old [`token`](Self::token) may get before a new login.
+    token_max_age: std::time::Duration,
     base_url: String,
     /// The episode ids [`episode_by_number`](Self::episode_by_number)
     /// resolved, kept for `cache_duration` as the
@@ -696,7 +711,10 @@ impl std::fmt::Debug for TvdbClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TvdbClient")
             .field("has_pin", &self.pin.is_some())
-            .field("has_token", &self.token.lock().is_ok_and(|t| t.is_some()))
+            .field(
+                "has_token",
+                &self.token.try_lock().is_ok_and(|t| t.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -728,7 +746,8 @@ impl TvdbClient {
             limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
-            token: Mutex::new(None),
+            token: tokio::sync::Mutex::new(None),
+            token_max_age: DEFAULT_TOKEN_MAX_AGE,
             base_url: API_BASE.to_owned(),
             episode_ids: Mutex::new(EpisodeIdCache::new()),
             season_ids: Mutex::new(SeasonIdCache::new()),
@@ -746,6 +765,14 @@ impl TvdbClient {
         self
     }
 
+    /// Sets how old the bearer token may get before the client logs in again
+    /// ([`DEFAULT_TOKEN_MAX_AGE`] unless set).
+    #[must_use]
+    pub fn with_token_max_age(mut self, max_age: std::time::Duration) -> Self {
+        self.token_max_age = max_age;
+        self
+    }
+
     /// Points the client at a different API root (a mock server in tests).
     ///
     /// `pub`, matching `TmdbClient::with_base_url`: while this was
@@ -760,11 +787,16 @@ impl TvdbClient {
         self
     }
 
-    /// The cached bearer token, logging in on first use. Returns `None` if login
-    /// fails (the caller then yields no data — best-effort, like the plugin).
+    /// The cached bearer token, logging in on first use and again once it is
+    /// older than the token max age (the plugin's `LoginAsync`). The lock is
+    /// held across the login, so concurrent callers send one `/login`.
+    /// Returns `None` if login fails (the caller then yields no data —
+    /// best-effort, like the plugin).
     async fn token(&self) -> Option<String> {
-        if let Ok(guard) = self.token.lock()
-            && let Some(token) = guard.as_ref()
+        let mut guard = self.token.lock().await;
+        // A clock set back since the login (`elapsed` fails) renews too.
+        if let Some((obtained, token)) = guard.as_ref()
+            && obtained.elapsed().is_ok_and(|age| age < self.token_max_age)
         {
             return Some(token.clone());
         }
@@ -785,9 +817,7 @@ impl TvdbClient {
             .ok()?;
         let env: Envelope<LoginData> = resp.counted_json().await.ok()?;
         let token = env.data?.token;
-        if let Ok(mut guard) = self.token.lock() {
-            *guard = Some(token.clone());
-        }
+        *guard = Some((std::time::SystemTime::now(), token.clone()));
         Some(token)
     }
 
@@ -1866,6 +1896,51 @@ mod tests {
         let c = TvdbClient::new().with_base_url(&server.base_url);
         assert!(c.search("x", None, "en", &[]).await.is_empty());
         assert!(c.series_details(1, "usa").await.is_none());
+    }
+
+    /// The bearer token is reused until it is older than the token max age
+    /// (the plugin's 25 days, `FERROFIN_TVDB_TOKEN_DAYS`), then the client
+    /// logs in again; concurrent callers share one login.
+    #[tokio::test]
+    async fn the_token_is_renewed_once_older_than_its_max_age() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let logins = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&logins);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let payload = if req.contains("/login") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    r#"{"data":{"token":"tok"}}"#
+                } else {
+                    r#"{"data":{"name":"An episode"}}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let base = format!("http://{addr}");
+        let c = TvdbClient::new().with_base_url(&base);
+        let (a, b) = tokio::join!(c.episode_details(8), c.episode_details(9));
+        assert!(a.is_some() && b.is_some());
+        assert!(c.episode_details(8).await.is_some());
+        assert_eq!(logins.load(Ordering::SeqCst), 1, "one login, shared");
+        let c = TvdbClient::new()
+            .with_base_url(&base)
+            .with_token_max_age(std::time::Duration::ZERO);
+        for _ in 0..2 {
+            assert!(c.episode_details(8).await.is_some());
+        }
+        assert_eq!(logins.load(Ordering::SeqCst), 3, "an old token is renewed");
     }
 
     #[tokio::test]
