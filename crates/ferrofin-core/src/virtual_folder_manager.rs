@@ -73,6 +73,31 @@ fn is_shortcut(path: &Path) -> bool {
         .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case(SHORTCUT_EXTENSION))
 }
 
+/// The directory a caller-supplied library `name` denotes directly under
+/// `parent`, or `None` when the name would land anywhere else.
+///
+/// Port of `FileSystemHelper.GetChildPath` (upstream "Secure library paths"):
+/// blank names, NUL, anything that is not exactly one path segment (a
+/// separator, an absolute path, a Windows volume) and `.`/`..` are rejected.
+/// The check is lexical, like upstream's `Path.GetFullPath`; it never
+/// canonicalizes, because the root may legitimately sit behind a symlink.
+fn child_path(parent: &Path, name: &str) -> Option<PathBuf> {
+    if name.trim().is_empty() || name.contains('\0') {
+        return None;
+    }
+    // `file_name` is `None` for `.`/`..` and drops everything up to the last
+    // separator, so only a single normal segment equals the input.
+    if Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
+        return None;
+    }
+    // Windows strips trailing dots and spaces, so `...` would resolve to the
+    // parent itself and `Movies.` to a different child.
+    if cfg!(windows) && name.ends_with(['.', ' ']) {
+        return None;
+    }
+    Some(parent.join(name))
+}
+
 /// The collection-marker file extension (`<type>.collection`).
 const COLLECTION_EXTENSION: &str = "collection";
 
@@ -540,11 +565,6 @@ impl FerrofinVirtualFolderManager {
         Ok(stale.len())
     }
 
-    /// The on-disk directory of the named virtual folder.
-    fn folder_path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
-    }
-
     /// Sanitizes a proposed library name to a safe single path segment.
     ///
     /// Port of `IFileSystem.GetValidFilename(name.Trim())`: trims surrounding
@@ -826,16 +846,21 @@ impl FerrofinVirtualFolderManager {
         Ok(false)
     }
 
-    /// Errors when `name` does not resolve to an existing folder, else returns
-    /// its path.
+    /// Errors when `name` does not resolve to an existing directory directly
+    /// under the root (see [`child_path`]; upstream's `Directory.Exists`), else
+    /// returns its path.
     async fn require_folder(&self, name: &str) -> Result<PathBuf, ServiceError> {
-        let folder_path = self.folder_path(name);
-        if tokio::fs::try_exists(&folder_path).await.unwrap_or(false) {
-            Ok(folder_path)
-        } else {
-            Err(ServiceError::not_found(format!(
+        match child_path(&self.root, name) {
+            Some(folder_path)
+                if tokio::fs::metadata(&folder_path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir()) =>
+            {
+                Ok(folder_path)
+            }
+            _ => Err(ServiceError::not_found(format!(
                 "the media collection {name} does not exist"
-            )))
+            ))),
         }
     }
 }
@@ -1016,14 +1041,20 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         }
 
         // De-duplicate the directory name (`Movies`, `Movies2`, `Movies3`, …).
+        // A candidate `child_path` refuses (`.`, `..`) counts as taken: upstream's
+        // lexically normalizing `Directory.Exists` sees the root or its parent
+        // there, so it always moves on to `.2`/`..2`, even before the root exists.
         let mut dedup_name = name.clone();
         let mut count = 1;
-        let mut folder_path = self.folder_path(&dedup_name);
-        while tokio::fs::try_exists(&folder_path).await.unwrap_or(false) {
+        let folder_path = loop {
+            if let Some(path) = child_path(&self.root, &dedup_name)
+                && !tokio::fs::try_exists(&path).await.unwrap_or(false)
+            {
+                break path;
+            }
             count += 1;
             dedup_name = format!("{name}{count}");
-            folder_path = self.folder_path(&dedup_name);
-        }
+        };
 
         tokio::fs::create_dir_all(&folder_path)
             .await
@@ -1055,6 +1086,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     }
 
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
+        if name.trim().is_empty() {
+            return Err(ServiceError::invalid_input("name must not be empty"));
+        }
         let folder_path = self.require_folder(name).await?;
         // Delete the CollectionFolder row before the directory (its id derives from
         // the path). The items hang off the locations' folders, which the next
@@ -1087,14 +1121,12 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             return Err(ServiceError::invalid_input("new name must not be empty"));
         }
 
-        let current = self.folder_path(name);
-        let target = self.folder_path(new_name);
-
-        if !tokio::fs::try_exists(&current).await.unwrap_or(false) {
-            return Err(ServiceError::not_found(
-                "the media collection does not exist",
-            ));
-        }
+        // Both names are caller supplied: confine them to the root, the new one
+        // first (`400`), then the current one (`404`), in upstream's order.
+        let target = child_path(&self.root, new_name).ok_or_else(|| {
+            ServiceError::invalid_input("the new name is not a valid library name")
+        })?;
+        let current = self.require_folder(name).await?;
 
         let same_case_insensitive = current
             .to_string_lossy()
@@ -1239,11 +1271,12 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
 
 #[cfg(test)]
 mod tests {
-    use super::FerrofinVirtualFolderManager;
+    use super::{FerrofinVirtualFolderManager, OPTIONS_FILE};
     use crate::item_persistence_service::FerrofinItemPersistenceService;
     use ferrofin_db::Database;
     use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
     use ferrofin_model::entities::CollectionTypeOptions;
+    use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::library::VirtualFolderManager;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2382,6 +2415,175 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// `FileSystemHelperTests._parentPath`.
+    fn child_parent() -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("jellyfin-test")
+            .join("root")
+            .join("default")
+    }
+
+    // The `child_path_*` cases are transliterated from upstream
+    // `Jellyfin.Controller.Tests/IO/FileSystemHelperTests.cs`.
+    #[rstest::rstest]
+    #[case("Movies")]
+    #[case("My Movies")]
+    #[case("..2")]
+    #[case("a.b")]
+    fn child_path_valid_name_returns_path_inside_parent(#[case] name: &str) {
+        assert_eq!(
+            super::child_path(&child_parent(), name),
+            Some(child_parent().join(name))
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("")]
+    #[case("   ")]
+    #[case(".")]
+    #[case("..")]
+    #[case("../..")]
+    #[case("../../etc")]
+    #[case("Movies/../..")]
+    #[case("/var/lib/jellyfin/data")]
+    #[case("sub/folder")]
+    #[case("with\0null")]
+    fn child_path_escaping_name_returns_none(#[case] name: &str) {
+        assert_eq!(super::child_path(&child_parent(), name), None);
+    }
+
+    #[rstest::rstest]
+    #[case("..\\..")]
+    #[case("sub\\folder")]
+    #[case("C:\\Windows")]
+    fn child_path_windows_separator_does_not_escape_parent(#[case] name: &str) {
+        // Rejected on Windows; elsewhere a backslash is a legal file-name character.
+        let path = super::child_path(&child_parent(), name);
+        assert!(path.is_none_or(|p| p.parent() == Some(child_parent().as_path())));
+    }
+
+    #[rstest::rstest]
+    #[case("...")]
+    #[case("Movies.")]
+    #[case("Movies ")]
+    fn child_path_trailing_dot_or_space_rejected_on_windows(#[case] name: &str) {
+        let expected = (!cfg!(windows)).then(|| child_parent().join(name));
+        assert_eq!(super::child_path(&child_parent(), name), expected);
+    }
+
+    #[test]
+    fn child_path_parent_with_trailing_separator_returns_path_inside_parent() {
+        let parent = format!("{}{}", child_parent().display(), std::path::MAIN_SEPARATOR);
+        // Compare the raw strings, as upstream's Ordinal compare does: `Path`
+        // equality is per component and would accept a doubled separator.
+        assert_eq!(
+            super::child_path(std::path::Path::new(&parent), "Movies")
+                .map(std::path::PathBuf::into_os_string),
+            Some(child_parent().join("Movies").into_os_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn names_outside_the_root_never_reach_the_filesystem() {
+        // Upstream confines every caller-supplied library name with
+        // `GetChildPath`. `.`, `..`, absolute and multi-segment names must
+        // never reach `remove_dir_all`, a rename or the shortcut/options
+        // writers. The root is `{tmp}/default`, so `../victim` is `{tmp}/victim`.
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "m");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&media)))
+            .await
+            .unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("precious"), b"keep").unwrap();
+        let victim_abs = victim.to_string_lossy().into_owned();
+        let path_info = MediaPathInfo {
+            path: media.clone(),
+        };
+
+        for name in [".", "..", "../victim", victim_abs.as_str(), "Lib/.."] {
+            let not_found =
+                |r: Result<(), ServiceError>| matches!(r, Err(ServiceError::NotFound(_)));
+            assert!(
+                not_found(mgr.remove_virtual_folder(name).await),
+                "remove {name}"
+            );
+            assert!(
+                not_found(mgr.rename_virtual_folder(name, "Stolen").await),
+                "rename {name}"
+            );
+            assert!(
+                not_found(mgr.add_media_path(name, &path_info).await),
+                "add path {name}"
+            );
+            assert!(
+                not_found(mgr.update_media_path(name, &path_info).await),
+                "update path {name}"
+            );
+            assert!(
+                not_found(mgr.remove_media_path(name, &media).await),
+                "remove path {name}"
+            );
+            let options = LibraryOptions::default();
+            assert!(
+                not_found(mgr.update_library_options(name, &options).await),
+                "options {name}"
+            );
+            // A bad new name is the caller's mistake (`400`), checked first.
+            assert!(
+                matches!(
+                    mgr.rename_virtual_folder("Lib", name).await,
+                    Err(ServiceError::InvalidInput(_))
+                ),
+                "rename to {name}"
+            );
+        }
+        assert!(matches!(
+            mgr.remove_virtual_folder("  ").await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+
+        assert!(victim.join("precious").exists());
+        assert!(!victim.join(OPTIONS_FILE).exists());
+        let names: Vec<_> = mgr
+            .get_virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|f| f.name)
+            .collect();
+        assert_eq!(names, vec!["Lib".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn add_dot_names_dedup_inside_a_root_that_does_not_exist_yet() {
+        // A fresh install has no `root/default` until the first library is
+        // added, so `default/..` does not resolve and an existence probe alone
+        // would let `..` through to `create_dir_all`, writing the library into
+        // the root's parent. Upstream's lexical `Directory.Exists` always moves
+        // on to `..2`.
+        for (name, deduped) in [("..", "..2"), (".", ".2")] {
+            let (tmp, mgr) = manager();
+            mgr.add_virtual_folder(name, None, &LibraryOptions::default())
+                .await
+                .unwrap();
+            let names: Vec<_> = mgr
+                .get_virtual_folders()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|f| f.name)
+                .collect();
+            assert_eq!(names, vec![deduped.to_owned()], "{name}");
+            assert!(!tmp.path().join(OPTIONS_FILE).exists(), "{name}");
+            assert!(
+                !tmp.path().join("default").join(OPTIONS_FILE).exists(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

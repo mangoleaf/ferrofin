@@ -213,8 +213,10 @@ struct RemoveVirtualFolderQuery {
 
 /// `DELETE /Library/VirtualFolders` — remove a virtual folder.
 ///
-/// Port of `LibraryStructureController.RemoveVirtualFolder`: a missing folder is
-/// a `404` (mirroring the C# `FileNotFoundException`).
+/// Port of `LibraryStructureController.RemoveVirtualFolder`: a blank `name` is a
+/// `400` (C# `ArgumentNullException`), and a name that is not an existing
+/// folder directly under the libraries root (`GetChildPath`) is a `404`
+/// (mirroring the C# `FileNotFoundException`).
 #[utoipa::path(
     delete,
     path = "/Library/VirtualFolders",
@@ -224,6 +226,7 @@ struct RemoveVirtualFolderQuery {
     ),
     responses(
         (status = 204, description = "Folder removed"),
+        (status = 400, description = "Missing name"),
         (status = 404, description = "Folder not found")
     ),
     tag = "ferrofin"
@@ -257,8 +260,10 @@ struct RenameVirtualFolderQuery {
 /// `POST /Library/VirtualFolders/Name` — rename a virtual folder.
 ///
 /// Port of `LibraryStructureController.RenameVirtualFolder`: a missing `name`/
-/// `newName` is a `400` (C# `ArgumentNullException`), a missing source folder is
-/// a `404`, and a target name that already exists is a `409`.
+/// `newName` is a `400` (C# `ArgumentNullException`), as is a `newName` that is
+/// not a single folder under the libraries root (`GetChildPath`); a `name` that
+/// is not an existing such folder is a `404`, and a target name that already
+/// exists is a `409`.
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/Name",
@@ -269,6 +274,7 @@ struct RenameVirtualFolderQuery {
     ),
     responses(
         (status = 204, description = "Folder renamed"),
+        (status = 400, description = "Missing or invalid name"),
         (status = 404, description = "Library does not exist"),
         (status = 409, description = "Library already exists")
     ),
