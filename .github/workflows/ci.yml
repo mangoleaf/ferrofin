@@ -51,11 +51,15 @@ jobs:
           # Builds the WASM example guest for the end-to-end plugin-host test.
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1 # nextest
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
         # FERROFIN_WASM_GUEST_TESTS=1 builds+runs the real wasm-hello guest so
-        # the ferrofin:plugin WIT contract can't drift silently.
-      - run: FERROFIN_WASM_GUEST_TESTS=1 cargo test --workspace
+        # the ferrofin:plugin WIT contract can't drift silently. nextest runs the
+        # binaries in parallel, each test in its own process (the gate CLAUDE.md
+        # names); no CI job runs plain `cargo test`'s threads-in-one-process model.
+      - run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --workspace
+      - run: cargo test --workspace --doc # nextest cannot run doctests
 
 
   shell-tests:
