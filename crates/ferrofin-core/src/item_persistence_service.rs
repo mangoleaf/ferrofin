@@ -2291,7 +2291,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
             // (which resolves the id → BaseItems.CleanName) matches. Faithful to
             // Jellyfin, where genres/studios are BaseItems; here their id is the
-            // shared value id the DTO layer already emits for genre_items.
+            // shared value id, and the DTO's genre/studio links find the row by
+            // type and name (`item_repository::by_name_ids_by_clean_name`).
             // A music item's genre materializes ONLY as a `MusicGenre` row.
             // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
             // for audio, `GetGenre` otherwise — so a real 10.11.8 library has

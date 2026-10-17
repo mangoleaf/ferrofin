@@ -243,11 +243,11 @@ impl DynamicImageProviders {
     /// provider's (`LIMIT`ed) source query. Per-row failures are logged and
     /// skipped — one unreadable poster must not lose every other collage.
     ///
-    /// Genre rows go first: Ferrofin materializes one `Genre` row per name
-    /// shared by the Genres and Music Genres tabs (ids are the `ItemValueId`),
-    /// so a name used by both a movie and an album has a single Primary —
-    /// the video collage when the genre has any video sources, the music one
-    /// otherwise. Upstream keeps two rows and two images.
+    /// `Genre` and `MusicGenre` are separate rows, as upstream keeps them: a
+    /// scan writes a `Genre` row for a non-music item's genre (its id is the
+    /// `ItemValueId`) and a `MusicGenre` row for a music item's (a derived id),
+    /// so a name used by both a movie and an album has two rows and two
+    /// Primaries. An adopted database's rows keep Jellyfin's ids.
     ///
     /// # Errors
     ///
@@ -351,8 +351,12 @@ impl DynamicImageProviders {
             }
         }
 
-        // Genre rows serve both tabs (see `refresh_all`): a genre with no video
-        // sources falls through to the music sampling.
+        // TODO(parity, open work item — NOT an accepted divergence): left from
+        // when one `Genre` row served both tabs, before music genres got
+        // `MusicGenre` rows of their own: a genre with no video sources falls
+        // through to the music sampling. Upstream's `GenreImageProvider`
+        // samples Series/Movie only and draws nothing here; the fix is to drop
+        // this fall-through.
         let mut sources = self.sources_for(kind, item, item_id).await?;
         if sources.is_empty() && kind == DynamicImageKind::Genre {
             sources = self

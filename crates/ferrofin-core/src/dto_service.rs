@@ -132,15 +132,16 @@ struct Prefetched {
     /// Image rows per *person* id, for the whole page's cast/crew at once, so the
     /// primary-image tag lookup does not re-query per person per item.
     person_images: HashMap<Uuid, Vec<ItemImageInfo>>,
-    /// `ItemValues` id per clean value, bucketed by value type, for every
-    /// studio/genre/artist name across the page, so `attach_studios`/`_genres`/
-    /// `_artists` resolve from memory instead of a query per name. Nested (not
-    /// keyed by a `(i32, String)` tuple) so a lookup borrows the clean `&str`
+    /// By-name item id per clean name, bucketed by the by-name kind (`Studio`,
+    /// `Genre`, `MusicGenre`, `MusicArtist`), for every studio/genre/artist name
+    /// across the page, so `attach_studios`/`_genres`/`_artists` resolve from
+    /// memory instead of a query per name. Nested (not keyed by a
+    /// `(BaseItemKind, String)` tuple) so a lookup borrows the clean `&str`
     /// instead of allocating a key per name per item.
-    value_ids: HashMap<i32, HashMap<String, Uuid>>,
+    by_name_ids: HashMap<BaseItemKind, HashMap<String, Uuid>>,
     /// The clean value ([`crate::text_util::get_clean_value`]) of every distinct
     /// studio/genre/artist name on the page, computed once by the prefetch that
-    /// already had to compute it to build `value_ids`. `Prefetched::value_id`
+    /// already had to compute it to build `by_name_ids`. `Prefetched::by_name_id`
     /// reads it instead of re-cleaning the same name once per item.
     clean_values: HashMap<String, String>,
     /// Chapters per item id (populated only when the `Chapters` field is requested).
@@ -252,8 +253,9 @@ impl Prefetched {
     /// from that exact function, and a name the prefetch never saw (an unpopulated
     /// `Prefetched`, or a name reached outside the collected fields) falls back
     /// to computing it. Never normalize differently here — the clean value is the
-    /// join key against the stored `ItemValues.CleanValue` column, so a divergence
-    /// silently empties Genres/Studios/Artists.
+    /// join key against the stored `BaseItems.CleanName` (and the fallback's
+    /// `ItemValues.CleanValue`) column, so a divergence silently empties or
+    /// misdirects Genres/Studios/Artists.
     fn clean_key<'a>(&'a self, name: &str) -> std::borrow::Cow<'a, str> {
         self.clean_values.get(name).map_or_else(
             || std::borrow::Cow::Owned(crate::text_util::get_clean_value(name)),
@@ -261,30 +263,44 @@ impl Prefetched {
         )
     }
 
-    /// The `ItemValues` id stored for an already-cleaned value under `value_type`,
-    /// or `None` when the page's prefetch found no such row.
-    fn lookup_clean(&self, value_type: i32, clean: &str) -> Option<Uuid> {
-        self.value_ids.get(&value_type)?.get(clean).copied()
+    /// The `kind` by-name item id for an already-cleaned name, or `None` when the
+    /// page's prefetch found none.
+    fn lookup_clean(&self, kind: BaseItemKind, clean: &str) -> Option<Uuid> {
+        self.by_name_ids.get(&kind)?.get(clean).copied()
     }
 
-    /// [`Self::lookup_clean`] with the nil id for a missing row — exactly what the
-    /// per-name lookup resolved a missing row to.
-    fn value_id_clean(&self, value_type: i32, clean: &str) -> Uuid {
-        self.lookup_clean(value_type, clean)
+    /// A studio/genre id from the prefetched map. A `MusicGenre` with no row
+    /// takes the derived id its row is created with (`music_genre_row`,
+    /// `ensure_by_name_item`); a `Genre`/`Studio` with neither a row nor a
+    /// stored value row takes the nil id.
+    fn by_name_id(&self, kind: BaseItemKind, name: &str) -> Uuid {
+        self.lookup_clean(kind, &self.clean_key(name))
+            .or_else(|| {
+                (kind == BaseItemKind::MusicGenre)
+                    .then(|| crate::item_type_lookup::derive_item_id(kind, name.trim()))
+                    .flatten()
+            })
             .unwrap_or_else(Uuid::nil)
-    }
-
-    /// A studio/genre/artist id from the prefetched `ItemValues` map — the nil
-    /// id when the name has no stored value row, exactly as the per-name lookup
-    /// resolved a missing row.
-    fn value_id(&self, value_type: i32, name: &str) -> Uuid {
-        self.value_id_clean(value_type, &self.clean_key(name))
     }
 }
 use crate::kinds;
 
-/// `(ItemValues.Type, clean value)` keys to resolve.
-type CleanKeys = Vec<(i32, String)>;
+/// The by-name kind an item's `GenreItems` link to: `MusicGenre` for a music
+/// owner, `Genre` otherwise (C# `DtoService.GetGenreId`).
+///
+/// "Music owner" is the scanner's test (`ItemTypeLookup.MusicGenreTypes`, the
+/// one that picks which row a genre gets), not C#'s `is IHasMusicGenres`. They
+/// differ only for `AudioBook`, whose genres both trees store as `Genre` rows:
+/// upstream links them to the `MusicGenre` id, which has a row only when a
+/// music item carries the same genre; Ferrofin links them to their `Genre` row.
+/// Jellyfin bug not ported.
+fn genre_kind(item: &BaseItemEntity) -> BaseItemKind {
+    if crate::item_type_lookup::MUSIC_GENRE_TYPES.contains(&item.type_.as_str()) {
+        BaseItemKind::MusicGenre
+    } else {
+        BaseItemKind::Genre
+    }
+}
 
 /// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
 /// multiple" (backdrops/chapters) — the single-image loop skips
@@ -1612,73 +1628,40 @@ impl FerrofinDtoService {
         Ok(graph)
     }
 
-    /// Resolves many `(value type, CLEAN value)` pairs to their `ItemValues` ids
-    /// in one query — the page's studios/genres/artists — bucketed by type.
-    /// Pairs with no row are simply absent.
+    /// Resolves many `(by-name kind, CLEAN name)` pairs — the page's
+    /// studios/genres/artists — to the by-name item ids their links open, in
+    /// one query per family, bucketed by kind. Pairs with no id are absent.
     ///
     /// The caller passes values already normalized by
     /// [`crate::text_util::get_clean_value`] (the prefetch computes each name's
     /// clean form once and caches it for the projection); this must stay the
-    /// same normalization the stored `ItemValues.CleanValue` column holds.
+    /// same normalization the stored `CleanName`/`CleanValue` columns hold.
     ///
-    /// Port of the `_libraryManager.GetGenreId`/`GetStudioId`/… helpers, which
-    /// hash-map a clean value to a stable id; here the stored `ItemValues` row
-    /// carries the fallback id. Adopted music libraries can have a distinct
-    /// physical artist row, so artist links must prefer that browsable item's id.
-    async fn resolve_value_ids(
+    /// Port of `_libraryManager.GetGenreId`/`GetMusicGenreId`/`GetStudioId`
+    /// and `LinkedChildrenService.FindArtists`. Upstream hashes a name to the
+    /// by-name item's id; here the item is found by type and clean name (see
+    /// [`crate::item_repository::by_name_ids_by_clean_name`]), because a
+    /// Ferrofin-scanned row carries its `ItemValues` id, an adopted row
+    /// Jellyfin's path-derived id, and a `MusicGenre` row a derived id.
+    async fn resolve_by_name_ids(
         &self,
-        clean_pairs: &[(i32, String)],
-    ) -> Result<HashMap<i32, HashMap<String, Uuid>>, ServiceError> {
-        let mut map: HashMap<i32, HashMap<String, Uuid>> = HashMap::new();
-        // Dedup the (type, clean) keys we need.
-        let mut want: std::collections::HashSet<(i32, String)> = std::collections::HashSet::new();
-        for (t, clean) in clean_pairs {
-            want.insert((*t, clean.clone()));
-        }
-        if want.is_empty() {
-            return Ok(map);
-        }
-        // Artists and album artists link to an actual `MusicArtist` item found by
-        // its clean name (`LinkedChildrenService.FindArtists`), independent of
-        // the `ItemValues` rows; a name with no such item has no id at all.
-        let (artist_keys, keys): (CleanKeys, CleanKeys) = want
+        clean_pairs: &[(BaseItemKind, String)],
+    ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+        // Dedup the (kind, clean) keys we need.
+        let want: std::collections::HashSet<&(BaseItemKind, String)> = clean_pairs.iter().collect();
+        // Artist names link to an actual `MusicArtist` item found by its clean
+        // name (`LinkedChildrenService.FindArtists`), independent of the
+        // `ItemValues` rows; a name with no such item has no id at all.
+        let (artist_keys, keys): (Vec<_>, Vec<_>) = want
             .into_iter()
-            .partition(|(value_type, _)| matches!(value_type, 0 | 1));
-        let artist_cleans: Vec<&String> = artist_keys
-            .iter()
-            .map(|(_, clean)| clean)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+            .partition(|(kind, _)| *kind == BaseItemKind::MusicArtist);
+        let keys: Vec<(BaseItemKind, String)> = keys.into_iter().cloned().collect();
+        let mut map = crate::item_repository::by_name_ids_by_clean_name(&self.db, &keys).await?;
+        let artist_cleans: Vec<&String> = artist_keys.iter().map(|(_, clean)| clean).collect();
         let artists =
             crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
                 .await?;
-        for (value_type, clean) in artist_keys {
-            if let Some(id) = artists.get(&clean) {
-                map.entry(value_type).or_default().insert(clean, *id);
-            }
-        }
-        // Two host variables per key.
-        for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 2) {
-            let ph = (0..chunk.len())
-                .map(|_| "(?, ?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                r#"SELECT iv."Type", iv."CleanValue", iv."ItemValueId"
-                   FROM "ItemValues" iv
-                   WHERE (iv."Type", iv."CleanValue") IN ({ph})"#,
-            );
-            let mut query = sqlx::query_as::<_, (i32, String, String)>(sqlx::AssertSqlSafe(sql));
-            for (t, clean) in chunk {
-                query = query.bind(*t).bind(clean);
-            }
-            for (t, clean, id) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
-                if let Ok(uuid) = Uuid::parse_str(&id) {
-                    map.entry(t).or_default().insert(clean, uuid);
-                }
-            }
-        }
+        map.insert(BaseItemKind::MusicArtist, artists);
         Ok(map)
     }
 
@@ -1850,7 +1833,7 @@ impl FerrofinDtoService {
         let pairs = studios
             .into_iter()
             .map(|name| NameGuidPair {
-                id: prefetched.value_id(3, &name), // 3 = Studios
+                id: prefetched.by_name_id(BaseItemKind::Studio, &name),
                 name: Some(name),
             })
             .collect();
@@ -1859,22 +1842,14 @@ impl FerrofinDtoService {
 
     /// Attaches the item's genres as names and as name/id pairs (port of the
     /// `Genres`/`AttachGenreItems` block).
-    fn attach_genres(
-        dto: &mut BaseItemDto,
-        item: &BaseItemEntity,
-        kind: BaseItemKind,
-        prefetched: &Prefetched,
-    ) {
+    fn attach_genres(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
         let genres = split_multi(item.genres.as_deref());
-        // Music items resolve against the MusicGenre value space; everything else
-        // against the plain Genre space. Both are stored as `ItemValueType::Genre`
-        // (2) in this schema, so the id lookup is the same table.
-        let _is_music_genres = kinds::is_music(kind);
+        let kind = genre_kind(item);
         let pairs = genres
             .iter()
             .map(|name| NameGuidPair {
                 name: Some(name.clone()),
-                id: prefetched.value_id(2, name), // 2 = Genre
+                id: prefetched.by_name_id(kind, name),
             })
             .collect();
         dto.genre_items = Some(pairs);
@@ -1882,8 +1857,8 @@ impl FerrofinDtoService {
     }
 
     /// Attaches artist / album-artist names and name-id pairs (port of the
-    /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are resolved from
-    /// the shared `ItemValues` table (`Artist`/`AlbumArtist` value types).
+    /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are the
+    /// `MusicArtist` rows found by clean name.
     fn attach_artists(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
         // The distinct, non-blank names that match an actual `MusicArtist` item
         // (`GetArtists` → `FindArtists`), each paired with that item's id; a name
@@ -1895,10 +1870,8 @@ impl FerrofinDtoService {
                 .filter(|name| !name.trim().is_empty() && seen.insert(name.as_str()))
                 .filter_map(|name| {
                     let clean = prefetched.clean_key(name);
-                    // Both name kinds resolve to the same `MusicArtist` item.
                     prefetched
-                        .lookup_clean(0, &clean)
-                        .or_else(|| prefetched.lookup_clean(1, &clean))
+                        .lookup_clean(BaseItemKind::MusicArtist, &clean)
                         .map(|id| NameGuidPair {
                             name: Some(name.clone()),
                             id,
@@ -2635,7 +2608,7 @@ impl FerrofinDtoService {
         }
 
         if options.contains_field(ItemFields::Genres) {
-            Self::attach_genres(dto, item, kind, prefetched);
+            Self::attach_genres(dto, item, prefetched);
         }
 
         dto.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
@@ -4211,30 +4184,34 @@ impl FerrofinDtoService {
         // exactly what the attach steps resolve: studios/genres only when their
         // field is requested, artists/album-artists only for the kinds that carry
         // artist fields — so a prefetched miss never wrongly nils a real id.
-        let (value_ids, clean_values) = {
+        let (by_name_ids, clean_values) = {
             // Dedup by the RAW name first, borrowing from the rows, so each
             // distinct name is cleaned exactly once for the whole page (the
             // projection then reads those cleans back out of `clean_values`
             // instead of recomputing them per name per item).
-            let mut wanted: std::collections::HashSet<(i32, &str)> =
+            let mut wanted: std::collections::HashSet<(BaseItemKind, &str)> =
                 std::collections::HashSet::new();
             let want_studios = options.contains_field(ItemFields::Studios);
             let want_genres = options.contains_field(ItemFields::Genres);
             for item in items {
                 if want_studios {
-                    wanted.extend(split_multi_str(item.studios.as_deref()).map(|n| (3, n)));
+                    wanted.extend(
+                        split_multi_str(item.studios.as_deref()).map(|n| (BaseItemKind::Studio, n)),
+                    );
                 }
                 if want_genres {
-                    wanted.extend(split_multi_str(item.genres.as_deref()).map(|n| (2, n)));
+                    let kind = genre_kind(item);
+                    wanted.extend(split_multi_str(item.genres.as_deref()).map(|n| (kind, n)));
                 }
                 if kinds::has_artist_fields(row_kind(item)) {
-                    wanted.extend(split_multi_str(item.artists.as_deref()).map(|n| (0, n)));
-                    wanted.extend(split_multi_str(item.album_artists.as_deref()).map(|n| (1, n)));
+                    let artist = |n| (BaseItemKind::MusicArtist, n);
+                    wanted.extend(split_multi_str(item.artists.as_deref()).map(artist));
+                    wanted.extend(split_multi_str(item.album_artists.as_deref()).map(artist));
                 }
             }
             let mut clean_values: HashMap<String, String> = HashMap::new();
-            let mut pairs: Vec<(i32, String)> = Vec::with_capacity(wanted.len());
-            for (value_type, name) in wanted {
+            let mut pairs: Vec<(BaseItemKind, String)> = Vec::with_capacity(wanted.len());
+            for (kind, name) in wanted {
                 let clean = if let Some(clean) = clean_values.get(name) {
                     clean.clone()
                 } else {
@@ -4242,9 +4219,9 @@ impl FerrofinDtoService {
                     clean_values.insert(name.to_owned(), clean.clone());
                     clean
                 };
-                pairs.push((value_type, clean));
+                pairs.push((kind, clean));
             }
-            (self.resolve_value_ids(&pairs).await?, clean_values)
+            (self.resolve_by_name_ids(&pairs).await?, clean_values)
         };
         let chapters = if options.contains_field(ItemFields::Chapters) && !media_ids.is_empty() {
             self.chapters.get_chapters_batch(&media_ids).await?
@@ -4445,7 +4422,7 @@ impl FerrofinDtoService {
             locked_fields,
             people,
             person_images,
-            value_ids,
+            by_name_ids,
             clean_values,
             chapters,
             trickplay,
@@ -9154,11 +9131,10 @@ mod tests {
         }
         let svc = service(db);
         let map = svc
-            .resolve_value_ids(&[(0, clean.clone()), (1, clean.clone())])
+            .resolve_by_name_ids(&[(BaseItemKind::MusicArtist, clean.clone())])
             .await
             .unwrap();
-        assert_eq!(map[&0][&clean], artist);
-        assert_eq!(map[&1][&clean], artist);
+        assert_eq!(map[&BaseItemKind::MusicArtist][&clean], artist);
     }
 
     #[tokio::test]
@@ -9178,43 +9154,51 @@ mod tests {
         let svc = service(db);
 
         // The batch resolver finds the stored id under its (type, clean) key.
-        let map = svc.resolve_value_ids(&[(3, clean.clone())]).await.unwrap();
-        assert_eq!(map.get(&3).and_then(|m| m.get(&clean)).copied(), Some(vid));
+        let map = svc
+            .resolve_by_name_ids(&[(BaseItemKind::Studio, clean.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            map.get(&BaseItemKind::Studio)
+                .and_then(|m| m.get(&clean))
+                .copied(),
+            Some(vid)
+        );
 
-        // Prefetched::value_id reads the map without a query, and nil-s a name
+        // Prefetched::by_name_id reads the map without a query, and nil-s a name
         // with no row. With an empty clean cache it falls back to cleaning the
         // name itself, so an un-prefetched name still resolves.
         let pf = Prefetched {
-            value_ids: map,
+            by_name_ids: map,
             ..Prefetched::default()
         };
-        assert_eq!(pf.value_id(3, "Warner Bros."), vid);
-        assert!(pf.value_id(3, "Nobody").is_nil());
+        assert_eq!(pf.by_name_id(BaseItemKind::Studio, "Warner Bros."), vid);
+        assert!(pf.by_name_id(BaseItemKind::Studio, "Nobody").is_nil());
 
         // ...and the cached clean value resolves the same id, for every spelling
         // that cleans to it.
         let pf = Prefetched {
-            value_ids: pf.value_ids,
+            by_name_ids: pf.by_name_ids,
             clean_values: [("WARNER BROS.".to_owned(), clean.clone())]
                 .into_iter()
                 .collect(),
             ..Prefetched::default()
         };
-        assert_eq!(pf.value_id(3, "WARNER BROS."), vid);
+        assert_eq!(pf.by_name_id(BaseItemKind::Studio, "WARNER BROS."), vid);
     }
 
-    /// Studios/genres/artists must resolve to the SAME `ItemValues` ids the
+    /// Studios/genres/artists must resolve to the SAME by-name items the
     /// per-name lookup found, for names whose clean form differs from the stored
     /// spelling — the page's cached clean keys are the join key against
-    /// `ItemValues.CleanValue`, so any normalization drift empties these fields.
+    /// `BaseItems.CleanName` (and `ItemValues.CleanValue`, the fallback), so any
+    /// normalization drift empties or misdirects these fields.
     ///
-    /// The spellings below differ only in case and diacritics, which is exactly
-    /// what the clean value folds: C# `GetCleanValue` is
-    /// `RemoveDiacritics().ToLowerInvariant()` and keeps punctuation and
-    /// whitespace, so `'WARNER   BROS!'` is NOT another spelling of
-    /// `'Warner Bros.'` — to Jellyfin those are two different studios.
+    /// The spellings below differ in case and diacritics, which the clean value
+    /// folds along with punctuation and whitespace runs (C# 12 `GetCleanValue`:
+    /// diacritics removed, lower-cased, every non-letter/digit a space,
+    /// whitespace collapsed and trimmed).
     #[tokio::test]
-    async fn value_ids_resolve_end_to_end_for_awkward_names() {
+    async fn by_name_ids_resolve_end_to_end_for_awkward_names() {
         let db = test_db().await;
 
         // Seed one ItemValues row per (type, clean value).
@@ -9236,11 +9220,20 @@ mod tests {
                 vid
             }
         };
-        let studio_id = seed_value(3, "Warner Bros.").await;
-        let genre_id = seed_value(2, "Sci-Fi").await;
+        let studio_value = seed_value(3, "Warner Bros.").await;
+        let genre_value = seed_value(2, "Sci-Fi").await;
+        // The by-name rows, under ids unrelated to the value ids (an adopted
+        // shape), so a link that fell back to the value id would show.
+        let (studio_id, genre_id) = (Uuid::from_u128(0xA_9997), Uuid::from_u128(0xA_9998));
+        for (id, kind, name) in [
+            (studio_id, BaseItemKind::Studio, "Warner Bros."),
+            (genre_id, BaseItemKind::Genre, "Sci-Fi"),
+        ] {
+            seed_named_item(&db, id, kind, name).await;
+            crate::test_support::set_clean_name(&db, id, name).await;
+        }
         // The artist is stored under BOTH value types, with different spellings
-        // that share a clean value — attach_artists must prefer the AlbumArtist
-        // (1) row, which is the browsable one.
+        // that share a clean value; neither value id is the link.
         let artist_id = seed_value(0, "Sigur Rós").await;
         let album_artist_id = seed_value(1, "sigur ros").await;
         // The browsable artist: a `MusicArtist` item with that clean name.
@@ -9286,8 +9279,10 @@ mod tests {
         let studios = dtos[0].studios.as_ref().expect("studios");
         assert_eq!(studios[0].name.as_deref(), Some("WARNER BROS."));
         assert_eq!(studios[0].id, studio_id, "studio id");
+        assert_ne!(studios[0].id, studio_value);
         let genres = dtos[0].genre_items.as_ref().expect("genre items");
         assert_eq!(genres[0].id, genre_id, "genre id");
+        assert_ne!(genres[0].id, genre_value);
 
         // The links are the `MusicArtist` item whose clean name matches
         // (`FindArtists`), never an `ItemValues` id.
@@ -9298,6 +9293,119 @@ mod tests {
         assert_ne!(artists[0].id, album_artist_id);
         let album_artists = dtos[1].album_artists.as_ref().expect("album artists");
         assert_eq!(album_artists[0].id, artist_item, "album-artist id");
+    }
+
+    /// A music owner's genres link to `MusicGenre` rows, everyone else's to
+    /// `Genre` rows — the scanner's split, so `AudioBook` (an `IHasMusicGenres`
+    /// upstream) links to the `Genre` row its genre actually has.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Audio, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::MusicAlbum, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::MusicVideo, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::MusicArtist, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::AudioBook, BaseItemKind::Genre)]
+    #[case(BaseItemKind::Movie, BaseItemKind::Genre)]
+    #[case(BaseItemKind::Series, BaseItemKind::Genre)]
+    fn genre_links_follow_the_scanners_music_split(
+        #[case] owner: BaseItemKind,
+        #[case] expected: BaseItemKind,
+    ) {
+        let item = BaseItemEntity {
+            type_: crate::item_type_lookup::stored_type_name(owner)
+                .unwrap()
+                .to_owned(),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(genre_kind(&item), expected);
+    }
+
+    /// `GenreItems`/`Studios` link to the by-name ITEM a client can open
+    /// (C# `GetGenreId`/`GetMusicGenreId`/`GetStudioId`), found by type and
+    /// name — not to the `ItemValues` id, which on an adopted database is a
+    /// random guid no row carries, and which a music genre's row never takes.
+    #[tokio::test]
+    async fn genre_and_studio_links_open_the_by_name_item() {
+        use crate::test_support::{seed_item_value, set_clean_name};
+        use ferrofin_db::enums::ItemValueType;
+        let db = test_db().await;
+        // An adopted shape: the by-name rows already exist under Jellyfin's
+        // path-derived ids, unrelated to the `ItemValues` ids, so the scanner's
+        // type-and-name guard adds no row of its own beside them.
+        let (jazz, drama, acme, music_jazz) = (
+            Uuid::from_u128(0xD_0003),
+            Uuid::from_u128(0xD_0004),
+            Uuid::from_u128(0xD_0005),
+            Uuid::from_u128(0xD_0006),
+        );
+        for (id, kind, name) in [
+            (jazz, BaseItemKind::Genre, "Jazz"),
+            (drama, BaseItemKind::Genre, "Drama"),
+            (acme, BaseItemKind::Studio, "Acme"),
+            (music_jazz, BaseItemKind::MusicGenre, "Jazz"),
+        ] {
+            seed_named_item(&db, id, kind, name).await;
+            set_clean_name(&db, id, name).await;
+        }
+        // A movie and an album share "Jazz": the album's genre is a music
+        // genre, so it links to the `MusicGenre` row. "Blues" is music-only and
+        // has no adopted row, so the scanner writes one (derived id).
+        let movie = Uuid::from_u128(0xD_0001);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        let album = Uuid::from_u128(0xD_0002);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Record").await;
+        for (id, value_type, value) in [
+            (movie, ItemValueType::Genre, "Jazz"),
+            (movie, ItemValueType::Genre, "Drama"),
+            (movie, ItemValueType::Studios, "Acme"),
+            (album, ItemValueType::Genre, "Jazz"),
+            (album, ItemValueType::Genre, "Blues"),
+        ] {
+            seed_item_value(&db, id, value_type, value).await;
+        }
+        let music_genre =
+            |name| crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, name).unwrap();
+
+        let mut movie_row = fetch_item(&db, movie).await;
+        movie_row.genres = Some("Jazz|Drama".to_owned());
+        movie_row.studios = Some("Acme".to_owned());
+        let mut album_row = fetch_item(&db, album).await;
+        album_row.genres = Some("Jazz|Blues".to_owned());
+        let svc = service(db);
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie_row, album_row],
+                &DtoOptions::default(),
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let ids = |pairs: Option<&Vec<NameGuidPair>>| -> Vec<Uuid> {
+            pairs.expect("pairs").iter().map(|p| p.id).collect()
+        };
+        assert_eq!(
+            ids(dtos[0].genre_items.as_ref()),
+            vec![jazz, drama],
+            "a movie links to the Genre rows"
+        );
+        assert_eq!(ids(dtos[0].studios.as_ref()), vec![acme], "studio row");
+        assert_eq!(
+            ids(dtos[1].genre_items.as_ref()),
+            vec![music_jazz, music_genre("Blues")],
+            "an album links to the MusicGenre rows, not the movie's Genre row"
+        );
+        assert_ne!(music_jazz, music_genre("Jazz"));
+
+        // With no row at all, a music genre takes the id its row will be
+        // created with; a genre has nothing to fall back to.
+        let empty = Prefetched::default();
+        assert_eq!(
+            empty.by_name_id(BaseItemKind::MusicGenre, "Bebop"),
+            music_genre("Bebop")
+        );
+        assert!(empty.by_name_id(BaseItemKind::Genre, "Bebop").is_nil());
     }
 
     /// `DtoService` pairs only the distinct, non-blank artist names that match a
@@ -9830,13 +9938,13 @@ mod tests {
 
         // The prefetched (cached-clean) path and the uncached fallback path must
         // agree with each other AND with a fresh get_clean_value lookup.
-        let pairs: Vec<(i32, String)> = NAMES
+        let pairs: Vec<(BaseItemKind, String)> = NAMES
             .iter()
-            .map(|n| (3, crate::text_util::get_clean_value(n)))
+            .map(|n| (BaseItemKind::Studio, crate::text_util::get_clean_value(n)))
             .collect();
-        let value_ids = svc.resolve_value_ids(&pairs).await.unwrap();
+        let by_name_ids = svc.resolve_by_name_ids(&pairs).await.unwrap();
         let cached = Prefetched {
-            value_ids: value_ids.clone(),
+            by_name_ids: by_name_ids.clone(),
             clean_values: NAMES
                 .iter()
                 .map(|n| ((*n).to_owned(), crate::text_util::get_clean_value(n)))
@@ -9844,7 +9952,7 @@ mod tests {
             ..Prefetched::default()
         };
         let uncached = Prefetched {
-            value_ids,
+            by_name_ids,
             ..Prefetched::default()
         };
         for name in NAMES {
@@ -9857,8 +9965,16 @@ mod tests {
                 crate::text_util::get_clean_value(name),
                 "clean key diverged for {name:?}"
             );
-            assert_eq!(cached.value_id(3, name), want, "cached id for {name:?}");
-            assert_eq!(uncached.value_id(3, name), want, "uncached id for {name:?}");
+            assert_eq!(
+                cached.by_name_id(BaseItemKind::Studio, name),
+                want,
+                "cached id for {name:?}"
+            );
+            assert_eq!(
+                uncached.by_name_id(BaseItemKind::Studio, name),
+                want,
+                "uncached id for {name:?}"
+            );
         }
     }
 
