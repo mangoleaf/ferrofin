@@ -650,6 +650,16 @@ pub struct FerrofinPlaylistManager {
         Arc<crate::item_visibility::ItemVisibility>,
         Arc<dyn UserManager>,
     )>,
+    /// Held for the whole of an add, remove, move or update: each reads the
+    /// entries (or, through the re-rate after it, the whole row) and writes
+    /// them back, so two overlapping edits would both start from the same
+    /// state and lose one of the changes (parallel per-track adds do exactly
+    /// that). Share writes made outside an update do not take it
+    /// (`update_playlist` calls `add_user_to_shares` under the guard), so a
+    /// re-rate's whole-row save can still put an older `Shares` back into
+    /// `Data`; the fix for that is a re-rate that saves only its rating columns.
+    // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
+    entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -674,6 +684,7 @@ impl FerrofinPlaylistManager {
             items,
             paths,
             visibility: None,
+            entry_edits: Arc::default(),
         }
     }
 
@@ -919,6 +930,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // Ensure it exists, then apply the name (the only field this leaf row
         // carries); membership changes arrive through `add_item_to_playlist`.
         self.require_playlist(request.id).await?;
+        let _edit = self.entry_edits.lock().await;
         if let Some(name) = &request.name {
             sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(request.id))
@@ -1121,6 +1133,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // otherwise a splice), else at the end.
         self.require_playlist_argument(&playlist_id.to_string())
             .await?;
+        let _edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist_id);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
         let added: Vec<Entry> = item_ids
@@ -1155,6 +1168,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // C# `RemoveItemFromPlaylistAsync` (12.0): every entry whose item id
         // is in the request goes — all occurrences, not the first.
         let playlist = self.require_playlist_argument(playlist_id).await?;
+        let _edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist);
         let removals: Vec<String> = entry_ids
             .iter()
@@ -1184,6 +1198,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // Same ordering the read path uses (`get_linked_children_ids`), so the
         // relocation matches what the client sees.
         let playlist = self.require_playlist_argument(playlist_id).await?;
+        let _edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
@@ -3210,6 +3225,21 @@ mod tests {
         let set = Uuid::parse_str(&created.id).expect("uuid");
         mgr.add_to_collection(set, &[a]).await.expect("add again");
         assert_eq!(rows(&db, set).await, vec![a]);
+    }
+
+    /// Overlapping adds to one playlist each keep their entry: none of them
+    /// starts from a list another has not finished rewriting.
+    #[tokio::test]
+    async fn concurrent_adds_to_a_playlist_keep_every_entry() {
+        let db = test_db().await;
+        let a = Uuid::new_v4();
+        let (mgr, playlist, owner) = seeded_playlist(&db, &[a]).await;
+        let item = [a];
+        let adds = (0..8).map(|_| mgr.add_item_to_playlist(playlist, &item, None, owner));
+        for result in futures_util::future::join_all(adds).await {
+            result.expect("add");
+        }
+        assert_eq!(rows(&db, playlist).await.len(), 9);
     }
 
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
