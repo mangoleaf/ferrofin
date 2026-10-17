@@ -21,7 +21,7 @@ use ferrofin_model::live_tv::TunerHostInfo;
 use ferrofin_traits::error::ServiceError;
 
 use crate::fetch::SourceFetcher;
-use crate::m3u::parse_m3u;
+use crate::m3u::{is_valid_channel_url, parse_m3u};
 
 /// One channel as a tuner reported it, before anything is persisted.
 ///
@@ -269,9 +269,7 @@ impl TunerHost for M3uTunerHost {
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         // `M3UTunerHost.GetChannelStreamMediaSources` returns the ONE source
         // `CreateMediaSourceInfo` builds from the playlist URL.
-        let mut source = crate::stream::create_media_source_info(&channel.path, tuner);
-        crate::stream::normalize(&mut source);
-        Ok(vec![source])
+        Ok(vec![m3u_channel_source(tuner, channel)?])
     }
 
     async fn channel_stream(
@@ -282,13 +280,33 @@ impl TunerHost for M3uTunerHost {
     ) -> Result<ChannelStream, ServiceError> {
         // `M3UTunerHost.GetChannelStream` ignores the stream id: the playlist
         // offers exactly one source per channel.
-        let mut source = crate::stream::create_media_source_info(&channel.path, tuner);
-        crate::stream::normalize(&mut source);
         Ok(ChannelStream {
-            source,
+            source: m3u_channel_source(tuner, channel)?,
             kind: ChannelStreamKind::Http,
         })
     }
+}
+
+/// The one source an M3U channel plays from (`M3UTunerHost.CreateMediaSourceInfo`).
+///
+/// A stored path that [`is_valid_channel_url`] rejects is refused. Upstream
+/// re-parses the playlist after a restart, so its parser check covers every
+/// channel it serves. Channels persist here, and a row saved before the check
+/// existed stays until the next guide refresh drops it. Serving it would hand
+/// its path to the anonymous stream routes as a file.
+fn m3u_channel_source(
+    tuner: &TunerHostInfo,
+    channel: &StoredChannel,
+) -> Result<MediaSourceInfo, ServiceError> {
+    if !is_valid_channel_url(&channel.path) {
+        return Err(ServiceError::not_found(format!(
+            "playable URL for M3U channel {}",
+            channel.external_id
+        )));
+    }
+    let mut source = crate::stream::create_media_source_info(&channel.path, tuner);
+    crate::stream::normalize(&mut source);
+    Ok(source)
 }
 
 /// The advertised tuner-host types, ordered by name.
@@ -447,6 +465,27 @@ mod tests {
             .expect("stream");
         assert_eq!(stream.kind, ChannelStreamKind::Http);
         assert_eq!(stream.source.path.as_deref(), Some("http://tuner/bbc1.ts"));
+    }
+
+    /// A channel stored before the parser rejected file paths is never served.
+    #[tokio::test]
+    async fn a_stored_m3u_channel_with_a_file_path_has_no_source() {
+        let host = m3u_host("");
+        let tuner = TunerHostInfo::default();
+        let channel = StoredChannel {
+            external_id: "m3u_abc".to_owned(),
+            path: "/var/lib/ferrofin/jellyfin.db".to_owned(),
+            ..StoredChannel::default()
+        };
+        let err = host
+            .channel_media_sources(&tuner, &channel)
+            .await
+            .expect_err("a file path is refused");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(
+            host.channel_stream(&tuner, &channel, None).await.is_err(),
+            "opening it is refused too"
+        );
     }
 
     /// A host that reports itself unsupported, to prove the filter runs.
