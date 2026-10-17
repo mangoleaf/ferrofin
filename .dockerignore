@@ -37,3 +37,4 @@ adoption/fixtures/
 **/*.server.log
 **/*.smoke.txt
 **/*.smoke2.txt
+**/*.smoke-scan.txt
