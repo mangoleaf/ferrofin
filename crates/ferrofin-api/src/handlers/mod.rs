@@ -568,8 +568,8 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/ScheduledTasks/{taskId}"),
     ("post", "/ScheduledTasks/Running/{taskId}"),
     // Batch 16 — the last portable stubs.
-    // Similar-items aliases (`LibraryController.GetSimilarItems`); `Shows/…/Similar`
-    // is already real in Batch 8.
+    // Similar-items aliases (`LibraryController.GetSimilarItems`); the
+    // `Shows/…/Similar` row sits in Batch 8, though `handlers::similar` serves it.
     ("get", "/Albums/{itemId}/Similar"),
     ("get", "/Artists/{itemId}/Similar"),
     ("get", "/Items/{itemId}/Similar"),
