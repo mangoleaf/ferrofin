@@ -8,6 +8,43 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Ferrofin reports Jellyfin 12.2.0; Emby-era sign-in is off by default
+
+`/System/Info` now reports `Version` `12.2.0` (1.3.x reported `10.11.8`). As in Jellyfin 12,
+only the `Authorization: MediaBrowser …` header and the `ApiKey` query parameter
+authenticate by default, on HTTP requests and the `/socket` WebSocket alike. The
+Emby-era forms are refused while `EnableLegacyAuthorization` is `false`, the default on
+a fresh install since 1.2.0:
+
+- the `X-Emby-Authorization` header (sign-in returns `400`, "app is required")
+- the bare `X-Emby-Token` and `X-MediaBrowser-Token` headers (`401`; `403` on the socket)
+- the `api_key` query parameter, and the `Emby` scheme name in place of `MediaBrowser`
+
+1.2.0 through 1.3.x refused them too on a fresh install, while reporting 10.11.8, a
+version that accepts them by default. An install first set up on 1.0.x or 1.1.0 wrote
+that release's default, `true`, into `config/system.json` and still accepts them. A
+configuration adopted from Jellyfin keeps the value its `system.xml` had: on for a 10.11
+server (Jellyfin 12 turns it off when it upgrades one; Ferrofin does not). Set it to
+`false` in either case to match Jellyfin 12.
+
+If a client that sends these forms cannot be updated, turn the flag on (Jellyfin
+deprecated them, so only for such a client). jellyfin-web has no switch for it; use one of:
+
+- **Running server:** as an administrator, `GET /System/Configuration`, set
+  `"EnableLegacyAuthorization": true` and `POST` the whole document back to
+  `/System/Configuration`. It takes effect on the next request, without a restart.
+- **Stopped server:** set `"EnableLegacyAuthorization": true` in `config/system.json`.
+
+The `/socket` WebSocket used to read its token itself: it took `api_key`, `X-Emby-Token`
+and `X-MediaBrowser-Token` whatever the flag said, ignored the `Authorization` header, and
+opened without any credentials (keep-alive only). It now authenticates like every other
+request and, as in Jellyfin 12.2, refuses a connection without valid credentials with
+`403` before the upgrade. The bundled jellyfin-web 12.x is unaffected (it sends
+`?ApiKey=`), but a client whose socket sends `api_key` or a bare token header (jellyfin-web
+10.11, for one) now loses its live updates and remote control unless the flag is on.
+Clients built on jellyfin-sdk-kotlin send only the `Authorization` header on the socket;
+their socket now joins their session, so remote control and SyncPlay reach them.
+
 ## Unreleased — a set-up server no longer starts without its database
 
 This applies if setup has been completed (`IsStartupWizardCompleted` is `true` in
