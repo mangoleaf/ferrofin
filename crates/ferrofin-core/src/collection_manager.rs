@@ -442,10 +442,6 @@ impl CollectionManager for FerrofinCollectionManager {
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
-        // Even an empty collection gets its Data blob (upserts sync per child,
-        // but a zero-item create would otherwise leave Data without the
-        // LinkedChildren key Jellyfin expects to own).
-        item_data::sync_container_data(&self.db, id).await?;
         if options.item_id_list.is_empty() {
             return Ok(row);
         }
@@ -497,7 +493,6 @@ impl CollectionManager for FerrofinCollectionManager {
             .await
             .map_err(db_err)?;
         }
-        item_data::sync_container_data(&self.db, collection_id).await?;
         self.update_rating_to_items(collection_id, Rerate::Refresh)
             .await
     }
@@ -909,8 +904,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
             .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
             .collect();
         write_entries(self.db.writer(), &guid_to_db(id), &entries).await?;
-        // Write the full playlist state (owner/shares/children) into
-        // BaseItems.Data — the 10.11.8 storage Jellyfin reads on a swap back.
+        // Write the owner, open access and shares into BaseItems.Data, which
+        // 12.0 still serialises and each boot re-imports.
         item_data::sync_container_data(&self.db, id).await?;
         // Jellyfin's Playlist carries PlaylistMediaType in Data; without it a
         // swap back would default the playlist to Audio.
@@ -1154,7 +1149,6 @@ impl PlaylistManager for FerrofinPlaylistManager {
         });
         entries.splice(at..at, added);
         write_entries(self.db.writer(), &pid, &entries).await?;
-        item_data::sync_container_data(&self.db, playlist_id).await?;
         if item_ids.is_empty() {
             return Ok(());
         }
@@ -1188,7 +1182,6 @@ impl PlaylistManager for FerrofinPlaylistManager {
         if entries.len() != before {
             write_entries(self.db.writer(), &pid, &entries).await?;
         }
-        item_data::sync_container_data(&self.db, playlist).await?;
         self.update_rating_to_items(playlist).await
     }
 
@@ -1241,8 +1234,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             n => shown.get(n - 1).map_or(entries.len(), |prior| prior + 1),
         };
         entries.insert(target, entry);
-        write_entries(self.db.writer(), &pid, &entries).await?;
-        item_data::sync_container_data(&self.db, playlist).await
+        write_entries(self.db.writer(), &pid, &entries).await
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
@@ -2398,6 +2390,59 @@ mod tests {
         )
         .expect("uuid");
         assert_eq!(last, d, "no position should append at the end");
+    }
+
+    /// Adding, moving and removing entries leaves the playlist's `Data` alone
+    /// (12.0 keeps membership out of it), so a `Data` write that would fail
+    /// cannot fail an edit that committed.
+    #[tokio::test]
+    async fn membership_edits_never_write_data() {
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = playlist_manager(&db);
+        let owner = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Members".to_owned()),
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let data_before = crate::test_support::fetch_item(&db, playlist_id).await.data;
+        crate::item_data::fail_data_writes_of(&db, playlist_id).await;
+
+        let playlist = playlist_id.to_string();
+        let order = || async {
+            mgr.get_playlist_items(playlist_id, owner)
+                .await
+                .expect("items")
+                .iter()
+                .filter_map(|i| Uuid::parse_str(&i.id).ok())
+                .collect::<Vec<Uuid>>()
+        };
+        mgr.add_item_to_playlist(playlist_id, &[a, b], None, owner)
+            .await
+            .expect("add");
+        mgr.move_item(&playlist, &b.simple().to_string(), 0, owner)
+            .await
+            .expect("move");
+        assert_eq!(order().await, vec![b, a]);
+        mgr.remove_item_from_playlist(&playlist, &[a.simple().to_string()])
+            .await
+            .expect("remove");
+
+        assert_eq!(order().await, vec![b]);
+        assert_eq!(
+            crate::test_support::fetch_item(&db, playlist_id).await.data,
+            data_before
+        );
     }
 
     #[tokio::test]
