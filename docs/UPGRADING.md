@@ -8,6 +8,24 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — a genre image drawn from music art stays until you delete it
+
+Through 1.3.x, a genre whose movies and series had no poster could take music art
+(album covers, song or music-video images) carrying the same genre name for its
+generated image, which some clients show as the genre's tile. Jellyfin never draws that
+image, and Ferrofin no longer does either, but an image that was already drawn stays.
+A scan only redraws a generated genre image when its file changes on disk. Ferrofin also
+has no record of which items an image was drawn from, so it cannot remove these
+automatically.
+
+To clear one, as an administrator, send `GET /Genres?searchTerm={name}`, take the `Id`
+of the entry whose `Name` matches exactly, and send `DELETE /Items/{id}/Images/Primary`.
+(`GET /Genres/{name}` cannot find a name containing `-`, such as Hip-Hop, because it
+reads the dash as a URL slug.) The next full library scan (**Scan All Libraries** under
+Dashboard → Libraries, or the scheduled scan) draws a new image from the genre's movie
+and series posters if any exist. Otherwise it leaves the genre without one, as Jellyfin
+does. Scanning a single library does not redraw genre images.
+
 ## Unreleased — the "Clean up collections and playlists" task is gone
 
 Jellyfin 12 deleted this task, and Ferrofin has now removed it too. It ran about 3
