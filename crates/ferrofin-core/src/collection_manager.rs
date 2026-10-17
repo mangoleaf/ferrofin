@@ -123,9 +123,9 @@ async fn update_rating_to_items(
         if !keeps_rating {
             row.official_rating = visibility.rating_to_items(&row).await?;
         }
-        library_manager
-            .update_items(std::slice::from_ref(&row), None)
-            .await
+        // The rating columns alone: the rest of `row` is as read above, and
+        // saving it whole would undo a share change made to `Data` since.
+        library_manager.update_item_rating(row).await
     };
     match rerate.await {
         Err(error) if how == Rerate::Refresh => {
@@ -651,13 +651,12 @@ pub struct FerrofinPlaylistManager {
         Arc<dyn UserManager>,
     )>,
     /// Held for the whole of an add, remove, move or update: each reads the
-    /// entries (or, through the re-rate after it, the whole row) and writes
-    /// them back, so two overlapping edits would both start from the same
-    /// state and lose one of the changes (parallel per-track adds do exactly
-    /// that). Share writes made outside an update do not take it
-    /// (`update_playlist` calls `add_user_to_shares` under the guard), so a
-    /// re-rate's whole-row save can still put an older `Shares` back into
-    /// `Data`; the fix for that is a re-rate that saves only its rating columns.
+    /// entries and writes them back, so two overlapping edits would both
+    /// start from the same state and lose one of the changes (parallel
+    /// per-track adds do exactly that). Share writes made outside an update
+    /// do not take it (`update_playlist` calls `add_user_to_shares` under the
+    /// guard): the re-rate after an edit saves only its rating columns, never
+    /// `Data`, so it cannot put an older `Shares` back.
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
@@ -932,9 +931,12 @@ impl PlaylistManager for FerrofinPlaylistManager {
         self.require_playlist(request.id).await?;
         let _edit = self.entry_edits.lock().await;
         if let Some(name) = &request.name {
-            sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2 WHERE "Id" = ?1"#)
+            // With the `CleanName` the save derives (`BaseItemMapper.cs:279`),
+            // which is what a search by name matches.
+            sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2, "CleanName" = ?3 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(request.id))
                 .bind(name)
+                .bind(crate::text_util::get_clean_value(name))
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
@@ -1798,6 +1800,14 @@ mod tests {
         let created = mgr.create_collection(&options).await.expect("create");
         assert_eq!(created.name.as_deref(), Some("Favourites"));
         let collection_id = Uuid::parse_str(&created.id).expect("uuid");
+        assert_eq!(
+            crate::test_support::fetch_item(&db, collection_id)
+                .await
+                .clean_name
+                .as_deref(),
+            Some("favourites"),
+            "a new box set is found by name"
+        );
 
         mgr.add_to_collection(collection_id, &[movie_b])
             .await
@@ -2734,6 +2744,53 @@ mod tests {
         );
     }
 
+    /// A re-rate saves only the rating: a share revoked between the re-rate's
+    /// read and its save stays revoked in `Data`, so the boot re-import of the
+    /// shares from `Data` does not bring it back.
+    #[tokio::test]
+    async fn a_rerate_keeps_a_share_change_made_since_its_read() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let bob = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                users: vec![PlaylistUserPermissions::new(bob, true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        // The re-rate's read, then a revoke that lands before its save.
+        let mut read = crate::test_support::fetch_item(&db, playlist_id).await;
+        mgr.remove_user_from_shares(playlist_id, bob, &PlaylistUserPermissions::new(bob, true))
+            .await
+            .expect("revoke");
+        read.official_rating = Some("PG".to_owned());
+        mgr.library_manager
+            .update_item_rating(read)
+            .await
+            .expect("re-rate");
+
+        let stored = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(stored.official_rating.as_deref(), Some("PG"));
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .expect("shares")
+                .is_empty(),
+            "the revoked share stays revoked after a restart"
+        );
+    }
+
     /// Builds a playlist manager over `db` (the repeated three-collaborator
     /// constructor the access tests share).
     fn playlist_manager(db: &ferrofin_db::Database) -> FerrofinPlaylistManager {
@@ -2896,15 +2953,30 @@ mod tests {
         )
         .expect("uuid");
 
+        assert_eq!(
+            crate::test_support::fetch_item(&db, playlist_id)
+                .await
+                .clean_name
+                .as_deref(),
+            Some("mutable"),
+            "a new playlist is found by name"
+        );
         mgr.update_playlist(&PlaylistUpdateRequest {
             id: playlist_id,
             user_id: alice,
+            name: Some("Road Trip!".to_owned()),
             users: Some(vec![PlaylistUserPermissions::new(dave, false)]),
             public: Some(true),
             ..PlaylistUpdateRequest::default()
         })
         .await
         .expect("update");
+        let renamed = crate::test_support::fetch_item(&db, playlist_id).await;
+        assert_eq!(
+            (renamed.name.as_deref(), renamed.clean_name.as_deref()),
+            (Some("Road Trip!"), Some("road trip")),
+            "a rename is found by its new name"
+        );
 
         // The share list was replaced wholesale (bob is gone, dave read-only).
         assert_eq!(

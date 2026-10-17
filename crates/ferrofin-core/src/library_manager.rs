@@ -2819,6 +2819,16 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
+    async fn update_item_rating(&self, mut item: BaseItemEntity) -> Result<(), ServiceError> {
+        if let Some(visibility) = &self.visibility {
+            visibility
+                .update_rating_scores(std::slice::from_mut(&mut item))
+                .await?;
+        }
+        self.persistence.update_rating(&item).await?;
+        Ok(())
+    }
+
     async fn update_item_provider_ids(
         &self,
         item_id: Uuid,

@@ -1470,6 +1470,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// Writes an existing row's rating columns from `item` — `OfficialRating`,
+    /// `UnratedType` and the parental score (`InheritedParentalRatingValue` /
+    /// `…SubValue`) — with its `DateLastSaved` stamp and nothing else, then
+    /// announces `ItemUpdated`. The save behind a box set's or playlist's
+    /// re-rate from its members: a whole-row [`save_items`](Self::save_items)
+    /// of a row read earlier would put back every other column as it was
+    /// read, `Data` (the playlist shares) included. Returns whether the row
+    /// was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let _ = item;
+        Ok(false)
+    }
+
     /// The ids of the rows of `kind` never refreshed (`DateLastRefreshed`
     /// unset), in id order — with `by_name_only`, only those in no library
     /// (no `TopParentId`: an artist known only by name). The persisted
