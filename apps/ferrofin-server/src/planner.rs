@@ -65,11 +65,6 @@ use ferrofin_traits::system::ServerApplicationPaths as _;
 /// Used when the request declares no `SegmentLength`.
 const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 3;
 
-/// Assumed output frame rate for the NVENC GOP keyframe calc when the source
-/// frame rate is unknown (probing returned none). Only fires on pathological
-/// sources; `25` is a safe PAL-ish default. Candidate setting.
-const DEFAULT_KEYFRAME_FPS: f32 = 25.0;
-
 /// The default HLS segment container when the request declares none.
 ///
 /// Port of the `DynamicHlsController` fallback: MPEG-TS (`ts`) segments.
@@ -322,6 +317,31 @@ fn warn_unsupported_accelerator(options: &EncodingOptions) {
             "this hardware accelerator is not supported by Ferrofin; transcoding \
              in software instead. Supported: nvenc, vaapi, qsv."
         );
+    }
+}
+
+/// The rate ffmpeg encodes a constant-rate output at when no `-r` is set.
+///
+/// Port of the first rule of libavformat's `av_guess_frame_rate`, whose
+/// constants these are: the source's real rate (`r_frame_rate`), not its
+/// average, which would misplace every cut on a VFR source; but the average
+/// when the real rate is a timestamp-grid artefact (above 210 against an
+/// average below 70, e.g. `1000/1` on a millisecond grid). Divergence:
+/// upstream reads `RealFrameRate` alone, which pins a GOP of 3000 frames
+/// (100 s at the 30 fps ffmpeg encodes at) on such a file. ffmpeg's
+/// field-coding rule is not ported: it needs the codec frame rate, which
+/// ffprobe does not report, so a doubled-`tbr` source (`25 fps, 50 tbr`)
+/// still gets a GOP of two segments on the encoders that take a GOP alone.
+fn guessed_frame_rate(video: &MediaStream) -> Option<f32> {
+    // TODO(parity): the doubled-`tbr` case. Path: give libsvtav1 forced
+    // keyframes like NVENC/QSV (it honours them on ffmpeg n9.0.1 with
+    // SVT-AV1 4.2) once the oldest supported ffmpeg is checked, which leaves
+    // only AMF/RKMPP, never selected here, on a guessed GOP.
+    match (video.real_frame_rate, video.average_frame_rate) {
+        (Some(real), Some(average)) if real > 210.0 && average > 0.0 && average < 70.0 => {
+            Some(average)
+        }
+        (real, _) => real,
     }
 }
 
@@ -1219,9 +1239,6 @@ impl FerrofinStreamStatePlanner {
         // `EncodingHelper` path (libx264 / copy) is used.
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
-        // The encoder is NVENC. Distinct from `hw_filters` below and used only
-        // where a fact about the *encoder* is what matters.
-        let nvenc_video = video_encoder.ends_with("_nvenc");
         // Everything the ported hardware matrix reads about the job. The
         // render-node arguments are VAAPI/QSV territory and unused by the CUDA
         // branch; the hardware-transcoding roadmap phase 4 resolves them from the encoding
@@ -1696,45 +1713,31 @@ impl FerrofinStreamStatePlanner {
                 ),
             );
             let output_framerate = self.encoding_helper.framerate_param(state);
-            // Force a keyframe at every segment boundary so the HLS muxer cuts
+            // Put a keyframe at every segment boundary so the HLS muxer cuts
             // exactly on `-hls_time`. Without this, ffmpeg can only cut at the
             // encoder's natural GOP (libx264 keyint ≈250 frames ≈10 s), so the
             // first segment overruns its target length and time-to-first-segment
-            // — the dominant startup latency — balloons. Port of Jellyfin's
-            // `keyFrameArg`/`gopArg`.
-            if nvenc_video && !progressive {
-                // NVENC ignores the `-force_key_frames` expression; pin the GOP
-                // instead (Jellyfin's gopArg): N = ceil(segment_len × fps).
-                let fps = output_framerate
-                    .or_else(|| {
-                        state
-                            .video_stream
-                            .as_ref()
-                            .and_then(MediaStream::reference_frame_rate)
-                    })
-                    .unwrap_or(DEFAULT_KEYFRAME_FPS);
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "keyint is a small positive frame count"
-                )]
-                let keyint = (f64::from(fps) * f64::from(state.segment_length_secs)).ceil() as i64;
-                push_split(&mut args, "-g:v:0");
-                args.push(keyint.to_string());
-                push_split(&mut args, "-keyint_min:v:0");
-                args.push(keyint.to_string());
-                push_split(&mut args, "-sc_threshold:v:0");
-                args.push("0".to_owned());
+            // — the dominant startup latency — balloons.
+            if progressive {
+                // `GetProgressiveVideoArguments`' fixed five-second interval.
+                push_split(&mut args, "-force_key_frames:0 expr:gte(t,n_forced*5)");
             } else {
-                push_split(&mut args, "-force_key_frames:0");
-                args.push(format!(
-                    "expr:gte(t,n_forced*{})",
-                    if progressive {
-                        5
-                    } else {
-                        state.segment_length_secs
-                    }
-                ));
+                // The GOP counts output frames, and ffmpeg encodes an hls
+                // output at a constant rate: the `-r` this job sets, else the
+                // rate it guesses from the source. Divergence: upstream reads
+                // `RealFrameRate` alone, which pins a GOP of two segments when
+                // `-r` halves the rate; see `guessed_frame_rate` for the other.
+                let frame_rate = output_framerate
+                    .or_else(|| state.video_stream.as_ref().and_then(guessed_frame_rate));
+                push_split(
+                    &mut args,
+                    &ferrofin_mediaencoding::encoding_helper::helper::hls_video_key_frame_arguments(
+                        caps,
+                        &video_encoder,
+                        state.segment_length_secs,
+                        frame_rate,
+                    ),
+                );
             }
             // The plain software filter chain (downscale/tonemap/8-bit); the
             // burn-in branches below fold `sw_filters` into their own graphs
@@ -4223,7 +4226,7 @@ mod tests {
         // Force a keyframe on every 3 s segment boundary so the HLS muxer cuts on
         // `-hls_time` instead of libx264's ~10 s natural GOP — halving TTFS.
         assert!(
-            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3) -sc_threshold:v:0 0"),
             "segment-boundary keyframes expected: {args}"
         );
         assert!(
@@ -4463,6 +4466,13 @@ mod tests {
         // Gone with the bolt-on: the fixed constant-quality target and `-crf`.
         assert!(!args.contains("-cq"), "{args}");
         assert!(!args.contains("-crf"), "{args}");
+        // NVENC's forced keyframes cut segments once they are IDR frames, and
+        // need no frame rate: this source has none.
+        assert!(
+            args.contains("-forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "{args}"
+        );
+        assert!(!args.contains("-g:v:0"), "{args}");
     }
 
     /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but
@@ -4855,6 +4865,50 @@ mod tests {
         assert!(args.contains("scale_vaapi="), "{args}");
     }
 
+    #[tokio::test]
+    async fn only_an_amd_hevc_vaapi_hls_encode_extracts_the_extradata() {
+        // AMD's HEVC encoder writes in-band parameter sets that disagree with
+        // the extradata, which breaks `hvc1` decoding. The probed driver is the
+        // only source of the AMD flag, so this goes through the prober.
+        const AMD: &str = "Mesa Gallium driver 24.0.0 for AMD Radeon";
+        const EXTRACT: &str = "-flags:v -global_header -bsf:v extract_extradata=remove=0";
+        for (driver, codec, kind, expected) in [
+            (AMD, "hevc", PlaylistKind::Vod, true),
+            (AMD, "h264", PlaylistKind::Vod, false),
+            ("Intel iHD driver", "hevc", PlaylistKind::Vod, false),
+            (AMD, "hevc", PlaylistKind::Progressive, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_vaapi_ffmpeg(dir.path(), driver);
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                vaapi_caps(),
+                EncodingOptions {
+                    allow_hevc_encoding: true,
+                    ..vaapi_options()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some(codec.to_owned());
+            req.allow_video_stream_copy = false;
+            let plan = p.plan(&req, false, None, kind).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains(&format!("-c:v {codec}_vaapi")), "{args}");
+            assert_eq!(
+                args.contains(EXTRACT),
+                expected,
+                "{driver} {codec} {kind:?}: {args}"
+            );
+        }
+    }
+
     /// A QSV-capable ffmpeg on `platform`.
     fn qsv_caps(
         platform: ferrofin_mediaencoding::encoding_helper::hw::Platform,
@@ -4945,6 +4999,75 @@ mod tests {
             ),
             "{args}"
         );
+        // QSV's forced I-frames are not IDR frames until `forced_idr` says so,
+        // and only IDR frames can cut a segment (not yet run on an Intel GPU).
+        assert!(
+            args.contains("-forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_libsvtav1_gop_is_one_segment_of_output_frames() {
+        // libsvtav1 takes the GOP alone, sized in output frames: the `-r` a
+        // `MaxFramerate` sets, else the rate ffmpeg guesses and encodes at.
+        for (average, real, max_framerate, gop) in [
+            (None, Some(23.976), None, Some(72)),
+            (Some(59.94), Some(59.94), Some(30.0), Some(90)),
+            // A VFR phone clip: its average (24.04) would give 73 and cut
+            // 4.9 s / 2.4 s segments.
+            (Some(24.04), Some(30.0), None, Some(90)),
+            // A millisecond timestamp grid: ffmpeg encodes at the average, not
+            // at the real 1000 that upstream sizes a 100 s GOP by.
+            (Some(30.0), Some(1000.0), None, Some(90)),
+            // ffmpeg's bounds: a real 240 fps source, a real rate of 210 or
+            // less, an average of 70 or more, and no usable average all keep
+            // the real rate.
+            (Some(240.0), Some(240.0), None, Some(720)),
+            (Some(30.0), Some(210.0), None, Some(630)),
+            (Some(70.0), Some(1000.0), None, Some(3000)),
+            (Some(120.0), Some(1000.0), None, Some(3000)),
+            (Some(0.0), Some(1000.0), None, Some(3000)),
+            (None, Some(1000.0), None, Some(3000)),
+            // No real rate, no GOP, as upstream.
+            (Some(23.976), None, None, None),
+        ] {
+            let video = MediaStream {
+                average_frame_rate: average,
+                real_frame_rate: real,
+                ..video_stream("mpeg4")
+            };
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                FfmpegCapabilities::builder()
+                    .encoders(["libx264", "libsvtav1"])
+                    .build(),
+                EncodingOptions {
+                    allow_av1_encoding: true,
+                    ..EncodingOptions::default()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("av1".to_owned());
+            req.allow_video_stream_copy = false;
+            req.max_framerate = max_framerate;
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v libsvtav1"), "{args}");
+            let case = format!("{average:?}/{real:?}/{max_framerate:?}: {args}");
+            match gop {
+                Some(gop) => assert!(
+                    args.contains(&format!("-g:v:0 {gop} -keyint_min:v:0 {gop}")),
+                    "{case}"
+                ),
+                None => assert!(!args.contains("-g:v:0"), "{case}"),
+            }
+            assert!(!args.contains("-force_key_frames"), "{case}");
+        }
     }
 
     #[tokio::test]
