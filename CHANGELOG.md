@@ -175,6 +175,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- A genre whose movies and series have no poster no longer gets an image drawn from music
+  art of the same genre name, as in Jellyfin, where only movie and series posters are
+  sampled. An image already drawn that way stays until deleted. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - The "Clean up collections and playlists" scheduled task is removed, as in Jellyfin 12. It
   ran at every start and removed each collection and playlist member whose file it could not
   see, so a boot with the media storage not yet mounted emptied every playlist and collection
