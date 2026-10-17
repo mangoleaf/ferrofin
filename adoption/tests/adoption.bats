@@ -96,6 +96,19 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
   [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
 }
 
+@test "compare_smoke: a skipped probe is left out on both sides, every other line still counts" {
+  smoke oracle.txt 120; smoke unscanned.txt 120; smoke fewer.txt 119
+  echo '200  2                                             /Persons?UserId=dddddddddddddddddddddddddddddddd&Limit=0' >> oracle.txt
+  echo '200  0                                             /Persons?UserId=dddddddddddddddddddddddddddddddd&Limit=0' >> unscanned.txt
+  echo '200  0                                             /Persons?UserId=dddddddddddddddddddddddddddddddd&Limit=0' >> fewer.txt
+  run adoption_compare_smoke oracle.txt unscanned.txt
+  [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt unscanned.txt)" ]
+  run adoption_compare_smoke oracle.txt unscanned.txt '/Persons\?'
+  [ -z "$output" ]
+  run adoption_compare_smoke oracle.txt fewer.txt '/Persons\?'
+  [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
+}
+
 @test "compare_smoke: a view that is listed by one server and not the other fails" {
   smoke oracle.txt 120; smoke views.txt 120 yes
   run adoption_compare_smoke oracle.txt views.txt
@@ -258,6 +271,12 @@ EOS
   run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
   [ -z "$output" ]
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh")" -eq 10 ]
+}
+
+@test "run.sh: only a 10.11 source compares /Persons, and the whole smoke again, after the scan" {
+  grep -qF "case \$expected in 10.11.*) after_scan='/Persons\\?';; *) after_scan=;; esac" "$ADOPTION/run.sh"
+  grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke.txt\" \"\$after_scan\")" "$ADOPTION/run.sh"
+  grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke-scan.txt\" | sed 's/^/after scan: /')" "$ADOPTION/run.sh"
 }
 
 @test "run.sh: the oracle is Jellyfin 12.2 unless --oracle or ADOPTION_ORACLE picks 12.1" {
