@@ -117,6 +117,9 @@ struct FileConfig {
     /// 2) and fail the whole file on a string, so every value goes through
     /// [`Config::tvdb_cache_duration`]'s check and warning instead.
     tvdb_cache_hours: Option<String>,
+    /// Read as text for the same reason as `tvdb_cache_hours`; checked by
+    /// [`Config::tvdb_token_max_age`].
+    tvdb_token_days: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
     ffmpeg_path: Option<PathBuf>,
@@ -297,6 +300,15 @@ pub struct Config {
     /// where the client is built, so a bad value warns (tracing is up by
     /// then) and the default applies — it never stops the server.
     pub tvdb_cache_hours: Option<String>,
+
+    /// How old TheTVDB's bearer token may get before Ferrofin logs in again,
+    /// in whole days, as written: the TVDB plugin's 25 (`LoginAsync`), inside
+    /// the month a TVDB v4 token is valid for. Resolved
+    /// `FERROFIN_TVDB_TOKEN_DAYS` env > `tvdb_token_days` in `config.toml` >
+    /// unset; validated by [`tvdb_token_max_age`](Self::tvdb_token_max_age)
+    /// where the client is built, so a bad value warns and the default
+    /// applies.
+    pub tvdb_token_days: Option<String>,
 
     /// fanart.tv personal API key (`client_key`), raising rate limits and
     /// unlocking fresher artwork. Empty = the built-in key only. From
@@ -613,6 +625,11 @@ impl Config {
             .filter(|raw| !raw.trim().is_empty())
             .or(file.tvdb_cache_hours);
 
+        let tvdb_token_days = env
+            .var("FERROFIN_TVDB_TOKEN_DAYS")
+            .filter(|raw| !raw.trim().is_empty())
+            .or(file.tvdb_token_days);
+
         let fanart_personal_api_key = env
             .var("FERROFIN_FANART_KEY")
             .or(file.fanart_personal_api_key)
@@ -679,6 +696,7 @@ impl Config {
             tvdb_api_key,
             tvdb_subscriber_pin,
             tvdb_cache_hours,
+            tvdb_token_days,
             fanart_personal_api_key,
             musicbrainz_base_url,
             ffmpeg_path,
@@ -793,6 +811,30 @@ impl Config {
         }
     }
 
+    /// TheTVDB's token max age ([`tvdb_token_days`](Self::tvdb_token_days)):
+    /// the configured whole days, or the plugin's 25
+    /// ([`ferrofin_providers::tvdb::DEFAULT_TOKEN_MAX_AGE`]) when unset. A
+    /// value outside 1–29 days is refused with a warning and the default is
+    /// used: TheTVDB expires a token after a month, so 30 or more would let
+    /// every lookup fail before the renewal. Call it once tracing is
+    /// installed.
+    #[must_use]
+    pub fn tvdb_token_max_age(&self) -> std::time::Duration {
+        let default = ferrofin_providers::tvdb::DEFAULT_TOKEN_MAX_AGE;
+        let Some(raw) = self.tvdb_token_days.as_deref() else {
+            return default;
+        };
+        if let Ok(days @ 1..=29) = raw.trim().parse::<u32>() {
+            return std::time::Duration::from_hours(u64::from(days) * 24);
+        }
+        tracing::warn!(
+            value = raw,
+            default_days = default.as_secs() / 86_400,
+            "FERROFIN_TVDB_TOKEN_DAYS / tvdb_token_days is not a whole number of days from 1 to 29; using the default"
+        );
+        default
+    }
+
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for
     /// `ferrofin_db::Database::connect`.
     #[must_use]
@@ -830,6 +872,7 @@ impl Config {
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
             tvdb_cache_hours: None,
+            tvdb_token_days: None,
             fanart_personal_api_key: String::new(),
             musicbrainz_base_url: String::new(),
             ffmpeg_path: None,
@@ -1385,6 +1428,37 @@ mod tests {
                 ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION,
                 "{env_value:?} {file:?}"
             );
+        }
+    }
+
+    /// `FERROFIN_TVDB_TOKEN_DAYS` beats `tvdb_token_days` in `config.toml`,
+    /// unset is the plugin's 25 days, and a value that is not a whole number
+    /// of days from 1 to 29 warns and falls back to it.
+    #[test]
+    fn tvdb_token_days_env_beats_file_and_bad_values_fall_back() {
+        let days = |config: &Config| config.tvdb_token_max_age().as_secs() / 86_400;
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(days(&unset), 25, "the plugin's LoginAsync");
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "tvdb_token_days = 7\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(days(&Config::load_from(cli(), &FakeEnv::new()).unwrap()), 7);
+        let env = FakeEnv::new().with("FERROFIN_TVDB_TOKEN_DAYS", " 29 ");
+        assert_eq!(days(&Config::load_from(cli(), &env).unwrap()), 29);
+        let blank = FakeEnv::new().with("FERROFIN_TVDB_TOKEN_DAYS", "  ");
+        assert_eq!(days(&Config::load_from(cli(), &blank).unwrap()), 7);
+        for bad in ["0", "30", "-1", "1.5", "25d"] {
+            let env = FakeEnv::new().with("FERROFIN_TVDB_TOKEN_DAYS", bad);
+            assert_eq!(days(&Config::load_from(cli(), &env).unwrap()), 25, "{bad}");
+        }
+        for bad in ["30", "1.5", "\"25d\"", "true"] {
+            std::fs::write(&toml, format!("tvdb_token_days = {bad}\n")).unwrap();
+            let config = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+            assert_eq!(days(&config), 25, "file {bad}");
         }
     }
 

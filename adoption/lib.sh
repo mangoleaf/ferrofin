@@ -8,10 +8,11 @@ ADOPTION_IGNORE='/System/Info|/ScheduledTasks|/Plugins|/Devices|/Library/Virtual
 # What a boot repair logs when it did something; a second boot must log none of these.
 ADOPTION_REPAIR_RE='imported playlist|repaired |rewrote |recomputed |merged |backfilled |dropped dead|consolidat|reverted'
 
-# adoption_normalise <smoke-file>: the comparable form of a smoke output — item ids redacted
-# (they differ per copy), image byte counts dropped (encoders differ), ignored paths removed.
+# adoption_normalise <smoke-file> [skip-re]: the comparable form of a smoke output — item ids
+# redacted (they differ per copy), image byte counts dropped (encoders differ), ignored paths
+# and the probes skip-re matches removed.
 adoption_normalise() {
-  sed -E 's/[0-9a-f]{32}/<id>/g; s/\(bytes=[0-9]+\)/(bytes)/' "$1" | grep -Ev "$ADOPTION_IGNORE"
+  sed -E 's/[0-9a-f]{32}/<id>/g; s/\(bytes=[0-9]+\)/(bytes)/' "$1" | grep -Ev "$ADOPTION_IGNORE${2:+|$2}"
 }
 
 # adoption_check_boot_log <server-log> <expected-generation>: one reason per line, nothing when
@@ -24,11 +25,12 @@ adoption_check_boot_log() {
   if grep -Eq '"level":"ERROR"' "$log"; then echo "ERROR in boot log"; fi
 }
 
-# adoption_compare_smoke <oracle> <smoke>: a reason when the normalised answers differ, naming
-# the oracle's release (ORACLE_VERSION, which run.sh sets from --oracle).
+# adoption_compare_smoke <oracle> <smoke> [skip-re]: a reason when the normalised answers differ,
+# leaving out the probes skip-re matches on both sides, naming the oracle's release
+# (ORACLE_VERSION, which run.sh sets from --oracle).
 adoption_compare_smoke() {
-  local oracle=$1 smoke=$2
-  diff -q <(adoption_normalise "$oracle") <(adoption_normalise "$smoke") >/dev/null \
+  local oracle=$1 smoke=$2 skip=${3:-}
+  diff -q <(adoption_normalise "$oracle" "$skip") <(adoption_normalise "$smoke" "$skip") >/dev/null \
     || echo "smoke differs from Jellyfin ${ORACLE_VERSION:-12.1} (diff $oracle $smoke)"
 }
 

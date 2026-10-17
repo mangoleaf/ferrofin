@@ -53,6 +53,12 @@ testing on the release branch will validate them against a real library.
 2. The read-only probes in `smoke.sh` produce the same normalised summaries as **Jellyfin
    12.2** on the same library. IDs and image byte counts are normalised; server-info,
    task, plugin, device, virtual-folder, activity-log and session lines are excluded.
+   A 10.11 source has no music-artist credits until its first 12.x or Ferrofin scan
+   (10.11 never creates them; 12.x creates them on a metadata refresh, `AudioFileProber`
+   and `AlbumMetadataService.SetPeople`). So a 10.11 path compares `/Persons` only after
+   the scan in check 5, where the whole smoke is compared with the oracle again. This
+   assumes the oracle and the 12.x fixtures carry their release's own scan, as
+   `synthetic.py` builds them; `build-fixtures.sh` boots each release without scanning.
 3. `PRAGMA integrity_check` and `PRAGMA foreign_key_check` are clean on the adopted file,
    apart from the documented `IX_Peoples_NameLower` exception below. SQLite query failures
    are reported as failures.
@@ -192,7 +198,8 @@ PASS  12.1.0    jellyfin-12.1-from-12
 The second column is the generation the gate matched — the id *set*, so 10.11.9 reports
 `10.11.8` and 10.11.10 reports `10.11.11`; `run.sh` knows which is expected for which fixture.
 A `FAIL` line names every check that failed and points at the diff; the copy is kept under
-`work/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` and the metadata
+`work/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` (and, for a 10.11
+path, the post-scan `<name>.smoke-scan.txt`) and the metadata
 presence baseline `<name>.metadata.json` beside it. The per-stage
 `<name>.metadata-after-{adoption,restart,scan}.log` files record the metadata results.
 Watch-history baselines and results use the corresponding `.watch-history.json`
