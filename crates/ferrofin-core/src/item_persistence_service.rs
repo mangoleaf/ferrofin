@@ -1734,21 +1734,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .await
             .map_err(db_err)?;
         let closure: Vec<String> = deletion_closure_rows(&mut tx, &given).await?;
-        let known: std::collections::HashSet<String> = closure.iter().cloned().collect();
         detach_user_data(&mut tx, &closure).await?;
-        // The containers whose membership shrinks, for their `Data` re-sync
-        // after the commit (the deleted ones among them no-op there).
-        let mut containers: Vec<String> = Vec::new();
+        // A playlist or collection that loses a member needs no `Data`
+        // re-sync: 12.0 keeps membership out of `Data` (`[JsonIgnore]`), and
+        // the playlist keys it does hold are not changed by a delete.
         for chunk in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ids = numbered_placeholders(chunk.len());
-            let select = format!(
-                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#
-            );
-            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select.as_str()));
-            for id in chunk {
-                query = query.bind(id);
-            }
-            containers.extend(query.fetch_all(&mut *tx).await.map_err(db_err)?);
             for sql in [
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
@@ -1778,13 +1769,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             query.execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
-        containers.sort_unstable();
-        containers.dedup();
-        for container in containers.iter().filter(|c| !known.contains(*c)) {
-            if let Ok(container) = Uuid::parse_str(container) {
-                crate::item_data::sync_container_data(&self.db, container).await?;
-            }
-        }
         Ok(closure
             .iter()
             .filter_map(|id| Uuid::parse_str(id).ok())
@@ -7252,14 +7236,35 @@ mod tests {
             .expect("link b");
 
         let svc = FerrofinItemPersistenceService::new(db.clone());
+        crate::item_data::seed_playlist_owner(&db, playlist, Uuid::new_v4()).await;
+        crate::item_data::sync_container_data(&db, playlist)
+            .await
+            .expect("sync");
+        let playlist_data = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(playlist))
+            .fetch_one(db.pool())
+            .await
+            .expect("playlist Data")
+        };
+        let data_before = playlist_data().await;
 
         // Delete a member (the ChildId FK direction): its link clears, the
-        // playlist and other member survive — no FK 787.
+        // playlist and other member survive — no FK 787. Membership is not in
+        // `Data`, so the playlist's copy is left as it was.
         svc.delete_items(&[member_a])
             .await
             .expect("delete member_a");
         assert!(!svc.item_exists(member_a).await.expect("exists a"));
         assert!(svc.item_exists(playlist).await.expect("playlist survives"));
+        assert_eq!(playlist_data().await, data_before);
+        // A re-sync leaves it as it is too: the delete changed nothing it writes.
+        crate::item_data::sync_container_data(&db, playlist)
+            .await
+            .expect("re-sync");
+        assert_eq!(playlist_data().await, data_before);
 
         // Delete the playlist (the ParentId FK direction) while member_b's link
         // still exists — must clear it instead of tripping FK 787.
