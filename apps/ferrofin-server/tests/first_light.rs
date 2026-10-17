@@ -5,7 +5,8 @@
 //! [`ferrofin_server::seed::seed_default_admin`]) and a couple of scanned movie
 //! items, then drives the exact sequence a Jellyfin client performs on first
 //! contact — via `tower`'s [`ServiceExt::oneshot`] against the real
-//! [`ferrofin_api::create_router`] (no network sockets):
+//! [`ferrofin_api::create_router`] (no network sockets; only the session
+//! WebSocket test binds a loopback listener):
 //!
 //! 1. `GET  /System/Info/Public` — anonymous, `200`.
 //! 2. `POST /Users/AuthenticateByName` — `200` → `AuthenticationResult`.
@@ -683,4 +684,135 @@ async fn usernames_are_keyed_invariant_uppercase_and_legacy_auth_is_off() {
             "{label} is an Emby-era form, refused with EnableLegacyAuthorization = false"
         );
     }
+}
+
+/// A client side of the session WebSocket.
+type ClientSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens `/socket{query}` on `addr` with an optional header; `Err` carries the
+/// status the server refused the upgrade with.
+async fn open_socket(
+    addr: std::net::SocketAddr,
+    query: &str,
+    header: Option<(&str, &str)>,
+) -> Result<ClientSocket, u16> {
+    use tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest, http::HeaderName};
+    let mut request = format!("ws://{addr}/socket{query}")
+        .into_client_request()
+        .expect("socket request");
+    if let Some((name, value)) = header {
+        request.headers_mut().insert(
+            HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+            value.parse().expect("header value"),
+        );
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(Error::Http(response)) => Err(response.status().as_u16()),
+        Err(e) => panic!("/socket{query} {header:?}: {e}"),
+    }
+}
+
+/// The session WebSocket authenticates as every request does (C#
+/// `WebSocketManager.WebSocketRequestHandler` → `AuthService.Authenticate`), so
+/// `EnableLegacyAuthorization` decides the Emby-era forms on it too, and a
+/// refused socket is upstream's `403` before the upgrade (#75).
+///
+/// A socket carrying only the `Authorization` header, which is how
+/// jellyfin-sdk-kotlin connects, joins its session: the `ForceKeepAlive`
+/// greeting goes only to a socket that has one.
+#[tokio::test]
+async fn the_session_socket_honours_legacy_authorization() {
+    use futures_util::StreamExt as _;
+
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let authed = step_authenticate(&router).await;
+    let auth_header = client_auth_with_token(&authed.access_token);
+    let token = authed.access_token.as_str();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let served = router.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, served).await;
+    });
+
+    let mut sdk = open_socket(addr, "", Some(("authorization", &auth_header)))
+        .await
+        .expect("an Authorization-header socket upgrades");
+    let greeting = tokio::time::timeout(std::time::Duration::from_secs(10), sdk.next())
+        .await
+        .expect("greeted in time")
+        .expect("a frame")
+        .expect("a readable frame");
+    let greeting: serde_json::Value =
+        serde_json::from_str(greeting.to_text().expect("text frame")).expect("json frame");
+    assert_eq!(
+        greeting["MessageType"], "ForceKeepAlive",
+        "the socket joined its session"
+    );
+    drop(sdk);
+
+    let api_key = format!("?ApiKey={token}");
+    let legacy_query = format!("?api_key={token}");
+    let emby_forms = [
+        ("?api_key=", legacy_query.as_str(), None),
+        ("X-Emby-Token", "", Some(("x-emby-token", token))),
+        (
+            "X-MediaBrowser-Token",
+            "",
+            Some(("x-mediabrowser-token", token)),
+        ),
+        (
+            "X-Emby-Authorization",
+            "",
+            Some(("x-emby-authorization", auth_header.as_str())),
+        ),
+    ];
+    assert!(open_socket(addr, &api_key, None).await.is_ok(), "?ApiKey=");
+    assert_eq!(
+        open_socket(addr, "", None).await.err(),
+        Some(403),
+        "no token"
+    );
+    for (label, query, header) in emby_forms {
+        assert_eq!(
+            open_socket(addr, query, header).await.err(),
+            Some(403),
+            "{label} is refused while EnableLegacyAuthorization is false"
+        );
+    }
+
+    // Turn legacy authorization on as an administrator would.
+    let get = Request::builder()
+        .uri("/System/Configuration")
+        .header(header::AUTHORIZATION, &auth_header)
+        .body(Body::empty())
+        .unwrap();
+    let mut config = body_json(router.clone().oneshot(get).await.unwrap()).await;
+    config["EnableLegacyAuthorization"] = serde_json::Value::Bool(true);
+    let post = Request::builder()
+        .method("POST")
+        .uri("/System/Configuration")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(config.to_string()))
+        .unwrap();
+    let status = router.clone().oneshot(post).await.unwrap().status();
+    assert_eq!(status, StatusCode::NO_CONTENT, "configuration saved");
+
+    for (label, query, header) in emby_forms {
+        assert!(
+            open_socket(addr, query, header).await.is_ok(),
+            "{label} upgrades once EnableLegacyAuthorization is true"
+        );
+    }
+    assert_eq!(
+        open_socket(addr, "", None).await.err(),
+        Some(403),
+        "a socket without credentials is refused whatever the flag says"
+    );
 }

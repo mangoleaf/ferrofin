@@ -6,16 +6,19 @@
 //! calls all succeeded. These routes are NOT part of the OpenAPI contract (Swagger
 //! doesn't describe WebSocket endpoints), so they are registered as extras.
 //!
-//! The socket accepts the upgrade, answers pings, sends periodic keep-alives,
-//! and — when the caller authenticates via the `api_key` query parameter —
-//! **registers a message sink** on the [`SessionMessageBus`] keyed by the
+//! The socket resolves its credentials as an HTTP request does (C#
+//! `WebSocketManager.WebSocketRequestHandler` → `AuthService.Authenticate`), so
+//! the Emby-era credential forms follow `EnableLegacyAuthorization` here too, and
+//! a request without valid credentials is refused with `403` before the upgrade.
+//! No route policy runs on it (remote access, access schedule), as upstream.
+//! It then answers pings, sends periodic keep-alives, and **registers a message
+//! sink** on the [`SessionMessageBus`] keyed by the
 //! caller's session id, so server→client pushes (SyncPlay commands/group updates
 //! and the remote-control `Play`/`Playstate`/`GeneralCommand` casts) reach this
 //! client. The session manager also treats a bus-registered session as having a
 //! live controller, which is what makes it appear in the cast-to-device menu
 //! (`GET /Sessions?ControllableByUserId=…` → `SupportsRemoteControl`). The sink
-//! is unregistered when the socket closes. An anonymous socket still holds open (keep-alive only), so a client
-//! that opens the socket before authenticating is never dropped.
+//! is unregistered when the socket closes.
 //!
 //! Closing the socket also **ends the session** when no other socket took its
 //! place -- the port of `WebSocketController.OnConnectionClosed` ->
@@ -27,13 +30,15 @@
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{RawQuery, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use ferrofin_traits::options::AuthorizationInfo;
 use tokio::sync::mpsc;
 
+use crate::auth::AuthenticatedIdentity;
+use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The server keep-alive interval advertised to the client, in seconds
@@ -116,16 +121,27 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 /// `GET /socket` — upgrade the connection to a WebSocket.
 ///
-/// jellyfin-web passes the access token as the `api_key` query parameter. We
-/// resolve it to the caller's session id (best-effort; an anonymous socket still
-/// upgrades) so the socket can register a delivery sink for server→client pushes.
+/// Port of `WebSocketManager.WebSocketRequestHandler`: the credentials are
+/// resolved as for any request — jellyfin-web sends `?ApiKey=`,
+/// jellyfin-sdk-kotlin an `Authorization: MediaBrowser` header — and a request
+/// they do not authenticate is the `SecurityException("Token is required")`
+/// upstream answers with `403`. No route policy runs, so remote access and the
+/// access schedule are not checked here. The authenticated token is then
+/// resolved to the caller's session so the socket can register a delivery sink
+/// for server→client pushes.
 async fn websocket_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(query): RawQuery,
+    identity: Result<AuthenticatedIdentity, ApiError>,
 ) -> Response {
-    let caller = resolve_caller(&state, &headers, query.as_deref()).await;
+    let info = match identity {
+        Ok(AuthenticatedIdentity(info)) => info,
+        Err(e) if e.status() == axum::http::StatusCode::UNAUTHORIZED => {
+            return ApiError::Forbidden("Token is required".to_owned()).into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+    let caller = resolve_caller(&state, &info).await;
     ws.read_buffer_size(READ_BUFFER_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, state, caller))
 }
@@ -138,97 +154,72 @@ struct SocketCaller {
     user_id: uuid::Uuid,
 }
 
-/// Why a socket ended up anonymous — kept distinct so the logs can tell
-/// "client never sent a token" (expected for pre-auth clients) from "a token
-/// was sent but didn't resolve" (bad client input, or a server bug that would
-/// silently drop SyncPlay/push delivery).
+/// Why an authenticated socket carries no session — kept distinct so the logs
+/// can tell an API key (expected) from a user token that didn't resolve (a
+/// server bug that would silently drop SyncPlay/push delivery).
 #[derive(Clone, Copy)]
-enum AnonymousReason {
-    /// No `api_key`/`ApiKey` query parameter and no token header.
-    NoToken,
+enum SessionlessReason {
+    /// The socket authenticated with an API key, which has no device row.
+    ApiKey,
     /// A token was presented but the session manager could not resolve it.
     TokenUnresolved,
     /// The token resolved to a session that carries no session id.
     SessionWithoutId,
 }
 
-impl AnonymousReason {
+impl SessionlessReason {
     /// The value logged in the `reason` field.
     fn as_str(self) -> &'static str {
         match self {
-            Self::NoToken => "no-token",
+            Self::ApiKey => "api-key",
             Self::TokenUnresolved => "token-unresolved",
             Self::SessionWithoutId => "session-without-id",
         }
     }
 }
 
-/// Resolves the caller's session id from the socket's access token, or the
-/// reason the socket is anonymous.
+/// Resolves an authenticated socket's session, or the reason it has none.
 ///
-/// The WebSocket carries its token as the `api_key`/`ApiKey` query parameter (the
-/// Jellyfin convention) or, failing that, an `X-Emby-Token`/`X-MediaBrowser-Token`
-/// header. We resolve it straight through the session manager
-/// ([`get_session_by_authentication_token`]) rather than the general
-/// [`AuthService`], because the latter gates the lowercase `api_key` query
-/// parameter behind legacy-authorization config — which would silently drop the
-/// socket's session and its SyncPlay delivery. Passing an empty `device_id` lets
-/// the manager key the session off the token's own device, so the derived id
-/// matches the one the `/SyncPlay/*` handlers compute for the same client.
+/// The token is the one [`websocket_upgrade`] authenticated. It goes to the
+/// session manager ([`get_session_by_authentication_token`]) with an empty
+/// `device_id`, which keys the session off the token's own device, so the
+/// derived id matches the one the `/SyncPlay/*` handlers compute for the same
+/// client, and with the caller's address, which upstream's `GetSession` records
+/// on every connect (`GetNormalizedRemoteIP`).
 ///
 /// [`get_session_by_authentication_token`]: ferrofin_traits::session::SessionManager::get_session_by_authentication_token
-/// [`AuthService`]: ferrofin_traits::net::AuthService
 async fn resolve_caller(
     state: &AppState,
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Result<SocketCaller, AnonymousReason> {
-    let token = query_param(query, "api_key")
-        .or_else(|| query_param(query, "ApiKey"))
-        .or_else(|| header_token(headers))
-        .ok_or(AnonymousReason::NoToken)?;
+    info: &AuthorizationInfo,
+) -> Result<SocketCaller, SessionlessReason> {
+    // TODO: upstream `RequestHelpers.GetSession` gives an API-key socket a
+    // session with no user (`LogSessionActivity(..., user: null)`), so it is
+    // greeted and can subscribe. Porting it needs
+    // `SessionManager::log_session_activity` to take an optional user.
+    if info.is_api_key {
+        return Err(SessionlessReason::ApiKey);
+    }
+    let token = info
+        .token
+        .as_ref()
+        .ok_or(SessionlessReason::TokenUnresolved)?;
     let session = state
         .sessions
-        .get_session_by_authentication_token(&token, "", "")
+        .get_session_by_authentication_token(
+            token.expose(),
+            "",
+            info.remote_endpoint.as_deref().unwrap_or_default(),
+        )
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "websocket token did not resolve to a session");
-            AnonymousReason::TokenUnresolved
+            SessionlessReason::TokenUnresolved
         })?;
-    let session_id = session.id.ok_or(AnonymousReason::SessionWithoutId)?;
+    let session_id = session.id.ok_or(SessionlessReason::SessionWithoutId)?;
     Ok(SocketCaller {
         session_id,
         user_id: session.user_id,
     })
-}
-
-/// Reads a bare-token header (`X-Emby-Token` / `X-MediaBrowser-Token`).
-fn header_token(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-emby-token", "x-mediabrowser-token"] {
-        if let Some(value) = headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-        {
-            return Some(value.to_owned());
-        }
-    }
-    None
-}
-
-/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
-/// Raw authentication reads join nonempty StringValues; scalar model binding's
-/// first-value rule does not apply. Decode each key and value exactly once.
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    let mut values = form_urlencoded::parse(query?.as_bytes())
-        .filter(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty())
-        .map(|(_, value)| value);
-    let mut value = values.next()?.into_owned();
-    for next in values {
-        value.push(',');
-        value.push_str(&next);
-    }
-    Some(value)
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -387,9 +378,9 @@ type Registration = (
     ferrofin_traits::session_bus::SinkToken,
 );
 
-/// Registers an authenticated socket's push sink on the session bus, if the
-/// caller resolved to a session and a bus is wired. An anonymous socket (or a
-/// server with no bus) gets no registration and simply never receives pushes.
+/// Registers a socket's push sink on the session bus, if the caller resolved
+/// to a session and a bus is wired. A sessionless socket (or a server with no
+/// bus) gets no registration and simply never receives pushes.
 fn register_sink(
     state: &AppState,
     caller: Option<&SocketCaller>,
@@ -467,23 +458,23 @@ async fn say_goodbye(
     let _ = send_frame(socket, Message::Close(None), overflowed).await;
 }
 
-/// Holds a WebSocket open: register the caller's push sink (if authenticated),
+/// Holds a WebSocket open: register the caller's push sink (if it has a session),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
 #[tracing::instrument(
     name = "ws_session",
     skip_all,
-    fields(session_id = caller.as_ref().map_or("anonymous", |c| c.session_id.as_str()))
+    fields(session_id = caller.as_ref().map_or("none", |c| c.session_id.as_str()))
 )]
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
-    caller: Result<SocketCaller, AnonymousReason>,
+    caller: Result<SocketCaller, SessionlessReason>,
 ) {
     let started = std::time::Instant::now();
     let mut close_all = CLOSE_ALL.subscribe();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
-    // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
+    // sink. Keeping `tx` alive here also keeps `rx` open for sessionless sockets
     // (no sink registered) so the forward branch stays pending rather than
     // closing the loop. The channel is bounded (see `PUSH_QUEUE_DEPTH`) so a
     // client that stops reading cannot make the server buffer without limit.
@@ -519,7 +510,7 @@ async fn handle_socket(
     let open = greet_with_keep_alive(&mut socket, &overflowed, caller.is_some()).await;
 
     // The dashboard's periodic streams, armed by *Start subscription messages
-    // (each is `None` until subscribed). Only an authenticated socket may
+    // (each is `None` until subscribed). Only a socket with a session may
     // subscribe — the streams answer as the socket's user.
     let mut streams = Streams::default();
     let mut task_updates = None;
@@ -616,10 +607,10 @@ async fn handle_socket(
 }
 
 /// Debug diagnostics for accepted and ignored task subscriptions.
-fn log_task_subscription(inbound: Inbound, authenticated: bool) {
+fn log_task_subscription(inbound: Inbound, session: bool) {
     if matches!(inbound, Inbound::TasksStart(_) | Inbound::TasksStop) {
         tracing::debug!(
-            authenticated,
+            session,
             subscribing = matches!(inbound, Inbound::TasksStart(_)),
             "dashboard task subscription requested"
         );
@@ -649,11 +640,11 @@ async fn send_optional(
 
 /// The one `websocket connected` line, which says whether the socket carries a
 /// session and — when it does not — why not.
-fn log_connect(caller: Result<&SocketCaller, &AnonymousReason>, registered: bool) {
+fn log_connect(caller: Result<&SocketCaller, &SessionlessReason>, registered: bool) {
     match caller {
-        Ok(_) => tracing::info!(authenticated = registered, "websocket connected"),
+        Ok(_) => tracing::info!(session = registered, "websocket connected"),
         Err(reason) => tracing::info!(
-            authenticated = false,
+            session = false,
             reason = reason.as_str(),
             "websocket connected"
         ),
@@ -670,15 +661,15 @@ fn log_connect(caller: Result<&SocketCaller, &AnonymousReason>, registered: bool
 /// `[0.2, 48.0, 96.0, 144.1]`, Ferrofin at `[48.0, 96.1, 144.1]` — the same
 /// cadence, one frame short, every run.
 ///
-/// Only an authenticated socket is greeted, as upstream: `GetSession` runs
+/// Only a socket with a session is greeted, as upstream: `GetSession` runs
 /// before `KeepAliveWebSocket`, so a connection with no session never reaches
 /// the watchlist at all. Returns whether the socket is still usable.
 async fn greet_with_keep_alive(
     socket: &mut WebSocket,
     overflowed: &tokio::sync::Notify,
-    authenticated: bool,
+    has_session: bool,
 ) -> bool {
-    if !authenticated {
+    if !has_session {
         return true;
     }
     send_frame(
@@ -983,11 +974,9 @@ mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
         KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, action_for, force_keep_alive_message,
-        header_token, keep_alive_ack, keep_alive_action, parse_inbound, push_sink, query_param,
-        visible_tasks,
+        keep_alive_ack, keep_alive_action, parse_inbound, push_sink, visible_tasks,
     };
     use axum::extract::ws::Message;
-    use axum::http::HeaderMap;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1080,57 +1069,6 @@ mod tests {
                 .is_err(),
             "a closed socket is not an overflow",
         );
-    }
-
-    #[test]
-    fn query_param_accepts_jellyfin_and_host_normalized_token_keys() {
-        let q = Some("deviceId=dev1&api_key=abc123&x=1");
-        assert_eq!(query_param(q, "api_key").as_deref(), Some("abc123"));
-        assert_eq!(query_param(q, "deviceId").as_deref(), Some("dev1"));
-        assert_eq!(query_param(q, "ApiKey"), None); // underscore is significant
-        for key in ["ApiKey", "apiKey", "apikey", "APIKEY"] {
-            let query = format!("deviceId=dev1&{key}=aBc123&x=1");
-            assert_eq!(
-                query_param(Some(&query), "ApiKey").as_deref(),
-                Some("aBc123")
-            );
-        }
-        assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
-        assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
-        assert_eq!(query_param(None, "api_key"), None);
-        assert_eq!(
-            query_param(Some("API_KEY=first&api_key=second"), "api_key").as_deref(),
-            Some("first,second")
-        );
-        assert_eq!(
-            query_param(Some("api_key=&api_key=second"), "api_key").as_deref(),
-            Some("second")
-        );
-        assert_eq!(
-            query_param(Some("api_key&api_key=second"), "api_key").as_deref(),
-            Some("second")
-        );
-        assert_eq!(query_param(Some("api_key=&api_key"), "api_key"), None);
-        assert_eq!(
-            query_param(
-                Some("%61pi_key=first%2526&API_KEY=second%2Bvalue"),
-                "api_key"
-            )
-            .as_deref(),
-            Some("first%26,second+value")
-        );
-        assert_eq!(
-            query_param(Some("%2561pi_key=ignored&api_key=second"), "api_key").as_deref(),
-            Some("second")
-        );
-    }
-
-    #[test]
-    fn header_token_reads_bare_token_headers() {
-        let mut h = HeaderMap::new();
-        assert_eq!(header_token(&h), None);
-        h.insert("X-Emby-Token", "tok-1".parse().unwrap());
-        assert_eq!(header_token(&h).as_deref(), Some("tok-1"));
     }
 
     #[test]

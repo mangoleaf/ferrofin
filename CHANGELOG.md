@@ -41,7 +41,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   embedded VobSub subtitles render again
 - Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
   and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
-  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
+  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract. Emby-era credentials
+  (`X-Emby-Authorization`, `X-Emby-Token`, `api_key`) still need `EnableLegacyAuthorization`;
+  see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Serve `GET /Items/{itemId}/Collections` (Jellyfin 12.1's `GetItemCollections`): the
   collections the user can see that include the item, sorted and paged as upstream.
   jellyfin-web's item page calls it and hid its Collections section on the old `404`.
@@ -191,6 +193,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
   copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
   before that copy makes it on the next boot
+- The `/socket` WebSocket authenticates like every other request, as Jellyfin 12.2's does:
+  Emby-era credentials (`api_key`, `X-Emby-Token`, `X-MediaBrowser-Token`) count only with
+  `EnableLegacyAuthorization`, and a connection without valid credentials is refused with
+  `403` instead of opening. A socket that authenticates with the `Authorization` header, as
+  jellyfin-sdk-kotlin clients' sockets do, now joins its session, so remote control and SyncPlay
+  reach those clients (#75). Opening a socket no longer blanks the session's remote address,
+  so the dashboard and the session activity entries show the client's IP. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
