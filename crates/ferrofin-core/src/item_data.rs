@@ -759,12 +759,15 @@ pub async fn reconcile_playlist_permissions(db: &Database) -> Result<usize, Serv
     Ok(imported)
 }
 
-/// Sets a single key in an item's `Data` JSON, preserving everything else.
+/// Sets a single key in an item's `Data` JSON, preserving everything else, on
+/// a connection the caller holds — normally a writer transaction, so the key
+/// commits with the change it belongs to, and the read sees that change's
+/// uncommitted rows.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
-pub async fn set_data_key(
-    db: &Database,
+pub(crate) async fn set_data_key_in(
+    conn: &mut sqlx::SqliteConnection,
     item: Uuid,
     key: &str,
     value: Value,
@@ -773,7 +776,7 @@ pub async fn set_data_key(
     let data: Option<Option<String>> =
         sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
             .bind(&item_db)
-            .fetch_optional(db.pool())
+            .fetch_optional(&mut *conn)
             .await
             .map_err(db_err)?;
     let Some(data) = data else { return Ok(()) };
@@ -782,7 +785,7 @@ pub async fn set_data_key(
     sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
         .bind(&item_db)
         .bind(data_to_string(&map)?)
-        .execute(db.writer())
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
     Ok(())

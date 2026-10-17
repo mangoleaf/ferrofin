@@ -866,13 +866,25 @@ impl PlaylistManager for FerrofinPlaylistManager {
     ) -> Result<PlaylistCreationResult, ServiceError> {
         let id = Uuid::new_v4();
         let name = request.name.clone().unwrap_or_default();
-        crate::item_persistence_service::insert_named_item(
-            &self.db,
+        let parent = playlists_folder(&self.db, &self.paths).await?;
+        // Playlist entries are positions, not a set (C# `LinkedChild.Create`
+        // per requested id, no de-duplication).
+        let entries: Vec<Entry> = request
+            .item_id_list
+            .iter()
+            .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
+            .collect();
+        // One writer transaction: a playlist row committed without its owner
+        // row would open to every caller as its owner (`decide_access`), and
+        // no boot import could repair it.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        crate::item_persistence_service::insert_named_item_in(
+            &mut tx,
             id,
             BaseItemKind::Playlist,
             &name,
             true,
-            playlists_folder(&self.db, &self.paths).await?,
+            parent,
         )
         .await?;
         // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
@@ -884,37 +896,26 @@ impl PlaylistManager for FerrofinPlaylistManager {
         .bind(guid_to_db(id))
         .bind((!request.user_id.is_nil()).then(|| guid_to_db(request.user_id)))
         .bind(i64::from(request.public.unwrap_or(false)))
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         // Seed the share list from the request (C# `Shares = options.Users`).
         for share in &request.users {
-            self.add_user_to_shares(&PlaylistUserUpdateRequest {
-                id,
-                user_id: share.user_id,
-                can_edit: Some(share.can_edit),
-            })
-            .await?;
+            upsert_share(&mut tx, id, share.user_id, share.can_edit).await?;
         }
-        // Playlist entries are positions, not a set (C# `LinkedChild.Create`
-        // per requested id, no de-duplication).
-        let entries: Vec<Entry> = request
-            .item_id_list
-            .iter()
-            .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
-            .collect();
-        write_entries(self.db.writer(), &guid_to_db(id), &entries).await?;
+        write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
         // Write the owner, open access and shares into BaseItems.Data, which
         // 12.0 still serialises and each boot re-imports.
-        item_data::sync_container_data(&self.db, id).await?;
+        item_data::sync_container_data_in(&mut tx, id).await?;
         // Jellyfin's Playlist carries PlaylistMediaType in Data; without it a
         // swap back would default the playlist to Audio.
         if let Some(media_type) = &request.media_type {
             // The enum's serde form IS Jellyfin's JSON string ("Video", …).
             let value = serde_json::to_value(media_type)
                 .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
-            item_data::set_data_key(&self.db, id, "PlaylistMediaType", value).await?;
+            item_data::set_data_key_in(&mut tx, id, "PlaylistMediaType", value).await?;
         }
+        tx.commit().await.map_err(db_err)?;
         if !request.item_id_list.is_empty() {
             self.update_rating_to_items(id).await?;
         }
@@ -1267,8 +1268,8 @@ async fn read_entries(
 /// Replaces a playlist's entries wholesale with `entries`, `SortOrder`
 /// dense from 0 in the given order, in one transaction — what 12.0's
 /// `ItemPersistenceService` does on every folder save (delete the parent's
-/// rows, re-insert the array). Shared by create, add, remove and move; an
-/// update's replace runs [`write_entries_in`] inside the update's writer
+/// rows, re-insert the array). Shared by add, remove and move; a create's
+/// and an update's replace run [`write_entries_in`] inside their own writer
 /// transaction.
 async fn write_entries(
     pool: &sqlx::SqlitePool,
