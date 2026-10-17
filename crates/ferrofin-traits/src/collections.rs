@@ -231,7 +231,9 @@ pub trait PlaylistManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// Removes entries from a playlist by their entry ids.
+    /// Removes entries from a playlist by their entry ids. An id that names no
+    /// playlist is [`ServiceError::InvalidInput`] (C# `ArgumentException`),
+    /// which the handler answers with upstream's bare `404`.
     async fn remove_item_from_playlist(
         &self,
         playlist_id: &str,
