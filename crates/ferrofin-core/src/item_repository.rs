@@ -1971,17 +1971,11 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
             }
             qb.push(")");
         }
-        // The played state of the content row (the direct per-row rule the
-        // browse uses — see `append_user_data_predicates`).
+        // The played state of the content row, as the browse spells it
+        // (`scopeQuery.IsPlayed` through `TranslateQuery`).
         if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_played) {
-            qb.push(if want {
-                r#" AND ci."Id" IN "#
-            } else {
-                r#" AND ci."Id" NOT IN "#
-            })
-            .push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
-            .push_bind(guid_to_db(user_id))
-            .push(r#" AND ud."Played" = 1)"#);
+            qb.push(if want { " AND " } else { " AND NOT " });
+            crate::translate_query::push_is_played(qb, "ci", &guid_to_db(user_id), filter);
         }
     }
     qb.push(
@@ -9452,9 +9446,9 @@ mod tests {
 
     /// v12 `OrderMapper.cs:32-48`: an item's played date is the newest of its
     /// own progress and its alternate versions' — the second arm of the
-    /// `DatePlayed` ordering — while `PlayCount` / `IsPlayed` /
-    /// `IsFavoriteOrLiked` read the item's own first `UserData` row only
-    /// (`:57-61`).
+    /// `DatePlayed` ordering — while `PlayCount` / `IsFavoriteOrLiked` read
+    /// the item's own first `UserData` row only (`:57-61`). `IsPlayed` /
+    /// `IsUnplayed` are the played filter's predicate (`played_state_tests`).
     #[tokio::test]
     async fn date_played_spans_alternates_but_play_count_does_not() {
         use ferrofin_model::dto::SortOrder;
@@ -9530,7 +9524,7 @@ mod tests {
             names(ItemSortBy::PlayCount, user.clone()).await,
             vec!["Alpha", "Beta"]
         );
-        // The other first-row keys build and run.
+        // The other user-data keys build and run.
         for sort in [
             ItemSortBy::IsPlayed,
             ItemSortBy::IsUnplayed,
@@ -12061,3 +12055,7 @@ pub(crate) async fn by_name_ids_by_clean_name(
     }
     Ok(ids)
 }
+
+#[cfg(test)]
+#[path = "item_repository/played_state_tests.rs"]
+mod played_state_tests;

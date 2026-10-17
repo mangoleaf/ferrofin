@@ -74,15 +74,22 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-yaml
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats adoption/tests/adoption.bats verify/tests/verify.bats
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats verify/tests/verify.bats
       - run: bats scripts/tests adoption/tests verify/tests
       - run: scripts/ci-config-check.sh check
 
-  coverage:
+  # The 80% per-crate gate (scripts/coverage-gate.sh) runs as three parallel shards;
+  # the aggregate `coverage` job below is the one status check main's branch protection
+  # requires (matrix jobs report as `coverage-shard (core)` etc., never as `coverage`).
+  coverage-shard:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false # one failing shard must not hide another's result
+      matrix:
+        shard: [core, heavy, rest]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -100,31 +107,25 @@ jobs:
           toolchain: 1.98.1 # = rust-toolchain.toml
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.shard }} # a cache entry per shard, so they do not overwrite one another
       - uses: taiki-e/install-action@4e14a60b36eb62630dcc25614f0be0659ab8830c # cargo-llvm-cov
       - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1 # nextest
-      # 80% line-coverage gate, enforced per-crate over every crate in crates/.
       # ffmpeg is only needed by the env-gated integration tests; unit/parity tests avoid it.
       - name: coverage gate (per crate)
-        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: scripts/coverage-gate.sh "$SHARD"
+
+  coverage:
+    needs: coverage-shard
+    if: always() # a failed or cancelled shard must fail this check, not leave it skipped
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: all coverage shards passed
+        env:
+          RESULT: ${{ needs.coverage-shard.result }}
         run: |
-          set -euo pipefail
-          # Gate EACH crate independently: `-p a -p b --fail-under-lines` checks the
-          # MERGED total, which lets a sub-80% crate hide behind a stronger sibling.
-          # Line coverage only — branch coverage (-Z coverage-options=branch) is nightly-only; we pin stable.
-          # ferrofin-traits is exempt (trait definitions; the bodies live in ferrofin-core —
-          # see CLAUDE.md), as is apps/ferrofin-server (the composition root).
-          fail=0
-          for dir in crates/*/; do
-            crate=$(basename "$dir")
-            [ "$crate" = ferrofin-traits ] && continue
-            echo "── coverage: $crate ──"
-            # `-p X` still instruments X's workspace deps, so their (uncovered) source
-            # lands in the TOTAL the gate compares against. Exclude every sibling.
-            others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
-            if ! cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
-              --ignore-filename-regex "(crates/($others)|apps)/"; then
-              echo "::error::Tests or coverage failed for $crate"
-              fail=1
-            fi
-          done
-          exit $fail
+          echo "coverage-shard: $RESULT"
+          [ "$RESULT" = success ]

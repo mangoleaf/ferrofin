@@ -31,9 +31,6 @@
 //! Deferred (documented, per the unit-8 minimal-manager rule):
 //! - entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
 //!   entry-id strings) is approximated by the child item id;
-//! - `remove_playlists` (owned-playlist deletion + share transfer on user
-//!   removal) — ownership is recorded now, but the user-deletion cascade is not
-//!   wired;
 //! - the collections **folder** (`GetCollectionsFolder`) resolution needs the
 //!   user-view tree and returns `None` here.
 
@@ -44,8 +41,10 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BaseItemKind, MediaType};
+use ferrofin_model::dto::SortOrder;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
+use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::playlists::{
     PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
     PlaylistUserUpdateRequest,
@@ -58,12 +57,13 @@ use ferrofin_traits::collections::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
+use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
 use ferrofin_traits::system::ServerApplicationPaths;
 
 use crate::db_error::db_err;
 use crate::item_data;
-use crate::item_type_lookup::stored_type_name;
+use crate::item_type_lookup::{kind_from_type_name, stored_type_name};
 
 /// The manual [`LinkedChildType`](ferrofin_db::enums::LinkedChildType) discriminant
 /// (`0`) used to record a box-set/playlist member.
@@ -154,6 +154,40 @@ async fn item_of_kind(
         .get_item_by_id(id)
         .await?
         .filter(|row| BaseItemKind::from_stored_type_name(&row.type_) == Some(kind)))
+}
+
+/// The query `Playlist.GetPlaylistItems` lists a folder's playlist entries
+/// with (`Playlist.cs:217-228`): every non-folder audio or video item under
+/// it that `user` may see, through the folder's own `GetItemsInternal` — a
+/// series by its key, in name order and never virtual (`Series.cs:256-283`),
+/// a season through its episodes, a box set or playlist through its links.
+fn folder_items_query(
+    id: Uuid,
+    kind: BaseItemKind,
+    folder: &BaseItemEntity,
+    user: Option<UserEntity>,
+) -> InternalItemsQuery {
+    let mut query = InternalItemsQuery {
+        recursive: true,
+        is_folder: Some(false),
+        media_types: vec![MediaType::Audio, MediaType::Video],
+        enable_total_record_count: false,
+        ..InternalItemsQuery::default()
+    };
+    if let Some(user) = user {
+        query.set_user(user);
+    }
+    if kind == BaseItemKind::Series {
+        query.series_presentation_unique_key =
+            Some(crate::library_manager::episode_presentation_key(folder));
+        query.include_item_types = vec![BaseItemKind::Episode, BaseItemKind::Season];
+        query.order_by = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
+        query.is_virtual_item = Some(false);
+    } else {
+        query.set_parent(Some((id, kind)));
+        query.apply_folder_display_options = true;
+    }
+    query
 }
 
 /// Decides the caller's [`PlaylistAccess`] from the three joined access columns
@@ -722,6 +756,139 @@ impl FerrofinPlaylistManager {
             .map(|user| (visibility.as_ref(), user)))
     }
 
+    /// The entries an add stores for `ids` — `GetPlaylistItems(ids, user)
+    /// .Where(i => i.SupportsAddingToPlaylist)` (`PlaylistManager.cs:194-224`,
+    /// `Playlist.GetPlaylistItems`, `Playlist.cs:173-231`). An id naming no
+    /// item is dropped, and so is an item the user may not see. A music genre
+    /// or artist becomes its tracks (album artist, album, then name order),
+    /// any other folder its non-folder audio and video
+    /// ([`folder_items_query`]), and a kind that cannot be added — a photo, a
+    /// book, a person — is dropped. A nil `user_id` (an API key) sees
+    /// everything.
+    async fn playlist_items(&self, ids: &[Uuid], user_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        let user = if user_id.is_nil() {
+            None
+        } else {
+            crate::item_repository::query_user(&self.db, user_id).await?
+        };
+        let by_id: std::collections::HashMap<Uuid, BaseItemEntity> = self
+            .items
+            .retrieve_items(ids)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect();
+        // `itemIds.Select(GetItemById).Where(i => i is not null)`: request
+        // order, repeats kept.
+        let mut inputs: Vec<(Uuid, &BaseItemEntity)> = ids
+            .iter()
+            .filter_map(|id| by_id.get(id).map(|row| (*id, row)))
+            .collect();
+        if let (Some(user), Some((visibility, _))) = (&user, &self.visibility) {
+            let rows: Vec<BaseItemEntity> = inputs.iter().map(|(_, row)| (*row).clone()).collect();
+            let visible = visibility.visible(&rows, user, false).await?;
+            inputs = inputs
+                .into_iter()
+                .zip(visible)
+                .filter_map(|(input, visible)| visible.then_some(input))
+                .collect();
+        }
+        let mut items = Vec::new();
+        for (id, row) in inputs {
+            match kind_from_type_name(&row.type_) {
+                Some(kind @ (BaseItemKind::MusicGenre | BaseItemKind::MusicArtist)) => {
+                    let mut query = InternalItemsQuery {
+                        recursive: true,
+                        include_item_types: vec![BaseItemKind::Audio],
+                        order_by: vec![
+                            (ItemSortBy::AlbumArtist, SortOrder::Ascending),
+                            (ItemSortBy::Album, SortOrder::Ascending),
+                            (ItemSortBy::SortName, SortOrder::Ascending),
+                        ],
+                        ..InternalItemsQuery::default()
+                    };
+                    if let Some(user) = user.clone() {
+                        query.set_user(user);
+                    }
+                    if kind == BaseItemKind::MusicGenre {
+                        query.genre_ids = vec![id];
+                    } else {
+                        query.artist_ids = vec![id];
+                    }
+                    items.extend(self.library_manager.get_item_list(&query).await?);
+                }
+                Some(kind) if crate::kinds::is_folder(kind) => {
+                    let query = folder_items_query(id, kind, row, user.clone());
+                    items.extend(self.library_manager.query_items(&query).await?.items);
+                }
+                _ => items.push(row.clone()),
+            }
+        }
+        Ok(items
+            .into_iter()
+            .filter(|row| {
+                kind_from_type_name(&row.type_)
+                    .is_some_and(crate::kinds::supports_adding_to_playlist)
+            })
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect())
+    }
+
+    /// `CreatePlaylist`'s media type when the request names none
+    /// (`PlaylistManager.cs:90-127`): the first requested item that answers
+    /// decides — its own media type, `Audio` for an artist, album or music
+    /// genre, `Video` for a genre, a folder's first playable member's — and
+    /// `Audio` when none does. An id naming no item before that is upstream's
+    /// `ArgumentException`, thrown before anything is created.
+    async fn infer_media_type(&self, ids: &[Uuid]) -> Result<MediaType, ServiceError> {
+        for id in ids {
+            let item = self
+                .library_manager
+                .get_item_by_id(*id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_input("No item exists with the supplied Id")
+                })?;
+            let kind = kind_from_type_name(&item.type_);
+            let media_type = match crate::dto_service::parse_media_type(item.media_type.as_deref())
+            {
+                MediaType::Unknown => match kind {
+                    Some(
+                        BaseItemKind::MusicArtist
+                        | BaseItemKind::MusicAlbum
+                        | BaseItemKind::MusicGenre,
+                    ) => MediaType::Audio,
+                    Some(BaseItemKind::Genre) => MediaType::Video,
+                    // `GetRecursiveChildren(i => !i.IsFolder &&
+                    // i.SupportsAddingToPlaylist)`, with no user, missing
+                    // episodes included. Those members are all audio or
+                    // video, so the folder query finds them; it reads them in
+                    // name order where upstream walks the tree, which only
+                    // differs for a folder holding both.
+                    Some(kind) if crate::kinds::is_folder(kind) => {
+                        let mut query = folder_items_query(*id, kind, &item, None);
+                        query.is_virtual_item = None;
+                        query.limit = Some(1);
+                        self.library_manager
+                            .query_items(&query)
+                            .await?
+                            .items
+                            .first()
+                            .map_or(MediaType::Unknown, |member| {
+                                crate::dto_service::parse_media_type(member.media_type.as_deref())
+                            })
+                    }
+                    _ => MediaType::Unknown,
+                },
+                known => known,
+            };
+            if media_type != MediaType::Unknown {
+                return Ok(media_type);
+            }
+        }
+        Ok(MediaType::Audio)
+    }
+
     /// The rest of `Playlist.IsVisible` after [`decide_access`]'s owner/share
     /// answer ([`ItemVisibility::playlist_policy`](crate::item_visibility::ItemVisibility::playlist_policy)):
     /// a user with a maximum parental rating sees a playlist only when it is
@@ -866,13 +1033,35 @@ impl PlaylistManager for FerrofinPlaylistManager {
     ) -> Result<PlaylistCreationResult, ServiceError> {
         let id = Uuid::new_v4();
         let name = request.name.clone().unwrap_or_default();
-        crate::item_persistence_service::insert_named_item(
-            &self.db,
+        // An unknown id fails the create before anything is written, as
+        // upstream's does.
+        let media_type = match request.media_type {
+            Some(media_type) if media_type != MediaType::Unknown => media_type,
+            _ => self.infer_media_type(&request.item_id_list).await?,
+        };
+        let parent = playlists_folder(&self.db, &self.paths).await?;
+        // Playlist entries are positions, not a set (C# `LinkedChild.Create`
+        // per item, no de-duplication).
+        let entries: Vec<Entry> = self
+            .playlist_items(&request.item_id_list, request.user_id)
+            .await?
+            .into_iter()
+            .map(|item_id| (guid_to_db(item_id), i64::from(LINKED_CHILD_MANUAL)))
+            .collect();
+        // The enum's serde form IS Jellyfin's JSON string ("Video", …).
+        let media_type = serde_json::to_value(media_type)
+            .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
+        // One writer transaction: a playlist row committed without its owner
+        // row would open to every caller as its owner (`decide_access`), and
+        // no boot import could repair it.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        crate::item_persistence_service::insert_named_item_in(
+            &mut tx,
             id,
             BaseItemKind::Playlist,
             &name,
             true,
-            playlists_folder(&self.db, &self.paths).await?,
+            parent,
         )
         .await?;
         // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
@@ -884,38 +1073,28 @@ impl PlaylistManager for FerrofinPlaylistManager {
         .bind(guid_to_db(id))
         .bind((!request.user_id.is_nil()).then(|| guid_to_db(request.user_id)))
         .bind(i64::from(request.public.unwrap_or(false)))
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         // Seed the share list from the request (C# `Shares = options.Users`).
         for share in &request.users {
-            self.add_user_to_shares(&PlaylistUserUpdateRequest {
-                id,
-                user_id: share.user_id,
-                can_edit: Some(share.can_edit),
-            })
-            .await?;
+            upsert_share(&mut tx, id, share.user_id, share.can_edit).await?;
         }
-        // Playlist entries are positions, not a set (C# `LinkedChild.Create`
-        // per requested id, no de-duplication).
-        let entries: Vec<Entry> = request
-            .item_id_list
-            .iter()
-            .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
-            .collect();
-        write_entries(self.db.writer(), &guid_to_db(id), &entries).await?;
+        write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
+        crate::item_persistence_service::stamp_playlist_in(
+            &mut tx,
+            id,
+            media_type.as_str(),
+            (!entries.is_empty()).then(chrono::Utc::now),
+        )
+        .await?;
         // Write the owner, open access and shares into BaseItems.Data, which
         // 12.0 still serialises and each boot re-imports.
-        item_data::sync_container_data(&self.db, id).await?;
-        // Jellyfin's Playlist carries PlaylistMediaType in Data; without it a
-        // swap back would default the playlist to Audio.
-        if let Some(media_type) = &request.media_type {
-            // The enum's serde form IS Jellyfin's JSON string ("Video", …).
-            let value = serde_json::to_value(media_type)
-                .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
-            item_data::set_data_key(&self.db, id, "PlaylistMediaType", value).await?;
-        }
-        if !request.item_id_list.is_empty() {
+        item_data::sync_container_data_in(&mut tx, id).await?;
+        // `Playlist.PlaylistMediaType`, which Jellyfin reads back from `Data`.
+        item_data::set_data_key_in(&mut tx, id, "PlaylistMediaType", media_type).await?;
+        tx.commit().await.map_err(db_err)?;
+        if !entries.is_empty() {
             self.update_rating_to_items(id).await?;
         }
         Ok(PlaylistCreationResult { id: id.to_string() })
@@ -923,6 +1102,28 @@ impl PlaylistManager for FerrofinPlaylistManager {
 
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError> {
         self.require_playlist(request.id).await?;
+        // C# `UpdatePlaylist` (12.0, :608-614): `Ids` REPLACE the entries —
+        // `LinkedChildren = []`, then `AddToPlaylistInternal` — so they expand
+        // the way an add does, and duplicates survive. The playlist's own id
+        // expands after that clear upstream, to nothing. Only the direct id
+        // is dropped here: a container that links this playlist still
+        // expands its entries from before the update.
+        let entries = match &request.ids {
+            Some(ids) => Some(
+                self.playlist_items(
+                    &ids.iter()
+                        .copied()
+                        .filter(|id| *id != request.id)
+                        .collect::<Vec<_>>(),
+                    request.user_id,
+                )
+                .await?
+                .into_iter()
+                .map(|item_id| (guid_to_db(item_id), i64::from(LINKED_CHILD_MANUAL)))
+                .collect::<Vec<Entry>>(),
+            ),
+            None => None,
+        };
         let _edit = self.entry_edits.lock().await;
         // C# `UpdatePlaylist` saves the name, shares and open access together
         // (the last `UpdatePlaylistInternal`). Every change here commits with
@@ -965,20 +1166,21 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 upsert_share(&mut tx, request.id, share.user_id, share.can_edit).await?;
             }
         }
-        if let Some(ids) = &request.ids {
-            // C# `PlaylistManager.UpdatePlaylist` (12.0, :608-614): `Ids`
-            // REPLACES the entries — `LinkedChildren = []` then add — so an
-            // update with the same list is a no-op and duplicates in the list
-            // survive.
-            let entries: Vec<Entry> = ids
-                .iter()
-                .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
-                .collect();
-            write_entries_in(&mut tx, &guid_to_db(request.id), &entries).await?;
+        if let Some(entries) = &entries {
+            write_entries_in(&mut tx, &guid_to_db(request.id), entries).await?;
+            if !entries.is_empty() {
+                crate::item_persistence_service::stamp_playlist_in(
+                    &mut tx,
+                    request.id,
+                    None,
+                    Some(chrono::Utc::now()),
+                )
+                .await?;
+            }
         }
         item_data::sync_container_data_in(&mut tx, request.id).await?;
         tx.commit().await.map_err(db_err)?;
-        if request.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+        if entries.as_ref().is_some_and(|entries| !entries.is_empty()) {
             self.update_rating_to_items(request.id).await?;
         }
         Ok(())
@@ -1127,7 +1329,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: Uuid,
         item_ids: &[Uuid],
         position: Option<i32>,
-        _user_id: Uuid,
+        user_id: Uuid,
     ) -> Result<(), ServiceError> {
         // C# `PlaylistManager.AddToPlaylistInternal` (12.0): no duplicate
         // check — an item already in the playlist gets a second entry — and
@@ -1135,23 +1337,35 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // otherwise a splice), else at the end.
         self.require_playlist_argument(&playlist_id.to_string())
             .await?;
+        let added: Vec<Entry> = self
+            .playlist_items(item_ids, user_id)
+            .await?
+            .into_iter()
+            .map(|id| (guid_to_db(id), i64::from(LINKED_CHILD_MANUAL)))
+            .collect();
+        // "Do nothing else if there are no items to add to the playlist."
+        if added.is_empty() {
+            return Ok(());
+        }
         let _edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist_id);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
-        let added: Vec<Entry> = item_ids
-            .iter()
-            .map(|id| (guid_to_db(*id), i64::from(LINKED_CHILD_MANUAL)))
-            .collect();
         let at = position.map_or(entries.len(), |pos| {
             usize::try_from(pos.max(0))
                 .unwrap_or(usize::MAX)
                 .min(entries.len())
         });
         entries.splice(at..at, added);
-        write_entries(self.db.writer(), &pid, &entries).await?;
-        if item_ids.is_empty() {
-            return Ok(());
-        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        write_entries_in(&mut tx, &pid, &entries).await?;
+        crate::item_persistence_service::stamp_playlist_in(
+            &mut tx,
+            playlist_id,
+            None,
+            Some(chrono::Utc::now()),
+        )
+        .await?;
+        tx.commit().await.map_err(db_err)?;
         self.update_rating_to_items(playlist_id).await
     }
 
@@ -1237,13 +1451,74 @@ impl PlaylistManager for FerrofinPlaylistManager {
         write_entries(self.db.writer(), &pid, &entries).await
     }
 
-    async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        // Ownership is recorded (the `FerrofinPlaylists` table), but the user-deletion
-        // cascade — delete owned playlists, transfer shared ones (C#
-        // `RemovePlaylists`) — is still deferred; nothing is removed.
-        Ok(())
+    async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        // C# `RemovePlaylistsAsync`, over the playlists the user owns.
+        // Upstream walks every playlist the user can see (`GetUserPlaylists`),
+        // so it also hands away another user's playlist shared with or open
+        // to them, and passes over one they own but cannot see past a
+        // parental limit; and it can hand a playlist to the share of a user
+        // who no longer exists (the deleted user's own, or one an earlier
+        // deletion left behind), which leaves it owned by nobody. Both are
+        // Jellyfin bugs not ported: only owned playlists are walked, and only
+        // the shares of existing users inherit.
+        // The user row is gone by now, so a failed playlist cannot be retried
+        // through the API: one failure does not stop the others, and the
+        // first is returned once all have been tried.
+        let mut first_error = None;
+        for playlist in item_data::playlists_owned_by(&self.db, user_id).await? {
+            let outcome = async {
+                // A hand-over commits with its `Data` sync, as every boot
+                // re-imports the owner and the shares from `Data`.
+                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                item_data::import_playlist_meta_if_missing_in(&mut tx, playlist).await?;
+                let Some(permissions) =
+                    item_data::playlist_permissions_in(&mut tx, playlist).await?
+                else {
+                    return Ok(());
+                };
+                if permissions.owner != Some(user_id) {
+                    return Ok(()); // no longer theirs since the listing
+                }
+                // `Shares.OrderByDescending(x => x.CanEdit)` is a stable sort:
+                // the first editing share in `Shares` order, else the first.
+                let heir = permissions
+                    .shares
+                    .iter()
+                    .find(|share| share.can_edit)
+                    .or_else(|| permissions.shares.first())
+                    .map(|share| share.user_id);
+                if let Some(heir) = heir {
+                    item_data::hand_playlist_to_in(&mut tx, playlist, heir).await?;
+                }
+                tx.commit().await.map_err(db_err)?;
+                if heir.is_none() && !permissions.open_access {
+                    // `DeleteItem` with `DeleteFileLocation = false`.
+                    let options = ferrofin_traits::options::DeleteOptions {
+                        delete_file_location: false,
+                        delete_from_external_provider: false,
+                    };
+                    self.library_manager.delete_item(playlist, &options).await?;
+                }
+                Ok::<(), ServiceError>(())
+            }
+            .await;
+            match outcome {
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(error) => tracing::error!(
+                    item_id = %playlist,
+                    user_id = %user_id,
+                    %error,
+                    "could not hand over or delete a deleted user's playlist"
+                ),
+                Ok(()) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
+
+#[cfg(test)]
+mod remove_playlists_tests;
 
 /// One playlist entry: `(ChildId, ChildType)` as stored.
 type Entry = (String, i64);
@@ -1267,8 +1542,8 @@ async fn read_entries(
 /// Replaces a playlist's entries wholesale with `entries`, `SortOrder`
 /// dense from 0 in the given order, in one transaction — what 12.0's
 /// `ItemPersistenceService` does on every folder save (delete the parent's
-/// rows, re-insert the array). Shared by create, add, remove and move; an
-/// update's replace runs [`write_entries_in`] inside the update's writer
+/// rows, re-insert the array). Shared by remove and move; a create, an add
+/// and an update's replace run [`write_entries_in`] inside their own writer
 /// transaction.
 async fn write_entries(
     pool: &sqlx::SqlitePool,
@@ -2974,10 +3249,12 @@ mod tests {
 
         let db = test_db().await;
         let mgr = playlist_manager(&db);
-        let (bob, carol) = (Uuid::new_v4(), Uuid::new_v4());
+        let (bob, carol, member) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, member, BaseItemKind::Movie).await;
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
                 name: Some("Shared".to_owned()),
+                item_id_list: vec![member],
                 user_id: Uuid::new_v4(),
                 users: vec![PlaylistUserPermissions::new(bob, true)],
                 public: Some(true),
@@ -2988,20 +3265,18 @@ mod tests {
             .id,
         )
         .expect("uuid");
-        // `Ids` naming no item fails the entry rewrite (the
-        // `LinkedChildren.ChildId` foreign key) after the other changes.
-        // Upstream drops such ids (`GetPlaylistItems`); once that is ported
-        // this update succeeds, and the test needs another failing write.
+        // The `Data` sync, the update's last write, fails after the others.
+        crate::item_data::fail_data_writes_of(&db, playlist_id).await;
         mgr.update_playlist(&PlaylistUpdateRequest {
             id: playlist_id,
             name: Some("Renamed".to_owned()),
             users: Some(Vec::new()),
             public: Some(false),
-            ids: Some(vec![Uuid::new_v4()]),
+            ids: Some(Vec::new()),
             ..PlaylistUpdateRequest::default()
         })
         .await
-        .expect_err("an id of no item fails the update");
+        .expect_err("the failed `Data` write fails the update");
 
         for moment in ["after the failed update", "after a restart"] {
             assert_eq!(
@@ -3019,6 +3294,16 @@ mod tests {
         }
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.name.as_deref(), Some("Shared"));
+        assert_eq!(
+            super::read_entries(db.pool(), &ferrofin_db::store::guid_to_db(playlist_id))
+                .await
+                .expect("entries"),
+            vec![(
+                ferrofin_db::store::guid_to_db(member),
+                i64::from(super::LINKED_CHILD_MANUAL)
+            )],
+            "the entry replacement rolled back"
+        );
     }
 
     /// An update of a playlist no boot has imported yet (no

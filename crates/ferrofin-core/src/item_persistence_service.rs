@@ -197,6 +197,26 @@ pub(crate) async fn insert_named_item(
     is_folder: bool,
     container: Option<Uuid>,
 ) -> Result<BaseItemEntity, ServiceError> {
+    let mut conn = db.writer().acquire().await.map_err(db_err)?;
+    insert_named_item_in(&mut conn, id, kind, name, is_folder, container).await?;
+    drop(conn);
+    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// [`insert_named_item`]'s insert on a connection the caller holds, normally
+/// a writer transaction that commits the rest of the item with it.
+pub(crate) async fn insert_named_item_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    is_folder: bool,
+    container: Option<Uuid>,
+) -> Result<(), ServiceError> {
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
     sqlx::query(
@@ -243,15 +263,34 @@ pub(crate) async fn insert_named_item(
         None,
     ))
     .bind(crate::text_util::get_clean_value(name))
-    .execute(db.writer())
+    .execute(&mut *conn)
     .await
     .map_err(db_err)?;
+    Ok(())
+}
 
-    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-        .bind(guid_to_db(id))
-        .fetch_one(db.pool())
-        .await
-        .map_err(db_err)
+/// Saves what a playlist add stamps on the playlist beside its entries: the
+/// `MediaType` column (`Playlist.MediaType => PlaylistMediaType`, saved by
+/// the create's `SetMediaType`) and `DateLastMediaAdded`
+/// (`AddToPlaylistInternal`). `None` leaves a column as it is.
+pub(crate) async fn stamp_playlist_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    media_type: Option<&str>,
+    media_added: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "MediaType" = COALESCE(?2, "MediaType"),
+               "DateLastMediaAdded" = COALESCE(?3, "DateLastMediaAdded")
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(playlist))
+    .bind(media_type)
+    .bind(opt_datetime_to_db(media_added))
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// The id of the container row stored at `path`, or `None`.
