@@ -76,6 +76,11 @@ const CHILD_TYPES: [(i64, &str); 4] = [
     (3, "LinkedAlternateVersion"),
 ];
 
+/// `LinkedChildType::LocalAlternateVersion`.
+pub(crate) const LOCAL_ALTERNATE_VERSION: i64 = 2;
+/// `LinkedChildType::LinkedAlternateVersion`.
+pub(crate) const LINKED_ALTERNATE_VERSION: i64 = 3;
+
 /// A [`Uuid`] in Jellyfin's Data-JSON GUID form: N-format lowercase.
 #[must_use]
 pub fn json_guid(id: Uuid) -> String {
@@ -712,48 +717,65 @@ pub async fn set_data_key(
     Ok(())
 }
 
+/// What [`import_membership`] did with one container's entries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportedMembership {
+    /// Rows written.
+    pub(crate) written: usize,
+    /// Entries [`resolve_linked_child`] could not resolve.
+    pub(crate) dropped: usize,
+}
+
 /// Replaces `container_db`'s `LinkedChildren` rows with the `LinkedChildren`
-/// array of its `Data` JSON (C# `MigrateLinkedChildren`: `ItemId` first, then
-/// `Path`; unresolvable entries dropped; ordinals count only inserted rows).
+/// array of its `Data` JSON (C# `MigrateLinkedChildren.Perform`). Each entry
+/// is resolved by [`resolve_linked_child`] against `containing_folder`, and
+/// one that does not resolve is dropped and counted; ordinals count resolved
+/// entries. A playlist (`keep_repeats`) keeps every entry; any other container
+/// keeps one row per child, a `LocalAlternateVersion` before a
+/// `LinkedAlternateVersion` before the rest, each at its own ordinal.
 pub(crate) async fn import_membership(
     tx: &mut sqlx::SqliteConnection,
     container_db: &str,
+    containing_folder: Option<&str>,
+    keep_repeats: bool,
     map: &Map<String, Value>,
-) -> Result<usize, ServiceError> {
-    let children = read_linked_children(map);
-    let mut inserted = 0usize;
+) -> Result<ImportedMembership, ServiceError> {
+    let mut resolved: Vec<(i64, String, i64)> = Vec::new();
+    let mut dropped = 0usize;
+    for child in &read_linked_children(map) {
+        let Some(child_db) = resolve_linked_child(tx, child, containing_folder).await? else {
+            tracing::debug!(
+                item_id = %container_db.to_ascii_lowercase(),
+                child_id = child.item_id.as_deref(),
+                path = child.path.as_deref(),
+                "dropping unresolvable LinkedChildren entry"
+            );
+            dropped += 1;
+            continue;
+        };
+        let discriminant = CHILD_TYPES
+            .iter()
+            .find(|(_, n)| *n == child.child_type)
+            .map_or(0, |(d, _)| *d);
+        let order = i64::try_from(resolved.len()).unwrap_or(i64::MAX);
+        resolved.push((order, child_db, discriminant));
+    }
+    if !keep_repeats {
+        // Stable, so the first entry of a rank wins.
+        resolved.sort_by_key(|(_, _, t)| match *t {
+            LOCAL_ALTERNATE_VERSION => 0,
+            LINKED_ALTERNATE_VERSION => 1,
+            _ => 2,
+        });
+        let mut seen = std::collections::HashSet::new();
+        resolved.retain(|(_, child, _)| seen.insert(child.clone()));
+    }
     sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
         .bind(container_db)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    for child in &children {
-        // Resolve by id when present, else by path (Jellyfin's own load-time
-        // strategy). Unresolvable children are skipped — same as Jellyfin
-        // showing a stale path-only link as missing.
-        let resolved: Option<String> = if let Some(id) = child
-            .item_id
-            .as_deref()
-            .and_then(|i| Uuid::parse_str(i).ok())
-        {
-            Some(guid_to_db(id))
-        } else if let Some(path) = child.path.as_deref() {
-            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 LIMIT 1"#)
-                .bind(path)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?
-        } else {
-            None
-        };
-        let Some(child_db) = resolved else { continue };
-        let discriminant = CHILD_TYPES
-            .iter()
-            .find(|(_, n)| *n == child.child_type)
-            .map_or(0, |(d, _)| *d);
-        // Dense ordinals, duplicates kept: the table's key is
-        // `(ParentId, SortOrder)` and a 12.0 playlist may list an item twice.
-        let order = i64::try_from(inserted).unwrap_or(i64::MAX);
+    for (order, child_db, discriminant) in &resolved {
         sqlx::query(
             r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
                VALUES (?1, ?2, ?3, ?4)"#,
@@ -765,9 +787,74 @@ pub(crate) async fn import_membership(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        inserted += 1;
     }
-    Ok(inserted)
+    Ok(ImportedMembership {
+        written: resolved.len(),
+        dropped,
+    })
+}
+
+/// C# `MigrateLinkedChildren.ResolveChildId`: the cached `ItemId` while its
+/// row exists (10.x re-resolved a stale one from the path), then the exact
+/// `Path`, then a relative `Path` made absolute against `containing_folder`
+/// (10.x resolved entries relative to their container), then `LibraryItemId`
+/// while its row exists. `None` when nothing resolves.
+pub(crate) async fn resolve_linked_child(
+    tx: &mut sqlx::SqliteConnection,
+    child: &LinkedChildJson,
+    containing_folder: Option<&str>,
+) -> Result<Option<String>, ServiceError> {
+    if let Some(id) = live_item(tx, child.item_id.as_deref()).await? {
+        return Ok(Some(id));
+    }
+    if let Some(path) = child.path.as_deref().filter(|p| !p.is_empty()) {
+        if let Some(id) = item_by_path(tx, path).await? {
+            return Ok(Some(id));
+        }
+        let rooted = matches!(
+            std::path::Path::new(path).components().next(),
+            Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+        );
+        // `Path.GetFullPath(Path.Combine(folder, path))`: a relative folder
+        // (a relative `--data-dir`) is anchored at the working directory.
+        let absolute = containing_folder
+            .filter(|f| !rooted && !f.is_empty())
+            .and_then(|f| std::path::absolute(std::path::Path::new(f).join(path)).ok())
+            .map(|p| ferrofin_util::path_helper::get_full_path(&p.to_string_lossy()));
+        if let Some(absolute) = absolute
+            && let Some(id) = item_by_path(tx, &absolute.to_string_lossy()).await?
+        {
+            return Ok(Some(id));
+        }
+    }
+    live_item(tx, child.library_item_id.as_deref()).await
+}
+
+/// `raw` as a stored id when it parses as a GUID whose row exists.
+async fn live_item(
+    tx: &mut sqlx::SqliteConnection,
+    raw: Option<&str>,
+) -> Result<Option<String>, ServiceError> {
+    let Some(id) = raw.and_then(|r| Uuid::parse_str(r).ok()) else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)
+}
+
+/// The id of an item stored at exactly `path` (the lowest id on a tie).
+pub(crate) async fn item_by_path(
+    tx: &mut sqlx::SqliteConnection,
+    path: &str,
+) -> Result<Option<String>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY "Id" LIMIT 1"#)
+        .bind(path)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)
 }
 
 /// Upserts a playlist's owner / open-access row and replaces its shares from
@@ -1145,7 +1232,7 @@ mod tests {
 
         let map = parse_data(Some(&blob));
         let mut tx = db.writer().begin().await.expect("tx");
-        import_membership(&mut tx, &guid_to_db(playlist), &map)
+        import_membership(&mut tx, &guid_to_db(playlist), None, true, &map)
             .await
             .expect("import membership");
         import_playlist_meta(&mut tx, &guid_to_db(playlist), &map)

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
 use ferrofin_db::Database;
@@ -368,6 +368,19 @@ pub fn shutdown_tracing() {
     }
 }
 
+/// The directory layout under the program-data root, ported from
+/// `ServerApplicationPaths`: {data}/log, {config}, {cache}, {web}.
+#[must_use]
+pub fn application_paths(config: &Config) -> ferrofin_core::FerrofinServerApplicationPaths {
+    ferrofin_core::FerrofinServerApplicationPaths::new(
+        &config.data_dir,
+        config.data_dir.join("log"),
+        &config.config_dir,
+        &config.cache_dir,
+        &config.web_dir,
+    )
+}
+
 /// Opens the SQLite database at `{data_dir}/ferrofin.db` and applies migrations.
 ///
 /// Creates the data directory (and the DB file) if missing, then runs all
@@ -402,7 +415,13 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     // The one-shot ports of 12.0's data routines: membership from Data JSON
     // for a database newly adopted from 10.11.8 (never from a 12.0 one, whose
     // JSON is frozen), orphaned extras, OwnerId relationships, version links.
-    ferrofin_core::adoption_repairs::run_all(&db)
+    // The membership import expands a container's `%AppDataPath%` path; the
+    // configured metadata path is not loaded yet and not needed, as 10.11
+    // keeps playlists and box sets under the data path.
+    let paths = ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::new(
+        application_paths(config),
+    ));
+    ferrofin_core::adoption_repairs::run_all(&db, &paths)
         .await
         .context("failed to run the adoption repairs")?;
     // Rows written before the persistence service derived `SortName` still
