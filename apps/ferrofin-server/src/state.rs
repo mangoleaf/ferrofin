@@ -1868,14 +1868,6 @@ pub async fn build_app_state(
             Arc::clone(&config_trait),
             server_config.log_file_retention_days,
         )));
-        task_manager.register(Arc::new(
-            maint_tasks::CleanupCollectionAndPlaylistPathsTask::new(
-                Arc::clone(&library),
-                Arc::clone(&collections),
-                Arc::clone(&playlists),
-                Arc::clone(&linked_children_service),
-            ),
-        ));
         task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
             Arc::clone(&trickplay_impl),

@@ -105,8 +105,10 @@ Deep-verified against a real Jellyfin server:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — all 20 of Jellyfin's scheduled tasks (including the Live TV
-  guide refresh and the hidden channel refresh) plus the trigger scheduler.
+- **Scheduled tasks** — 19 of Jellyfin's scheduled tasks (including the Live TV guide
+  refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
+  collections and playlists" is gone, as in Jellyfin 12; Jellyfin 12's "Refresh upcoming
+  and missing episodes (TheMovieDb)" task is not ported yet.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half

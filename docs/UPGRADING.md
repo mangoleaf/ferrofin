@@ -8,6 +8,21 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the "Clean up collections and playlists" task is gone
+
+Jellyfin 12 deleted this task, and Ferrofin has now removed it too. It ran about 3
+seconds after every start and removed each collection and playlist member whose file it
+could not see at that moment. If the media storage was not mounted yet (a late NFS/SMB
+mount, a NAS slower to boot than the server, an empty bind mount), it emptied every
+playlist and collection, and they stayed empty after the storage came back. Upgrading
+does not bring back members it already removed; restore a backup taken before the loss
+for that.
+
+Nothing replaces it. Deleting an item already removes it from every playlist and
+collection it was in. A member whose file you deleted stays listed until the next library
+scan removes the item. Jellyfin 12 behaves the same way. Dashboard → Scheduled Tasks no
+longer lists the task, and a trigger you saved for it is ignored.
+
 ## Unreleased — Ferrofin reports Jellyfin 12.2.0; Emby-era sign-in is off by default
 
 `/System/Info` now reports `Version` `12.2.0` (1.3.x reported `10.11.8`). As in Jellyfin 12,
