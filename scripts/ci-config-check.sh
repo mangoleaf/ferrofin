@@ -17,7 +17,7 @@
 #                                        Runs every check; exit 1 if any failed.
 set -uo pipefail
 
-GITLAB_PROJECT=mlstudios%2Fferrofin # the project whose CI Lint resolves includes and variables
+GITLAB_PROJECT=${GITLAB_PROJECT:-76} # GitLab project id for CI Lint (resolves includes and variables); override via the environment
 
 # --no-renames lists a rename as delete + add, so moving a source file into a CI path still shows the
 # source deletion; -z keeps odd path characters unquoted.
