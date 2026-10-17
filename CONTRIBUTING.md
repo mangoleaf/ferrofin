@@ -42,7 +42,8 @@ cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
   --ignore-filename-regex "(crates/($others)|apps)/"
 ```
 
-This is CI's form (`.github/workflows/ci.yml`). `-p` alone still instruments the
+This is CI's form: both pipelines run it per crate from `scripts/coverage-gate.sh`,
+split into three parallel shards. `-p` alone still instruments the
 crate's workspace dependencies, so a crate whose tests link another crate (e.g.
 `ferrofin-wasm`'s scan tests link `ferrofin-core`) would count that crate's uncovered
 source in its total; the regex leaves only the crate's own files.
