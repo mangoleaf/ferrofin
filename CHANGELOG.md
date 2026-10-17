@@ -175,6 +175,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- The "Clean up collections and playlists" scheduled task is removed, as in Jellyfin 12. It
+  ran at every start and removed each collection and playlist member whose file it could not
+  see, so a boot with the media storage not yet mounted emptied every playlist and collection
+  for good. Deleting an item still removes it from them. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - A library on a database adopted from Jellyfin no longer browses empty after Ferrofin's
   first scan, and media deleted from disk is removed from it again. Jellyfin files a
   library's items under the library location's folder, Ferrofin under the library itself.
