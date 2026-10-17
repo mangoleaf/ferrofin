@@ -338,6 +338,7 @@ async fn hidden_items_return_404_before_direct_reads_and_writes() {
         format!("/Items/{id}/LocalTrailers"),
         format!("/Items/{id}/Intros"),
         format!("/Items/{id}/Similar"),
+        format!("/Shows/{id}/Similar"),
         format!("/Items/{id}/ThemeSongs"),
         format!("/Items/{id}/ThemeVideos"),
         format!("/UserItems/{id}/UserData"),
