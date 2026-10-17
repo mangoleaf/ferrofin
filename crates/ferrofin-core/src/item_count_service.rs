@@ -6,13 +6,14 @@
 //! playlist's links through the `DescendantOfId` closure, as v12.2 does. The
 //! per-page played/total batch (`get_played_and_total_count_batch`) unions
 //! v12.2's three branches: the `AncestorIds` closure, the `LinkedChildren`, and
-//! the closure of each linked folder.
+//! the closure of each linked folder. See the TODOs in its body and on
+//! `folder_leaf_count_sql` for where it still differs from v12.2.
 //!
 //! TODO: the per-ancestor counts (`get_played_count`, `get_total_count`,
 //! `get_played_and_total_count`, all through `descendant_counts`) have no
 //! production caller and still read the bare `AncestorIds` closure: no link
 //! following, no presentation-key group, no `IsCountableLeaf`. Un-defer path:
-//! port v12.2 `BuildGroupedDescendantsQuery` (`ItemCountService.cs:440-451`)
+//! port v12.2 `BuildGroupedDescendantsQuery` (`ItemCountService.cs:441-452`)
 //! the way `get_played_and_total_count_from_linked_children` ports its sibling.
 
 use std::collections::{HashMap, HashSet};
@@ -711,9 +712,28 @@ impl ItemCountService for FerrofinItemCountService {
                 },
             );
         }
-        // Folders with no leaf descendants (e.g. by-name items, which have no
-        // `AncestorIds` closure) are absent from the grouped rows ⇒ default 0/0,
-        // exactly as the prior per-folder path returned.
+        // Folders with no countable leaf in any branch are absent from the
+        // grouped rows ⇒ 0/0: e.g. an empty folder, a season whose episodes are
+        // all virtual (missing or unaired), a folder whose leaves the access
+        // filter hides from this user, or a box set holding only box sets.
+        //
+        // TODO: v12.2 leaves a 0/0 folder OUT of the batch
+        // (`if (total > 0 || played > 0)`, `ItemCountService.cs:684`), and
+        // `Folder.FillUserDataDtoValues` (Folder.cs:2042-2058) then counts it
+        // per item through `GetAllDescendantIdsBatch`, which follows a box set
+        // nested in a box set, where the branches here stop at the inner set's
+        // own (empty) closure. Un-defer path: drop 0/0 entries here and fall
+        // back per item in the DTO folder branch through
+        // `get_played_and_total_count_from_linked_children` (its
+        // `descendant_of_id` walks both the closure and the links).
+        //
+        // TODO: v12.2 also resolves each requested folder to its merged
+        // presentation-key group (`GetPresentationKeyGroups`,
+        // `ItemCountService.cs:612`, `:693`) and sums the members' counts
+        // (`:669-688`); here each folder counts
+        // alone, so a series merged across rows counts one row's episodes.
+        // Un-defer path: resolve each page id's group, seed the branches with
+        // every member, and sum the members per requested id.
         for (&folder, key) in folder_ids.iter().zip(&ids) {
             out.insert(folder, by_parent.get(key).copied().unwrap_or_default());
         }
@@ -922,7 +942,7 @@ impl FerrofinItemCountService {
     /// which is `IsFolder = 0`, `IsVirtualItem = 0` and has no
     /// `PrimaryVersionId`, so both statements below see it. v12 never counts it:
     /// it reaches the `AggregateFolder`'s leaves through
-    /// `AncestorIds`/`LinkedChildren` (`ItemCountService.cs:495-530`) and the
+    /// `AncestorIds`/`LinkedChildren` (v12.2 `ItemCountService.cs:622-654`) and the
     /// placeholder is in neither. Measured on the adopted bench database, the
     /// `total` arm serves 23,928 where the honest answer is 23,927 (the
     /// placeholder is one of those rows and has zero `AncestorIds` rows). The
@@ -1115,10 +1135,19 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
 /// carry several rows — 2,154 of them on that same adopted database — and the
 /// join multiplies: without the `DISTINCT` the shows folder counts 1,382 played
 /// leaves against a true 691, and movies 2,649 against 883. The `DISTINCT` is
-/// also exactly v12's rule:
-/// `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624) counts an item
-/// played when `b.UserData.Any(u => u.UserId == userId && u.Played)` — ANY key
-/// row, not all of them.
+/// also v12.2's rule: `GetPlayedAndTotalCountBatch` counts
+/// `g.Where(x => x.Played).Select(x => x.Id).Distinct()` (`:663-664`), and a
+/// leaf is played when ANY of its key rows is, not all of them.
+///
+/// TODO: v12.2's played test is `DescendantQueryHelper.IsPlayedBy`, which also
+/// counts a primary as played when one of its alternate versions is
+/// (`LinkedChildren` of type `LocalAlternateVersion`/`LinkedAlternateVersion`
+/// whose child the user played). Both played statements here, this one and
+/// [`WHOLE_SERVER_PLAYED_COUNT_SQL`], read the leaf's own `UserData` only,
+/// while the per-item linked-children path already counts the version group
+/// (`push_is_played`). Un-defer path: join that version arm into both played
+/// statements together, as `IsPlayedBy` does, so a page holding a folder and
+/// the `AggregateFolder` keeps one played rule.
 ///
 /// The pin has a loss regime, and it is bounded. It wins whenever the parents'
 /// combined closure is smaller than the user's played-row count — every album /
@@ -1140,11 +1169,12 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
 /// `ExtraType`) belongs to its owner and is no item of its own; an extra
 /// is counted (`DescendantQueryHelper.IsDistinctLibraryItem`).
 ///
-/// `IsVirtualItem = 0` is upstream's, not an optimisation: BOTH
-/// `Folder.GetRecursiveChildCount` (Folder.cs:701-714) and the
-/// `UnplayedItemCount` query in `Folder.FillUserDataDtoValues`
-/// (Folder.cs:1812-1824) set `IsVirtualItem = false`, so a missing episode is
-/// counted by neither. It was absent here while the whole-server variant
+/// `IsVirtualItem = 0` is upstream's, not an optimisation: v12.2's batch keeps
+/// only `DescendantQueryHelper.IsCountableLeaf` (`!b.IsFolder &&
+/// !b.IsVirtualItem`, DescendantQueryHelper.cs:21-22), and
+/// `Folder.GetRecursiveChildCount` (Folder.cs:977-991) sets
+/// `IsVirtualItem = false`, so a missing episode is counted by neither. It was
+/// absent here while the whole-server variant
 /// (`whole_server_leaf_counts`, the `AggregateFolder`'s counts) carried it,
 /// which meant a page holding both an ordinary folder and the aggregate counted
 /// them by two different rules.
@@ -1177,12 +1207,14 @@ fn folder_leaf_count_sql(extra_join: &str, extra_where: &str) -> String {
 /// bound to one `UserId`. The sibling of [`folder_leaf_count_sql`] for the one
 /// parent whose descendants are everything, so it needs no ancestor closure.
 ///
-/// The `COUNT(DISTINCT bi."Id")` is v12's rule and it is load-bearing.
+/// The `COUNT(DISTINCT bi."Id")` is v12.2's rule and it is load-bearing.
 /// `ItemCountService.GetPlayedAndTotalCountFromQuery`
-/// (v12 `ItemCountService.cs:610-624`) projects ONE boolean PER ITEM —
-/// `query.Select(b => b.UserData!.Any(u => u.UserId == userId && u.Played))` —
-/// and counts the true ones, and `GetPlayedAndTotalCountBatch` (`:535-540`)
-/// spells the same thing out as
+/// (v12.2 `ItemCountService.cs:735-749`) projects ONE boolean PER ITEM —
+/// `query.Select(DescendantQueryHelper.IsPlayedBy(userId))`, whose first arm is
+/// `b.UserData!.Any(u => u.UserId.Equals(userId) && u.Played)` — and counts the true
+/// ones (its second, alternate-version arm is not ported here; see the TODO on
+/// [`folder_leaf_count_sql`], which covers both played statements), and
+/// `GetPlayedAndTotalCountBatch` (`:663-664`) spells the same thing out as
 /// `g.Where(x => x.Played).Select(x => x.Id).Distinct().Count()`. `UserData`'s
 /// primary key is `(ItemId, UserId, CustomDataKey)`, so one `(item, user)` pair
 /// can carry several rows — 2,154 such pairs on the adopted bench database —
@@ -3134,9 +3166,9 @@ mod tests {
         }
     }
 
-    /// A leaf is played when ANY of its `UserData` key rows is played — v12
-    /// `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624),
-    /// `b.UserData.Any(u => u.UserId == userId && u.Played)`. Both mixed
+    /// A leaf is played when ANY of its `UserData` key rows is played — v12.2
+    /// `DescendantQueryHelper.IsPlayedBy`'s first arm,
+    /// `b.UserData!.Any(u => u.UserId.Equals(userId) && u.Played)`. Both mixed
     /// orders count, and the `DISTINCT` still keeps the leaf from counting
     /// twice.
     #[tokio::test]
@@ -3367,9 +3399,9 @@ mod tests {
     /// The `AggregateFolder`'s played/total pair, pinned against duplicate
     /// `UserData` key rows.
     ///
-    /// v12 `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624)
-    /// projects one boolean PER ITEM —
-    /// `b.UserData.Any(u => u.UserId == userId && u.Played)` — so a leaf with
+    /// v12.2 `ItemCountService.GetPlayedAndTotalCountFromQuery` (`:735-749`)
+    /// projects one boolean PER ITEM — `IsPlayedBy`, whose first arm is
+    /// `b.UserData!.Any(u => u.UserId.Equals(userId) && u.Played)` — so a leaf with
     /// four played key rows is ONE played leaf. A bare `COUNT(*)` over the
     /// `UserData` join counted it four times: 4,031 played leaves against a true
     /// 1,574 on the adopted bench database, out of 23,928. `extra_keys > 0` is
