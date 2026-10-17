@@ -465,6 +465,10 @@ impl PlaylistManager for RecordingPlaylists {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), ServiceError> {
+        // The manager's `ArgumentException` for an id that is no playlist's.
+        if playlist_id != PLAYLIST_ID.to_string() {
+            return Err(ServiceError::invalid_input("no playlist"));
+        }
         *self.removed.lock().unwrap() = Some((playlist_id.to_owned(), entry_ids.to_vec()));
         Ok(())
     }
@@ -555,6 +559,20 @@ fn state_full(
     dto: Arc<OkDto>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
+    let auth = Arc::new(OkAuth);
+    state_authed(playlists, collections, dto, users, (auth.clone(), auth))
+}
+
+/// [`state_full`] with the caller's credentials chosen by the test: [`OkAuth`]
+/// is the fixed user, `FakeAuthContext` + `ApiKeyAuthService` an API key (no
+/// user).
+fn state_authed(
+    playlists: Arc<RecordingPlaylists>,
+    collections: Arc<RecordingCollections>,
+    dto: Arc<OkDto>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    (context, auth): (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>),
+) -> AppState {
     AppState::new(
         Arc::new(ferrofin_api::test_support::FakeLibrary),
         users,
@@ -570,8 +588,8 @@ fn state_full(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         dto,
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        context,
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         playlists,
         collections,
@@ -779,6 +797,36 @@ async fn remove_items_from_playlist_records_call() {
     let (pid, entries) = pl.removed.lock().unwrap().clone().expect("recorded");
     assert_eq!(pid, PLAYLIST_ID.to_string());
     assert_eq!(entries, vec![ITEM_A.to_string()]);
+}
+
+/// An API key skips the access gate, so the manager is what refuses an id
+/// that is no playlist's — and `RemoveItemFromPlaylist` answers that with a
+/// bare `NotFound()`, never the `400` its exception would otherwise be.
+#[tokio::test]
+async fn an_api_key_removing_from_a_non_playlist_is_not_found() {
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state_authed(
+        pl.clone(),
+        Arc::new(RecordingCollections::default()),
+        Arc::new(OkDto::default()),
+        Arc::new(OkUsers),
+        (
+            Arc::new(ferrofin_api::test_support::FakeAuthContext),
+            Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+        ),
+    );
+    let (status, body) = send(
+        app,
+        "DELETE",
+        &format!("/Playlists/{ITEM_A}/Items?entryIds={ITEM_A}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The parameterless `NotFound()`'s ProblemDetails, not the gate's message.
+    let document: serde_json::Value = serde_json::from_slice(&body).expect("problem details");
+    assert_eq!(document["title"], "Not Found");
+    assert!(pl.removed.lock().unwrap().is_none());
 }
 
 #[tokio::test]

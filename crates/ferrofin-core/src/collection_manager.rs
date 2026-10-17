@@ -98,8 +98,8 @@ async fn update_rating_to_items(
         return Ok(());
     };
     let rerate = async {
-        // Only a box set or playlist takes its members' rating: the playlist and
-        // collection writes reach here with whatever id the caller sent.
+        // Only a box set or playlist takes its members' rating. Every caller
+        // has checked the kind already; this keeps any new one honest.
         let Some(mut row) = library_manager
             .get_item_by_id(container)
             .await?
@@ -138,6 +138,22 @@ async fn update_rating_to_items(
         }
         result => result,
     }
+}
+
+/// The row `id` names when it is an item of `kind`, else `None`: upstream's
+/// `GetItemById(id) is not BoxSet` / `is not Playlist` test, which every
+/// collection and playlist membership change makes before it touches anything.
+/// Without it those writes reach any item the caller names — a movie's name
+/// and its version links included.
+async fn item_of_kind(
+    library_manager: &dyn LibraryManager,
+    id: Uuid,
+    kind: BaseItemKind,
+) -> Result<Option<BaseItemEntity>, ServiceError> {
+    Ok(library_manager
+        .get_item_by_id(id)
+        .await?
+        .filter(|row| BaseItemKind::from_stored_type_name(&row.type_) == Some(kind)))
 }
 
 /// Decides the caller's [`PlaylistAccess`] from the three joined access columns
@@ -392,6 +408,17 @@ impl FerrofinCollectionManager {
         )
         .await
     }
+
+    /// `AddToCollectionAsync`/`RemoveFromCollectionAsync`: an id that is not
+    /// a box set's is an `ArgumentException` (→ `400`).
+    async fn require_box_set(&self, id: Uuid) -> Result<(), ServiceError> {
+        item_of_kind(self.library_manager.as_ref(), id, BaseItemKind::BoxSet)
+            .await?
+            .map(drop)
+            .ok_or_else(|| {
+                ServiceError::invalid_input(format!("no collection exists with id {id}"))
+            })
+    }
 }
 
 #[async_trait]
@@ -435,6 +462,7 @@ impl CollectionManager for FerrofinCollectionManager {
         collection_id: Uuid,
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
+        self.require_box_set(collection_id).await?;
         let current = self
             .linked_children
             .get_linked_children_ids(collection_id, None)
@@ -457,6 +485,7 @@ impl CollectionManager for FerrofinCollectionManager {
         collection_id: Uuid,
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
+        self.require_box_set(collection_id).await?;
         for item_id in item_ids {
             sqlx::query(
                 r#"DELETE FROM "LinkedChildren"
@@ -692,12 +721,13 @@ impl FerrofinPlaylistManager {
     /// a user with a maximum parental rating sees a playlist only when it is
     /// empty or a member passes the rating, and a playlist file also answers
     /// to its own rating and tags. Invisible is `NotFound`, as the C#
-    /// `GetPlaylistForUser` returns null.
+    /// `GetPlaylistForUser` returns null — and so is an item that is no
+    /// playlist, which that lookup never lists, with or without the evaluator.
     async fn require_visible(&self, playlist_id: Uuid, user_id: Uuid) -> Result<(), ServiceError> {
+        let playlist = self.require_playlist(playlist_id).await?;
         let Some((visibility, user)) = self.visibility_user(user_id).await? else {
             return Ok(());
         };
-        let playlist = self.require_playlist(playlist_id).await?;
         if visibility
             .playlist_policy(&[playlist], &user)
             .await?
@@ -744,12 +774,29 @@ impl FerrofinPlaylistManager {
             .collect())
     }
 
-    /// Loads a playlist row or errors with [`ServiceError::NotFound`].
+    /// Loads a playlist row or errors with [`ServiceError::NotFound`]; an item
+    /// of any other kind is not found either.
     async fn require_playlist(&self, id: Uuid) -> Result<BaseItemEntity, ServiceError> {
-        self.library_manager
-            .get_item_by_id(id)
+        item_of_kind(self.library_manager.as_ref(), id, BaseItemKind::Playlist)
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("playlist {id}")))
+    }
+
+    /// The playlist a membership change names. Upstream's
+    /// `AddToPlaylistInternal`, `RemoveItemFromPlaylistAsync` and
+    /// `MoveItemAsync` throw `ArgumentException` for an id that is no
+    /// playlist's. The controllers' `GetPlaylistForUser` gate answers `404`
+    /// before that, except for an API key's remove, which skips the gate and
+    /// turns the exception into the same `404`.
+    async fn require_playlist_argument(&self, id: &str) -> Result<Uuid, ServiceError> {
+        let no_playlist =
+            || ServiceError::invalid_input(format!("no playlist exists with id {id}"));
+        let uuid = Uuid::parse_str(id).map_err(|_| no_playlist())?;
+        match self.require_playlist(uuid).await {
+            Ok(_) => Ok(uuid),
+            Err(ServiceError::NotFound(_)) => Err(no_playlist()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolves the caller's access to a playlist (C# `Playlist.IsVisible` plus
@@ -757,7 +804,9 @@ impl FerrofinPlaylistManager {
     ///
     /// One LEFT-JOIN query: the base row proves existence, the `FerrofinPlaylists` meta
     /// row carries owner/open-access, and the caller's own `FerrofinPlaylistShares` row
-    /// (if any) carries `CanEdit`. Missing **or invisible** → `NotFound`.
+    /// (if any) carries `CanEdit`. The query reads a row of any kind, so it is the
+    /// unconditional [`Self::require_visible`] that proves the row is a playlist.
+    /// Missing, invisible **or no playlist** → `NotFound`.
     async fn access(
         &self,
         playlist_id: Uuid,
@@ -1070,6 +1119,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // check — an item already in the playlist gets a second entry — and
         // the new block goes at `position` (≤ 0 prepends, ≥ length appends,
         // otherwise a splice), else at the end.
+        self.require_playlist_argument(&playlist_id.to_string())
+            .await?;
         let pid = guid_to_db(playlist_id);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
         let added: Vec<Entry> = item_ids
@@ -1099,12 +1150,12 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // wire form is a dashless `Guid('N')` (`GetPlaylistItems` emits
         // `item.id.replace('-', "")`), but `ChildId` is stored in the canonical
         // dashed uppercase form. Parse and re-format via `guid_to_db` to
-        // normalise back to the stored form (same for the playlist id, which
-        // arrives as a caller-formatted string); skip any entry id that isn't a
+        // normalise back to the stored form; skip any entry id that isn't a
         // valid GUID.
         // C# `RemoveItemFromPlaylistAsync` (12.0): every entry whose item id
         // is in the request goes — all occurrences, not the first.
-        let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
+        let playlist = self.require_playlist_argument(playlist_id).await?;
+        let pid = guid_to_db(playlist);
         let removals: Vec<String> = entry_ids
             .iter()
             .filter_map(|e| Uuid::parse_str(e).ok())
@@ -1116,11 +1167,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         if entries.len() != before {
             write_entries(self.db.writer(), &pid, &entries).await?;
         }
-        if let Ok(playlist) = Uuid::parse_str(playlist_id) {
-            item_data::sync_container_data(&self.db, playlist).await?;
-            self.update_rating_to_items(playlist).await?;
-        }
-        Ok(())
+        item_data::sync_container_data(&self.db, playlist).await?;
+        self.update_rating_to_items(playlist).await
     }
 
     async fn move_item(
@@ -1134,9 +1182,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // then rewrite the `SortOrder` ordinals. `entry_id` is the `ChildId` (as
         // `remove_item_from_playlist` treats it).
         // Same ordering the read path uses (`get_linked_children_ids`), so the
-        // relocation matches what the client sees. The playlist id arrives as a
-        // caller-formatted string — normalise to the stored canonical form.
-        let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
+        // relocation matches what the client sees.
+        let playlist = self.require_playlist_argument(playlist_id).await?;
+        let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
         // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored in the
@@ -1172,10 +1220,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         };
         entries.insert(target, entry);
         write_entries(self.db.writer(), &pid, &entries).await?;
-        if let Ok(playlist) = Uuid::parse_str(playlist_id) {
-            item_data::sync_container_data(&self.db, playlist).await?;
-        }
-        Ok(())
+        item_data::sync_container_data(&self.db, playlist).await
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
@@ -1930,11 +1975,11 @@ mod tests {
         );
 
         set_rating(heat, "R").await;
-        // A movie addressed as a collection keeps its own rating.
-        collections
-            .add_to_collection(heat, &[up])
-            .await
-            .expect("add to a movie");
+        // A movie addressed as a collection is refused and keeps its own rating.
+        assert!(matches!(
+            collections.add_to_collection(heat, &[up]).await,
+            Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+        ));
         assert_eq!(rating(heat).await, (Some("R".to_owned()), None));
         let playlists = playlist_manager(&db).with_visibility(
             Arc::clone(&visibility),
@@ -3216,6 +3261,127 @@ mod tests {
         .expect("update");
         assert_eq!(rows(&db, playlist).await, vec![b, b]);
     }
+
+    /// A movie named "Movie" with one alternate-version link:
+    /// the item the writes below aim at, and the link they must leave alone.
+    async fn movie_with_a_version(db: &ferrofin_db::Database) -> (Uuid, Uuid) {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let (movie, version) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_named_item(db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_item(db, version, BaseItemKind::Movie).await;
+        FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(
+                movie,
+                version,
+                i32::from(ferrofin_db::enums::LinkedChildType::LocalAlternateVersion),
+            )
+            .await
+            .expect("version link");
+        (movie, version)
+    }
+
+    async fn name_of(db: &ferrofin_db::Database, id: Uuid) -> String {
+        library_manager_over(db.clone())
+            .get_item_by_id(id)
+            .await
+            .expect("read")
+            .expect("row")
+            .name
+            .unwrap_or_default()
+    }
+
+    /// Upstream's `GetPlaylistForUser` lists only playlists, so a movie or a
+    /// box set id is `404` on every playlist route, and the manager's add,
+    /// remove and move throw `ArgumentException`. Before, an item with no
+    /// `FerrofinPlaylists` row read as a legacy playlist every caller owns:
+    /// anyone could rename a movie or rewrite its version links, and read a
+    /// box set's members through the playlist routes.
+    #[tokio::test]
+    async fn playlist_calls_refuse_an_item_that_is_no_playlist() {
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::persistence::LinkedChildrenService;
+
+        let db = test_db().await;
+        let (movie, version) = movie_with_a_version(&db).await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let mgr = playlist_manager(&db);
+        let caller = Uuid::new_v4();
+        let movie_str = movie.to_string();
+
+        let not_found = |result: Result<(), ServiceError>| {
+            assert!(
+                matches!(result, Err(ServiceError::NotFound(_))),
+                "{result:?}"
+            );
+        };
+        not_found(mgr.get_playlist_access(movie, caller).await.map(drop));
+        not_found(mgr.get_playlist_for_user(movie, caller).await.map(drop));
+        not_found(mgr.get_playlist_items(movie, caller).await.map(drop));
+        // A box set's manual member reaches the members-present branch.
+        let box_set = Uuid::new_v4();
+        seed_item(&db, box_set, BaseItemKind::BoxSet).await;
+        FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(box_set, track, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("member");
+        not_found(mgr.get_playlist_items(box_set, caller).await.map(drop));
+        not_found(
+            mgr.update_playlist(&PlaylistUpdateRequest {
+                id: movie,
+                name: Some("Renamed".to_owned()),
+                ids: Some(vec![track]),
+                ..PlaylistUpdateRequest::default()
+            })
+            .await,
+        );
+
+        let invalid = |result: Result<(), ServiceError>| {
+            assert!(
+                matches!(result, Err(ServiceError::InvalidInput(_))),
+                "{result:?}"
+            );
+        };
+        invalid(
+            mgr.add_item_to_playlist(movie, &[track], None, caller)
+                .await,
+        );
+        invalid(
+            mgr.remove_item_from_playlist(&movie_str, &[version.simple().to_string()])
+                .await,
+        );
+        invalid(
+            mgr.move_item(&movie_str, &version.simple().to_string(), 0, caller)
+                .await,
+        );
+        invalid(mgr.remove_item_from_playlist("not-a-guid", &[]).await);
+
+        assert_eq!(name_of(&db, movie).await, "Movie");
+        assert_eq!(rows(&db, movie).await, [version]);
+    }
+
+    /// `AddToCollectionAsync`/`RemoveFromCollectionAsync`: an id that is no
+    /// box set's is an `ArgumentException` (`400`), and nothing changes.
+    #[tokio::test]
+    async fn collection_writes_refuse_an_item_that_is_no_box_set() {
+        let db = test_db().await;
+        let (movie, version) = movie_with_a_version(&db).await;
+        let mgr = collection_manager_over(&db);
+        for result in [
+            mgr.add_to_collection(movie, &[version]).await,
+            mgr.remove_from_collection(movie, &[version]).await,
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+                ),
+                "{result:?}"
+            );
+        }
+        assert_eq!(rows(&db, movie).await, [version]);
+    }
+
     #[tokio::test]
     async fn plain_collection_collapse_uses_visible_folder_children_all_links_and_local_alternates()
     {
