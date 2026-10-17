@@ -1,6 +1,7 @@
-//! `BaseItems.Data` JSON — Jellyfin 10.11.8's serialized-item payload, the
-//! **source of truth** for playlist/collection membership, ownership, and
-//! shares.
+//! `BaseItems.Data` JSON — Jellyfin's serialized-item payload, the **source of
+//! truth** for a playlist's ownership and shares. Membership lives in the
+//! `LinkedChildren` table since 12.0 (`Folder.LinkedChildren` is
+//! `[JsonIgnore]`); a 10.11 `Data` copy of it is imported once, on adoption.
 //!
 //! Jellyfin serializes the whole runtime item object into the `Data` column
 //! (`BaseItemRepository`: `entity.Data = JsonSerializer.Serialize(dto, dtoType,
@@ -17,16 +18,14 @@
 //!    {"Path":"/media/…/M.mkv","Type":"Manual"}], …}
 //! ```
 //!
-//! Ferrofin's query paths keep using the `LinkedChildren` /
-//! `FerrofinPlaylists` / `FerrofinPlaylistShares` tables as a **derived cache**;
-//! every membership/ownership mutation writes through to `Data` via
-//! [`sync_container_data`], and [`reconcile_playlist_permissions`] rebuilds the
-//! cache from `Data` (adopted Jellyfin databases) or backfills `Data` from the
-//! cache (databases created before this module existed) at startup.
+//! Ferrofin's query paths keep using the `FerrofinPlaylists` /
+//! `FerrofinPlaylistShares` tables as a **derived cache**; every ownership or
+//! share mutation writes through to `Data` via [`sync_container_data`], and
+//! [`reconcile_playlist_permissions`] rebuilds the cache from `Data` at startup.
 //!
 //! Writes are **read-modify-write** over the raw JSON object: keys Ferrofin does
 //! not model (`DisplayOrder`, `DateLastSaved`, `IsHD`, …) are preserved
-//! byte-for-byte so a round trip back to Jellyfin loses nothing.
+//! byte-for-byte, so they survive Ferrofin's writes.
 
 use ferrofin_db::Database;
 use ferrofin_db::store::guid_to_db;
@@ -547,7 +546,8 @@ fn data_to_string(data: &Map<String, Value>) -> Result<String, ServiceError> {
         .map_err(|e| ServiceError::Backend(format!("serialize Data JSON: {e}")))
 }
 
-/// The container kinds whose `Data` JSON carries membership.
+/// The stored type names of playlists and box sets (the containers whose
+/// 10.11 `Data` JSON carried membership).
 fn container_type_names() -> [&'static str; 2] {
     [
         stored_type_name(BaseItemKind::Playlist)

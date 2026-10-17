@@ -828,13 +828,11 @@ async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Res
 ///
 /// axum drops a handler's future when the connection closes, which could
 /// stop a delete between its files and its rows, or half way through its
-/// paths. The row delete itself is one transaction, but what follows its
-/// commit — the extracted-data cleanup, re-syncing the `Data` of the
-/// playlists and collections that lost a member, and the `LibraryChanged`
-/// notice — would be skipped, and a `DELETE /Items?ids=` would stop between
-/// two items. Upstream's controller does not observe `RequestAborted` here,
-/// so its delete finishes; the work runs on its own task, which the request
-/// only awaits.
+/// paths. The row delete itself is one transaction, but the `LibraryChanged`
+/// notice that follows its commit would be skipped, and a
+/// `DELETE /Items?ids=` would stop between two items. Upstream's controller
+/// does not observe `RequestAborted` here, so its delete finishes; the work
+/// runs on its own task, which the request only awaits.
 async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
 where
     F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
