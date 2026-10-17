@@ -1009,7 +1009,8 @@ pub(crate) async fn seed_playlist_owner(db: &Database, playlist: Uuid, owner: Uu
 }
 
 /// Test-only: makes every write of `item`'s `Data` abort (a `BEFORE UPDATE OF
-/// "Data"` trigger), to prove an edit that changes no `Data` key never writes it.
+/// "Data"` trigger), to prove an edit that changes no `Data` key never writes
+/// it, or to fail an edit at its `Data` sync.
 #[cfg(test)]
 pub(crate) async fn fail_data_writes_of(db: &Database, item: Uuid) {
     sqlx::query(sqlx::AssertSqlSafe(format!(

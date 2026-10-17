@@ -269,6 +269,30 @@ pub(crate) async fn insert_named_item_in(
     Ok(())
 }
 
+/// Saves what a playlist add stamps on the playlist beside its entries: the
+/// `MediaType` column (`Playlist.MediaType => PlaylistMediaType`, saved by
+/// the create's `SetMediaType`) and `DateLastMediaAdded`
+/// (`AddToPlaylistInternal`). `None` leaves a column as it is.
+pub(crate) async fn stamp_playlist_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    media_type: Option<&str>,
+    media_added: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "MediaType" = COALESCE(?2, "MediaType"),
+               "DateLastMediaAdded" = COALESCE(?3, "DateLastMediaAdded")
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(playlist))
+    .bind(media_type)
+    .bind(opt_datetime_to_db(media_added))
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// The id of the container row stored at `path`, or `None`.
 ///
 /// **Matched by exact path**, the way `CollectionManager.EnsureLibraryFolder`

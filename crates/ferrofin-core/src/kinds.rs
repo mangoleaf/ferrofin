@@ -616,6 +616,25 @@ pub fn is_audio(kind: BaseItemKind) -> bool {
     matches!(kind, BaseItemKind::Audio | BaseItemKind::AudioBook)
 }
 
+/// Whether an item of this kind may go into a playlist — C#
+/// `BaseItem.SupportsAddingToPlaylist`, `false` on the base and `true` on
+/// `Video` and `Audio` (with every subclass), `MusicAlbum`, `MusicArtist`,
+/// `MusicGenre`, `Season` and `Series`. A photo, a book or a person is never
+/// added.
+#[must_use]
+pub fn supports_adding_to_playlist(kind: BaseItemKind) -> bool {
+    is_video(kind)
+        || is_audio(kind)
+        || matches!(
+            kind,
+            BaseItemKind::MusicAlbum
+                | BaseItemKind::MusicArtist
+                | BaseItemKind::MusicGenre
+                | BaseItemKind::Season
+                | BaseItemKind::Series
+        )
+}
+
 /// Whether this kind carries artist/album-artist DTO fields — the kinds whose
 /// C# classes implement `IHasArtist`/`IHasAlbumArtist` (`Audio`, `AudioBook`,
 /// `MusicAlbum`, `MusicVideo`). Jellyfin's `DtoService` only attaches
@@ -693,8 +712,9 @@ mod tests {
     use super::{
         collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
         latest_items_index_container_kind, presentation_unique_key, series_presentation_unique_key,
-        series_user_data_keys, supports_ancestors, supports_inherited_parent_images,
-        supports_people, supports_played_status, supports_similarity, supports_theme_media,
+        series_user_data_keys, supports_adding_to_playlist, supports_ancestors,
+        supports_inherited_parent_images, supports_people, supports_played_status,
+        supports_similarity, supports_theme_media,
     };
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
@@ -1266,5 +1286,32 @@ mod tests {
         ] {
             assert!(supports_played_status(kind), "{kind:?}");
         }
+    }
+
+    /// `BaseItem.SupportsAddingToPlaylist` is `false`; `Video` and `Audio`
+    /// (with their subclasses), `MusicAlbum`, `MusicArtist`, `MusicGenre`,
+    /// `Season` and `Series` override it to `true`.
+    #[rstest]
+    #[case(BaseItemKind::Audio, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::Video, true)]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::MusicVideo, true)]
+    #[case(BaseItemKind::Trailer, true)]
+    #[case(BaseItemKind::MusicAlbum, true)]
+    #[case(BaseItemKind::MusicArtist, true)]
+    #[case(BaseItemKind::MusicGenre, true)]
+    #[case(BaseItemKind::Season, true)]
+    #[case(BaseItemKind::Series, true)]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::Book, false)]
+    #[case(BaseItemKind::Person, false)]
+    #[case(BaseItemKind::Genre, false)]
+    #[case(BaseItemKind::BoxSet, false)]
+    #[case(BaseItemKind::Playlist, false)]
+    #[case(BaseItemKind::Folder, false)]
+    fn which_kinds_a_playlist_takes(#[case] kind: BaseItemKind, #[case] expected: bool) {
+        assert_eq!(supports_adding_to_playlist(kind), expected);
     }
 }

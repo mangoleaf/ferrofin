@@ -79,13 +79,19 @@ struct CreatePlaylistQuery {
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
+    /// The media type (obsolete query form).
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
+    media_type: Option<ferrofin_model::data::MediaType>,
 }
 
 /// `POST /Playlists` — creates a new playlist.
 ///
 /// Port of `PlaylistsController.CreatePlaylist`. Query parameters (obsolete) take
 /// precedence over the body, matching the C# merge: `ids` fall back to the body,
-/// and `name`/`userId` prefer the query when present.
+/// and `name`/`userId`/`mediaType` prefer the query when present.
 #[utoipa::path(
     post,
     path = "/Playlists",
@@ -118,7 +124,7 @@ async fn create_playlist(
     let request = PlaylistCreationRequest {
         name: query.name.or(body.name),
         item_id_list,
-        media_type: body.media_type,
+        media_type: query.media_type.or(body.media_type),
         user_id,
         users: body.users,
         public: body.is_public,
