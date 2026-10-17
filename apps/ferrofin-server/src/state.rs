@@ -518,12 +518,15 @@ pub async fn build_app_state(
     // with the built-in project key (like TMDB); a user key/PIN override
     // enables their subscription tier. The plugin's `CacheDurationInHours`
     // (FERROFIN_TVDB_CACHE_HOURS, config `tvdb_cache_hours`; a bad value
-    // warns and keeps the one-hour default) bounds its resolved-id caches.
+    // warns and keeps the one-hour default) bounds its resolved-id caches;
+    // FERROFIN_TVDB_TOKEN_DAYS (config `tvdb_token_days`, default the
+    // plugin's 25) bounds how long its bearer token is reused.
     let the_tvdb = ferrofin_providers::TvdbClient::with_config(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
     )
-    .with_cache_duration(config.tvdb_cache_duration());
+    .with_cache_duration(config.tvdb_cache_duration())
+    .with_token_max_age(config.tvdb_token_max_age());
     let the_tvdb = Arc::new(match endpoints.tvdb.as_deref() {
         Some(base) => the_tvdb.with_base_url(base),
         None => the_tvdb,
