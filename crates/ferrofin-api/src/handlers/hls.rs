@@ -25,10 +25,11 @@
 //! - `DELETE /Videos/ActiveEncodings` (stop an encoding)
 //! - `GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}` (attachment serve)
 //!
-//! The transcode branch of `/Videos|Audio/{id}/{container}` and
-//! `/Audio/{id}/universal` is folded into the existing direct-play handlers
-//! (`videos`/`audio`), which fall back to [`HlsStreamManager::transcode_stream`]
-//! only when the item has no direct-playable file.
+//! The transcode branch of `/Videos|Audio/{id}/stream[.{container}]` and
+//! `/Audio/{id}/universal` is folded into the direct-play handlers
+//! (`videos`/`audio`), which call [`HlsStreamManager::transcode_stream`] for a
+//! request that is not `Static=true`, a static video request for a disc
+//! folder, and a universal request with no direct-playable source.
 
 use axum::Router;
 use axum::body::Body;
@@ -434,11 +435,11 @@ pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), 
 
 /// Serves the transcode branch of a direct-play stream route.
 ///
-/// The `/Videos|Audio/{id}/{container}` (`stream.{container}`) and
-/// `/Audio/{id}/universal` routes first attempt direct play (serving the item's
-/// on-disk file); when the item has no direct-playable file this runs the
+/// The `/Videos|Audio/{id}/stream[.{container}]` and `/Audio/{id}/universal`
+/// routes serve `Static=true` requests directly; this runs their
 /// progressive-transcode branch (`VideosController.GetVideoStream` /
-/// `UniversalAudioController` transcode path) via
+/// `AudioHelper.GetAudioStream` / `UniversalAudioController` transcode path)
+/// for everything else, via
 /// [`HlsStreamManager::transcode_stream`]. Shared by `videos` and `audio` so the
 /// fallback is not duplicated.
 ///
@@ -518,6 +519,9 @@ pub(crate) fn request_from_universal_query(
     auth: &ferrofin_traits::options::AuthorizationInfo,
 ) -> HlsStreamRequest {
     query.0.container = None;
+    // `GetUniversalAudioStream` takes no live stream id, and neither request it
+    // builds carries one.
+    query.0.live_stream_id = None;
     request_from_query(item_id, HlsQueryPub(query.0), raw_query, auth)
 }
 
@@ -1131,6 +1135,22 @@ mod tests {
             HlsRequestContext::default(),
         );
         assert_eq!(req.live_stream_id, None);
+    }
+
+    #[test]
+    fn a_universal_request_carries_its_version_but_no_live_stream() {
+        // `GetUniversalAudioStream` takes no live stream id, so a stray key
+        // must not steer its stream to an open one; the version it names stays.
+        let query: HlsQuery =
+            parse("LiveStreamId=prov_service_source&MediaSourceId=source").expect("parses");
+        let req = request_from_universal_query(
+            uuid::Uuid::from_u128(7),
+            UniversalHlsQueryPub(query),
+            None,
+            &ferrofin_traits::options::AuthorizationInfo::default(),
+        );
+        assert_eq!(req.live_stream_id, None);
+        assert_eq!(req.media_source_id.as_deref(), Some("source"));
     }
 
     #[test]

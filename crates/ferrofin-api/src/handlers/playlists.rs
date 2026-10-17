@@ -41,10 +41,11 @@ use ferrofin_model::playlists::{
 };
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
+use ferrofin_traits::error::ServiceError;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
@@ -440,11 +441,18 @@ async fn remove_item_from_playlist(
                 .collect()
         })
         .unwrap_or_default();
-    state
+    // C# `catch (ArgumentException) { return NotFound(); }`: the manager's
+    // "no such playlist" is a bare `404` here, which is how an API key, past
+    // no gate above, hears that the id names no playlist.
+    match state
         .playlists
         .remove_item_from_playlist(&playlist_id.to_string(), &entry_ids)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(ServiceError::InvalidInput(_)) => Err(ApiError::Problem(ProblemStatus::NotFound)),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// `POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}` — reorders.

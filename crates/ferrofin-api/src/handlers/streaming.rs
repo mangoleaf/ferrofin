@@ -1,94 +1,192 @@
 //! Shared direct-play (static) file-serving helpers for the streaming
 //! controllers (`Videos`, `Audio`, `UniversalAudio`).
 //!
-//! Every one of those controllers, on its non-transcoding path, resolves an
-//! item's static [`MediaSourceInfo`](ferrofin_model::dto::MediaSourceInfo), takes
-//! its on-disk path, and serves the file with HTTP `Range` support. The
-//! transcoding / HLS / stream-copy machinery those controllers also expose is
-//! deferred (no ffmpeg runner), so only this direct-stream slice is ported; it is
-//! factored here so `videos`/`audio` don't each duplicate it.
+//! Every one of those controllers, on its `Static=true` path, resolves the
+//! requested [`MediaSourceInfo`](ferrofin_model::dto::MediaSourceInfo) and
+//! serves it without ffmpeg: a file with HTTP `Range` support, a remote target
+//! by relaying it, an open live stream from its buffer. It is factored here so
+//! `videos`/`audio` don't each duplicate it; everything else is transcoded by
+//! [`transcode_stream_fallback`].
 
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
+use ferrofin_model::entities::VideoType;
+use ferrofin_traits::media_encoding::HlsStreamRequest;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::handlers::hls::transcode_stream_fallback;
 use crate::state::AppState;
 
-/// What a static (direct-play) request is served from: the first static media
-/// source with a path — a file on disk, or a remote URL the item stands for
-/// (a `.strm` shortcut's target).
+/// What a static (direct-play) request is served from: the requested media
+/// source's path — a file on disk, a remote URL the item stands for (a `.strm`
+/// shortcut's target), or an open live stream.
 pub(crate) struct StaticSource {
-    /// The file path or remote URL.
+    /// The file path or remote URL the source is read from: its encoder path
+    /// when it names one, else its path.
     pub path: String,
     /// The protocol the path is read over.
     pub protocol: ferrofin_model::media_info::MediaProtocol,
+    /// The source's video type: a disc folder is never served as a file.
+    pub video_type: Option<VideoType>,
+    /// Whether the source is an opened live stream, whose shared buffer is
+    /// read directly (upstream's `state.DirectStreamProvider`).
+    pub is_live_stream: bool,
+    /// The `User-Agent` the source requires (an IPTV tuner's), sent when a
+    /// remote target is relayed.
+    pub user_agent: Option<String>,
 }
 
-/// Resolves the direct-play source for an item's first static media source.
+/// Resolves the direct-play source a stream request names.
 ///
-/// Ports the direct-stream lookup shared by the streaming controllers: the item's
-/// static (non-probed) source's `Path` and `Protocol`. Returns `404` when the
-/// item has no static media source, or that source has no path (nothing to
-/// direct-stream). The transcoding parameters the controllers accept are ignored
-/// here — only the static path is served.
+/// The source is chosen by
+/// [`get_stream_media_source`](ferrofin_traits::library::MediaSourceManager::get_stream_media_source),
+/// as for a transcode: the open live stream, else the version
+/// `media_source_id` names, else the item's first. It is read from its encoder
+/// path when it names one. Returns `404` when there is no such source, or it
+/// has neither an encoder path nor a path (nothing to direct-stream).
 pub(crate) async fn static_source(
     state: &AppState,
     item_id: Uuid,
+    media_source_id: Option<&str>,
+    live_stream_id: Option<&str>,
 ) -> Result<StaticSource, ApiError> {
-    let sources = state
+    let source = state
         .media_sources
-        .get_static_media_sources(item_id, true, None)
+        .get_stream_media_source(item_id, media_source_id, live_stream_id)
         .await?;
-    sources
-        .into_iter()
-        .find_map(|source| {
-            Some(StaticSource {
-                path: source.path?,
-                protocol: source.protocol,
-            })
-        })
-        .ok_or_else(|| ApiError::NotFound(format!("no direct stream for item {item_id}")))
+    // `EncodingHelper.AttachMediaSourceInfo`: a source that names how it is read
+    // (an in-progress recording's `LiveRecordings` URL) is read that way.
+    let (path, protocol) = match (source.encoder_path, source.encoder_protocol) {
+        (Some(path), Some(protocol)) if !path.is_empty() => (path, protocol),
+        _ => (
+            source.path.ok_or_else(|| {
+                ApiError::NotFound(format!("no direct stream for item {item_id}"))
+            })?,
+            source.protocol,
+        ),
+    };
+    let user_agent = source
+        .required_http_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
+        .map(|(_, value)| value.clone());
+    Ok(StaticSource {
+        path,
+        protocol,
+        video_type: source.video_type,
+        is_live_stream: source.live_stream_id.is_some(),
+        user_agent,
+    })
 }
 
-/// Serves a static source: a file with `Range` support, an HTTP(S) target by
-/// proxying it, anything else is refused.
+/// The shared body of `VideosController.GetVideoStream` and
+/// `AudioHelper.GetAudioStream`: a `Static=true` request is served from the
+/// source it names; anything else, and a static video request for a disc
+/// folder (which only ffmpeg reads), is transcoded.
+pub(crate) async fn static_or_transcode(
+    state: &AppState,
+    item_id: Uuid,
+    is_audio: bool,
+    req: HlsStreamRequest,
+    request: Request,
+) -> Result<Response, ApiError> {
+    if req.is_static {
+        let source = static_source(
+            state,
+            item_id,
+            req.media_source_id.as_deref(),
+            req.live_stream_id.as_deref(),
+        )
+        .await?;
+        if is_audio || !matches!(source.video_type, Some(VideoType::BluRay | VideoType::Dvd)) {
+            return serve_static_source(state, source, request).await;
+        }
+    }
+    transcode_stream_fallback(state, item_id, is_audio, req, request).await
+}
+
+/// Serves a static source: an open shared live stream from its buffer, a file
+/// with `Range` support, an HTTP(S) target by proxying it, anything else is
+/// refused.
 ///
-/// Port of the static branches of `VideosController.GetVideoStream`: an HTTP
-/// input goes through `GetStaticRemoteStreamResult`, any other non-file
-/// protocol is `400 Input protocol … cannot be streamed statically`.
+/// Port of the static branches of `VideosController.GetVideoStream`: the
+/// `DirectStreamProvider` is read as `file.ts`, an HTTP input goes through
+/// `GetStaticRemoteStreamResult`, any other non-file protocol is
+/// `400 Input protocol … cannot be streamed statically`.
+///
+/// TODO: upstream serves a `File` source with `IsInfiniteStream` and no encoder
+/// path (an in-progress recording has one and is relayed) as a
+/// `ProgressiveFileStream` that follows the file as it grows; here it is
+/// served as the bytes on disk at request time. Fix path: carry
+/// `is_infinite_stream` in [`StaticSource`] and serve it through `live_tv`'s
+/// progressive body, typed by the output container.
 pub(crate) async fn serve_static_source(
+    state: &AppState,
     source: StaticSource,
     request: Request,
 ) -> Result<Response, ApiError> {
     use ferrofin_model::media_info::MediaProtocol;
+    if source.is_live_stream
+        && let Some(unique_id) = live_buffer_id(&source.path)
+    {
+        return crate::handlers::live_tv::live_stream_buffer(state, unique_id, "file.ts").await;
+    }
     match source.protocol {
         MediaProtocol::File => serve_static_file(&source.path, request).await,
-        MediaProtocol::Http => serve_remote_static(&source.path, request).await,
+        MediaProtocol::Http => {
+            serve_remote_static(&source.path, source.user_agent.as_deref(), request).await
+        }
         other => Err(ApiError::BadRequest(format!(
             "Input protocol {other:?} cannot be streamed statically"
         ))),
     }
 }
 
+/// The unique id of the shared buffer a live source reads, from the
+/// `…/LiveTv/LiveStreamFiles/{uniqueId}/stream.ts` path the Live TV manager
+/// gives a shared stream. A pass-through stream keeps its tuner URL: `None`.
+fn live_buffer_id(path: &str) -> Option<&str> {
+    path.split_once("/LiveTv/LiveStreamFiles/")?
+        .1
+        .split('/')
+        .next()
+        .filter(|id| !id.is_empty())
+}
+
 /// `FileStreamResponseHelpers.GetStaticRemoteStreamResult`: relays the remote
-/// target's body to the client, forwarding the client's `Range` and answering
-/// with the upstream status, `Accept-Ranges` (`none` when the upstream does not
-/// offer ranges), `Content-Range`, `Content-Length` and `Content-Type`
+/// target's body to the client, sending the source's required `User-Agent` and
+/// forwarding the client's `Range`, and answering with the upstream status,
+/// `Accept-Ranges` (`none` when the upstream does not offer ranges),
+/// `Content-Range`, `Content-Length` and `Content-Type`
 /// (`application/octet-stream` when it names none).
-async fn serve_remote_static(url: &str, request: Request) -> Result<Response, ApiError> {
+async fn serve_remote_static(
+    url: &str,
+    user_agent: Option<&str>,
+    request: Request,
+) -> Result<Response, ApiError> {
     use axum::http::{HeaderValue, StatusCode, header};
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
+    // `NamedClient.Default` always names the server; a source's required agent
+    // replaces it per request (reqwest fills only headers a request leaves unset).
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(concat!("Ferrofin/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default()
+    });
     let method = if request.method() == axum::http::Method::HEAD {
         reqwest::Method::HEAD
     } else {
         reqwest::Method::GET
     };
     let mut upstream = client.request(method, url);
+    if let Some(user_agent) = user_agent {
+        upstream = upstream.header(header::USER_AGENT, user_agent);
+    }
     if let Some(range) = request
         .headers()
         .get(header::RANGE)

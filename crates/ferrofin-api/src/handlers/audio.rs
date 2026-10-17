@@ -12,13 +12,15 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
-use crate::handlers::streaming::{serve_static_source, static_source};
+use crate::handlers::streaming::{serve_static_source, static_or_transcode, static_source};
 use crate::state::AppState;
 
-/// `GET`/`HEAD /Audio/{itemId}/stream` — serve the item's audio file.
+/// `GET`/`HEAD /Audio/{itemId}/stream` — stream the requested audio source.
 ///
-/// Port of `AudioController.GetAudioStream` (direct-stream path only). Range
-/// requests yield `206 Partial Content`; `HEAD` returns headers only.
+/// Port of `AudioController.GetAudioStream`: `Static=true` serves the version
+/// or open live stream the request names ([`static_or_transcode`]); anything
+/// else is transcoded. Range requests yield `206 Partial Content`; `HEAD`
+/// returns headers only.
 async fn get_audio_stream(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
@@ -29,11 +31,7 @@ async fn get_audio_stream(
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
     crate::handlers::hls::validate_stream_request(&req)?;
-    if req.is_static {
-        let source = static_source(&state, item_id).await?;
-        return serve_static_source(source, request).await;
-    }
-    crate::handlers::hls::transcode_stream_fallback(&state, item_id, true, req, request).await
+    static_or_transcode(&state, item_id, true, req, request).await
 }
 
 /// The extension route has the same Static=false default as the bare route.
@@ -54,11 +52,7 @@ async fn get_audio_stream_by_container(
             .to_owned(),
     );
     crate::handlers::hls::validate_stream_request(&req)?;
-    if req.is_static {
-        let source = static_source(&state, item_id).await?;
-        return serve_static_source(source, request).await;
-    }
-    crate::handlers::hls::transcode_stream_fallback(&state, item_id, true, req, request).await
+    static_or_transcode(&state, item_id, true, req, request).await
 }
 
 /// The `userId` query parameter `GET /Audio/{itemId}/universal` accepts.
@@ -79,11 +73,12 @@ struct UniversalAudioUserQuery {
     user_id: Option<Uuid>,
 }
 
-/// `GET`/`HEAD /Audio/{itemId}/universal` — serve the item's audio file.
+/// `GET`/`HEAD /Audio/{itemId}/universal` — stream the requested audio source.
 ///
-/// Port of `UniversalAudioController.GetUniversalAudioStream`, direct-play branch:
-/// the resolved source supports direct stream, so the original file is served
-/// progressively (Range/`HEAD`). Requires authentication (`[Authorize]`).
+/// Port of `UniversalAudioController.GetUniversalAudioStream`: the version
+/// `mediaSourceId` names (the item's first by default) is served as it is
+/// (Range/`HEAD`) when it has a path, and transcoded otherwise. Requires
+/// authentication (`[Authorize]`).
 async fn get_universal_audio_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
@@ -94,14 +89,17 @@ async fn get_universal_audio_stream(
 ) -> Result<Response, ApiError> {
     let user = resolve_user_opt(&state, &auth, user_query.user_id).await?;
     require_visible_item(&state, item_id, user.as_ref()).await?;
+    let raw = request.uri().query().map(ToOwned::to_owned);
+    let req = crate::handlers::hls::request_from_universal_query(item_id, hls_query, raw, &auth);
     // Direct-play when a static source exists; otherwise transcode (the
-    // UniversalAudioController fallback), now wired to the real runtime.
-    match static_source(&state, item_id).await {
-        Ok(source) => serve_static_source(source, request).await,
-        Err(ApiError::NotFound(_)) => {
-            let raw = request.uri().query().map(ToOwned::to_owned);
-            let req =
-                crate::handlers::hls::request_from_universal_query(item_id, hls_query, raw, &auth);
+    // UniversalAudioController fallback). Both carry the `mediaSourceId` (the
+    // version picked) and never a live stream id.
+    match static_source(&state, item_id, req.media_source_id.as_deref(), None).await {
+        Ok(source) => serve_static_source(&state, source, request).await,
+        Err(
+            ApiError::NotFound(_)
+            | ApiError::Service(ferrofin_traits::error::ServiceError::NotFound(_)),
+        ) => {
             crate::handlers::hls::transcode_stream_fallback(&state, item_id, true, req, request)
                 .await
         }
