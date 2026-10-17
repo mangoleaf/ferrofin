@@ -249,7 +249,10 @@ pub trait PlaylistManager: Send + Sync {
         calling_user_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// Removes all playlists owned by a user (transferring shared ones).
+    /// Disposes of the playlists a deleted user owned (C#
+    /// `RemovePlaylistsAsync`): one shared with users who still exist goes to
+    /// the first of them with edit rights, else the first of them; any other
+    /// is deleted unless it is open access, which keeps it as it is.
     async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError>;
 }
 

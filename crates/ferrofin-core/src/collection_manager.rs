@@ -31,9 +31,6 @@
 //! Deferred (documented, per the unit-8 minimal-manager rule):
 //! - entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
 //!   entry-id strings) is approximated by the child item id;
-//! - `remove_playlists` (owned-playlist deletion + share transfer on user
-//!   removal) — ownership is recorded now, but the user-deletion cascade is not
-//!   wired;
 //! - the collections **folder** (`GetCollectionsFolder`) resolution needs the
 //!   user-view tree and returns `None` here.
 
@@ -1237,13 +1234,74 @@ impl PlaylistManager for FerrofinPlaylistManager {
         write_entries(self.db.writer(), &pid, &entries).await
     }
 
-    async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        // Ownership is recorded (the `FerrofinPlaylists` table), but the user-deletion
-        // cascade — delete owned playlists, transfer shared ones (C#
-        // `RemovePlaylists`) — is still deferred; nothing is removed.
-        Ok(())
+    async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        // C# `RemovePlaylistsAsync`, over the playlists the user owns.
+        // Upstream walks every playlist the user can see (`GetUserPlaylists`),
+        // so it also hands away another user's playlist shared with or open
+        // to them, and passes over one they own but cannot see past a
+        // parental limit; and it can hand a playlist to the share of a user
+        // who no longer exists (the deleted user's own, or one an earlier
+        // deletion left behind), which leaves it owned by nobody. Both are
+        // Jellyfin bugs not ported: only owned playlists are walked, and only
+        // the shares of existing users inherit.
+        // The user row is gone by now, so a failed playlist cannot be retried
+        // through the API: one failure does not stop the others, and the
+        // first is returned once all have been tried.
+        let mut first_error = None;
+        for playlist in item_data::playlists_owned_by(&self.db, user_id).await? {
+            let outcome = async {
+                // A hand-over commits with its `Data` sync, as every boot
+                // re-imports the owner and the shares from `Data`.
+                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                item_data::import_playlist_meta_if_missing_in(&mut tx, playlist).await?;
+                let Some(permissions) =
+                    item_data::playlist_permissions_in(&mut tx, playlist).await?
+                else {
+                    return Ok(());
+                };
+                if permissions.owner != Some(user_id) {
+                    return Ok(()); // no longer theirs since the listing
+                }
+                // `Shares.OrderByDescending(x => x.CanEdit)` is a stable sort:
+                // the first editing share in `Shares` order, else the first.
+                let heir = permissions
+                    .shares
+                    .iter()
+                    .find(|share| share.can_edit)
+                    .or_else(|| permissions.shares.first())
+                    .map(|share| share.user_id);
+                if let Some(heir) = heir {
+                    item_data::hand_playlist_to_in(&mut tx, playlist, heir).await?;
+                }
+                tx.commit().await.map_err(db_err)?;
+                if heir.is_none() && !permissions.open_access {
+                    // `DeleteItem` with `DeleteFileLocation = false`.
+                    let options = ferrofin_traits::options::DeleteOptions {
+                        delete_file_location: false,
+                        delete_from_external_provider: false,
+                    };
+                    self.library_manager.delete_item(playlist, &options).await?;
+                }
+                Ok::<(), ServiceError>(())
+            }
+            .await;
+            match outcome {
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(error) => tracing::error!(
+                    item_id = %playlist,
+                    user_id = %user_id,
+                    %error,
+                    "could not hand over or delete a deleted user's playlist"
+                ),
+                Ok(()) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
+
+#[cfg(test)]
+mod remove_playlists_tests;
 
 /// One playlist entry: `(ChildId, ChildType)` as stored.
 type Entry = (String, i64);
