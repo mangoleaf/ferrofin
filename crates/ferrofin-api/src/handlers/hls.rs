@@ -682,8 +682,9 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 /// with no `[AllowAnonymous]`, so the `hls1` segment routes are gated upstream —
 /// unlike the legacy `hls` segment routes below, which upstream leaves open with
 /// an explicit comment about Chrome omitting the query string. `RequireAuth`
-/// accepts the `api_key`/`ApiKey` query parameter, which is how players that
-/// cannot set an `Authorization` header on a segment URL authenticate.
+/// accepts the `ApiKey` query parameter (`api_key` only with legacy
+/// authorization), which is how players that cannot set an `Authorization`
+/// header on a segment URL authenticate.
 async fn get_video_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,

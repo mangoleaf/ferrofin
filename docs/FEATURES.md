@@ -50,6 +50,8 @@ Deep-verified against a real Jellyfin server:
 
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
+  As in Jellyfin 12, Emby-era credentials (`X-Emby-Authorization`, `X-Emby-Token`) need
+  `EnableLegacyAuthorization`, off by default ([UPGRADING.md](UPGRADING.md)).
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
   path-scoped ingest; virtual folders; item read + write/edit + delete (a delete removes the
   item's files exactly as Jellyfin does — a video's own folder, prefix-matched sidecars —
