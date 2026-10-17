@@ -9,6 +9,9 @@ use axum::{Json, Router, extract::State, http::Uri};
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
 const CLIENT: &str =
     r#"MediaBrowser Client="lyrics-test", Device="fixture", DeviceId="lyrics-test", Version="1""#;
 
@@ -132,49 +135,28 @@ async fn saved_lyrics_destinations_change_without_restarting() {
     let mock = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = Config {
+    let ffmpeg = probe_stub(tmp.path(), "ffmpeg");
+    let ffprobe = probe_stub(tmp.path(), "ffprobe");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let (server, base, _) = boot::spawn_server(&client, |port| Config {
         port,
-        ffmpeg_path: Some(probe_stub(tmp.path(), "ffmpeg")),
-        ffprobe_path: Some(probe_stub(tmp.path(), "ffprobe")),
+        ffmpeg_path: Some(ffmpeg.clone()),
+        ffprobe_path: Some(ffprobe.clone()),
         provider_endpoints: ProviderEndpoints {
-            lrclib: Some(endpoint),
+            lrclib: Some(endpoint.clone()),
             ..Default::default()
         },
         ..Config::test_stub(tmp.path())
-    };
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ferrofin_server::run(config))
-            .unwrap();
-    });
+    })
+    .await;
     let mut api = Api {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap(),
-        base: format!("http://127.0.0.1:{port}"),
+        client,
+        base,
         auth: CLIENT.to_owned(),
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Ok(response) = api
-            .client
-            .get(format!("{}/System/Info/Public", api.base))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "server readiness");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let login: Value = api
         .client
         .post(format!("{}/Users/AuthenticateByName", api.base))
@@ -332,7 +314,7 @@ async fn saved_lyrics_destinations_change_without_restarting() {
     );
     assert!(!adjacent.exists());
     api.post("/System/Shutdown", &Value::Null).await;
-    tokio::task::spawn_blocking(move || server.join().unwrap())
+    tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())
         .await
         .unwrap();
     mock.abort();

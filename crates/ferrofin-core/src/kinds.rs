@@ -631,23 +631,6 @@ pub fn has_artist_fields(kind: BaseItemKind) -> bool {
     )
 }
 
-/// Whether this kind is one of the music container/leaf kinds
-/// (`Audio`/`MusicAlbum`/`MusicArtist`/`MusicGenre`/`MusicVideo`).
-///
-/// Used by [`crate`]'s music manager to decide which seeds and which item types
-/// participate in an instant mix.
-#[must_use]
-pub fn is_music(kind: BaseItemKind) -> bool {
-    matches!(
-        kind,
-        BaseItemKind::Audio
-            | BaseItemKind::MusicAlbum
-            | BaseItemKind::MusicArtist
-            | BaseItemKind::MusicGenre
-            | BaseItemKind::MusicVideo
-    )
-}
-
 /// Whether a "similar items" request about an item of this kind runs at all —
 /// the C# `LibraryController.GetSimilarItems` guard, which answers an empty
 /// result for an `Episode` or for any `IItemByName` other than a
@@ -1114,15 +1097,10 @@ mod tests {
 
     #[test]
     fn audio_music_and_similarity_helpers() {
-        use super::{is_audio, is_music, supports_similarity};
+        use super::{is_audio, supports_similarity};
         assert!(is_audio(BaseItemKind::Audio));
         assert!(is_audio(BaseItemKind::AudioBook));
         assert!(!is_audio(BaseItemKind::Movie));
-
-        assert!(is_music(BaseItemKind::Audio));
-        assert!(is_music(BaseItemKind::MusicAlbum));
-        assert!(is_music(BaseItemKind::MusicArtist));
-        assert!(!is_music(BaseItemKind::Movie));
 
         assert!(supports_similarity(BaseItemKind::Movie));
         assert!(supports_similarity(BaseItemKind::MusicAlbum));

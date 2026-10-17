@@ -360,11 +360,12 @@ shell-tests:
   image: alpine:3.22
   before_script:
     # Adoption checks invoke Python and use Pillow to validate preserved artwork.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml
   script:
-    - shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
-    - shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats
+    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
+    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats adoption/tests/adoption.bats
     - bats scripts/tests adoption/tests
+    - scripts/ci-config-check.sh check
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true
@@ -381,6 +382,11 @@ coverage:
   extends: .sccache
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    # Same 12Gi OOM as `lint` (see its variables): full-debuginfo links of the
+    # instrumented test binaries, many at once. Line coverage reads the coverage
+    # mapping sections, not DWARF, so dropping debuginfo changes no percentage.
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_BUILD_JOBS: "4"
   before_script:
     - !reference [.sccache-setup, script]
   script:

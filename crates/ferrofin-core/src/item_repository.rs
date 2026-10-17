@@ -10026,6 +10026,72 @@ mod tests {
         );
     }
 
+    /// The DTO's by-name links pick the same survivor as the list above (the
+    /// lowest id), fall back to a `Genre`/`Studio` name's `ItemValues` id when
+    /// it has no row, never to `Genre`'s value id for a `MusicGenre`, and stay
+    /// on the `(Type, CleanName)` / `(Type, CleanValue)` indexes.
+    #[tokio::test]
+    async fn by_name_link_ids_take_the_lowest_row_then_the_value_id() {
+        use ferrofin_db::enums::ItemValueType;
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0x9C01);
+        let (lo, hi) = (Uuid::from_u128(0x9C02), Uuid::from_u128(0x9C03));
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        crate::test_support::seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" <> ?1"#)
+            .bind(guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("drop the scanner rows");
+        for id in [hi, lo] {
+            seed_named_item(&db, id, BaseItemKind::Genre, "Drama").await;
+            set_clean_name(&db, id, "Drama").await;
+        }
+        let acme_value: String =
+            sqlx::query_scalar(r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Value" = 'Acme'"#)
+                .fetch_one(db.pool())
+                .await
+                .expect("value id");
+
+        let keys = [
+            (BaseItemKind::Genre, "drama".to_owned()),
+            (BaseItemKind::MusicGenre, "drama".to_owned()),
+            (BaseItemKind::Studio, "acme".to_owned()),
+            (BaseItemKind::Studio, "nobody".to_owned()),
+        ];
+        let ids = by_name_ids_by_clean_name(&db, &keys).await.expect("ids");
+        assert_eq!(ids[&BaseItemKind::Genre]["drama"], lo, "Min(Id) survivor");
+        assert!(!ids.contains_key(&BaseItemKind::MusicGenre), "{ids:?}");
+        assert_eq!(
+            ids[&BaseItemKind::Studio]["acme"],
+            Uuid::parse_str(&acme_value).unwrap(),
+            "no row: the value id"
+        );
+        assert!(!ids[&BaseItemKind::Studio].contains_key("nobody"));
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            by_name_ids_sql(1)
+        )))
+        .bind("t")
+        .bind(2)
+        .bind("c")
+        .fetch_all(db.pool())
+        .await
+        .expect("plan");
+        let has = |needle: &str| plan.iter().any(|(_, _, _, line)| line.contains(needle));
+        assert!(
+            has("SEARCH bi USING INDEX IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)")
+                && has(
+                    "SEARCH iv USING INDEX IX_ItemValues_Type_CleanValue (Type=? AND CleanValue=?)"
+                )
+                && !has("SCAN bi")
+                && !has("SCAN iv"),
+            "{plan:?}"
+        );
+    }
+
     /// …and rows with NO key collapse together, because that is what SQLite's
     /// `GROUP BY` and EF's `GroupBy` both do with NULL — the very behaviour
     /// that makes a live Jellyfin list four music genres where its database
@@ -11918,6 +11984,72 @@ pub(crate) async fn music_artist_ids_by_clean_name(
         for (clean, id) in rows {
             if let Ok(uuid) = Uuid::parse_str(&id) {
                 ids.entry(clean).or_insert(uuid);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys of three
+/// binds each (stored type name, `ItemValues.Type`, clean name).
+fn by_name_ids_sql(keys: usize) -> String {
+    let values = vec!["(?, ?, ?)"; keys].join(", ");
+    format!(
+        r#"WITH "want"("Type", "ValueType", "CleanName") AS (VALUES {values})
+           SELECT w."Type", w."CleanName", COALESCE(
+               (SELECT MIN(bi."Id") FROM "BaseItems" bi
+                 WHERE bi."Type" = w."Type" AND bi."CleanName" = w."CleanName"),
+               (SELECT iv."ItemValueId" FROM "ItemValues" iv
+                 WHERE iv."Type" = w."ValueType" AND iv."CleanValue" = w."CleanName"
+                 LIMIT 1))
+           FROM "want" w"#
+    )
+}
+
+/// The id of the by-name `Genre`/`MusicGenre`/`Studio` item for each
+/// `(kind, clean name)` key — the item a `GenreItems`/`Studios` link opens
+/// (C# `GetGenreId`/`GetMusicGenreId`/`GetStudioId`).
+///
+/// The row is found by type and clean name, as the by-name queries find it:
+/// on an adopted database it carries Jellyfin's path-derived id, unrelated to
+/// the `ItemValues` id. When several rows share the name the lowest id wins,
+/// the survivor `GetItemValues`' `Min(Id)` collapse lists when they also share
+/// a `PresentationUniqueKey`, and a listed row otherwise. A `Genre`/`Studio` name
+/// with no row falls back to its `ItemValues` id, the id a scan or
+/// `ItemPersistenceService::ensure_by_name_item` gives the row; a key with
+/// neither is absent from the map.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn by_name_ids_by_clean_name(
+    db: &Database,
+    keys: &[(BaseItemKind, String)],
+) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+    let mut ids: HashMap<BaseItemKind, HashMap<String, Uuid>> = HashMap::new();
+    for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
+        let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
+            by_name_ids_sql(chunk.len()),
+        ));
+        for (kind, clean) in chunk {
+            let value_type = match kind {
+                BaseItemKind::Genre => Some(i32::from(ItemValueType::Genre)),
+                BaseItemKind::Studio => Some(i32::from(ItemValueType::Studios)),
+                // A `MusicGenre` shares `Genre`'s value space, whose id belongs
+                // to the `Genre` row (see `music_genre_row`).
+                _ => None,
+            };
+            query = query
+                .bind(stored_type_name(*kind))
+                .bind(value_type)
+                .bind(clean.as_str());
+        }
+        for (type_name, clean, id) in query.fetch_all(db.pool()).await.map_err(db_err)? {
+            if let (Some(kind), Some(Ok(id))) = (
+                BaseItemKind::from_stored_type_name(&type_name),
+                id.as_deref().map(Uuid::parse_str),
+            ) {
+                ids.entry(kind).or_default().insert(clean, id);
             }
         }
     }
