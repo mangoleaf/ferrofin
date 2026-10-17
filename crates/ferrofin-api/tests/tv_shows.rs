@@ -719,7 +719,7 @@ async fn similar_shows_returns_items() {
 /// `DtoOptions` the controller then projects with (v12
 /// SimilarItemsManager.cs:108-112, LibraryController.cs:835-849), so every
 /// Similar row carries the field even when `fields` never named it — on the
-/// `/Shows` route and on the `LibraryController` aliases alike.
+/// `/Shows` alias and the other `LibraryController` aliases alike.
 #[tokio::test]
 async fn similar_rows_always_carry_provider_ids() {
     for path in [
