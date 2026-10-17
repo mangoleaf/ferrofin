@@ -28,7 +28,7 @@ pub struct Fixture {
     pub options: Value,
     pub media: PathBuf,
     pub media_file: PathBuf,
-    server: std::thread::JoinHandle<()>,
+    server: std::thread::JoinHandle<anyhow::Result<()>>,
     mock: tokio::task::JoinHandle<()>,
 }
 
@@ -184,7 +184,7 @@ impl Fixture {
     pub async fn finish(self) {
         self.release();
         self.post("/System/Shutdown", None).await;
-        self.server.join().unwrap();
+        self.server.join().unwrap().unwrap();
         self.mock.abort();
     }
     #[allow(clippy::too_many_lines)]
@@ -211,15 +211,13 @@ impl Fixture {
             .await
             .unwrap();
         });
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let config = Config {
+        let ffmpeg = tool_stub(tmp.path(), "ffmpeg");
+        let ffprobe = tool_stub(tmp.path(), "ffprobe");
+        let client = reqwest::Client::new();
+        let (server, base, _) = crate::boot::spawn_server(&client, |port| Config {
             port,
-            ffmpeg_path: Some(tool_stub(tmp.path(), "ffmpeg")),
-            ffprobe_path: Some(tool_stub(tmp.path(), "ffprobe")),
+            ffmpeg_path: Some(ffmpeg.clone()),
+            ffprobe_path: Some(ffprobe.clone()),
             musicbrainz_base_url: endpoint.clone(),
             studios_repo_url: endpoint.clone(),
             provider_endpoints: ProviderEndpoints {
@@ -230,20 +228,15 @@ impl Fixture {
                 fanart: Some(endpoint.clone()),
                 audiodb: Some(endpoint.clone()),
                 lrclib: Some(endpoint.clone()),
-                opensubtitles: Some(endpoint),
+                opensubtitles: Some(endpoint.clone()),
             },
             ..Config::test_stub(tmp.path())
-        };
-        let server = std::thread::spawn(move || {
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(ferrofin_server::run(config))
-                .unwrap();
-        });
+        })
+        .await;
         let mut fixture = Self {
             tmp,
-            client: reqwest::Client::new(),
-            base: format!("http://127.0.0.1:{port}"),
+            client,
+            base,
             auth: CLIENT.to_owned(),
             library: String::new(),
             movie: String::new(),
@@ -253,20 +246,6 @@ impl Fixture {
             server,
             mock,
         };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if fixture
-                .client
-                .get(format!("{}/System/Info/Public", fixture.base))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "server did not start");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
         let login: Value = fixture
             .request(
                 reqwest::Method::POST,
