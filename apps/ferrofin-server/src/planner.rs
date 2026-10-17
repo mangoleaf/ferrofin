@@ -1188,10 +1188,11 @@ impl FerrofinStreamStatePlanner {
     /// The ffmpeg video encoder for `state`. Port of `GetVideoEncoder`.
     ///
     /// One dispatch decides software and hardware alike — it returns the
-    /// vendor encoder when the configured accelerator has one for the target
-    /// codec and the running ffmpeg was built with it, and the software encoder
-    /// otherwise. A copy request short-circuits ahead of it, since `copy` is
-    /// not an encoder at all.
+    /// vendor encoder when hardware encoding is enabled, the configured
+    /// accelerator is a supported one ([`hardware_path_is_ported`]) with an
+    /// encoder for the target codec, and the running ffmpeg was built with it,
+    /// and the software encoder otherwise. A copy request short-circuits ahead
+    /// of it, since `copy` is not an encoder at all.
     fn resolve_video_encoder(&self, state: &EncodingJobInfo, options: &EncodingOptions) -> String {
         let codec = state.output_video_codec.as_deref().unwrap_or("copy");
         if EncodingJobInfo::is_copy_codec(Some(codec)) {
@@ -1234,15 +1235,14 @@ impl FerrofinStreamStatePlanner {
         let is_event_playlist = kind == PlaylistKind::Event;
         let progressive = kind == PlaylistKind::Progressive;
 
-        // Resolve the video encoder up front (it decides input hwaccel too). NVENC
-        // maps the target codec to its hardware encoder; otherwise the software
-        // `EncodingHelper` path (libx264 / copy) is used.
+        // Resolve the video encoder up front (it decides input hwaccel too). A
+        // supported accelerator (NVENC, VAAPI, QSV) with hardware encoding on
+        // maps the target codec to its hardware encoder when the build has
+        // it; otherwise a software encoder (e.g. libx264, libx265, libsvtav1)
+        // or `copy` is used.
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
-        // Everything the ported hardware matrix reads about the job. The
-        // render-node arguments are VAAPI/QSV territory and unused by the CUDA
-        // branch; the hardware-transcoding roadmap phase 4 resolves them from the encoding
-        // options, which are not readable this early today.
+        // Everything the ported hardware matrix reads about the job.
         let caps = probed_caps;
         let requested = hw::decoder::RequestedSize {
             width: state.base_request.width,
@@ -1258,19 +1258,18 @@ impl FerrofinStreamStatePlanner {
             output_video_codec: state.output_video_codec.as_deref(),
             requested,
         };
-        // Only NVENC has a ported filter chain today, so only NVENC may take
+        // Only an accelerator with a ported chain (NVENC, VAAPI, QSV) may take
         // the hardware path at all. This is a **scope gate, not a capability
         // gate**: `input_video_hwaccel_args` happily produces a device graph
-        // for every vendor, and `resolve_video_encoder` happily names their
-        // encoders, but the chain behind them lands with phases 4-7. Letting a
-        // VAAPI or QSV server through today gives it a vendor encoder with no
-        // encoder parameters, no filter graph at all — so the client's
-        // `MaxWidth` is silently ignored and it receives a full-resolution
-        // encode — and a silently dropped subtitle burn-in. That is worse than
-        // the software transcode it has now, not merely less optimal.
-        //
-        // Each vendor's phase removes itself from this gate as its chain and
-        // its `GetEncoderParam`/`GetVideoBitrateParam` arms land.
+        // for AMF, VideoToolbox and RKMPP too, and `hw::encoder::video_encoder`
+        // happily names their encoders, but a server let through would get a
+        // vendor encoder with no encoder parameters and no filter graph at all
+        // — so the client's `MaxWidth` is silently ignored and it receives a
+        // full-resolution encode — and a silently dropped subtitle burn-in.
+        // That is worse than the software transcode it gets instead (with a
+        // one-time warning). `resolve_video_encoder` applies the same gate, so
+        // the encoder, the device graph and the filters fall back together;
+        // see `hardware_path_is_ported`.
         let hw_ported = hardware_path_is_ported(options);
         warn_unsupported_accelerator(options);
         // The configured render node, resolved against the filesystem. An
