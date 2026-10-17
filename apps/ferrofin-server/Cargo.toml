@@ -88,7 +88,7 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # the server's own database file.
 sqlx.workspace = true
 tracing-opentelemetry.workspace = true
-# first_light: drives the session WebSocket over a real loopback connection.
+# first_light, elevation: drive the session WebSocket over a real loopback connection.
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 
