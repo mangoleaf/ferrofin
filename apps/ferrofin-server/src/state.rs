@@ -1021,6 +1021,16 @@ pub async fn build_app_state(
             .with_people(Arc::clone(&people_repository))
             // A box set's or playlist's refresh takes its members' rating.
             .with_linked_children(Arc::clone(&linked_children_service))
+            // A genre's, music genre's or playlist's refresh redraws its
+            // generated Primary, as the scan's closing pass draws it.
+            .with_generated_images(Arc::new(
+                ferrofin_core::dynamic_images::DynamicImageProviders::new(
+                    Arc::clone(&item_repository),
+                    Arc::clone(&item_persistence_service),
+                    Arc::clone(&image_processor),
+                    metadata_library.clone(),
+                ),
+            ))
             // The SERVER-WIDE per-item-type MetadataOptions. Identify's
             // provider ordering falls back to this array's
             // `MetadataFetcherOrder` for a kind whose library saved no

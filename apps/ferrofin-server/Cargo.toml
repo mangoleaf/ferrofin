@@ -90,6 +90,9 @@ tracing-opentelemetry.workspace = true
 # first_light, elevation: drive the session WebSocket over a real loopback connection.
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+# item_refresh_generated_images: writes the artwork a collage is drawn from and
+# reads the drawn pixels back.
+image.workspace = true
 
 # jemalloc's configure script cannot build under MSVC; main.rs cfg-gates the
 # allocator the same way, so Windows falls back to the system allocator.
