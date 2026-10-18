@@ -51,7 +51,12 @@ jobs:
           # Builds the WASM example guest for the end-to-end plugin-host test.
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1 # nextest
+      # Pin a release tag (on install-action's main), never a per-tool tag such as
+      # @nextest: those commits sit off main and are orphaned when the tag moves,
+      # which zizmor reports as an impostor commit.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
         # FERROFIN_WASM_GUEST_TESTS=1 builds+runs the real wasm-hello guest so
@@ -113,8 +118,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.shard }} # a cache entry per shard, so they do not overwrite one another
-      - uses: taiki-e/install-action@4e14a60b36eb62630dcc25614f0be0659ab8830c # cargo-llvm-cov
-      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1 # nextest
+      # Same release-tag pin as lint (see the note there): never a per-tool tag.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov,nextest
       # ffmpeg is only needed by the env-gated integration tests; unit/parity tests avoid it.
       - name: coverage gate (per crate)
         env:
