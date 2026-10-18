@@ -180,6 +180,7 @@ mod device_repository;
 pub mod display_preferences_manager;
 pub mod dto_service;
 pub mod dynamic_images;
+mod embedded_lyrics;
 pub mod event_manager;
 pub mod external_data_manager;
 mod extra_owners_repository;

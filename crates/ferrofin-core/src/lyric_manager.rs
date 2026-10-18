@@ -207,9 +207,8 @@ impl FerrofinLyricManager {
         .is_some_and(|o| o.save_lyrics_with_media)
     }
 
-    /// The save-path list for a lyric, in `TrySaveLyric` order: the media folder
-    /// only when the library opts in, then always the internal metadata folder.
-    /// The file name is the media base name plus the lowercased lyric format.
+    /// The item's save-path list ([`save_targets`]) under its library's live
+    /// `SaveLyricsWithMedia`.
     async fn save_targets(
         &self,
         item_id: Uuid,
@@ -217,41 +216,12 @@ impl FerrofinLyricManager {
         media_path: &Path,
         format: &str,
     ) -> Vec<PathBuf> {
-        let name = sidecar_file_name(media_path, &normalise_format(format));
-        let mut targets = Vec::new();
-        if self.save_with_media(item).await
-            && let Some(folder) = media_path.parent()
-        {
-            targets.push(folder.join(&name));
-        }
-        if let Some(dir) = self.item_metadata_dir(item_id) {
-            targets.push(dir.join(&name));
-        }
-        targets
-    }
-
-    /// Writes `content` to the first path that accepts it — port of
-    /// `TrySaveToFiles`, which returns after the first successful write and only
-    /// throws when every candidate failed.
-    fn try_save_to_files(targets: &[PathBuf], content: &str) -> Result<(), ServiceError> {
-        let mut last_error: Option<std::io::Error> = None;
-        for target in targets {
-            let written = target
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(target, content));
-            match written {
-                Ok(()) => {
-                    tracing::info!(path = %target.display(), "saved lyrics");
-                    return Ok(());
-                }
-                Err(e) => last_error = Some(e),
-            }
-        }
-        Err(last_error.map_or_else(
-            || ServiceError::backend("no lyric save path is configured"),
-            |e| ServiceError::backend(format!("write lyrics: {e}")),
-        ))
+        save_targets(
+            media_path,
+            self.save_with_media(item).await,
+            self.item_metadata_dir(item_id).as_deref(),
+            format,
+        )
     }
 
     /// The paths of the item's `Lyric` streams, in stream order —
@@ -406,6 +376,51 @@ fn sidecar_file_name(media_path: &Path, ext: &str) -> std::ffi::OsString {
     name
 }
 
+/// The save-path list for a lyric of `media_path`, in `TrySaveLyric` order:
+/// the media folder only when the library opts in (`SaveLyricsWithMedia`),
+/// then always the item's internal metadata folder. The file name is the
+/// media base name plus the lowercased lyric format.
+pub(crate) fn save_targets(
+    media_path: &Path,
+    save_with_media: bool,
+    metadata_dir: Option<&Path>,
+    format: &str,
+) -> Vec<PathBuf> {
+    let name = sidecar_file_name(media_path, &normalise_format(format));
+    let mut targets = Vec::new();
+    if save_with_media && let Some(folder) = media_path.parent() {
+        targets.push(folder.join(&name));
+    }
+    if let Some(dir) = metadata_dir {
+        targets.push(dir.join(&name));
+    }
+    targets
+}
+
+/// Writes `content` to the first path that accepts it and returns that path
+/// — port of `TrySaveToFiles`, which returns after the first successful write
+/// and only throws when every candidate failed.
+pub(crate) fn try_save_to_files<'a>(
+    targets: &'a [PathBuf],
+    content: &str,
+) -> Result<&'a Path, ServiceError> {
+    let mut last_error: Option<std::io::Error> = None;
+    for target in targets {
+        let written = target
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(target, content));
+        match written {
+            Ok(()) => return Ok(target),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.map_or_else(
+        || ServiceError::backend("no lyric save path is configured"),
+        |e| ServiceError::backend(format!("write lyrics: {e}")),
+    ))
+}
+
 /// Runs the parser chain over a named lyric file — port of
 /// `LyricManager.InternalParseRemoteLyricsAsync`/`GetLyricsAsync`, which walk
 /// `_lyricParsers` in priority order and take the first non-null result:
@@ -555,7 +570,8 @@ impl LyricManager for FerrofinLyricManager {
         let targets = self
             .save_targets(item_id, &item, path, &response.format)
             .await;
-        Self::try_save_to_files(&targets, &response.text)?;
+        let saved = try_save_to_files(&targets, &response.text)?;
+        tracing::info!(path = %saved.display(), "saved lyrics");
         Ok(Some(dto))
     }
 
@@ -592,7 +608,8 @@ impl LyricManager for FerrofinLyricManager {
             return Ok(None);
         };
         let targets = self.save_targets(item_id, &item, path, format).await;
-        Self::try_save_to_files(&targets, lyrics)?;
+        let saved = try_save_to_files(&targets, lyrics)?;
+        tracing::info!(path = %saved.display(), "saved lyrics");
         Ok(Some(dto))
     }
 
