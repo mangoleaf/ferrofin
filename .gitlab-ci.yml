@@ -92,6 +92,9 @@ create-release:
     - job: request-release
     - job: lint
     - job: coverage
+      parallel:
+        matrix:
+          - SHARD: [core, heavy, rest]   # every shard; keep in step with the `coverage` job's matrix
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
@@ -360,45 +363,41 @@ shell-tests:
   image: alpine:3.22
   before_script:
     # Adoption checks invoke Python and use Pillow to validate preserved artwork.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml
   script:
-    - shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
-    - shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats
+    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
+    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats
     - bats scripts/tests adoption/tests
+    - scripts/ci-config-check.sh check
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Per-crate 80% line-coverage gate. Gate EACH crate independently: a merged
-# `-p a -p b --fail-under-lines` check lets a sub-80% crate hide behind a
-# stronger sibling. Line coverage only (branch needs nightly; we pin stable).
+# Per-crate 80% line-coverage gate, run as three parallel shards from
+# scripts/coverage-gate.sh (which documents the rule and the shards). Each shard
+# pays its own build. The OOM limits below (CARGO_PROFILE_DEV_DEBUG,
+# CARGO_BUILD_JOBS) apply to each shard; shards that land on one runner add up.
 # Runs on MRs and main — a tag is cut from an already-green main, so it is not
 # re-gated on the release pipeline.
 coverage:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
+  parallel:
+    matrix:
+      - SHARD: [core, heavy, rest]
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    # Same 12Gi OOM as `lint` (see its variables): full-debuginfo links of the
+    # instrumented test binaries, many at once. Line coverage reads the coverage
+    # mapping sections, not DWARF, so dropping debuginfo changes no percentage.
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_BUILD_JOBS: "4"
   before_script:
     - !reference [.sccache-setup, script]
   script:
-    - |
-      set -euo pipefail
-      fail=0
-      # ferrofin-traits is exempt (trait definitions only — see CLAUDE.md).
-      for dir in crates/*/; do
-        crate=$(basename "$dir")
-        [ "$crate" = ferrofin-traits ] && continue
-        echo "── coverage: $crate ──"
-        # `-p X` still instruments X's workspace deps, so their (uncovered) source
-        # lands in the TOTAL the gate compares against. Exclude every sibling.
-        others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
-        cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
-          --ignore-filename-regex "(crates/($others)|apps)/" || fail=1
-      done
-      exit $fail
+    - scripts/coverage-gate.sh "$SHARD"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true

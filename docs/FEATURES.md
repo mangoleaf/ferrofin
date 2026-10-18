@@ -84,6 +84,12 @@ Deep-verified against a real Jellyfin server:
     the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
     before the moved entry is taken out and lands it one place short when it moves down past
     a member hidden from that user. Ferrofin puts it at the position asked for.
+  - **Accepted divergence (a fix, not a gap):** deleting a user hands over or deletes only
+    the playlists that user owned, once the delete has succeeded, and never hands one to a
+    user who no longer exists. Jellyfin also takes from their owners the playlists that were
+    shared with or open to the deleted user, skips one the user owned but could not see past
+    a parental limit, gives away or deletes the playlists even when it then refuses to delete
+    the last user or administrator, and can hand a playlist to a deleted user.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,

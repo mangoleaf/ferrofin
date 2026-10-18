@@ -41,10 +41,13 @@
 //!
 //! `BaseDynamicImageProvider.HasChanged` + `FetchAsync`, per item:
 //!
+//! - a locked item → never touched (`RefreshWithProviders` returns before
+//!   its custom providers);
 //! - no Primary yet → generate iff the provider finds at least one source;
 //! - a Primary that is a remote URL, or a local file **outside** the item's
-//!   internal metadata folder (a user upload / local `folder.jpg`) → never
-//!   touched;
+//!   internal metadata folder (a local `folder.jpg`) → never touched. A user
+//!   upload is NOT protected yet: Ferrofin stores it inside that folder, so
+//!   it counts as the provider's own (gl-590);
 //! - a generated Primary (inside the metadata folder) → regenerated only when
 //!   the file's modification time no longer matches the recorded
 //!   `DateModified` (`HasChangedByDate`), or when the refresh is forced
@@ -54,10 +57,33 @@
 //! The pass runs at the end of every library validation that was not
 //! cancelled — a rescan that changed nothing included, since a genre or a
 //! playlist the metadata editor or `POST /Playlists` created is no scan
-//! change — over every supported row, each gated by the rule above
+//! change. It first redraws, forced, the photo albums, folders and playlist
+//! files the validation's walk refreshed with every provider (a first
+//! refresh, a changed folder, an overdue interval), then goes over every
+//! other supported row, each gated by the rule above
 //! ([`DynamicImageProviders::refresh_all_between`], which serves the scan's
-//! item-refresh lane between two rows). An item or folder refresh runs
-//! none of it. Upstream's `GenresValidator`
+//! item-refresh lane between two rows).
+//!
+//! An item refresh runs the provider too, as upstream's `MetadataService`
+//! runs a custom provider: not with metadata mode `None`, forced when the
+//! refresh runs every provider (`runAllProviders`: "Replace all metadata",
+//! a full refresh, a first, changed or overdue refresh), and otherwise
+//! behind the gate above.
+//!
+//! - A genre, music genre or playlist refreshes through the provider
+//!   manager, which reaches these providers through
+//!   [`GeneratedImageProvider`].
+//! - A photo album or folder refreshes through a scan of its path; that
+//!   scan's closing passes draw every photo album, folder and playlist file it
+//!   refreshed ([`DynamicImageProviders::refresh_rows_between`]).
+//! - A library's or the root's refresh validates whole libraries the same
+//!   way, and also redraws the library tiles; the root's reaches the user
+//!   root's image too ([`DynamicImageProviders::refresh_user_root_between`]).
+//!   Those tiles and the root are forced by the refresh's options alone, not
+//!   yet by their own first or overdue refresh (see `runs_every_provider`
+//!   in the library scan).
+//!
+//! Upstream's `GenresValidator`
 //! only refreshes genres it is seeing for the first time, so a genre whose
 //! movies gained posters *after* it was created stays blank there until a
 //! manual refresh; Ferrofin re-evaluates the (cheap) `HasChanged` gate each
@@ -78,7 +104,7 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::providers::ItemUpdateType;
+use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType};
 use uuid::Uuid;
 
 use crate::item_type_lookup::kind_from_type_name;
@@ -209,6 +235,22 @@ pub struct DynamicImageProviders {
     metadata_dir: DirectoryPath,
 }
 
+#[async_trait::async_trait]
+impl GeneratedImageProvider for DynamicImageProviders {
+    async fn refresh_generated_image(
+        &self,
+        item: &BaseItemEntity,
+        force: bool,
+    ) -> Result<ItemUpdateType, ServiceError> {
+        // The scan pass's guard: without a collage-capable encoder no
+        // provider here draws anything.
+        if !self.processor.supports_image_collage_creation() {
+            return Ok(ItemUpdateType::None);
+        }
+        self.refresh_item(item, force).await
+    }
+}
+
 impl std::fmt::Debug for DynamicImageProviders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynamicImageProviders")
@@ -255,35 +297,95 @@ impl DynamicImageProviders {
     /// row is logged and the pass continues.
     pub async fn refresh_all(&self) -> Result<DynamicImageReport, ServiceError> {
         let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
-        self.refresh_all_between(&nothing).await
+        self.refresh_all_between(&std::collections::HashSet::new(), &nothing)
+            .await
     }
 
     /// [`refresh_all`](Self::refresh_all), awaiting `between` before each
-    /// row — the library scan serves its priority lane there.
+    /// row — the library scan serves its priority lane there — and leaving
+    /// out the rows in `done` (the ones a forced pass already drew).
     ///
     /// # Errors
     ///
     /// As [`refresh_all`](Self::refresh_all).
     pub async fn refresh_all_between<'b>(
         &self,
+        done: &std::collections::HashSet<Uuid>,
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
     ) -> Result<DynamicImageReport, ServiceError> {
-        if !self.processor.supports_image_collage_creation() {
-            return Ok(DynamicImageReport::default());
-        }
+        let report = self
+            .refresh_kinds_between(
+                &[
+                    BaseItemKind::Genre,
+                    BaseItemKind::MusicGenre,
+                    BaseItemKind::Playlist,
+                    BaseItemKind::PhotoAlbum,
+                    // `FolderImageProvider`. The library tiles this copies from
+                    // are drawn by `refresh_library_images`, which runs BEFORE
+                    // this pass (library_scan.rs), so the root's source is
+                    // already on disk.
+                    BaseItemKind::Folder,
+                    BaseItemKind::UserRootFolder,
+                    BaseItemKind::AggregateFolder,
+                ],
+                false,
+                done,
+                between,
+            )
+            .await?;
+        tracing::debug!(
+            examined = report.examined,
+            generated = report.generated,
+            "dynamic image pass finished"
+        );
+        Ok(report)
+    }
+
+    /// The user root's Primary, which a refresh of the root reaches besides
+    /// the libraries it validates (`UserRootFolder` is the root clients
+    /// refresh, and its children are the libraries): forced when that refresh
+    /// runs every provider (`runAllProviders`), else gated. Awaits `between`
+    /// before the row.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-595): an
+    /// `AggregateFolder` refresh reaches its own image and every playlist's
+    /// too (its virtual `PlaylistsFolder` child, `LibraryManager.cs:
+    /// 1120-1146`), but both roots refresh as the same `ScanTarget::All`, so
+    /// the scan cannot tell them apart. Un-defer path: carry the refreshed
+    /// root in the scan request and draw the `AggregateFolder`, the user root
+    /// and the playlists for the aggregate's refresh.
+    ///
+    /// # Errors
+    ///
+    /// As [`refresh_all`](Self::refresh_all).
+    pub async fn refresh_user_root_between<'b>(
+        &self,
+        force: bool,
+        between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
+    ) -> Result<DynamicImageReport, ServiceError> {
+        self.refresh_kinds_between(
+            &[BaseItemKind::UserRootFolder],
+            force,
+            &std::collections::HashSet::new(),
+            between,
+        )
+        .await
+    }
+
+    /// Every row of `kinds` but those in `skip`, in that order, forced or
+    /// gated as `force` says.
+    async fn refresh_kinds_between<'b>(
+        &self,
+        kinds: &[BaseItemKind],
+        force: bool,
+        skip: &std::collections::HashSet<Uuid>,
+        between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
+    ) -> Result<DynamicImageReport, ServiceError> {
         let mut report = DynamicImageReport::default();
-        for kind in [
-            BaseItemKind::Genre,
-            BaseItemKind::MusicGenre,
-            BaseItemKind::Playlist,
-            BaseItemKind::PhotoAlbum,
-            // `FolderImageProvider`. The library tiles this copies from are
-            // drawn by `refresh_library_images`, which runs BEFORE this pass
-            // (library_scan.rs), so the root's source is already on disk.
-            BaseItemKind::Folder,
-            BaseItemKind::UserRootFolder,
-            BaseItemKind::AggregateFolder,
-        ] {
+        if !self.processor.supports_image_collage_creation() {
+            return Ok(report);
+        }
+        for &kind in kinds {
             let rows = self
                 .items
                 .get_item_list(&InternalItemsQuery {
@@ -292,23 +394,92 @@ impl DynamicImageProviders {
                 })
                 .await?;
             for row in rows {
+                if Uuid::parse_str(&row.id).is_ok_and(|id| skip.contains(&id)) {
+                    continue;
+                }
                 between().await;
-                report.examined += 1;
-                match self.refresh_item(&row, false).await {
-                    Ok(ItemUpdateType::ImageUpdate) => report.generated += 1,
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(%err, item_id = %row.id, kind = %row.type_, "dynamic image failed");
-                    }
+                self.refresh_tallied(&row, force, &mut report).await;
+            }
+        }
+        Ok(report)
+    }
+
+    /// The Primaries of the rows an item refresh reached, each forced as that
+    /// refresh was (`runAllProviders`) or else gated: the folders, photo
+    /// albums and playlists a scan refreshed, drawn in its closing passes.
+    ///
+    /// Rows are drawn in the order given — a parent folder before the folder
+    /// it copies from, as upstream refreshes a folder before its children — an
+    /// id listed twice once (forced if either listing was). Awaits `between`
+    /// before each row; an id with no row, and a locked row, are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Only when the rows cannot be read; a failure on one row is logged and
+    /// the pass continues.
+    pub async fn refresh_rows_between<'b>(
+        &self,
+        rows: &[(Uuid, bool)],
+        between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
+    ) -> Result<DynamicImageReport, ServiceError> {
+        let mut report = DynamicImageReport::default();
+        if !self.processor.supports_image_collage_creation() {
+            return Ok(report);
+        }
+        let mut order: Vec<(Uuid, bool)> = Vec::with_capacity(rows.len());
+        let mut at: std::collections::HashMap<Uuid, usize> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for &(id, force) in rows {
+            match at.entry(id) {
+                std::collections::hash_map::Entry::Occupied(slot) => order[*slot.get()].1 |= force,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(order.len());
+                    order.push((id, force));
                 }
             }
         }
-        tracing::debug!(
-            examined = report.examined,
-            generated = report.generated,
-            "dynamic image pass finished"
-        );
+        // Whole rows: read a bind-sized chunk at a time.
+        for chunk in order.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let ids: Vec<Uuid> = chunk.iter().map(|&(id, _)| id).collect();
+            let mut found: std::collections::HashMap<Uuid, BaseItemEntity> = self
+                .items
+                .retrieve_items(&ids)
+                .await?
+                .into_iter()
+                .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+                .collect();
+            for &(id, force) in chunk {
+                let Some(row) = found.remove(&id) else {
+                    continue;
+                };
+                between().await;
+                self.refresh_tallied(&row, force, &mut report).await;
+            }
+        }
         Ok(report)
+    }
+
+    /// One row of a pass, tallied into `report`; a failure is logged and the
+    /// pass goes on — one unreadable poster must not lose every other image.
+    /// A locked row is skipped: `RefreshWithProviders` returns before a locked
+    /// item's custom providers (`MetadataService.cs:785-788`).
+    async fn refresh_tallied(
+        &self,
+        row: &BaseItemEntity,
+        force: bool,
+        report: &mut DynamicImageReport,
+    ) {
+        if row.is_locked {
+            return;
+        }
+        report.examined += 1;
+        match self.refresh_item(row, force).await {
+            Ok(ItemUpdateType::ImageUpdate) => report.generated += 1,
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(%err, item_id = %row.id, kind = %row.type_, "dynamic image failed");
+            }
+        }
     }
 
     /// Port of `BaseDynamicImageProvider.FetchAsync` for one item: returns
@@ -351,18 +522,7 @@ impl DynamicImageProviders {
             }
         }
 
-        // TODO(parity, open work item — NOT an accepted divergence): left from
-        // when one `Genre` row served both tabs, before music genres got
-        // `MusicGenre` rows of their own: a genre with no video sources falls
-        // through to the music sampling. Upstream's `GenreImageProvider`
-        // samples Series/Movie only and draws nothing here; the fix is to drop
-        // this fall-through.
-        let mut sources = self.sources_for(kind, item, item_id).await?;
-        if sources.is_empty() && kind == DynamicImageKind::Genre {
-            sources = self
-                .sources_for(DynamicImageKind::MusicGenre, item, item_id)
-                .await?;
-        }
+        let sources = self.sources_for(kind, item, item_id).await?;
         if sources.is_empty() {
             // `CreateImage` returns null for an empty set → `ItemUpdateType.None`.
             return Ok(ItemUpdateType::None);
@@ -941,6 +1101,70 @@ mod tests {
         assert_eq!(forced, ItemUpdateType::ImageUpdate);
     }
 
+    /// gl-576: the rows an item refresh reached redraw as that refresh ran —
+    /// a forced one past the date gate, a gated one only when it opens — and
+    /// an id with no row is skipped. The seam the provider manager calls is
+    /// the same `FetchAsync`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refreshed_rows_redraw_forced_or_gated() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let a = write_png(&media, "a-poster.png", [200, 20, 20]);
+        fx.seed(BaseItemKind::Movie, "Heat", Some("Crime"), Some(&a))
+            .await;
+        fx.seed(BaseItemKind::Series, "Lost", Some("Drama"), Some(&a))
+            .await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 2);
+        let crime = fx.by_name(BaseItemKind::Genre, "Crime").await;
+        let drama = fx.by_name(BaseItemKind::Genre, "Drama").await;
+        let id = |row: &BaseItemEntity| Uuid::parse_str(&row.id).expect("id");
+
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        let report = fx
+            .providers
+            .refresh_rows_between(
+                &[
+                    (id(&crime), false),
+                    (id(&drama), false),
+                    (Uuid::new_v4(), true),
+                    // Listed twice: drawn once, forced as either listing.
+                    (id(&crime), true),
+                ],
+                &nothing,
+            )
+            .await
+            .expect("pass");
+        assert_eq!(
+            report,
+            DynamicImageReport {
+                examined: 2,
+                generated: 1
+            }
+        );
+
+        let seam: &dyn GeneratedImageProvider = &fx.providers;
+        assert_eq!(
+            seam.refresh_generated_image(&drama, true)
+                .await
+                .expect("forced"),
+            ItemUpdateType::ImageUpdate
+        );
+        assert_eq!(
+            seam.refresh_generated_image(&drama, false)
+                .await
+                .expect("gated"),
+            ItemUpdateType::None
+        );
+
+        // The gated pass leaves out the rows a forced pass already drew.
+        let report = fx
+            .providers
+            .refresh_all_between(&std::collections::HashSet::from([id(&crime)]), &nothing)
+            .await
+            .expect("pass");
+        assert_eq!(report.examined, 1, "{report:?}");
+    }
+
     /// `HasChangedByDate`: a file modified out of band no longer matches the
     /// recorded `DateModified`, so the next pass regenerates it.
     #[tokio::test(flavor = "multi_thread")]
@@ -1044,6 +1268,34 @@ mod tests {
         let decoded = image::open(&primary.path).expect("png");
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
         assert_eq!(decoded.to_rgb8().get_pixel(10, 10).0, [10, 160, 10]);
+    }
+
+    /// `GenreImageProvider` samples Series/Movie only: a `Genre` row whose
+    /// videos have no art draws nothing, even when same-named music items
+    /// carry covers — those belong to the `MusicGenre` row's collage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genre_without_video_art_does_not_borrow_music_covers() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let cover = write_png(&media, "cover.png", [10, 160, 10]);
+        fx.seed(BaseItemKind::Movie, "Whiplash", Some("Jazz"), None)
+            .await;
+        fx.seed(
+            BaseItemKind::MusicAlbum,
+            "Kind of Blue",
+            Some("Jazz"),
+            Some(&cover),
+        )
+        .await;
+
+        let report = fx.providers.refresh_all().await.expect("pass");
+        assert_eq!(report.generated, 1, "{report:?}");
+        let genre = fx.by_name(BaseItemKind::Genre, "Jazz").await;
+        let genre_id = Uuid::parse_str(&genre.id).expect("id");
+        assert!(fx.primary_of(genre_id).await.is_none());
+        let music = fx.by_name(BaseItemKind::MusicGenre, "Jazz").await;
+        let music_id = Uuid::parse_str(&music.id).expect("id");
+        assert!(fx.primary_of(music_id).await.is_some());
     }
 
     /// The genre query honours `ImageTypes = [Primary]`: a movie without a
@@ -1295,6 +1547,67 @@ mod tests {
             fx.primary_of(playlists).await.is_none(),
             "a BasePluginFolder is IsTopParent, so FolderImageProvider skips it"
         );
+    }
+
+    /// gl-576: a refresh of the root recopies the user root's image — past
+    /// the date gate when it runs every provider, behind it otherwise — and
+    /// never a locked root's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_root_refresh_recopies_the_roots_unless_locked() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let tile = write_png(&media, "library-tile.png", [3, 4, 5]);
+        let user_root = fx
+            .seed(BaseItemKind::UserRootFolder, "Media Folders", None, None)
+            .await;
+        let library = fx
+            .seed(BaseItemKind::CollectionFolder, "Movies", None, Some(&tile))
+            .await;
+        fx.persistence
+            .set_parent_id(library, user_root)
+            .await
+            .expect("parent");
+        fx.persistence
+            .set_ancestors(library, &[user_root])
+            .await
+            .expect("ancestors");
+        fx.providers.refresh_all().await.expect("pass");
+        let copy = || async {
+            std::fs::read(fx.primary_of(user_root).await.expect("primary").path).expect("read")
+        };
+        let first = copy().await;
+
+        let recoloured =
+            std::fs::read(write_png(&media, "library-tile.png", [9, 9, 9])).expect("tile");
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        fx.providers
+            .refresh_user_root_between(false, &nothing)
+            .await
+            .expect("gated");
+        assert_eq!(copy().await, first, "a current copy is behind its gate");
+        fx.providers
+            .refresh_user_root_between(true, &nothing)
+            .await
+            .expect("forced");
+        assert_eq!(copy().await, recoloured, "a forced refresh recopies");
+
+        let mut row = fx
+            .items
+            .retrieve_item(user_root)
+            .await
+            .expect("read")
+            .expect("row");
+        row.is_locked = true;
+        fx.persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("lock");
+        write_png(&media, "library-tile.png", [200, 200, 200]);
+        fx.providers
+            .refresh_user_root_between(true, &nothing)
+            .await
+            .expect("forced");
+        assert_eq!(copy().await, recoloured, "a locked root is left alone");
     }
 
     /// `PhotoAlbumImageProvider` (`BaseFolderImageProvider`): the first photo

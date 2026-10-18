@@ -31,8 +31,8 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ItemTypeLookup};
 use ferrofin_traits::providers::{
-    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
-    RemoteSearchRequest,
+    GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
+    ProviderManager, RefreshPriority, RemoteSearchRequest,
 };
 use uuid::Uuid;
 
@@ -1153,6 +1153,10 @@ pub struct LocalProviderManager {
     /// A box set's or playlist's members, which its refresh takes its
     /// rating from. Absent → the rating is left as stored.
     linked_children: Option<Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>>,
+    /// The providers that draw a genre's, music genre's or playlist's Primary
+    /// from other items' artwork, run by the refresh as upstream's custom
+    /// providers. Absent → a refresh draws no such image.
+    generated_images: Option<Arc<dyn GeneratedImageProvider>>,
     /// The culture table TheTVDB's translations are matched against
     /// (`ThreeLetterISOLanguageNames`, `TvdbCultureInfo`). Absent → no
     /// translation matches but TVDB's own `zhtw`/`pt`/`por` codes.
@@ -1235,6 +1239,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_tvdb", &self.tvdb.is_some())
             .field("has_people", &self.people.is_some())
             .field("has_linked_children", &self.linked_children.is_some())
+            .field("has_generated_images", &self.generated_images.is_some())
             .field("has_localization", &self.localization.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .field(
@@ -1260,6 +1265,15 @@ impl LocalProviderManager {
     #[must_use]
     pub fn with_nfo_saver(mut self, saver: Arc<crate::nfo_save::NfoSaver>) -> Self {
         self.nfo_saver = Some(saver);
+        self
+    }
+
+    /// Attaches the providers that draw an item's Primary from other items'
+    /// artwork (upstream's `BaseDynamicImageProvider` family), so a refresh of
+    /// a genre, music genre or playlist redraws its collage.
+    #[must_use]
+    pub fn with_generated_images(mut self, provider: Arc<dyn GeneratedImageProvider>) -> Self {
+        self.generated_images = Some(provider);
         self
     }
 
@@ -1301,6 +1315,7 @@ impl LocalProviderManager {
             tvdb: None,
             people: None,
             linked_children: None,
+            generated_images: None,
             localization: None,
             kind_by_type_name: HashMap::new(),
             virtual_folders: None,
@@ -2600,6 +2615,32 @@ impl LocalProviderManager {
         }
         crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
+        // `RefreshWithProviders`' custom providers, after the merge
+        // (`MetadataService.cs:922-925`): a genre's, music genre's or
+        // playlist's generated Primary (`BaseDynamicImageProvider`). As an
+        // `IForcedProvider` it ignores the fetcher checkboxes, but a locked
+        // item returns before it (`:785-788`); it runs with every provider
+        // (`runAllProviders`) or when its `HasChanged` gate opens.
+        let generated = match &self.generated_images {
+            Some(provider)
+                if !stored.is_locked
+                    && options.metadata_refresh_mode != MetadataRefreshMode::None =>
+            {
+                match provider
+                    .refresh_generated_image(&row, plan.run_all_providers)
+                    .await
+                {
+                    Ok(update) => update == ItemUpdateType::ImageUpdate,
+                    Err(err) => {
+                        // `RunCustomProvider`: a failure, and the refresh goes on.
+                        failures += 1;
+                        tracing::warn!(%item_id, %err, "generated image failed");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
         let image_saved = if fetch.images && self.image_store.is_some() {
             let (saved, image_failures) = Box::pin(crate::rate_limit::count_request_failures(
                 self.refresh_ordered_images(
@@ -2623,7 +2664,7 @@ impl LocalProviderManager {
             plan,
             &request,
             PassOutcome {
-                changed: metadata_changed || ids_changed || image_saved,
+                changed: metadata_changed || ids_changed || image_saved || generated,
                 failed: failures > 0,
             },
         );
@@ -2673,7 +2714,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved {
+        } else if image_saved || generated {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -4860,8 +4901,8 @@ mod tests {
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::options::ItemImageInfo;
     use ferrofin_traits::providers::{
-        ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager,
-        RefreshPriority, RemoteSearchRequest,
+        GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
+        ProviderManager, RefreshPriority, RemoteSearchRequest,
     };
     use uuid::Uuid;
 
@@ -9655,6 +9696,138 @@ mod tests {
             .expect("saved: the stored parental score starts unset");
         assert_eq!(row.official_rating.as_deref(), rating);
         assert_eq!(row.inherited_parental_rating_value, score);
+    }
+
+    /// The generated-image providers, recording each call's `force`.
+    #[derive(Default)]
+    struct GeneratedImages {
+        forced: std::sync::Mutex<Vec<bool>>,
+        /// Every draw fails.
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl GeneratedImageProvider for GeneratedImages {
+        async fn refresh_generated_image(
+            &self,
+            _item: &BaseItemEntity,
+            force: bool,
+        ) -> Result<ItemUpdateType, ServiceError> {
+            self.forced.lock().expect("lock").push(force);
+            if self.fail {
+                return Err(ServiceError::backend("the collage could not be drawn"));
+            }
+            Ok(ItemUpdateType::ImageUpdate)
+        }
+    }
+
+    /// gl-576: a genre's refresh runs the generated-image providers as
+    /// upstream's custom providers (`MetadataService.GetProviders`, `:785-788`):
+    /// forced when the refresh runs every provider ("Replace all metadata", a
+    /// full refresh, a first refresh), gated otherwise, never for a locked
+    /// item or with metadata mode `None`. A drawn image saves the row.
+    #[rstest::rstest]
+    #[case::full_refresh(MetadataRefreshMode::FullRefresh, false, true, false, Some(true))]
+    #[case::replace_all(MetadataRefreshMode::Default, true, true, false, Some(true))]
+    #[case::first_refresh(MetadataRefreshMode::Default, false, false, false, Some(true))]
+    #[case::default(MetadataRefreshMode::Default, false, true, false, Some(false))]
+    #[case::validation_only(MetadataRefreshMode::ValidationOnly, false, true, false, Some(false))]
+    #[case::mode_none(MetadataRefreshMode::None, false, true, false, None)]
+    #[case::locked(MetadataRefreshMode::FullRefresh, false, true, true, None)]
+    #[tokio::test]
+    async fn a_genre_refresh_runs_the_generated_image_providers(
+        #[case] mode: MetadataRefreshMode,
+        #[case] replace_all_metadata: bool,
+        #[case] refreshed_before: bool,
+        #[case] is_locked: bool,
+        #[case] forced: Option<bool>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.is_locked = is_locked;
+        stored.date_last_refreshed = refreshed_before.then(chrono::Utc::now);
+        // Settled as the refresh settles it, so only the image changes.
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let generated = Arc::new(GeneratedImages::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_generated_images(Arc::clone(&generated) as _);
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            replace_all_metadata,
+            ..MetadataRefreshOptions::default()
+        };
+        let update = mgr
+            .refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let calls = generated.forced.lock().expect("lock").clone();
+        assert_eq!(calls, forced.into_iter().collect::<Vec<_>>());
+        if forced.is_some() && !replace_all_metadata {
+            assert_eq!(update, ItemUpdateType::ImageUpdate);
+            assert!(
+                !store.saved.lock().expect("lock").is_empty(),
+                "a drawn image saves the row"
+            );
+        }
+    }
+
+    /// A draw that fails is a provider failure (`RunCustomProvider`): the
+    /// refresh goes on, but `DateLastRefreshed` is not stamped, as it is when
+    /// the draw succeeds.
+    #[rstest::rstest]
+    #[case::drawn(false, true)]
+    #[case::failed(true, false)]
+    #[tokio::test]
+    async fn a_failed_generated_image_withholds_the_refresh_stamp(
+        #[case] fail: bool,
+        #[case] stamped: bool,
+    ) {
+        let item_id = Uuid::new_v4();
+        let before = chrono::Utc::now() - chrono::TimeDelta::days(1);
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(before);
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_generated_images(Arc::new(GeneratedImages {
+                fail,
+                ..GeneratedImages::default()
+            }));
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_single_item(item_id, &options)
+            .await
+            .expect("a failed draw does not fail the refresh");
+        let restamped = store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .is_some_and(|row| row.date_last_refreshed.is_some_and(|at| at > before));
+        assert_eq!(restamped, stamped);
     }
 
     /// A season with no folder of its own (a virtual season) refreshes here,

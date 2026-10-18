@@ -673,6 +673,152 @@ pub(crate) async fn import_playlist_meta_if_missing_in(
     import_playlist_meta(conn, &container_db, &parse_data(data.as_deref())).await
 }
 
+/// A playlist's owner, open access and shares (C# `Playlist.OwnerUserId`,
+/// `OpenAccess` and `Shares`), as [`playlist_permissions_in`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaylistPermissions {
+    /// The owner; `None` for an unowned playlist.
+    pub(crate) owner: Option<Uuid>,
+    /// Whether every user may read the playlist.
+    pub(crate) open_access: bool,
+    /// The shares of users that exist, in `Shares` order.
+    pub(crate) shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
+}
+
+/// The playlists `user` owns: those whose `FerrofinPlaylists` row names
+/// them, and those no boot has imported yet whose `Data` `OwnerUserId` does.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying query fails.
+pub(crate) async fn playlists_owned_by(
+    db: &Database,
+    user: Uuid,
+) -> Result<Vec<Uuid>, ServiceError> {
+    let [playlist_type, _] = container_type_names();
+    let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as(
+        r#"SELECT bi."Id", p."PlaylistId" IS NOT NULL,
+                  CASE WHEN p."PlaylistId" IS NULL THEN bi."Data" END
+           FROM "BaseItems" bi
+           LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = bi."Id"
+           WHERE bi."Type" = ?1 AND (p."OwnerUserId" = ?2 OR p."PlaylistId" IS NULL)"#,
+    )
+    .bind(playlist_type)
+    .bind(guid_to_db(user))
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, imported, data)| {
+            *imported
+                || parse_data(data.as_deref())
+                    .get("OwnerUserId")
+                    .and_then(Value::as_str)
+                    .and_then(|owner| Uuid::parse_str(owner).ok())
+                    == Some(user)
+        })
+        .filter_map(|(id, _, _)| Uuid::parse_str(&id).ok())
+        .collect())
+}
+
+/// A playlist's permissions from its `FerrofinPlaylists` and
+/// `FerrofinPlaylistShares` rows. The shares are those of users that still
+/// have a `Users` row (a deleted user's share stays on the playlist), in the
+/// order the `Data` `Shares` array lists them (the `Playlist.Shares` order
+/// upstream reads; Ferrofin writes the array in user-id order, a playlist
+/// Jellyfin wrote keeps its own until it changes), any share the array lacks
+/// after those, by user id. `None` when the playlist has no
+/// `FerrofinPlaylists` row.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn playlist_permissions_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+) -> Result<Option<PlaylistPermissions>, ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let row: Option<(Option<String>, bool, Option<String>)> = sqlx::query_as(
+        r#"SELECT p."OwnerUserId", p."OpenAccess", bi."Data"
+           FROM "FerrofinPlaylists" p JOIN "BaseItems" bi ON bi."Id" = p."PlaylistId"
+           WHERE p."PlaylistId" = ?1"#,
+    )
+    .bind(&playlist_db)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let Some((owner, open_access, data)) = row else {
+        return Ok(None);
+    };
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT s."UserId", s."CanEdit" FROM "FerrofinPlaylistShares" s
+           WHERE s."PlaylistId" = ?1
+             AND EXISTS (SELECT 1 FROM "Users" u WHERE u."Id" = s."UserId")
+           ORDER BY s."UserId""#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let listed: Vec<Uuid> = parse_data(data.as_deref())
+        .get("Shares")
+        .cloned()
+        .and_then(|shares| serde_json::from_value::<Vec<ShareJson>>(shares).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|share| Uuid::parse_str(&share.user_id).ok())
+        .collect();
+    let mut shares: Vec<_> = rows
+        .into_iter()
+        .filter_map(|(user, can_edit)| {
+            Uuid::parse_str(&user).ok().map(|user| {
+                ferrofin_model::entities_media::PlaylistUserPermissions::new(user, can_edit)
+            })
+        })
+        .collect();
+    shares.sort_by_key(|share| {
+        listed
+            .iter()
+            .position(|user| *user == share.user_id)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(Some(PlaylistPermissions {
+        owner: owner.as_deref().and_then(|o| Uuid::parse_str(o).ok()),
+        open_access,
+        shares,
+    }))
+}
+
+/// Makes `heir` the owner of `playlist` and drops `heir`'s share, with the
+/// `Data` sync, on a connection the caller holds (normally a writer
+/// transaction, so the next boot's re-import keeps the change): C#
+/// `RemovePlaylistsAsync`'s `OwnerUserId = rankedShares[0].UserId` and
+/// `Shares = rankedShares.Skip(1)`.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn hand_playlist_to_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    heir: Uuid,
+) -> Result<(), ServiceError> {
+    let (playlist_db, heir_db) = (guid_to_db(playlist), guid_to_db(heir));
+    sqlx::query(r#"UPDATE "FerrofinPlaylists" SET "OwnerUserId" = ?2 WHERE "PlaylistId" = ?1"#)
+        .bind(&playlist_db)
+        .bind(&heir_db)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    sqlx::query(
+        r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
+    )
+    .bind(&playlist_db)
+    .bind(&heir_db)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    sync_container_data_in(conn, playlist).await
+}
+
 /// Folds a playlist's owner / open-access / shares cache rows into its parsed
 /// `Data` object (the `OwnerUserId` / `OpenAccess` / `Shares` keys).
 async fn sync_playlist_meta(
@@ -759,12 +905,15 @@ pub async fn reconcile_playlist_permissions(db: &Database) -> Result<usize, Serv
     Ok(imported)
 }
 
-/// Sets a single key in an item's `Data` JSON, preserving everything else.
+/// Sets a single key in an item's `Data` JSON, preserving everything else, on
+/// a connection the caller holds — normally a writer transaction, so the key
+/// commits with the change it belongs to, and the read sees that change's
+/// uncommitted rows.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
-pub async fn set_data_key(
-    db: &Database,
+pub(crate) async fn set_data_key_in(
+    conn: &mut sqlx::SqliteConnection,
     item: Uuid,
     key: &str,
     value: Value,
@@ -773,7 +922,7 @@ pub async fn set_data_key(
     let data: Option<Option<String>> =
         sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
             .bind(&item_db)
-            .fetch_optional(db.pool())
+            .fetch_optional(&mut *conn)
             .await
             .map_err(db_err)?;
     let Some(data) = data else { return Ok(()) };
@@ -782,7 +931,7 @@ pub async fn set_data_key(
     sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
         .bind(&item_db)
         .bind(data_to_string(&map)?)
-        .execute(db.writer())
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
     Ok(())
@@ -1006,7 +1155,8 @@ pub(crate) async fn seed_playlist_owner(db: &Database, playlist: Uuid, owner: Uu
 }
 
 /// Test-only: makes every write of `item`'s `Data` abort (a `BEFORE UPDATE OF
-/// "Data"` trigger), to prove an edit that changes no `Data` key never writes it.
+/// "Data"` trigger), to prove an edit that changes no `Data` key never writes
+/// it, or to fail an edit at its `Data` sync.
 #[cfg(test)]
 pub(crate) async fn fail_data_writes_of(db: &Database, item: Uuid) {
     sqlx::query(sqlx::AssertSqlSafe(format!(

@@ -175,7 +175,8 @@ pub struct NextUpEpisodeBatchResult {
 /// manager's to apply — the repository only reads.
 #[derive(Debug, Clone)]
 pub struct PlaylistAccessColumns {
-    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy or API-key playlist).
+    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy playlist, an older
+    /// build's user-less API-key create, or a `Data` naming no owner).
     pub owner_user_id: Option<String>,
     /// `FerrofinPlaylists.OpenAccess` (`None` only when the meta row is absent).
     pub open_access: Option<i64>,

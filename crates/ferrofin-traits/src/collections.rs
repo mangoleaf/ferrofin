@@ -156,8 +156,15 @@ pub trait PlaylistManager: Send + Sync {
     /// Returns [`ServiceError::NotFound`] when the playlist does not exist **or**
     /// is not visible to `user_id` — the C# `GetPlaylistForUser` returns `null`
     /// for both, and no endpoint distinguishes them. A playlist with no recorded
-    /// owner (created before owner tracking, or by an API key) grants
-    /// [`PlaylistAccessLevel::Owner`] to every caller for back-compat.
+    /// owner (created before owner tracking, by an older build's user-less
+    /// API-key create, or imported from a `Data` naming no owner) grants
+    /// [`PlaylistAccessLevel::Owner`] to every caller for
+    /// back-compat. A nil `user_id` is [`ServiceError::InvalidInput`]
+    /// (upstream's `GetUserById(Guid.Empty)` throw), here and in
+    /// [`get_playlist_for_user`](Self::get_playlist_for_user),
+    /// [`create_playlist`](Self::create_playlist),
+    /// [`get_playlists`](Self::get_playlists) and
+    /// [`get_playlist_items`](Self::get_playlist_items).
     async fn get_playlist_access(
         &self,
         playlist_id: Uuid,
@@ -249,7 +256,10 @@ pub trait PlaylistManager: Send + Sync {
         calling_user_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// Removes all playlists owned by a user (transferring shared ones).
+    /// Disposes of the playlists a deleted user owned (C#
+    /// `RemovePlaylistsAsync`): one shared with users who still exist goes to
+    /// the first of them with edit rights, else the first of them; any other
+    /// is deleted unless it is open access, which keeps it as it is.
     async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError>;
 }
 
