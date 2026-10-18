@@ -300,7 +300,14 @@ impl MediaSourceManager for StreamSources {
         _allow_media_probe: bool,
         _enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        Ok(vec![static_source(&self.path)])
+        let mut sources = vec![static_source(&self.path)];
+        if let Some(alternate) = &self.alternate {
+            sources.push(MediaSourceInfo {
+                id: Some(ALT_ID.to_string()),
+                ..static_source(alternate)
+            });
+        }
+        Ok(sources)
     }
     async fn get_static_media_sources(
         &self,

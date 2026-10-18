@@ -255,7 +255,7 @@ async fn playback_info(
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user_opt(state, auth, request.user_id).await?;
-    require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_ref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, request.user_id).await?,
@@ -302,61 +302,19 @@ async fn playback_info(
     // decode). Without this every source claimed direct-play, so incompatible-audio
     // files played video-only. No profile (the GET form) keeps the static sources.
     if let Some(profile) = &request.profile {
-        let policy = playback_policy(state, auth, user.as_ref(), resolved_user_id).await?;
-        // `maxStreamingBitrate ?? profile.MaxStreamingBitrate`: the remote cap
-        // applies to the profile's own limit when the client sends none.
-        let client_limit = request
-            .max_streaming_bitrate
-            .or(profile.max_streaming_bitrate);
-        let max_streaming_bitrate =
-            playback_bitrate_limit(state, auth, &policy, client_limit).await?;
-        // Use the item's media type rather than the presence of a video stream:
-        // audio files can have cover-art video streams, and video probes may be empty.
-        let media_type = state
-            .library
-            .get_item_by_id(item_id)
-            .await?
-            .and_then(|item| item.media_type);
-        let mut decisions = Vec::new();
-        for source in &mut media_sources {
-            let is_audio = media_type.as_deref().map_or_else(
-                || source.video_stream().is_none(),
-                |kind| kind.eq_ignore_ascii_case("Audio"),
-            );
-            // SetDeviceSpecificData applies the track picks only to the version
-            // the client named; every other version negotiates its defaults.
-            let requested = request.media_source_id.as_deref().is_some_and(|id| {
-                source
-                    .id
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(id))
-            });
-            let selection = if requested {
-                request.selection
-            } else {
-                StreamSelection {
-                    audio_stream_index: None,
-                    subtitle_stream_index: None,
-                    ..request.selection
-                }
-            };
-            let decision = apply_stream_decision(
-                source,
-                profile,
-                item_id,
-                max_streaming_bitrate,
-                auth.token.as_ref().map(Secret::expose),
-                auth.device_id.as_deref(),
-                selection,
-                &play_session_id,
-                request.flags,
-                &policy,
-                is_audio,
-            );
-            if let Some(decision) = decision {
-                decisions.push((source.id.clone(), decision));
-            }
-        }
+        let decisions = set_device_specific_data(
+            state,
+            auth,
+            user.as_ref(),
+            resolved_user_id,
+            item_id,
+            item.media_type.as_deref(),
+            &mut media_sources,
+            profile,
+            &request,
+            &play_session_id,
+        )
+        .await?;
         // Upstream sorts on the client's own limit, not the policy-capped one.
         sort_media_sources(&mut media_sources, request.max_streaming_bitrate, item_id);
         // Record the decision for the metrics track (Track A). Clients play the
@@ -429,6 +387,165 @@ async fn playback_info(
         play_session_id: Some(play_session_id),
         error_code: None,
     })
+}
+
+/// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
+/// user's policy and bitrate limit, then one [`apply_stream_decision`] each,
+/// with the track picks applied only to the version `request` names. Returns
+/// each decided source's id with its decision.
+#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
+async fn set_device_specific_data(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    user: Option<&ferrofin_db::entities::users::UserEntity>,
+    resolved_user_id: Uuid,
+    item_id: Uuid,
+    media_type: Option<&str>,
+    media_sources: &mut [MediaSourceInfo],
+    profile: &DeviceProfile,
+    request: &PlaybackRequest,
+    play_session_id: &str,
+) -> Result<Vec<(Option<String>, StreamDecision)>, ApiError> {
+    let policy = playback_policy(state, auth, user, resolved_user_id).await?;
+    // `maxStreamingBitrate ?? profile.MaxStreamingBitrate`: the remote cap
+    // applies to the profile's own limit when the client sends none.
+    let client_limit = request
+        .max_streaming_bitrate
+        .or(profile.max_streaming_bitrate);
+    let max_streaming_bitrate = playback_bitrate_limit(state, auth, &policy, client_limit).await?;
+    let mut decisions = Vec::new();
+    for source in media_sources {
+        // Use the item's media type rather than the presence of a video stream:
+        // audio files can have cover-art video streams, and video probes may be empty.
+        let is_audio = media_type.map_or_else(
+            || source.video_stream().is_none(),
+            |kind| kind.eq_ignore_ascii_case("Audio"),
+        );
+        // SetDeviceSpecificData applies the track picks only to the version
+        // the client named; every other version negotiates its defaults.
+        let requested = request.media_source_id.as_deref().is_some_and(|id| {
+            source
+                .id
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(id))
+        });
+        let selection = if requested {
+            request.selection
+        } else {
+            StreamSelection {
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                ..request.selection
+            }
+        };
+        let decision = apply_stream_decision(
+            source,
+            profile,
+            item_id,
+            max_streaming_bitrate,
+            auth.token.as_ref().map(Secret::expose),
+            auth.device_id.as_deref(),
+            selection,
+            play_session_id,
+            request.flags,
+            &policy,
+            is_audio,
+        );
+        if let Some(decision) = decision {
+            decisions.push((source.id.clone(), decision));
+        }
+    }
+    Ok(decisions)
+}
+
+/// The media source `UniversalAudioController.GetUniversalAudioStream` acts
+/// on (its `info.MediaSources[0]`), as negotiated.
+pub(crate) struct UniversalAudioSource {
+    /// The first-sorted source, with its negotiated `SupportsDirectPlay`/
+    /// `SupportsDirectStream`, transcoding container and protocol, and
+    /// `TranscodeReasons` (empty when it plays as it is).
+    pub source: MediaSourceInfo,
+    /// The play-session id `GetPlaybackInfo` minted for the request.
+    pub play_session_id: String,
+}
+
+/// The negotiation of `UniversalAudioController.GetUniversalAudioStream`:
+/// `MediaInfoHelper.GetPlaybackInfo` (the version `media_source_id` names, or
+/// every version), the client's transcoding container and protocol stamped on
+/// each, `SetDeviceSpecificData` against the universal `profile`, then
+/// `SortMediaSources`. Returns the first source, or [`None`] when there is
+/// none (upstream indexes an empty list there).
+#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
+pub(crate) async fn universal_audio_source(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    item_id: Uuid,
+    user_id: Option<Uuid>,
+    media_source_id: Option<&str>,
+    profile: &DeviceProfile,
+    max_streaming_bitrate: Option<i32>,
+    max_audio_channels: Option<i32>,
+    transcoding_container: Option<&str>,
+    transcoding_protocol: Option<MediaStreamProtocol>,
+) -> Result<Option<UniversalAudioSource>, ApiError> {
+    let user = resolve_user_opt(state, auth, user_id).await?;
+    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let resolved_user_id = match &user {
+        Some(user) => user_uuid(user)?,
+        None => effective_user_id(state, auth, user_id).await?,
+    };
+    // Every version (the universal route takes no live stream id), narrowed
+    // below rather than by the helper's exact match.
+    let mut media_sources =
+        resolve_playback_media_sources(state, item_id, resolved_user_id, None, None).await?;
+    // The version is matched in either GUID spelling, as the static stream
+    // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
+    // `mediaSourceId` is what a direct-play request for it would carry.
+    if let Some(id) = non_blank(media_source_id) {
+        media_sources.retain(|source| source.id_matches(id));
+    }
+    if media_sources.is_empty() {
+        return Ok(None);
+    }
+    let play_session_id = Uuid::new_v4().simple().to_string();
+    for source in &mut media_sources {
+        source.transcoding_container = transcoding_container.map(str::to_owned);
+        if let Some(protocol) = transcoding_protocol {
+            source.transcoding_sub_protocol = protocol;
+        }
+    }
+    // No track picks (upstream passes null indexes); its other options are
+    // the request's defaults: every method allowed.
+    let request = PlaybackRequest {
+        user_id,
+        max_streaming_bitrate,
+        selection: StreamSelection {
+            max_audio_channels,
+            ..StreamSelection::default()
+        },
+        ..PlaybackRequest::default()
+    };
+    set_device_specific_data(
+        state,
+        auth,
+        user.as_ref(),
+        resolved_user_id,
+        item_id,
+        item.media_type.as_deref(),
+        &mut media_sources,
+        profile,
+        &request,
+        &play_session_id,
+    )
+    .await?;
+    sort_media_sources(&mut media_sources, max_streaming_bitrate, item_id);
+    Ok(media_sources
+        .into_iter()
+        .next()
+        .map(|source| UniversalAudioSource {
+            source,
+            play_session_id,
+        }))
 }
 
 /// Resolves the user policy required by upstream device-profile negotiation.

@@ -1789,12 +1789,13 @@ impl FerrofinStreamStatePlanner {
                 push_split(&mut args, &bsf);
             }
             if !EncodingJobInfo::is_copy_codec(Some(&audio_encoder)) {
-                if let Some(bitrate) = self.encoding_helper.audio_bitrate_param(
-                    state.output_audio_bitrate,
-                    Some(&audio_encoder),
-                    state.audio_stream.as_ref(),
-                    state.output_audio_channels,
-                ) {
+                // `-ab state.OutputAudioBitrate` as planned, skipped for a
+                // lossless encoder. Recomputing it from the encoder name
+                // (`libmp3lame`, not `mp3`) dropped the client's bitrate cap.
+                if let Some(bitrate) = state
+                    .output_audio_bitrate
+                    .filter(|_| !is_lossless_audio_codec(&audio_encoder))
+                {
                     push_split(&mut args, "-b:a");
                     args.push(bitrate.to_string());
                 }
@@ -2839,6 +2840,49 @@ mod tests {
         assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
         assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
         assert_ne!(limited.playlist_path, audio_limited.playlist_path);
+    }
+
+    /// `GetProgressiveAudioFullCommandLine` emits `-ab state.OutputAudioBitrate`:
+    /// a stereo FLAC transcoded to mp3 under a 128 kbit/s cap is encoded at
+    /// 128 kbit/s, not at the 128 kbit/s-per-channel default the `libmp3lame`
+    /// encoder name would select.
+    #[tokio::test]
+    async fn progressive_audio_honours_the_requested_bitrate() {
+        let mut flac = audio_stream("flac");
+        flac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![flac])]);
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.audio_bitrate = Some(128_000);
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // The audio HLS segments of the same request encode to the same cap.
+        let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        let args = hls.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // A lossless encoder takes no bitrate.
+        let mut alac = audio_stream("alac");
+        alac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![alac])]);
+        req.output_container = Some("flac".to_owned());
+        req.audio_codec = Some("flac".to_owned());
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a flac"), "{args}");
+        assert!(!args.contains("-b:a"), "{args}");
     }
 
     #[tokio::test]
