@@ -1311,6 +1311,60 @@ fn add_external_lyrics(
     streams.extend(lyrics.into_iter().take(1));
 }
 
+/// `AudioFileProber.FetchAsync`'s embedded-lyric step (`:143-157`, with
+/// `FetchDataFromTags` `:562-572` and `LyricManager.SaveLyricAsync`), run on an
+/// unlocked track's probe result: the lyrics in its tags
+/// ([`embedded_lyrics::from_tags`]) are saved as `{stem}.lrc` — beside the
+/// track when the library saves lyrics with media, else in its internal
+/// metadata folder — when it has no lyric sidecar yet, or under
+/// `ReplaceAllMetadata`. A track that had none then picks the saved file up as
+/// its lyric stream ([`add_external_lyrics`]).
+///
+/// The save goes by path, not through the lyric manager's item lookup: a
+/// track's row is not stored yet when its first probe returns.
+///
+/// A write that fails everywhere is an error, as `TrySaveToFiles` throws:
+/// the caller then drops the probe result, as upstream loses the whole
+/// `FetchAsync`.
+fn extract_embedded_lyrics(
+    seam: &ExternalProbeSeam,
+    id: Uuid,
+    path: &str,
+    probed: &mut MediaInfo,
+    replace_all: bool,
+    save_with_media: bool,
+) -> Result<(), ServiceError> {
+    let try_extract = !probed
+        .media_source
+        .media_streams
+        .iter()
+        .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric);
+    if !(try_extract || replace_all) {
+        return Ok(());
+    }
+    let Some(lyrics) = probed
+        .raw_audio_tags
+        .as_ref()
+        .and_then(crate::embedded_lyrics::from_tags)
+    else {
+        return Ok(());
+    };
+    let internal = seam.for_item(id).internal_metadata_path;
+    let targets = crate::lyric_manager::save_targets(
+        std::path::Path::new(path),
+        save_with_media,
+        internal.as_deref().map(std::path::Path::new),
+        "lrc",
+    );
+    let saved = crate::lyric_manager::try_save_to_files(&targets, &lyrics)?;
+    tracing::debug!(path = %saved.display(), "saved embedded lyrics");
+    if try_extract {
+        let target = seam.resolvers.target_for(path, internal);
+        add_external_lyrics(&seam.resolvers, &target, probed);
+    }
+    Ok(())
+}
+
 /// The look-ahead probe pipeline: tracks which planned rows probe, keeps a
 /// bounded set of ffprobe tasks in flight, and hands each planned item its
 /// result **in plan order**.
@@ -6449,9 +6503,34 @@ impl LibraryScanner {
             .request_for(item, !matches!(stored, Stored::New));
         let options = request.options;
         let cancel = state.refresh.cancel;
-        let Some(probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
+        let Some(mut probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
             return Ok(ItemSaved::Cancelled);
         };
+        let unsaved_lyrics = if probe.is_audio
+            && !locked
+            && let (Some(info), Some(seam), Some(path)) = (
+                probe.info.as_mut(),
+                state.refresh.externals.as_ref(),
+                item.entity.path.as_deref(),
+            ) {
+            extract_embedded_lyrics(
+                seam,
+                item.id,
+                path,
+                info,
+                options.replace_all_metadata,
+                policy.options.is_some_and(|o| o.save_lyrics_with_media),
+            )
+            .err()
+        } else {
+            None
+        };
+        if let Some(e) = unsaved_lyrics {
+            let path = item.entity.path.as_deref();
+            tracing::warn!(error = %e, ?path, "embedded lyrics not saved; item left unprobed");
+            probe.info = None;
+            probe.failed = true;
+        }
         let probe_ran = probe.info.is_some();
         let mut failures = u32::from(probe.failed);
         let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
