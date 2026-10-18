@@ -179,6 +179,20 @@ impl ImageFileSaver {
         })
     }
 
+    /// Whether the item's own path lies in the server's data or internal
+    /// metadata directory (a genre's `{metadata}/Genre/<name>`, a playlist in
+    /// `{data}/playlists`) rather than in a media library. The check is
+    /// lexical, so a path it cannot match falls back to the library's setting.
+    fn in_server_directories(&self, item: &BaseItemEntity) -> bool {
+        let Some(path) = item.path.as_deref().map(Path::new) else {
+            return false;
+        };
+        let paths = self.configuration.application_paths();
+        [paths.data_path(), paths.internal_metadata_path()]
+            .iter()
+            .any(|root| !root.is_empty() && path.starts_with(root))
+    }
+
     async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {
         let series = if policy::short_kind(item) == "Season" {
             let id = item
@@ -197,14 +211,19 @@ impl ImageFileSaver {
         // `IsSaveLocalMetadataEnabled`: a genre, music genre or playlist
         // overrides it to true (`Genre.cs:55`, `MusicGenre.cs:63`,
         // `Playlist.cs:126`), so its artwork lives beside its own path, out of
-        // reach of the dynamic image providers. Divergence: upstream's other
-        // overrides (Person, Studio, Year, BoxSet, a by-name MusicArtist,
-        // CollectionFolder, UserView) still follow the owning library, so
-        // their downloaded art stays in the internal metadata folder.
-        if !matches!(
+        // reach of the dynamic image providers. Accepted divergence: the
+        // override holds only while that path is in the server's own data or
+        // metadata directory. A playlist file or folder inside a media
+        // library follows the library's "Save artwork into media folders",
+        // so nothing is written into a media folder the library did not open
+        // to it. Upstream's other overrides (Person, Studio, Year, BoxSet, a
+        // by-name MusicArtist, CollectionFolder, UserView) are not ported yet,
+        // so their downloaded art stays in the internal metadata folder.
+        if !(matches!(
             policy::short_kind(item),
             "Genre" | "MusicGenre" | "Playlist"
-        ) {
+        ) && self.in_server_directories(item))
+        {
             let folders = self.folders.get_virtual_folders().await?;
             let options = ferrofin_model::entities_media::owning_library(
                 &folders,

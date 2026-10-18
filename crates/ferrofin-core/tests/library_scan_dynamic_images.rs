@@ -494,27 +494,37 @@ async fn an_uploaded_photo_album_primary_survives_a_default_rescan() {
     );
 }
 
+const MUSIC_GENRE: &str = "MediaBrowser.Controller.Entities.Audio.MusicGenre";
+const PLAYLIST: &str = "MediaBrowser.Controller.Playlists.Playlist";
+
 /// gl-590: a music genre's and a playlist folder's upload is saved beside the
 /// item's own path whatever the library says, as `IsSaveLocalMetadataEnabled`
-/// is overridden to true for both (`MusicGenre.cs:63`, `Playlist.cs:126`).
+/// is overridden to true for both (`MusicGenre.cs:63`, `Playlist.cs:126`) —
+/// while that path is in the server's own directories. A playlist file inside
+/// a media library whose "Save artwork into media folders" is off keeps its
+/// upload in the internal metadata folder: nothing is written into the media.
 #[rstest::rstest]
-#[case::music_genre("MediaBrowser.Controller.Entities.Audio.MusicGenre", false)]
-#[case::playlist("MediaBrowser.Controller.Playlists.Playlist", true)]
+#[case::music_genre(MUSIC_GENRE, "metadata/MusicGenre/Mix", false, Some("folder.png"))]
+#[case::playlist(PLAYLIST, "data/playlists/Mix", false, Some("folder.png"))]
+#[case::playlist_file_in_a_library(PLAYLIST, "photos/Mix.m3u", true, None)]
 #[tokio::test(flavor = "multi_thread")]
 async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
     #[case] type_: &str,
-    #[case] is_folder: bool,
+    #[case] path: &str,
+    #[case] is_file: bool,
+    #[case] beside: Option<&str>,
 ) {
     let lib = PhotoLibrary::scanned(RED).await;
     let id = uuid::Uuid::new_v4();
-    let dir = lib.tmp.path().join("own").join("Mix");
+    let path = lib.tmp.path().join(path);
     lib.persistence
         .save_items(&[BaseItemEntity {
             id: guid_to_db(id),
             type_: type_.to_owned(),
             name: Some("Mix".to_owned()),
-            path: Some(dir.to_string_lossy().into_owned()),
-            is_folder,
+            path: Some(path.to_string_lossy().into_owned()),
+            is_folder: type_ == PLAYLIST,
+            is_in_mixed_folder: is_file,
             ..BaseItemEntity::default()
         }])
         .await
@@ -525,12 +535,25 @@ async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
         .await
         .expect("upload");
     let images = lib.items.get_image_infos(id).await.expect("images");
+    let want = match beside {
+        Some(name) => path.join(name),
+        None => lib
+            .tmp
+            .path()
+            .join("metadata/library")
+            .join(guid_to_db(id))
+            .join("primary.png"),
+    };
     assert_eq!(
         images
             .iter()
             .find(|i| i.image_type == ImageType::Primary)
             .map(|i| Path::new(&i.path).to_owned()),
-        Some(dir.join("folder.png"))
+        Some(want)
+    );
+    assert!(
+        !lib.tmp.path().join("photos/Mix-poster.png").exists(),
+        "nothing written into the media library"
     );
 }
 

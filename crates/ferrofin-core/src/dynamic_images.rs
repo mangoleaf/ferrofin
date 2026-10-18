@@ -46,17 +46,21 @@
 //! - no Primary yet → generate iff the provider finds at least one source;
 //! - a Primary that is a remote URL, or a local file **outside** the item's
 //!   internal metadata folder (a local `folder.jpg`) → never touched. That
-//!   includes a user upload to a genre, music genre or playlist, which
-//!   `ImageFileSaver` stores beside the item's own path, as `ImageSaver` does;
-//! - a Primary inside the metadata folder (a generated one, or an upload to a
-//!   photo album or folder whose library does not save local metadata, or to
-//!   a playlist created here, which has no path of its own to save beside) →
+//!   includes a user upload to a genre, music genre or playlist whose path is
+//!   in the server's own data or metadata directory, which `ImageFileSaver`
+//!   stores beside that path, as `ImageSaver` does;
+//! - a Primary inside the metadata folder (a generated one; an upload to a
+//!   photo album, folder or playlist file in a library that does not save
+//!   artwork into media folders, since nothing is written into a media folder
+//!   without that opt-in; or an upload to a playlist created here, which has
+//!   no path of its own to save beside) →
 //!   regenerated only when the file's modification time no longer matches the
 //!   recorded `DateModified` (`HasChangedByDate`; an upload records its file's
 //!   time), or when the refresh is forced (`FullRefresh` /
 //!   `ReplaceAllMetadata`, [`DynamicImageProviders::refresh_item`] with
 //!   `force`), which draws over such an upload (as upstream does for a photo
-//!   album or folder; upstream's playlists always have a path).
+//!   album or folder; upstream saves every playlist's upload beside its path,
+//!   inside a media library too, which Ferrofin deliberately does not).
 //!
 //! The pass runs at the end of every library validation that was not
 //! cancelled — a rescan that changed nothing included, since a genre or a

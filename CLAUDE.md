@@ -392,6 +392,15 @@ The real remaining gaps are **by design**, not un-ported routes:
   `github.com/mangoleaf/ferrofin-plugin-template`, never from the example.
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
+- **No artwork is written into a media library without the library's opt-in** — an owner
+  decision (2026-10-17). Upstream's `IsSaveLocalMetadataEnabled()` overrides (Genre,
+  MusicGenre, Playlist, Person, Studio, Year, BoxSet, …) save artwork "beside the item"
+  whatever the library says. Ferrofin ports them (Genre, MusicGenre and Playlist so far)
+  only while the item's own path is in its data or metadata directory (a genre's
+  `{metadata}/Genre/<name>`, a playlist in `{data}/playlists`). An item inside a media
+  library (an `.m3u` playlist file, a playlist folder) follows the library's "Save artwork
+  into media folders" (`SaveLocalMetadata`), so with it off the media folders stay
+  untouched and need no write permission.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
   VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
   decision (2026-08-26), not an un-ported route: their filter chains cannot be verified
