@@ -156,6 +156,22 @@ impl RateLimiter {
         }
     }
 
+    /// A fresh gate (sharing nothing with `self`) that skips failure backoff and
+    /// its jitter, for a test of what an endpoint does when its provider fails.
+    /// Unlike [`test_support::skip_backoff`] it reaches this limiter only, so
+    /// the limiter's own tests still see real backoff. Every retry is still sent.
+    #[cfg(test)]
+    pub(crate) fn without_backoff(self) -> Self {
+        let rate = RequestRate {
+            skip_backoff: true,
+            ..RequestRate::default()
+        };
+        Self {
+            state: Arc::new(Mutex::new(rate)),
+            ..self
+        }
+    }
+
     /// Whether `other` is a clone of this gate (shares its state).
     #[cfg(test)]
     pub(crate) fn shares_gate_with(&self, other: &Self) -> bool {
@@ -520,9 +536,25 @@ struct RequestRate {
     successes: u32,
     last_failure: Option<Instant>,
     quota: Option<Quota>,
+    /// Set by `RateLimiter::without_backoff`: this gate skips failure backoff.
+    #[cfg(test)]
+    skip_backoff: bool,
 }
 
 impl RequestRate {
+    /// Whether failure backoff and jitter are off, for this gate or the process.
+    #[cfg(test)]
+    fn backoff_skipped(&self) -> bool {
+        self.skip_backoff || backoff_skipped()
+    }
+
+    /// Whether failure backoff and jitter are off for the process.
+    #[cfg(not(test))]
+    #[expect(clippy::unused_self, reason = "same call shape as the test build")]
+    fn backoff_skipped(&self) -> bool {
+        backoff_skipped()
+    }
+
     async fn wait_ready(
         &mut self,
         provider: &str,
@@ -562,7 +594,7 @@ impl RequestRate {
     }
 
     fn adaptive_interval(&self) -> Duration {
-        if self.failures == 0 || backoff_skipped() {
+        if self.failures == 0 || self.backoff_skipped() {
             return Duration::ZERO;
         }
         Duration::from_secs(2_u64 << self.failures.min(6).saturating_sub(1)).min(BACKOFF_CAP)
@@ -642,7 +674,7 @@ impl RequestRate {
         self.last_failure = Some(Instant::now());
         let backoff = self.adaptive_interval();
         // Positive jitter avoids synchronizing clients without shortening Retry-After.
-        let jitter = if backoff_skipped() {
+        let jitter = if self.backoff_skipped() {
             Duration::ZERO
         } else {
             Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]))
@@ -1169,6 +1201,22 @@ mod tests {
         assert!(delays.iter().any(|d| *d > backoff), "no jitter: {delays:?}");
         let retry_after = Duration::from_mins(2);
         assert!(RequestRate::default().failed(retry_after) >= retry_after);
+    }
+
+    /// `without_backoff` drops backoff and jitter for one gate only; a server
+    /// cooldown still applies, and a default gate keeps its real backoff.
+    #[test]
+    fn without_backoff_is_per_gate() {
+        let skipping = RateLimiter::new("skipping").without_backoff();
+        let mut rate = skipping.state.try_lock().expect("fresh gate");
+        assert_eq!(rate.failed(Duration::ZERO), Duration::ZERO);
+        let retry_after = Duration::from_secs(5);
+        assert_eq!(rate.failed(retry_after), retry_after);
+        drop(rate);
+
+        let default = RateLimiter::new("default");
+        let mut rate = default.state.try_lock().expect("fresh gate");
+        assert!(rate.failed(Duration::ZERO) >= Duration::from_secs(2));
     }
 
     // Real HTTP exercises the entire request/retry path, including headers and

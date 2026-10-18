@@ -1605,6 +1605,7 @@ dependencies = [
  "ferrofin-wasm",
  "flate2",
  "futures-util",
+ "image",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

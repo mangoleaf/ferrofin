@@ -179,6 +179,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
   [docs/UPGRADING.md](docs/UPGRADING.md)
+- "Search for missing metadata" or "Replace all metadata" on a genre, music genre, playlist,
+  photo album, folder, library or the root folder now redraws the image Ferrofin generated
+  for it from the current artwork, as in Jellyfin. Before, only a library scan drew these
+  images, and only when one was missing or out of date. A library scan now also redraws a
+  photo album's, folder's or playlist file's image whenever its own refresh runs every
+  provider (its first refresh, a changed folder, or its library's automatic refresh interval
+  coming due), a library's or the root's refresh redraws a library tile older than a week, and
+  a locked item's image is left alone
 - The "Clean up collections and playlists" scheduled task is removed, as in Jellyfin 12. It
   ran at every start and removed each collection and playlist member whose file it could not
   see, so a boot with the media storage not yet mounted emptied every playlist and collection
