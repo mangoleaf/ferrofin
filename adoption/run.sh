@@ -16,9 +16,9 @@
 #   5. populated metadata survives both boots and an explicit library scan (DB + HTTP).
 #   6. watch history survives each stage for every user (DB + HTTP).
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
-# includes two boots and a full scan. Fixtures are NOT in the repository — see adoption/README.md for what DIR
-# must contain and how build-fixtures.sh derives everything from one 10.11.8 snapshot. Media
-# mounts come from DIR/media-mounts.sh, or from the file ADOPTION_MEDIA_MOUNTS names.
+# includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
+# build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
+# adoption/README.md. DIR and the work directory must be on a local disk.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=adoption/lib.sh
@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do case $1 in
 case $ORACLE_VERSION in 12.1|12.2) ;; *) echo "run: --oracle must be 12.1 or 12.2, not '$ORACLE_VERSION'" >&2; exit 2;; esac
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
-WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work}
+WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work/run}  # synthetic.py run owns work/<fixture>
 for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
 python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is required for artwork checks" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
@@ -40,10 +40,9 @@ ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
 # the probes must run as the account the oracle ran as; the builder records it
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
-MEDIA=(); MOUNTS=${ADOPTION_MEDIA_MOUNTS:-$FIXTURES/media-mounts.sh}
-[ -z "${ADOPTION_MEDIA_MOUNTS:-}" ] || [ -f "$MOUNTS" ] || { echo "run: no $MOUNTS" >&2; exit 2; }
-# shellcheck disable=SC1090,SC1091 # user-supplied, outside the repository
-[ ! -f "$MOUNTS" ] || . "$MOUNTS"
+[ -d "$FIXTURES/media" ] || { echo "run: $FIXTURES/media missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
+adoption_require_local "$FIXTURES" && adoption_require_local "$WORK" || exit 2; mkdir -p "$WORK"
+MEDIA=(-v "$FIXTURES/media:/media:ro")
 # name|fixture directory|host port
 # The generation is the id SET the gate matches, so 10.11.9 adopts as "10.11.8" (it adds no
 # migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids). Every row
@@ -92,9 +91,8 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   # A 10.11 source has no music-artist credits until its first 12.x or Ferrofin scan: 10.11
   # never made them, and 12.x makes them only on a metadata refresh (AudioFileProber,
   # AlbumMetadataService.SetPeople), as Ferrofin does. The oracle and the 12.x fixtures carry
-  # their release's own scan (synthetic.py scans every fixture it derives; build-fixtures.sh
-  # only boots them), so a 10.11 path compares /Persons, and the whole smoke once more, after
-  # the scan stage.
+  # their release's own scan (synthetic.py scans every fixture it derives), so a 10.11 path
+  # compares /Persons, and the whole smoke once more, after the scan stage.
   case $expected in 10.11.*) after_scan='/Persons\?';; *) after_scan=;; esac
   docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dst" "$dst-cache"; mkdir -p "$WORK"
   cp -a "$FIXTURES/$src" "$dst"; mkdir -p "$dst-cache"

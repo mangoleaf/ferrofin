@@ -323,10 +323,14 @@ a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite
 never exists.
 
 ### Adoption has its own live check — `adoption/`
-`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers real 10.11.8, 10.11.9,
+`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers 10.11.8, 10.11.9,
 10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
-fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them once with
-`adoption/build-fixtures.sh`; they are never committed.  On fresh copies it checks
+fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
+once with `adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
+each database themselves); they are never committed.  Never point the suite at a real
+library or a network share — the scripts refuse a DIR on a network filesystem, because every
+fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
+(seeding is not idempotent): build into a new DIR.  On fresh copies it checks
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
