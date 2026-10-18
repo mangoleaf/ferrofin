@@ -353,7 +353,7 @@ pub(crate) async fn ensure_container(
         // …and the same for the `Data` blob, which an older Ferrofin left NULL:
         // without it the row's `CollectionType` reads as absent forever.
         if let Some(data) = data {
-            backfill_container_data(db, id, data).await?;
+            backfill_container_data(db.writer(), id, data).await?;
         }
         return Ok(Some(id));
     }
@@ -404,11 +404,16 @@ pub(crate) async fn ensure_container(
         Some(p) if row_exists(db, p).await? => Some(p),
         _ => None,
     };
-    insert_named_item(db, id, kind, name, true, parent).await?;
-    set_container_path(db, id, path).await?;
+    // One writer transaction: `container_at` finds the row by its `Path`
+    // only, so a row committed without one would never be found again, and
+    // every later provision would fail to insert the same id.
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    insert_named_item_in(&mut tx, id, kind, name, true, parent).await?;
+    set_container_path(&mut *tx, id, path).await?;
     if let Some(data) = data {
-        backfill_container_data(db, id, data).await?;
+        backfill_container_data(&mut *tx, id, data).await?;
     }
+    tx.commit().await.map_err(db_err)?;
     Ok(Some(id))
 }
 
@@ -446,14 +451,18 @@ pub(crate) async fn container_row(
 /// database: Jellyfin's own blob carries `PhysicalLocationsList`,
 /// `PhysicalFolderIds` and the rest, and overwriting it with a one-key document
 /// would destroy the library's physical paths on swap-back.
-async fn backfill_container_data(db: &Database, id: Uuid, data: &str) -> Result<(), ServiceError> {
+async fn backfill_container_data<'e>(
+    conn: impl sqlx::SqliteExecutor<'e>,
+    id: Uuid,
+    data: &str,
+) -> Result<(), ServiceError> {
     sqlx::query(
         r#"UPDATE "BaseItems" SET "Data" = ?2
            WHERE "Id" = ?1 AND ("Data" IS NULL OR "Data" = '')"#,
     )
     .bind(guid_to_db(id))
     .bind(data)
-    .execute(db.writer())
+    .execute(conn)
     .await
     .map_err(db_err)?;
     Ok(())
@@ -628,11 +637,15 @@ const JELLYFIN_DATA_PATH_TOKEN: &str = "%AppDataPath%";
 
 /// Stamps a provisioned container with its directory and makes it its own top
 /// parent, the shape Jellyfin's `%AppDataPath%/collections` row has.
-async fn set_container_path(db: &Database, id: Uuid, path: &str) -> Result<(), ServiceError> {
+async fn set_container_path<'e>(
+    conn: impl sqlx::SqliteExecutor<'e>,
+    id: Uuid,
+    path: &str,
+) -> Result<(), ServiceError> {
     sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2, "TopParentId" = ?1 WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
         .bind(path)
-        .execute(db.writer())
+        .execute(conn)
         .await
         .map_err(db_err)?;
     Ok(())
@@ -7268,6 +7281,63 @@ mod tests {
                 .as_deref(),
             Some(adopted),
             "an adopted database's own Data survives"
+        );
+    }
+
+    /// gl-584: a provision whose `Path` write fails leaves no row behind.
+    /// `container_at` finds a container by its path only, so a row committed
+    /// without one was never found again, and every later provision failed
+    /// to insert the same path-derived id.
+    #[tokio::test]
+    async fn a_failed_container_path_write_leaves_no_row_behind() {
+        let db = test_db().await;
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some("/data".to_owned()),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("playlists").to_string_lossy().into_owned();
+        let provision = || {
+            ensure_container(
+                &db,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                &path,
+                &mode,
+                None,
+                None,
+            )
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER "fail_path" BEFORE UPDATE OF "Path" ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'disk full'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+        assert!(provision().await.is_err(), "the Path write fails");
+        let derived = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::PlaylistsFolder,
+            &path,
+        )
+        .expect("an id");
+        assert!(
+            container_row(&db, derived).await.expect("row").is_none(),
+            "the row is rolled back with it"
+        );
+
+        sqlx::query(r#"DROP TRIGGER "fail_path""#)
+            .execute(db.writer())
+            .await
+            .expect("drop trigger");
+        let id = provision()
+            .await
+            .expect("the next provision succeeds")
+            .expect("an id");
+        assert_eq!(
+            super::container_at(&db, &path).await.expect("lookup"),
+            Some(id)
         );
     }
 
