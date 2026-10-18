@@ -66,6 +66,7 @@ struct Seed<'a> {
     episode_folders: std::collections::HashMap<String, super::EpisodeFolder>,
     budget: Option<Arc<Budget>>,
     cancel: Option<super::ScanCancel>,
+    dirs: Option<Arc<super::DirectoryCache>>,
 }
 
 impl<'a> Seed<'a> {
@@ -84,6 +85,7 @@ impl<'a> Seed<'a> {
             episode_folders: ctx.episode_folders.borrow().clone(),
             budget: ctx.fanout.clone(),
             cancel: ctx.cancel.clone(),
+            dirs: ctx.dirs.clone(),
         }
     }
 
@@ -104,6 +106,7 @@ impl<'a> Seed<'a> {
         *ctx.episode_folders.borrow_mut() = self.episode_folders;
         ctx.fanout = self.budget;
         ctx.cancel = self.cancel;
+        ctx.dirs = self.dirs;
         ctx
     }
 }

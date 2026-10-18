@@ -69,6 +69,7 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::directory_cache::DirectoryCache;
 use crate::item_folders::{self, MovedFolders};
 use crate::item_type_lookup;
 use crate::media_info_resolver::ExternalStreamResolvers;
@@ -84,6 +85,10 @@ use music::{MusicKind, MusicRefresh};
 /// its seasons/episodes reuse that match (and its per-season episode stills).
 #[derive(Default)]
 struct ArtworkCache {
+    /// The run's directory listings, which the walk's local image discovery
+    /// reads ([`discover_local_images`]); `None` lists each item's folders
+    /// afresh.
+    dirs: Option<Arc<DirectoryCache>>,
     /// Series item id → its stored `DisplayOrder` (raw; empty when it has
     /// none), read once per pass for its seasons and episodes.
     display_orders: HashMap<String, String>,
@@ -135,6 +140,17 @@ struct ArtworkCache {
     /// dimensions and a blurhash are functions of the file alone, so two rows
     /// sharing one `folder.jpg` share the answer.
     stored_images: std::collections::HashMap<String, StoredImageMetadata>,
+}
+
+impl ArtworkCache {
+    /// [`discover_local_images`] over the run's listings, or over listings
+    /// of its own when the run has none.
+    fn discover_local_images(&self, entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+        match &self.dirs {
+            Some(dirs) => discover_local_images(entity, dirs.as_ref()),
+            None => discover_local_images(entity, &FsDirectoryService::new()),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1206,6 +1222,18 @@ impl ExternalProbeSeam {
     }
 }
 
+/// Runs blocking filesystem work (a plan pass, a window's file checks) on
+/// this worker after handing the worker's other tasks to the rest of the
+/// runtime (`block_in_place`), so requests keep every other worker while a
+/// scan walks a slow disk. A current-thread runtime has no other worker to
+/// hand them to, and runs it in place.
+fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// Runs `request` on the encoder as a detached task, so the caller can keep
 /// several probes in flight while it works through the scan in order.
 ///
@@ -1938,6 +1966,10 @@ pub struct ScanRun<'a> {
     /// It validates every library from the root ([`ScanTarget::All`]): a
     /// refresh of the root reaches the user root's image too.
     from_root: bool,
+    /// The directory listings the run shares between its items (one per
+    /// run, as upstream's validation has one `DirectoryService`); set by
+    /// [`LibraryScanner::scan_target`].
+    dirs: Option<&'a Arc<DirectoryCache>>,
 }
 
 impl std::fmt::Debug for ScanRun<'_> {
@@ -1972,6 +2004,7 @@ impl<'a> ScanRun<'a> {
             lane: None,
             touched: None,
             from_root: false,
+            dirs: None,
         }
     }
 
@@ -2102,6 +2135,8 @@ struct RefreshContext<'a> {
     locked: &'a std::collections::HashSet<Uuid>,
     /// The external subtitle/audio resolvers, for the sidecar change check.
     externals: Option<ExternalProbeSeam>,
+    /// The run's directory listings ([`ScanRun::dirs`]).
+    dirs: Option<&'a Arc<DirectoryCache>>,
     /// Plan indices of the earlier copies of an id the plan holds more than
     /// once ([`superseded_copies`]).
     superseded: std::collections::HashSet<usize>,
@@ -2140,6 +2175,7 @@ impl<'a> RefreshContext<'a> {
             outside: FetcherPolicy::default(),
             locked: &NO_LOCKS,
             externals: None,
+            dirs: run.dirs,
             superseded: std::collections::HashSet::new(),
             date_added: DateAdded::default(),
             cancel: run.cancel,
@@ -2672,7 +2708,14 @@ fn lyrics_changed(
 /// mtime — each provider's `BaseNfoProvider.GetXmlFile`, whose `HasChanged`
 /// any of them can raise — or `None` (no such file, a kind with no NFO, or
 /// the library disabled the reader).
-fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
+///
+/// A candidate the run's listing of its folder (`dirs`) does not hold is
+/// not stat'ed: the plan pass listed that folder this scan.
+fn nfo_file(
+    entity: &BaseItemEntity,
+    policy: FetcherPolicy<'_>,
+    dirs: Option<&DirectoryCache>,
+) -> Option<LocalMetadataFile> {
     if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
         // A playlist folder's `PlaylistXmlProvider` monitors its
         // `playlist.xml` (`BaseXmlProvider.HasChanged`). A playlist file's
@@ -2710,6 +2753,9 @@ fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalM
         .into_iter()
         .filter_map(|(_, candidates)| {
             candidates.into_iter().find_map(|candidate| {
+                if dirs.is_some_and(|dirs| dirs.known_absent(&candidate)) {
+                    return None;
+                }
                 let meta = std::fs::metadata(candidate).ok()?;
                 meta.is_file().then_some(meta.modified().ok()?)
             })
@@ -2846,6 +2892,10 @@ struct PlanCtx<'a> {
     date_added: DateAdded,
     fanout: Option<Arc<fanout::Budget>>,
     cancel: Option<ScanCancel>,
+    /// The run's directory listings, which [`LibraryScanner::list`] fills
+    /// for the readers after the pass; `None` lists through the scanner's
+    /// filesystem alone.
+    dirs: Option<Arc<DirectoryCache>>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -2884,6 +2934,7 @@ impl<'a> PlanCtx<'a> {
             date_added: DateAdded::default(),
             fanout: None,
             cancel: None,
+            dirs: None,
         }
     }
 
@@ -4245,6 +4296,14 @@ impl LibraryScanner {
         target: &ScanTarget,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
+        // One cache of directory listings for the whole run, read by every
+        // item in it (`new DirectoryService` per validation upstream). The
+        // refreshes a run serves get their own.
+        let dirs = Arc::new(DirectoryCache::new(Arc::clone(&self.file_system)));
+        let run = ScanRun {
+            dirs: Some(run.dirs.unwrap_or(&dirs)),
+            ..run
+        };
         match target {
             ScanTarget::All => self.scan_libraries(None, run).await,
             ScanTarget::Library(id) => self.scan_libraries(Some(*id), run).await,
@@ -4357,6 +4416,11 @@ impl LibraryScanner {
                     panic_message(panic.as_ref())
                 )))
             });
+            // The refresh may have written anywhere under its paths (artwork,
+            // NFOs, subtitles): this run lists again what it reads next.
+            if let Some(dirs) = run.dirs {
+                dirs.clear();
+            }
             touched.extend(
                 planned
                     .into_inner()
@@ -4509,13 +4573,16 @@ impl LibraryScanner {
                 });
             }
             Box::pin(self.serve_lane(run)).await;
-            let part = self.plan_in(
-                library,
-                &all_folders,
-                PlanScope::ALL,
-                date_added,
-                Some(run.cancel),
-            );
+            let part = off_runtime(|| {
+                self.plan_in(
+                    library,
+                    &all_folders,
+                    PlanScope::ALL,
+                    date_added,
+                    Some(run.cancel),
+                    run.dirs,
+                )
+            });
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
             plan.rip_folds.extend(part.rip_folds);
@@ -4873,13 +4940,16 @@ impl LibraryScanner {
         // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
-        let plan = self.plan_in(
-            &affected,
-            &folders,
-            PlanScope::paths(roots, also_path),
-            self.date_added(),
-            Some(run.cancel),
-        );
+        let plan = off_runtime(|| {
+            self.plan_in(
+                &affected,
+                &folders,
+                PlanScope::paths(roots, also_path),
+                self.date_added(),
+                Some(run.cancel),
+                run.dirs,
+            )
+        });
         tracing::info!(
             changed,
             roots = roots.len(),
@@ -5592,7 +5662,7 @@ impl LibraryScanner {
                 ..Default::default()
             },
             locked: &locked_items,
-            externals: self.external_probe_seam(),
+            externals: self.external_probe_seam(run.dirs),
             superseded: superseded_copies(&planned),
             date_added,
             ..RefreshContext::of(run)
@@ -5601,7 +5671,7 @@ impl LibraryScanner {
         // reads, so it runs `probe_concurrency` files ahead of this loop — as
         // far as the items whose refresh plan is known, i.e. to the end of the
         // stored-row window. The loop itself keeps plan order.
-        let mut probes = self.probe_pipeline(&planned, run.options);
+        let mut probes = self.probe_pipeline(&planned, run);
         let mut reported = 0;
         // What the closing passes take from the walk: the albums and artists
         // whose music refresh it decided, and those a lane refresh served
@@ -6925,6 +6995,13 @@ impl LibraryScanner {
         let images_changed = artwork
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
+        // Artwork this pass saved beside the item is read by the next item
+        // in that folder (a version sharing its `poster.jpg`).
+        if images_changed && let (Some(dirs), Some(images)) = (&state.art_cache.dirs, &artwork) {
+            for image in images {
+                dirs.invalidate(&image.path);
+            }
+        }
         let ancestors_changed = ancestors_changed(links, item);
         let row_changed = stored_row.is_none_or(|row| {
             crate::item_persistence_service::scan_save_changes_row(
@@ -7204,32 +7281,35 @@ impl LibraryScanner {
                 None
             }
         };
-        let mut plans: Vec<ItemRefreshPlan> = Vec::with_capacity(end - start);
-        for (offset, item) in planned[start..end].iter().enumerate() {
-            // A cancelled scan stops right after this read (`run_scan`), so
-            // the rest of the window is never walked: stop planning it.
-            if refresh.cancel.is_cancelled() {
-                break;
+        // Each item's plan stats its file and lists its sidecars.
+        window.plans = off_runtime(|| {
+            let mut plans: Vec<ItemRefreshPlan> = Vec::with_capacity(end - start);
+            for (offset, item) in planned[start..end].iter().enumerate() {
+                // A cancelled scan stops right after this read (`run_scan`),
+                // so the rest of the window is never walked: stop planning it.
+                if refresh.cancel.is_cancelled() {
+                    break;
+                }
+                let mut plan = self.plan_item(
+                    refresh,
+                    window.get(item.id).row(),
+                    !matches!(window.get(item.id), Stored::New),
+                    item,
+                    window.links(item.id),
+                );
+                // A superseded copy is skipped by the walk: it must not reach
+                // the probe pipeline, whose results are taken in order.
+                if refresh.superseded.contains(&(start + offset)) {
+                    plan.probe = false;
+                }
+                // An undecodable row runs nothing (`Stored::Undecodable`).
+                if matches!(window.get(item.id), Stored::Undecodable) {
+                    plan = crate::refresh_plan::ItemRefreshPlan::IDLE;
+                }
+                plans.push(plan);
             }
-            let mut plan = self.plan_item(
-                refresh,
-                window.get(item.id).row(),
-                !matches!(window.get(item.id), Stored::New),
-                item,
-                window.links(item.id),
-            );
-            // A superseded copy is skipped by the walk: it must not reach
-            // the probe pipeline, whose results are taken in order.
-            if refresh.superseded.contains(&(start + offset)) {
-                plan.probe = false;
-            }
-            // An undecodable row runs nothing (`Stored::Undecodable`).
-            if matches!(window.get(item.id), Stored::Undecodable) {
-                plan = crate::refresh_plan::ItemRefreshPlan::IDLE;
-            }
-            plans.push(plan);
-        }
-        window.plans = plans;
+            plans
+        });
     }
 
     /// The `BaseItems` half of [`read_stored_window`](Self::read_stored_window).
@@ -7494,7 +7574,10 @@ impl LibraryScanner {
         // Boxed: the scan loop holds this cache across every item's awaits, so
         // keeping its six maps out of that future keeps the per-scan future
         // small (clippy's `large_futures` ceiling is the tripwire).
-        let mut art_cache = Box::new(ArtworkCache::default());
+        let mut art_cache = Box::new(ArtworkCache {
+            dirs: run.dirs.cloned(),
+            ..ArtworkCache::default()
+        });
         self.preload_provider_ids(planned, &mut art_cache).await;
         self.preload_image_metadata(planned, &mut art_cache).await;
         let touched = self
@@ -7577,7 +7660,9 @@ impl LibraryScanner {
         }
         for (id, album) in albums {
             touched.extend(Box::pin(self.serve_lane(run)).await);
-            let mut images = discover_local_images(album);
+            // Listed afresh: the walk may have saved artwork into the
+            // album's folder since the run listed it.
+            let mut images = discover_local_images(album, &FsDirectoryService::new());
             self.append_art_dir_images(album, &mut images);
             if !images.iter().any(|i| i.image_type == ImageType::Primary)
                 && let Some(items) = &self.item_repository
@@ -8740,14 +8825,11 @@ impl LibraryScanner {
     /// need the naming options' extension/flag tables, the language lookup
     /// (the configured localization, else the default culture set — the
     /// lookup itself is culture-table-only), the encoder, and the filesystem.
-    fn probe_pipeline<'a>(
-        &self,
-        planned: &'a [Planned],
-        options: &MetadataRefreshOptions,
-    ) -> ProbePipeline<'a> {
+    fn probe_pipeline<'a>(&self, planned: &'a [Planned], run: ScanRun<'_>) -> ProbePipeline<'a> {
+        let options = run.options;
         ProbePipeline::new(
             self.media_encoder.clone(),
-            self.external_probe_seam(),
+            self.external_probe_seam(run.dirs),
             planned,
             self.probe_concurrency,
         )
@@ -8757,8 +8839,9 @@ impl LibraryScanner {
     }
 
     /// The external subtitle/audio resolvers plus the metadata root, or
-    /// `None` when no probe is wired (then nothing is probed at all).
-    fn external_probe_seam(&self) -> Option<ExternalProbeSeam> {
+    /// `None` when no probe is wired (then nothing is probed at all). The
+    /// resolvers read the run's directory listings, `dirs`, when it has them.
+    fn external_probe_seam(&self, dirs: Option<&Arc<DirectoryCache>>) -> Option<ExternalProbeSeam> {
         self.media_encoder.as_ref().map(|encoder| {
             let localization = self.localization.clone().unwrap_or_else(|| {
                 Arc::new(crate::localization_manager::LocalizationManager::new(""))
@@ -8768,7 +8851,10 @@ impl LibraryScanner {
                     Arc::new(NamingOptions::new()),
                     localization,
                     Arc::clone(encoder),
-                    Arc::clone(&self.file_system),
+                    dirs.map_or_else(
+                        || Arc::clone(&self.file_system),
+                        |dirs| Arc::clone(dirs) as Arc<dyn FileSystem>,
+                    ),
                 )),
                 metadata_dir: self.metadata_dir.clone(),
             }
@@ -8798,7 +8884,14 @@ impl LibraryScanner {
             is_virtual_item: row.is_virtual_item,
             is_locked: row.is_locked || refresh.locked.contains(&item.id),
         });
-        let facts = Self::file_facts(item, stored, links, refresh.externals.as_ref(), policy);
+        let facts = Self::file_facts(
+            item,
+            stored,
+            links,
+            refresh.externals.as_ref(),
+            refresh.dirs.map(AsRef::as_ref),
+            policy,
+        );
         let backfill = stored.is_some_and(|row| self.wants_backfill(row, policy));
         let mut plan = crate::refresh_plan::plan_item_refresh(
             state.as_ref(),
@@ -8835,6 +8928,7 @@ impl LibraryScanner {
         stored: Option<&BaseItemEntity>,
         links: Option<&StoredItemLinks>,
         externals: Option<&ExternalProbeSeam>,
+        dirs: Option<&DirectoryCache>,
         policy: FetcherPolicy<'_>,
     ) -> FileFacts {
         let entity = &item.entity;
@@ -8859,7 +8953,7 @@ impl LibraryScanner {
             sidecars_changed,
             lyrics_changed: matches!(probe, ProbeKind::Audio)
                 && externals.is_some_and(|seam| lyrics_changed(seam, item, stored)),
-            local_metadata: nfo_file(entity, policy),
+            local_metadata: nfo_file(entity, policy, dirs),
             supports_cumulative_run_time: matches!(
                 kind,
                 Some(BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist)
@@ -11130,7 +11224,7 @@ impl LibraryScanner {
             // ILocalImageProvider` to true before consulting `TypeOptions` — and the
             // dashboard checkbox list only ever contains remote fetchers, so gating
             // here silently killed all sidecar artwork once library options were saved.
-            let mut images = discover_local_images(entity);
+            let mut images = art_cache.discover_local_images(entity);
             // Local discovery wins per type; the embedded cover fills what it
             // left empty (`dedup_images_by_type` is the `RemoteImage` twin of
             // this, which cannot be reused for `ItemImageInfo`).
@@ -11157,7 +11251,7 @@ impl LibraryScanner {
         // `CanRefreshImages` short-circuits `ILocalImageProvider` to enabled before
         // the `TypeOptions.ImageFetchers` check, and that checkbox list only ever
         // names remote fetchers — gating on it silently dropped all sidecar art.
-        let mut images = discover_local_images(entity);
+        let mut images = art_cache.discover_local_images(entity);
         // Explicit music uploads/sidecars take precedence over shared art.
         if fetch != ImageFetch::All || matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
@@ -12466,8 +12560,15 @@ impl LibraryScanner {
     /// folds it into `homevideos`.
     #[cfg(test)]
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
-        self.plan_in(folders, folders, PlanScope::ALL, DateAdded::default(), None)
-            .items
+        self.plan_in(
+            folders,
+            folders,
+            PlanScope::ALL,
+            DateAdded::default(),
+            None,
+            None,
+        )
+        .items
     }
 
     /// [`plan`](Self::plan) restricted to `scope`: the items at or under its
@@ -12481,7 +12582,7 @@ impl LibraryScanner {
     #[cfg(test)]
     fn plan_paths(&self, folders: &[VirtualFolderInfo], scope: PlanScope<'_>) -> Vec<Planned> {
         let affected = affected_libraries(folders, scope.roots.unwrap_or_default(), scope.exact);
-        self.plan_in(&affected, folders, scope, DateAdded::default(), None)
+        self.plan_in(&affected, folders, scope, DateAdded::default(), None, None)
             .items
     }
 
@@ -12499,6 +12600,7 @@ impl LibraryScanner {
         scope: PlanScope<'_>,
         date_added: DateAdded,
         cancel: Option<&ScanCancel>,
+        dirs: Option<&Arc<DirectoryCache>>,
     ) -> PlanOutput {
         let naming = NamingOptions::new();
         let mut ctx = PlanCtx::new(&naming, scope)
@@ -12507,6 +12609,7 @@ impl LibraryScanner {
             .with_date_added(date_added);
         ctx.fanout.clone_from(&self.scan_fanout);
         ctx.cancel = cancel.cloned();
+        ctx.dirs = dirs.cloned();
         let mut out = Vec::new();
         for folder in plan_folders {
             let Some(cf) = collection_folder_id(folder) else {
@@ -12676,7 +12779,13 @@ impl LibraryScanner {
         if let Some(entries) = ctx.prelisted.borrow_mut().remove(dir) {
             return entries;
         }
-        match self.file_system.try_get_file_system_entries(dir) {
+        // Always listed afresh: what exists and what is gone is decided
+        // from this listing. The run's cache keeps it for the readers after.
+        let listed = match &ctx.dirs {
+            Some(dirs) => dirs.relist(dir),
+            None => self.file_system.try_get_file_system_entries(dir),
+        };
+        match listed {
             Ok(entries) => {
                 // Availability is measured before exclusions: a mounted
                 // directory containing only ignored files is still reachable.
@@ -20249,7 +20358,10 @@ fn image_metadata_is_current(
 /// by adopting a previous scan's probe or by decoding the file. Episodes use the
 /// episode provider; everything the generic provider supports uses it;
 /// unsupported kinds yield nothing.
-fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+fn discover_local_images<D: ferrofin_providers::DirectoryService>(
+    entity: &BaseItemEntity,
+    dir: &D,
+) -> Vec<ItemImageInfo> {
     let Some(path) = entity.path.as_deref() else {
         return Vec::new();
     };
@@ -20274,11 +20386,10 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
     });
     item.containing_folder_path = containing;
 
-    let dir = FsDirectoryService::new();
     let found = if kind == ImageItemKind::Episode {
-        EpisodeLocalImageProvider::get_images(&item, &dir)
+        EpisodeLocalImageProvider::get_images(&item, dir)
     } else if LocalImageProvider::supports(&item) {
-        LocalImageProvider::get_images(&item, &dir)
+        LocalImageProvider::get_images(&item, dir)
     } else {
         Vec::new()
     };
@@ -27025,6 +27136,7 @@ mod tests {
             outside: super::FetcherPolicy::default(),
             locked: &std::collections::HashSet::new(),
             externals: None,
+            dirs: None,
             superseded: std::collections::HashSet::new(),
             date_added: super::DateAdded::default(),
             cancel: &super::ScanCancel::new(),
