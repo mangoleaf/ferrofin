@@ -583,15 +583,17 @@ fn client_kind(kind: BaseItemKind) -> BaseItemKind {
     }
 }
 
-/// Whether this row enters the C# `AttachUserSpecificInfo` folder branch — the
-/// *runtime* `BaseItem.IsFolder`, not just the stored column. Pure by-name kinds
-/// (`Genre`/`MusicGenre`/`Studio`/`Person`/`Year`) are `BaseItem` subclasses in
-/// C#, never folders, whatever the stored flag says (Ferrofin materializes their
-/// rows with `IsFolder = 1`). `MusicArtist` is the one by-name kind that *is* a
-/// C# `Folder`, but overrides `IsFolder => !IsAccessedByName`, and
-/// `IsAccessedByName => ParentId.IsEmpty()` — so only a physically-parented
-/// artist folder counts as a folder here.
-fn folder_emits_counts(item: &BaseItemEntity) -> bool {
+/// The C# computed `BaseItem.IsFolder` property, ported: the DTO's and the
+/// search hint's `IsFolder`, and the gate of the `AttachUserSpecificInfo`
+/// folder branch. Pure by-name kinds (`Genre`/`MusicGenre`/`Studio`/`Person`/
+/// `Year`) are `BaseItem` subclasses in C#, never folders. `MusicArtist` is the
+/// one by-name kind that *is* a C# `Folder`, but overrides
+/// `IsFolder => !IsAccessedByName`, and `IsAccessedByName => ParentId.IsEmpty()`
+/// — so only a physically-parented artist folder counts as a folder here.
+/// It is the stored column, forced false for the pure by-name kinds and for a
+/// parentless artist, whatever that column says (earlier builds stored 1 on
+/// by-name rows; migration 0043 repairs the column for the SQL that reads it).
+pub(crate) fn runtime_is_folder(item: &BaseItemEntity) -> bool {
     if !item.is_folder {
         return false;
     }
@@ -2239,8 +2241,10 @@ impl FerrofinDtoService {
                 dto.user_data = take_or_clone(&mut prefetched.user_data, &item_id, repeated);
                 // C# `BaseItem.FillUserDataDtoValues`: a positive resume position
                 // over a known runtime becomes `PlayedPercentage` — the value
-                // client progress bars render on posters and resume rows.
-                if !item.is_folder
+                // client progress bars render on posters and resume rows. Chosen
+                // by class: `Folder` overrides it without calling the base
+                // (Folder.cs:2024), so a by-name artist never gets one.
+                if !kinds::is_folder(kind)
                     && let Some(ud) = dto.user_data.as_mut()
                     && ud.playback_position_ticks > 0
                     && let Some(runtime) = item.run_time_ticks.filter(|rt| *rt > 0)
@@ -2250,7 +2254,7 @@ impl FerrofinDtoService {
                 }
                 // Folder UserData carries UnplayedItemCount = unplayed leaf
                 // descendants; leaf items leave it unset. The branch keys on the
-                // runtime C# `IsFolder` (`folder_emits_counts`): pure by-name
+                // runtime C# `IsFolder` (`runtime_is_folder`): pure by-name
                 // kinds never enter it, a MusicArtist only when physically
                 // parented.
                 //
@@ -2267,7 +2271,7 @@ impl FerrofinDtoService {
                 // MusicAlbum overrides SupportsPlayedStatus to false while
                 // SupportsUserDataFromChildren stays true. Ferrofin emitted
                 // neither, on any folder.
-                if folder_emits_counts(item)
+                if runtime_is_folder(item)
                     && kinds::supports_user_data_from_children(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
@@ -2355,10 +2359,10 @@ impl FerrofinDtoService {
         // The value is the folder's own stored runtime — measured: J's
         // MusicAlbum returns CumulativeRunTimeTicks=60000000 next to the
         // RunTimeTicks=60000000.
-        // Both gates key on the runtime `IsFolder` (`folder_emits_counts`):
-        // a by-name Genre row is stored as a folder but is a plain `BaseItem`
-        // upstream, and never enters the branch.
-        let runtime_folder = user.is_some() && folder_emits_counts(item);
+        // Both gates key on the runtime `IsFolder` (`runtime_is_folder`):
+        // a by-name Genre row is a plain `BaseItem` upstream, and never enters
+        // the branch, whatever its stored flag.
+        let runtime_folder = user.is_some() && runtime_is_folder(item);
         if runtime_folder && options.contains_field(ItemFields::CumulativeRunTimeTicks) {
             dto.cumulative_run_time_ticks = item.run_time_ticks;
         }
@@ -2619,17 +2623,10 @@ impl FerrofinDtoService {
         dto.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
         dto.parent_index_number = item.parent_index_number.and_then(|n| i32::try_from(n).ok());
 
-        // Jellyfin's `IsFolder` is a per-type property, not a stored flag: a
-        // Genre/Studio/Person is `BaseItem` (not a folder) even though Ferrofin stores
-        // `is_folder=true` for some of them. For by-name items use the kind-faithful
-        // value (`kinds::is_folder` — false for Genre/Studio/Person/Year/MusicGenre,
-        // true only for MusicArtist), matching the C# class hierarchy.
-        let item_is_folder = if kinds::is_item_by_name(kind) {
-            kinds::is_folder(kind)
-        } else {
-            item.is_folder
-        };
-        if item_is_folder {
+        // `if (item.IsFolder) dto.IsFolder = true; else if (item is IHasMediaSources)
+        // dto.IsFolder = false;` (DtoService.cs:1180-1187): a by-name artist is not
+        // a folder, so its DTO carries no `IsFolder`.
+        if runtime_is_folder(item) {
             dto.is_folder = Some(true);
         } else if kinds::is_video(kind) || kinds::is_audio(kind) || is_live_tv_channel(kind) {
             // A Live TV channel is `IHasMediaSources`, so C# sets IsFolder=false;
@@ -3729,10 +3726,10 @@ impl FerrofinDtoService {
                 apply_name_counts(&mut dto, counts);
             }
             // ChildCount only where the C# runtime `IsFolder` is true (see
-            // `folder_emits_counts`) — by-name rows are folders in storage only.
+            // `runtime_is_folder`), not where the stored column says so.
             if user.is_some()
                 && options.contains_field(ItemFields::ChildCount)
-                && folder_emits_counts(item)
+                && runtime_is_folder(item)
             {
                 attach_child_count(&mut dto, item, &prefetched.child_counts);
             }
@@ -4247,7 +4244,7 @@ impl FerrofinDtoService {
                 let folder_ids: Vec<Uuid> = items
                     .iter()
                     .filter(|i| {
-                        folder_emits_counts(i)
+                        runtime_is_folder(i)
                             && !matches!(
                                 row_kind(i),
                                 BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -4300,7 +4297,7 @@ impl FerrofinDtoService {
         let played_counts = match user {
             Some(user) if options.enable_user_data => {
                 let counted = |i: &&BaseItemEntity| {
-                    folder_emits_counts(i)
+                    runtime_is_folder(i)
                         && !matches!(
                             row_kind(i),
                             BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -8310,6 +8307,38 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(dto.can_delete, Some(false), "{path:?}");
+        }
+    }
+
+    /// `MusicArtist.IsFolder => !IsAccessedByName` (v12.2 MusicArtist.cs:30-33):
+    /// a by-name artist's DTO carries no `IsFolder`, even from a row an earlier
+    /// build stored as a folder; an artist directory under a library is one.
+    #[tokio::test]
+    async fn only_a_parented_artist_is_a_folder() {
+        let db = test_db().await;
+        let (library, by_name, directory) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, library, BaseItemKind::CollectionFolder, "Music", None).await;
+        seed_folder_item(&db, by_name, BaseItemKind::MusicArtist, "By name", None).await;
+        seed_folder_item(
+            &db,
+            directory,
+            BaseItemKind::MusicArtist,
+            "Dir",
+            Some(library),
+        )
+        .await;
+        let svc = service(db.clone());
+        for (id, expected) in [(by_name, None), (directory, Some(true))] {
+            let dto = svc
+                .get_base_item_dto(
+                    &fetch_item(&db, id).await,
+                    &DtoOptions::default(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(dto.is_folder, expected, "{:?}", dto.name);
         }
     }
 
