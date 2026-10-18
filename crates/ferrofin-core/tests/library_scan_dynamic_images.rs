@@ -27,7 +27,7 @@ use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
 use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository};
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, ProviderManager};
 
 /// One movie with a Kodi sidecar naming the genre, and a real PNG poster.
 fn write_movie_library(media: &Path) {
@@ -139,6 +139,170 @@ async fn scan_generates_the_genre_collage_from_the_library_posters() {
     );
 }
 
+/// The provider manager as the server wires it for `POST /Items/{id}/Images`:
+/// the item store, the art root and the media-adjacent `ImageFileSaver`.
+async fn uploader(
+    root: &Path,
+    items: &Arc<dyn ItemRepository>,
+    vf: &Arc<dyn VirtualFolderManager>,
+    persistence: &Arc<FerrofinItemPersistenceService>,
+    meta_root: &Path,
+) -> ferrofin_providers::LocalProviderManager {
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        root,
+        root.join("log"),
+        root.join("config"),
+        root.join("cache"),
+        root.join("web"),
+    ));
+    let configuration = Arc::new(
+        ferrofin_core::FerrofinServerConfigurationManager::load(paths)
+            .await
+            .expect("configuration"),
+    );
+    let saver = Arc::new(ferrofin_providers::image_save::ImageFileSaver::new(
+        Arc::clone(items),
+        Arc::clone(vf),
+        configuration,
+        meta_root.to_owned().into(),
+    ));
+    ferrofin_providers::LocalProviderManager::new(Vec::new())
+        .with_image_saver(saver)
+        .with_image_store(persistence.clone(), meta_root.to_owned())
+        .with_remote_images(
+            Arc::new(ferrofin_providers::TmdbClient::new()),
+            Arc::clone(items),
+        )
+}
+
+/// A solid `colour` 40×60 PNG, as an upload's body.
+fn png(colour: [u8; 3]) -> Vec<u8> {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(40, 60, image::Rgb(colour))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("png");
+    bytes.into_inner()
+}
+
+/// gl-590: a Primary uploaded to a genre is saved beside the genre's own
+/// path, as `ImageSaver.SaveImage` saves it (`Genre.IsSaveLocalMetadataEnabled`
+/// is true), with the file's own modification time — so neither a rescan nor
+/// a full-refresh validation draws the collage over it. A row adopted from
+/// Jellyfin stores that path as `%MetadataPath%/Genre/…`, expanded first.
+#[rstest::rstest]
+#[case::ferrofin(false)]
+#[case::adopted(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let media = tmp.path().join("movies");
+    write_movie_library(&media);
+    let metadata = tmp.path().join("metadata");
+    let meta_root = metadata.join("library");
+
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+            .with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "Movies",
+        Some(CollectionTypeOptions::movies),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: media.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("add library");
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
+        ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
+    );
+    let by_name = ferrofin_core::by_name_store::ByNameStore::new(
+        persistence.clone(),
+        metadata.join("Genre"),
+        metadata.join("MusicGenre"),
+        metadata.join("Studio"),
+        metadata.join("artists"),
+    );
+    let scanner = LibraryScanner::new(
+        Arc::clone(&vf),
+        Arc::new(ferrofin_core::file_system::FerrofinFileSystem::new()),
+        persistence.clone(),
+    )
+    .with_items(Arc::clone(&items))
+    .with_image_processor(processor)
+    .with_by_name_store(by_name)
+    .with_metadata_dir(meta_root.clone());
+    scanner.scan_all().await.expect("scan");
+    let providers = uploader(tmp.path(), &items, &vf, &persistence, &meta_root).await;
+
+    let genre = items
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Genre],
+            name: Some("Crime".to_owned()),
+            ..InternalItemsQuery::default()
+        })
+        .await
+        .expect("genre query")
+        .into_iter()
+        .next()
+        .expect("the NFO genre is materialized as a Genre row");
+    let genre_id = uuid::Uuid::parse_str(&genre.id).expect("genre id");
+    let genre_dir = Path::new(genre.path.as_deref().expect("a by-name path")).to_owned();
+    if adopted {
+        let mut row = genre.clone();
+        row.path = Some("%MetadataPath%/Genre/Crime".to_owned());
+        persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("adopted path");
+    }
+    providers
+        .save_image(genre_id, &png(BLUE), "image/png", ImageType::Primary, None)
+        .await
+        .expect("upload");
+
+    let primary = || async {
+        items
+            .get_image_infos(genre_id)
+            .await
+            .expect("images")
+            .into_iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .expect("a Primary")
+    };
+    let saved = primary().await;
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    scanner.scan_all().await.expect("rescan");
+    scanner.scan_with(None, &full).await.expect("full rescan");
+    assert_eq!(primary().await.path, saved.path);
+    let kept = image::open(&saved.path).expect("decodable").to_rgb8();
+    assert_eq!(
+        (kept.width(), kept.height(), kept.get_pixel(10, 10).0),
+        (40, 60, BLUE),
+        "the collage was drawn over the upload"
+    );
+    assert_eq!(
+        Path::new(&saved.path),
+        genre_dir.join("folder.png"),
+        "saved beside the genre, outside its internal metadata folder"
+    );
+}
+
 const RED: [u8; 3] = [180, 30, 30];
 const BLUE: [u8; 3] = [30, 30, 180];
 
@@ -151,11 +315,12 @@ fn write_photo(dir: &Path, colour: [u8; 3]) {
 
 /// A home-video library over `Trip/a.png`, scanned once.
 struct PhotoLibrary {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     album_dir: std::path::PathBuf,
     scanner: LibraryScanner,
     items: Arc<dyn ItemRepository>,
     persistence: Arc<FerrofinItemPersistenceService>,
+    vf: Arc<dyn VirtualFolderManager>,
 }
 
 impl PhotoLibrary {
@@ -192,7 +357,7 @@ impl PhotoLibrary {
             ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
         );
         let scanner = LibraryScanner::new(
-            vf,
+            Arc::clone(&vf),
             Arc::new(ferrofin_core::file_system::FerrofinFileSystem::new()),
             persistence.clone(),
         )
@@ -201,12 +366,25 @@ impl PhotoLibrary {
         .with_metadata_dir(tmp.path().join("metadata").join("library"));
         scanner.scan_all().await.expect("scan");
         Self {
-            _tmp: tmp,
+            tmp,
             album_dir,
             scanner,
             items,
             persistence,
+            vf,
         }
+    }
+
+    async fn uploader(&self) -> ferrofin_providers::LocalProviderManager {
+        let root = self.tmp.path();
+        uploader(
+            root,
+            &self.items,
+            &self.vf,
+            &self.persistence,
+            &root.join("metadata").join("library"),
+        )
+        .await
     }
 
     async fn row(&self, kind: BaseItemKind, name: &str) -> BaseItemEntity {
@@ -292,6 +470,67 @@ async fn a_photo_album_refresh_redraws_its_image_as_its_options_say(
     assert_eq!(
         lib.primary_colour(BaseItemKind::PhotoAlbum, "Trip").await,
         want
+    );
+}
+
+/// gl-590: a Primary uploaded to a photo album whose library does not save
+/// local metadata stays in the album's internal folder, as upstream's does,
+/// and a default rescan finds it current and leaves it alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploaded_photo_album_primary_survives_a_default_rescan() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let album = lib.row(BaseItemKind::PhotoAlbum, "Trip").await;
+    let album_id = uuid::Uuid::parse_str(&album.id).expect("id");
+    lib.uploader()
+        .await
+        .save_image(album_id, &png(BLUE), "image/png", ImageType::Primary, None)
+        .await
+        .expect("upload");
+
+    lib.scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::PhotoAlbum, "Trip").await,
+        BLUE
+    );
+}
+
+/// gl-590: a music genre's and a playlist folder's upload is saved beside the
+/// item's own path whatever the library says, as `IsSaveLocalMetadataEnabled`
+/// is overridden to true for both (`MusicGenre.cs:63`, `Playlist.cs:126`).
+#[rstest::rstest]
+#[case::music_genre("MediaBrowser.Controller.Entities.Audio.MusicGenre", false)]
+#[case::playlist("MediaBrowser.Controller.Playlists.Playlist", true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
+    #[case] type_: &str,
+    #[case] is_folder: bool,
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let id = uuid::Uuid::new_v4();
+    let dir = lib.tmp.path().join("own").join("Mix");
+    lib.persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(id),
+            type_: type_.to_owned(),
+            name: Some("Mix".to_owned()),
+            path: Some(dir.to_string_lossy().into_owned()),
+            is_folder,
+            ..BaseItemEntity::default()
+        }])
+        .await
+        .expect("row");
+    lib.uploader()
+        .await
+        .save_image(id, &png(BLUE), "image/png", ImageType::Primary, None)
+        .await
+        .expect("upload");
+    let images = lib.items.get_image_infos(id).await.expect("images");
+    assert_eq!(
+        images
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .map(|i| Path::new(&i.path).to_owned()),
+        Some(dir.join("folder.png"))
     );
 }
 

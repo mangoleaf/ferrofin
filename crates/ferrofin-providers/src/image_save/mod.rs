@@ -10,6 +10,8 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::ItemRepository;
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::string_extensions::replace_ignore_ascii_case;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -91,6 +93,7 @@ impl ImageFileSaver {
         index: usize,
         current: &[ItemImageInfo],
     ) -> Result<SavedImage, ServiceError> {
+        let item = &self.expand_path(item);
         let Some(settings) = self.settings(item).await? else {
             return Ok(SavedImage::clean(image));
         };
@@ -118,6 +121,7 @@ impl ImageFileSaver {
         images: &mut [ItemImageInfo],
         previous: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
+        let item = &self.expand_path(item);
         let Some(settings) = self.settings(item).await? else {
             return Ok(());
         };
@@ -158,6 +162,23 @@ impl ImageFileSaver {
         failure.map_or(Ok(()), Err)
     }
 
+    /// `ExpandVirtualPath` on the item's own path (`BaseItemRepository.Map`):
+    /// an adopted genre or playlist stores `%MetadataPath%/Genre/…` or
+    /// `%AppDataPath%/playlists/…`, and the item read leaves it as stored.
+    fn expand_path<'a>(&self, item: &'a BaseItemEntity) -> Cow<'a, BaseItemEntity> {
+        let Some(path) = item.path.as_deref().filter(|path| path.contains('%')) else {
+            return Cow::Borrowed(item);
+        };
+        let paths = self.configuration.application_paths();
+        let path = replace_ignore_ascii_case(path, "%AppDataPath%", &paths.data_path());
+        let path =
+            replace_ignore_ascii_case(&path, "%MetadataPath%", &paths.internal_metadata_path());
+        Cow::Owned(BaseItemEntity {
+            path: Some(path),
+            ..item.clone()
+        })
+    }
+
     async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {
         let series = if policy::short_kind(item) == "Season" {
             let id = item
@@ -173,17 +194,29 @@ impl ImageFileSaver {
         } else {
             None
         };
-        let folders = self.folders.get_virtual_folders().await?;
-        let options = ferrofin_model::entities_media::owning_library(
-            &folders,
-            item.top_parent_id.as_deref(),
-            item.path
-                .as_deref()
-                .or_else(|| series.as_ref().and_then(|series| series.path.as_deref())),
-        )
-        .and_then(|folder| folder.library_options.as_ref());
-        if !options.is_some_and(|options| options.save_local_metadata) {
-            return Ok(None);
+        // `IsSaveLocalMetadataEnabled`: a genre, music genre or playlist
+        // overrides it to true (`Genre.cs:55`, `MusicGenre.cs:63`,
+        // `Playlist.cs:126`), so its artwork lives beside its own path, out of
+        // reach of the dynamic image providers. Divergence: upstream's other
+        // overrides (Person, Studio, Year, BoxSet, a by-name MusicArtist,
+        // CollectionFolder, UserView) still follow the owning library, so
+        // their downloaded art stays in the internal metadata folder.
+        if !matches!(
+            policy::short_kind(item),
+            "Genre" | "MusicGenre" | "Playlist"
+        ) {
+            let folders = self.folders.get_virtual_folders().await?;
+            let options = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path
+                    .as_deref()
+                    .or_else(|| series.as_ref().and_then(|series| series.path.as_deref())),
+            )
+            .and_then(|folder| folder.library_options.as_ref());
+            if !options.is_some_and(|options| options.save_local_metadata) {
+                return Ok(None);
+            }
         }
         let configuration = self.configuration.configuration().await?;
         let path = PathBuf::from(
