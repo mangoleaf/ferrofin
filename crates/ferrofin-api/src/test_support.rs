@@ -1730,7 +1730,8 @@ impl QuickConnect for FakeQuickConnect {
     }
 }
 
-/// A fake [`PlaylistManager`]; every method is unused by INFRA-level tests.
+/// A fake [`PlaylistManager`]; every method but `remove_playlists` (a no-op)
+/// is unused by INFRA-level tests.
 pub struct FakePlaylists;
 
 #[async_trait]
@@ -1814,7 +1815,8 @@ impl PlaylistManager for FakePlaylists {
         unimplemented!("fake")
     }
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        unimplemented!("fake")
+        // `DELETE /Users/{userId}` hands over the deleted user's playlists.
+        Ok(())
     }
 }
 

@@ -729,7 +729,7 @@ fn split_multi_str(stored: Option<&str>) -> impl Iterator<Item = &str> {
 
 /// Parses a stored `MediaType` string into the enum, defaulting to
 /// [`MediaType::Unknown`].
-fn parse_media_type(stored: Option<&str>) -> MediaType {
+pub(crate) fn parse_media_type(stored: Option<&str>) -> MediaType {
     match stored {
         Some("Video") => MediaType::Video,
         Some("Audio") => MediaType::Audio,
