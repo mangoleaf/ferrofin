@@ -279,6 +279,14 @@ EOS
   grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke-scan.txt\" | sed 's/^/after scan: /')" "$ADOPTION/run.sh"
 }
 
+@test "run.sh: the second-boot log starts at the restarted container's own start, and must hold a server start" {
+  # a zone-less `date -u` --since is read as local time: empty west of UTC, the first boot east of it
+  run grep -cF "logs --since \"\$(date" "$ADOPTION/run.sh"
+  [ "$output" = 0 ]
+  grep -qF "docker logs --since \"\$(docker inspect -f '{{.State.StartedAt}}' \"\$name\")\" \"\$name\" > \"\$dst.boot2.log\" 2>&1" "$ADOPTION/run.sh"
+  grep -qF "grep -q '\"ferrofin-server starting\"' \"\$dst.boot2.log\" || why+=(\"second boot log has no server start\")" "$ADOPTION/run.sh"
+}
+
 @test "run.sh: the oracle is Jellyfin 12.2 unless --oracle or ADOPTION_ORACLE picks 12.1" {
   fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0

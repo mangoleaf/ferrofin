@@ -46,6 +46,16 @@ with exit status 0. Later server changes require rerunning this matrix. The 12.2
 use synthetic fixtures built and validated by real Jellyfin 12.2 images; live-fixture
 testing on the release branch will validate them against a real library.
 
+**Correction (2026-10-17):** in that run, and in the `run.sh` runs recorded under
+[Metadata gate validation](#metadata-gate-validation) and
+[Watch-history gate validation](#watch-history-gate-validation), the repeated-repair half of
+check 4 below could not fail. `run.sh` selected the second boot's log with a UTC time that
+Docker read as local time, so on a host west of UTC the log was always empty. Those PASS
+results do not cover that half; the second boot's probe summaries were still compared. `run.sh`
+now reads the log from the restarted container's own start time and fails a log with no
+server start. The synthetic preservation matrix (`synthetic.py run`) slices restart logs by
+line offset and was not affected.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
