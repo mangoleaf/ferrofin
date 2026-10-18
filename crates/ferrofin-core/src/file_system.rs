@@ -117,6 +117,47 @@ fn total_size(_path: &str) -> u64 {
     u64::MAX
 }
 
+/// Whether the symlink at `path` lists as a directory.
+///
+/// `ManagedFileSystem.GetFileSystemMetadata` stats a link's target, so a
+/// link to a directory is a directory (a linked series or movie folder is
+/// scanned); a link to a file, or one that dangles, is a file. A link back
+/// to a directory already on the way to it (see [`leads_back`]) is not
+/// descended, or the walk would nest until the kernel's `ELOOP` limit.
+/// Upstream appears to have no such guard, so this is a deliberate divergence.
+fn symlink_is_directory(path: &Path) -> bool {
+    let Ok(target) = fs::metadata(path) else {
+        return false;
+    };
+    if !target.is_dir() {
+        return false;
+    }
+    if leads_back(path, &target) {
+        // Not an error, but the reason a linked folder never shows up.
+        tracing::debug!(path = %path.display(), "symlink leads back to a directory on its own path; not descending");
+        return false;
+    }
+    true
+}
+
+/// Whether `target`, the directory the link at `path` resolves to, is one of
+/// the directories `path` lies in (compared by device and inode, along the
+/// listed path, links followed).
+#[cfg(unix)]
+fn leads_back(path: &Path, target: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    path.ancestors()
+        .skip(1)
+        .filter_map(|ancestor| fs::metadata(ancestor).ok())
+        .any(|dir| dir.dev() == target.dev() && dir.ino() == target.ino())
+}
+
+/// Non-unix fallback: no inode identity to compare, so no link is cut.
+#[cfg(not(unix))]
+fn leads_back(_path: &Path, _target: &fs::Metadata) -> bool {
+    false
+}
+
 impl FileSystem for FerrofinFileSystem {
     fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo> {
         self.try_get_file_system_entries(path).unwrap_or_default()
@@ -135,7 +176,11 @@ impl FileSystem for FerrofinFileSystem {
             // it is cannot be told, so the whole listing is a failure.
             let entry = entry.map_err(listing_failed)?;
             let full_path = entry.path();
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            let is_dir = match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => symlink_is_directory(&full_path),
+                Ok(kind) => kind.is_dir(),
+                Err(_) => false,
+            };
             entries.push(FileSystemEntryInfo {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: full_path.to_string_lossy().into_owned(),
@@ -391,6 +436,72 @@ shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
         assert_eq!(entries[0].type_, FileSystemEntryType::File);
         assert_eq!(entries[1].name, "sub");
         assert_eq!(entries[1].type_, FileSystemEntryType::Directory);
+    }
+
+    /// The type each entry of `dir` lists as, by name.
+    #[cfg(unix)]
+    fn listed_types(dir: &Path) -> std::collections::BTreeMap<String, FileSystemEntryType> {
+        FerrofinFileSystem::new()
+            .get_file_system_entries(&dir.to_string_lossy())
+            .into_iter()
+            .map(|entry| (entry.name, entry.type_))
+            .collect()
+    }
+
+    /// `ManagedFileSystem.GetFileSystemMetadata` sets `IsDirectory` for a
+    /// link to a directory (.NET stats the target of a link), so a linked
+    /// series or movie folder is scanned; a link to a file stays a file and a
+    /// dangling link is a plain file, never a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_lists_as_what_it_points_at() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(outside.path().join("Show")).expect("mkdir");
+        std::fs::write(outside.path().join("movie.mkv"), b"x").expect("write");
+        symlink(outside.path().join("Show"), tmp.path().join("linked dir")).expect("link");
+        symlink(
+            outside.path().join("movie.mkv"),
+            tmp.path().join("linked.mkv"),
+        )
+        .expect("link");
+        symlink(outside.path().join("gone"), tmp.path().join("dangling")).expect("link");
+
+        let types = listed_types(tmp.path());
+        assert_eq!(types["linked dir"], FileSystemEntryType::Directory);
+        assert_eq!(types["linked.mkv"], FileSystemEntryType::File);
+        assert_eq!(types["dangling"], FileSystemEntryType::File);
+    }
+
+    /// A link back to a directory already on the way to it is not a
+    /// directory to descend: a link to itself, to its parent or to a
+    /// grandparent would otherwise nest until the kernel's `ELOOP` limit.
+    /// Links that only lead somewhere else are still followed; of two links
+    /// that point at each other's directories, the second is the one cut.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_back_to_an_ancestor_is_not_descended() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a/sub")).expect("mkdir");
+        std::fs::create_dir(root.join("c")).expect("mkdir");
+        symlink(root, root.join("a/sub/to-root")).expect("link");
+        symlink(root.join("a"), root.join("a/to-parent")).expect("link");
+        symlink(root.join("a/sub"), root.join("a/sub/to-self")).expect("link");
+        symlink(root.join("c"), root.join("a/b")).expect("link");
+        symlink(root.join("a"), root.join("c/d")).expect("link");
+
+        let sub = listed_types(&root.join("a/sub"));
+        assert_eq!(sub["to-root"], FileSystemEntryType::File);
+        assert_eq!(sub["to-self"], FileSystemEntryType::File);
+        let a = listed_types(&root.join("a"));
+        assert_eq!(a["to-parent"], FileSystemEntryType::File);
+        assert_eq!(a["b"], FileSystemEntryType::Directory, "leads away");
+        // `a/b` is `c`, whose `d` leads back to `a`: the loop is cut there.
+        let through = listed_types(&root.join("a/b"));
+        assert_eq!(through["d"], FileSystemEntryType::File, "back to `a`");
     }
 
     #[test]
