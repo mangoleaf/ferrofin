@@ -8,6 +8,24 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — playlists get their own folder and a new id, once
+
+A playlist created in Ferrofin had no folder. Jellyfin gives each playlist one,
+`<data>/playlists/<name>` (`<name>1` when that is taken), and derives the playlist's id
+from it. A playlist made in Ferrofin is now stored the same way, so Jellyfin finds it in
+its folder after a switch back.
+
+On the first start after upgrading, each playlist an earlier version created moves to
+its folder and its new id. Its entries, owner, shares, played state and favourite move
+with it. The database file is copied to `<database>.pre-playlist-folders` first.
+
+- **A playlist's id changes once.** A client or script that kept the old id has to look
+  the playlist up again. Reloading the playlist list is enough in jellyfin-web and the apps.
+- **Deleting a playlist now deletes its folder too**, as in Jellyfin.
+- **An image uploaded to one of these playlists before the upgrade stays where it was.**
+  A "Replace all metadata" refresh can still replace it with the generated collage. Upload
+  the image again after upgrading to keep it.
+
 ## Unreleased — an API key must name the user a playlist is for
 
 An API key carries no user. Earlier versions let `POST /Playlists` with an API key and

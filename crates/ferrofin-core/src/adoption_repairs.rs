@@ -32,7 +32,7 @@ use crate::item_data::{
 use crate::item_folders::{MovedFolders, move_item_folders};
 use crate::item_persistence_service::{
     FerrofinItemPersistenceService, REPAIR_PARTITION, RekeyKind, alternate_version_child_type,
-    detach_user_data, move_user_data, rekey_rows, user_weights,
+    detach_user_data, move_user_data, rekey_rows, rekey_rows_at, user_weights,
 };
 use crate::item_type_lookup::{
     IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
@@ -1328,6 +1328,153 @@ pub async fn run_rekey_virtual_seasons(
         tracing::info!(
             items = moved,
             "re-keyed seasons with no folder to their series, number and name"
+        );
+    }
+    Ok(())
+}
+
+/// The extension of the database snapshot [`rekey_pathless_playlists`]
+/// takes (`jellyfin.db.pre-playlist-folders`).
+const PLAYLIST_SNAPSHOT_EXTENSION: &str = "db.pre-playlist-folders";
+
+/// Gives each playlist an older Ferrofin created with no folder the one
+/// `PlaylistManager.CreatePlaylist` makes in `playlists`, and moves it to
+/// the id `Folder.AddChild` derives from that path
+/// ([`crate::collection_manager::new_playlist_folder_and_id`], gl-597).
+///
+/// Jellyfin's rescan resolves every folder in the playlists folder to that
+/// id and deletes a playlist row it finds no folder for
+/// (`Folder.ValidateChildrenInternal`), so the path and the new id are
+/// written together, in the move's own savepoint ([`rekey_rows_at`]). The
+/// entries, owner and shares, user data and images move with it. An upload
+/// an older Ferrofin stored in the playlist's metadata folder stays there:
+/// nothing tells it from a generated image.
+///
+/// Playlists are taken in the order they were stored, so of two with one
+/// name the older gets the plain folder. Runs once; a move that fails is
+/// undone (its folder removed) and the repair runs again on the next boot.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn rekey_pathless_playlists(
+    db: &Database,
+    derivation: &IdDerivation,
+    playlists: &str,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<usize, ServiceError> {
+    const KEY: &str = "playlist_folders_v1";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let playlist_type = stored_type_name(BaseItemKind::Playlist).unwrap_or_default();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Name" FROM "BaseItems"
+           WHERE "Type" = ?1 AND ("Path" IS NULL OR "Path" = '')
+           ORDER BY rowid"#,
+    )
+    .bind(playlist_type)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    if rows.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    // It rewrites rows users made something of: the file as it was goes
+    // aside first, as before a table-rebuilding migration.
+    if let Some(backup) = db
+        .snapshot_once(PLAYLIST_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before giving playlists their folders"
+        );
+    }
+    let mut complete = true;
+    let (mut moves, mut paths, mut renamed) = (Vec::new(), Vec::new(), Vec::new());
+    for (id, name) in rows {
+        let Ok(from) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let (path, to) = match crate::collection_manager::new_playlist_folder_and_id(
+            db,
+            derivation,
+            playlists,
+            name.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            Ok(target) => target,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    item_id = %from,
+                    "could not make a playlist's folder; it keeps its id, \
+                     and the repair runs again on the next boot"
+                );
+                complete = false;
+                continue;
+            }
+        };
+        let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+        renamed.push((to, folders, path.clone()));
+        moves.push(ItemRekey {
+            from,
+            to,
+            type_name: playlist_type.to_owned(),
+            dirs,
+            merged: Vec::new(),
+            extra: false,
+        });
+        paths.push(path);
+    }
+    let made: BTreeSet<Uuid> = match rekey_rows_at(db, &moves, &paths, RekeyKind::Represented).await
+    {
+        Ok(done) => done.iter().map(|m| m.to).collect(),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "could not give playlists their folders; they keep their ids, \
+                 and the repair runs again on the next boot"
+            );
+            BTreeSet::new()
+        }
+    };
+    for (to, folders, path) in renamed {
+        if made.contains(&to) {
+            folders.commit();
+        } else {
+            folders.undo();
+            if let Err(err) = tokio::fs::remove_dir(&path).await {
+                tracing::warn!(%err, path = %path, "could not remove an unused playlist folder");
+            }
+        }
+    }
+    if complete && made.len() == moves.len() {
+        done(db, KEY).await?;
+    }
+    Ok(made.len())
+}
+
+/// [`rekey_pathless_playlists`] and its log line, for the composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the repair's queries fail.
+pub async fn run_rekey_pathless_playlists(
+    db: &Database,
+    derivation: &IdDerivation,
+    playlists: &str,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<(), ServiceError> {
+    let moved = rekey_pathless_playlists(db, derivation, playlists, art_root, path_manager).await?;
+    if moved > 0 {
+        tracing::info!(
+            items = moved,
+            "gave playlists with no folder their folders and the ids Jellyfin keys them by"
         );
     }
     Ok(())
@@ -4807,5 +4954,186 @@ mod tests {
         .unwrap();
         assert_eq!(fossil, 7, "the snapshot predates the writes");
         assert_eq!(plays(&db, &ids[0]).await[1].play_count, 9);
+    }
+
+    /// gl-597: a playlist an older Ferrofin created with no folder gets the
+    /// one `CreatePlaylist` makes and the id its path derives, its entries,
+    /// owner row and user data with it; of two with one name the older gets
+    /// the plain folder. A playlist with a path is left alone, and a second
+    /// boot does nothing.
+    #[tokio::test]
+    async fn a_playlist_with_no_folder_gets_one_and_the_id_its_path_derives() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_string_lossy().into_owned();
+        let mode = IdDerivation::from_meta(Some("jellyfin-10.11.8"), Some(root.clone()));
+        let playlists = format!("{root}/data/playlists");
+        let (older, newer, adopted, track) = (
+            Uuid::from_u128(0xB),
+            Uuid::from_u128(0xA),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for id in [older, newer] {
+            seed_named_item(&db, id, BaseItemKind::Playlist, "Mix").await;
+        }
+        seed_named_item(&db, adopted, BaseItemKind::Playlist, "Kept").await;
+        set_path(&db, adopted, "%AppDataPath%/playlists/Kept").await;
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let owner = Uuid::new_v4();
+        seed_user(&db, owner).await;
+        seed_user_data(&db, owner, older, true, None).await;
+        sqlx::query(
+            r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+               VALUES (?1, ?2, 0)"#,
+        )
+        .bind(guid_to_db(older))
+        .bind(guid_to_db(owner))
+        .execute(db.writer())
+        .await
+        .expect("owner row");
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, 0, ?2, 0)"#,
+        )
+        .bind(guid_to_db(older))
+        .bind(guid_to_db(track))
+        .execute(db.writer())
+        .await
+        .expect("entry");
+
+        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+            .await
+            .expect("repair");
+        assert_eq!(moved, 2);
+
+        let at = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(guid_to_db(id))
+                .fetch_optional(db.pool())
+                .await
+                .expect("path")
+            }
+        };
+        for (old, folder) in [(older, "Mix"), (newer, "Mix1")] {
+            let path = format!("{playlists}/{folder}");
+            assert!(Path::new(&path).is_dir(), "{path} is made");
+            let new = derive_item_id_with(&mode, BaseItemKind::Playlist, &path).expect("id");
+            assert_eq!(at(new).await, Some(Some(path)), "{folder} is at its path");
+            assert_eq!(at(old).await, None, "and no longer at its old id");
+        }
+        let new = derive_item_id_with(&mode, BaseItemKind::Playlist, &format!("{playlists}/Mix"))
+            .expect("id");
+        let (owner_row, entry, user_data): (Option<String>, Option<String>, i64) = sqlx::query_as(
+            r#"SELECT
+                     (SELECT "OwnerUserId" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1),
+                     (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1),
+                     (SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1)"#,
+        )
+        .bind(guid_to_db(new))
+        .fetch_one(db.pool())
+        .await
+        .expect("moved rows");
+        assert_eq!(owner_row, Some(guid_to_db(owner)), "the owner row moves");
+        assert_eq!(entry, Some(guid_to_db(track)), "the entries move");
+        assert_eq!(user_data, 1, "the user data moves");
+        assert_eq!(
+            at(adopted).await,
+            Some(Some("%AppDataPath%/playlists/Kept".to_owned())),
+            "a playlist with a path is left alone"
+        );
+
+        assert_eq!(
+            rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+                .await
+                .expect("second boot"),
+            0
+        );
+    }
+
+    /// The repair's playlists folder, id derivation and stored `Path` reader.
+    fn playlist_repair_fixture(tmp: &tempfile::TempDir) -> (IdDerivation, String) {
+        let root = tmp.path().to_string_lossy().into_owned();
+        let mode = IdDerivation::from_meta(Some("jellyfin-10.11.8"), Some(root.clone()));
+        (mode, format!("{root}/data/playlists"))
+    }
+
+    async fn stored_path(db: &Database, id: Uuid) -> Option<Option<String>> {
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_optional(db.pool())
+            .await
+            .expect("path")
+    }
+
+    /// A playlist already at the id a new folder derives (one whose folder
+    /// went missing) keeps its id and gets that folder back; the playlist
+    /// with no folder takes the next name.
+    #[tokio::test]
+    async fn a_playlist_with_no_folder_skips_a_name_whose_id_is_taken() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mode, playlists) = playlist_repair_fixture(&tmp);
+        let taken_path = format!("{playlists}/Mix");
+        let taken = derive_item_id_with(&mode, BaseItemKind::Playlist, &taken_path).expect("id");
+        seed_named_item(&db, taken, BaseItemKind::Playlist, "Mix").await;
+        set_path(&db, taken, &taken_path).await;
+        let pathless = Uuid::new_v4();
+        seed_named_item(&db, pathless, BaseItemKind::Playlist, "Mix").await;
+
+        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+            .await
+            .expect("repair");
+        assert_eq!(moved, 1);
+        assert_eq!(
+            stored_path(&db, taken).await,
+            Some(Some(taken_path.clone()))
+        );
+        assert!(Path::new(&taken_path).is_dir(), "its folder is made again");
+        let next = format!("{playlists}/Mix1");
+        let to = derive_item_id_with(&mode, BaseItemKind::Playlist, &next).expect("id");
+        assert_eq!(stored_path(&db, to).await, Some(Some(next)));
+        assert_eq!(stored_path(&db, pathless).await, None);
+    }
+
+    /// A move that fails is undone: the playlist keeps its id and no folder,
+    /// the folder made for it goes, and the next boot runs the repair again.
+    #[tokio::test]
+    async fn a_failed_playlist_move_is_undone_and_retried_on_the_next_boot() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mode, playlists) = playlist_repair_fixture(&tmp);
+        let pathless = Uuid::new_v4();
+        seed_named_item(&db, pathless, BaseItemKind::Playlist, "Mix").await;
+        sqlx::query(
+            r#"CREATE TRIGGER "fail_rekey" BEFORE UPDATE OF "Id" ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'disk full'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+
+        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+            .await
+            .expect("repair");
+        assert_eq!(moved, 0);
+        assert_eq!(stored_path(&db, pathless).await, Some(None));
+        let folder = format!("{playlists}/Mix");
+        assert!(!Path::new(&folder).exists(), "the unused folder is removed");
+
+        sqlx::query(r#"DROP TRIGGER "fail_rekey""#)
+            .execute(db.writer())
+            .await
+            .expect("drop trigger");
+        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+            .await
+            .expect("next boot");
+        assert_eq!(moved, 1, "the next boot runs it again");
+        let to = derive_item_id_with(&mode, BaseItemKind::Playlist, &folder).expect("id");
+        assert_eq!(stored_path(&db, to).await, Some(Some(folder)));
     }
 }

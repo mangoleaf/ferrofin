@@ -18,19 +18,23 @@ use crate::test_support::{
 
 use super::FerrofinPlaylistManager;
 
-fn manager(db: &ferrofin_db::Database) -> FerrofinPlaylistManager {
-    FerrofinPlaylistManager::new(
+/// A playlist manager over `db`, on a data directory of its own that lives
+/// as long as the returned guard.
+fn manager(db: &ferrofin_db::Database) -> (FerrofinPlaylistManager, tempfile::TempDir) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mgr = FerrofinPlaylistManager::new(
         db.clone(),
         library_manager_over(db.clone()),
         item_repository_over(db.clone()),
         Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-            "/tmp/ferrofin-collections-test",
-            "/tmp/ferrofin-collections-test/log",
-            "/tmp/ferrofin-collections-test/config",
-            "/tmp/ferrofin-collections-test/cache",
-            "/tmp/ferrofin-collections-test/web",
+            root.path(),
+            root.path().join("log"),
+            root.path().join("config"),
+            root.path().join("cache"),
+            root.path().join("web"),
         )),
-    )
+    );
+    (mgr, root)
 }
 
 async fn create(
@@ -82,7 +86,7 @@ async fn level(
 #[tokio::test]
 async fn removing_an_owner_hands_over_shared_playlists_and_deletes_private_ones() {
     let db = test_db().await;
-    let mgr = manager(&db);
+    let (mgr, _root) = manager(&db);
     let (alice, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     living(&db, &[bob, carol]).await;
     let track = Uuid::new_v4();
@@ -164,7 +168,7 @@ async fn the_heir_is_the_first_editor_in_the_order_data_lists_the_shares() {
     let (carol, dave) = (Uuid::from_u128(0xC), Uuid::from_u128(0xD));
     for imported in [false, true] {
         let db = test_db().await;
-        let mgr = manager(&db);
+        let (mgr, _root) = manager(&db);
         living(&db, &[bob, carol, dave]).await;
         let (editors, readers) = (Uuid::new_v4(), Uuid::new_v4());
         let shares = |users: &[(Uuid, bool)]| {
@@ -235,7 +239,7 @@ async fn the_heir_is_the_first_editor_in_the_order_data_lists_the_shares() {
 #[tokio::test]
 async fn the_share_of_a_user_who_no_longer_exists_never_inherits() {
     let db = test_db().await;
-    let mgr = manager(&db);
+    let (mgr, _root) = manager(&db);
     let (alice, gone, bob) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     living(&db, &[bob]).await;
     let shared = create(
@@ -286,7 +290,7 @@ async fn the_share_of_a_user_who_no_longer_exists_never_inherits() {
 #[tokio::test]
 async fn a_failed_hand_over_does_not_stop_the_others() {
     let db = test_db().await;
-    let mgr = manager(&db);
+    let (mgr, _root) = manager(&db);
     let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
     living(&db, &[bob]).await;
     let shares = || vec![PlaylistUserPermissions::new(bob, true)];
