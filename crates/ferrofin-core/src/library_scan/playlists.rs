@@ -46,7 +46,7 @@
 //! directory in the internal `PlaylistsFolder`, keeps Jellyfin's walk of
 //! `{data}/playlists` from pruning an API playlist whose `playlist.xml` is
 //! gone. Ferrofin never walks that folder: its API playlists are database
-//! rows, which no scan prunes.
+//! rows, each with its folder there, which no scan reads or prunes.
 
 use std::path::Path;
 

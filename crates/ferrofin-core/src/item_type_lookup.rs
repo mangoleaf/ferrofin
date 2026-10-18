@@ -372,10 +372,18 @@ fn bound_folder_name(valid: String) -> String {
 /// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
 /// single path segment every by-name `GetPath` builds from an item name.
 pub(crate) fn valid_filename(name: &str) -> String {
+    get_valid_filename(name)
+        .trim()
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// `ManagedFileSystem.GetValidFilename(name)`: every invalid path character
+/// replaced by a space, nothing trimmed.
+pub(crate) fn get_valid_filename(name: &str) -> String {
     // `ManagedFileSystem._invalidPathCharacters`, verbatim.
     const INVALID: &[char] = &['"', '<', '>', '|', ':', '*', '?', '\\', '/'];
-    let sanitized: String = name
-        .chars()
+    name.chars()
         .map(|c| {
             if INVALID.contains(&c) || (c as u32) <= 31 {
                 ' '
@@ -383,8 +391,7 @@ pub(crate) fn valid_filename(name: &str) -> String {
                 c
             }
         })
-        .collect();
-    sanitized.trim().trim_end_matches('.').to_owned()
+        .collect()
 }
 
 /// [`derive_item_id_with`] under [`IdDerivation::LegacyLowercase`] — kept for

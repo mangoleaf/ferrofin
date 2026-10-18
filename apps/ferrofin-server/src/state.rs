@@ -703,6 +703,17 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to re-key seasons with no folder")?;
+    // …and a playlist an older Ferrofin created with no folder gets the one
+    // Jellyfin's `CreatePlaylist` makes, and the id Jellyfin keys it by.
+    ferrofin_core::adoption_repairs::run_rekey_pathless_playlists(
+        db,
+        &id_derivation,
+        &format!("{}/playlists", paths.data_path()),
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await
+    .context("failed to give playlists their folders")?;
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
         Arc::new(FerrofinClientEventLogger::new(
             Arc::clone(&paths) as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>

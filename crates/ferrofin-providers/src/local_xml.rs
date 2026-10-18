@@ -16,11 +16,13 @@
 //! `library_scan/playlists.rs`, whose TODO records what of it is not yet
 //! applied). Nothing writes these files yet: upstream's `PlaylistXmlSaver`
 //! saves a scanned playlist folder's `playlist.xml` after each refresh that
-//! read it, and that port is the same open work item. A `BoxSet` or
-//! `Playlist` made through the API is a **pathless** DB row
-//! (`collection_manager`'s `insert_named_item` writes no `Path`) with its
-//! membership in the `LinkedChildren` table, which is what Jellyfin 12 reads
-//! too, so it has no folder of its own to save into.
+//! read it, and that port is the same open work item. A `Playlist` made
+//! through the API has the folder upstream's `CreatePlaylist` gives it
+//! (`{data}/playlists/<name>`); writing its `playlist.xml` there is that
+//! same work item. A `BoxSet` made through the API is a **pathless** DB row
+//! (`collection_manager`'s `insert_named_item` writes no `Path`), so it has
+//! no folder of its own to save into. Both keep their membership in the
+//! `LinkedChildren` table, which is what Jellyfin 12 reads too.
 //!
 //! The savers are complete and tested all the same. They are deliberately
 //! NOT wired to a synthetic path: writing `collection.xml` somewhere Jellyfin

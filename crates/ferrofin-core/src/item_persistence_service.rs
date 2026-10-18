@@ -293,6 +293,20 @@ pub(crate) async fn stamp_playlist_in(
     Ok(())
 }
 
+/// Stores `path` as item `id`'s `Path`, on a connection the caller holds.
+pub(crate) async fn set_item_path_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    path: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(path)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// The id of the container row stored at `path`, or `None`.
 ///
 /// **Matched by exact path**, the way `CollectionManager.EnsureLibraryFolder`
@@ -3882,6 +3896,22 @@ pub(crate) async fn rekey_rows(
     moves: &[ItemRekey],
     kind: RekeyKind,
 ) -> Result<Vec<ItemRekey>, ServiceError> {
+    rekey_rows_at(db, moves, &[], kind).await
+}
+
+/// [`rekey_rows`], each move also storing its item at a new path —
+/// `paths[i]` for `moves[i]`, none for a move past its end — in that move's
+/// savepoint, so no item is left moved without its path, or at its path
+/// under the old id.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the transaction cannot be opened or committed.
+pub(crate) async fn rekey_rows_at(
+    db: &Database,
+    moves: &[ItemRekey],
+    paths: &[String],
+    kind: RekeyKind,
+) -> Result<Vec<ItemRekey>, ServiceError> {
     if moves.is_empty() {
         return Ok(Vec::new());
     }
@@ -3909,14 +3939,22 @@ pub(crate) async fn rekey_rows(
             .map(|(table, column)| ((*table).to_owned(), (*column).to_owned(), false)),
     );
     let mut done = Vec::new();
-    for m in moves {
+    for (i, m) in moves.iter().enumerate() {
         // One savepoint per move: a move that fails is undone alone and
         // reported unmade, and the rest go ahead.
         sqlx::query("SAVEPOINT rekey_move")
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        match rekey_one(&mut tx, m, &references, kind).await {
+        match rekey_one_at(
+            &mut tx,
+            m,
+            paths.get(i).map(String::as_str),
+            &references,
+            kind,
+        )
+        .await
+        {
             Ok(made) => {
                 sqlx::query("RELEASE rekey_move")
                     .execute(&mut *tx)
@@ -4050,6 +4088,21 @@ async fn rekey_one(
         merge_one(conn, (loser, m.to), m.extra, references).await?;
     }
     Ok(true)
+}
+
+/// [`rekey_one`], then the moved item's new `path`, if it has one.
+async fn rekey_one_at(
+    conn: &mut sqlx::SqliteConnection,
+    m: &ItemRekey,
+    path: Option<&str>,
+    references: &[RekeyReference],
+    kind: RekeyKind,
+) -> Result<bool, sqlx::Error> {
+    let made = rekey_one(conn, m, references, kind).await?;
+    if made && let Some(path) = path {
+        set_item_path_in(conn, m.to, path).await?;
+    }
+    Ok(made)
 }
 
 /// Whether a `BaseItems` row has the id `id`.

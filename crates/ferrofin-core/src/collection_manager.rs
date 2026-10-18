@@ -316,11 +316,12 @@ async fn collections_folder(
 }
 
 /// The playlists folder a created playlist belongs to, adopting any orphans a
-/// previous version left behind.
+/// previous version left behind, and the id derivation its playlists are
+/// keyed by.
 async fn playlists_folder(
     db: &Database,
     paths: &Arc<dyn ServerApplicationPaths>,
-) -> Result<Option<Uuid>, ServiceError> {
+) -> Result<(Option<Uuid>, crate::item_type_lookup::IdDerivation), ServiceError> {
     // `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
     // the latter name — it is only `PlaylistsFolder.GetClientTypeName()` — and
     // the row an adopted database carries is stored as
@@ -353,7 +354,60 @@ async fn playlists_folder(
     if let Some(id) = container {
         crate::item_persistence_service::adopt_orphans(db, BaseItemKind::Playlist, id).await?;
     }
-    Ok(container)
+    Ok((container, mode))
+}
+
+/// Makes the folder `PlaylistManager.CreatePlaylist` gives a new playlist
+/// named `name` (`PlaylistManager.cs:83,130-137`) and returns its path:
+/// `Path.Combine(playlists, GetValidFilename(name))`, with `1` appended
+/// while that is taken (`GetTargetPath`).
+///
+/// The creation itself tells a taken path, not an existence check before
+/// it, so two creates of one name never share a folder. An empty name gets
+/// a folder inside `playlists` (`playlists/1`): upstream's `Path.Combine`
+/// of an empty name is the playlists folder itself, which `GetTargetPath`
+/// turns into `playlists1`, beside the folder its rescan walks.
+///
+/// # Errors
+/// The I/O error that kept the folder from being made.
+async fn new_playlist_folder(playlists: &str, name: &str) -> std::io::Result<String> {
+    tokio::fs::create_dir_all(playlists).await?;
+    let mut path = std::path::Path::new(playlists)
+        .join(crate::item_type_lookup::get_valid_filename(name))
+        .to_string_lossy()
+        .into_owned();
+    loop {
+        match tokio::fs::create_dir(&path).await {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => path.push('1'),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// [`new_playlist_folder`] and the id `Folder.AddChild` derives from it
+/// under `mode`. A row already at that id (a playlist whose folder went
+/// missing) keeps the folder, made again for it, and the next name is
+/// tried, so the id is always free.
+///
+/// # Errors
+/// The I/O error that kept a folder from being made, or a failed lookup.
+pub(crate) async fn new_playlist_folder_and_id(
+    db: &Database,
+    mode: &crate::item_type_lookup::IdDerivation,
+    playlists: &str,
+    name: &str,
+) -> Result<(String, Uuid), ServiceError> {
+    loop {
+        let path = new_playlist_folder(playlists, name)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create the playlist folder: {e}")))?;
+        let id = crate::item_type_lookup::derive_item_id_with(mode, BaseItemKind::Playlist, &path)
+            .ok_or_else(|| ServiceError::backend("no stored type name for Playlist"))?;
+        if !crate::item_persistence_service::row_exists(db, id).await? {
+            return Ok((path, id));
+        }
+    }
 }
 
 /// Linked membership and local alternates are read in bounded batches rather
@@ -1044,7 +1098,6 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         request: &PlaylistCreationRequest,
     ) -> Result<PlaylistCreationResult, ServiceError> {
-        let id = Uuid::new_v4();
         let name = request.name.clone().unwrap_or_default();
         // An unknown id fails the create before anything is written, as
         // upstream's does.
@@ -1053,7 +1106,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             _ => self.infer_media_type(&request.item_id_list).await?,
         };
         require_user(request.user_id)?;
-        let parent = playlists_folder(&self.db, &self.paths).await?;
+        let (parent, mode) = playlists_folder(&self.db, &self.paths).await?;
         // Playlist entries are positions, not a set (C# `LinkedChild.Create`
         // per item, no de-duplication).
         let entries: Vec<Entry> = self
@@ -1065,48 +1118,68 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // The enum's serde form IS Jellyfin's JSON string ("Video", …).
         let media_type = serde_json::to_value(media_type)
             .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
+        // Its own folder, and the id `Folder.AddChild` derives from that
+        // path: Jellyfin's rescan resolves every folder in the playlists
+        // folder to that id, and deletes a playlist row it finds no folder
+        // for.
+        let playlists = format!("{}/playlists", self.paths.data_path());
+        let (path, id) = new_playlist_folder_and_id(&self.db, &mode, &playlists, &name).await?;
         // One writer transaction: a playlist row committed without its owner
         // row would open to every caller as its owner (`decide_access`), and
         // no boot import could repair it.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        crate::item_persistence_service::insert_named_item_in(
-            &mut tx,
-            id,
-            BaseItemKind::Playlist,
-            &name,
-            true,
-            parent,
-        )
-        .await?;
-        // The ownership meta row (C# `OwnerUserId`/`OpenAccess`).
-        sqlx::query(
-            r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
-               VALUES (?1, ?2, ?3)"#,
-        )
-        .bind(guid_to_db(id))
-        .bind(guid_to_db(request.user_id))
-        .bind(i64::from(request.public.unwrap_or(false)))
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        // Seed the share list from the request (C# `Shares = options.Users`).
-        for share in &request.users {
-            upsert_share(&mut tx, id, share.user_id, share.can_edit).await?;
+        let written = async {
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            crate::item_persistence_service::insert_named_item_in(
+                &mut tx,
+                id,
+                BaseItemKind::Playlist,
+                &name,
+                true,
+                parent,
+            )
+            .await?;
+            crate::item_persistence_service::set_item_path_in(&mut tx, id, &path)
+                .await
+                .map_err(db_err)?;
+            // The ownership meta row (C# `OwnerUserId`/`OpenAccess`).
+            sqlx::query(
+                r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+                   VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(request.user_id))
+            .bind(i64::from(request.public.unwrap_or(false)))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            // Seed the share list from the request (C# `Shares = options.Users`).
+            for share in &request.users {
+                upsert_share(&mut tx, id, share.user_id, share.can_edit).await?;
+            }
+            write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
+            crate::item_persistence_service::stamp_playlist_in(
+                &mut tx,
+                id,
+                media_type.as_str(),
+                (!entries.is_empty()).then(chrono::Utc::now),
+            )
+            .await?;
+            // Write the owner, open access and shares into BaseItems.Data, which
+            // 12.0 still serialises and each boot re-imports.
+            item_data::sync_container_data_in(&mut tx, id).await?;
+            // `Playlist.PlaylistMediaType`, which Jellyfin reads back from `Data`.
+            item_data::set_data_key_in(&mut tx, id, "PlaylistMediaType", media_type).await?;
+            tx.commit().await.map_err(db_err)
         }
-        write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
-        crate::item_persistence_service::stamp_playlist_in(
-            &mut tx,
-            id,
-            media_type.as_str(),
-            (!entries.is_empty()).then(chrono::Utc::now),
-        )
-        .await?;
-        // Write the owner, open access and shares into BaseItems.Data, which
-        // 12.0 still serialises and each boot re-imports.
-        item_data::sync_container_data_in(&mut tx, id).await?;
-        // `Playlist.PlaylistMediaType`, which Jellyfin reads back from `Data`.
-        item_data::set_data_key_in(&mut tx, id, "PlaylistMediaType", media_type).await?;
-        tx.commit().await.map_err(db_err)?;
+        .await;
+        if let Err(err) = written {
+            // A folder with no row would come back as an empty playlist on a
+            // Jellyfin rescan.
+            if let Err(e) = tokio::fs::remove_dir(&path).await {
+                tracing::warn!(%e, path = %path, "could not remove an unused playlist folder");
+            }
+            return Err(err);
+        }
         if !entries.is_empty() {
             self.update_rating_to_items(id).await?;
         }
@@ -1665,12 +1738,19 @@ mod tests {
     /// Test paths under a temp root, so the provisioned containers land
     /// somewhere harmless.
     fn test_paths() -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        test_paths_in(std::path::Path::new("/tmp/ferrofin-collections-test"))
+    }
+
+    /// Test paths under `root`: a created playlist makes a folder there.
+    pub(super) fn test_paths_in(
+        root: &std::path::Path,
+    ) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
         Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-            "/tmp/ferrofin-collections-test",
-            "/tmp/ferrofin-collections-test/log",
-            "/tmp/ferrofin-collections-test/config",
-            "/tmp/ferrofin-collections-test/cache",
-            "/tmp/ferrofin-collections-test/web",
+            root,
+            root.join("log"),
+            root.join("config"),
+            root.join("cache"),
+            root.join("web"),
         ))
     }
 
@@ -1926,6 +2006,12 @@ mod tests {
     #[tokio::test]
     async fn a_created_playlist_reuses_the_existing_playlists_folder() {
         let db = test_db().await;
+        let (mgr, root) = playlist_manager(&db);
+        let folder = root
+            .path()
+            .join("data/playlists")
+            .to_string_lossy()
+            .into_owned();
         // What `user_view_manager::ensure_playlists_folder` leaves behind.
         let existing = Uuid::from_u128(0xF0DE);
         crate::item_persistence_service::insert_named_item(
@@ -1938,14 +2024,8 @@ mod tests {
         )
         .await
         .expect("seed the existing folder");
-        crate::test_support::set_item_path(
-            &db,
-            existing,
-            "/tmp/ferrofin-collections-test/data/playlists",
-        )
-        .await;
+        crate::test_support::set_item_path(&db, existing, &folder).await;
 
-        let mgr = playlist_manager(&db);
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("My Playlist".to_owned()),
@@ -1966,12 +2046,101 @@ mod tests {
             "the playlist reuses the folder already there, rather than a second one"
         );
 
-        let folders = crate::test_support::items_at_path(
-            &db,
-            "/tmp/ferrofin-collections-test/data/playlists",
-        )
-        .await;
+        let folders = crate::test_support::items_at_path(&db, &folder).await;
         assert_eq!(folders, 1, "exactly one playlists folder at that path");
+    }
+
+    /// gl-597: a created playlist is stored as `PlaylistManager.CreatePlaylist`
+    /// stores one: in a folder of its own in the playlists folder, named
+    /// `GetValidFilename(name)` with `1` appended while that is taken
+    /// (`GetTargetPath`), under the id `Folder.AddChild` derives from that
+    /// path. Without the folder an upload had nowhere to be saved beside, and
+    /// without the id Jellyfin's rescan would delete the row. The ids are
+    /// Jellyfin's own, worked out apart from Ferrofin: the MD5 of the UTF-16LE
+    /// `MediaBrowser.Controller.Playlists.Playlist` + `data\playlists\<folder>`
+    /// (`GetNewItemIdInternal`, case-sensitive ids by default).
+    #[tokio::test]
+    async fn a_created_playlist_gets_a_folder_and_the_id_its_path_derives() {
+        let db = test_db().await;
+        db.meta_set("item_id_derivation", "jellyfin-10.11.8")
+            .await
+            .expect("derivation");
+        let (mgr, root) = playlist_manager(&db);
+        let playlists = root.path().join("data/playlists");
+        for (folder, jellyfin_id) in [
+            ("Road  Trip ", "ac169649-cd0e-fce1-b4c2-0f38aa100497"),
+            ("Road  Trip 1", "2431360a-7a6f-47bc-9bb7-60c9e32fa505"),
+        ] {
+            let created = mgr
+                .create_playlist(&PlaylistCreationRequest {
+                    name: Some("Road: Trip?".to_owned()),
+                    user_id: Uuid::new_v4(),
+                    ..Default::default()
+                })
+                .await
+                .expect("create playlist");
+            let path = playlists.join(folder);
+            assert!(path.is_dir(), "{} is made", path.display());
+            let path = path.to_string_lossy().into_owned();
+            let id = Uuid::parse_str(&created.id).expect("playlist id");
+            assert_eq!(
+                crate::test_support::fetch_item(&db, id).await.path,
+                Some(path.clone())
+            );
+            assert_eq!(id.to_string(), jellyfin_id);
+        }
+    }
+
+    /// A playlist already at the id a new folder derives (one whose folder
+    /// went missing) gets that folder back, and the create takes the next
+    /// name rather than failing on the stored id.
+    #[tokio::test]
+    async fn a_created_playlist_skips_a_name_whose_id_is_taken() {
+        let db = test_db().await;
+        let (mgr, root) = playlist_manager(&db);
+        let (mode, _) = super::container_identity(&db, &mgr.paths)
+            .await
+            .expect("mode");
+        let playlists = root.path().join("data/playlists");
+        let taken_path = playlists.join("Mix").to_string_lossy().into_owned();
+        let taken = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::Playlist,
+            &taken_path,
+        )
+        .expect("id");
+        crate::test_support::seed_named_item(&db, taken, BaseItemKind::Playlist, "Mix").await;
+        crate::test_support::set_item_path(&db, taken, &taken_path).await;
+
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..Default::default()
+            })
+            .await
+            .expect("create playlist");
+        let id = Uuid::parse_str(&created.id).expect("playlist id");
+        assert_ne!(id, taken);
+        let next = playlists.join("Mix1").to_string_lossy().into_owned();
+        assert_eq!(
+            crate::test_support::fetch_item(&db, id).await.path,
+            Some(next)
+        );
+        assert!(std::path::Path::new(&taken_path).is_dir());
+    }
+
+    /// An empty name gets a folder inside the playlists folder, never the
+    /// `playlists1` beside it that upstream's `Path.Combine` makes of it.
+    #[tokio::test]
+    async fn a_playlist_with_no_name_gets_a_folder_inside_the_playlists_folder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let playlists = tmp.path().join("playlists").to_string_lossy().into_owned();
+        let path = super::new_playlist_folder(&playlists, "")
+            .await
+            .expect("folder");
+        assert_eq!(path, format!("{playlists}/1"));
+        assert!(std::path::Path::new(&path).is_dir());
     }
 
     /// A created collection has to stay reachable.
@@ -2328,7 +2497,8 @@ mod tests {
             Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
         ));
         assert_eq!(rating(heat).await, (Some("R".to_owned()), None));
-        let playlists = playlist_manager(&db).with_visibility(
+        let (playlists, _root) = playlist_manager(&db);
+        let playlists = playlists.with_visibility(
             Arc::clone(&visibility),
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone())),
         );
@@ -2468,7 +2638,7 @@ mod tests {
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
 
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
 
         // Reads below must come from the owner: playlists are visible only to
         // their owner / shared users now.
@@ -2521,7 +2691,7 @@ mod tests {
         seed_item(&db, track_a, BaseItemKind::Audio).await;
         seed_item(&db, track_b, BaseItemKind::Audio).await;
 
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
 
         let owner = Uuid::new_v4();
         let created = mgr
@@ -2560,7 +2730,7 @@ mod tests {
         for id in [a, b, c] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -2592,7 +2762,7 @@ mod tests {
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
 
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
 
         let owner = Uuid::new_v4();
         let created = mgr
@@ -2636,7 +2806,7 @@ mod tests {
         for id in [a, b, c] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -2694,7 +2864,7 @@ mod tests {
         for id in [a, b] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -2753,7 +2923,7 @@ mod tests {
         for id in [a, b, c] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -2798,7 +2968,7 @@ mod tests {
         let db = test_db().await;
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -2840,7 +3010,7 @@ mod tests {
         let db = test_db().await;
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (alice, carol) = (Uuid::new_v4(), Uuid::new_v4());
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -2885,7 +3055,7 @@ mod tests {
         for id in [a, b] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
 
         // Shared read-only with bob.
@@ -2940,7 +3110,7 @@ mod tests {
         // the fallback must still answer: empty for the owner, NotFound for a
         // stranger.
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let alice = Uuid::new_v4();
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -2976,7 +3146,7 @@ mod tests {
         let track = Uuid::new_v4();
         seed_item(&db, legacy, BaseItemKind::Playlist).await;
         seed_item(&db, track, BaseItemKind::Audio).await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         mgr.add_item_to_playlist(legacy, &[track], None, Uuid::new_v4())
             .await
             .expect("add");
@@ -2999,7 +3169,7 @@ mod tests {
         for id in [member, shortcut] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -3034,7 +3204,7 @@ mod tests {
     #[tokio::test]
     async fn get_playlist_items_missing_is_not_found() {
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let err = mgr
             .get_playlist_items(Uuid::new_v4(), Uuid::new_v4())
             .await
@@ -3048,7 +3218,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_playlist_is_not_found() {
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let err = mgr
             .get_playlist_for_user(Uuid::new_v4(), Uuid::new_v4())
             .await
@@ -3065,7 +3235,7 @@ mod tests {
         use ferrofin_model::playlists::PlaylistUserUpdateRequest;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
                 name: Some("Shared".to_owned()),
@@ -3128,7 +3298,7 @@ mod tests {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let bob = Uuid::new_v4();
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -3175,7 +3345,7 @@ mod tests {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let bob = Uuid::new_v4();
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -3223,7 +3393,7 @@ mod tests {
         use ferrofin_model::playlists::PlaylistUserUpdateRequest;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (playlist_id, bob) = (Uuid::new_v4(), Uuid::new_v4());
         seed_item(&db, playlist_id, BaseItemKind::Playlist).await;
         mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
@@ -3265,7 +3435,7 @@ mod tests {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (bob, carol, member) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         seed_item(&db, member, BaseItemKind::Movie).await;
         let playlist_id = Uuid::parse_str(
@@ -3331,7 +3501,7 @@ mod tests {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (playlist_id, bob, dave) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         crate::test_support::seed_item_with_data(
             &db,
@@ -3362,14 +3532,19 @@ mod tests {
     }
 
     /// Builds a playlist manager over `db` (the repeated three-collaborator
-    /// constructor the access tests share).
-    fn playlist_manager(db: &ferrofin_db::Database) -> FerrofinPlaylistManager {
-        FerrofinPlaylistManager::new(
+    /// constructor the access tests share), on a data directory of its own
+    /// that lives as long as the returned guard.
+    fn playlist_manager(
+        db: &ferrofin_db::Database,
+    ) -> (FerrofinPlaylistManager, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
             item_repository_over(db.clone()),
-            test_paths(),
-        )
+            test_paths_in(root.path()),
+        );
+        (mgr, root)
     }
 
     #[tokio::test]
@@ -3378,7 +3553,7 @@ mod tests {
         use ferrofin_traits::collections::PlaylistAccessLevel;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (alice, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -3419,7 +3594,7 @@ mod tests {
         use ferrofin_traits::error::ServiceError;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let invalid = |result: Result<(), ServiceError>| {
             assert!(
                 matches!(result, Err(ServiceError::InvalidInput(_))),
@@ -3469,7 +3644,7 @@ mod tests {
         use ferrofin_traits::collections::PlaylistAccessLevel;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
                 name: Some("Public".to_owned()),
@@ -3497,7 +3672,7 @@ mod tests {
         use ferrofin_traits::collections::PlaylistAccessLevel;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         // A pre-ownership row: the BaseItems row exists with no `FerrofinPlaylists` meta.
         let legacy = Uuid::new_v4();
         seed_item(&db, legacy, BaseItemKind::Playlist).await;
@@ -3516,7 +3691,7 @@ mod tests {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (alice, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let create = |name: &str, owner: Uuid, users: Vec<PlaylistUserPermissions>| {
             PlaylistCreationRequest {
@@ -3560,7 +3735,7 @@ mod tests {
         use ferrofin_traits::collections::PlaylistAccessLevel;
 
         let db = test_db().await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let (alice, bob, dave) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -3623,12 +3798,12 @@ mod tests {
         owner: Uuid,
         shared_with: Option<Uuid>,
         public: bool,
-    ) -> (FerrofinPlaylistManager, Uuid, Uuid) {
+    ) -> (FerrofinPlaylistManager, Uuid, Uuid, tempfile::TempDir) {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let track = Uuid::new_v4();
         seed_item(db, track, BaseItemKind::Audio).await;
-        let mgr = playlist_manager(db);
+        let (mgr, root) = playlist_manager(db);
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("Members".to_owned()),
@@ -3643,7 +3818,12 @@ mod tests {
             })
             .await
             .expect("create");
-        (mgr, Uuid::parse_str(&created.id).expect("uuid"), track)
+        (
+            mgr,
+            Uuid::parse_str(&created.id).expect("uuid"),
+            track,
+            root,
+        )
     }
 
     /// The member ids `get_playlist_items` returns for `reader`, in link order.
@@ -3667,7 +3847,7 @@ mod tests {
         // that leg must let through.
         let db = test_db().await;
         let (owner, friend) = (Uuid::new_v4(), Uuid::new_v4());
-        let (mgr, playlist_id, track) =
+        let (mgr, playlist_id, track, _root) =
             playlist_with_one_track(&db, owner, Some(friend), false).await;
 
         assert_eq!(
@@ -3689,7 +3869,7 @@ mod tests {
         // playlist. Invisible reads as missing (never a partial member list).
         let db = test_db().await;
         let (owner, friend, stranger) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let (mgr, playlist_id, _track) =
+        let (mgr, playlist_id, _track, _root) =
             playlist_with_one_track(&db, owner, Some(friend), false).await;
 
         let err = mgr
@@ -3717,7 +3897,7 @@ mod tests {
         // Open access is orthogonal to the share join: with no share row at all
         // any caller still reads the members (unchanged behaviour).
         let db = test_db().await;
-        let (mgr, playlist_id, track) =
+        let (mgr, playlist_id, track, _root) =
             playlist_with_one_track(&db, Uuid::new_v4(), None, true).await;
 
         assert_eq!(
@@ -3778,7 +3958,8 @@ mod tests {
             row.official_rating = Some(rating.to_owned());
             crate::test_support::save_item(&db, &row).await;
         }
-        let mgr = playlist_manager(&db).with_visibility(
+        let (mgr, _root) = playlist_manager(&db);
+        let mgr = mgr.with_visibility(
             Arc::new(crate::item_visibility::ItemVisibility::new(
                 db.clone(),
                 item_repository_over(db.clone()),
@@ -3866,14 +4047,14 @@ mod tests {
     async fn seeded_playlist(
         db: &ferrofin_db::Database,
         items: &[Uuid],
-    ) -> (FerrofinPlaylistManager, Uuid, Uuid) {
+    ) -> (FerrofinPlaylistManager, Uuid, Uuid, tempfile::TempDir) {
         let mut unique = items.to_vec();
         unique.sort();
         unique.dedup();
         for id in unique {
             seed_item(db, id, BaseItemKind::Audio).await;
         }
-        let mgr = playlist_manager(db);
+        let (mgr, root) = playlist_manager(db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -3884,7 +4065,12 @@ mod tests {
             })
             .await
             .expect("create");
-        (mgr, Uuid::parse_str(&created.id).expect("uuid"), owner)
+        (
+            mgr,
+            Uuid::parse_str(&created.id).expect("uuid"),
+            owner,
+            root,
+        )
     }
 
     /// C# `AddToPlaylistInternal` (12.0) has no duplicate check: the key is
@@ -3893,7 +4079,7 @@ mod tests {
     async fn playlist_add_of_the_same_item_twice_keeps_two_entries() {
         let db = test_db().await;
         let a = Uuid::new_v4();
-        let (mgr, playlist, owner) = seeded_playlist(&db, &[a]).await;
+        let (mgr, playlist, owner, _root) = seeded_playlist(&db, &[a]).await;
         mgr.add_item_to_playlist(playlist, &[a], None, owner)
             .await
             .expect("add again");
@@ -3927,7 +4113,7 @@ mod tests {
     async fn concurrent_adds_to_a_playlist_keep_every_entry() {
         let db = test_db().await;
         let a = Uuid::new_v4();
-        let (mgr, playlist, owner) = seeded_playlist(&db, &[a]).await;
+        let (mgr, playlist, owner, _root) = seeded_playlist(&db, &[a]).await;
         let item = [a];
         let adds = (0..8).map(|_| mgr.add_item_to_playlist(playlist, &item, None, owner));
         for result in futures_util::future::join_all(adds).await {
@@ -3941,7 +4127,7 @@ mod tests {
     async fn remove_item_from_playlist_removes_every_occurrence() {
         let db = test_db().await;
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let (mgr, playlist, _) = seeded_playlist(&db, &[a, b]).await;
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
         mgr.add_item_to_playlist(playlist, &[a], None, Uuid::nil())
             .await
             .expect("dup");
@@ -3958,7 +4144,7 @@ mod tests {
     async fn move_item_moves_the_first_occurrence() {
         let db = test_db().await;
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let (mgr, playlist, _) = seeded_playlist(&db, &[a, b, a]).await;
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b, a]).await;
         mgr.move_item(
             &playlist.to_string(),
             &a.simple().to_string(),
@@ -3975,7 +4161,7 @@ mod tests {
     async fn update_playlist_with_ids_replaces_the_entries() {
         let db = test_db().await;
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let (mgr, playlist, _) = seeded_playlist(&db, &[a, b]).await;
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
         mgr.update_playlist(&PlaylistUpdateRequest {
             id: playlist,
             ids: Some(vec![b, b]),
@@ -4029,7 +4215,7 @@ mod tests {
         let (movie, version) = movie_with_a_version(&db).await;
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
-        let mgr = playlist_manager(&db);
+        let (mgr, _root) = playlist_manager(&db);
         let caller = Uuid::new_v4();
         let movie_str = movie.to_string();
 
