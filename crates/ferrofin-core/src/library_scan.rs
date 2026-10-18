@@ -1702,8 +1702,11 @@ pub enum ScanPasses {
     /// scheduled scan, `POST /Library/Refresh`, a library change).
     Library,
     /// Only what is scoped to the items this scan touched: the music
-    /// refresh of the albums and artists among them, their album covers, and
-    /// the children-derived columns of the folders it planned.
+    /// refresh of the albums and artists among them, their album covers, the
+    /// children-derived columns of the folders it planned, and the generated
+    /// Primaries of the photo albums, folders and playlists among them — plus
+    /// the library tiles for a library's or the root's refresh, and the user
+    /// root's image for the root's.
     /// An item or folder refresh over the API, and the library monitor's
     /// refresh of what a changed path belongs to (the watcher, the
     /// webhooks): upstream's `ProviderManager.RefreshItem` runs no post-scan
@@ -1904,6 +1907,9 @@ pub struct ScanRun<'a> {
     pub lane: Option<&'a dyn PriorityLane>,
     /// Where it records the ids it planned, for the scan serving it.
     touched: Option<&'a TouchedIds>,
+    /// It validates every library from the root ([`ScanTarget::All`]): a
+    /// refresh of the root reaches the user root's image too.
+    from_root: bool,
 }
 
 impl std::fmt::Debug for ScanRun<'_> {
@@ -1937,6 +1943,7 @@ impl<'a> ScanRun<'a> {
             passes: ScanPasses::Library,
             lane: None,
             touched: None,
+            from_root: false,
         }
     }
 
@@ -2547,6 +2554,25 @@ enum ItemSaved {
     Cancelled,
 }
 
+/// Whether a refresh with `options` runs every provider whatever the item's
+/// own state — the options' half of `runAllProviders`
+/// (`MetadataService.cs:654-657`): "Replace all metadata" or a full refresh,
+/// with a metadata mode at all (`:160`).
+///
+/// TODO(parity, open work item — NOT an accepted divergence; gl-594): the
+/// library tiles and the user root's image a library or root refresh
+/// reaches are forced by this alone; upstream also forces a row on its own
+/// first refresh or once its library's `AutomaticRefreshIntervalDays` have
+/// passed (`isFirstRefresh`/`requiresRefresh` at Default or above). Un-defer
+/// path: decide those rows with `plan_item_refresh` from their stored
+/// `DateLastRefreshed` and their library's options, as the walk decides the
+/// rows it plans, and test a Default root refresh of a never-refreshed root.
+fn runs_every_provider(options: &MetadataRefreshOptions) -> bool {
+    options.metadata_refresh_mode != MetadataRefreshMode::None
+        && (options.replace_all_metadata
+            || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh)
+}
+
 /// Whether the external subtitle or audio files beside `item`'s video differ
 /// from the ones its stored streams came from — `ProbeProvider.HasChanged`
 /// comparing `GetExternalFiles` with `Video.SubtitleFiles`/`AudioFiles`
@@ -3130,6 +3156,12 @@ struct ScanWork<'r> {
     served: Served,
     /// The fetcher policy of an item in no library (a by-name artist).
     outside: FetcherPolicy<'r>,
+    /// The rows with a generated Primary (a photo album, folder or playlist,
+    /// [`DynamicImageKind`](crate::dynamic_images::DynamicImageKind)) the walk
+    /// refreshed, each with whether that refresh ran every provider
+    /// (`runAllProviders`, which forces the redraw). Their providers run in
+    /// the closing passes, once the art they draw from is saved.
+    generated_images: Vec<(Uuid, bool)>,
 }
 
 impl ScanWork<'_> {
@@ -4390,6 +4422,7 @@ impl LibraryScanner {
         tracking.started().await;
         let run = ScanRun {
             tracking: Some(&tracking),
+            from_root: only.is_none(),
             ..run
         };
         // One library at a time (sync: `NamingOptions` never crosses an
@@ -5510,6 +5543,7 @@ impl LibraryScanner {
             music: Vec::new(),
             served: Served::new(),
             outside: refresh.outside,
+            generated_images: Vec::new(),
         };
         // The versions the walk took out of a local group, by the primary
         // that owned them ([`released_from`]). A stop still unlinks them: the
@@ -5709,6 +5743,33 @@ impl LibraryScanner {
                     replace: playlists::replaces_members(request.options),
                 });
             }
+            // `RefreshWithProviders`' custom providers (`MetadataService.cs:
+            // 922-925`), skipped for a locked item (`:785-788`) and with
+            // metadata mode `None`: the generated Primary, drawn by the
+            // closing passes. An artist's provider draws nothing
+            // (`ArtistSources`), so it is not asked.
+            //
+            // TODO(parity, open work item — NOT an accepted divergence;
+            // gl-593): the walk has already decided this row's save and stamped its
+            // `DateLastRefreshed` when the closing pass draws, so a failed
+            // draw does not withhold the stamp and a drawn image does not
+            // re-save the row, as `RunCustomProvider` and `SaveInternal` do in
+            // the same `RefreshMetadata` upstream. Un-defer path: leave these
+            // rows' stamp and save to the closing pass, as `music_pending`
+            // leaves an album's to the music pass, which stamps only a
+            // successful draw and saves on `ImageUpdate`; test it with a draw
+            // that fails.
+            if !locked
+                && !undecodable
+                && !matches!(saved, ItemSaved::Cancelled)
+                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
+                && crate::dynamic_images::DynamicImageKind::for_entity(&item.entity).is_some_and(
+                    |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
+                )
+            {
+                work.generated_images
+                    .push((item.id, plan.run_all_providers));
+            }
             match saved {
                 ItemSaved::Unchanged => outcome.unchanged += 1,
                 ItemSaved::Saved if is_new => outcome.created += 1,
@@ -5812,7 +5873,10 @@ impl LibraryScanner {
                 Box::pin(self.post_scan_passes(folders, &planned, &art_cache, &work, run)).await
             }
             ScanPasses::Touched => {
-                Box::pin(self.touched_passes(&planned, &art_cache, &work, run)).await
+                // A library's or the root's refresh validates whole
+                // libraries, whose tiles it refreshes too.
+                let libraries = scope.is_none().then_some(folders);
+                Box::pin(self.touched_passes(&planned, &art_cache, &work, libraries, run)).await
             }
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
@@ -6121,15 +6185,18 @@ impl LibraryScanner {
     /// The closing passes of an item or folder refresh, and of the library
     /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
     /// albums and artists it refreshed, the album covers this pass gathered,
-    /// and the children-derived columns of the folders it planned — never a
-    /// pass over the whole database. (The folders planned for context
-    /// included: see the owner-approved divergence at
+    /// the children-derived columns of the folders it planned, the generated
+    /// Primaries of the photo albums, folders and playlists it refreshed, and
+    /// the tiles of the `libraries` a library's or the root's refresh
+    /// validated whole — never a pass over the whole database. (The folders
+    /// planned for context included: see the owner-approved divergence at
     /// [`update_folder_aggregates`](Self::update_folder_aggregates).)
     async fn touched_passes(
         &self,
         planned: &[Planned],
         art_cache: &ArtworkCache,
         work: &ScanWork<'_>,
+        libraries: Option<&[VirtualFolderInfo]>,
         run: ScanRun<'_>,
     ) -> bool {
         if run.cancel.is_cancelled() {
@@ -6140,6 +6207,50 @@ impl LibraryScanner {
         self.finish_album_artwork(art_cache, run).await;
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
+        }
+        // The custom providers of what it refreshed, after the art they draw
+        // from: the photo albums, folders and playlists it walked. A cancel
+        // stops between two passes, as library validation's do.
+        if let Some(providers) = self.dynamic_image_providers() {
+            let between =
+                || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+                    Box::pin(async move {
+                        Box::pin(self.serve_lane(run)).await;
+                    })
+                };
+            if run.cancel.is_cancelled() {
+                return false;
+            }
+            if let Err(err) = providers
+                .refresh_rows_between(&work.generated_images, &between)
+                .await
+            {
+                tracing::warn!(%err, "dynamic image pass failed");
+            }
+            let runs = run.options.metadata_refresh_mode != MetadataRefreshMode::None;
+            let force = runs_every_provider(run.options);
+            // `CollectionFolderImageProvider`, of each library a library's or
+            // the root's refresh validated.
+            if run.cancel.is_cancelled() {
+                return false;
+            }
+            if runs
+                && let Some(libraries) = libraries
+                && let Err(err) = self.refresh_library_images(libraries, force).await
+            {
+                tracing::warn!(%err, "library image pass failed");
+            }
+            // The user root's image a root's refresh reaches, after the tiles
+            // it copies.
+            if run.cancel.is_cancelled() {
+                return false;
+            }
+            if runs
+                && run.from_root
+                && let Err(err) = providers.refresh_user_root_between(force, &between).await
+            {
+                tracing::warn!(%err, "root image pass failed");
+            }
         }
         run.report(100.0);
         !run.cancel.is_cancelled()
@@ -7554,8 +7665,8 @@ impl LibraryScanner {
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
-    /// | library tiles | their own 7-day staleness (`HasChangedByDate`) | `CollectionFolderImageProvider` |
-    /// | dynamic images | per item: no generated Primary yet, or its file changed (`HasChangedByDate`) | `BaseDynamicImageProvider.HasChanged` |
+    /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
+    /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     // One straight sequence of the closing passes, each timed; a helper per
     // pass would only scatter the table above.
@@ -7662,7 +7773,10 @@ impl LibraryScanner {
         // that fetch that content's artwork — otherwise a first scan sees no
         // art and the "My Media" tile keeps the icon placeholder.
         let started = std::time::Instant::now();
-        if let Err(err) = self.refresh_library_images(folders).await {
+        if let Err(err) = self
+            .refresh_library_images(folders, runs_every_provider(run.options))
+            .await
+        {
             tracing::warn!(%err, "library image pass failed");
         }
         timings.library_images = started.elapsed();
@@ -7674,24 +7788,26 @@ impl LibraryScanner {
         // the end of library validation). Same ordering reason as the library
         // tiles: the collages sample the artwork the passes above produced.
         let started = std::time::Instant::now();
-        if let (Some(items), Some(processor), Some(meta_root)) = (
-            &self.item_repository,
-            &self.image_processor,
-            &self.metadata_dir,
-        ) {
-            let providers = crate::dynamic_images::DynamicImageProviders::new(
-                Arc::clone(items),
-                Arc::clone(&self.persistence),
-                Arc::clone(processor),
-                meta_root.clone(),
-            );
+        if let Some(providers) = self.dynamic_image_providers() {
             let between =
                 || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
                     Box::pin(async move {
                         Box::pin(self.serve_lane(run)).await;
                     })
                 };
-            if let Err(err) = providers.refresh_all_between(&between).await {
+            // The rows the walk refreshed with every provider redraw first;
+            // the gated pass over every other row follows.
+            let forced: Vec<(Uuid, bool)> = work
+                .generated_images
+                .iter()
+                .copied()
+                .filter(|&(_, force)| force)
+                .collect();
+            if let Err(err) = providers.refresh_rows_between(&forced, &between).await {
+                tracing::warn!(%err, "forced dynamic image pass failed");
+            }
+            let drawn = forced.iter().map(|&(id, _)| id).collect();
+            if let Err(err) = providers.refresh_all_between(&drawn, &between).await {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
         }
@@ -7758,6 +7874,24 @@ impl LibraryScanner {
             "retiring by-name MusicArtist rows superseded by resolved artist folders"
         );
         self.persistence.delete_items(&stale).await.map(|_| ())
+    }
+
+    /// The dynamic image providers over this scanner's stores, when it has all
+    /// of them (an item repository, an image processor and an art folder).
+    fn dynamic_image_providers(&self) -> Option<crate::dynamic_images::DynamicImageProviders> {
+        let (Some(items), Some(processor), Some(meta_root)) = (
+            &self.item_repository,
+            &self.image_processor,
+            &self.metadata_dir,
+        ) else {
+            return None;
+        };
+        Some(crate::dynamic_images::DynamicImageProviders::new(
+            Arc::clone(items),
+            Arc::clone(&self.persistence),
+            Arc::clone(processor),
+            meta_root.clone(),
+        ))
     }
 
     /// The children-derived columns of every folder this scan planned: the
@@ -11350,9 +11484,14 @@ impl LibraryScanner {
     /// upstream's (`BaseDynamicImageProvider`/`HasChangedByDate`). Without
     /// this, the home screen's "My Media" tiles render the icon-on-blue
     /// fallback forever.
+    ///
+    /// `force` is a library or root refresh that runs every provider
+    /// (`runAllProviders`); [`library_tile_due`](Self::library_tile_due) says
+    /// which tiles it redraws.
     async fn refresh_library_images(
         &self,
         folders: &[VirtualFolderInfo],
+        force: bool,
     ) -> Result<(), ServiceError> {
         let (Some(items), Some(processor), Some(meta_root)) = (
             &self.item_repository,
@@ -11367,14 +11506,7 @@ impl LibraryScanner {
             };
             let out_dir = meta_root.join(guid_to_db(cf));
             let out = out_dir.join("primary.png");
-            // Regenerate only when missing or older than 7 days (upstream's
-            // HasChangedByDate window).
-            let fresh = std::fs::metadata(&out)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
-            if fresh {
+            if !Self::library_tile_due(items, cf, &out, force).await? {
                 continue;
             }
             // Random content sample; over-fetch since not every row has art.
@@ -11447,11 +11579,68 @@ impl LibraryScanner {
                 height: options.height,
                 blur_hash: None,
             };
-            if let Err(err) = self.persistence.save_item_images(cf, &[info]).await {
+            // `ProviderManager.SaveImage` replaces the Primary only; the
+            // library's other images stay.
+            let mut images = match items.get_image_infos(cf).await {
+                Ok(images) => images,
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "failed to read the library images");
+                    continue;
+                }
+            };
+            images.retain(|i| i.image_type != ImageType::Primary);
+            images.insert(0, info);
+            if let Err(err) = self.persistence.save_item_images(cf, &images).await {
                 tracing::warn!(%err, library = %cf, "failed to persist the library image");
             }
         }
         Ok(())
+    }
+
+    /// Whether `library`'s tile at `out` is drawn this pass. Never for a
+    /// locked library: `RefreshWithProviders` returns before its custom
+    /// providers (`MetadataService.cs:785-788`). When missing or older than 7
+    /// days (upstream's `HasChangedByDate` window), as the scan has always
+    /// drawn it. A fresh tile only when `force`d (`runAllProviders`), and,
+    /// as `FetchAsync`, not over a Primary this pass did not draw (a remote
+    /// one, or a file outside the library's art folder).
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-591): a
+    /// missing or stale tile is drawn over such a Primary too, and Jellyfin's
+    /// `{metadata}/library/{xx}/{id}` folder is not taken for the library's
+    /// own. Un-defer path: drop image rows whose file is gone
+    /// (`ValidateImages`), then apply the `FetchAsync` rule before the date
+    /// gate, accepting both folder layouts as `remove_item_images` does.
+    async fn library_tile_due(
+        items: &Arc<dyn ItemRepository>,
+        library: Uuid,
+        out: &Path,
+        force: bool,
+    ) -> Result<bool, ServiceError> {
+        if items
+            .retrieve_item(library)
+            .await?
+            .is_some_and(|row| row.is_locked)
+        {
+            return Ok(false);
+        }
+        let fresh = std::fs::metadata(out)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
+        if !fresh || !force {
+            return Ok(!fresh);
+        }
+        let art_dir = out.parent().unwrap_or(out);
+        Ok(items
+            .get_image_infos(library)
+            .await?
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .is_none_or(|primary| {
+                primary.is_local_file() && Path::new(&primary.path).starts_with(art_dir)
+            }))
     }
 
     /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
