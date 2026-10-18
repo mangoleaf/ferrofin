@@ -18395,8 +18395,11 @@ impl MergeMode {
 ///   date) from a by-date name.
 ///
 /// No other kind takes anything (a book's year or series never comes back
-/// from its path). Two episode fields upstream may also set here are not
-/// ported yet — see the `TODO(parity)` notes below.
+/// from its path). The embedded MP4 episode info `Episode.BeforeMetadataRefresh`
+/// also reads is applied with the probe ([`embedded_episode_info_enabled`]).
+/// The one field upstream sets here that Ferrofin does not is an episode's
+/// `IndexNumberEnd` (open work item gl-102; see
+/// [`fill_episode_numbers_from_path`]).
 fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
