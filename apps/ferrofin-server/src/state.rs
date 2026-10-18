@@ -976,7 +976,8 @@ pub async fn build_app_state(
             .with_items(Arc::clone(&item_repository))
             .with_providers(lyric_providers)
             .with_metadata_path(metadata_root.clone())
-            .with_virtual_folders(Arc::clone(&virtual_folders)),
+            .with_virtual_folders(Arc::clone(&virtual_folders))
+            .with_media_streams(Arc::clone(&media_stream_repository)),
     );
     // Built after the virtual-folder manager: the refresh path reads the
     // owning library's saved options through it (C# `BaseItemManager`). Two
@@ -1870,6 +1871,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(lib_tasks::LyricDownloadTask::new(
             Arc::clone(&library),
             Arc::clone(&lyrics),
+            Arc::clone(&media_stream_repository),
         )));
         task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
             Arc::clone(&library),

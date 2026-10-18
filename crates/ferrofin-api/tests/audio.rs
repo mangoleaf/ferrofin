@@ -318,7 +318,20 @@ impl LibraryManager for StreamLibrary {
             // it, the way C# `GetItemById<Audio>` does.
             return Ok(Some(minimal_base_item(MOVIE_ID, "A Movie", "Movie")));
         }
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Song", "Audio")))
+        // A library track: the refresh a lyric write queues is its path's scan.
+        Ok((id == ITEM_ID).then(|| BaseItemEntity {
+            path: Some("/music/Artist/Album/A Song.flac".to_owned()),
+            top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
+            ..minimal_base_item(ITEM_ID, "A Song", "Audio")
+        }))
+    }
+
+    async fn queue_refresh_scan(
+        &self,
+        _target: ferrofin_traits::library::ScanTarget,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
     }
     async fn query_items(
         &self,
