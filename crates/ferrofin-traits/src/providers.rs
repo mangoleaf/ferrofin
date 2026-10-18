@@ -562,9 +562,9 @@ pub trait GeneratedImageProvider: Send + Sync {
     /// `FetchAsync` for one item: draws its Primary and reports
     /// [`ItemUpdateType::ImageUpdate`], or reports [`ItemUpdateType::None`] for
     /// a kind no provider supports, a Primary outside the item's metadata
-    /// folder (remote, or a local file elsewhere), or an item with nothing to
-    /// draw from. An upload stored in that folder is not told apart from a
-    /// drawn image yet (gl-590).
+    /// folder (remote, or a local file elsewhere, such as an upload saved
+    /// beside a genre's or playlist's path), or an item with nothing to draw
+    /// from.
     ///
     /// `force` is the refresh's `runAllProviders`; without it the provider
     /// draws only when its `HasChanged` gate opens (no Primary yet, or the

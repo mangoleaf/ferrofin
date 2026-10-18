@@ -120,6 +120,29 @@ fn is_nonspacing_mark(c: char) -> bool {
         0x20D0..=0x20FF) // Combining Diacritical Marks for Symbols
 }
 
+/// Case-insensitive `String.Replace` of every occurrence of `from` with `to`.
+///
+/// Mirrors C# `string.Replace(old, new, StringComparison.OrdinalIgnoreCase)`.
+/// Empty search or replacement strings leave the input unchanged.
+#[must_use]
+pub fn replace_ignore_ascii_case(haystack: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || to.is_empty() {
+        return haystack.to_owned();
+    }
+    let lower_hay = haystack.to_ascii_lowercase();
+    let lower_from = from.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower_hay[cursor..].find(&lower_from) {
+        let start = cursor + rel;
+        out.push_str(&haystack[cursor..start]);
+        out.push_str(to);
+        cursor = start + from.len();
+    }
+    out.push_str(&haystack[cursor..]);
+    out
+}
+
 /// Counts the number of occurrences of `needle` in `value`.
 ///
 /// C# operated on a `ReadOnlySpan<char>` (UTF-16 code units); this operates on

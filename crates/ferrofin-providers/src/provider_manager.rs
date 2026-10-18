@@ -3039,10 +3039,15 @@ impl LocalProviderManager {
                 let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
             }
         }
+        // `SetImagePath(…, FileInfo)`: the file's own modification time, so
+        // the dynamic image providers' date gate sees an upload as current.
+        let date_modified = std::fs::metadata(&dest)
+            .and_then(|info| info.modified())
+            .map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
-            date_modified: Utc::now(),
+            date_modified,
             width: 0,
             height: 0,
             blur_hash: None,
@@ -9168,6 +9173,32 @@ mod tests {
             .unwrap();
         assert!(identical.path.strip_suffix("backdrop3.png").is_some());
         assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
+    }
+
+    /// `SetImagePath(…, FileInfo)`: an upload records its file's own
+    /// modification time, so the dynamic image providers' date gate sees an
+    /// upload left in the internal folder as current (gl-590).
+    #[test]
+    fn image_upload_records_the_file_modification_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let image = manager
+            .write_image_file(
+                Uuid::from_u128(0x9590),
+                b"art",
+                "image/png",
+                ImageType::Primary,
+                None,
+            )
+            .unwrap();
+        let modified = std::fs::metadata(&image.path).unwrap().modified().unwrap();
+        assert_eq!(
+            image.date_modified,
+            chrono::DateTime::<chrono::Utc>::from(modified)
+        );
     }
 
     #[test]
