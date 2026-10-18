@@ -861,6 +861,15 @@ fn build_runtime_parts(
     // HostState).
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
         .map_err(|e| ServiceError::backend(format!("wasi linker setup failed: {e:#}")))?;
+    // …then shadow its monotonic clock, whose waits would outlast the call
+    // deadline (see DeadlineClocks).
+    linker.allow_shadowing(true);
+    wasmtime_wasi::p2::bindings::clocks::monotonic_clock::add_to_linker::<
+        HostState,
+        bindings::DeadlineClocks,
+    >(&mut linker, bindings::DeadlineClocks::view)
+    .map_err(|e| ServiceError::backend(format!("wasi clock linker setup failed: {e:#}")))?;
+    linker.allow_shadowing(false);
     let linker = Arc::new(linker);
 
     Ok((engine, linker))
