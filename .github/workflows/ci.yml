@@ -18,8 +18,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # Debug builds of this 20-crate workspace overflow the runner's ~14 GB free
-  # disk; debuginfo is useless in CI (nothing is debugged interactively).
+  # Debuginfo is useless in CI (nothing is debugged interactively) and only
+  # inflates target/ and the rust-cache entries.
   CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
@@ -31,11 +31,10 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: free runner disk (~25 GB of preinstalled toolchains)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+      # No disk freeing: the build fits the runner's free disk without it. The
+      # df/du steps record the margin, so a future overflow shows in the log.
+      - name: disk at start
+        run: df -h /
       # NOTE: the benchmark/parity suite (v2) and its CI gates were retired on
       # 2026-09-02 by owner decision. Suite v3 (bench/) deliberately does NOT run here:
       # it needs a quiet machine, pinned cores and ~17 GB of generated test data, and a
@@ -65,6 +64,11 @@ jobs:
         # names); no CI job runs plain `cargo test`'s threads-in-one-process model.
       - run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --workspace
       - run: cargo test --workspace --doc # nextest cannot run doctests
+      - name: disk at end
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true # absent when the job failed before building
 
 
   shell-tests:
@@ -103,11 +107,10 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: free runner disk (~25 GB of preinstalled toolchains)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+      # No disk freeing: the build fits the runner's free disk without it. The
+      # df/du steps record the margin, so a future overflow shows in the log.
+      - name: disk at start
+        run: df -h /
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
         # the 1.98.1 branch on every master merge (orphaning its SHAs) and moves
@@ -127,6 +130,11 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: scripts/coverage-gate.sh "$SHARD"
+      - name: disk at end
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true # absent when the job failed before building
 
   coverage:
     needs: coverage-shard
