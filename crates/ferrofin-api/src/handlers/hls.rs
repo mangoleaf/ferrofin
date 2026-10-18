@@ -288,6 +288,10 @@ struct HlsQuery {
     /// The negotiated subtitle delivery method name.
     #[serde(default)]
     subtitle_method: Option<String>,
+    /// Whether the subtitle is burned into any transcoded video
+    /// (`alwaysBurnInSubtitleWhenTranscoding`, default `false`).
+    #[serde(default)]
+    always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The client's transcode reasons (forwarded into the master's variant URL).
     #[serde(default)]
     transcode_reasons: Option<String>,
@@ -414,6 +418,9 @@ fn build_request(
         min_segments: query.min_segments,
         subtitle_stream_index: query.subtitle_stream_index,
         subtitle_method: query.subtitle_method,
+        always_burn_in_subtitle_when_transcoding: query
+            .always_burn_in_subtitle_when_transcoding
+            .unwrap_or(false),
         transcode_reasons: query.transcode_reasons,
         enable_subtitles_in_manifest: query
             .enable_subtitles_in_manifest
@@ -1208,7 +1215,7 @@ mod tests {
             "Profile=high&Level=41&Framerate=30&Width=1280&Height=720&MinSegments=2&\
              SubtitleStreamIndex=3&SubtitleMethod=Hls&TranscodeReasons=ContainerNotSupported&\
              EnableSubtitlesInManifest=true&EnableAdaptiveBitrateStreaming=true&\
-             enableTrickplay=false",
+             enableTrickplay=false&alwaysBurnInSubtitleWhenTranscoding=true",
         )
         .expect("parses");
         let ctx = HlsRequestContext {
@@ -1227,6 +1234,7 @@ mod tests {
         assert_eq!(req.min_segments, Some(2));
         assert_eq!(req.subtitle_stream_index, Some(3));
         assert_eq!(req.subtitle_method.as_deref(), Some("Hls"));
+        assert!(req.always_burn_in_subtitle_when_transcoding);
         assert_eq!(
             req.transcode_reasons.as_deref(),
             Some("ContainerNotSupported")
@@ -1249,5 +1257,9 @@ mod tests {
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
         assert!(req.enable_subtitles_in_manifest);
         assert!(!req.is_in_local_network);
+        assert!(
+            !req.always_burn_in_subtitle_when_transcoding,
+            "defaults false"
+        );
     }
 }
