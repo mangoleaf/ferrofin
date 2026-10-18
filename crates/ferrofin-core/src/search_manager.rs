@@ -321,7 +321,7 @@ fn to_hint(
         backdrop_image_tag: None,
         backdrop_image_item_id: None,
         type_: kind,
-        is_folder: item.is_folder.then_some(true),
+        is_folder: crate::dto_service::runtime_is_folder(item).then_some(true),
         run_time_ticks: item.run_time_ticks,
         media_type: parse_media_type(item.media_type.as_deref()),
         start_date: item.start_date,
@@ -750,6 +750,9 @@ mod tests {
         let artist = Uuid::from_u128(0x502);
         seed_folder_item(&db, artist, BaseItemKind::MusicArtist, "Action", None).await;
         set_clean_name(&db, artist, "Action").await;
+        let series = Uuid::from_u128(0x503);
+        seed_folder_item(&db, series, BaseItemKind::Series, "Action", None).await;
+        set_clean_name(&db, series, "Action").await;
         let mgr = manager(&db);
 
         let result = mgr
@@ -759,7 +762,7 @@ mod tests {
             })
             .await
             .expect("hints");
-        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items.len(), 3);
 
         for hint in &result.items {
             // `SearchEngine` never fills `SearchHintInfo.MatchedTerm`, so the
@@ -776,9 +779,12 @@ mod tests {
                 .find(|h| h.type_ == kind)
                 .unwrap_or_else(|| panic!("no {kind:?} hint"))
         };
-        // `if (item.IsFolder) result.IsFolder = true;` — and nothing else.
+        // `if (item.IsFolder) result.IsFolder = true;` — and nothing else. A
+        // parentless artist is accessed by name, so not a folder
+        // (`MusicArtist.cs:30-33`), even stored as one by an earlier build.
         assert_eq!(by_kind(BaseItemKind::Movie).is_folder, None);
-        assert_eq!(by_kind(BaseItemKind::MusicArtist).is_folder, Some(true));
+        assert_eq!(by_kind(BaseItemKind::MusicArtist).is_folder, None);
+        assert_eq!(by_kind(BaseItemKind::Series).is_folder, Some(true));
     }
 
     #[tokio::test]

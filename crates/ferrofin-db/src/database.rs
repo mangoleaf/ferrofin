@@ -1167,8 +1167,8 @@ pub struct JellyfinGeneration {
 /// generation already has; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
 /// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
-/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041` and `0042` are
-/// never baselined: they are data-only or Ferrofin-side convergence and must run
+/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041`, `0042` and
+/// `0043` are never baselined: they are data-only or Ferrofin-side convergence and must run
 /// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
 /// matches both an upgraded install and a fresh one (see
 /// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
@@ -2698,10 +2698,11 @@ mod tests {
         assert!(by_name("12.0.0").baselined_versions.contains(&30));
         assert!(by_name("12.2.0").baselined_versions.contains(&30));
         // Retention (`0035`), intro skipper (`0036`–`0038`), the duplicate-index
-        // drop (`0039`), the fresh-install convergence (`0041`) and the orphan
-        // clean-up (`0042`) run on every path.
+        // drop (`0039`), the fresh-install convergence (`0041`), the orphan
+        // clean-up (`0042`) and the by-name `IsFolder` repair (`0043`) run on
+        // every path.
         for generation in &JELLYFIN_GENERATIONS {
-            for version in [35, 36, 37, 38, 39, 41, 42] {
+            for version in [35, 36, 37, 38, 39, 41, 42, 43] {
                 assert!(
                     !generation.baselined_versions.contains(&version),
                     "{}: {version:04} must run on every path",

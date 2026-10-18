@@ -17,8 +17,8 @@
 use super::*;
 use crate::test_support::{
     fetch_item, item_repository_over, link_alternate_version, save_item, seed_folder_item,
-    seed_item_genre, seed_library_over, seed_named_item, seed_top_parented_item, seed_user_data,
-    seed_user_with_defaults, test_db,
+    seed_item_genre, seed_item_value, seed_library_over, seed_named_item, seed_top_parented_item,
+    seed_user_data, seed_user_with_defaults, test_db,
 };
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::live_tv::ItemSortBy;
@@ -645,4 +645,43 @@ async fn by_name_counts_roll_a_series_up_from_its_episodes() {
         .find(|genre| genre.item.name.as_deref() == Some("Drama"))
         .expect("the genre is listed");
     assert_eq!(drama.counts.series_count, 1, "only the unwatched series");
+}
+
+/// A by-name artist is a leaf: `MusicArtist.IsFolder => !IsAccessedByName`
+/// (v12.2 `MusicArtist.cs:30-33`), so the scan stores it with `IsFolder = 0`
+/// and the page's `IsPlayed` reads the artist row's own played state. Stored
+/// as a folder, it had no leaves below it and always read played.
+#[tokio::test]
+async fn a_by_name_artist_reads_its_own_played_state() {
+    let (db, repository, user, user_id) = library().await;
+    let mut seed = Seed::default();
+    let song = seed.leaf(&db, BaseItemKind::Audio, "Song").await;
+    seed.write(&db, user_id).await;
+    seed_item_value(
+        &db,
+        song,
+        ferrofin_db::enums::ItemValueType::Artist,
+        "Miles Davis",
+    )
+    .await;
+    let artists = async |played: bool| -> Vec<String> {
+        let filter = InternalItemsQuery {
+            user: Some(user.clone()),
+            is_played: Some(played),
+            ..Default::default()
+        };
+        let page = repository.get_artists(&filter).await.expect("artists");
+        page.items
+            .iter()
+            .map(|artist| artist.item.id.clone())
+            .collect()
+    };
+    let unplayed = artists(false).await;
+    assert_eq!(unplayed.len(), 1, "the unplayed artist is listed");
+    assert!(artists(true).await.is_empty());
+
+    let artist = Uuid::parse_str(&unplayed[0]).expect("artist id");
+    seed_user_data(&db, user_id, artist, true, None).await;
+    assert!(artists(false).await.is_empty());
+    assert_eq!(artists(true).await, unplayed, "its own played row decides");
 }
