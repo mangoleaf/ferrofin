@@ -1841,7 +1841,10 @@ pub trait ItemCountService: Send + Sync {
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError>;
 
-    /// Batch-fetches played/total counts for several folders.
+    /// Batch-fetches played/total counts for several folders. A folder whose
+    /// counts are 0/0 has no entry (`GetPlayedAndTotalCountBatch`): the DTO
+    /// fill counts it per item (`Folder.FillUserDataDtoValues`), while the
+    /// `IsPlayed` filter reads a missing entry as 0/0 (`UserViewBuilder.Filter`).
     async fn get_played_and_total_count_batch(
         &self,
         folder_ids: &[Uuid],
