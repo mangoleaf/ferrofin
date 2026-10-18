@@ -328,6 +328,12 @@ pub struct MediaInfo {
     #[serde(skip)]
     pub raw_audio_tags: Option<HashMap<String, String>>,
 
+    /// Every external lyric file the scan matched for an audio track
+    /// (`Audio.LyricFiles`, distinct paths); only the first also becomes a
+    /// `Lyric` stream. Internal to the scan, never part of the HTTP DTO.
+    #[serde(skip)]
+    pub lyric_files: Vec<String>,
+
     /// Gets or sets the chapters.
     pub chapters: Vec<ChapterInfo>,
 

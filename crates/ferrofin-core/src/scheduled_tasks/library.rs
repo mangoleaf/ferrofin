@@ -47,7 +47,8 @@ use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::{InternalItemsQuery, SourceType};
 use ferrofin_traits::persistence::KeyframeRepository;
 #[cfg(test)]
-use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+use ferrofin_traits::persistence::MediaStreamQuery;
+use ferrofin_traits::persistence::MediaStreamRepository;
 use ferrofin_traits::providers::{MetadataRefreshOptions, ProviderManager};
 use ferrofin_traits::stubs::LyricManager;
 #[cfg(test)]
@@ -1075,18 +1076,29 @@ impl ScheduledTask for SubtitleDownloadTask {
 // ---------------------------------------------------------------------------
 
 /// "Download missing lyrics" — downloads lyrics for songs. Port of
-/// `LyricScheduledTask`: every audio item without lyrics is searched through
-/// the lyric-manager provider fan-out and the first result is downloaded.
+/// `LyricScheduledTask`: every audio item without a `Lyric` stream is searched
+/// through the lyric-manager provider fan-out and the first result is
+/// downloaded.
 pub struct LyricDownloadTask {
     library: Arc<dyn LibraryManager>,
     lyrics: Arc<dyn LyricManager>,
+    streams: Arc<dyn MediaStreamRepository>,
 }
 
 impl LyricDownloadTask {
-    /// Builds the task over the library and lyric-manager seams.
+    /// Builds the task over the library, lyric-manager and media-stream
+    /// seams.
     #[must_use]
-    pub fn new(library: Arc<dyn LibraryManager>, lyrics: Arc<dyn LyricManager>) -> Self {
-        Self { library, lyrics }
+    pub fn new(
+        library: Arc<dyn LibraryManager>,
+        lyrics: Arc<dyn LyricManager>,
+        streams: Arc<dyn MediaStreamRepository>,
+    ) -> Self {
+        Self {
+            library,
+            lyrics,
+            streams,
+        }
     }
 }
 
@@ -1123,20 +1135,25 @@ impl ScheduledTask for LyricDownloadTask {
             if items.is_empty() {
                 break;
             }
+            let ids: Vec<Uuid> = items
+                .iter()
+                .filter_map(|item| Uuid::parse_str(&item.id).ok())
+                .collect();
+            // `GetMediaStreams().All(s => s.Type != MediaStreamType.Lyric)`.
+            let with_lyrics: std::collections::HashSet<Uuid> = self
+                .streams
+                .get_item_ids_with_lyrics(&ids)
+                .await?
+                .into_iter()
+                .collect();
             for item in &items {
                 done += 1;
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
                     continue;
                 };
-                // Only items with no lyrics yet (stream or sidecar).
-                match self.lyrics.get_lyrics(item_id).await {
-                    Ok(Some(_)) => continue,
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::debug!(item = %item.id, error = %e, "lyric lookup failed");
-                        continue;
-                    }
+                if with_lyrics.contains(&item_id) {
+                    continue;
                 }
                 match self.lyrics.search_lyrics_automatically(item_id).await {
                     Ok(results) => {
@@ -2317,12 +2334,30 @@ mod tests {
         seed_item(&db, has, BaseItemKind::Audio).await;
         seed_item(&db, missing, BaseItemKind::Audio).await;
 
+        // `has` carries a Lyric stream; `missing` has a lyric the manager
+        // can read but no stream row, and is searched all the same: the
+        // task decides on the streams alone (`LyricScheduledTask.cs:111`).
+        let streams =
+            crate::media_stream_repository::FerrofinMediaStreamRepository::new(db.clone());
+        streams
+            .save_media_streams(
+                has,
+                &[MediaStreamInfoEntity {
+                    item_id: has.to_string(),
+                    stream_index: 1,
+                    stream_type: media_stream_type_disc(StreamTypeEnum::Lyric),
+                    path: Some("/music/has.lrc".to_owned()),
+                    ..MediaStreamInfoEntity::default()
+                }],
+            )
+            .await
+            .expect("save lyric stream");
         let lyrics = Arc::new(FakeLyrics {
-            existing: vec![has],
+            existing: vec![missing],
             downloads: Mutex::new(Vec::new()),
             automated_searches: Mutex::new(Vec::new()),
         });
-        let task = LyricDownloadTask::new(library, lyrics.clone());
+        let task = LyricDownloadTask::new(library, lyrics.clone(), Arc::new(streams));
         assert_eq!(task.key(), "DownloadLyrics");
         task.execute(&TaskProgress::default()).await.expect("run");
 
