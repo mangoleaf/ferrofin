@@ -2,8 +2,8 @@
 //! AddToPlaylistInternal` through `Playlist.GetPlaylistItems` — over the real
 //! router, database and playlist manager: containers expand into their
 //! tracks or episodes, unknown ids and kinds that cannot be added are dropped,
-//! a create infers and persists the playlist's media type, and everything a
-//! create writes commits together.
+//! a create infers and persists the playlist's media type, everything a
+//! create writes commits together, and a create or lookup needs a user.
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
@@ -730,4 +730,97 @@ async fn a_create_whose_last_write_fails_leaves_nothing() {
         fx.count(r#"SELECT COUNT(*) FROM "LinkedChildren""#).await,
         0
     );
+}
+
+/// An API key that names no user: upstream's `CreatePlaylist` and
+/// `GetPlaylistForUser` call `GetUserById(Guid.Empty)`, which throws
+/// `ArgumentException` (400). No unowned playlist is created, and the
+/// routes that look a playlist up for a user answer 400 too. Naming the
+/// user makes them the owner, as before, and a remove — upstream's one
+/// API-key exception — still goes through.
+#[tokio::test]
+async fn an_api_key_without_a_user_cannot_create_or_look_up_a_playlist() {
+    let fx = fixture().await;
+    let (status, _) = fx
+        .call("POST", "/Auth/Keys?app=playlist-items-test", None)
+        .await;
+    assert!(status.is_success());
+    let (_, keys) = fx.call("GET", "/Auth/Keys", None).await;
+    let key = keys["Items"][0]["AccessToken"].as_str().unwrap().to_owned();
+
+    let (status, body) = call(
+        &fx.router,
+        &key,
+        "POST",
+        "/Playlists",
+        Some(json!({"Name": "Keyed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("Guid can't be empty"), "{body}");
+    assert_eq!(fx.playlist_count().await, 0, "no unowned playlist");
+
+    let (_, me) = fx.call("GET", "/Users/Me", None).await;
+    let admin = me["Id"].as_str().unwrap().to_owned();
+    // With members, so the items read takes its joined path, not the
+    // empty-playlist fallback.
+    let music = seed_music(&fx).await;
+    let (status, created) = call(
+        &fx.router,
+        &key,
+        "POST",
+        &format!("/Playlists?userId={admin}"),
+        Some(json!({"Name": "Keyed", "Ids": [music.album]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["Id"].as_str().unwrap().to_owned();
+    let owner: Option<String> = sqlx::query_scalar(
+        r#"SELECT "OwnerUserId" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
+    )
+    .bind(guid_to_db(id.parse().unwrap()))
+    .fetch_one(fx.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.and_then(|o| Uuid::parse_str(&o).ok()),
+        Some(admin.parse().unwrap()),
+        "the named user owns it"
+    );
+
+    for (method, path) in [
+        ("GET", format!("/Playlists/{id}")),
+        ("POST", format!("/Playlists/{id}")),
+        ("GET", format!("/Playlists/{id}/Items")),
+        ("POST", format!("/Playlists/{id}/Items?ids={id}")),
+        ("POST", format!("/Playlists/{id}/Items/{id}/Move/0")),
+        ("GET", format!("/Playlists/{id}/Users")),
+        ("GET", format!("/Playlists/{id}/Users/{admin}")),
+        ("POST", format!("/Playlists/{id}/Users/{admin}")),
+        ("DELETE", format!("/Playlists/{id}/Users/{admin}")),
+    ] {
+        let (status, body) = call(&fx.router, &key, method, &path, Some(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");
+        assert!(body.to_string().contains("Guid can't be empty"), "{body}");
+    }
+    // Upstream's one API-key exception: a remove skips the user lookup.
+    assert_eq!(fx.stored(&id).await, ["Zulu", "Alpha"]);
+    let first: String = sqlx::query_scalar(
+        r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1 ORDER BY "SortOrder" LIMIT 1"#,
+    )
+    .bind(guid_to_db(id.parse().unwrap()))
+    .fetch_one(fx.db.pool())
+    .await
+    .unwrap();
+    let entry = Uuid::parse_str(&first).unwrap().simple();
+    let (status, body) = call(
+        &fx.router,
+        &key,
+        "DELETE",
+        &format!("/Playlists/{id}/Items?entryIds={entry}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(fx.stored(&id).await, ["Alpha"]);
 }
