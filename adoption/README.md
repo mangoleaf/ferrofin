@@ -9,11 +9,12 @@ real installation.
 ## Supported and tested versions
 
 The 10.11 and 12.0–12.1 fixture paths below **passed** the live suite on **2026-09-16
-(US/Mountain)**. The 12.2 paths passed the **synthetic** suite on 2026-10-13; live-fixture
-testing of 12.2 is deferred to the release branch.
+(US/Mountain)**, against fixtures derived from a real library. The suite no longer uses real
+libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synthetic). All ten
+paths, 12.2 included, **passed** both `run.sh` and `synthetic.py run` on synthetic fixtures on
+**2026-10-17**; the synthetic results follow the table.
 
-Each test booted Ferrofin on a fresh copy of a real (or, for the synthetic suite, a
-seed-populated) Jellyfin database from the same library. The 10.11.8 fixture was the
+Each test booted Ferrofin on a fresh copy of a Jellyfin database. The 10.11.8 fixture was the
 original snapshot; the others were produced by booting the corresponding Jellyfin releases on
 copies, as shown below.
 
@@ -26,8 +27,9 @@ copies, as shown below.
 | 12.0.0 | 10.11.8 → 12.0.0 | 102 | `12.0.0` | PASS |
 | 12.1.0 | 10.11.8 → 12.1.0 | 104 | `12.1.0` | PASS |
 | 12.1.0 | 10.11.8 → 12.0.0 → 12.1.0 | 105 | `12.1.0` | PASS |
-| 12.2.0 | 10.11.8 → 12.2.0 | 108 | `12.2.0` | synthetic |
-| 12.2.0 | 10.11.8 → 12.0.0 → 12.2.0 | 108 | `12.2.0` | synthetic |
+| 12.2.0 | 10.11.8 → 12.2.0 | 107 | `12.2.0` | PASS (synthetic) |
+| 12.2.0 | 10.11.8 → 12.0.0 → 12.2.0 | 108 | `12.2.0` | PASS (synthetic) |
+| 12.2.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 | 109 | `12.2.0` | PASS (synthetic) |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
@@ -42,9 +44,7 @@ server commit `1732f97c`, with local image ID
 `sha256:0b29af8f135a83d196329a0ada9f41f0ecd7d851e98dde9092d4dd01766ca42d`.
 The run used the corrected harness that reports SQLite query failures and detects
 alternate-version promotions even when `repaired` is zero. All seven fixtures passed
-with exit status 0. Later server changes require rerunning this matrix. The 12.2 paths
-use synthetic fixtures built and validated by real Jellyfin 12.2 images; live-fixture
-testing on the release branch will validate them against a real library.
+with exit status 0. Later server changes require rerunning this matrix.
 
 **Correction (2026-10-17):** in that run, and in the `run.sh` runs recorded under
 [Metadata gate validation](#metadata-gate-validation) and
@@ -55,6 +55,50 @@ results do not cover that half; the second boot's probe summaries were still com
 now reads the log from the restarted container's own start time and fails a log with no
 server start. The synthetic preservation matrix (`synthetic.py run`) slices restart logs by
 line offset and was not affected.
+
+### 2026-10-14 synthetic run
+
+All ten paths were built from synthetic data by `build-fixtures.sh` and run with image
+`ferrofin:adopt-synthetic-27a22ea5` (server code of `release/v1.4.0` at `27a22ea5`), using the
+harness as committed. Every fixture had its release's EF migration-ID count: 68, 68, 71, 71, 102,
+104, 105, 107 (12.2 from 10.11), 108 (12.2 from 12.0) and 109 (12.2 from 12.1). Jellyfin 12.2
+gave identical smoke answers on the 10.11 and 12.0 lineages.
+
+| Check | 10.11.8–10.11.11 (4 paths) | 12.0, 12.1 ×2, 12.2 ×3 (6 paths) |
+|---|---|---|
+| `synthetic.py run`, all four stages | PASS | PASS |
+| `run.sh`: generation, migrations, no `ERROR` | PASS | PASS |
+| `run.sh`: integrity and foreign keys | PASS | PASS |
+| `run.sh`: repair-free second boot (log holds exactly one server start) | PASS | PASS |
+| `run.sh`: metadata and watch history after adoption, restart and scan | PASS | PASS |
+| `run.sh`: smoke parity with Jellyfin 12.2 | **FAIL**: playlists + persons | **FAIL**: playlists |
+
+The smoke failures are two Ferrofin bugs, neither new on `release/v1.4.0`: both reproduce on
+builds from September onward.
+
+- **Playlists (all ten paths):** an administrator sees another user's two private playlists in
+  `/Items?IncludeItemTypes=Playlist` and gets a Playlists view; Jellyfin 12.2 shows neither.
+- **Persons (10.11 sources only):** Ferrofin's scan never records album artists as people, so
+  `/Persons` returns 0 where Jellyfin 12.2 returns 2. Every 12.x fixture already holds the
+  artist `Peoples` rows Jellyfin 12.x wrote, and Ferrofin lists those correctly.
+
+### 2026-10-17 synthetic run
+
+A fresh fixture directory on a local disk was built by `build-fixtures.sh` (every EF
+migration-ID count as above), and both runners used it with image
+`ferrofin:adopt-synthetic-1906c8f6`: server code of `release/v1.4.0` at `1906c8f6`, local image ID
+`sha256:7ef754ae19910972dbf879b8c3e46ab6a2a9884deb7039281831d8ef797bffd1`. `run.sh` and
+`synthetic.py run` ran at the same time against the same directory, `run.sh` under `work/run/`.
+
+- `run.sh`: **PASS** on all ten paths, exit status 0. This covers every check, including
+  smoke parity with Jellyfin 12.2, the 10.11 paths' post-scan `/Persons` comparison, and both
+  halves of check 4 (the second-boot log must hold one server start). Neither smoke failure
+  recorded on 2026-10-14 reproduces at `1906c8f6`.
+- `synthetic.py run`: **PASS** on all ten paths at all four stages (40 of 40).
+
+Two earlier builds on the same host, under a load average near 27, stopped in the 10.11.8 seed
+with "the linked … has no live member"; each was rebuilt into a new directory. That seeding
+failure is tracked separately.
 
 ## What the live suite checks
 
@@ -67,8 +111,8 @@ line offset and was not affected.
    (10.11 never creates them; 12.x creates them on a metadata refresh, `AudioFileProber`
    and `AlbumMetadataService.SetPeople`). So a 10.11 path compares `/Persons` only after
    the scan in check 5, where the whole smoke is compared with the oracle again. This
-   assumes the oracle and the 12.x fixtures carry their release's own scan, as
-   `synthetic.py` builds them; `build-fixtures.sh` boots each release without scanning.
+   relies on the oracle and the 12.x fixtures carrying their release's own scan, which
+   `synthetic.py` guarantees: it scans every fixture it derives before recording it.
 3. `PRAGMA integrity_check` and `PRAGMA foreign_key_check` are clean on the adopted file,
    apart from the documented `IX_Peoples_NameLower` exception below. SQLite query failures
    are reported as failures.
@@ -117,15 +161,15 @@ keys, plus user/item UUIDs and the playback fields needed for API checks. It has
 owner-only permissions, contains no titles or media paths, and stays outside the
 repository. Failure messages contain field names and counts only.
 
-Only fixture copies are scanned; source snapshots remain untouched. All media mounts
-must resolve for the scan, which can otherwise remove unavailable items. The scan
+Only fixture copies are scanned; source fixtures remain untouched. The only media
+mounted is the generated `$FIXTURES/media`, read-only. The scan
 keeps the fixture's provider settings, but the container's HTTP(S) requests use an
 unreachable local proxy. Provider failures therefore cannot be hidden by a later
 successful download refilling lost metadata, and the check does not depend on live
 API keys or quotas. This tests retention during provider failure; provider enrichment
 is covered separately by the server's controlled HTTP scan tests. Its default timeout is
 600 seconds; set `ADOPTION_SCAN_TIMEOUT` for larger libraries. Set
-`ADOPTION_WORK_DIR` to isolate a run from previous artifacts (default: `$FIXTURES/work`).
+`ADOPTION_WORK_DIR` to isolate a run from previous artifacts (default: `$FIXTURES/work/run`).
 A timeout, failed scan, failed query, malformed response or inaccessible metadata
 endpoint fails the run.
 
@@ -135,63 +179,73 @@ and presence information only and is written with owner-only permissions. Existi
 smoke outputs, server logs and database copies can still contain library details;
 keep those local. No reporter library data is needed to test the harness.
 
-These checks cover the reference library and the probe summaries; they do not assert
+These checks cover the synthetic library and the probe summaries; they do not assert
 equality of every API field or cover every possible library configuration.
 
-It is not a CI gate: it needs a populated library and fixtures. Each generation takes
-about two minutes for the boot probes, plus a complete library scan. Run it before
+It is not a CI gate: it needs Docker and the built fixtures. Each generation takes
+about two minutes for the boot probes, plus a library scan of the small synthetic
+library. Run it before
 any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 `database.rs`, or the boot repairs in `adoption_repairs.rs`, and before a release.
 
-## The fixtures are yours, not the repository's
+## The fixtures are synthetic
 
-Nothing under `adoption/` contains a database. You supply **one** Jellyfin 10.11.8 data
-directory and the builder derives the rest with the official Jellyfin images:
+Every fixture is built from **synthetic data only**: no real library, personal media
+server or network share is read, mounted or scanned. `build-fixtures.sh` runs the
+[synthetic builder](#synthetic-preservation-fixture), which generates invented media
+under `$FIXTURES/media` and has each official Jellyfin image build its own fixture through
+its API. It then records the Jellyfin 12.1 and 12.2 oracles. `run.sh` and `synthetic.py`
+use the same directory.
 
-Committed test cases use invented users, item IDs and metadata. Keep real fixture
-snapshots and generated reports outside the checkout. Git ignore rules also exclude
-the fixture directories, media mount scripts and generated metadata/smoke reports;
-never force-add these private artifacts. Live baselines retain item UUIDs locally so
-the same items can be checked across stages, but reports show only aggregate results.
+The fixture directory and the work directory must be on a **local disk**. Every fixture
+is copied, booted and scanned several times, so `run.sh`, `build-fixtures.sh` and
+`synthetic.py` refuse a directory on NFS, SMB/CIFS, 9p, Ceph, GlusterFS, AFS, WebDAV or
+a network FUSE mount (sshfs, rclone, s3fs), judged by `findmnt` before anything is created.
+Local FUSE disks such as ntfs-3g or mergerfs are accepted. Nothing under `adoption/` contains
+a database, and Git ignore rules
+exclude the fixture directories and generated reports.
 
 ```
 $FIXTURES/
-  jellyfin-10.11.8/            supplied: config/, data/jellyfin.db, root/, metadata/ …
-  media-mounts.sh              optional: MEDIA=(-v /host/path:/container/path:ro …)
-  jellyfin-10.11.9/            built: one boot of jellyfin/jellyfin:10.11.9 on 10.11.8
-  jellyfin-10.11.10/           built: one boot of jellyfin/jellyfin:10.11.10 on 10.11.8
-  jellyfin-10.11.11/           built: one boot of jellyfin/jellyfin:10.11.11 on 10.11.8
-  jellyfin-12.0/               built: one boot of jellyfin/jellyfin:12.0
-  jellyfin-12.1-from-10/       built: one boot of jellyfin/jellyfin:12.1 on 10.11.8
-  jellyfin-12.1-from-12/       built: one boot of jellyfin/jellyfin:12.1 on 12.0
-  oracle/smoke-jellyfin-12.1.txt  built: Jellyfin 12.1's own smoke answers
+  media/                       generated: invented video, audio, subtitles and images
+  jellyfin-10.11.8/            built: Jellyfin 10.11.8 seeded through its API
+  jellyfin-10.11.9/            built: jellyfin/jellyfin:10.11.9 booted and scanned on 10.11.8
+  jellyfin-10.11.10/           built: the same with 10.11.10
+  jellyfin-10.11.11/           built: the same with 10.11.11
+  jellyfin-12.0/               built: jellyfin/jellyfin:12.0 on 10.11.8
+  jellyfin-12.1-from-10/       built: jellyfin/jellyfin:12.1 on 10.11.8
+  jellyfin-12.1-from-12/       built: jellyfin/jellyfin:12.1 on 12.0
+  jellyfin-12.2-from-10/       built: jellyfin/jellyfin:12.2 on 10.11.8
+  jellyfin-12.2-from-12/       built: jellyfin/jellyfin:12.2 on 12.0
+  jellyfin-12.2-from-121/      built: jellyfin/jellyfin:12.2 on 12.1-from-12
+  oracle/smoke-jellyfin-12.{1,2}.txt  built: each release's own smoke answers
   oracle/user.txt              built: the account those answers were probed as
-  work/                        scratch; a failed fixture's copy, logs and smoke output stay here
+  jellyfin-12.2-schema.sql     built: the 12.2 schema the other 12.2 routes are diffed against
+  work/                        scratch: synthetic.py's copies, work/run/ for run.sh's; failures stay here
 ```
 
-Take the snapshot with the server stopped, or copy the database with
-`sqlite3 jellyfin.db ".backup /snapshot/data/jellyfin.db"` so the WAL is folded in. Bring
-`root/` (library definitions) and `metadata/` (images) along with `data/`; without them the
-library list is empty and every poster is a placeholder, which the probes will notice. The
-media paths referenced by the library options must resolve inside the container, hence
-`media-mounts.sh`. The probes need an administrator with a **Jellyfin Web** session in `Devices`
-(the builder records which account the oracle ran as in `oracle/user.txt` and the runner
-probes every fixture as that account; `--user NAME` or `ADOPTION_USER` overrides) and an
-**API key** in `ApiKeys`. Credentials are read from the copy at run time and never written.
-The runner also requires Python 3 and Pillow for metadata checks and image decoding
-(`python3-pil` on Debian/Ubuntu). The artwork checker does not invoke FFmpeg.
+The probes run as the synthetic administrator, which has a **Jellyfin Web** session in
+`Devices` and an **API key** in `ApiKeys`; `oracle/user.txt` records it, and `--user NAME`
+or `ADOPTION_USER` overrides. Credentials are read from the copy at run time and never
+written. The builder and runner need Docker, Python 3, Pillow (`python3-pil` on
+Debian/Ubuntu), `sqlite3`, `jq` and `curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
-adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once, ~25 min, pulls 10.11.9–12.1
+adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
 docker build -t ferrofin:bench .                            # the commit under test
 adoption/run.sh --fixtures /path/to/fixtures --image ferrofin:bench
+python3 adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
 adoption/run.sh --fixtures … --only jellyfin-12.1-from-10   # one generation
 ```
 
+A build that fails part-way, for example when Jellyfin resets a connection while seeding
+(seen once under heavy host load), is not retried: seeding calls are not idempotent, so a
+retry could change the baseline. The half-built fixture is refused; build into a new
+directory.
+
 Full adoption validation requires **both** `adoption/run.sh` and the
-[synthetic preservation matrix](#running-the-synthetic-matrix). The original
-runner does not invoke `adoption/synthetic.py`; use separate fixture directories
-and run both against the same Ferrofin image.
+[synthetic preservation matrix](#running-the-synthetic-matrix), run against the same
+fixture directory and the same Ferrofin image.
 
 Output is one line per generation:
 
@@ -208,7 +262,7 @@ PASS  12.1.0    jellyfin-12.1-from-12
 The second column is the generation the gate matched — the id *set*, so 10.11.9 reports
 `10.11.8` and 10.11.10 reports `10.11.11`; `run.sh` knows which is expected for which fixture.
 A `FAIL` line names every check that failed and points at the diff; the copy is kept under
-`work/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` (and, for a 10.11
+`work/run/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` (and, for a 10.11
 path, the post-scan `<name>.smoke-scan.txt`) and the metadata
 presence baseline `<name>.metadata.json` beside it. The per-stage
 `<name>.metadata-after-{adoption,restart,scan}.log` files record the metadata results.
@@ -239,14 +293,15 @@ The 2026-09-16 validation also passed all **23 adoption harness tests** and **13
 tests** (36 total), plus ShellCheck. The database crate passed **121 tests**, including
 12.0 adoption, both 12.1 migration histories, incomplete-history rejection and schema
 conformance; one performance test was ignored. These automated checks complement the
-live matrix above; CI does not run the real-library fixture suite.
+live matrix above; CI does not run the live fixture suite.
 
 ## Adding a generation
 
-When Jellyfin ships a release with new `__EFMigrationsHistory` ids: add a builder step that
-boots that image on the right parent fixture, add a row to `FIXTURE_TABLE` in `run.sh`, refresh
-the oracle if that release changes answers (delete `oracle/` and rebuild), then teach the gate
-(`JELLYFIN_GENERATIONS` in `crates/ferrofin-db/src/database.rs`). The oracle is always the
+When Jellyfin ships a release with new `__EFMigrationsHistory` ids: add a row to `VERSIONS` in
+`synthetic.py` naming the fixture, the release and its parent fixture. Add its expected EF id count
+to the check in `build-fixtures.sh`, and a row to `FIXTURE_TABLE` in `run.sh`. Build into a new
+fixture directory (the recipe changes), refresh the oracle if that release changes answers, then
+teach the gate (`JELLYFIN_GENERATIONS` in `crates/ferrofin-db/src/database.rs`). The oracle is always the
 newest supported Jellyfin: parity is measured against the current release, not the one the
 database came from.
 
@@ -300,7 +355,7 @@ dependency with Pillow, using the same server image. The sample checks posters a
 backdrops for 32 movies and 13 series, plus one episode poster.
 The regression tests include explicit database and post-scan API checks for missing
 descriptions and ratings, corrupt images, stable sampling and decoder failures.
-Committed test data is synthetic; real snapshots and reports remain local and
+Committed test data is synthetic; generated reports remain local and
 excluded from Git.
 
 ## Watch-history gate validation
@@ -320,8 +375,7 @@ by this validation.
 
 ## Synthetic preservation fixture
 
-The original library snapshot does not need parental controls, playlists, manual
-edits, or music. `synthetic.py` builds a separate, small fixture through Jellyfin's
+`synthetic.py` builds every adoption fixture, small and complete, through Jellyfin's
 own setup, library, user, metadata, and playlist APIs. It uses invented accounts,
 titles, tags, provider IDs, solid-color images, silent video, and generated tones.
 It neither reads nor modifies a personal media server.
@@ -404,20 +458,24 @@ verify that unlisted future policy/configuration fields are compared.
 Requires Docker, Python 3, Pillow, Bash, and jq. Media encoding uses
 `/usr/lib/jellyfin-ffmpeg/ffmpeg` from the official Jellyfin container; no host
 FFmpeg installation is needed. Docker must be available to the invoking user.
-Use a fresh fixture directory outside the checkout:
+Use a fresh fixture directory on a local disk, outside the checkout.
+`build-fixtures.sh` runs the build step below and adds the `run.sh` oracles:
 
 ```bash
-python3 adoption/synthetic.py build --fixtures /path/to/synthetic-fixtures
+adoption/build-fixtures.sh --fixtures /path/to/fixtures   # or: python3 adoption/synthetic.py build --fixtures …
 docker build -t ferrofin:bench .
-python3 adoption/synthetic.py run --fixtures /path/to/synthetic-fixtures --image ferrofin:bench
+python3 adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
 ```
 
-The seven version/upgrade paths are the same as the original adoption matrix.
+The ten version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic.py`).
 Each upgraded Jellyfin completes a scan before supplying its baseline. `--only`
 selects one named fixture; building an upgraded fixture requires its parent to
 have been built. `--port` changes the localhost-only test port (default 18120).
 The builder records a recipe hash and refuses to reuse a completed fixture after
-its recipe changes; build into a new directory then.
+its recipe changes; build into a new directory then. Likewise, a build that fails
+part-way, for example when Jellyfin resets a connection while seeding (seen once under
+heavy host load), is not retried: seeding calls are not idempotent, so a retry could
+change the baseline.
 
 The runner copies each source into `work/`, mounts generated media read-only,
 and blocks provider requests with an unreachable proxy. It configures an
