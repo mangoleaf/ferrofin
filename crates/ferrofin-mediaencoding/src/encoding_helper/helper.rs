@@ -1153,7 +1153,8 @@ pub fn find_index(media_streams: &[MediaStream], stream_to_find: &MediaStream) -
 
 /// Whether the encoded output would embed a burnt-in subtitle. Port of
 /// `ShouldEncodeSubtitle`.
-fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
+#[must_use]
+pub fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
     state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
         || (state.base_request.always_burn_in_subtitle_when_transcoding
             && !EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref()))
