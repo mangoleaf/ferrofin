@@ -712,8 +712,9 @@ impl Database {
 
     /// `Playlist.OwnerUserId` of each of the playlists among `ids` (stored
     /// GUID form) that has an owner: `(PlaylistId, OwnerUserId)` from
-    /// `FerrofinPlaylists`. A playlist with no owner (made through an API key)
-    /// and an id that is no playlist are absent.
+    /// `FerrofinPlaylists`. A playlist with no owner (an older build's
+    /// user-less API-key create, or a `Data` naming none) and an id that is
+    /// no playlist are absent.
     ///
     /// # Errors
     ///

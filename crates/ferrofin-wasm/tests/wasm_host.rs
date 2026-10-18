@@ -394,6 +394,128 @@ async fn epoch_deadline_interrupts_a_spinning_guest_and_breaker_trips() {
     );
 }
 
+/// The fixture plus real `wasi:clocks/monotonic-clock` + `wasi:io/poll`
+/// imports, shaped like a std guest's. Extra `run-task` ids: `slep` loops
+/// on `subscribe-duration(u64::MAX).block()` (`std::thread::sleep(MAX)`),
+/// `wait` does the same with a far-future `subscribe-instant`, and `nap!`
+/// blocks 10 ms, then succeeds.
+fn clock_sleeper_wat() -> String {
+    let prelude = r#"
+  (type $poll-interface (instance
+    (export "pollable" (type $pollable (sub resource)))
+    (type $borrowed (borrow $pollable))
+    (type $block (func (param "self" $borrowed)))
+    (export "[method]pollable.block" (func (type $block)))
+  ))
+  (import "wasi:io/poll@0.2.0" (instance $poll (type $poll-interface)))
+  (alias export $poll "pollable" (type $pollable))
+  (type $clock-interface (instance
+    (alias outer 1 $pollable (type $outer-pollable))
+    (export "pollable" (type $pollable (eq $outer-pollable)))
+    (type $owned (own $pollable))
+    (type $subscribe (func (param "when" u64) (result $owned)))
+    (export "subscribe-duration" (func (type $subscribe)))
+    (export "subscribe-instant" (func (type $subscribe)))
+  ))
+  (import "wasi:clocks/monotonic-clock@0.2.0" (instance $clock (type $clock-interface)))
+  (alias export $clock "subscribe-duration" (func $subscribe-duration))
+  (alias export $clock "subscribe-instant" (func $subscribe-instant))
+  (alias export $poll "[method]pollable.block" (func $block))
+  (core func $subscribe-duration (canon lower (func $subscribe-duration)))
+  (core func $subscribe-instant (canon lower (func $subscribe-instant)))
+  (core func $block (canon lower (func $block)))
+  (core instance $wasi
+    (export "subscribe-duration" (func $subscribe-duration))
+    (export "subscribe-instant" (func $subscribe-instant))
+    (export "block" (func $block)))
+"#;
+    let imports = r#"(core module $m
+    (import "wasi" "subscribe-duration" (func $subscribe-duration (param i64) (result i32)))
+    (import "wasi" "subscribe-instant" (func $subscribe-instant (param i64) (result i32)))
+    (import "wasi" "block" (func $block (param i32)))"#;
+    let tasks = r";; 's'lep / 'w'ait: wait forever, like a std guest's sleep loop
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 115))
+        (then (loop $again
+          (call $block (call $subscribe-duration (i64.const -1)))
+          (br $again))))
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 119))
+        (then (loop $again
+          (call $block (call $subscribe-instant (i64.const -1)))
+          (br $again))))
+      ;; 'n'ap: a 10 ms sleep well inside the deadline, then ok
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 110))
+        (then
+          (call $block (call $subscribe-duration (i64.const 10000000)))
+          (i32.store (i32.const 768) (i32.const 0))
+          (i32.store (i32.const 772) (i32.const 0))
+          (i32.store (i32.const 776) (i32.const 0))
+          (return (i32.const 768))))
+      ;; len-4 ids dispatch on the first byte";
+    FIXTURE_WAT
+        .replace("(core module $m", imports)
+        .replace(";; len-4 ids dispatch on the first byte", tasks)
+        .replace(
+            "(core instance $i (instantiate $m))",
+            "(core instance $i (instantiate $m (with \"wasi\" (instance $wasi))))",
+        )
+        .replace("(component", &format!("(component{prelude}"))
+}
+
+#[tokio::test]
+async fn a_guest_waiting_on_a_wasi_clock_is_held_to_the_call_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "sleeper", &clock_sleeper_wat());
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &tight_settings())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin = &host.plugins()[0];
+
+    // A short sleep inside the budget is untouched.
+    plugin.run_task_for_test("nap!".to_owned()).await.unwrap();
+
+    // An unbounded wait in host code must still end at the 1 s deadline.
+    for task in ["slep", "wait"] {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            plugin.run_task_for_test(task.to_owned()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("`{task}` blocked in a WASI clock past the call deadline"));
+        let err = outcome.unwrap_err();
+        assert!(err.contains("plugin call failed"), "{task}: {err}");
+    }
+}
+
+#[test]
+fn a_descriptor_waiting_on_a_wasi_clock_cannot_hang_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let wat = clock_sleeper_wat().replace(
+        "(func (export \"descriptor\") (result i32)",
+        "(func (export \"descriptor\") (result i32)
+      (loop $again (call $block (call $subscribe-duration (i64.const -1))) (br $again))",
+    );
+    write_fixture(dir.path(), "sleeper", &wat);
+    // A plain thread, not spawn_blocking: if load hangs, the test must fail
+    // rather than wait on the blocking pool's shutdown forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = dir.path().to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(WasmPluginHost::load(&path, &tight_settings()));
+    });
+    let host = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("plugin load blocked in a WASI clock past the call deadline")
+        .unwrap();
+    assert!(
+        host.plugins().is_empty(),
+        "the stuck plugin must be skipped"
+    );
+}
+
 #[tokio::test]
 async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     let dir = tempfile::tempdir().unwrap();

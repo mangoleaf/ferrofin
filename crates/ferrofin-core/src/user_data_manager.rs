@@ -632,30 +632,29 @@ impl FerrofinUserDataManager {
     /// `Folder.FillUserDataDtoValues`' counts for one container, with no
     /// precomputed batch (v12.2 Folder.cs:2048-2059): a folder with linked
     /// children (a box set, a playlist) counts through
-    /// `GetPlayedAndTotalCountFromLinkedChildren`, any other its descendants.
+    /// `GetPlayedAndTotalCountFromLinkedChildren`, any other through
+    /// `GetPlayedAndTotalCount`.
     async fn container_counts(
         &self,
         container: &Container,
         counts: &Arc<dyn ItemCountService>,
     ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
+        // `new InternalItemsQuery(user)`: `set_user` also carries the user's
+        // parental-rating cap.
+        let mut query = ferrofin_traits::options::InternalItemsQuery::default();
+        query.set_user(container.user.clone());
         if counts
             .get_linked_children_count_batch(&[container.id])
             .await?
             .contains_key(&container.id)
         {
-            let query = ferrofin_traits::options::InternalItemsQuery {
-                user: Some(container.user.clone()),
-                ..ferrofin_traits::options::InternalItemsQuery::default()
-            };
             return counts
                 .get_played_and_total_count_from_linked_children(&query, container.id)
                 .await;
         }
-        Ok(counts
-            .get_played_and_total_count_batch(&[container.id], &container.user)
-            .await?
-            .remove(&container.id)
-            .unwrap_or_default())
+        counts
+            .get_played_and_total_count(&query, container.id)
+            .await
     }
 
     /// Port of `BaseItem.MarkPlayed(user, datePlayed, resetPosition: true)`

@@ -3566,8 +3566,8 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
         // A single item is a batch of one: the same prefetched projection path
-        // as a page, so a per-item N+1 fallback no longer exists for new
-        // handlers to reach.
+        // as a page. Only a folder's played/total counts differ: by id they
+        // are counted per item, as upstream's `GetBaseItemDto` counts them.
         //
         // `retrieved_by_id: true` — this is the projection of a row the caller
         // fetched by id, and C# `BaseItemRepository.RetrieveItem` unconditionally
@@ -4296,24 +4296,70 @@ impl FerrofinDtoService {
         // UserData can carry UnplayedItemCount (C# AttachUserSpecificInfo folder branch).
         let played_counts = match user {
             Some(user) if options.enable_user_data => {
-                let folder_ids: Vec<Uuid> = items
-                    .iter()
-                    .filter(|i| {
-                        runtime_is_folder(i)
-                            && !matches!(
-                                row_kind(i),
-                                BaseItemKind::CollectionFolder | BaseItemKind::UserView
-                            )
-                    })
-                    .map(row_id)
-                    .collect();
-                if folder_ids.is_empty() {
+                let counted = |i: &&BaseItemEntity| {
+                    runtime_is_folder(i)
+                        && !matches!(
+                            row_kind(i),
+                            BaseItemKind::CollectionFolder | BaseItemKind::UserView
+                        )
+                };
+                let folder_ids: Vec<Uuid> = items.iter().filter(counted).map(row_id).collect();
+                // Only a page has a batch: `GetBaseItemDto` (by id) passes none
+                // (v12.2 DtoService.cs:319-321), so `AttachUserSpecificInfo`
+                // takes `GetUserDataDto` (:629-633) and the folder counts per
+                // item below.
+                let mut counts = if folder_ids.is_empty() || !list_page {
                     HashMap::new()
                 } else {
                     self.item_counts
                         .get_played_and_total_count_batch(&folder_ids, user)
                         .await?
+                };
+                // `Folder.FillUserDataDtoValues` (v12.2 Folder.cs:2032-2060)
+                // counts a folder with no batch entry (0/0 on a page, or read by
+                // id) per item, behind the same guards the fill site applies:
+                // through its links when it has any, else through its
+                // descendants.
+                let unbatched: Vec<Uuid> = items
+                    .iter()
+                    .filter(counted)
+                    .filter(|i| {
+                        let kind = row_kind(i);
+                        kinds::supports_user_data_from_children(kind)
+                            && (kinds::supports_played_status(kind)
+                                || options.contains_field(ItemFields::RecursiveItemCount))
+                    })
+                    .map(row_id)
+                    .filter(|id| !counts.contains_key(id))
+                    .collect();
+                if !unbatched.is_empty() {
+                    let linked = self
+                        .item_counts
+                        .get_linked_children_count_batch(&unbatched)
+                        .await?;
+                    let mut query = ferrofin_traits::options::InternalItemsQuery::default();
+                    query.set_user(user.clone());
+                    // Resolved once for every folder below.
+                    let query = crate::query_restrictions::resolve(&self.db, &query)
+                        .await?
+                        .unwrap_or(query);
+                    for id in unbatched {
+                        if counts.contains_key(&id) {
+                            continue; // repeated on the page
+                        }
+                        let c = if linked.contains_key(&id) {
+                            self.item_counts
+                                .get_played_and_total_count_from_linked_children(&query, id)
+                                .await?
+                        } else {
+                            self.item_counts
+                                .get_played_and_total_count(&query, id)
+                                .await?
+                        };
+                        counts.insert(id, c);
+                    }
                 }
+                counts
             }
             _ => HashMap::new(),
         };
@@ -6103,6 +6149,89 @@ mod tests {
         }
     }
 
+    /// A box set holding only another box set reads the inner set's members.
+    /// v12.2 `GetPlayedAndTotalCountBatch` has no entry for the outer set (its
+    /// branches stop at the inner set's own closure, and `if (total > 0 ||
+    /// played > 0)` drops the 0/0), so `Folder.FillUserDataDtoValues`
+    /// (Folder.cs:2042-2060) counts it per item through
+    /// `GetAllDescendantIdsBatch`, which follows the inner set's links. A set
+    /// read by id always counts per item (`GetBaseItemDto` passes no batch).
+    #[tokio::test]
+    async fn a_box_set_of_box_sets_counts_the_inner_set_s_members() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let [outer, inner, mixed, empty, played, unplayed, single] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, name) in [
+            (outer, "Saga"),
+            (inner, "Trilogy"),
+            (mixed, "Mixed"),
+            (empty, "Empty"),
+        ] {
+            seed_folder_item(&db, id, BaseItemKind::BoxSet, name, None).await;
+        }
+        for (id, name) in [(played, "Part 1"), (unplayed, "Part 2"), (single, "Other")] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+        }
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        crate::test_support::seed_user_data(&db, user_id, played, true, None).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        for (parent, child) in [
+            (outer, inner),
+            (inner, played),
+            (inner, unplayed),
+            (mixed, single),
+            (mixed, inner),
+        ] {
+            links.upsert_linked_child(parent, child, 0).await.unwrap();
+        }
+        let rows = [
+            fetch_item(&db, outer).await,
+            fetch_item(&db, inner).await,
+            fetch_item(&db, mixed).await,
+            fetch_item(&db, empty).await,
+        ];
+        let mut svc = service(db.clone());
+        svc.item_counts = Arc::new(crate::FerrofinItemCountService::new(db));
+        let options = DtoOptions {
+            fields: vec![ItemFields::RecursiveItemCount],
+            ..DtoOptions::default()
+        };
+        let counts = |dto: &BaseItemDto| {
+            let ud = dto.user_data.as_ref().unwrap();
+            (
+                ud.played,
+                ud.unplayed_item_count,
+                ud.played_percentage,
+                dto.recursive_item_count,
+            )
+        };
+        let page = svc
+            .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+            .await
+            .unwrap();
+        let half = (false, Some(1), Some(50.0), Some(2));
+        // The mixed set has a batch entry on a page: its linked movie, as
+        // upstream's batch counts it (the inner set's closure is empty).
+        let one_unplayed = (false, Some(1), Some(0.0), Some(1));
+        // An empty set has nothing to count either way: 0/0 reads played.
+        let nothing = (true, Some(0), None, Some(0));
+        let got: Vec<_> = page.iter().map(counts).collect();
+        assert_eq!(got, [half, half, one_unplayed, nothing]);
+        let mut by_id = Vec::new();
+        for row in &rows {
+            let dto = svc
+                .get_base_item_dto(row, &options, Some(&user), None)
+                .await
+                .unwrap();
+            by_id.push(counts(&dto));
+        }
+        // By id, the mixed set follows the inner set's links too.
+        let all_three = (false, Some(2), Some(1.0 / 3.0 * 100.0), Some(3));
+        assert_eq!(by_id, [half, half, all_three, nothing]);
+    }
+
     /// An [`ItemCountService`] fake returning fixed name-item counts.
     ///
     /// `linked` is how many LINKED children every parent reports
@@ -6183,14 +6312,17 @@ mod tests {
             _filter: &ferrofin_traits::options::InternalItemsQuery,
             _ancestor_id: Uuid,
         ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
-            Ok(ferrofin_traits::persistence::PlayedAndTotal::default())
+            Ok(ferrofin_traits::persistence::PlayedAndTotal {
+                played: self.played,
+                total: self.total,
+            })
         }
         async fn get_played_and_total_count_from_linked_children(
             &self,
-            _filter: &ferrofin_traits::options::InternalItemsQuery,
-            _parent_id: Uuid,
+            filter: &ferrofin_traits::options::InternalItemsQuery,
+            parent_id: Uuid,
         ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
-            Ok(ferrofin_traits::persistence::PlayedAndTotal::default())
+            self.get_played_and_total_count(filter, parent_id).await
         }
         async fn get_played_and_total_count_batch(
             &self,
@@ -6199,7 +6331,11 @@ mod tests {
         ) -> Result<HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>, ServiceError>
         {
             // Every folder reports the same counts (1 of 4 leaf descendants
-            // played → 3 unplayed, by default).
+            // played → 3 unplayed, by default); 0/0 is left out, as the real
+            // service leaves it.
+            if self.played == 0 && self.total == 0 {
+                return Ok(HashMap::new());
+            }
             Ok(folder_ids
                 .iter()
                 .map(|&f| {

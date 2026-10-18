@@ -825,3 +825,62 @@ async fn live_fanout_keeps_full_and_scoped_plans_identical() {
         );
     }
 }
+
+/// A library built from linked folders — a series, a season and a movie
+/// folder on another drive, linked in — plans the items under the link
+/// paths, as Jellyfin's `ManagedFileSystem` does; a link back to the
+/// library's own root adds nothing and ends the walk.
+#[cfg(unix)]
+#[tokio::test]
+async fn plan_follows_linked_folders_and_stops_at_a_loop() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let drive = root.join("other drive");
+    touch(&drive, "Linked Show/Season 01/Linked Show S01E01.mkv");
+    touch(&drive, "Split Show/Season 01/Split Show S01E01.mkv");
+    touch(&drive, "Linked Movie (2001)/Linked Movie (2001).mkv");
+    let tv = root.join("tv");
+    let movies = root.join("movies");
+    std::fs::create_dir_all(tv.join("Split Show")).unwrap();
+    std::fs::create_dir_all(&movies).unwrap();
+    symlink(drive.join("Linked Show"), tv.join("Linked Show")).unwrap();
+    symlink(
+        drive.join("Split Show/Season 01"),
+        tv.join("Split Show/Season 01"),
+    )
+    .unwrap();
+    symlink(&tv, drive.join("Linked Show/loop")).unwrap();
+    symlink(
+        drive.join("Linked Movie (2001)"),
+        movies.join("Linked Movie (2001)"),
+    )
+    .unwrap();
+    let folders = vec![
+        library(1, Some(CollectionTypeOptions::tvshows), &tv),
+        library(2, Some(CollectionTypeOptions::movies), &movies),
+    ];
+
+    let scanner = scanner(root, Arc::new(CountingFs::default())).await;
+    let paths: Vec<String> = scanner
+        .plan(&folders)
+        .into_iter()
+        .filter_map(|p| p.entity.path)
+        .collect();
+    let tv = tv.to_string_lossy();
+    let movies = movies.to_string_lossy();
+    for linked in [
+        format!("{tv}/Linked Show"),
+        format!("{tv}/Linked Show/Season 01/Linked Show S01E01.mkv"),
+        format!("{tv}/Split Show/Season 01"),
+        format!("{tv}/Split Show/Season 01/Split Show S01E01.mkv"),
+        format!("{movies}/Linked Movie (2001)/Linked Movie (2001).mkv"),
+    ] {
+        assert!(paths.contains(&linked), "{linked} is planned: {paths:#?}");
+    }
+    assert!(
+        !paths.iter().any(|path| path.contains("/loop")),
+        "a link back to the library root is not descended: {paths:#?}"
+    );
+}

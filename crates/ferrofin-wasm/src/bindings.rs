@@ -12,6 +12,7 @@
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::StoreLimits;
 use wasmtime::component::bindgen;
+use wasmtime_wasi::p2::bindings::clocks::monotonic_clock;
 
 /// The bindgen output — a generated module tree we cannot document item-by-
 /// item, hence the lint carve-outs (the WIT file carries the real docs).
@@ -82,6 +83,11 @@ pub struct HostState {
     pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
     /// True when this guest call attempted a write suppressed by live segment policy.
     pub segment_policy_skipped: bool,
+    /// When the current guest call's time budget runs out, armed with the
+    /// epoch deadline (`runtime::arm_deadline`). Epoch checks only run in
+    /// wasm code, so WASI clock waits are capped at this instead
+    /// ([`DeadlineClocks`]).
+    pub call_deadline: std::time::Instant,
     /// The empty WASI context (see the struct docs).
     pub wasi: wasmtime_wasi::WasiCtx,
     /// The resource table WASI's generated bindings require.
@@ -91,6 +97,11 @@ pub struct HostState {
 impl HostState {
     /// The locked-down WASI context every plugin store gets: nothing
     /// attached, nothing inherited.
+    ///
+    /// Keep it that way: with no preopens, sockets or real stdio, the
+    /// `monotonic-clock` subscribes are the only waits a guest can reach, so
+    /// [`DeadlineClocks`] alone holds them to the call deadline. Granting any
+    /// I/O here adds pollables that can block past it.
     #[must_use]
     pub fn empty_wasi() -> wasmtime_wasi::WasiCtx {
         wasmtime_wasi::WasiCtxBuilder::new().build()
@@ -103,6 +114,78 @@ impl wasmtime_wasi::WasiView for HostState {
             ctx: &mut self.wasi,
             table: &mut self.table,
         }
+    }
+}
+
+/// `wasi:clocks/monotonic-clock` with every wait held to the guest call's
+/// deadline. Linked over wasmtime-wasi's own (which `subscribe`s for any
+/// duration, and waits forever on one it cannot represent): a guest blocked
+/// in `pollable.block`/`poll` is in host code, where the epoch deadline
+/// never fires. A wait is cut to the time left; once none is left, the
+/// subscribe traps, as the epoch would. That covers every wait only while
+/// the ctx grants no I/O ([`HostState::empty_wasi`]).
+pub struct DeadlineClocks;
+
+impl wasmtime::component::HasData for DeadlineClocks {
+    type Data<'a> = DeadlineClocksView<'a>;
+}
+
+impl DeadlineClocks {
+    /// The linker getter: the store's WASI clocks plus its call deadline.
+    pub fn view(state: &mut HostState) -> DeadlineClocksView<'_> {
+        let deadline = state.call_deadline;
+        DeadlineClocksView {
+            clocks: wasmtime_wasi::clocks::WasiClocksView::clocks(state),
+            deadline,
+        }
+    }
+}
+
+/// What [`DeadlineClocks`] hands each `monotonic-clock` call.
+pub struct DeadlineClocksView<'a> {
+    clocks: wasmtime_wasi::clocks::WasiClocksCtxView<'a>,
+    deadline: std::time::Instant,
+}
+
+impl DeadlineClocksView<'_> {
+    /// Nanoseconds left in the call's budget, or the trap once it is spent.
+    fn remaining_nanos(&self) -> wasmtime::Result<u64> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(wasmtime::Error::msg(
+                "plugin call deadline exceeded while waiting on wasi:clocks",
+            ));
+        }
+        Ok(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX))
+    }
+}
+
+impl monotonic_clock::Host for DeadlineClocksView<'_> {
+    fn now(&mut self) -> wasmtime::Result<monotonic_clock::Instant> {
+        monotonic_clock::Host::now(&mut self.clocks)
+    }
+
+    fn resolution(&mut self) -> wasmtime::Result<monotonic_clock::Duration> {
+        monotonic_clock::Host::resolution(&mut self.clocks)
+    }
+
+    fn subscribe_instant(
+        &mut self,
+        when: monotonic_clock::Instant,
+    ) -> wasmtime::Result<wasmtime::component::Resource<wasmtime_wasi::p2::DynPollable>> {
+        let latest =
+            monotonic_clock::Host::now(&mut self.clocks)?.saturating_add(self.remaining_nanos()?);
+        monotonic_clock::Host::subscribe_instant(&mut self.clocks, when.min(latest))
+    }
+
+    fn subscribe_duration(
+        &mut self,
+        when: monotonic_clock::Duration,
+    ) -> wasmtime::Result<wasmtime::component::Resource<wasmtime_wasi::p2::DynPollable>> {
+        let left = self.remaining_nanos()?;
+        monotonic_clock::Host::subscribe_duration(&mut self.clocks, when.min(left))
     }
 }
 

@@ -7,14 +7,9 @@
 //! per-page played/total batch (`get_played_and_total_count_batch`) unions
 //! v12.2's three branches: the `AncestorIds` closure, the `LinkedChildren`, and
 //! the closure of each linked folder. See the TODOs in its body and on
-//! `folder_leaf_count_sql` for where it still differs from v12.2.
-//!
-//! TODO: the per-ancestor counts (`get_played_count`, `get_total_count`,
-//! `get_played_and_total_count`, all through `descendant_counts`) have no
-//! production caller and still read the bare `AncestorIds` closure: no link
-//! following, no presentation-key group, no `IsCountableLeaf`. Un-defer path:
-//! port v12.2 `BuildGroupedDescendantsQuery` (`ItemCountService.cs:441-452`)
-//! the way `get_played_and_total_count_from_linked_children` ports its sibling.
+//! `folder_leaf_count_sql` for where it still differs from v12.2. A folder the
+//! batch leaves out (0/0) is counted per item, as `Folder.FillUserDataDtoValues`
+//! does, through `get_played_and_total_count` or its linked sibling.
 
 use std::collections::{HashMap, HashSet};
 
@@ -138,70 +133,27 @@ impl FerrofinItemCountService {
         Ok(i32::try_from(count).unwrap_or(i32::MAX))
     }
 
-    /// Counts descendants of `ancestor_id` (via the `AncestorIds` closure) that
-    /// also match `filter`, optionally requiring them to be played by the filter's
-    /// user. Returns `(played, total)`.
-    async fn descendant_counts(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<PlayedAndTotal, ServiceError> {
-        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
-        let filter = preferences.as_ref().unwrap_or(filter);
-        let descendants =
-            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
-        let filter = descendants.as_ref().unwrap_or(filter);
-        // Reuse the translated filter to constrain the matching item set, then
-        // intersect with the ancestor's descendant closure.
-        let matching = {
-            let mut qb = build_query(filter, QueryShape::IdsOnly);
-            qb.build_query_scalar::<String>()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?
-        };
-        if matching.is_empty() {
-            return Ok(PlayedAndTotal::default());
+    /// The folders sharing `folder_id`'s `PresentationUniqueKey`: a merged
+    /// series or season is one row per library (v12.2
+    /// `GetPresentationKeyGroups`, `ItemCountService.cs:693-733`). A folder
+    /// with no key, or whose key matches no folder, is a group of one.
+    async fn presentation_key_group(&self, folder_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        let members: Vec<String> = sqlx::query_scalar(
+            r#"SELECT m."Id" FROM "BaseItems" r
+               JOIN "BaseItems" m ON m."PresentationUniqueKey" = r."PresentationUniqueKey"
+               WHERE r."Id" = ?1 AND r."PresentationUniqueKey" <> '' AND m."IsFolder""#,
+        )
+        .bind(guid_to_db(folder_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if members.is_empty() {
+            return Ok(vec![folder_id]);
         }
-
-        let descendants: Vec<String> = {
-            let mut sql = String::from(
-                r#"SELECT a."ItemId" FROM "AncestorIds" a WHERE a."ParentItemId" = ? AND a."ItemId" IN ("#,
-            );
-            sql.push_str(&placeholders(matching.len()));
-            sql.push(')');
-            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                .bind(guid_to_db(ancestor_id));
-            for id in &matching {
-                query = query.bind(id.as_str());
-            }
-            query.fetch_all(self.db.pool()).await.map_err(db_err)?
-        };
-        if descendants.is_empty() {
-            return Ok(PlayedAndTotal::default());
-        }
-
-        let total = i32::try_from(descendants.len()).unwrap_or(i32::MAX);
-        let Some(user_id) = filter.user_id() else {
-            return Ok(PlayedAndTotal { played: 0, total });
-        };
-
-        let mut sql = String::from(
-            r#"SELECT COUNT(DISTINCT ud."ItemId") FROM "UserData" ud
-               WHERE ud."UserId" = ? AND ud."Played" = 1 AND ud."ItemId" IN ("#,
-        );
-        sql.push_str(&placeholders(descendants.len()));
-        sql.push(')');
-        let mut query =
-            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(user_id));
-        for id in &descendants {
-            query = query.bind(id.as_str());
-        }
-        let played_i64 = query.fetch_one(self.db.pool()).await.map_err(db_err)?;
-        Ok(PlayedAndTotal {
-            played: i32::try_from(played_i64).unwrap_or(i32::MAX),
-            total,
-        })
+        members
+            .iter()
+            .map(|id| Uuid::parse_str(id).map_err(|e| ServiceError::backend(e.to_string())))
+            .collect()
     }
 
     /// Counts each person's credited items by type via `PeopleBaseItemMap`→`Peoples`,
@@ -578,7 +530,10 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         ancestor_id: Uuid,
     ) -> Result<i32, ServiceError> {
-        Ok(self.descendant_counts(filter, ancestor_id).await?.played)
+        Ok(self
+            .get_played_and_total_count(filter, ancestor_id)
+            .await?
+            .played)
     }
 
     async fn get_total_count(
@@ -586,15 +541,46 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         ancestor_id: Uuid,
     ) -> Result<i32, ServiceError> {
-        Ok(self.descendant_counts(filter, ancestor_id).await?.total)
+        Ok(self
+            .get_played_and_total_count(filter, ancestor_id)
+            .await?
+            .total)
     }
 
+    /// Port of v12.2 `GetPlayedAndTotalCount` over
+    /// `BuildGroupedDescendantsQuery` (`ItemCountService.cs:430-452`): the
+    /// countable leaves below every folder in `ancestor_id`'s presentation-key
+    /// group, each walked as
+    /// [`ItemCountService::get_played_and_total_count_from_linked_children`]
+    /// walks its parent (`GetAllDescendantIdsBatch`, closure and links).
     async fn get_played_and_total_count(
         &self,
         filter: &InternalItemsQuery,
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        self.descendant_counts(filter, ancestor_id).await
+        // The `AggregateFolder` is every item's ancestor upstream; Ferrofin's
+        // closure stops at the library, so its scope is stated directly, as in
+        // `get_played_and_total_count_batch`.
+        if let (Some(roots), Some(user)) = (self.roots, filter.user.as_ref())
+            && roots.aggregate == ancestor_id
+        {
+            return self.whole_server_leaf_counts(user).await;
+        }
+        // ponytail: summed per member where upstream unions the members' leaves
+        // first; members are distinct merged folders, whose leaves cannot
+        // overlap (the batch sums them the same way, `ItemCountService.cs:669`).
+        // Resolved once for every member.
+        let resolved = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
+        let mut sum = PlayedAndTotal::default();
+        for member in self.presentation_key_group(ancestor_id).await? {
+            let counts = self
+                .get_played_and_total_count_from_linked_children(filter, member)
+                .await?;
+            sum.played = sum.played.saturating_add(counts.played);
+            sum.total = sum.total.saturating_add(counts.total);
+        }
+        Ok(sum)
     }
 
     /// Port of v12.2 `GetPlayedAndTotalCountFromLinkedChildren`
@@ -630,7 +616,7 @@ impl ItemCountService for FerrofinItemCountService {
                 None => leaves,
             };
         let total = self.count_rows(&leaves).await?;
-        if leaves.user.is_none() {
+        if leaves.user.is_none() || total == 0 {
             return Ok(PlayedAndTotal { played: 0, total });
         }
         let played = self
@@ -658,7 +644,7 @@ impl ItemCountService for FerrofinItemCountService {
         // Two grouped joins over the `AncestorIds` and `LinkedChildren` branches
         // resolve the whole page in one pass each: total leaf descendants per
         // folder, then the played subset.
-        // The prior path looped `descendant_counts` per folder, and each call
+        // The prior path looped a per-folder descendant count, and each call
         // re-scanned every leaf in the library (a folder-independent id set) before
         // intersecting via a thousand-parameter `IN` — O(folders × library) with no
         // batching, which dominated the by-name browse endpoints.
@@ -715,27 +701,26 @@ impl ItemCountService for FerrofinItemCountService {
         // Folders with no countable leaf in any branch are absent from the
         // grouped rows ⇒ 0/0: e.g. an empty folder, a season whose episodes are
         // all virtual (missing or unaired), a folder whose leaves the access
-        // filter hides from this user, or a box set holding only box sets.
-        //
-        // TODO: v12.2 leaves a 0/0 folder OUT of the batch
-        // (`if (total > 0 || played > 0)`, `ItemCountService.cs:684`), and
-        // `Folder.FillUserDataDtoValues` (Folder.cs:2042-2058) then counts it
-        // per item through `GetAllDescendantIdsBatch`, which follows a box set
-        // nested in a box set, where the branches here stop at the inner set's
-        // own (empty) closure. Un-defer path: drop 0/0 entries here and fall
-        // back per item in the DTO folder branch through
-        // `get_played_and_total_count_from_linked_children` (its
-        // `descendant_of_id` walks both the closure and the links).
+        // filter hides from this user, or a box set holding only box sets. v12.2
+        // leaves them OUT of the batch (`if (total > 0 || played > 0)`,
+        // `ItemCountService.cs:684`), and `Folder.FillUserDataDtoValues`
+        // (Folder.cs:2042-2060) counts them per item through
+        // `GetAllDescendantIdsBatch`, which follows a box set nested in a box
+        // set where the branches here stop at the inner set's own closure.
         //
         // TODO: v12.2 also resolves each requested folder to its merged
         // presentation-key group (`GetPresentationKeyGroups`,
         // `ItemCountService.cs:612`, `:693`) and sums the members' counts
         // (`:669-688`); here each folder counts
-        // alone, so a series merged across rows counts one row's episodes.
+        // alone, so a series merged across rows counts one row's episodes on a
+        // page while its detail page and mark-played answer (per item, through
+        // `presentation_key_group`) count the whole group.
         // Un-defer path: resolve each page id's group, seed the branches with
         // every member, and sum the members per requested id.
         for (&folder, key) in folder_ids.iter().zip(&ids) {
-            out.insert(folder, by_parent.get(key).copied().unwrap_or_default());
+            if let Some(&counts) = by_parent.get(key) {
+                out.insert(folder, counts);
+            }
         }
         // The `AggregateFolder` is the PHYSICAL root
         // (`AggregateFolder.IsPhysicalRoot`), so every item on the server is one
@@ -1709,6 +1694,57 @@ mod tests {
         assert_eq!(empty.total, 0);
     }
 
+    /// v12.2 `BuildGroupedDescendantsQuery` counts every folder sharing the
+    /// requested one's `PresentationUniqueKey` (a series merged across two
+    /// libraries); a folder with a key of its own counts alone.
+    #[tokio::test]
+    async fn played_and_total_sums_the_presentation_key_group() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5740_0001);
+        let user = seed_user(&db, user_id).await;
+        let first = Uuid::from_u128(0x5740_1001);
+        let second = Uuid::from_u128(0x5740_1002);
+        let other = Uuid::from_u128(0x5740_1003);
+        for (series, key) in [(first, "merged"), (second, "merged"), (other, "own")] {
+            crate::test_support::seed_folder_item(&db, series, BaseItemKind::Series, "Show", None)
+                .await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1 WHERE "Id" = ?2"#)
+                .bind(key)
+                .bind(guid_to_db(series))
+                .execute(db.writer())
+                .await
+                .expect("key");
+            let episode = Uuid::new_v4();
+            seed_item(&db, episode, BaseItemKind::Episode).await;
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(guid_to_db(episode))
+                .bind(guid_to_db(series))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+            seed_user_data(&db, user_id, episode, series == first, None).await;
+        }
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(user);
+        let service = svc(&db);
+        // Either merged row stands for the whole series.
+        for (series, (played, total)) in [(first, (1, 2)), (second, (1, 2)), (other, (0, 1))] {
+            let c = service
+                .get_played_and_total_count(&filter, series)
+                .await
+                .expect("played/total");
+            assert_eq!((c.played, c.total), (played, total));
+            assert_eq!(
+                service.get_played_count(&filter, series).await.unwrap(),
+                played
+            );
+            assert_eq!(
+                service.get_total_count(&filter, series).await.unwrap(),
+                total
+            );
+        }
+    }
+
     /// A Jellyfin library's `ChildCount` is its physical folders' children.
     ///
     /// Nothing carries a `CollectionFolder`'s id as `ParentId` on an adopted
@@ -1852,15 +1888,15 @@ mod tests {
         // Batch over the closure folder AND `parent` (which has a direct child via
         // ParentId but no `AncestorIds` closure row — like a by-name item): the
         // grouped query resolves both in one pass, closure folder = 2/1, the
-        // closure-less folder defaults to 0/0.
+        // closure-less folder is left out as v12.2 leaves a 0/0 out
+        // (`ItemCountService.cs:684`), for the caller to count per item.
         let batch = service
             .get_played_and_total_count_batch(&[folder, parent], &user_entity)
             .await
             .expect("batch");
         assert_eq!(batch[&folder].total, 2);
         assert_eq!(batch[&folder].played, 1);
-        assert_eq!(batch[&parent].total, 0);
-        assert_eq!(batch[&parent].played, 0);
+        assert!(!batch.contains_key(&parent));
 
         let counts = service
             .get_child_count_batch(&[parent, folder], None)
@@ -3308,7 +3344,8 @@ mod tests {
             .get_played_and_total_count_batch(&folders, &user)
             .await
             .expect("an oversized page counts");
-        assert_eq!(counts.len(), folders.len());
+        // Only the folder with a leaf has an entry: the 0/0 rest are left out.
+        assert_eq!(counts.len(), 1);
         let got = counts[&last];
         assert_eq!((got.played, got.total), (1, 1));
     }
@@ -3442,6 +3479,15 @@ mod tests {
             ),
             "aggregate played/total with {extra_keys} extra UserData key rows per leaf"
         );
+        // Read by id, the aggregate counts the same whole server.
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(user);
+        let by_id = svc(&db)
+            .with_root_ids(roots)
+            .get_played_and_total_count(&filter, roots.aggregate)
+            .await
+            .expect("per-item whole-server counts");
+        assert_eq!((by_id.played, by_id.total), (got.played, got.total));
     }
 
     /// A whole-server leaf is played when ANY of its `UserData` key rows is —
