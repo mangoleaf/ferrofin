@@ -8,6 +8,22 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — an API key must name the user a playlist is for
+
+An API key carries no user. Earlier versions let `POST /Playlists` with an API key and
+no `userId` create a playlist with no owner, which every account could then rename, edit,
+share or delete. Ferrofin now answers `400 Bad Request`, as Jellyfin does: pass the id of
+the account the playlist is for as `UserId` in the body (or `userId=`). `GET`/`POST
+/Playlists/{id}/Items` take it as `userId=`. The other playlist routes (`GET`/`POST
+/Playlists/{id}`, `Move` and the `Users` routes) act as the account whose token calls
+them, so an API key always gets `400` from them, as in Jellyfin; call them with that
+account's own token. Removing entries (`DELETE /Playlists/{id}/Items`) still works with an
+API key, as in Jellyfin.
+
+Playlists an API key already created stay ownerless, so every account keeps owner rights
+over them, and only an administrator can delete one. To give one an owner, create it again
+for that account, then delete the old one.
+
 ## Unreleased — a genre image drawn from music art stays until you delete it
 
 Through 1.3.x, a genre whose movies and series had no poster could take music art
@@ -396,8 +412,9 @@ accounts without deletion rights; three things are refined:
   jellyfin-web shows its delete entry by, so the entry appears only where the delete is
   allowed. A *list* of playlists reports every playlist deletable, as Jellyfin's does;
   deleting a playlist still needs its owner or an administrator. A playlist with no owner
-  (made with an API key, or created before Ferrofin stored playlist owners) can now be
-  deleted by an administrator only; in 1.3.x any signed-in account could delete one.
+  (made with an API key by an earlier version, or created before Ferrofin stored playlist
+  owners) can now be deleted by an administrator only; in 1.3.x any signed-in account
+  could delete one.
 - Some items cannot be deleted at all, as in Jellyfin: an item with no file of its own (a
   season Ferrofin groups from a series folder without season folders, a streamed item), a
   missing (virtual) episode or season, and a video a DVR recording is still writing.
