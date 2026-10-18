@@ -494,11 +494,13 @@ pub(crate) async fn universal_audio_source(
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, user_id).await?,
     };
+    // Every version (the universal route takes no live stream id), narrowed
+    // below rather than by the helper's exact match.
+    let mut media_sources =
+        resolve_playback_media_sources(state, item_id, resolved_user_id, None, None).await?;
     // The version is matched in either GUID spelling, as the static stream
     // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
     // `mediaSourceId` is what a direct-play request for it would carry.
-    let mut media_sources =
-        resolve_playback_media_sources(state, item_id, resolved_user_id, None, None).await?;
     if let Some(id) = non_blank(media_source_id) {
         media_sources.retain(|source| source.id_matches(id));
     }
