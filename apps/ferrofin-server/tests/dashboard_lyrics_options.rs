@@ -62,7 +62,9 @@ impl Api {
             .unwrap()
             .error_for_status()
             .unwrap();
-        let lyrics = self.get(&format!("/Audio/{item}/Lyrics")).await;
+        // The lyric is read from the track's Lyric stream, which the refresh
+        // queued by the upload records.
+        let lyrics = self.lyrics_after_refresh(item).await;
         assert_eq!(lyrics["Lyrics"][0]["Text"], text, "{lyrics}");
     }
 
@@ -75,6 +77,37 @@ impl Api {
             .unwrap()
             .error_for_status()
             .unwrap();
+        // The refresh queued by the delete drops the stream, and with it
+        // `HasLyrics`.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let items = self.get(&format!("/Items?ids={item}")).await;
+            if items["Items"][0]["HasLyrics"] == json!(false) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "lyrics delete refresh: {items}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Polls `GET /Audio/{item}/Lyrics` until it answers, returning the lyric.
+    async fn lyrics_after_refresh(&self, item: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = self
+                .client
+                .get(format!("{}/Audio/{item}/Lyrics", self.base))
+                .header("Authorization", &self.auth)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            if status.is_success() {
+                return response.json().await.unwrap();
+            }
+            assert!(Instant::now() < deadline, "lyrics refresh: {status}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -287,8 +320,11 @@ async fn saved_lyrics_destinations_change_without_restarting() {
         adjacent.is_file(),
         "the live task selection did not download lyrics"
     );
+    // The task saves the file only (`LyricScheduledTask`); the next scan sees
+    // the new lyric file and records its stream.
+    api.post("/Library/Refresh", &Value::Null).await;
     assert_eq!(
-        api.get(&format!("/Audio/{item}/Lyrics")).await["Lyrics"][0]["Text"],
+        api.lyrics_after_refresh(&item).await["Lyrics"][0]["Text"],
         "scheduled download"
     );
     assert!(

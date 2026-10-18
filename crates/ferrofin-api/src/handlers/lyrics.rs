@@ -15,10 +15,11 @@
 //! implied by administrator, so this is what stops any authenticated account
 //! overwriting or deleting another user's lyrics.
 //!
-//! Every route is backed by the [`LyricManager`] (sidecar `.lrc`/`.txt` files
-//! plus the registered remote providers such as LrcLib). On a successful item
-//! resolve, upload / download also queue a metadata refresh, matching the C#
-//! flow.
+//! Every route is backed by the [`LyricManager`] (the item's `Lyric` streams,
+//! which the audio probe records from its `.lrc`/`.txt` sidecars, plus the
+//! registered remote providers such as LrcLib). On a successful item resolve,
+//! upload / download / delete also queue a metadata refresh, which re-probes
+//! the track's lyric streams, matching the C# flow.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -146,7 +147,11 @@ async fn upload_lyrics(
 /// `DELETE /Audio/{itemId}/Lyrics` — delete the item's stored lyrics.
 ///
 /// Port of `LyricsController.DeleteLyrics`: `204` on success, `404` for a
-/// missing item.
+/// missing item. `LyricManager.DeleteLyricsAsync` ends with
+/// `audio.RefreshMetadata`, which drops the deleted files' streams; here that
+/// refresh is queued at high priority, as the upload and download refreshes
+/// are, so `HasLyrics` turns false once it has run rather than before the
+/// `204`.
 #[utoipa::path(
     delete,
     path = "/Audio/{itemId}/Lyrics",
@@ -164,6 +169,7 @@ async fn delete_lyrics(
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
     state.lyrics.delete_lyrics(item_id).await?;
+    queue_high_priority_refresh(&state, item_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

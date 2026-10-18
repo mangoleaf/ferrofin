@@ -1,7 +1,9 @@
 //! Scan-time discovery of a video's **external** media streams — the sidecar
 //! subtitle (`Movie.eng.forced.srt`) and audio (`Movie.commentary.mka`) files
-//! that sit next to it. Port of `MediaBrowser.Providers/MediaInfo/MediaInfoResolver.cs`
-//! and its two concrete flavours, `SubtitleResolver` and `AudioResolver`.
+//! that sit next to it — and of an audio track's lyric sidecars
+//! (`Song.en.lrc`). Port of `MediaBrowser.Providers/MediaInfo/MediaInfoResolver.cs`
+//! and its three concrete flavours, `SubtitleResolver`, `AudioResolver` and
+//! `LyricResolver`.
 //!
 //! The pipeline is upstream's exactly: list the files in the video's folder
 //! (and its internal metadata folder, where downloaded/uploaded sidecars land
@@ -159,6 +161,50 @@ impl MediaInfoResolver {
             file_system,
             DlnaProfileType::Audio,
         )
+    }
+
+    /// The external **lyric** resolver (`LyricResolver`), run for audio
+    /// tracks by [`get_external_lyric_streams`](Self::get_external_lyric_streams).
+    #[must_use]
+    pub fn lyric(
+        naming_options: Arc<NamingOptions>,
+        localization: Arc<LocalizationManager>,
+        media_encoder: Arc<dyn MediaEncoder>,
+        file_system: Arc<dyn FileSystem>,
+    ) -> Self {
+        Self::new(
+            naming_options,
+            localization,
+            media_encoder,
+            file_system,
+            DlnaProfileType::Lyric,
+        )
+    }
+
+    /// The external lyric streams of an audio `track`, numbered from
+    /// `start_index`. Port of `GetExternalStreams(Audio, startIndex, …)`:
+    /// the matched files are not probed, each becomes a `Lyric` stream
+    /// carrying its path and the filename's language. The file search is
+    /// [`get_external_files`](Self::get_external_files), whose check that the
+    /// containing folder exists upstream's audio overload lacks; a track in a
+    /// folder that does not exist has no sidecars either way.
+    #[must_use]
+    pub fn get_external_lyric_streams(
+        &self,
+        track: &ExternalMediaTarget,
+        start_index: i32,
+    ) -> Vec<MediaStream> {
+        self.get_external_files(track)
+            .into_iter()
+            .zip(start_index..)
+            .map(|(info, index)| MediaStream {
+                stream_type: MediaStreamType::Lyric,
+                path: Some(info.path),
+                language: info.language,
+                index,
+                ..MediaStream::default()
+            })
+            .collect()
     }
 
     /// The stream type this resolver's files must probe as.
@@ -418,7 +464,8 @@ fn strip_prefix_ignore_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> 
     Some(&name[consumed..])
 }
 
-/// The resolver pair the scan runs for every video: subtitles, then audio.
+/// The resolvers the scan runs: subtitles, then audio, for every video, and
+/// lyrics for every audio track.
 ///
 /// Upstream `FFProbeVideoInfo.Fetch` adds the external subtitle streams first,
 /// then the external audio streams, and only then the embedded streams — so
@@ -428,6 +475,7 @@ fn strip_prefix_ignore_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> 
 pub struct ExternalStreamResolvers {
     subtitles: MediaInfoResolver,
     audio: MediaInfoResolver,
+    lyrics: MediaInfoResolver,
 }
 
 impl std::fmt::Debug for ExternalStreamResolvers {
@@ -438,7 +486,7 @@ impl std::fmt::Debug for ExternalStreamResolvers {
 }
 
 impl ExternalStreamResolvers {
-    /// Builds both resolvers over shared naming options, localization, the
+    /// Builds the resolvers over shared naming options, localization, the
     /// ffprobe seam and the filesystem.
     #[must_use]
     pub fn new(
@@ -455,6 +503,12 @@ impl ExternalStreamResolvers {
                 Arc::clone(&file_system),
             ),
             audio: MediaInfoResolver::audio(
+                Arc::clone(&naming_options),
+                Arc::clone(&localization),
+                Arc::clone(&media_encoder),
+                Arc::clone(&file_system),
+            ),
+            lyrics: MediaInfoResolver::lyric(
                 naming_options,
                 localization,
                 media_encoder,
@@ -473,6 +527,12 @@ impl ExternalStreamResolvers {
     #[must_use]
     pub fn audio(&self) -> &MediaInfoResolver {
         &self.audio
+    }
+
+    /// The external lyric resolver, run for audio tracks.
+    #[must_use]
+    pub fn lyrics(&self) -> &MediaInfoResolver {
+        &self.lyrics
     }
 
     /// The search target for a video at `path`: its containing folder is the
@@ -1400,6 +1460,79 @@ mod tests {
     #[case("smb://nas/share/Movie.mkv", false)]
     fn is_file_protocol_matches_get_path_protocol(#[case] path: &str, #[case] is_file: bool) {
         assert_eq!(is_file_protocol(path), is_file);
+    }
+
+    // `GetExternalStreams(Audio, …)`: every lyric sidecar whose stem is the
+    // track's (any case, then a media-flag delimiter), in the folder then the
+    // metadata folder, becomes an unprobed Lyric stream numbered from
+    // `startIndex`, with the filename's language.
+    #[test]
+    fn lyric_streams_match_prefix_without_case_in_both_folders() {
+        let fs = FakeFs::new(
+            &[VIDEO_DIRECTORY_PATH, METADATA_DIRECTORY_PATH],
+            vec![
+                (
+                    VIDEO_DIRECTORY_PATH,
+                    vec![
+                        format!("{VIDEO_DIRECTORY_PATH}/Song.flac"),
+                        format!("{VIDEO_DIRECTORY_PATH}/song.en.LRC"),
+                        format!("{VIDEO_DIRECTORY_PATH}/Songbook.lrc"),
+                        format!("{VIDEO_DIRECTORY_PATH}/Song.srt"),
+                    ],
+                ),
+                (
+                    METADATA_DIRECTORY_PATH,
+                    vec![format!("{METADATA_DIRECTORY_PATH}/Song.txt")],
+                ),
+            ],
+        );
+        // An audio track's sidecars are never probed: the encoder would
+        // answer with a subtitle stream if it were asked.
+        let resolver = MediaInfoResolver::lyric(
+            Arc::new(NamingOptions::new()),
+            localization(),
+            Arc::new(FakeEncoder {
+                streams: vec![MediaStream::default()],
+            }),
+            fs,
+        );
+        let track = ExternalMediaTarget::for_file(
+            format!("{VIDEO_DIRECTORY_PATH}/Song.flac"),
+            Some(METADATA_DIRECTORY_PATH.to_owned()),
+        );
+
+        let streams = resolver.get_external_lyric_streams(&track, 2);
+
+        let got: Vec<_> = streams
+            .iter()
+            .map(|s| {
+                (
+                    s.stream_type,
+                    s.index,
+                    s.path.as_deref(),
+                    s.language.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    MediaStreamType::Lyric,
+                    2,
+                    Some("Test Data/Video/song.en.LRC"),
+                    Some("eng"),
+                ),
+                (
+                    MediaStreamType::Lyric,
+                    3,
+                    Some("library/00/00000000000000000000000000000000/Song.txt"),
+                    None,
+                ),
+            ]
+        );
+        let remote = ExternalMediaTarget::for_file("https://host/Song.flac", None);
+        assert!(resolver.get_external_lyric_streams(&remote, 0).is_empty());
     }
 
     #[rstest]

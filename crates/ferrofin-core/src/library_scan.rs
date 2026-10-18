@@ -1213,7 +1213,9 @@ impl ExternalProbeSeam {
 /// subtitle/audio files next to it — each one its own ffprobe — and prepends
 /// them to the embedded streams in upstream's order (external subtitles,
 /// external audio, then the file's own streams, renumbered from 0). That
-/// keeps the sidecar probes off the scan loop like the main probe.
+/// keeps the sidecar probes off the scan loop like the main probe. For an
+/// audio track it appends the lyric sidecars instead ([`add_external_lyrics`]),
+/// which need no probe of their own.
 ///
 /// A probe failure is logged and reported as `None` — exactly what the
 /// inline probe did — so one unreadable file never aborts a scan. The
@@ -1263,6 +1265,10 @@ fn spawn_probe(
             let target = external
                 .resolvers
                 .target_for(path, external.internal_metadata_path);
+            if request.media_is_audio {
+                add_external_lyrics(&external.resolvers, &target, &mut probed);
+                return Some(probed);
+            }
             let externals = external.resolvers.external_streams(&target, 0).await;
             if !externals.is_empty() {
                 tracing::debug!(
@@ -1277,6 +1283,32 @@ fn spawn_probe(
         }
         Some(probed)
     })
+}
+
+/// `AudioFileProber.AddExternalLyrics`: every lyric sidecar of the track is
+/// recorded in [`MediaInfo::lyric_files`], and the first one is appended as a
+/// `Lyric` stream numbered after the probe's last stream.
+fn add_external_lyrics(
+    resolvers: &ExternalStreamResolvers,
+    track: &crate::media_info_resolver::ExternalMediaTarget,
+    probed: &mut MediaInfo,
+) {
+    let streams = &mut probed.media_source.media_streams;
+    let start_index = streams
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .map_or(0, |max| max + 1);
+    let lyrics = resolvers
+        .lyrics()
+        .get_external_lyric_streams(track, start_index);
+    probed.lyric_files = Vec::new();
+    for path in lyrics.iter().filter_map(|s| s.path.clone()) {
+        if !probed.lyric_files.contains(&path) {
+            probed.lyric_files.push(path);
+        }
+    }
+    streams.extend(lyrics.into_iter().take(1));
 }
 
 /// The look-ahead probe pipeline: tracks which planned rows probe, keeps a
@@ -1457,19 +1489,15 @@ impl<'a> ProbePipeline<'a> {
                     None
                 };
                 self.next += 1;
-                // Sidecar streams are a video concern (`FFProbeVideoInfo`);
-                // an audio item's probe is the embedded-tag path only.
-                let external = self
-                    .externals
-                    .as_ref()
-                    .filter(|_| !request.media_is_audio)
-                    .map(|seam| {
-                        let mut external = seam.for_item(self.planned[index].id);
-                        // The sidecars sit beside the `.strm`, not its target.
-                        external.sidecar_path =
-                            shortcut.and(self.planned[index].entity.path.clone());
-                        external
-                    });
+                // A video's sidecars are subtitles and audio tracks
+                // (`FFProbeVideoInfo`), an audio track's are its lyrics
+                // (`AudioFileProber.AddExternalLyrics`).
+                let external = self.externals.as_ref().map(|seam| {
+                    let mut external = seam.for_item(self.planned[index].id);
+                    // The sidecars sit beside the `.strm`, not its target.
+                    external.sidecar_path = shortcut.and(self.planned[index].entity.path.clone());
+                    external
+                });
                 let is_audio = request.media_is_audio;
                 self.inflight.push_back((
                     index,
@@ -2599,6 +2627,45 @@ fn sidecars_changed(
     };
     differs(seam.resolvers.subtitles(), &links.external_subtitles)
         || differs(seam.resolvers.audio(), &links.external_audio)
+}
+
+/// Whether the lyric files beside `item`'s audio track differ from the ones
+/// its last probe recorded — `ProbeProvider.HasChanged` comparing
+/// `LyricResolver.GetExternalFiles` with `Audio.LyricFiles` (ordinal sets).
+/// An unknown stored row counts as changed, and so does a row scanned before
+/// `LyricFiles` was recorded once lyric files sit beside it.
+///
+/// Upstream builds the on-disk set ignoring case and compares it with an
+/// ordinal `LyricFiles`, so `a.lrc` beside `A.lrc` on a case-sensitive
+/// filesystem re-probes the track on every scan; both sets here are ordinal,
+/// as the video arm's are, and settle.
+fn lyrics_changed(
+    seam: &ExternalProbeSeam,
+    item: &Planned,
+    stored: Option<&BaseItemEntity>,
+) -> bool {
+    let (Some(stored), Some(path)) = (stored, item.entity.path.as_deref()) else {
+        return true;
+    };
+    let target = seam
+        .resolvers
+        .target_for(path, seam.for_item(item.id).internal_metadata_path);
+    let now: std::collections::HashSet<String> = seam
+        .resolvers
+        .lyrics()
+        .get_external_files(&target)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    let data = crate::item_data::parse_data(stored.data.as_deref());
+    let recorded: std::collections::HashSet<&str> = data
+        .get("LyricFiles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    now.len() != recorded.len() || !now.iter().all(|p| recorded.contains(p.as_str()))
 }
 
 /// The newest NFO sidecar the local readers would read for `entity`, with its
@@ -8790,14 +8857,8 @@ impl LibraryScanner {
             mtime: entity.date_modified,
             probe,
             sidecars_changed,
-            // TODO(parity, open work item — NOT an accepted divergence): the
-            // scan's probe records no lyric files (`AudioFileProber`'s lyric
-            // resolver and its `Lyric` streams are not ported; lyrics are read
-            // from their sidecars at request time), so there is no stored set
-            // for `ProbeProvider.HasChanged`'s lyric arm to compare. Porting
-            // the lyric streams into the probe and feeding both sets here
-            // closes it; `plan_item_refresh` already honours the flag.
-            lyrics_changed: false,
+            lyrics_changed: matches!(probe, ProbeKind::Audio)
+                && externals.is_some_and(|seam| lyrics_changed(seam, item, stored)),
             local_metadata: nfo_file(entity, policy),
             supports_cumulative_run_time: matches!(
                 kind,
@@ -8997,6 +9058,19 @@ impl LibraryScanner {
             Vec::new()
         };
         let people = media_is_audio.then(|| audio_credits(entity, probed, policy.options));
+        // `Audio.LyricFiles`, which the lyric arm of the change detection
+        // compares with the sidecars on disk. A track with none stores no key,
+        // which reads back as the same empty set.
+        let lyric_files =
+            (!probed.lyric_files.is_empty()).then(|| serde_json::json!(probed.lyric_files));
+        if media_is_audio
+            && let Some(data) = crate::item_data::merge_data_fields(
+                entity.data.as_deref(),
+                &[("LyricFiles", lyric_files)],
+            )
+        {
+            entity.data = Some(data);
+        }
         let allowed = policy
             .options
             .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
@@ -18774,18 +18848,25 @@ fn overlay_shortcut_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
 /// Restores direct probe properties after the provider metadata merge. A
 /// completed video probe owns its nullable stream index regardless of the
 /// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
-/// must not restore an index from the previous probe.
+/// must not restore an index from the previous probe. An audio probe owns
+/// `LyricFiles` the same way (`AudioFileProber.AddExternalLyrics`), so the
+/// lyric files that are gone do not survive as "existing" data.
 fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     let data = crate::item_data::parse_data(scanned.data.as_deref());
     if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
         row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
     }
-    if scanned.media_type.as_deref() == Some("Video")
-        && let Some(index) = data.get("DefaultVideoStreamIndex").cloned()
-        && let Some(data) = crate::item_data::merge_data_fields(
-            row.data.as_deref(),
-            &[("DefaultVideoStreamIndex", Some(index))],
-        )
+    let field = match scanned.media_type.as_deref() {
+        Some("Video") => data
+            .get("DefaultVideoStreamIndex")
+            .cloned()
+            .map(|index| ("DefaultVideoStreamIndex", Some(index))),
+        // No key: the track has no lyric files now, and the stored list goes.
+        Some("Audio") => Some(("LyricFiles", data.get("LyricFiles").cloned())),
+        _ => None,
+    };
+    if let Some(field) = field
+        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &[field])
     {
         row.data = Some(data);
     }
