@@ -2392,11 +2392,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     // `music_genre_row`, and the same reason an adopted
                     // Jellyfin database (whose by-name rows carry Jellyfin's
                     // ids) must not get a duplicate laid beside each row.
+                    // `IsFolder` is 0, as in `ensure_by_name_item`: the row has
+                    // no parent, so even a `MusicArtist` is `IsAccessedByName`
+                    // (`MusicArtist.cs:30-33`, `IsFolder => !IsAccessedByName`).
                     r#"INSERT INTO "BaseItems"
                        ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
                         "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       SELECT ?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0
+                       SELECT ?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0
                        WHERE NOT EXISTS (
                            SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
                 )
@@ -2415,14 +2418,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         None,
                     )
                 }))
-                // `IsFolder` follows the C# class, not the by-name-ness:
-                // `MusicArtist : Folder`, but `Genre`/`MusicGenre`/`Studio`
-                // are plain `BaseItem`s, so the controller's
-                // `if (item.IsFolder) result.IsFolder = true;` never fires for
-                // them and a genre hint carries no `IsFolder` at all.
-                .bind(i32::from(
-                    by_name_kind(*type_) == Some(BaseItemKind::MusicArtist),
-                ))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;

@@ -307,7 +307,7 @@ async fn get_universal_audio_stream(
     req.max_audio_bit_depth = query.max_audio_bit_depth;
     req.start_time_ticks = query.start_time_ticks;
     req.context = Some(EncodingContext::Static);
-    let reasons = negotiated.transcode_reasons;
+    let reasons = negotiated.source.transcode_reasons;
     req.transcode_reasons = (!reasons.is_empty())
         .then(|| ferrofin_model::session::transcode_reasons_unique_names(reasons).join(","));
     // `SubtitleMethod` and `CopyTimestamps` are not carried: they only shape
