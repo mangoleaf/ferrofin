@@ -18,8 +18,9 @@
 //! and every read resolves the caller's [`PlaylistAccess`] — owner, `CanEdit`
 //! share, read-only share, or open-access — with invisible playlists reported as
 //! `NotFound` (the C# `GetPlaylistForUser` null). A playlist with no `Playlists`
-//! row (created before owner tracking, or by an API key) grants `Owner` to every
-//! caller for back-compat.
+//! row (created before owner tracking), or with no owner in it, grants `Owner`
+//! to every caller for back-compat. A create or lookup with no user is
+//! refused, as upstream's `GetUserById` does.
 //!
 //! A playlist the library scan resolved from a `.m3u`/`.pls` file is owned by
 //! nobody and open to everyone (`PlaylistResolver`), so every caller reads it
@@ -190,6 +191,17 @@ fn folder_items_query(
     query
 }
 
+/// Upstream's `GetUserById(Guid.Empty)` throw (`UserManager.cs:123-128`, a
+/// 400 through `ExceptionMiddleware`): `CreatePlaylist` and every
+/// `GetPlaylists`/`GetPlaylistForUser` lookup make it, so an API key that
+/// names no user gets neither an unowned playlist nor a look at one.
+fn require_user(user_id: Uuid) -> Result<(), ServiceError> {
+    if user_id.is_nil() {
+        return Err(ServiceError::invalid_input("Guid can't be empty"));
+    }
+    Ok(())
+}
+
 /// Decides the caller's [`PlaylistAccess`] from the three joined access columns
 /// (C# `Playlist.IsVisible` plus the owner/`CanEdit` split the controller checks
 /// derive from it). `None` means invisible — callers report `NotFound`.
@@ -211,14 +223,14 @@ fn decide_access(
         });
     };
     let open_access = open_access != 0;
-    // A NULL owner in an existing meta row is an API-key playlist: no user
-    // owns it, so — like a legacy row — every caller is owner-equivalent.
+    // A NULL owner in an existing meta row (an older build's user-less
+    // API-key create, or a `Data` naming no owner) means no user owns it, so
+    // — like a legacy row — every caller is owner-equivalent.
     // Parse-compare the stored owner GUID so rows written in either case
     // (legacy lowercase, canonical uppercase) still match. The empty GUID is
     // nobody's: a playlist the library scan found is owned by it
-    // (`PlaylistResolver`), and an API key calls as it — upstream's API-key
-    // edit of such a playlist never gets past `GetPlaylistForUser`, which
-    // asks `IsVisible` of a user it does not have.
+    // (`PlaylistResolver`). No caller here is the empty GUID — the manager
+    // refuses one first ([`require_user`]) — so the guard is defensive.
     let owner_is_caller =
         !user_id.is_nil() && owner.and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
     let level = if owner.is_none() || owner_is_caller {
@@ -985,6 +997,7 @@ impl FerrofinPlaylistManager {
         playlist_id: Uuid,
         user_id: Uuid,
     ) -> Result<PlaylistAccess, ServiceError> {
+        require_user(user_id)?;
         let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
             r#"SELECT p."OwnerUserId", p."OpenAccess", s."CanEdit"
                FROM "BaseItems" bi
@@ -1039,6 +1052,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             Some(media_type) if media_type != MediaType::Unknown => media_type,
             _ => self.infer_media_type(&request.item_id_list).await?,
         };
+        require_user(request.user_id)?;
         let parent = playlists_folder(&self.db, &self.paths).await?;
         // Playlist entries are positions, not a set (C# `LinkedChild.Create`
         // per item, no de-duplication).
@@ -1064,14 +1078,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
             parent,
         )
         .await?;
-        // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
-        // (API-key create) stores NULL — unowned, visible to all.
+        // The ownership meta row (C# `OwnerUserId`/`OpenAccess`).
         sqlx::query(
             r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                VALUES (?1, ?2, ?3)"#,
         )
         .bind(guid_to_db(id))
-        .bind((!request.user_id.is_nil()).then(|| guid_to_db(request.user_id)))
+        .bind(guid_to_db(request.user_id))
         .bind(i64::from(request.public.unwrap_or(false)))
         .execute(&mut *tx)
         .await
@@ -1187,6 +1200,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
     }
 
     async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        require_user(user_id)?;
         let type_name = stored_type_name(BaseItemKind::Playlist)
             .ok_or_else(|| ServiceError::backend("no stored type name for Playlist"))?;
         // Visibility predicate (C# `Playlist.IsVisible`): legacy/unowned rows,
@@ -1226,6 +1240,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: Uuid,
         user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        require_user(user_id)?;
         // One round-trip through the repository seam: the member rows already
         // in link order (the same ordering `get_linked_children_ids` applies),
         // each carrying the caller's access columns, so the visibility gate
@@ -1625,8 +1640,8 @@ mod tests {
     };
 
     /// A playlist owned by the empty GUID — one the library scan found — is
-    /// open to read for every caller, an API key (the empty caller) too, and
-    /// owned by none of them.
+    /// open to read for every caller and owned by none of them; even an empty
+    /// caller, which the manager refuses before asking, would not own it.
     #[test]
     fn the_empty_owner_is_nobody() {
         use ferrofin_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
@@ -1934,6 +1949,7 @@ mod tests {
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("My Playlist".to_owned()),
+                user_id: Uuid::new_v4(),
                 ..Default::default()
             })
             .await
@@ -2324,6 +2340,7 @@ mod tests {
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("Mix".to_owned()),
                 item_id_list: vec![unrated, heat],
+                user_id: Uuid::new_v4(),
                 ..PlaylistCreationRequest::default()
             })
             .await
@@ -3393,6 +3410,58 @@ mod tests {
             mgr.get_playlist_for_user(playlist_id, carol).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
         ));
+    }
+
+    /// No user, no playlist: upstream's `GetUserById(Guid.Empty)` throws in
+    /// `CreatePlaylist` and in every `GetPlaylists`/`GetPlaylistForUser`.
+    #[tokio::test]
+    async fn a_nil_user_is_refused() {
+        use ferrofin_traits::error::ServiceError;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let invalid = |result: Result<(), ServiceError>| {
+            assert!(
+                matches!(result, Err(ServiceError::InvalidInput(_))),
+                "{result:?}"
+            );
+        };
+        invalid(
+            mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Keyed".to_owned()),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .map(drop),
+        );
+        assert!(
+            mgr.get_playlists(Uuid::new_v4()).await.unwrap().is_empty(),
+            "no unowned playlist was written"
+        );
+        // A member, so the items read takes its joined path, not the
+        // empty-playlist fallback through `access`.
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let owned = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Owned".to_owned()),
+                item_id_list: vec![track],
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        invalid(mgr.get_playlist_access(owned, Uuid::nil()).await.map(drop));
+        invalid(
+            mgr.get_playlist_for_user(owned, Uuid::nil())
+                .await
+                .map(drop),
+        );
+        invalid(mgr.get_playlist_items(owned, Uuid::nil()).await.map(drop));
+        invalid(mgr.get_playlists(Uuid::nil()).await.map(drop));
     }
 
     #[tokio::test]

@@ -2214,7 +2214,8 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
 struct PlaylistItemRow {
     /// The member item row.
     item: BaseItemEntity,
-    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy or API-key playlist).
+    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy playlist, an older
+    /// build's user-less API-key create, or a `Data` naming no owner).
     owner: Option<String>,
     /// `FerrofinPlaylists.OpenAccess` (NULL only when the meta row is absent).
     open_access: Option<i64>,
