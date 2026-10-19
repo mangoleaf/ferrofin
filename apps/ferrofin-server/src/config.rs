@@ -137,6 +137,8 @@ struct FileConfig {
     shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
+    scan_directory_cache_records: Option<u32>,
+    scan_directory_cache_idle_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
@@ -424,6 +426,25 @@ pub struct Config {
     /// `FERROFIN_SCAN_PROBE_CONCURRENCY` env > `scan_probe_concurrency` in
     /// `config.toml` > default.
     pub scan_probe_concurrency: Option<u32>,
+
+    /// The directory listings one library scan keeps: dropped whole once
+    /// they hold this many records (a folder counts each entry plus one).
+    /// A scan lists each folder once and its items read that listing, so
+    /// this bounds the memory a huge library's scan spends on them; past it,
+    /// a folder is listed again. `None` = upstream's
+    /// `DirectoryService.MaxCachedRecords` (100 000). Resolved
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` env >
+    /// `scan_directory_cache_records` in `config.toml` > default; `0` is an
+    /// error.
+    pub scan_directory_cache_records: Option<u32>,
+
+    /// How long, in seconds, a library scan's directory listings survive
+    /// unread before they are dropped whole. `None` = upstream's
+    /// `DirectoryService.IdleTimeoutMs` (300 s). Resolved
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` env >
+    /// `scan_directory_cache_idle_secs` in `config.toml` > default; `0` is an
+    /// error.
+    pub scan_directory_cache_idle_secs: Option<u32>,
 
     /// How many trickplay generations (one item width each, an ffmpeg frame
     /// extraction plus tile packing) run at once. A library scan runs several;
@@ -724,6 +745,18 @@ impl Config {
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
                 .or(file.scan_probe_concurrency),
+            scan_directory_cache_records: resolve_positive(
+                env,
+                "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
+                "scan_directory_cache_records",
+                file.scan_directory_cache_records,
+            )?,
+            scan_directory_cache_idle_secs: resolve_positive(
+                env,
+                "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
+                "scan_directory_cache_idle_secs",
+                file.scan_directory_cache_idle_secs,
+            )?,
             trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
@@ -890,6 +923,8 @@ impl Config {
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
+            scan_directory_cache_records: None,
+            scan_directory_cache_idle_secs: None,
             trickplay_concurrency: None,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
@@ -959,6 +994,31 @@ fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Resu
             "invalid db_pool `{s}` in config.toml: expected an integer or \"auto\""
         )),
     }
+}
+
+/// Resolves a count that must be positive: the `env_key` env var > `file_key`
+/// in `config.toml` > `None` (the default). Zero and anything that is not a
+/// non-negative integer are errors, so a typo or a `0` meant as "off" is
+/// noticed instead of silently disabling a cache. An empty env value is
+/// unset.
+fn resolve_positive(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+) -> anyhow::Result<Option<u32>> {
+    if let Some(raw) = env.var(env_key).filter(|s| !s.trim().is_empty()) {
+        let n: u32 = raw.trim().parse().map_err(|_| {
+            anyhow::anyhow!("invalid {env_key} `{raw}`: expected a positive integer")
+        })?;
+        anyhow::ensure!(n > 0, "invalid {env_key} `0`: expected a positive integer");
+        return Ok(Some(n));
+    }
+    anyhow::ensure!(
+        file != Some(0),
+        "invalid {file_key} `0` in config.toml: expected a positive integer"
+    );
+    Ok(file)
 }
 
 /// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
@@ -1706,6 +1766,62 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_WASM_PRIVATE_HTTP_ALLOW", "  ");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.wasm_private_http_allow, None, "blank is unset");
+    }
+
+    #[test]
+    fn scan_directory_cache_limits_resolve_and_reject_zero() {
+        // Unset → None (the scanner keeps upstream's values).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, None);
+        assert_eq!(cfg.scan_directory_cache_idle_secs, None);
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "5000")
+            .with("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "60");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(5000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(60));
+
+        for (key, value) in [
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "0"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "0"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5"),
+        ] {
+            let err = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{key}={value}: {err}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let load = |body: &str| {
+            std::fs::write(&toml, body).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            Config::load_from(cli, &FakeEnv::new())
+        };
+        let cfg =
+            load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 9\n").unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(7));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(9));
+        let err = load("scan_directory_cache_idle_secs = 0\n").unwrap_err();
+        assert!(
+            err.to_string().contains("scan_directory_cache_idle_secs"),
+            "{err}"
+        );
+        // Env wins over the file.
+        std::fs::write(&toml, "scan_directory_cache_records = 7\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(11));
     }
 
     #[test]

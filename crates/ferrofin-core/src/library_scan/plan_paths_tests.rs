@@ -785,6 +785,7 @@ async fn live_fanout_keeps_full_and_scoped_plans_identical() {
         PlanScope::ALL,
         super::DateAdded::default(),
         None,
+        None,
     );
     let expected = canon(baseline.items);
     let roots = [
@@ -805,6 +806,7 @@ async fn live_fanout_keeps_full_and_scoped_plans_identical() {
             &folders,
             PlanScope::ALL,
             super::DateAdded::default(),
+            None,
             None,
         );
         assert_eq!(canon(actual.items), expected, "limit {limit}");

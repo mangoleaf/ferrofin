@@ -1319,6 +1319,21 @@ pub async fn build_app_state(
     if let Some(concurrency) = config.scan_probe_concurrency.filter(|c| *c > 0) {
         scanner = scanner.with_probe_concurrency(concurrency as usize);
     }
+    // The bounds of each scan's directory listings (bootstrap knobs, both
+    // validated positive); unset keeps upstream's `DirectoryService` values.
+    {
+        let mut limits = ferrofin_core::library_scan::DirectoryCacheLimits::default();
+        if let Some(records) = config
+            .scan_directory_cache_records
+            .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+        {
+            limits.max_records = records;
+        }
+        if let Some(secs) = config.scan_directory_cache_idle_secs {
+            limits.idle_timeout = std::time::Duration::from_secs(u64::from(secs));
+        }
+        scanner = scanner.with_directory_cache_limits(limits);
+    }
     // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
     // registered below (once the session manager exists) forward them to
     // clients over the WebSocket so open views refresh after a scan.
