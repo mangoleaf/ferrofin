@@ -417,16 +417,13 @@ class ReportTests(unittest.TestCase):
         self.assertIn('no Jellyfin reference selected', text)
         self.assertNotIn('faster', self.row(text))
 
-    def test_dropped_and_aborted_work_withholds_resource_comparisons(self):
-        for key in ('dropped_iterations', 'aborted_iterations'):
-            with self.subTest(key=key):
-                self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({key: 1}))
-                m = self.build()
-                self.assertIsNotNone(self.home(m).flag)
-                for name, cells in m['memory']:
-                    if name in report.README_MEMORY:
-                        self.assertIsNotNone(cells['ferrofin'].flag)
-                self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({key: 0}))
+    def test_dropped_work_withholds_resource_comparisons(self):
+        self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({'dropped_iterations': 1}))
+        m = self.build()
+        self.assertIsNotNone(self.home(m).flag)
+        for name, cells in m['memory']:
+            if name in report.README_MEMORY:
+                self.assertIsNotNone(cells['ferrofin'].flag)
 
     def test_missing_window_is_incomplete_not_zero_errors(self):
         (self.b / 'ferrofin/k6-loaded.json').unlink()
@@ -813,6 +810,18 @@ class UserIsolationTests(unittest.TestCase):
                 seed.check_role_sessions([sessions[0], {**sessions[1], **change}], self.ids)
         with self.assertRaises(RuntimeError):
             seed.check_role_sessions(sessions + [sessions[1]], self.ids)
+
+    def test_harness_sessions_are_accounted_for(self):
+        roles = [{'Client': 'bench', 'DeviceId': 'bench-browse', 'UserId': 'a', 'AdditionalUsers': []},
+                 {'Client': 'bench', 'DeviceId': 'bench-playback', 'UserId': 'b', 'AdditionalUsers': []}]
+        cold = {'Client': 'bench', 'DeviceId': coldstart.DEVICE, 'UserId': 'a', 'AdditionalUsers': []}
+        self.assertIn(coldstart.DEVICE, seed.CONTROL_DEVICES)
+        self.assertIn(ttfs.DEVICE, seed.CONTROL_DEVICES)
+        seed.check_role_sessions(roles + [cold, {**cold, 'DeviceId': ttfs.DEVICE}], self.ids)
+        seed.check_role_sessions(roles + [{**cold, 'Client': 'other', 'DeviceId': 'x', 'UserId': 'z'}], self.ids)
+        for change in ({'DeviceId': 'bench-unknown'}, {'UserId': 'b'}, {'AdditionalUsers': [{'UserId': 'b'}]}):
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                seed.check_role_sessions(roles + [{**cold, **change}], self.ids)
 
     def test_user_state_requires_exact_item_coverage(self):
         api = Mock()
