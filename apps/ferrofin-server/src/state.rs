@@ -976,7 +976,8 @@ pub async fn build_app_state(
             .with_items(Arc::clone(&item_repository))
             .with_providers(lyric_providers)
             .with_metadata_path(metadata_root.clone())
-            .with_virtual_folders(Arc::clone(&virtual_folders)),
+            .with_virtual_folders(Arc::clone(&virtual_folders))
+            .with_media_streams(Arc::clone(&media_stream_repository)),
     );
     // Built after the virtual-folder manager: the refresh path reads the
     // owning library's saved options through it (C# `BaseItemManager`). Two
@@ -1317,6 +1318,21 @@ pub async fn build_app_state(
     // `None`/zero keeps the crate default.
     if let Some(concurrency) = config.scan_probe_concurrency.filter(|c| *c > 0) {
         scanner = scanner.with_probe_concurrency(concurrency as usize);
+    }
+    // The bounds of each scan's directory listings (bootstrap knobs, both
+    // validated positive); unset keeps upstream's `DirectoryService` values.
+    {
+        let mut limits = ferrofin_core::library_scan::DirectoryCacheLimits::default();
+        if let Some(records) = config
+            .scan_directory_cache_records
+            .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+        {
+            limits.max_records = records;
+        }
+        if let Some(secs) = config.scan_directory_cache_idle_secs {
+            limits.idle_timeout = std::time::Duration::from_secs(u64::from(secs));
+        }
+        scanner = scanner.with_directory_cache_limits(limits);
     }
     // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
     // registered below (once the session manager exists) forward them to
@@ -1870,6 +1886,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(lib_tasks::LyricDownloadTask::new(
             Arc::clone(&library),
             Arc::clone(&lyrics),
+            Arc::clone(&media_stream_repository),
         )));
         task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
             Arc::clone(&library),

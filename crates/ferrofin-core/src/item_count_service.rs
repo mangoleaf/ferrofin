@@ -937,7 +937,12 @@ impl FerrofinItemCountService {
     /// because none happens to be played. The fix is to exclude the placeholder
     /// (`Type = 'PLACEHOLDER'`) from both arms, with its own before/after. Kept
     /// out of the `DISTINCT` commit so that fix had a clean before/after; the
-    /// test const `UNSEEDED_LEAVES` pins the current behaviour meanwhile.
+    /// test const `UNSEEDED_LEAVES` pins the current behaviour meanwhile. The
+    /// same gap is wider than that one row: every by-name row (`Genre`,
+    /// `MusicGenre`, `Studio`, `Person`, `Year`, and a by-name `MusicArtist`)
+    /// is `IsFolder = 0` with no `AncestorIds` either, and both arms count it.
+    /// Counting only rows reachable through `AncestorIds`/`LinkedChildren`, as
+    /// upstream does, fixes both.
     async fn whole_server_leaf_counts(
         &self,
         user: &UserEntity,

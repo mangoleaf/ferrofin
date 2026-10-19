@@ -37,6 +37,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00A1_0000);
+/// Another user an administrator may name in `userId`.
+const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00A1_00FF);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
 /// A non-audio item id: it EXISTS, but the lyric routes must still refuse it.
 const MOVIE_ID: Uuid = Uuid::from_u128(0x00A1_0002);
@@ -124,7 +126,16 @@ struct OkUsers {
 #[async_trait]
 impl UserManager for OkUsers {
     async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
-        Ok((id == USER_ID).then(user))
+        Ok(match id {
+            USER_ID => Some(user()),
+            OTHER_USER_ID => Some(UserEntity {
+                id: OTHER_USER_ID.to_string(),
+                username: "bob".to_owned(),
+                normalized_username: "BOB".to_owned(),
+                ..user()
+            }),
+            _ => None,
+        })
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
@@ -307,7 +318,20 @@ impl LibraryManager for StreamLibrary {
             // it, the way C# `GetItemById<Audio>` does.
             return Ok(Some(minimal_base_item(MOVIE_ID, "A Movie", "Movie")));
         }
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Song", "Audio")))
+        // A library track: the refresh a lyric write queues is its path's scan.
+        Ok((id == ITEM_ID).then(|| BaseItemEntity {
+            path: Some("/music/Artist/Album/A Song.flac".to_owned()),
+            top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
+            ..minimal_base_item(ITEM_ID, "A Song", "Audio")
+        }))
+    }
+
+    async fn queue_refresh_scan(
+        &self,
+        _target: ferrofin_traits::library::ScanTarget,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
     }
     async fn query_items(
         &self,
@@ -812,7 +836,7 @@ async fn providers_lyrics_by_id_returns_remote_lyric_without_item() {
 #[tokio::test]
 async fn universal_audio_cross_user_as_non_admin_is_forbidden() {
     let (_dir, path) = temp_media();
-    let other = Uuid::from_u128(0x00A1_00FF);
+    let other = OTHER_USER_ID;
     let (status, _) = call(
         state(&path, no_lyrics()),
         "GET",
@@ -826,7 +850,7 @@ async fn universal_audio_cross_user_as_non_admin_is_forbidden() {
 #[tokio::test]
 async fn universal_audio_cross_user_as_admin_is_allowed() {
     let (_dir, path) = temp_media();
-    let other = Uuid::from_u128(0x00A1_00FF);
+    let other = OTHER_USER_ID;
     let (status, _) = call(
         state_as(&path, no_lyrics(), true, true),
         "GET",

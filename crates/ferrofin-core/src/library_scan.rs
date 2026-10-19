@@ -69,6 +69,8 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::directory_cache::DirectoryCache;
+pub use crate::directory_cache::DirectoryCacheLimits;
 use crate::item_folders::{self, MovedFolders};
 use crate::item_type_lookup;
 use crate::media_info_resolver::ExternalStreamResolvers;
@@ -84,6 +86,10 @@ use music::{MusicKind, MusicRefresh};
 /// its seasons/episodes reuse that match (and its per-season episode stills).
 #[derive(Default)]
 struct ArtworkCache {
+    /// The run's directory listings, which the walk's local image discovery
+    /// reads ([`discover_local_images`]); `None` lists each item's folders
+    /// afresh.
+    dirs: Option<Arc<DirectoryCache>>,
     /// Series item id → its stored `DisplayOrder` (raw; empty when it has
     /// none), read once per pass for its seasons and episodes.
     display_orders: HashMap<String, String>,
@@ -135,6 +141,17 @@ struct ArtworkCache {
     /// dimensions and a blurhash are functions of the file alone, so two rows
     /// sharing one `folder.jpg` share the answer.
     stored_images: std::collections::HashMap<String, StoredImageMetadata>,
+}
+
+impl ArtworkCache {
+    /// [`discover_local_images`] over the run's listings, or over listings
+    /// of its own when the run has none.
+    fn discover_local_images(&self, entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+        match &self.dirs {
+            Some(dirs) => discover_local_images(entity, dirs.as_ref()),
+            None => discover_local_images(entity, &FsDirectoryService::new()),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1186,6 +1203,9 @@ struct ExternalProbe {
 struct ExternalProbeSeam {
     resolvers: Arc<ExternalStreamResolvers>,
     metadata_dir: Option<DirectoryPath>,
+    /// The run's directory listings the resolvers read, which a file the
+    /// scan saves beside an item must be forgotten in.
+    dirs: Option<Arc<DirectoryCache>>,
 }
 
 impl ExternalProbeSeam {
@@ -1206,6 +1226,19 @@ impl ExternalProbeSeam {
     }
 }
 
+/// Runs blocking filesystem work (a plan pass, a window's file checks) on
+/// this worker after handing the worker's other tasks to the rest of the
+/// runtime (`block_in_place`), so requests keep every other worker while a
+/// scan walks a slow disk. On a current-thread runtime it runs the work
+/// inline: there is no other worker to hand the tasks to, and
+/// `block_in_place` would panic there.
+fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// Runs `request` on the encoder as a detached task, so the caller can keep
 /// several probes in flight while it works through the scan in order.
 ///
@@ -1213,7 +1246,9 @@ impl ExternalProbeSeam {
 /// subtitle/audio files next to it — each one its own ffprobe — and prepends
 /// them to the embedded streams in upstream's order (external subtitles,
 /// external audio, then the file's own streams, renumbered from 0). That
-/// keeps the sidecar probes off the scan loop like the main probe.
+/// keeps the sidecar probes off the scan loop like the main probe. For an
+/// audio track it appends the lyric sidecars instead ([`add_external_lyrics`]),
+/// which need no probe of their own.
 ///
 /// A probe failure is logged and reported as `None` — exactly what the
 /// inline probe did — so one unreadable file never aborts a scan. The
@@ -1263,6 +1298,10 @@ fn spawn_probe(
             let target = external
                 .resolvers
                 .target_for(path, external.internal_metadata_path);
+            if request.media_is_audio {
+                add_external_lyrics(&external.resolvers, &target, &mut probed);
+                return Some(probed);
+            }
             let externals = external.resolvers.external_streams(&target, 0).await;
             if !externals.is_empty() {
                 tracing::debug!(
@@ -1277,6 +1316,91 @@ fn spawn_probe(
         }
         Some(probed)
     })
+}
+
+/// `AudioFileProber.AddExternalLyrics`: every lyric sidecar of the track is
+/// recorded in [`MediaInfo::lyric_files`], and the first one is appended as a
+/// `Lyric` stream numbered after the probe's last stream.
+fn add_external_lyrics(
+    resolvers: &ExternalStreamResolvers,
+    track: &crate::media_info_resolver::ExternalMediaTarget,
+    probed: &mut MediaInfo,
+) {
+    let streams = &mut probed.media_source.media_streams;
+    let start_index = streams
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .map_or(0, |max| max + 1);
+    let lyrics = resolvers
+        .lyrics()
+        .get_external_lyric_streams(track, start_index);
+    probed.lyric_files = Vec::new();
+    for path in lyrics.iter().filter_map(|s| s.path.clone()) {
+        if !probed.lyric_files.contains(&path) {
+            probed.lyric_files.push(path);
+        }
+    }
+    streams.extend(lyrics.into_iter().take(1));
+}
+
+/// `AudioFileProber.FetchAsync`'s embedded-lyric step (`:143-157`, with
+/// `FetchDataFromTags` `:562-572` and `LyricManager.SaveLyricAsync`), run on an
+/// unlocked track's probe result: the lyrics in its tags
+/// ([`embedded_lyrics::from_tags`]) are saved as `{stem}.lrc` — beside the
+/// track when the library saves lyrics with media, else in its internal
+/// metadata folder — when it has no lyric sidecar yet, or under
+/// `ReplaceAllMetadata`. A track that had none then picks the saved file up as
+/// its lyric stream ([`add_external_lyrics`]).
+///
+/// The save goes by path, not through the lyric manager's item lookup: a
+/// track's row is not stored yet when its first probe returns.
+///
+/// A write that fails everywhere is an error, as `TrySaveToFiles` throws:
+/// the caller then drops the probe result, as upstream loses the whole
+/// `FetchAsync`.
+fn extract_embedded_lyrics(
+    seam: &ExternalProbeSeam,
+    id: Uuid,
+    path: &str,
+    probed: &mut MediaInfo,
+    replace_all: bool,
+    save_with_media: bool,
+) -> Result<(), ServiceError> {
+    let try_extract = !probed
+        .media_source
+        .media_streams
+        .iter()
+        .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric);
+    if !(try_extract || replace_all) {
+        return Ok(());
+    }
+    let Some(lyrics) = probed
+        .raw_audio_tags
+        .as_ref()
+        .and_then(crate::embedded_lyrics::from_tags)
+    else {
+        return Ok(());
+    };
+    let internal = seam.for_item(id).internal_metadata_path;
+    let targets = crate::lyric_manager::save_targets(
+        std::path::Path::new(path),
+        save_with_media,
+        internal.as_deref().map(std::path::Path::new),
+        "lrc",
+    );
+    let saved = crate::lyric_manager::try_save_to_files(&targets, &lyrics)?;
+    tracing::debug!(path = %saved.display(), "saved embedded lyrics");
+    // `LyricManager` invalidates the saved path (`LyricManager.cs:455`):
+    // the lookup below then lists its folder again and finds the file.
+    if let Some(dirs) = &seam.dirs {
+        dirs.invalidate(&saved.to_string_lossy());
+    }
+    if try_extract {
+        let target = seam.resolvers.target_for(path, internal);
+        add_external_lyrics(&seam.resolvers, &target, probed);
+    }
+    Ok(())
 }
 
 /// The look-ahead probe pipeline: tracks which planned rows probe, keeps a
@@ -1457,19 +1581,15 @@ impl<'a> ProbePipeline<'a> {
                     None
                 };
                 self.next += 1;
-                // Sidecar streams are a video concern (`FFProbeVideoInfo`);
-                // an audio item's probe is the embedded-tag path only.
-                let external = self
-                    .externals
-                    .as_ref()
-                    .filter(|_| !request.media_is_audio)
-                    .map(|seam| {
-                        let mut external = seam.for_item(self.planned[index].id);
-                        // The sidecars sit beside the `.strm`, not its target.
-                        external.sidecar_path =
-                            shortcut.and(self.planned[index].entity.path.clone());
-                        external
-                    });
+                // A video's sidecars are subtitles and audio tracks
+                // (`FFProbeVideoInfo`), an audio track's are its lyrics
+                // (`AudioFileProber.AddExternalLyrics`).
+                let external = self.externals.as_ref().map(|seam| {
+                    let mut external = seam.for_item(self.planned[index].id);
+                    // The sidecars sit beside the `.strm`, not its target.
+                    external.sidecar_path = shortcut.and(self.planned[index].entity.path.clone());
+                    external
+                });
                 let is_audio = request.media_is_audio;
                 self.inflight.push_back((
                     index,
@@ -1910,6 +2030,10 @@ pub struct ScanRun<'a> {
     /// It validates every library from the root ([`ScanTarget::All`]): a
     /// refresh of the root reaches the user root's image too.
     from_root: bool,
+    /// The directory listings the run shares between its items (one per
+    /// run, as upstream's validation has one `DirectoryService`); set by
+    /// [`LibraryScanner::scan_target`].
+    dirs: Option<&'a Arc<DirectoryCache>>,
 }
 
 impl std::fmt::Debug for ScanRun<'_> {
@@ -1944,6 +2068,7 @@ impl<'a> ScanRun<'a> {
             lane: None,
             touched: None,
             from_root: false,
+            dirs: None,
         }
     }
 
@@ -2601,10 +2726,54 @@ fn sidecars_changed(
         || differs(seam.resolvers.audio(), &links.external_audio)
 }
 
+/// Whether the lyric files beside `item`'s audio track differ from the ones
+/// its last probe recorded — `ProbeProvider.HasChanged` comparing
+/// `LyricResolver.GetExternalFiles` with `Audio.LyricFiles` (ordinal sets).
+/// An unknown stored row counts as changed, and so does a row scanned before
+/// `LyricFiles` was recorded once lyric files sit beside it.
+///
+/// Upstream builds the on-disk set ignoring case and compares it with an
+/// ordinal `LyricFiles`, so `a.lrc` beside `A.lrc` on a case-sensitive
+/// filesystem re-probes the track on every scan; both sets here are ordinal,
+/// as the video arm's are, and settle.
+fn lyrics_changed(
+    seam: &ExternalProbeSeam,
+    item: &Planned,
+    stored: Option<&BaseItemEntity>,
+) -> bool {
+    let (Some(stored), Some(path)) = (stored, item.entity.path.as_deref()) else {
+        return true;
+    };
+    let target = seam
+        .resolvers
+        .target_for(path, seam.for_item(item.id).internal_metadata_path);
+    let now: std::collections::HashSet<String> = seam
+        .resolvers
+        .lyrics()
+        .get_external_files(&target)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    let data = crate::item_data::parse_data(stored.data.as_deref());
+    let recorded: std::collections::HashSet<&str> = data
+        .get("LyricFiles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    now.len() != recorded.len() || !now.iter().all(|p| recorded.contains(p.as_str()))
+}
+
 /// The newest NFO sidecar the local readers would read for `entity`, with its
 /// mtime — each provider's `BaseNfoProvider.GetXmlFile`, whose `HasChanged`
 /// any of them can raise — or `None` (no such file, a kind with no NFO, or
 /// the library disabled the reader).
+///
+/// Every candidate is stat'ed, not read from the run's listings: an
+/// NFO a webhook drops in after the plan pass listed the folder is read in
+/// this scan, as upstream's `GetXmlFile` → `IDirectoryService.GetFile`
+/// stats a path it has not seen exist (it memoises only files it found).
 fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
     if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
         // A playlist folder's `PlaylistXmlProvider` monitors its
@@ -2779,6 +2948,10 @@ struct PlanCtx<'a> {
     date_added: DateAdded,
     fanout: Option<Arc<fanout::Budget>>,
     cancel: Option<ScanCancel>,
+    /// The run's directory listings, which [`LibraryScanner::list`] fills
+    /// for the readers after the pass; `None` lists through the scanner's
+    /// filesystem alone.
+    dirs: Option<Arc<DirectoryCache>>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -2817,6 +2990,7 @@ impl<'a> PlanCtx<'a> {
             date_added: DateAdded::default(),
             fanout: None,
             cancel: None,
+            dirs: None,
         }
     }
 
@@ -3317,6 +3491,8 @@ pub struct LibraryScanner {
     /// The saved NFO options (`ReleaseDateFormat`, `UserId`), read per sidecar.
     nfo_configuration:
         Option<Arc<dyn Fn() -> ferrofin_providers::xbmc::config::NfoConfiguration + Send + Sync>>,
+    /// The bounds of each run's directory listings.
+    directory_cache_limits: DirectoryCacheLimits,
     chapter_image_extractor:
         std::sync::OnceLock<Arc<crate::chapter_image_extractor::ChapterImageExtractor>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -3519,15 +3695,27 @@ impl LibraryScanner {
         self
     }
 
+    /// Saves `images` to their destinations and removes the `previous`
+    /// files they replace. The folders it wrote or deleted in are forgotten
+    /// in `dirs`, the run's listings: the next item in that folder (a
+    /// version sharing its `poster.jpg`) lists what is there now.
     async fn publish_media_artwork(
         &self,
         row: &BaseItemEntity,
         images: &mut [ItemImageInfo],
         previous: &[ItemImageInfo],
+        dirs: Option<&DirectoryCache>,
     ) -> u32 {
-        if let Some(saver) = &self.image_saver
-            && let Err(error) = saver.save_all(row, images, previous).await
-        {
+        let Some(saver) = &self.image_saver else {
+            return 0;
+        };
+        let published = saver.save_all(row, images, previous).await;
+        if let Some(dirs) = dirs {
+            for image in images.iter().chain(previous) {
+                dirs.invalidate(&image.path);
+            }
+        }
+        if let Err(error) = published {
             tracing::warn!(%error, item_id=%row.id, "could not apply artwork destination");
             return 1;
         }
@@ -3540,9 +3728,10 @@ impl LibraryScanner {
         row: &BaseItemEntity,
         images: &mut [ItemImageInfo],
         previous: Option<&[ItemImageInfo]>,
+        dirs: Option<&DirectoryCache>,
     ) -> bool {
         let failed = self
-            .publish_media_artwork(row, images, previous.unwrap_or_default())
+            .publish_media_artwork(row, images, previous.unwrap_or_default(), dirs)
             .await
             > 0;
         self.fill_image_metadata(images).await;
@@ -3625,6 +3814,7 @@ impl LibraryScanner {
             chapter_image_extractor: std::sync::OnceLock::new(),
             dummy_chapter_duration: None,
             nfo_configuration: None,
+            directory_cache_limits: DirectoryCacheLimits::default(),
         }
     }
 
@@ -3801,6 +3991,17 @@ impl LibraryScanner {
     pub fn with_probe_concurrency(mut self, concurrency: usize) -> Self {
         self.probe_concurrency = concurrency.max(1);
         self.probe_slots = Arc::new(tokio::sync::Semaphore::new(self.probe_concurrency));
+        self
+    }
+
+    /// Bounds each run's directory listings (see [`DirectoryCacheLimits`]).
+    ///
+    /// Wired from the `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` and
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` bootstrap knobs; unit tests
+    /// keep upstream's values.
+    #[must_use]
+    pub fn with_directory_cache_limits(mut self, limits: DirectoryCacheLimits) -> Self {
+        self.directory_cache_limits = limits;
         self
     }
 
@@ -4178,6 +4379,17 @@ impl LibraryScanner {
         target: &ScanTarget,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
+        // One cache of directory listings for the whole run, read by every
+        // item in it (`new DirectoryService` per validation upstream). The
+        // refreshes a run serves get their own.
+        let dirs = Arc::new(DirectoryCache::new(
+            Arc::clone(&self.file_system),
+            self.directory_cache_limits,
+        ));
+        let run = ScanRun {
+            dirs: Some(run.dirs.unwrap_or(&dirs)),
+            ..run
+        };
         match target {
             ScanTarget::All => self.scan_libraries(None, run).await,
             ScanTarget::Library(id) => self.scan_libraries(Some(*id), run).await,
@@ -4290,6 +4502,14 @@ impl LibraryScanner {
                     panic_message(panic.as_ref())
                 )))
             });
+            // The refresh may have written anywhere under its paths (artwork,
+            // NFOs, subtitles): this run lists again what it reads next. The
+            // library monitor's changes do not come this way (they queue as a
+            // scan of their own, with its own listings), so a file the disk
+            // gains mid-run is seen by that scan, not this one.
+            if let Some(dirs) = run.dirs {
+                dirs.clear();
+            }
             touched.extend(
                 planned
                     .into_inner()
@@ -4442,13 +4662,16 @@ impl LibraryScanner {
                 });
             }
             Box::pin(self.serve_lane(run)).await;
-            let part = self.plan_in(
-                library,
-                &all_folders,
-                PlanScope::ALL,
-                date_added,
-                Some(run.cancel),
-            );
+            let part = off_runtime(|| {
+                self.plan_in(
+                    library,
+                    &all_folders,
+                    PlanScope::ALL,
+                    date_added,
+                    Some(run.cancel),
+                    run.dirs,
+                )
+            });
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
             plan.rip_folds.extend(part.rip_folds);
@@ -4806,13 +5029,16 @@ impl LibraryScanner {
         // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
-        let plan = self.plan_in(
-            &affected,
-            &folders,
-            PlanScope::paths(roots, also_path),
-            self.date_added(),
-            Some(run.cancel),
-        );
+        let plan = off_runtime(|| {
+            self.plan_in(
+                &affected,
+                &folders,
+                PlanScope::paths(roots, also_path),
+                self.date_added(),
+                Some(run.cancel),
+                run.dirs,
+            )
+        });
         tracing::info!(
             changed,
             roots = roots.len(),
@@ -5525,7 +5751,7 @@ impl LibraryScanner {
                 ..Default::default()
             },
             locked: &locked_items,
-            externals: self.external_probe_seam(),
+            externals: self.external_probe_seam(run.dirs),
             superseded: superseded_copies(&planned),
             date_added,
             ..RefreshContext::of(run)
@@ -5534,7 +5760,7 @@ impl LibraryScanner {
         // reads, so it runs `probe_concurrency` files ahead of this loop — as
         // far as the items whose refresh plan is known, i.e. to the end of the
         // stored-row window. The loop itself keeps plan order.
-        let mut probes = self.probe_pipeline(&planned, run.options);
+        let mut probes = self.probe_pipeline(&planned, run);
         let mut reported = 0;
         // What the closing passes take from the walk: the albums and artists
         // whose music refresh it decided, and those a lane refresh served
@@ -5617,9 +5843,9 @@ impl LibraryScanner {
             if is_new && self.events.is_some() {
                 items_added.push(item);
             }
-            let plan = stored_rows
-                .plan(scanned)
-                .unwrap_or_else(|| self.plan_item(&refresh, None, !is_new, item, None));
+            let plan = stored_rows.plan(scanned).unwrap_or_else(|| {
+                off_runtime(|| self.plan_item(&refresh, None, !is_new, item, None))
+            });
             // A folder a path-scoped scan carries for context only — one
             // above the items it refreshes — is read, never refreshed or
             // written: upstream's refresh of an item never touches the
@@ -6382,9 +6608,34 @@ impl LibraryScanner {
             .request_for(item, !matches!(stored, Stored::New));
         let options = request.options;
         let cancel = state.refresh.cancel;
-        let Some(probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
+        let Some(mut probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
             return Ok(ItemSaved::Cancelled);
         };
+        let unsaved_lyrics = if probe.is_audio
+            && !locked
+            && let (Some(info), Some(seam), Some(path)) = (
+                probe.info.as_mut(),
+                state.refresh.externals.as_ref(),
+                item.entity.path.as_deref(),
+            ) {
+            extract_embedded_lyrics(
+                seam,
+                item.id,
+                path,
+                info,
+                options.replace_all_metadata,
+                policy.options.is_some_and(|o| o.save_lyrics_with_media),
+            )
+            .err()
+        } else {
+            None
+        };
+        if let Some(e) = unsaved_lyrics {
+            let path = item.entity.path.as_deref();
+            tracing::warn!(error = %e, ?path, "embedded lyrics not saved; item left unprobed");
+            probe.info = None;
+            probe.failed = true;
+        }
         let probe_ran = probe.info.is_some();
         let mut failures = u32::from(probe.failed);
         let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
@@ -7041,6 +7292,10 @@ impl LibraryScanner {
             downloader
                 .download_missing_from_probe_locked(&entity, options, cancel, &unfiltered)
                 .await;
+            // A subtitle saved beside the video lands in its folder's listing.
+            if let (Some(dirs), Some(path)) = (&state.art_cache.dirs, &entity.path) {
+                dirs.invalidate(path);
+            }
         }
         self.persist_video_chapters(
             &entity,
@@ -7137,32 +7392,35 @@ impl LibraryScanner {
                 None
             }
         };
-        let mut plans: Vec<ItemRefreshPlan> = Vec::with_capacity(end - start);
-        for (offset, item) in planned[start..end].iter().enumerate() {
-            // A cancelled scan stops right after this read (`run_scan`), so
-            // the rest of the window is never walked: stop planning it.
-            if refresh.cancel.is_cancelled() {
-                break;
+        // Each item's plan stats its file and lists its sidecars.
+        window.plans = off_runtime(|| {
+            let mut plans: Vec<ItemRefreshPlan> = Vec::with_capacity(end - start);
+            for (offset, item) in planned[start..end].iter().enumerate() {
+                // A cancelled scan stops right after this read (`run_scan`),
+                // so the rest of the window is never walked: stop planning it.
+                if refresh.cancel.is_cancelled() {
+                    break;
+                }
+                let mut plan = self.plan_item(
+                    refresh,
+                    window.get(item.id).row(),
+                    !matches!(window.get(item.id), Stored::New),
+                    item,
+                    window.links(item.id),
+                );
+                // A superseded copy is skipped by the walk: it must not reach
+                // the probe pipeline, whose results are taken in order.
+                if refresh.superseded.contains(&(start + offset)) {
+                    plan.probe = false;
+                }
+                // An undecodable row runs nothing (`Stored::Undecodable`).
+                if matches!(window.get(item.id), Stored::Undecodable) {
+                    plan = crate::refresh_plan::ItemRefreshPlan::IDLE;
+                }
+                plans.push(plan);
             }
-            let mut plan = self.plan_item(
-                refresh,
-                window.get(item.id).row(),
-                !matches!(window.get(item.id), Stored::New),
-                item,
-                window.links(item.id),
-            );
-            // A superseded copy is skipped by the walk: it must not reach
-            // the probe pipeline, whose results are taken in order.
-            if refresh.superseded.contains(&(start + offset)) {
-                plan.probe = false;
-            }
-            // An undecodable row runs nothing (`Stored::Undecodable`).
-            if matches!(window.get(item.id), Stored::Undecodable) {
-                plan = crate::refresh_plan::ItemRefreshPlan::IDLE;
-            }
-            plans.push(plan);
-        }
-        window.plans = plans;
+            plans
+        });
     }
 
     /// The `BaseItems` half of [`read_stored_window`](Self::read_stored_window).
@@ -7427,7 +7685,10 @@ impl LibraryScanner {
         // Boxed: the scan loop holds this cache across every item's awaits, so
         // keeping its six maps out of that future keeps the per-scan future
         // small (clippy's `large_futures` ceiling is the tripwire).
-        let mut art_cache = Box::new(ArtworkCache::default());
+        let mut art_cache = Box::new(ArtworkCache {
+            dirs: run.dirs.cloned(),
+            ..ArtworkCache::default()
+        });
         self.preload_provider_ids(planned, &mut art_cache).await;
         self.preload_image_metadata(planned, &mut art_cache).await;
         let touched = self
@@ -7510,7 +7771,9 @@ impl LibraryScanner {
         }
         for (id, album) in albums {
             touched.extend(Box::pin(self.serve_lane(run)).await);
-            let mut images = discover_local_images(album);
+            // Listed afresh: the walk may have saved artwork into the
+            // album's folder since the run listed it.
+            let mut images = discover_local_images(album, &FsDirectoryService::new());
             self.append_art_dir_images(album, &mut images);
             if !images.iter().any(|i| i.image_type == ImageType::Primary)
                 && let Some(items) = &self.item_repository
@@ -8673,14 +8936,11 @@ impl LibraryScanner {
     /// need the naming options' extension/flag tables, the language lookup
     /// (the configured localization, else the default culture set — the
     /// lookup itself is culture-table-only), the encoder, and the filesystem.
-    fn probe_pipeline<'a>(
-        &self,
-        planned: &'a [Planned],
-        options: &MetadataRefreshOptions,
-    ) -> ProbePipeline<'a> {
+    fn probe_pipeline<'a>(&self, planned: &'a [Planned], run: ScanRun<'_>) -> ProbePipeline<'a> {
+        let options = run.options;
         ProbePipeline::new(
             self.media_encoder.clone(),
-            self.external_probe_seam(),
+            self.external_probe_seam(run.dirs),
             planned,
             self.probe_concurrency,
         )
@@ -8690,8 +8950,9 @@ impl LibraryScanner {
     }
 
     /// The external subtitle/audio resolvers plus the metadata root, or
-    /// `None` when no probe is wired (then nothing is probed at all).
-    fn external_probe_seam(&self) -> Option<ExternalProbeSeam> {
+    /// `None` when no probe is wired (then nothing is probed at all). The
+    /// resolvers read the run's directory listings, `dirs`, when it has them.
+    fn external_probe_seam(&self, dirs: Option<&Arc<DirectoryCache>>) -> Option<ExternalProbeSeam> {
         self.media_encoder.as_ref().map(|encoder| {
             let localization = self.localization.clone().unwrap_or_else(|| {
                 Arc::new(crate::localization_manager::LocalizationManager::new(""))
@@ -8701,9 +8962,13 @@ impl LibraryScanner {
                     Arc::new(NamingOptions::new()),
                     localization,
                     Arc::clone(encoder),
-                    Arc::clone(&self.file_system),
+                    dirs.map_or_else(
+                        || Arc::clone(&self.file_system),
+                        |dirs| Arc::clone(dirs) as Arc<dyn FileSystem>,
+                    ),
                 )),
                 metadata_dir: self.metadata_dir.clone(),
+                dirs: dirs.cloned(),
             }
         })
     }
@@ -8790,14 +9055,8 @@ impl LibraryScanner {
             mtime: entity.date_modified,
             probe,
             sidecars_changed,
-            // TODO(parity, open work item — NOT an accepted divergence): the
-            // scan's probe records no lyric files (`AudioFileProber`'s lyric
-            // resolver and its `Lyric` streams are not ported; lyrics are read
-            // from their sidecars at request time), so there is no stored set
-            // for `ProbeProvider.HasChanged`'s lyric arm to compare. Porting
-            // the lyric streams into the probe and feeding both sets here
-            // closes it; `plan_item_refresh` already honours the flag.
-            lyrics_changed: false,
+            lyrics_changed: matches!(probe, ProbeKind::Audio)
+                && externals.is_some_and(|seam| lyrics_changed(seam, item, stored)),
             local_metadata: nfo_file(entity, policy),
             supports_cumulative_run_time: matches!(
                 kind,
@@ -8997,6 +9256,19 @@ impl LibraryScanner {
             Vec::new()
         };
         let people = media_is_audio.then(|| audio_credits(entity, probed, policy.options));
+        // `Audio.LyricFiles`, which the lyric arm of the change detection
+        // compares with the sidecars on disk. A track with none stores no key,
+        // which reads back as the same empty set.
+        let lyric_files =
+            (!probed.lyric_files.is_empty()).then(|| serde_json::json!(probed.lyric_files));
+        if media_is_audio
+            && let Some(data) = crate::item_data::merge_data_fields(
+                entity.data.as_deref(),
+                &[("LyricFiles", lyric_files)],
+            )
+        {
+            entity.data = Some(data);
+        }
         let allowed = policy
             .options
             .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
@@ -10941,6 +11213,8 @@ impl LibraryScanner {
         if let Some(saver) = &self.image_saver
             && let Ok(Some(row)) = items.retrieve_item(album_uuid).await
         {
+            // Not forgotten in the run's listings: this closing pass runs
+            // after the walk, and the music pass lists album folders afresh.
             match saver.save(&row, album_cover.clone(), 0, &existing).await {
                 Ok(saved) => {
                     album_cover = saved.image;
@@ -11020,6 +11294,7 @@ impl LibraryScanner {
     /// a cancel cut one short. Each file is written whole between awaits, so
     /// the returned set (the art dir re-read after a cut-short remote fetch)
     /// is exactly the artwork on disk.
+    #[allow(clippy::too_many_lines)]
     async fn collect_artwork(
         &self,
         item_id: Uuid,
@@ -11038,6 +11313,7 @@ impl LibraryScanner {
             cancel,
         } = art;
         let mut cut_short = false;
+        let dirs = art_cache.dirs.clone();
         if remove_existing {
             self.remove_item_images(entity, stored);
         }
@@ -11056,7 +11332,7 @@ impl LibraryScanner {
             // ILocalImageProvider` to true before consulting `TypeOptions` — and the
             // dashboard checkbox list only ever contains remote fetchers, so gating
             // here silently killed all sidecar artwork once library options were saved.
-            let mut images = discover_local_images(entity);
+            let mut images = art_cache.discover_local_images(entity);
             // Local discovery wins per type; the embedded cover fills what it
             // left empty (`dedup_images_by_type` is the `RemoteImage` twin of
             // this, which cannot be reused for `ItemImageInfo`).
@@ -11075,7 +11351,9 @@ impl LibraryScanner {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
             adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
-            cut_short |= self.finish_artwork(entity, &mut images, stored).await;
+            cut_short |= self
+                .finish_artwork(entity, &mut images, stored, dirs.as_deref())
+                .await;
             return (Some(images), cut_short);
         }
         // "Local Images" is the media-adjacent discovery (poster.jpg next to the
@@ -11083,7 +11361,7 @@ impl LibraryScanner {
         // `CanRefreshImages` short-circuits `ILocalImageProvider` to enabled before
         // the `TypeOptions.ImageFetchers` check, and that checkbox list only ever
         // names remote fetchers — gating on it silently dropped all sidecar art.
-        let mut images = discover_local_images(entity);
+        let mut images = art_cache.discover_local_images(entity);
         // Explicit music uploads/sidecars take precedence over shared art.
         if fetch != ImageFetch::All || matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
@@ -11131,7 +11409,9 @@ impl LibraryScanner {
             art_cache.albums_needing_backfill.insert(*album);
         }
         adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
-        cut_short |= self.finish_artwork(entity, &mut images, stored).await;
+        cut_short |= self
+            .finish_artwork(entity, &mut images, stored, dirs.as_deref())
+            .await;
         for image in &images {
             art_cache.stored_images.insert(
                 image.path.clone(),
@@ -12392,8 +12672,15 @@ impl LibraryScanner {
     /// folds it into `homevideos`.
     #[cfg(test)]
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
-        self.plan_in(folders, folders, PlanScope::ALL, DateAdded::default(), None)
-            .items
+        self.plan_in(
+            folders,
+            folders,
+            PlanScope::ALL,
+            DateAdded::default(),
+            None,
+            None,
+        )
+        .items
     }
 
     /// [`plan`](Self::plan) restricted to `scope`: the items at or under its
@@ -12407,7 +12694,7 @@ impl LibraryScanner {
     #[cfg(test)]
     fn plan_paths(&self, folders: &[VirtualFolderInfo], scope: PlanScope<'_>) -> Vec<Planned> {
         let affected = affected_libraries(folders, scope.roots.unwrap_or_default(), scope.exact);
-        self.plan_in(&affected, folders, scope, DateAdded::default(), None)
+        self.plan_in(&affected, folders, scope, DateAdded::default(), None, None)
             .items
     }
 
@@ -12425,6 +12712,7 @@ impl LibraryScanner {
         scope: PlanScope<'_>,
         date_added: DateAdded,
         cancel: Option<&ScanCancel>,
+        dirs: Option<&Arc<DirectoryCache>>,
     ) -> PlanOutput {
         let naming = NamingOptions::new();
         let mut ctx = PlanCtx::new(&naming, scope)
@@ -12433,6 +12721,7 @@ impl LibraryScanner {
             .with_date_added(date_added);
         ctx.fanout.clone_from(&self.scan_fanout);
         ctx.cancel = cancel.cloned();
+        ctx.dirs = dirs.cloned();
         let mut out = Vec::new();
         for folder in plan_folders {
             let Some(cf) = collection_folder_id(folder) else {
@@ -12602,7 +12891,13 @@ impl LibraryScanner {
         if let Some(entries) = ctx.prelisted.borrow_mut().remove(dir) {
             return entries;
         }
-        match self.file_system.try_get_file_system_entries(dir) {
+        // Always listed afresh: what exists and what is gone is decided
+        // from this listing. The run's cache keeps it for the readers after.
+        let listed = match &ctx.dirs {
+            Some(dirs) => dirs.relist(dir),
+            None => self.file_system.try_get_file_system_entries(dir),
+        };
+        match listed {
             Ok(entries) => {
                 // Availability is measured before exclusions: a mounted
                 // directory containing only ignored files is still reachable.
@@ -18242,8 +18537,11 @@ impl MergeMode {
 ///   date) from a by-date name.
 ///
 /// No other kind takes anything (a book's year or series never comes back
-/// from its path). Two episode fields upstream may also set here are not
-/// ported yet — see the `TODO(parity)` notes below.
+/// from its path). The embedded MP4 episode info `Episode.BeforeMetadataRefresh`
+/// also reads is applied with the probe ([`embedded_episode_info_enabled`]).
+/// The one field upstream sets here that Ferrofin does not is an episode's
+/// `IndexNumberEnd` (open work item gl-102; see
+/// [`fill_episode_numbers_from_path`]).
 fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
@@ -18774,18 +19072,25 @@ fn overlay_shortcut_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
 /// Restores direct probe properties after the provider metadata merge. A
 /// completed video probe owns its nullable stream index regardless of the
 /// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
-/// must not restore an index from the previous probe.
+/// must not restore an index from the previous probe. An audio probe owns
+/// `LyricFiles` the same way (`AudioFileProber.AddExternalLyrics`), so the
+/// lyric files that are gone do not survive as "existing" data.
 fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     let data = crate::item_data::parse_data(scanned.data.as_deref());
     if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
         row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
     }
-    if scanned.media_type.as_deref() == Some("Video")
-        && let Some(index) = data.get("DefaultVideoStreamIndex").cloned()
-        && let Some(data) = crate::item_data::merge_data_fields(
-            row.data.as_deref(),
-            &[("DefaultVideoStreamIndex", Some(index))],
-        )
+    let field = match scanned.media_type.as_deref() {
+        Some("Video") => data
+            .get("DefaultVideoStreamIndex")
+            .cloned()
+            .map(|index| ("DefaultVideoStreamIndex", Some(index))),
+        // No key: the track has no lyric files now, and the stored list goes.
+        Some("Audio") => Some(("LyricFiles", data.get("LyricFiles").cloned())),
+        _ => None,
+    };
+    if let Some(field) = field
+        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &[field])
     {
         row.data = Some(data);
     }
@@ -20168,7 +20473,10 @@ fn image_metadata_is_current(
 /// by adopting a previous scan's probe or by decoding the file. Episodes use the
 /// episode provider; everything the generic provider supports uses it;
 /// unsupported kinds yield nothing.
-fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+fn discover_local_images<D: ferrofin_providers::DirectoryService>(
+    entity: &BaseItemEntity,
+    dir: &D,
+) -> Vec<ItemImageInfo> {
     let Some(path) = entity.path.as_deref() else {
         return Vec::new();
     };
@@ -20193,11 +20501,10 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
     });
     item.containing_folder_path = containing;
 
-    let dir = FsDirectoryService::new();
     let found = if kind == ImageItemKind::Episode {
-        EpisodeLocalImageProvider::get_images(&item, &dir)
+        EpisodeLocalImageProvider::get_images(&item, dir)
     } else if LocalImageProvider::supports(&item) {
-        LocalImageProvider::get_images(&item, &dir)
+        LocalImageProvider::get_images(&item, dir)
     } else {
         Vec::new()
     };
@@ -20222,6 +20529,8 @@ mod music;
 mod playlists;
 mod trickplay;
 
+#[cfg(test)]
+mod directory_cache_tests;
 #[cfg(test)]
 mod plan_paths_tests;
 

@@ -38,7 +38,7 @@ use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
 use ferrofin_mediaencoding::encoder::split_args;
 use ferrofin_mediaencoding::encoding_helper::helper::{
-    shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
+    shift_audio_codecs_if_needed, shift_video_codecs_if_needed, should_encode_subtitle,
 };
 use ferrofin_mediaencoding::encoding_helper::{bitstream, hw};
 use ferrofin_mediaencoding::{
@@ -827,6 +827,13 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // live MPEG-TS usually probes with no bitrate, so leaving it unset
             // software-transcodes every channel that could have been copied.
             live_stream_id: request.live_stream_id.clone(),
+            // Only the video HLS actions bind `alwaysBurnInSubtitleWhenTranscoding`
+            // upstream; the audio HLS actions pin it false and the progressive
+            // stream actions never read it.
+            always_burn_in_subtitle_when_transcoding: request
+                .always_burn_in_subtitle_when_transcoding
+                && !is_audio
+                && !progressive,
             ..BaseEncodingJobOptions::default()
         };
 
@@ -1063,7 +1070,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // every ffmpeg (re)start — tens of seconds added to every play/seek.
         // On resolution failure fall back to `si=` on the original input.
         let burn_subtitle_path = if !request.is_head_request
-            && state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+            && should_encode_subtitle(&state)
             && let Some(sub) = state
                 .subtitle_stream
                 .as_ref()
@@ -1789,12 +1796,13 @@ impl FerrofinStreamStatePlanner {
                 push_split(&mut args, &bsf);
             }
             if !EncodingJobInfo::is_copy_codec(Some(&audio_encoder)) {
-                if let Some(bitrate) = self.encoding_helper.audio_bitrate_param(
-                    state.output_audio_bitrate,
-                    Some(&audio_encoder),
-                    state.audio_stream.as_ref(),
-                    state.output_audio_channels,
-                ) {
+                // `-ab state.OutputAudioBitrate` as planned, skipped for a
+                // lossless encoder. Recomputing it from the encoder name
+                // (`libmp3lame`, not `mp3`) dropped the client's bitrate cap.
+                if let Some(bitrate) = state
+                    .output_audio_bitrate
+                    .filter(|_| !is_lossless_audio_codec(&audio_encoder))
+                {
                     push_split(&mut args, "-b:a");
                     args.push(bitrate.to_string());
                 }
@@ -2089,9 +2097,10 @@ fn resolve_output_audio_channels(
 /// via the `subtitles` filter. The graphical (PGS/DVDSUB) counterpart is
 /// [`burns_graphical_subtitle`](ferrofin_mediaencoding::encoding_helper::helper::burns_graphical_subtitle);
 /// text subs are normally delivered externally, so this only fires when the
-/// client explicitly asks for Encode (e.g. the "burn all subtitles" setting).
+/// client asks for Encode or sets `alwaysBurnInSubtitleWhenTranscoding`
+/// (`ShouldEncodeSubtitle`).
 fn burns_text_subtitle(state: &EncodingJobInfo) -> bool {
-    state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+    should_encode_subtitle(state)
         && state.video_stream.is_some()
         && state
             .subtitle_stream
@@ -2166,6 +2175,9 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     // produces different video.
     query_param_i32(&request.query_string, "SubtitleStreamIndex").hash(&mut hasher);
     query_param(&request.query_string, "SubtitleMethod").hash(&mut hasher);
+    request
+        .always_burn_in_subtitle_when_transcoding
+        .hash(&mut hasher);
     // The chosen tracks and the output rate shape the output as well: a
     // re-request on the same session naming another audio track must not
     // replay the previous track's segments.
@@ -2839,6 +2851,49 @@ mod tests {
         assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
         assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
         assert_ne!(limited.playlist_path, audio_limited.playlist_path);
+    }
+
+    /// `GetProgressiveAudioFullCommandLine` emits `-ab state.OutputAudioBitrate`:
+    /// a stereo FLAC transcoded to mp3 under a 128 kbit/s cap is encoded at
+    /// 128 kbit/s, not at the 128 kbit/s-per-channel default the `libmp3lame`
+    /// encoder name would select.
+    #[tokio::test]
+    async fn progressive_audio_honours_the_requested_bitrate() {
+        let mut flac = audio_stream("flac");
+        flac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![flac])]);
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.audio_bitrate = Some(128_000);
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // The audio HLS segments of the same request encode to the same cap.
+        let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        let args = hls.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // A lossless encoder takes no bitrate.
+        let mut alac = audio_stream("alac");
+        alac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![alac])]);
+        req.output_container = Some("flac".to_owned());
+        req.audio_codec = Some("flac".to_owned());
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a flac"), "{args}");
+        assert!(!args.contains("-b:a"), "{args}");
     }
 
     #[tokio::test]
@@ -3596,6 +3651,100 @@ mod tests {
         assert!(
             args.contains("subtitles=f='/media/movie.mkv':si=0"),
             "explicit Encode must burn: {args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_always_burn_in_burns_a_transcoded_video_whatever_the_method() {
+        // `ShouldEncodeSubtitle`: `alwaysBurnInSubtitleWhenTranscoding` burns
+        // the selected track into any video that is not stream-copied, even
+        // when the negotiated method is External.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        req.always_burn_in_subtitle_when_transcoding = true;
+        req.allow_video_stream_copy = false;
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("subtitles=f='/media/movie.mkv':si=0"),
+            "always-burn-in must burn a transcoded video: {args}"
+        );
+
+        // A stream-copied video cannot take a filter, so the flag yields.
+        req.video_codec = Some("hevc".to_owned());
+        req.allow_video_stream_copy = true;
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|a| a == ["-c:v", "copy"]),
+            "the video is copied: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "a copied video is never burned: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_ignores_always_burn_in_outside_video_hls() {
+        // Upstream binds the flag on the video HLS routes only; the
+        // progressive stream routes leave it false.
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![
+                    video_stream("hevc"),
+                    audio_stream("aac"),
+                    subtitle_stream("subrip", 2),
+                ],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut req = request("abc");
+        req.output_container = Some("mp4".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        req.always_burn_in_subtitle_when_transcoding = true;
+        let plan = planner
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "progressive must not burn: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn output_id_keys_on_always_burn_in() {
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        let external = output_id(&req, "ts", false);
+        req.always_burn_in_subtitle_when_transcoding = true;
+        assert_ne!(
+            external,
+            output_id(&req, "ts", false),
+            "burn vs no-burn must not share cache files"
         );
     }
 

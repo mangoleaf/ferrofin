@@ -161,6 +161,9 @@ def main(argv=None):
     os.umask(0o077)
     root = args.fixtures.resolve()
     try:
+        # Never on a network share: every fixture is booted, scanned and copied repeatedly.
+        subprocess.run(["bash", "-c", '. "$1"; adoption_require_local "$2"', "_",
+                        str(Path(__file__).with_name("lib.sh")), str(root)], check=True)
         if args.mode == "build":
             build(root, args.only, args.port)
         else:

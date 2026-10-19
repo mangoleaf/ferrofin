@@ -1,55 +1,59 @@
 #!/usr/bin/env bash
 # adoption/build-fixtures.sh --fixtures DIR
 #
-# Derives every fixture adoption/run.sh needs from ONE supplied Jellyfin 10.11.8 data directory
-# at DIR/jellyfin-10.11.8 (config/, data/jellyfin.db, root/, metadata/ …; the database should be
-# a checkpointed copy, e.g. `sqlite3 jellyfin.db ".backup jellyfin.db"`). Nothing here touches
-# that snapshot. Produces, next to it:
-#   jellyfin-10.11.9/  10.11.10/  10.11.11/   one boot of that jellyfin/jellyfin release on a copy
-#   jellyfin-12.0/                 one boot of jellyfin/jellyfin:12.0 on a copy
-#   jellyfin-12.1-from-10/         one boot of jellyfin/jellyfin:12.1 on a copy of 10.11.8
-#   jellyfin-12.1-from-12/         one boot of jellyfin/jellyfin:12.1 on a copy of 12.0
-#   jellyfin-12.2-from-10/         one boot of jellyfin/jellyfin:12.2 on a copy of 10.11.8
-#   jellyfin-12.2-from-12/         one boot of jellyfin/jellyfin:12.2 on a copy of 12.0
-#   jellyfin-12.2-from-121/        one boot of jellyfin/jellyfin:12.2 on a copy of 12.1-from-12
+# Builds every fixture adoption/run.sh needs from synthetic data only — no real library, no
+# media server, no network share. synthetic.py generates invented media under DIR/media and has
+# each Jellyfin release build its own fixture through its API (see VERSIONS there):
+#   jellyfin-10.11.8/                 Jellyfin 10.11.8 seeded from scratch
+#   jellyfin-10.11.9/  10.11.10/  10.11.11/   that release booted and scanned on a copy of 10.11.8
+#   jellyfin-12.0/  12.1-from-10/  12.1-from-12/  12.2-from-10/  12.2-from-12/  12.2-from-121/
+# Then, next to them:
 #   oracle/smoke-jellyfin-12.1.txt smoke.sh against Jellyfin 12.1 on a throwaway copy of 12.1-from-12
 #   oracle/smoke-jellyfin-12.2.txt smoke.sh against Jellyfin 12.2 on a throwaway copy of 12.2-from-121
 #   oracle/user.txt                the account both oracles (and run.sh) probe as
 #   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat1/sqlite_sequence,
 #                                  rewritten every run; the other 12.2 routes are diffed against it
-# Every boot prints its EF history-id count. Existing fixtures and oracles are kept; delete one
-# to rebuild it. Needs docker and ~7× the snapshot's size. An interrupted oracle build can leave
-# a copy under DIR/work/oracle-*; work/ is scratch and may be deleted between runs.
-# If the library options reference media paths, put a media-mounts.sh in DIR that sets
-# MEDIA=(-v host:container:ro …), or point ADOPTION_MEDIA_MOUNTS at one; it is sourced here
-# and by run.sh.
+# Existing fixtures and oracles are kept; synthetic.py refuses fixtures from an older recipe, so
+# build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
+# can leave a copy under DIR/work/oracle-*; work/ is scratch and may be deleted between runs.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=adoption/lib.sh
+. "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
-while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,25p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,18p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || { echo "--fixtures DIR is required" >&2; exit 2; }
-FIXTURES=$(cd "$FIXTURES" && pwd); SRC=$FIXTURES/jellyfin-10.11.8
-[ -f "$SRC/data/jellyfin.db" ] || { echo "no $SRC/data/jellyfin.db" >&2; exit 2; }
-MEDIA=(); MOUNTS=${ADOPTION_MEDIA_MOUNTS:-$FIXTURES/media-mounts.sh}
-[ -z "${ADOPTION_MEDIA_MOUNTS:-}" ] || [ -f "$MOUNTS" ] || { echo "no $MOUNTS" >&2; exit 2; }
-# shellcheck disable=SC1090,SC1091 # user-supplied, outside the repository
-[ ! -f "$MOUNTS" ] || . "$MOUNTS"
-count=$(sqlite3 -readonly "file:$SRC/data/jellyfin.db?immutable=1" 'SELECT COUNT(*) FROM __EFMigrationsHistory')
-[ "$count" = 68 ] || { echo "$SRC has $count EF migration ids, a 10.11.8 database has 68" >&2; exit 2; }
+adoption_require_local "$FIXTURES" || exit 2
+mkdir -p "$FIXTURES"; FIXTURES=$(cd "$FIXTURES" && pwd)
+# Pull the release of every fixture still to build (and 10.11.8, whose FFmpeg encodes the
+# media): a stale local tag would otherwise build a different release without complaint.
+# Captured first: a failed command substitution in a for list would not stop the script.
+versions=$(python3 - "$HERE" "$FIXTURES" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from synthetic import VERSIONS
+root = Path(sys.argv[2])
+wanted = {version for name, version, _ in VERSIONS if not (root / name / "synthetic-ready.json").exists()}
+if wanted or not (root / "media").exists():
+    wanted.add("10.11.8")
+print(*sorted(wanted))
+PY
+)
+for version in $versions; do docker pull -q "jellyfin/jellyfin:$version" >/dev/null; done
+python3 "$HERE/synthetic.py" build --fixtures "$FIXTURES"
+MEDIA=(-v "$FIXTURES/media:/media:ro")
 
-boot_jellyfin() { # boot_jellyfin <image> <dir> <port> [expected-ids] — one boot, wait, let startup tasks run, stop cleanly
-  local image=$1 dir=$2 port=$3 expected=${4:-} ids
-  local name=fixture-$port
-  mkdir -p "$dir-cache"; docker rm -f "$name" >/dev/null 2>&1 || true
-  docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" -v "$dir:/config" -v "$dir-cache:/cache" "${MEDIA[@]}" "$image" >/dev/null
-  for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && break; sleep 3; done
-  sleep 90
-  docker logs "$name" > "$dir-migration.log" 2>&1; docker stop -t 60 "$name" >/dev/null; docker rm "$name" >/dev/null
-  sqlite3 "$dir/data/jellyfin.db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
-  ids=$(sqlite3 "$dir/data/jellyfin.db" 'SELECT COUNT(*) FROM __EFMigrationsHistory')
-  echo "$(basename "$dir"): $ids EF ids"
-  [ -z "$expected" ] || [ "$ids" = "$expected" ] || echo "MISMATCH: $(basename "$dir") has $ids EF ids, expected $expected"
-}
+# Each fixture must carry exactly its release's EF history ids (the v12.2 C# gives 107 from
+# 10.11, 108 from 12.0, 109 from 12.1), with the WAL folded in so read-only readers see it all.
+for spec in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
+            12.2-from-10:107 12.2-from-12:108 12.2-from-121:109; do
+  db=$FIXTURES/jellyfin-${spec%:*}/data/jellyfin.db
+  [ -f "$db" ] || { echo "jellyfin-${spec%:*} has no data/jellyfin.db" >&2; exit 1; }
+  sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
+  ids=$(sqlite3 -readonly "$db" 'SELECT COUNT(*) FROM __EFMigrationsHistory')
+  [ "$ids" = "${spec#*:}" ] || { echo "jellyfin-${spec%:*} has $ids EF history ids, expected ${spec#*:}" >&2; exit 1; }
+done
 
 build_oracle() { # build_oracle <version> <fixture> <port> — that release's own answers on a throwaway copy
   local version=$1 source=$FIXTURES/$2 port=$3 user=${ADOPTION_USER:-}
@@ -87,25 +91,6 @@ dump_schema() { # dump_schema <fixture dir> — the schema without SQLite's own 
   sqlite3 -readonly "$1/data/jellyfin.db" .schema | grep -v -E '^CREATE TABLE (sqlite_stat1|sqlite_sequence)'
 }
 
-# Every 10.11 point release Ferrofin adopts, each a real boot of that release on a copy of the
-# snapshot: 10.11.9 leaves the 68 ids as they are; 10.11.10 and 10.11.11 add the three
-# NormalizedUsername ids (71).
-for v in 10.11.9:18089 10.11.10:18088 10.11.11:18098; do
-  ver=${v%%:*}; port=${v#*:}
-  [ -d "$FIXTURES/jellyfin-$ver" ] && continue
-  docker pull -q "jellyfin/jellyfin:$ver"; cp -a "$SRC" "$FIXTURES/jellyfin-$ver"; boot_jellyfin "jellyfin/jellyfin:$ver" "$FIXTURES/jellyfin-$ver" "$port"
-done
-if [ ! -d "$FIXTURES/jellyfin-12.0" ]; then docker pull -q jellyfin/jellyfin:12.0; cp -a "$SRC" "$FIXTURES/jellyfin-12.0"; boot_jellyfin jellyfin/jellyfin:12.0 "$FIXTURES/jellyfin-12.0" 18096; fi
-if [ ! -d "$FIXTURES/jellyfin-12.1-from-10" ]; then docker pull -q jellyfin/jellyfin:12.1; cp -a "$SRC" "$FIXTURES/jellyfin-12.1-from-10"; boot_jellyfin jellyfin/jellyfin:12.1 "$FIXTURES/jellyfin-12.1-from-10" 18094; fi
-if [ ! -d "$FIXTURES/jellyfin-12.1-from-12" ]; then docker pull -q jellyfin/jellyfin:12.1; cp -a "$FIXTURES/jellyfin-12.0" "$FIXTURES/jellyfin-12.1-from-12"; boot_jellyfin jellyfin/jellyfin:12.1 "$FIXTURES/jellyfin-12.1-from-12" 18095; fi
-# Jellyfin 12.2 on each upgrade route, from the parent the route names. Its history ids, derived
-# from the v12.2 C#: 107 from 10.11, 108 from 12.0, 109 from 12.1 (itself from 12.0).
-for spec in jellyfin-12.2-from-10:jellyfin-10.11.8:18087:107 jellyfin-12.2-from-12:jellyfin-12.0:18086:108 \
-            jellyfin-12.2-from-121:jellyfin-12.1-from-12:18085:109; do
-  IFS=: read -r name parent port expected <<<"$spec"
-  [ -d "$FIXTURES/$name" ] && continue
-  docker pull -q jellyfin/jellyfin:12.2; cp -a "$FIXTURES/$parent" "$FIXTURES/$name"; boot_jellyfin jellyfin/jellyfin:12.2 "$FIXTURES/$name" "$port" "$expected"
-done
 build_oracle 12.1 jellyfin-12.1-from-12 18095
 build_oracle 12.2 jellyfin-12.2-from-121 18085
 if [ -d "$FIXTURES/jellyfin-12.2-from-121" ]; then

@@ -14,7 +14,7 @@ use super::MediaSourceType;
 use crate::entities::{IsoType, MediaStreamType, Video3DFormat, VideoType};
 use crate::entities_media::{MediaAttachment, MediaStream};
 use crate::media_info::{AudioIndexSource, MediaProtocol, TransportStreamTimestamp};
-use crate::session::TranscodeReason;
+use crate::session::TranscodeReasons;
 
 /// Description of a single media source (file, disc, live stream, …) for an item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -192,7 +192,7 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the transcode reasons. `[JsonIgnore]` upstream.
     #[serde(skip)]
-    pub transcode_reasons: Option<TranscodeReason>,
+    pub transcode_reasons: TranscodeReasons,
 
     /// Gets or sets the default audio index source. `[JsonIgnore]` upstream.
     #[serde(skip)]
@@ -258,7 +258,7 @@ impl Default for MediaSourceInfo {
             transcoding_sub_protocol: crate::data::MediaStreamProtocol::default(),
             transcoding_container: None,
             analyze_duration_ms: None,
-            transcode_reasons: None,
+            transcode_reasons: TranscodeReasons::empty(),
             default_audio_index_source: AudioIndexSource::NONE,
             default_audio_stream_index: None,
             default_subtitle_stream_index: None,

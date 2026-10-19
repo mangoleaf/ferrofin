@@ -5936,7 +5936,7 @@ mod tests {
                ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
                 "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
                VALUES (?1,'MediaBrowser.Controller.Entities.Audio.MusicArtist',
-                       'Miles Davis','miles davis',1,0,0,0,0,0,0)"#,
+                       'Miles Davis','miles davis',0,0,0,0,0,0,0)"#,
         )
         .bind(&value_id)
         .execute(db.writer())

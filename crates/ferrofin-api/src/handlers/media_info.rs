@@ -3,9 +3,10 @@
 //! Ports `GET`/`POST /Items/{itemId}/PlaybackInfo`: resolves the item's playable
 //! [`MediaSourceInfo`](ferrofin_model::dto::MediaSourceInfo)s for the requesting
 //! user via the [`MediaSourceManager`](ferrofin_traits::library::MediaSourceManager)
-//! and returns them in a [`PlaybackInfoResponse`]. The `POST` body (a device
-//! profile + stream selections) is accepted and ignored for now; both verbs
-//! share one handler, matching Jellyfin's two actions.
+//! and returns them in a [`PlaybackInfoResponse`]. The `POST` form also takes
+//! the client's device profile and stream picks (query or body) and negotiates
+//! each source's play method against them; the `GET` form returns the static
+//! sources, matching Jellyfin's two actions.
 
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
@@ -109,6 +110,24 @@ struct PlaybackInfoQuery {
     /// Whether `-c:a copy` is permitted in a transcode (default true).
     #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
+    /// The client's maximum streaming bitrate (`POST` only).
+    #[serde(default)]
+    max_streaming_bitrate: Option<i32>,
+    /// The playback start position in ticks (`POST` only).
+    #[serde(default)]
+    start_time_ticks: Option<i64>,
+    /// The maximum number of audio channels (`POST` only).
+    #[serde(default)]
+    max_audio_channels: Option<i32>,
+    /// The media source (version) to play (`POST` only).
+    #[serde(default)]
+    media_source_id: Option<String>,
+    /// An already-open live stream to play (`POST` only).
+    #[serde(default)]
+    live_stream_id: Option<String>,
+    /// Whether to open a source that requires opening (`POST` only).
+    #[serde(default)]
+    auto_open_live_stream: Option<bool>,
 }
 
 /// The resolved playback capability flags (query wins over the posted body,
@@ -139,31 +158,123 @@ impl Default for PlaybackFlags {
     }
 }
 
+/// The inputs of `MediaInfoController.GetPostedPlaybackInfo`, folded from the
+/// query and the posted body (query wins). The `GET` form fills only the user
+/// and the flags.
+#[derive(Debug, Default)]
+struct PlaybackRequest {
+    /// The requested user (before the administrator gate).
+    user_id: Option<Uuid>,
+    /// The client's device profile; [`None`] keeps the static sources.
+    profile: Option<DeviceProfile>,
+    /// The client's maximum streaming bitrate.
+    max_streaming_bitrate: Option<i32>,
+    /// The media source (version) the client asked for.
+    media_source_id: Option<String>,
+    /// An already-open live stream the client asked for.
+    live_stream_id: Option<String>,
+    /// Whether to open the chosen source when it requires opening.
+    auto_open_live_stream: bool,
+    /// The stream picks and limits handed to the [`StreamBuilder`].
+    selection: StreamSelection,
+    /// The client's capability vetoes.
+    flags: PlaybackFlags,
+}
+
+/// A non-blank optional string (C# `!string.IsNullOrWhiteSpace`).
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// `MediaInfoHelper.ResolvePlaybackMediaSources`: an open live stream when
+/// one is named, otherwise the item's playback sources, narrowed to the
+/// requested version when the client names one.
+async fn resolve_playback_media_sources(
+    state: &AppState,
+    item_id: Uuid,
+    user_id: Uuid,
+    media_source_id: Option<&str>,
+    live_stream_id: Option<&str>,
+) -> Result<Vec<MediaSourceInfo>, ApiError> {
+    if let Some(live_stream_id) = non_blank(live_stream_id) {
+        return Ok(vec![
+            state.media_sources.get_live_stream(live_stream_id).await?,
+        ]);
+    }
+    let mut sources = state
+        .media_sources
+        .get_playback_media_sources(item_id, user_id, true, true)
+        .await?;
+    if let Some(id) = non_blank(media_source_id) {
+        sources.retain(|s| s.id.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(id)));
+    }
+    Ok(sources)
+}
+
+/// `MediaInfoHelper.SortMediaSources` (the v12 form): the queried item's own
+/// source first (it carries the user's resume state for that version), then
+/// direct-playable files, direct-playable or -streamable sources, files, and
+/// sources that fit `max_bitrate`; ties keep their order (a stable sort).
+fn sort_media_sources(
+    sources: &mut [MediaSourceInfo],
+    max_bitrate: Option<i32>,
+    preferred_item_id: Uuid,
+) {
+    use ferrofin_model::media_info::MediaProtocol;
+    let preferred_id =
+        (!preferred_item_id.is_nil()).then(|| preferred_item_id.simple().to_string());
+    sources.sort_by_key(|s| {
+        let preferred = preferred_id
+            .as_deref()
+            .is_some_and(|p| s.id.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(p)));
+        let is_file = s.protocol == MediaProtocol::File;
+        let bitrate_fit = match (max_bitrate, s.bitrate) {
+            (Some(max), Some(bitrate)) if bitrate <= max => 0,
+            (Some(_), Some(_)) => 2,
+            _ => 1,
+        };
+        (
+            !preferred,
+            !(s.supports_direct_play && is_file),
+            !(s.supports_direct_play || s.supports_direct_stream),
+            !is_file,
+            bitrate_fit,
+        )
+    });
+}
+
 /// Resolves the playback info for `item_id` and the effective user.
 ///
-/// Shared by the `GET` and `POST` handlers. `allow_media_probe` and
-/// `enable_path_substitution` mirror the C# defaults for the basic path.
-#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
+/// Shared by the `GET` and `POST` handlers; port of
+/// `MediaInfoController.GetPostedPlaybackInfo` from the user lookup on.
+#[allow(clippy::too_many_lines)] // one upstream action, step for step
 async fn playback_info(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
     item_id: Uuid,
-    user_id: Option<Uuid>,
-    profile: Option<&DeviceProfile>,
-    max_streaming_bitrate: Option<i32>,
-    stream_selection: StreamSelection,
-    flags: PlaybackFlags,
+    request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
-    let user = resolve_user_opt(state, auth, user_id).await?;
-    require_visible_item(state, item_id, user.as_ref()).await?;
+    let user = resolve_user_opt(state, auth, request.user_id).await?;
+    let item = require_visible_item(state, item_id, user.as_ref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
-        None => effective_user_id(state, auth, user_id).await?,
+        None => effective_user_id(state, auth, request.user_id).await?,
     };
-    let mut media_sources = state
-        .media_sources
-        .get_playback_media_sources(item_id, resolved_user_id, true, true)
-        .await?;
+    let mut media_sources = resolve_playback_media_sources(
+        state,
+        item_id,
+        resolved_user_id,
+        request.media_source_id.as_deref(),
+        request.live_stream_id.as_deref(),
+    )
+    .await?;
+    if media_sources.is_empty() {
+        return Ok(PlaybackInfoResponse {
+            media_sources,
+            play_session_id: None,
+            error_code: Some(ferrofin_model::dlna::PlaybackErrorCode::NoCompatibleStream),
+        });
+    }
 
     // Stamp `HasSegments` from the media-segment store (upstream
     // MediaSourceManager does this via IMediaSegmentManager). jellyfin-web's
@@ -190,45 +301,31 @@ async fn playback_info(
     // direct-play or must transcode (e.g. h264 video but AC3 audio a browser can't
     // decode). Without this every source claimed direct-play, so incompatible-audio
     // files played video-only. No profile (the GET form) keeps the static sources.
-    if let Some(profile) = profile
-        && !media_sources.is_empty()
-    {
-        let policy = playback_policy(state, auth, user.as_ref(), resolved_user_id).await?;
-        let max_streaming_bitrate =
-            playback_bitrate_limit(state, auth, &policy, max_streaming_bitrate).await?;
-        // Use the item's media type rather than the presence of a video stream:
-        // audio files can have cover-art video streams, and video probes may be empty.
-        let media_type = state
-            .library
-            .get_item_by_id(item_id)
-            .await?
-            .and_then(|item| item.media_type);
-        let mut first_decision = None;
-        for source in &mut media_sources {
-            let is_audio = media_type.as_deref().map_or_else(
-                || source.video_stream().is_none(),
-                |kind| kind.eq_ignore_ascii_case("Audio"),
-            );
-            let decision = apply_stream_decision(
-                source,
-                profile,
-                item_id,
-                max_streaming_bitrate,
-                auth.token.as_ref().map(Secret::expose),
-                auth.device_id.as_deref(),
-                stream_selection,
-                &play_session_id,
-                flags,
-                &policy,
-                is_audio,
-            );
-            if first_decision.is_none() {
-                first_decision = decision.map(|d| (d, source.clone()));
-            }
-        }
+    if let Some(profile) = &request.profile {
+        let decisions = set_device_specific_data(
+            state,
+            auth,
+            user.as_ref(),
+            resolved_user_id,
+            item_id,
+            item.media_type.as_deref(),
+            &mut media_sources,
+            profile,
+            &request,
+            &play_session_id,
+        )
+        .await?;
+        // Upstream sorts on the client's own limit, not the policy-capped one.
+        sort_media_sources(&mut media_sources, request.max_streaming_bitrate, item_id);
         // Record the decision for the metrics track (Track A). Clients play the
         // first/default source; multi-version items are the rare exception, so
         // one row per play session (not per source) keeps the data readable.
+        let first_decision = media_sources.first().and_then(|first| {
+            decisions
+                .into_iter()
+                .find(|(id, _)| *id == first.id)
+                .map(|(_, decision)| (decision, first.clone()))
+        });
         if let (Some((decision, source)), Some(metrics)) =
             (first_decision, state.playback_metrics.as_ref())
         {
@@ -254,11 +351,201 @@ async fn playback_info(
         }
     }
 
+    if request.auto_open_live_stream {
+        let source = match non_blank(request.media_source_id.as_deref()) {
+            None => media_sources.first(),
+            Some(id) => media_sources.iter().find(|s| s.id.as_deref() == Some(id)),
+        };
+        if let Some(source) = source
+            && source.requires_opening
+            && non_blank(source.live_stream_id.as_deref()).is_none()
+        {
+            let open = LiveStreamRequest {
+                open_token: source.open_token.clone(),
+                user_id: resolved_user_id,
+                play_session_id: Some(play_session_id.clone()),
+                max_streaming_bitrate: request.max_streaming_bitrate,
+                start_time_ticks: request.selection.start_time_ticks,
+                audio_stream_index: request.selection.audio_stream_index,
+                subtitle_stream_index: request.selection.subtitle_stream_index,
+                max_audio_channels: request.selection.max_audio_channels,
+                item_id,
+                enable_direct_play: request.flags.enable_direct_play,
+                enable_direct_stream: request.flags.enable_direct_stream,
+                always_burn_in_subtitle_when_transcoding: request
+                    .selection
+                    .always_burn_in_subtitle_when_transcoding,
+                direct_play_protocols: vec![ferrofin_model::media_info::MediaProtocol::Http],
+            };
+            // The same open as `POST /LiveStreams/Open`.
+            media_sources = vec![state.media_sources.open_live_stream(&open).await?];
+        }
+    }
+
     Ok(PlaybackInfoResponse {
         media_sources,
         play_session_id: Some(play_session_id),
         error_code: None,
     })
+}
+
+/// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
+/// user's policy and bitrate limit, then one [`apply_stream_decision`] each,
+/// with the track picks applied only to the version `request` names. Returns
+/// each decided source's id with its decision.
+#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
+async fn set_device_specific_data(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    user: Option<&ferrofin_db::entities::users::UserEntity>,
+    resolved_user_id: Uuid,
+    item_id: Uuid,
+    media_type: Option<&str>,
+    media_sources: &mut [MediaSourceInfo],
+    profile: &DeviceProfile,
+    request: &PlaybackRequest,
+    play_session_id: &str,
+) -> Result<Vec<(Option<String>, StreamDecision)>, ApiError> {
+    let policy = playback_policy(state, auth, user, resolved_user_id).await?;
+    // `maxStreamingBitrate ?? profile.MaxStreamingBitrate`: the remote cap
+    // applies to the profile's own limit when the client sends none.
+    let client_limit = request
+        .max_streaming_bitrate
+        .or(profile.max_streaming_bitrate);
+    let max_streaming_bitrate = playback_bitrate_limit(state, auth, &policy, client_limit).await?;
+    let mut decisions = Vec::new();
+    for source in media_sources {
+        // Use the item's media type rather than the presence of a video stream:
+        // audio files can have cover-art video streams, and video probes may be empty.
+        let is_audio = media_type.map_or_else(
+            || source.video_stream().is_none(),
+            |kind| kind.eq_ignore_ascii_case("Audio"),
+        );
+        // SetDeviceSpecificData applies the track picks only to the version
+        // the client named; every other version negotiates its defaults.
+        let requested = request.media_source_id.as_deref().is_some_and(|id| {
+            source
+                .id
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(id))
+        });
+        let selection = if requested {
+            request.selection
+        } else {
+            StreamSelection {
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                ..request.selection
+            }
+        };
+        let decision = apply_stream_decision(
+            source,
+            profile,
+            item_id,
+            max_streaming_bitrate,
+            auth.token.as_ref().map(Secret::expose),
+            auth.device_id.as_deref(),
+            selection,
+            play_session_id,
+            request.flags,
+            &policy,
+            is_audio,
+        );
+        if let Some(decision) = decision {
+            decisions.push((source.id.clone(), decision));
+        }
+    }
+    Ok(decisions)
+}
+
+/// The media source `UniversalAudioController.GetUniversalAudioStream` acts
+/// on (its `info.MediaSources[0]`), as negotiated.
+pub(crate) struct UniversalAudioSource {
+    /// The first-sorted source, with its negotiated `SupportsDirectPlay`/
+    /// `SupportsDirectStream`, transcoding container and protocol, and
+    /// `TranscodeReasons` (empty when it plays as it is).
+    pub source: MediaSourceInfo,
+    /// The play-session id `GetPlaybackInfo` minted for the request.
+    pub play_session_id: String,
+}
+
+/// The negotiation of `UniversalAudioController.GetUniversalAudioStream`:
+/// `MediaInfoHelper.GetPlaybackInfo` (the version `media_source_id` names, or
+/// every version), the client's transcoding container and protocol stamped on
+/// each, `SetDeviceSpecificData` against the universal `profile`, then
+/// `SortMediaSources`. Returns the first source, or [`None`] when there is
+/// none (upstream indexes an empty list there).
+#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
+pub(crate) async fn universal_audio_source(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    item_id: Uuid,
+    user_id: Option<Uuid>,
+    media_source_id: Option<&str>,
+    profile: &DeviceProfile,
+    max_streaming_bitrate: Option<i32>,
+    max_audio_channels: Option<i32>,
+    transcoding_container: Option<&str>,
+    transcoding_protocol: Option<MediaStreamProtocol>,
+) -> Result<Option<UniversalAudioSource>, ApiError> {
+    let user = resolve_user_opt(state, auth, user_id).await?;
+    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let resolved_user_id = match &user {
+        Some(user) => user_uuid(user)?,
+        None => effective_user_id(state, auth, user_id).await?,
+    };
+    // Every version (the universal route takes no live stream id), narrowed
+    // below rather than by the helper's exact match.
+    let mut media_sources =
+        resolve_playback_media_sources(state, item_id, resolved_user_id, None, None).await?;
+    // The version is matched in either GUID spelling, as the static stream
+    // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
+    // `mediaSourceId` is what a direct-play request for it would carry.
+    if let Some(id) = non_blank(media_source_id) {
+        media_sources.retain(|source| source.id_matches(id));
+    }
+    if media_sources.is_empty() {
+        return Ok(None);
+    }
+    let play_session_id = Uuid::new_v4().simple().to_string();
+    for source in &mut media_sources {
+        source.transcoding_container = transcoding_container.map(str::to_owned);
+        if let Some(protocol) = transcoding_protocol {
+            source.transcoding_sub_protocol = protocol;
+        }
+    }
+    // No track picks (upstream passes null indexes); its other options are
+    // the request's defaults: every method allowed.
+    let request = PlaybackRequest {
+        user_id,
+        max_streaming_bitrate,
+        selection: StreamSelection {
+            max_audio_channels,
+            ..StreamSelection::default()
+        },
+        ..PlaybackRequest::default()
+    };
+    set_device_specific_data(
+        state,
+        auth,
+        user.as_ref(),
+        resolved_user_id,
+        item_id,
+        item.media_type.as_deref(),
+        &mut media_sources,
+        profile,
+        &request,
+        &play_session_id,
+    )
+    .await?;
+    sort_media_sources(&mut media_sources, max_streaming_bitrate, item_id);
+    Ok(media_sources
+        .into_iter()
+        .next()
+        .map(|source| UniversalAudioSource {
+            source,
+            play_session_id,
+        }))
 }
 
 /// Resolves the user policy required by upstream device-profile negotiation.
@@ -397,14 +684,21 @@ fn hls_transcoding_max_audio_channels(profile: &DeviceProfile, container: &str) 
     fallback
 }
 
-/// The client's requested stream-index overrides, threaded from the
-/// PlaybackInfo query/body into the [`StreamBuilder`]'s [`MediaOptions`].
+/// The client's stream picks and limits, threaded from the PlaybackInfo
+/// query/body into the [`StreamBuilder`]'s [`MediaOptions`] and the
+/// resulting [`StreamInfo`](ferrofin_model::dlna::StreamInfo).
 #[derive(Debug, Clone, Copy, Default)]
 struct StreamSelection {
     /// The requested audio stream index.
     audio_stream_index: Option<i32>,
     /// The requested subtitle stream index (`-1` = none selected).
     subtitle_stream_index: Option<i32>,
+    /// The client's maximum number of audio channels.
+    max_audio_channels: Option<i32>,
+    /// The playback start position, in ticks.
+    start_time_ticks: Option<i64>,
+    /// Whether a transcode always burns the selected subtitle in.
+    always_burn_in_subtitle_when_transcoding: bool,
 }
 
 /// The play decision summary for one source, fed to the metrics recorder
@@ -459,7 +753,7 @@ fn optimal_stream(
 /// / remux stream, with the negotiated codecs) is set so the client transcodes.
 /// Returns the decision summary for the metrics recorder ([`None`] when the
 /// builder produced no stream).
-#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors SetDeviceSpecificData
 fn apply_stream_decision(
     source: &mut MediaSourceInfo,
     profile: &DeviceProfile,
@@ -495,14 +789,19 @@ fn apply_stream_decision(
     // builder never picks a vetoed method.
     options.enable_direct_play = flags.enable_direct_play;
     options.enable_direct_stream = flags.enable_direct_stream;
-    // The client's explicit stream picks (a `-1` subtitle index means "none" —
-    // C# treats negatives as unset when resolving the stream).
+    // The client's explicit stream picks. A `-1` subtitle index ("off") passes
+    // through as upstream: it matches no stream, whereas leaving it unset
+    // would fall back to the default subtitle.
     options.audio_stream_index = stream_selection.audio_stream_index;
-    options.subtitle_stream_index = stream_selection.subtitle_stream_index.filter(|&i| i >= 0);
+    options.subtitle_stream_index = stream_selection.subtitle_stream_index;
+    options.max_audio_channels = stream_selection.max_audio_channels;
+    options.always_burn_in_subtitle_when_transcoding =
+        stream_selection.always_burn_in_subtitle_when_transcoding;
     options.media_sources = vec![source.clone()];
 
     let support = FerrofinTranscoderSupport;
-    let stream = optimal_stream(&support, &options, is_audio)?;
+    let mut stream = optimal_stream(&support, &options, is_audio)?;
+    stream.start_position_ticks = stream_selection.start_time_ticks.unwrap_or(0);
 
     let profile_type = if is_audio {
         DlnaProfileType::Audio
@@ -558,7 +857,6 @@ fn apply_stream_decision(
     // on the StreamInfo; we pin the delivery to HLS because the builder can mislabel
     // an audio-only re-encode as a raw-copy DirectStream, which would hand the client
     // the untouched incompatible audio (the "video plays, no audio" case).
-    let mut stream = stream;
     stream.play_method = PlayMethod::Transcode;
     stream.sub_protocol = MediaStreamProtocol::hls;
     // Choose a valid HLS segment container. Jellyfin's `supportedHlsContainers`
@@ -618,6 +916,7 @@ fn apply_stream_decision(
     if force_remote || !flags.allow_audio_stream_copy {
         transcoding_url.push_str("&AllowAudioStreamCopy=false");
     }
+    push_burn_in(&mut transcoding_url, &stream);
     source.transcoding_url = Some(transcoding_url);
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
     source.transcoding_container = Some(container.clone());
@@ -652,6 +951,7 @@ fn audio_transcode_decision(
         if force_remote || !flags.allow_audio_stream_copy {
             url.push_str("&AllowAudioStreamCopy=false");
         }
+        push_burn_in(&mut url, &stream);
         source.transcoding_url = Some(url);
         source.transcoding_container.clone_from(&stream.container);
         source.transcoding_sub_protocol = stream.sub_protocol;
@@ -674,14 +974,24 @@ fn force_remote_delivery(
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
     stream.play_session_id = Some(play_session_id.to_owned());
-    source.transcoding_url = Some(format!(
+    let mut url = format!(
         "{}&AllowVideoStreamCopy=false&AllowAudioStreamCopy=false",
         stream.to_url(None, token, None)
-    ));
+    );
+    push_burn_in(&mut url, &stream);
+    source.transcoding_url = Some(url);
     source.transcoding_container.clone_from(&stream.container);
     source.transcoding_sub_protocol = stream.sub_protocol;
     apply_subtitle_delivery(source, &stream, support, token);
     StreamDecision::transcode(&stream)
+}
+
+/// `SetDeviceSpecificData` appends the burn-in request to every transcoding URL
+/// it builds, so the transcoder burns in the subtitle the client chose.
+fn push_burn_in(url: &mut String, stream: &ferrofin_model::dlna::StreamInfo) {
+    if stream.always_burn_in_subtitle_when_transcoding {
+        url.push_str("&alwaysBurnInSubtitleWhenTranscoding=true");
+    }
 }
 
 /// Recomputes the selected subtitle's delivery after a decision is pinned to HLS.
@@ -722,12 +1032,19 @@ fn set_hls_subtitle_delivery(
 /// no delivery method, so the client can't fetch (text → external VTT) or
 /// request burn-in (image subs like DVDSUB/PGS → `Encode`), and a selected
 /// subtitle simply never renders.
+///
+/// Also stamps the decision's tracks and reasons onto the source
+/// (`SetDeviceSpecificSubtitleInfo` and the `DefaultAudioStreamIndex` line
+/// after it): the client marks those tracks active when playback starts.
 fn apply_subtitle_delivery(
     source: &mut MediaSourceInfo,
     stream: &ferrofin_model::dlna::StreamInfo,
     support: &FerrofinTranscoderSupport,
     token: Option<&str>,
 ) {
+    source.default_audio_stream_index = stream.audio_stream_index;
+    source.default_subtitle_stream_index = stream.subtitle_stream_index;
+    source.transcode_reasons = stream.transcode_reasons;
     // Relative URLs (empty base), matching the transcoding URL; all subtitles
     // (not just a selected one) so the client knows how to handle each — but ONE
     // resolved profile per stream (`enable_all_profiles=false`, the C#
@@ -766,19 +1083,12 @@ async fn get_playback_info(
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
     // The GET form carries no device profile, so every source keeps its static
     // (direct-play) shape.
-    Ok(Json(
-        playback_info(
-            &state,
-            &auth,
-            item_id,
-            query.user_id,
-            None,
-            None,
-            StreamSelection::default(),
-            flags_from(&query, None),
-        )
-        .await?,
-    ))
+    let request = PlaybackRequest {
+        user_id: query.user_id,
+        flags: flags_from(&query, None),
+        ..PlaybackRequest::default()
+    };
+    Ok(Json(playback_info(&state, &auth, item_id, request).await?))
 }
 
 /// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
@@ -801,6 +1111,18 @@ struct PlaybackInfoBody {
     audio_stream_index: Option<i32>,
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     subtitle_stream_index: Option<i32>,
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    start_time_ticks: Option<i64>,
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    max_audio_channels: Option<i32>,
+    #[serde(default)]
+    media_source_id: Option<String>,
+    #[serde(default)]
+    live_stream_id: Option<String>,
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    auto_open_live_stream: Option<bool>,
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    always_burn_in_subtitle_when_transcoding: Option<bool>,
     #[serde(default)]
     #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_play: Option<bool>,
@@ -848,9 +1170,11 @@ fn flags_from(query: &PlaybackInfoQuery, body: Option<&PlaybackInfoBody>) -> Pla
 
 /// `POST /Items/{itemId}/PlaybackInfo` — playback info with a posted profile.
 ///
-/// Port of `MediaInfoController.GetPostedPlaybackInfo`. The posted device
-/// profile / stream selections are accepted and ignored for the basic path; the
-/// resolved sources are identical to the `GET` form.
+/// Port of `MediaInfoController.GetPostedPlaybackInfo`: the query and the
+/// posted [`PlaybackInfoBody`] are folded together (query wins), the sources
+/// are narrowed to the requested version or live stream, and each is
+/// negotiated against the device profile (the posted one, else the device's
+/// stored capabilities).
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/PlaybackInfo",
@@ -865,24 +1189,45 @@ async fn post_playback_info(
     Query(query): Query<PlaybackInfoQuery>,
     body: Option<JsonBody<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
-    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
-    let stream_selection = StreamSelection {
-        audio_stream_index: query.audio_stream_index.or(body.audio_stream_index),
-        subtitle_stream_index: query.subtitle_stream_index.or(body.subtitle_stream_index),
+    let mut body = body.map(|JsonBody(b)| b).unwrap_or_default();
+    // A client that posts no profile negotiates with the one its device last
+    // reported through `/Sessions/Capabilities`.
+    let profile = match body.device_profile.take() {
+        Some(profile) => Some(profile),
+        None => {
+            state
+                .devices
+                .get_capabilities(auth.device_id.as_deref())
+                .await?
+                .device_profile
+        }
     };
-    Ok(Json(
-        playback_info(
-            &state,
-            &auth,
-            item_id,
-            query.user_id.or(body.user_id),
-            body.device_profile.as_ref(),
-            body.max_streaming_bitrate,
-            stream_selection,
-            flags_from(&query, Some(&body)),
-        )
-        .await?,
-    ))
+    let request = PlaybackRequest {
+        user_id: query.user_id.or(body.user_id),
+        profile,
+        max_streaming_bitrate: query.max_streaming_bitrate.or(body.max_streaming_bitrate),
+        media_source_id: query
+            .media_source_id
+            .clone()
+            .or(body.media_source_id.take()),
+        live_stream_id: query.live_stream_id.clone().or(body.live_stream_id.take()),
+        auto_open_live_stream: query
+            .auto_open_live_stream
+            .or(body.auto_open_live_stream)
+            .unwrap_or(false),
+        selection: StreamSelection {
+            audio_stream_index: query.audio_stream_index.or(body.audio_stream_index),
+            subtitle_stream_index: query.subtitle_stream_index.or(body.subtitle_stream_index),
+            max_audio_channels: query.max_audio_channels.or(body.max_audio_channels),
+            start_time_ticks: query.start_time_ticks.or(body.start_time_ticks),
+            // Body only: the query form has no burn-in parameter.
+            always_burn_in_subtitle_when_transcoding: body
+                .always_burn_in_subtitle_when_transcoding
+                .unwrap_or(false),
+        },
+        flags: flags_from(&query, Some(&body)),
+    };
+    Ok(Json(playback_info(&state, &auth, item_id, request).await?))
 }
 
 /// Query parameters for `POST /LiveStreams/Open`.
@@ -1171,6 +1516,75 @@ mod tests {
     use ferrofin_model::entities::MediaStreamType;
     use ferrofin_model::entities_media::MediaStream;
 
+    /// `MediaInfoHelperTests.CreateSource`.
+    fn sort_source(
+        item_id: uuid::Uuid,
+        bitrate: i32,
+        supports_direct_play: bool,
+    ) -> MediaSourceInfo {
+        MediaSourceInfo {
+            id: Some(item_id.simple().to_string()),
+            bitrate: Some(bitrate),
+            supports_direct_play,
+            supports_direct_stream: true,
+            supports_transcoding: true,
+            ..MediaSourceInfo::default()
+        }
+    }
+
+    #[test]
+    fn sort_media_sources_preferred_item_exceeds_bitrate_stays_default() {
+        let preferred_item_id = uuid::Uuid::new_v4();
+        let preferred = sort_source(preferred_item_id, 80_000_000, false);
+        let sibling = sort_source(uuid::Uuid::new_v4(), 8_000_000, true);
+        let mut sources = vec![sibling, preferred.clone()];
+        super::sort_media_sources(&mut sources, Some(20_000_000), preferred_item_id);
+        assert_eq!(sources[0].id, preferred.id);
+    }
+
+    #[test]
+    fn sort_media_sources_no_preferred_item_orders_by_playability() {
+        let direct_play = sort_source(uuid::Uuid::new_v4(), 8_000_000, true);
+        let mut transcode_only = sort_source(uuid::Uuid::new_v4(), 8_000_000, false);
+        transcode_only.supports_direct_stream = false;
+        let mut sources = vec![transcode_only, direct_play.clone()];
+        super::sort_media_sources(&mut sources, Some(20_000_000), uuid::Uuid::nil());
+        assert_eq!(sources[0].id, direct_play.id);
+    }
+
+    #[test]
+    fn sort_media_sources_preferred_id_not_in_sources_keeps_playability_order() {
+        let direct_play = sort_source(uuid::Uuid::new_v4(), 8_000_000, true);
+        let mut transcode_only = sort_source(uuid::Uuid::new_v4(), 8_000_000, false);
+        transcode_only.supports_direct_stream = false;
+        let mut sources = vec![transcode_only, direct_play.clone()];
+        super::sort_media_sources(&mut sources, Some(20_000_000), uuid::Uuid::new_v4());
+        assert_eq!(sources[0].id, direct_play.id);
+    }
+
+    #[test]
+    fn sort_media_sources_puts_profiles_that_fit_the_bitrate_first() {
+        // Multi-profile Live TV channels (HDHomeRun EXTEND) arrive widest
+        // first; under a 4 Mbps limit the fitting profiles lead, unknown
+        // bitrates follow, and the order is otherwise kept.
+        let channel = |id: &str, bitrate: Option<i32>| MediaSourceInfo {
+            id: Some(id.to_owned()),
+            protocol: ferrofin_model::media_info::MediaProtocol::Http,
+            bitrate,
+            supports_direct_stream: true,
+            ..MediaSourceInfo::default()
+        };
+        let mut sources = vec![
+            channel("heavy", Some(15_000_000)),
+            channel("internet540", Some(2_500_000)),
+            channel("unknown", None),
+            channel("internet360", Some(1_000_000)),
+        ];
+        super::sort_media_sources(&mut sources, Some(4_000_000), uuid::Uuid::nil());
+        let order: Vec<_> = sources.iter().filter_map(|s| s.id.as_deref()).collect();
+        assert_eq!(order, ["internet540", "internet360", "unknown", "heavy"]);
+    }
+
     #[test]
     fn open_live_stream_reads_the_posted_body_and_lets_the_query_win() {
         // The shape jellyfin-web (and the parity harness) POSTs: everything in
@@ -1311,6 +1725,91 @@ mod tests {
         assert_eq!(hls_segment_container(Some("ts"), &h264), "ts");
         assert_eq!(hls_segment_container(Some("mkv"), &h264), "ts");
         assert_eq!(hls_segment_container(None, &h264), "ts");
+    }
+
+    #[test]
+    fn transcode_carries_the_start_position_burn_in_and_channel_limit() {
+        use ferrofin_model::dlna::DirectPlayProfile;
+        // AC3 6ch is outside the profile, so the source is transcoded.
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mp4".to_owned(),
+                video_codec: Some("h264".to_owned()),
+                audio_codec: Some("aac".to_owned()),
+                profile_type: DlnaProfileType::Video,
+            }],
+            transcoding_profiles: vec![TranscodingProfile {
+                container: "ts".to_owned(),
+                video_codec: "h264".to_owned(),
+                audio_codec: "aac".to_owned(),
+                profile_type: DlnaProfileType::Video,
+                protocol: MediaStreamProtocol::hls,
+                ..TranscodingProfile::default()
+            }],
+            ..DeviceProfile::default()
+        };
+        let policy = ferrofin_model::users::UserPolicy {
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            ..ferrofin_model::users::UserPolicy::default()
+        };
+        let transcode = |selection: super::StreamSelection| {
+            let mut source = source_with_video("h264");
+            source.container = Some("mp4".to_owned());
+            source.supports_transcoding = true;
+            source.media_streams.push(MediaStream {
+                stream_type: MediaStreamType::Audio,
+                codec: Some("ac3".to_owned()),
+                channels: Some(6),
+                index: 1,
+                ..MediaStream::default()
+            });
+            super::apply_stream_decision(
+                &mut source,
+                &profile,
+                uuid::Uuid::from_u128(1),
+                None,
+                None,
+                None,
+                selection,
+                "session",
+                super::PlaybackFlags::default(),
+                &policy,
+                false,
+            );
+            // SetDeviceSpecificSubtitleInfo stamps the decision's reasons.
+            assert!(
+                source
+                    .transcode_reasons
+                    .contains(ferrofin_model::session::TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED),
+                "{:?}",
+                source.transcode_reasons
+            );
+            source.transcoding_url.expect("transcode")
+        };
+        let plain = transcode(super::StreamSelection::default());
+        assert!(!plain.contains("StartTimeTicks"), "{plain}");
+        assert!(!plain.contains("alwaysBurnIn"), "{plain}");
+        let url = transcode(super::StreamSelection {
+            max_audio_channels: Some(2),
+            start_time_ticks: Some(600_000_000),
+            always_burn_in_subtitle_when_transcoding: true,
+            ..super::StreamSelection::default()
+        });
+        assert!(url.contains("StartTimeTicks=600000000"), "{url}");
+        assert!(
+            url.contains("&alwaysBurnInSubtitleWhenTranscoding=true"),
+            "{url}"
+        );
+        // The channel cap is the builder's global limit: a stereo target
+        // gets a smaller audio bitrate than the 6ch source would.
+        let audio_bitrate = |url: &str| {
+            url.split(['?', '&'])
+                .find_map(|kv| kv.strip_prefix("AudioBitrate="))
+                .map(str::to_owned)
+        };
+        assert_ne!(audio_bitrate(&url), audio_bitrate(&plain), "{url}");
     }
 
     #[test]
@@ -1630,8 +2129,8 @@ mod tests {
             None,
             None,
             super::StreamSelection {
-                audio_stream_index: None,
                 subtitle_stream_index: Some(2),
+                ..super::StreamSelection::default()
             },
             "ps1",
             flags,

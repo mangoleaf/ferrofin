@@ -269,10 +269,13 @@ Jellyfin. Read [`bench/README.md`](bench/README.md) first — it defines every n
 sentence.
 
 ```bash
-# needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
-# ffprobe and Python Pillow to build the test data
-docker pull jellyfin/jellyfin:10.11.8 && docker pull jellyfin/jellyfin:12.0-rc7 && docker pull jellyfin/jellyfin:12.2
-bench/testdata/build.sh                          # once: ~20 min, ~17 GB (gitignored)
+# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
+# plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
+docker pull jellyfin/jellyfin:10.11.8
+docker pull "$(cat bench/testdata/jellyfin-image.txt)"
+bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
+bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
+bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
 bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
 python3 bench/report.py --serve                  # compare runs at 127.0.0.1:8097
@@ -281,7 +284,7 @@ python3 bench/report.py --serve                  # compare runs at 127.0.0.1:809
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are
-90 % idle. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
+90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
 Publishable numbers come from **three** runs — `report.py` takes the median and prints the
 range each cell spanned.
 
@@ -302,7 +305,12 @@ keeps day-to-day work fast:
   fixed or the owner accepts it. So does a `⚠` response-shape note the baseline does not
   have.
 - When chasing a regression, `bench/run.sh --servers ferrofin --only loaded` on two builds is
-  the cheap form, skipping both Jellyfins.
+  the cheap form, skipping Jellyfin.
+
+The fast stdlib reporter correctness tests (`bench/test_report.py`) do run in CI and gate
+releases; they start no servers and impose no performance thresholds. The benchmark
+reference is Jellyfin **12.2**, pinned by digest in `bench/testdata/jellyfin-image.txt`;
+this does not change the source-verification `UPSTREAM_TAG` recorded below.
 
 Parity in the project's sense, implementation compared against the upstream C# and recorded
 in `handlers::VERIFIED`, is still done per change. Only measurement moved.
@@ -323,10 +331,14 @@ a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite
 never exists.
 
 ### Adoption has its own live check — `adoption/`
-`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers real 10.11.8, 10.11.9,
+`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers 10.11.8, 10.11.9,
 10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
-fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them once with
-`adoption/build-fixtures.sh`; they are never committed.  On fresh copies it checks
+fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
+once with `adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
+each database themselves); they are never committed.  Never point the suite at a real
+library or a network share — the scripts refuse a DIR on a network filesystem, because every
+fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
+(seeding is not idempotent): build into a new DIR.  On fresh copies it checks
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration

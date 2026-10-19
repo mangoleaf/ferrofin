@@ -2063,7 +2063,7 @@ impl DeviceManager for FakeDevices {
         &self,
         _device_id: Option<&str>,
     ) -> Result<ClientCapabilities, ServiceError> {
-        unimplemented!("fake")
+        Ok(ClientCapabilities::default())
     }
     async fn get_device(&self, _id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {
         unimplemented!("fake")

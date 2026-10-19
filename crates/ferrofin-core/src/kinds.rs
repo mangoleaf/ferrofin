@@ -557,8 +557,7 @@ pub fn supports_user_data_from_children(kind: BaseItemKind) -> bool {
             | BaseItemKind::BasePluginFolder
             | BaseItemKind::PlaylistsFolder
             | BaseItemKind::ManualPlaylistsFolder
-            // `IItemByName` without dual access — the by-name grouping rows
-            // Ferrofin materializes as folders.
+            // `IItemByName` without dual access — the by-name grouping rows.
             | BaseItemKind::Genre
             | BaseItemKind::MusicGenre
             | BaseItemKind::Studio

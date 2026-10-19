@@ -696,7 +696,6 @@ async fn every_planning_route_carries_trusted_playback_permissions() {
         "Audio/ITEM/hls1/main/0.ts",
         "Videos/ITEM/stream.ts",
         "Audio/ITEM/stream.aac",
-        "Audio/ITEM/universal",
     ] {
         // Each route's `[Required]` members (`CheckModel` refuses without).
         let required = if route.ends_with("master.m3u8") {
@@ -724,6 +723,53 @@ async fn every_planning_route_carries_trusted_playback_permissions() {
             }),
             "{uri}"
         );
+    }
+}
+
+/// The audio HLS routes encode to `audioBitRate ?? maxStreamingBitrate`
+/// (`DynamicHlsController`'s audio actions); the video ones never read the cap.
+#[tokio::test]
+async fn audio_hls_routes_encode_to_the_streaming_bitrate_cap() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let rec = Arc::new(Recorded::default());
+    let router = router_no_static(ok_hls(temp.path().to_str().unwrap(), rec.clone()));
+    let segment = "&RuntimeTicks=0&ActualSegmentLengthTicks=0";
+    for (route, query, expected) in [
+        (
+            "Audio/ITEM/master.m3u8",
+            "MaxStreamingBitrate=192000&MediaSourceId=s",
+            Some(192_000),
+        ),
+        (
+            "Audio/ITEM/main.m3u8",
+            "maxStreamingBitrate=192000",
+            Some(192_000),
+        ),
+        (
+            "Audio/ITEM/hls1/main/0.ts",
+            "maxStreamingBitrate=192000",
+            Some(192_000),
+        ),
+        (
+            "Audio/ITEM/main.m3u8",
+            "maxStreamingBitrate=192000&audioBitRate=96000",
+            Some(96_000),
+        ),
+        ("Videos/ITEM/main.m3u8", "maxStreamingBitrate=192000", None),
+    ] {
+        let extra = if route.contains("/hls1/") {
+            segment
+        } else {
+            ""
+        };
+        let uri = format!(
+            "/{}?{query}{extra}",
+            route.replace("ITEM", &ITEM_ID.to_string())
+        );
+        let response = router.clone().oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let request = rec.last.lock().unwrap().clone().unwrap();
+        assert_eq!(request.audio_bitrate, expected, "{uri}");
     }
 }
 
@@ -1180,17 +1226,19 @@ async fn video_stream_container_falls_back_to_transcode() {
     assert_eq!(last.device_id.as_deref(), Some("d1"));
 }
 
+/// Universal audio negotiates over the item's playback sources, so an item
+/// with none has nothing to serve (upstream indexes the empty list).
 #[tokio::test]
-async fn audio_universal_falls_back_to_transcode() {
+async fn audio_universal_without_a_media_source_is_404() {
     let tmp = TempFile::new();
     let rec = Arc::new(Recorded::default());
-    let router = router_no_static(ok_hls(&tmp.path, rec));
+    let router = router_no_static(ok_hls(&tmp.path, rec.clone()));
     let resp = router
         .oneshot(authed("GET", &format!("/Audio/{ITEM_ID}/universal")))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_string(resp).await, "SEGMENT-BYTES");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(rec.last.lock().unwrap().is_none());
 }
 
 #[tokio::test]
