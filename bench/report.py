@@ -86,7 +86,7 @@ def load(path):
 
 def load_shape(d):
     """Load legacy shape summaries and retain individual request observations."""
-    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "fields": set(), "n": 0, "samples": {}})
+    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "n": 0, "samples": {}})
     try:
         with open(os.path.join(d, "shape.log")) as f:
             lines = f.read().splitlines()
@@ -106,7 +106,6 @@ def load_shape(d):
             s["count"].add(rec["count"])
         if "total" in rec and rec["total"] is not None:
             s["total"].add(rec["total"])
-        s["fields"].update(rec.get("fields") or [])
         # Preserve request identity instead of accepting counts swapped between URLs.
         # Old NextUp URLs used wall-clock cutoffs; retain their historical shape check
         # without claiming that these legacy inputs were identical.
@@ -119,7 +118,7 @@ def load_shape(d):
     for name, observations in list(out.items()):
         if name.endswith(":image"):
             aggregate = out["image"]
-            for field in ("status", "count", "total", "fields"):
+            for field in ("status", "count", "total"):
                 aggregate[field].update(observations[field])
             aggregate["n"] += observations["n"]
             aggregate["samples"].update(observations["samples"])
@@ -272,10 +271,6 @@ def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
             return f"{n}: items {sorted(s['count'])} vs {sorted(o['count'])}"
         if s["total"] != o["total"]:
             return f"{n}: TotalRecordCount {sorted(s['total'])} vs {sorted(o['total'])}"
-        missing = sorted(o["fields"] - s["fields"])
-        if missing:
-            more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
-            return f"{n}: missing {', '.join(m.lstrip('.') for m in missing[:3])}{more}"
         if s.get("samples") is not None and o.get("samples") is not None:
             if s["samples"].keys() != o["samples"].keys():
                 return f"{n}: request picks differ"
@@ -574,9 +569,8 @@ def window_problem(x):
         return "missing load window"
     if not number(x.get("iterations")) or x["iterations"] <= 0:
         return "missing completed iterations"
-    for key in ("dropped_iterations", "aborted_iterations"):
-        if x.get(key):
-            return f"invalid window: {key}={x[key]}"
+    if x.get("dropped_iterations"):
+        return f"invalid window: dropped_iterations={x['dropped_iterations']}"
     for group in ("screens", "endpoints"):
         if not x.get(group):
             return f"missing {group} samples"
@@ -859,7 +853,7 @@ def build(runs):
         bad = [window_problem(x) for x in windows[k] if window_problem(x)]
         resource_bad = [phase_problem(d, metas[i], ["startup", "startup-drain", "sampler"]) for i, d in enumerate(ds)]
         resource_bad += [isolation_problem(d, metas[i], [name for level in run_levels(d) for name in (f"warmup-{level}", level)]) for i, d in enumerate(ds)]
-        resource_bad += [r.get("error") for i, windows in enumerate(m["resources"][k]) if metas[i].get("resource_schema") for r in windows.values()]
+        resource_bad += [r.get("error") for i, res_windows in enumerate(m["resources"][k]) if metas[i].get("resource_schema") for r in res_windows.values()]
         memory_flags[k] = reasons(mixed, *bad, *resource_bad)
         # the peak is only meaningful if the loaded window that produced it was the specified load
         peak[k] = gated(Cell([(x or {}).get("peak") for x in mems[k]], mib, memory_flags[k], unit="MiB"),

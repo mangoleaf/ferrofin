@@ -107,12 +107,12 @@ function record(name, res, method, path, body) {
     const observation = { shape: scoped, slot, key, status: res.status, content_type: contentType };
     if (contentType.includes('json')) {
         try {
-            const body = res.json();
-            const types = {}; fieldTypes(body, types); observation.types = types;
-            const rows = Array.isArray(body) ? body : body && Array.isArray(body.Items) ? body.Items : null;
+            const data = res.json();
+            const types = {}; fieldTypes(data, types); observation.types = types;
+            const rows = Array.isArray(data) ? data : data && Array.isArray(data.Items) ? data.Items : null;
             if (rows) { observation.count = rows.length; observation.ids = rows.map(x => x && x.Id !== undefined ? x.Id : null); }
-            else if (body && body.Id !== undefined) observation.ids = [body.Id];
-            if (body && body.TotalRecordCount !== undefined) observation.total = body.TotalRecordCount;
+            else if (data && data.Id !== undefined) observation.ids = [data.Id];
+            if (data && data.TotalRecordCount !== undefined) observation.total = data.TotalRecordCount;
         } catch (e) { observation.invalid_json = true; iterOk = false; }
     }
     if (isImage) observation.bytes = bytes;
