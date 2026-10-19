@@ -20,6 +20,9 @@ import urllib.parse
 import urllib.request
 
 AUTH = 'MediaBrowser Client="bench", Device="bench", DeviceId="bench-seed", Version="3"'
+#: Devices that use the control token (`ids["token"]`, the browse user): seeding, state
+#: snapshots, run.sh, coldstart.py and ttfs.py. check_role_sessions rejects any other one.
+CONTROL_DEVICES = ('bench-seed', 'bench-state', 'bench-run', 'bench-cold', 'bench-ttfs')
 LIBS = [("Movies", "movies", "/media/movies"), ("Shows", "tvshows", "/media/shows"), ("Music", "music", "/media/music")]
 TYPES = ["Movie", "Series", "Season", "Episode", "MusicAlbum", "MusicArtist", "Audio", "MusicVideo",
          "Video", "Trailer", "BoxSet", "Person", "Studio", "Genre", "Book", "Photo"]
@@ -249,6 +252,14 @@ def check_role_sessions(sessions, ids):
             raise RuntimeError(f'{role} session missing, duplicated or owned by wrong user')
         if matches[0].get('AdditionalUsers'):
             raise RuntimeError(f'{role} session has additional users')
+    # Every other harness session must be a known control-token device, so none escapes the check.
+    for s in sessions:
+        if s.get('Client') != 'bench' or s.get('DeviceId') in ('bench-browse', 'bench-playback'):
+            continue
+        if s.get('DeviceId') not in CONTROL_DEVICES:
+            raise RuntimeError(f"unaccounted bench session {s.get('DeviceId')!r}")
+        if normalized_id(s.get('UserId')) != normalized_id(ids['user']) or s.get('AdditionalUsers'):
+            raise RuntimeError(f"control session {s['DeviceId']!r} owned by wrong user or has additional users")
 
 
 def state_snapshot(url, ids_path, out):

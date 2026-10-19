@@ -72,10 +72,15 @@ from.
    accepts it. The viewer shows notes for the release runs only. The baseline's own notes are
    in its `report.md` (`bench/runs/vPREV-baseline-N/report.md`).
 
-   **Validate adoption.** Run the full adoption validation in
-   [`adoption/README.md`](adoption/README.md) against the image built from the release
-   commit: `adoption/run.sh` **and** the synthetic preservation matrix. An adoption failure
-   is never waived; fix it, which means starting again from step 1. Dropping a Jellyfin
+   **Validate adoption.** The evidence is a green run of the `Adoption` workflow
+   (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
+   that commit and runs the full adoption validation in
+   [`adoption/README.md`](adoption/README.md): `adoption/run.sh` **and** the synthetic
+   preservation matrix, all ten paths. Every push to `release/**` starts it; for a patch
+   release from `main`, start it with **Actions → Adoption → Run workflow** on `main`. Keep
+   the run's link for step 5. A manual run of the same commands is for debugging only and
+   does not replace the CI run. An adoption failure is never waived; fix it, which means
+   starting again from step 1. Dropping a Jellyfin
    version instead is also a code change: the adoption gate in
    `crates/ferrofin-db/src/database.rs` must refuse it, and versions that share a
    migration set go together.
@@ -87,7 +92,8 @@ from.
    Watch it finish, then verify (below).
 5. **Record the results** after the tag, so the record never moves the frozen head: note the
    benchmark result in the release PR (release branch → `main`), or in the GitHub Release for
-   a patch release from `main`, and update the adoption test record in `adoption/README.md`.
+   a patch release from `main`, and update the adoption test record in `adoption/README.md`
+   with the link to the green `Adoption` run from step 2.
    After a patch release from `main`, merge `main` into the open release branch so the fix
    is carried forward.
 

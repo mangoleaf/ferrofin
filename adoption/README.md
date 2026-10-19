@@ -293,7 +293,8 @@ The 2026-09-16 validation also passed all **23 adoption harness tests** and **13
 tests** (36 total), plus ShellCheck. The database crate passed **121 tests**, including
 12.0 adoption, both 12.1 migration histories, incomplete-history rejection and schema
 conformance; one performance test was ignored. These automated checks complement the
-live matrix above; CI does not run the live fixture suite.
+live matrix above. PR CI does not run the live fixture suite; the `Adoption` workflow runs
+it on release branches (see [Running the synthetic matrix](#running-the-synthetic-matrix)).
 
 ## Adding a generation
 
@@ -489,8 +490,15 @@ snapshots, media files, credentials, or per-item reports belong in Git.
 Adoption remains one-way: Jellyfin is never started against an adopted copy.
 
 The synthetic harness regression tests run through `bats adoption/tests`, along
-with the original metadata and watch-history tests. The live Docker matrix is a
-separate command, so routine CI does not encode or scan these fixtures.
+with the original metadata and watch-history tests. The PR CI does not encode or scan these
+fixtures. The live matrix runs in the `Adoption` workflow (`.github/workflows/adoption.yml`)
+on every push to a `release/**` branch, or by hand on any branch: it builds the image from
+the commit, restores the fixtures from a cache keyed on the recipe, `smoke.sh`,
+`build-fixtures.sh` and the Jellyfin image digests (building them on a miss; GitHub scopes
+the cache to the branch, so each new release branch builds once), and runs
+`run.sh` and `synthetic.py run`. A failed run uploads `work/` as the `adoption-work`
+artifact. Its green run on the frozen release commit is the release's adoption evidence,
+linked from the test record above (`RELEASE.md`, "Validate adoption").
 
 ### Initial synthetic matrix validation
 
