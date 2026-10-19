@@ -144,6 +144,7 @@ impl Database {
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            log_dangling_row_cleanup(&mut conn).await?;
             crate::normalized_usernames::repair(&mut conn).await?;
             foreign_key_check(&mut conn).await?;
             sqlx::Connection::close(conn).await?;
@@ -1411,9 +1412,10 @@ const ADOPTION_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS "FerrofinAdoption
 )"#;
 
 /// The migrations that rebuild Jellyfin-owned tables (the 12-step SQLite
-/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape). Each
-/// gets a file snapshot before it first applies — see [`backup_before_rebuild`].
-const REBUILD_MIGRATIONS: &[i64] = &[7, 32];
+/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape), plus
+/// `0044`, which deletes the rows of deleted users outright. Each gets a file
+/// snapshot before it first applies — see [`backup_before_rebuild`].
+const REBUILD_MIGRATIONS: &[i64] = &[7, 32, 44];
 
 /// Snapshots the database file before a table-rebuilding migration first
 /// applies.
@@ -1467,7 +1469,7 @@ async fn backup_before_rebuild(
     tracing::info!(
         backup = %backup.display(),
         migration = version,
-        "database snapshot taken before a schema-rebuild migration"
+        "database snapshot taken before a table-rebuilding or row-deleting migration"
     );
     Ok(())
 }
@@ -1573,17 +1575,57 @@ async fn applied_migration_count(conn: &mut sqlx::SqliteConnection) -> Result<i6
 /// crash window. The scan is **O(rows × foreign keys)** — measured at 0.14 s
 /// on a real 42k-item, 250 MB library — noise against a cold start.
 async fn foreign_key_check(conn: &mut sqlx::SqliteConnection) -> Result<()> {
-    let violations = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *conn)
-        .await?
-        .len();
-    if violations > 0 {
-        tracing::error!(
-            violations,
-            "foreign-key violations after migration — database integrity is compromised"
-        );
-        return Err(crate::DbError::MigrationIntegrity { violations });
+    // Rows of `foreign_key_check` are (table, rowid, parent, fkid); count them per table.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(r#"SELECT "table", "parent" FROM pragma_foreign_key_check"#)
+            .fetch_all(&mut *conn)
+            .await?;
+    if rows.is_empty() {
+        return Ok(());
     }
+    let mut per_table = std::collections::BTreeMap::<String, usize>::new();
+    for (table, parent) in &rows {
+        *per_table.entry(format!("{table} → {parent}")).or_default() += 1;
+    }
+    let tables = per_table
+        .iter()
+        .map(|(table, n)| format!("{table}: {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(crate::DbError::MigrationIntegrity {
+        violations: rows.len(),
+        tables,
+    })
+}
+
+/// Logs what migration `0044` deleted: the rows of users that no longer exist
+/// and `AncestorIds` rows naming missing items, counted per table in the
+/// temporary table the migration leaves on this connection (present only on
+/// the boot that applied it). Drops that table.
+async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    let present: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM temp.sqlite_master WHERE name = 'FerrofinDanglingRowCleanup'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if present.is_none() {
+        return Ok(());
+    }
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "Table", "Rows" FROM temp."FerrofinDanglingRowCleanup" WHERE "Rows" > 0"#,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for (table, rows) in counts {
+        tracing::info!(
+            table,
+            rows,
+            "removed rows of a deleted user or item left behind by an earlier server"
+        );
+    }
+    sqlx::query(r#"DROP TABLE temp."FerrofinDanglingRowCleanup""#)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -2395,23 +2437,27 @@ mod tests {
             .connect()
             .await
             .expect("connect with enforcement off");
-        // `AccessSchedules`, not `Permissions`: 0032 ports 12.0's
-        // RemoveOrphanedUserPermissionsAndPreferences and would legitimately
-        // delete an orphaned permission row before the check ever saw it.
+        // A provider id of a missing item: no migration removes it (0044
+        // deletes only the rows of missing users and `AncestorIds` of missing
+        // items), so it reaches the check.
         sqlx::query(
-            r#"INSERT INTO "AccessSchedules" ("Id","DayOfWeek","EndHour","StartHour","UserId")
-               VALUES (99,0,23.0,1.0,'ffffffff-ffff-ffff-ffff-ffffffffffff')"#,
+            r#"INSERT INTO "BaseItemProviders" ("ItemId","ProviderId","ProviderValue")
+               VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff','Tmdb','1')"#,
         )
         .execute(&mut conn)
         .await
-        .expect("plant an access schedule whose user does not exist");
+        .expect("plant a provider id whose item does not exist");
         sqlx::Connection::close(conn).await.expect("close");
 
         let err = Database::connect_sized(&url, Some(1))
             .await
             .expect_err("a foreign-key violation after migrating must refuse the open");
         assert!(
-            matches!(err, crate::DbError::MigrationIntegrity { violations: 1 }),
+            matches!(
+                &err,
+                crate::DbError::MigrationIntegrity { violations: 1, tables }
+                    if tables == "BaseItemProviders → BaseItems: 1"
+            ),
             "unexpected error: {err}"
         );
     }
