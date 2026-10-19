@@ -69,7 +69,7 @@ jobs:
       # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
       # The version matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the
       # registry and compiled dependencies; sccache serves the workspace crates it discards.
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
           version: v0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -150,7 +150,7 @@ jobs:
       # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
       # The version matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the
       # registry and compiled dependencies; sccache serves the workspace crates it discards.
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
           version: v0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
