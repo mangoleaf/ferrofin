@@ -178,11 +178,76 @@ where
     Ok(identical)
 }
 
+/// Decodes a text file's bytes as .NET's `new StreamReader(stream,
+/// Encoding.UTF8)` and `File.ReadAllText(path)` do: a UTF-32, UTF-16 or UTF-8
+/// byte-order mark picks the encoding and is dropped, anything else is UTF-8,
+/// and a sequence that is invalid in that encoding becomes U+FFFD. It never
+/// fails, so a Latin-1 or UTF-16 sidecar still reads.
+#[must_use]
+pub fn decode_stream_text(mut bytes: Vec<u8>) -> String {
+    // UTF-32LE's BOM starts with UTF-16LE's, so it is checked first.
+    match bytes.as_slice() {
+        [0xFF, 0xFE, 0x00, 0x00, rest @ ..] => return decode_utf32(rest, u32::from_le_bytes),
+        [0x00, 0x00, 0xFE, 0xFF, rest @ ..] => return decode_utf32(rest, u32::from_be_bytes),
+        [0xFF, 0xFE, rest @ ..] => return decode_utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => return decode_utf16(rest, u16::from_be_bytes),
+        _ => {}
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    String::from_utf8(bytes)
+        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
+}
+
+/// UTF-16 code units in `unit`'s byte order; a lone surrogate or a trailing
+/// odd byte becomes U+FFFD.
+fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+    let (units, tail) = bytes.as_chunks::<2>();
+    let mut text: String = char::decode_utf16(units.iter().map(|&pair| unit(pair)))
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    if !tail.is_empty() {
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    text
+}
+
+/// UTF-32 code points in `unit`'s byte order; an invalid one or a trailing
+/// partial unit becomes U+FFFD.
+fn decode_utf32(bytes: &[u8], unit: fn([u8; 4]) -> u32) -> String {
+    let (units, tail) = bytes.as_chunks::<4>();
+    let mut text: String = units
+        .iter()
+        .map(|&quad| char::from_u32(unit(quad)).unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    if !tail.is_empty() {
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env::temp_dir;
     use std::io::Cursor;
+
+    #[rstest::rstest]
+    #[case::plain(b"Caf\xC3\xA9", "Café")]
+    #[case::utf8_bom(b"\xEF\xBB\xBFCaf\xC3\xA9", "Café")]
+    #[case::latin1(b"Caf\xE9", "Caf\u{FFFD}")]
+    #[case::utf16_le(b"\xFF\xFEC\x00a\x00f\x00\xE9\x00", "Café")]
+    #[case::utf16_be(b"\xFE\xFF\x00C\x00a\x00f\x00\xE9", "Café")]
+    #[case::utf16_lone_surrogate(b"\xFF\xFE\x00\xD8C\x00", "\u{FFFD}C")]
+    #[case::utf16_odd_byte(b"\xFF\xFEC\x00a", "C\u{FFFD}")]
+    #[case::utf32_le(b"\xFF\xFE\x00\x00\xE9\x00\x00\x00\x3B\xF6\x01\x00", "é😻")]
+    #[case::utf32_be(b"\x00\x00\xFE\xFF\x00\x00\x00\xE9\x00\x01\xF6\x3B", "é😻")]
+    #[case::utf32_invalid(b"\xFF\xFE\x00\x00\x00\x00\x11\x00", "\u{FFFD}")]
+    #[case::empty(b"", "")]
+    fn decode_stream_text_matches_the_dotnet_reader(#[case] bytes: &[u8], #[case] expected: &str) {
+        assert_eq!(decode_stream_text(bytes.to_vec()), expected);
+    }
 
     /// A non-seekable reader over an in-memory buffer.
     struct NonSeekableReadStream {
