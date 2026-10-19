@@ -5,8 +5,8 @@
 //! (`LibraryManager.cs:1499`), so the readers that ask about the same folder
 //! for each of its items (the external subtitle, audio and lyric searches,
 //! `MediaInfoResolver.GetExternalFiles` → `GetFilePaths`; the local image
-//! providers; the NFO lookups) share one listing of it instead of listing it
-//! again for every item.
+//! providers) share one listing of it instead of listing it again for every
+//! item.
 //!
 //! - It is a [`FileSystem`]: a listing is memoised, every other call goes to
 //!   the filesystem it wraps. A listing that fails is not memoised, so the
@@ -16,17 +16,22 @@
 //!   decides from its listings what exists and what is gone, so it never
 //!   reads a memo, and the readers after it read what it listed.
 //! - [`invalidate`](DirectoryCache::invalidate) forgets a path and its
-//!   parent (`Invalidate`): the scan does so for the artwork it saves.
-//!   [`clear`](DirectoryCache::clear) forgets every listing: the scan does
-//!   so after each refresh it serves, which may have written anywhere under
-//!   its paths.
-//! - It is bounded as upstream's is: it is dropped whole once it holds
-//!   [`MAX_CACHED_RECORDS`] records (a listing counts each entry plus one) or
-//!   when nothing read it for [`IDLE_TIMEOUT`] (`DropCacheIfIdleOrFull`).
-//!   Upstream refreshes its access time at most once a second
-//!   (`AccessIntervalMs`); this one, behind a lock anyway, on every access.
+//!   parent (`Invalidate`): the scan does so where it writes or deletes a
+//!   file a later reader of the run lists. [`clear`](DirectoryCache::clear)
+//!   forgets every listing: the scan does so after each refresh it serves,
+//!   which may have written anywhere under its paths.
+//! - A listing read while an invalidation or a clear landed is handed to its
+//!   reader but not memoised (a generation count), so a reader that listed a
+//!   folder just before a write never puts the old listing back.
+//! - It is bounded as upstream's is ([`DirectoryCacheLimits`]): dropped whole
+//!   once it holds `max_records` records (a listing counts each entry plus
+//!   one) or when nothing read it for `idle_timeout`
+//!   (`DropCacheIfIdleOrFull`). Upstream refreshes its access time at most
+//!   once a second (`AccessIntervalMs`); this one, behind a lock anyway, on
+//!   every access.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -36,22 +41,46 @@ use ferrofin_providers::FileSystemMetadata;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
 
-/// `DirectoryService.MaxCachedRecords`: the records held before the whole
-/// cache is dropped.
-const MAX_CACHED_RECORDS: usize = 100_000;
+/// The bounds of a [`DirectoryCache`] (`DirectoryService`'s
+/// `MaxCachedRecords` and `IdleTimeoutMs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryCacheLimits {
+    /// The records held before the whole cache is dropped; a listing counts
+    /// each entry plus one.
+    pub max_records: NonZeroUsize,
+    /// How long the cache survives unread before it is dropped whole.
+    pub idle_timeout: Duration,
+}
 
-/// `DirectoryService.IdleTimeoutMs`: how long the cache survives unread.
-const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+impl DirectoryCacheLimits {
+    /// `DirectoryService.MaxCachedRecords`.
+    pub const DEFAULT_MAX_RECORDS: NonZeroUsize = NonZeroUsize::new(100_000).unwrap();
+    /// `DirectoryService.IdleTimeoutMs`.
+    pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+}
+
+impl Default for DirectoryCacheLimits {
+    /// Upstream's values.
+    fn default() -> Self {
+        Self {
+            max_records: Self::DEFAULT_MAX_RECORDS,
+            idle_timeout: Self::DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+}
 
 /// One scan's memo of directory listings over a [`FileSystem`].
 pub(crate) struct DirectoryCache {
     file_system: Arc<dyn FileSystem>,
+    limits: DirectoryCacheLimits,
     state: Mutex<State>,
 }
 
 impl std::fmt::Debug for DirectoryCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectoryCache").finish_non_exhaustive()
+        f.debug_struct("DirectoryCache")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
     }
 }
 
@@ -67,18 +96,29 @@ struct State {
     records: usize,
     /// When the cache was last read.
     last_access: Option<Instant>,
+    /// Bumped by every invalidation, clear and drop: a listing read across
+    /// one is not memoised.
+    generation: u64,
 }
 
 impl State {
     /// `DropCacheIfIdleOrFull`, at `now`.
-    fn drop_if_idle_or_full(&mut self, now: Instant) {
+    fn drop_if_idle_or_full(&mut self, now: Instant, limits: DirectoryCacheLimits) {
         let idle = self
             .last_access
-            .is_some_and(|last| now.duration_since(last) >= IDLE_TIMEOUT);
-        if idle || self.records >= MAX_CACHED_RECORDS {
-            *self = Self::default();
+            .is_some_and(|last| now.duration_since(last) >= limits.idle_timeout);
+        if idle || self.records >= limits.max_records.get() {
+            self.reset();
         }
         self.last_access = Some(now);
+    }
+
+    /// Every listing forgotten.
+    fn reset(&mut self) {
+        *self = Self {
+            generation: self.generation + 1,
+            ..Self::default()
+        };
     }
 
     /// `Forget`: `path`'s records.
@@ -93,10 +133,11 @@ impl State {
 }
 
 impl DirectoryCache {
-    /// An empty cache over `file_system`.
-    pub(crate) fn new(file_system: Arc<dyn FileSystem>) -> Self {
+    /// An empty cache over `file_system`, bounded by `limits`.
+    pub(crate) fn new(file_system: Arc<dyn FileSystem>, limits: DirectoryCacheLimits) -> Self {
         Self {
             file_system,
+            limits,
             state: Mutex::new(State::default()),
         }
     }
@@ -107,40 +148,55 @@ impl DirectoryCache {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.drop_if_idle_or_full(Instant::now());
+        state.drop_if_idle_or_full(Instant::now(), self.limits);
         state
     }
 
     /// Lists `path` afresh and memoises the listing when it succeeds
-    /// (upstream's `GetFilePaths(path, clearCache: true)`).
+    /// (upstream's `GetFilePaths(path, clearCache: true)`). Both of the
+    /// folder's memos go, the image providers' too: upstream's `clearCache`
+    /// drops only `_filePathCache`, but a fresh listing beside an old one
+    /// would let two readers of one scan disagree about the folder.
     ///
     /// # Errors
     ///
     /// The wrapped filesystem's failure to list `path` completely; the old
     /// memo of it is forgotten either way.
     pub(crate) fn relist(&self, path: &str) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
-        self.state().forget(path);
+        let generation = {
+            let mut state = self.state();
+            state.forget(path);
+            state.generation
+        };
         let entries = self.file_system.try_get_file_system_entries(path)?;
-        self.keep(path, Arc::from(entries.as_slice()));
+        self.keep(path, Arc::from(entries.as_slice()), generation);
         Ok(entries)
     }
 
     /// `path`'s memoised listing, listing it first when there is none.
     fn try_shared(&self, path: &str) -> Result<Arc<[FileSystemEntryInfo]>, ServiceError> {
-        if let Some(hit) = self.state().entries.get(path) {
-            return Ok(Arc::clone(hit));
-        }
+        let generation = {
+            let state = self.state();
+            if let Some(hit) = state.entries.get(path) {
+                return Ok(Arc::clone(hit));
+            }
+            state.generation
+        };
         // Listed outside the lock: two readers of one new folder may both
         // list it, as upstream's `GetOrAdd` factory may run twice.
         let entries: Arc<[FileSystemEntryInfo]> =
             self.file_system.try_get_file_system_entries(path)?.into();
-        self.keep(path, Arc::clone(&entries));
+        self.keep(path, Arc::clone(&entries), generation);
         Ok(entries)
     }
 
-    /// Memoises `entries` as `path`'s listing.
-    fn keep(&self, path: &str, entries: Arc<[FileSystemEntryInfo]>) {
+    /// Memoises `entries` as `path`'s listing, unless the cache was
+    /// invalidated or cleared since `generation`, when the listing was read.
+    fn keep(&self, path: &str, entries: Arc<[FileSystemEntryInfo]>, generation: u64) {
         let mut state = self.state();
+        if state.generation != generation {
+            return;
+        }
         state.forget(path);
         state.records += entries.len() + 1;
         state.entries.insert(path.to_owned(), entries);
@@ -150,6 +206,7 @@ impl DirectoryCache {
     /// removed there is read on the next listing.
     pub(crate) fn invalidate(&self, path: &str) {
         let mut state = self.state();
+        state.generation += 1;
         state.forget(path);
         if let Some(parent) = Path::new(path).parent().and_then(Path::to_str) {
             state.forget(parent);
@@ -158,35 +215,22 @@ impl DirectoryCache {
 
     /// Forgets every listing: the next reader of a folder lists it again.
     pub(crate) fn clear(&self) {
-        *self.state() = State::default();
+        self.state().reset();
     }
+}
 
-    /// Whether this scan's listing of the folder `path` lies in, when it
-    /// holds one, has no entry by `path`'s name (compared ignoring case, so
-    /// a case-insensitive filesystem never reads a file as missing). `false`
-    /// when there is no such listing: ask the filesystem.
-    pub(crate) fn known_absent(&self, path: &Path) -> bool {
-        let (Some(folder), Some(name)) = (
-            path.parent().and_then(Path::to_str),
-            path.file_name().and_then(|n| n.to_str()),
-        ) else {
-            return false;
-        };
-        let lower = name.to_lowercase();
-        let same = |entry: &FileSystemEntryInfo| {
-            entry.name.eq_ignore_ascii_case(name)
-                || (!entry.name.is_ascii() && entry.name.to_lowercase() == lower)
-        };
-        self.state()
-            .entries
-            .get(folder)
-            .is_some_and(|entries| !entries.iter().any(same))
-    }
+/// `listed`, or no entries when the folder could not be listed (logged: the
+/// readers that take this treat a failed listing as an empty folder).
+fn or_empty<T>(path: &str, listed: Result<T, ServiceError>, empty: impl FnOnce() -> T) -> T {
+    listed.unwrap_or_else(|err| {
+        tracing::debug!(%err, path, "could not list a directory; reading it as empty");
+        empty()
+    })
 }
 
 impl FileSystem for DirectoryCache {
     fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo> {
-        self.try_get_file_system_entries(path).unwrap_or_default()
+        or_empty(path, self.try_get_file_system_entries(path), Vec::new)
     }
 
     fn try_get_file_system_entries(
@@ -197,7 +241,7 @@ impl FileSystem for DirectoryCache {
     }
 
     fn shared_file_system_entries(&self, path: &str) -> Arc<[FileSystemEntryInfo]> {
-        self.try_shared(path).unwrap_or_else(|_| Arc::from([]))
+        or_empty(path, self.try_shared(path), || Arc::from([]))
     }
 
     fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
@@ -237,7 +281,11 @@ impl FileSystem for DirectoryCache {
 /// link counts as what it points to, as the listing classifies it.
 impl ferrofin_providers::DirectoryService for DirectoryCache {
     fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
-        if let Some(hit) = self.state().metadata.get(path) {
+        let (hit, generation) = {
+            let state = self.state();
+            (state.metadata.get(path).map(Arc::clone), state.generation)
+        };
+        if let Some(hit) = hit {
             return hit.to_vec();
         }
         let entries: Arc<[FileSystemMetadata]> = self
@@ -246,10 +294,13 @@ impl ferrofin_providers::DirectoryService for DirectoryCache {
             .map(image_metadata)
             .collect();
         let mut state = self.state();
-        if let Some(old) = state.metadata.insert(path.to_owned(), Arc::clone(&entries)) {
-            state.records = state.records.saturating_sub(old.len() + 1);
+        if state.generation == generation {
+            if let Some(old) = state.metadata.insert(path.to_owned(), Arc::clone(&entries)) {
+                state.records = state.records.saturating_sub(old.len() + 1);
+            }
+            state.records += entries.len() + 1;
         }
-        state.records += entries.len() + 1;
+        drop(state);
         entries.to_vec()
     }
 }
@@ -339,7 +390,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.mkv"), b"x").unwrap();
         let dir = tmp.path().to_string_lossy().into_owned();
         let fs = Arc::new(Counting::default());
-        let cache = DirectoryCache::new(fs.clone());
+        let cache = DirectoryCache::new(fs.clone(), DirectoryCacheLimits::default());
         (tmp, dir, fs, cache)
     }
 
@@ -380,14 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn known_absent_answers_only_from_a_listing() {
-        let (tmp, dir, _, cache) = cache();
-        let nfo = tmp.path().join("movie.nfo");
-        let video = tmp.path().join("A.MKV");
-        assert!(!cache.known_absent(&nfo), "nothing listed: ask the disk");
-        cache.get_file_system_entries(&dir);
-        assert!(cache.known_absent(&nfo));
-        assert!(!cache.known_absent(&video), "names compare ignoring case");
+    fn a_listing_read_across_an_invalidation_is_not_memoised() {
+        let (tmp, dir, fs, cache) = cache();
+        // A reader starts listing (the generation it saw), a writer
+        // invalidates the folder, then the reader's listing lands.
+        let seen = cache.state().generation;
+        let stale = cache.file_system.try_get_file_system_entries(&dir).unwrap();
+        std::fs::write(tmp.path().join("a.srt"), b"x").unwrap();
+        cache.invalidate(&tmp.path().join("a.srt").to_string_lossy());
+        cache.keep(&dir, stale.into(), seen);
+        assert_eq!(
+            cache.get_file_system_entries(&dir).len(),
+            2,
+            "listed afresh"
+        );
+        assert_eq!(fs.listings(), 2);
     }
 
     #[test]
@@ -419,21 +477,33 @@ mod tests {
 
     #[test]
     fn the_cache_drops_whole_when_full_or_idle() {
+        let limits = DirectoryCacheLimits {
+            max_records: NonZeroUsize::new(3).unwrap(),
+            idle_timeout: Duration::from_secs(60),
+        };
         let start = Instant::now();
         let mut state = State {
-            records: MAX_CACHED_RECORDS,
+            records: 3,
             ..State::default()
         };
         state.entries.insert("/a".to_owned(), Arc::from([]));
-        state.drop_if_idle_or_full(start);
+        state.drop_if_idle_or_full(start, limits);
         assert!(state.entries.is_empty());
         assert_eq!(state.records, 0);
+        assert_eq!(state.generation, 1, "a drop discards listings in flight");
 
         state.entries.insert("/a".to_owned(), Arc::from([]));
         state.records = 1;
-        state.drop_if_idle_or_full(start + IDLE_TIMEOUT / 2);
+        state.drop_if_idle_or_full(start + Duration::from_secs(30), limits);
         assert_eq!(state.entries.len(), 1, "read again in time");
-        state.drop_if_idle_or_full(start + IDLE_TIMEOUT * 2);
+        state.drop_if_idle_or_full(start + Duration::from_secs(120), limits);
         assert!(state.entries.is_empty(), "idle too long");
+    }
+
+    #[test]
+    fn the_defaults_are_upstreams() {
+        let limits = DirectoryCacheLimits::default();
+        assert_eq!(limits.max_records.get(), 100_000);
+        assert_eq!(limits.idle_timeout, Duration::from_secs(300));
     }
 }

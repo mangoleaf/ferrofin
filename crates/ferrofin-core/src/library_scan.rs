@@ -70,6 +70,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::directory_cache::DirectoryCache;
+pub use crate::directory_cache::DirectoryCacheLimits;
 use crate::item_folders::{self, MovedFolders};
 use crate::item_type_lookup;
 use crate::media_info_resolver::ExternalStreamResolvers;
@@ -1225,8 +1226,9 @@ impl ExternalProbeSeam {
 /// Runs blocking filesystem work (a plan pass, a window's file checks) on
 /// this worker after handing the worker's other tasks to the rest of the
 /// runtime (`block_in_place`), so requests keep every other worker while a
-/// scan walks a slow disk. A current-thread runtime has no other worker to
-/// hand them to, and runs it in place.
+/// scan walks a slow disk. On a current-thread runtime it runs the work
+/// inline: there is no other worker to hand the tasks to, and
+/// `block_in_place` would panic there.
 fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
@@ -2135,8 +2137,6 @@ struct RefreshContext<'a> {
     locked: &'a std::collections::HashSet<Uuid>,
     /// The external subtitle/audio resolvers, for the sidecar change check.
     externals: Option<ExternalProbeSeam>,
-    /// The run's directory listings ([`ScanRun::dirs`]).
-    dirs: Option<&'a Arc<DirectoryCache>>,
     /// Plan indices of the earlier copies of an id the plan holds more than
     /// once ([`superseded_copies`]).
     superseded: std::collections::HashSet<usize>,
@@ -2175,7 +2175,6 @@ impl<'a> RefreshContext<'a> {
             outside: FetcherPolicy::default(),
             locked: &NO_LOCKS,
             externals: None,
-            dirs: run.dirs,
             superseded: std::collections::HashSet::new(),
             date_added: DateAdded::default(),
             cancel: run.cancel,
@@ -2709,13 +2708,11 @@ fn lyrics_changed(
 /// any of them can raise — or `None` (no such file, a kind with no NFO, or
 /// the library disabled the reader).
 ///
-/// A candidate the run's listing of its folder (`dirs`) does not hold is
-/// not stat'ed: the plan pass listed that folder this scan.
-fn nfo_file(
-    entity: &BaseItemEntity,
-    policy: FetcherPolicy<'_>,
-    dirs: Option<&DirectoryCache>,
-) -> Option<LocalMetadataFile> {
+/// Every candidate is stat'ed, not read from the run's listings: an
+/// NFO a webhook drops in after the plan pass listed the folder is read in
+/// this scan, as upstream's `GetXmlFile` → `IDirectoryService.GetFile`
+/// stats a path it has not seen exist (it memoises only files it found).
+fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
     if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
         // A playlist folder's `PlaylistXmlProvider` monitors its
         // `playlist.xml` (`BaseXmlProvider.HasChanged`). A playlist file's
@@ -2753,9 +2750,6 @@ fn nfo_file(
         .into_iter()
         .filter_map(|(_, candidates)| {
             candidates.into_iter().find_map(|candidate| {
-                if dirs.is_some_and(|dirs| dirs.known_absent(&candidate)) {
-                    return None;
-                }
                 let meta = std::fs::metadata(candidate).ok()?;
                 meta.is_file().then_some(meta.modified().ok()?)
             })
@@ -3435,6 +3429,8 @@ pub struct LibraryScanner {
     /// The saved NFO options (`ReleaseDateFormat`, `UserId`), read per sidecar.
     nfo_configuration:
         Option<Arc<dyn Fn() -> ferrofin_providers::xbmc::config::NfoConfiguration + Send + Sync>>,
+    /// The bounds of each run's directory listings.
+    directory_cache_limits: DirectoryCacheLimits,
     chapter_image_extractor:
         std::sync::OnceLock<Arc<crate::chapter_image_extractor::ChapterImageExtractor>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -3637,15 +3633,27 @@ impl LibraryScanner {
         self
     }
 
+    /// Saves `images` to their destinations and removes the `previous`
+    /// files they replace. The folders it wrote or deleted in are forgotten
+    /// in `dirs`, the run's listings: the next item in that folder (a
+    /// version sharing its `poster.jpg`) lists what is there now.
     async fn publish_media_artwork(
         &self,
         row: &BaseItemEntity,
         images: &mut [ItemImageInfo],
         previous: &[ItemImageInfo],
+        dirs: Option<&DirectoryCache>,
     ) -> u32 {
-        if let Some(saver) = &self.image_saver
-            && let Err(error) = saver.save_all(row, images, previous).await
-        {
+        let Some(saver) = &self.image_saver else {
+            return 0;
+        };
+        let published = saver.save_all(row, images, previous).await;
+        if let Some(dirs) = dirs {
+            for image in images.iter().chain(previous) {
+                dirs.invalidate(&image.path);
+            }
+        }
+        if let Err(error) = published {
             tracing::warn!(%error, item_id=%row.id, "could not apply artwork destination");
             return 1;
         }
@@ -3658,9 +3666,10 @@ impl LibraryScanner {
         row: &BaseItemEntity,
         images: &mut [ItemImageInfo],
         previous: Option<&[ItemImageInfo]>,
+        dirs: Option<&DirectoryCache>,
     ) -> bool {
         let failed = self
-            .publish_media_artwork(row, images, previous.unwrap_or_default())
+            .publish_media_artwork(row, images, previous.unwrap_or_default(), dirs)
             .await
             > 0;
         self.fill_image_metadata(images).await;
@@ -3743,6 +3752,7 @@ impl LibraryScanner {
             chapter_image_extractor: std::sync::OnceLock::new(),
             dummy_chapter_duration: None,
             nfo_configuration: None,
+            directory_cache_limits: DirectoryCacheLimits::default(),
         }
     }
 
@@ -3919,6 +3929,17 @@ impl LibraryScanner {
     pub fn with_probe_concurrency(mut self, concurrency: usize) -> Self {
         self.probe_concurrency = concurrency.max(1);
         self.probe_slots = Arc::new(tokio::sync::Semaphore::new(self.probe_concurrency));
+        self
+    }
+
+    /// Bounds each run's directory listings (see [`DirectoryCacheLimits`]).
+    ///
+    /// Wired from the `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` and
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` bootstrap knobs; unit tests
+    /// keep upstream's values.
+    #[must_use]
+    pub fn with_directory_cache_limits(mut self, limits: DirectoryCacheLimits) -> Self {
+        self.directory_cache_limits = limits;
         self
     }
 
@@ -4299,7 +4320,10 @@ impl LibraryScanner {
         // One cache of directory listings for the whole run, read by every
         // item in it (`new DirectoryService` per validation upstream). The
         // refreshes a run serves get their own.
-        let dirs = Arc::new(DirectoryCache::new(Arc::clone(&self.file_system)));
+        let dirs = Arc::new(DirectoryCache::new(
+            Arc::clone(&self.file_system),
+            self.directory_cache_limits,
+        ));
         let run = ScanRun {
             dirs: Some(run.dirs.unwrap_or(&dirs)),
             ..run
@@ -4417,7 +4441,10 @@ impl LibraryScanner {
                 )))
             });
             // The refresh may have written anywhere under its paths (artwork,
-            // NFOs, subtitles): this run lists again what it reads next.
+            // NFOs, subtitles): this run lists again what it reads next. The
+            // library monitor's changes do not come this way (they queue as a
+            // scan of their own, with its own listings), so a file the disk
+            // gains mid-run is seen by that scan, not this one.
             if let Some(dirs) = run.dirs {
                 dirs.clear();
             }
@@ -5754,9 +5781,9 @@ impl LibraryScanner {
             if is_new && self.events.is_some() {
                 items_added.push(item);
             }
-            let plan = stored_rows
-                .plan(scanned)
-                .unwrap_or_else(|| self.plan_item(&refresh, None, !is_new, item, None));
+            let plan = stored_rows.plan(scanned).unwrap_or_else(|| {
+                off_runtime(|| self.plan_item(&refresh, None, !is_new, item, None))
+            });
             // A folder a path-scoped scan carries for context only — one
             // above the items it refreshes — is read, never refreshed or
             // written: upstream's refresh of an item never touches the
@@ -6995,13 +7022,6 @@ impl LibraryScanner {
         let images_changed = artwork
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
-        // Artwork this pass saved beside the item is read by the next item
-        // in that folder (a version sharing its `poster.jpg`).
-        if images_changed && let (Some(dirs), Some(images)) = (&state.art_cache.dirs, &artwork) {
-            for image in images {
-                dirs.invalidate(&image.path);
-            }
-        }
         let ancestors_changed = ancestors_changed(links, item);
         let row_changed = stored_row.is_none_or(|row| {
             crate::item_persistence_service::scan_save_changes_row(
@@ -7185,6 +7205,10 @@ impl LibraryScanner {
             downloader
                 .download_missing_from_probe_locked(&entity, options, cancel, &unfiltered)
                 .await;
+            // A subtitle saved beside the video lands in its folder's listing.
+            if let (Some(dirs), Some(path)) = (&state.art_cache.dirs, &entity.path) {
+                dirs.invalidate(path);
+            }
         }
         self.persist_video_chapters(
             &entity,
@@ -8884,14 +8908,7 @@ impl LibraryScanner {
             is_virtual_item: row.is_virtual_item,
             is_locked: row.is_locked || refresh.locked.contains(&item.id),
         });
-        let facts = Self::file_facts(
-            item,
-            stored,
-            links,
-            refresh.externals.as_ref(),
-            refresh.dirs.map(AsRef::as_ref),
-            policy,
-        );
+        let facts = Self::file_facts(item, stored, links, refresh.externals.as_ref(), policy);
         let backfill = stored.is_some_and(|row| self.wants_backfill(row, policy));
         let mut plan = crate::refresh_plan::plan_item_refresh(
             state.as_ref(),
@@ -8928,7 +8945,6 @@ impl LibraryScanner {
         stored: Option<&BaseItemEntity>,
         links: Option<&StoredItemLinks>,
         externals: Option<&ExternalProbeSeam>,
-        dirs: Option<&DirectoryCache>,
         policy: FetcherPolicy<'_>,
     ) -> FileFacts {
         let entity = &item.entity;
@@ -8953,7 +8969,7 @@ impl LibraryScanner {
             sidecars_changed,
             lyrics_changed: matches!(probe, ProbeKind::Audio)
                 && externals.is_some_and(|seam| lyrics_changed(seam, item, stored)),
-            local_metadata: nfo_file(entity, policy, dirs),
+            local_metadata: nfo_file(entity, policy),
             supports_cumulative_run_time: matches!(
                 kind,
                 Some(BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist)
@@ -11109,6 +11125,8 @@ impl LibraryScanner {
         if let Some(saver) = &self.image_saver
             && let Ok(Some(row)) = items.retrieve_item(album_uuid).await
         {
+            // Not forgotten in the run's listings: this closing pass runs
+            // after the walk, and the music pass lists album folders afresh.
             match saver.save(&row, album_cover.clone(), 0, &existing).await {
                 Ok(saved) => {
                     album_cover = saved.image;
@@ -11188,6 +11206,7 @@ impl LibraryScanner {
     /// a cancel cut one short. Each file is written whole between awaits, so
     /// the returned set (the art dir re-read after a cut-short remote fetch)
     /// is exactly the artwork on disk.
+    #[allow(clippy::too_many_lines)]
     async fn collect_artwork(
         &self,
         item_id: Uuid,
@@ -11206,6 +11225,7 @@ impl LibraryScanner {
             cancel,
         } = art;
         let mut cut_short = false;
+        let dirs = art_cache.dirs.clone();
         if remove_existing {
             self.remove_item_images(entity, stored);
         }
@@ -11243,7 +11263,9 @@ impl LibraryScanner {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
             adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
-            cut_short |= self.finish_artwork(entity, &mut images, stored).await;
+            cut_short |= self
+                .finish_artwork(entity, &mut images, stored, dirs.as_deref())
+                .await;
             return (Some(images), cut_short);
         }
         // "Local Images" is the media-adjacent discovery (poster.jpg next to the
@@ -11299,7 +11321,9 @@ impl LibraryScanner {
             art_cache.albums_needing_backfill.insert(*album);
         }
         adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
-        cut_short |= self.finish_artwork(entity, &mut images, stored).await;
+        cut_short |= self
+            .finish_artwork(entity, &mut images, stored, dirs.as_deref())
+            .await;
         for image in &images {
             art_cache.stored_images.insert(
                 image.path.clone(),
@@ -20415,6 +20439,8 @@ mod playlists;
 mod trickplay;
 
 #[cfg(test)]
+mod directory_cache_tests;
+#[cfg(test)]
 mod plan_paths_tests;
 
 #[cfg(test)]
@@ -27136,7 +27162,6 @@ mod tests {
             outside: super::FetcherPolicy::default(),
             locked: &std::collections::HashSet::new(),
             externals: None,
-            dirs: None,
             superseded: std::collections::HashSet::new(),
             date_added: super::DateAdded::default(),
             cancel: &super::ScanCancel::new(),

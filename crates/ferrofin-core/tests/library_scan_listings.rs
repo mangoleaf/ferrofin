@@ -35,7 +35,7 @@ use ferrofin_traits::persistence::{ItemRepository, MediaStreamRepository};
 const FILES: usize = 12;
 
 /// An ffprobe stand-in: a video is one video and one audio stream, an audio
-/// track one audio stream.
+/// track one audio stream, a `.srt` one subtitle stream.
 struct Probe;
 
 #[async_trait]
@@ -53,6 +53,22 @@ impl MediaEncoder for Probe {
         &self,
         request: &MediaInfoRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
+        if request
+            .media_source
+            .path
+            .as_deref()
+            .is_some_and(|p| Path::new(p).extension().is_some_and(|e| e == "srt"))
+        {
+            return Ok(MediaSourceInfo {
+                media_streams: vec![MediaStream {
+                    index: 0,
+                    stream_type: MediaStreamType::Subtitle,
+                    codec: Some("subrip".to_owned()),
+                    ..MediaStream::default()
+                }],
+                ..MediaSourceInfo::default()
+            });
+        }
         let audio = MediaStream {
             index: 0,
             stream_type: MediaStreamType::Audio,
@@ -112,6 +128,9 @@ impl MediaEncoder for Probe {
 #[derive(Default)]
 struct CountingFs {
     listed: Mutex<Vec<String>>,
+    /// A file written right after the first listing of its folder: one the
+    /// disk gains once the plan pass has listed the folder.
+    after_listing: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl CountingFs {
@@ -138,7 +157,16 @@ impl FileSystem for CountingFs {
         path: &str,
     ) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
         self.listed.lock().expect("lock").push(path.to_owned());
-        FerrofinFileSystem::new().try_get_file_system_entries(path)
+        let entries = FerrofinFileSystem::new().try_get_file_system_entries(path);
+        let mut after = self.after_listing.lock().expect("lock");
+        if after
+            .as_ref()
+            .is_some_and(|file| file.parent() == Some(Path::new(path)))
+        {
+            let file = after.take().expect("file");
+            std::fs::write(file, b"1\n00:00:01,000 --> 00:00:02,000\nhi\n").expect("write");
+        }
+        entries
     }
     fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
         Vec::new()
@@ -160,15 +188,16 @@ impl FileSystem for CountingFs {
     }
 }
 
-/// A scanner with the probe stand-in over one library of `kind` at `media`,
-/// whose `folder` holds `FILES` files named by `name`, scanned once; the
-/// listings of that first scan are forgotten.
+/// A scanner with the probe stand-in over `fs` and one library of `kind` at
+/// `media`, whose `folder` holds `FILES` files named by `name`, scanned
+/// once; the listings of that first scan are forgotten.
 async fn scanned(
     tmp: &Path,
     kind: CollectionTypeOptions,
     folder: &Path,
     name: impl Fn(usize) -> String,
-) -> (LibraryScanner, Arc<CountingFs>) {
+    fs: Arc<CountingFs>,
+) -> (LibraryScanner, Arc<CountingFs>, Database) {
     std::fs::create_dir_all(folder).expect("mkdir");
     for n in 1..=FILES {
         std::fs::write(folder.join(name(n)), b"0123").expect("write");
@@ -195,30 +224,33 @@ async fn scanned(
         db.clone(),
         Arc::new(ItemTypeLookup::new()),
     ));
-    let fs = Arc::new(CountingFs::default());
     let scanner = LibraryScanner::new(vf, fs.clone(), persistence)
         .with_items(items)
         .with_probe(
             Arc::new(Probe) as Arc<dyn MediaEncoder>,
             Arc::new(FerrofinMediaStreamRepository::new(db.clone()))
                 as Arc<dyn MediaStreamRepository>,
-            Arc::new(FerrofinChapterRepository::new(db)),
+            Arc::new(FerrofinChapterRepository::new(db.clone())),
         )
         .with_metadata_dir(tmp.join("metadata"))
         .with_progress_every(0);
     let first = scanner.scan_all().await.expect("scan");
     assert!(first.created >= FILES, "{first:?}");
     fs.take_count(folder);
-    (scanner, fs)
+    (scanner, fs, db)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unchanged_rescan_lists_a_flat_folder_of_videos_once() {
     let tmp = tempfile::tempdir().expect("tmp");
     let folder = tmp.path().join("media");
-    let (scanner, fs) = scanned(tmp.path(), CollectionTypeOptions::movies, &folder, |n| {
-        format!("Movie {n} ({}).mkv", 1990 + n)
-    })
+    let (scanner, fs, _) = scanned(
+        tmp.path(),
+        CollectionTypeOptions::movies,
+        &folder,
+        |n| format!("Movie {n} ({}).mkv", 1990 + n),
+        Arc::default(),
+    )
     .await;
 
     let rescan = scanner.scan_all().await.expect("rescan");
@@ -236,9 +268,13 @@ async fn an_unchanged_rescan_lists_a_flat_album_folder_as_often_as_a_single() {
     let single = tmp.path().join("media").join("Single");
     std::fs::create_dir_all(&single).expect("mkdir");
     std::fs::write(single.join("01 Only.mp3"), b"0123").expect("write");
-    let (scanner, fs) = scanned(tmp.path(), CollectionTypeOptions::music, &folder, |n| {
-        format!("{n:02} Track {n}.mp3")
-    })
+    let (scanner, fs, _) = scanned(
+        tmp.path(),
+        CollectionTypeOptions::music,
+        &folder,
+        |n| format!("{n:02} Track {n}.mp3"),
+        Arc::default(),
+    )
     .await;
 
     let rescan = scanner.scan_all().await.expect("rescan");
@@ -251,4 +287,39 @@ async fn an_unchanged_rescan_lists_a_flat_album_folder_as_often_as_a_single() {
     let count = |dir: &Path| listed.iter().filter(|l| Path::new(l) == dir).count();
     assert!(count(&single) > 0, "{listed:?}");
     assert_eq!(count(&folder), count(&single), "{listed:?}");
+}
+
+/// The subtitle streams stored from `.srt` files.
+async fn srt_streams(db: &Database) -> i64 {
+    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaStreamInfos" WHERE "Path" LIKE '%.srt'"#)
+        .fetch_one(db.pool())
+        .await
+        .expect("count")
+}
+
+/// A sidecar that appears after the plan pass listed its folder is not seen
+/// by that scan: its items read the scan's listing, as each validation's
+/// `DirectoryService` serves its items upstream. The next scan lists the
+/// folder again, finds it changed and probes the video with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sidecar_added_after_the_plan_pass_waits_for_the_next_scan() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let folder = tmp.path().join("media");
+    let fs = Arc::new(CountingFs::default());
+    *fs.after_listing.lock().expect("lock") = Some(folder.join("Movie 1 (1991).en.srt"));
+    let (scanner, _, db) = scanned(
+        tmp.path(),
+        CollectionTypeOptions::movies,
+        &folder,
+        |n| format!("Movie {n} ({}).mkv", 1990 + n),
+        fs,
+    )
+    .await;
+    assert!(folder.join("Movie 1 (1991).en.srt").is_file());
+    assert_eq!(srt_streams(&db).await, 0, "listed before it was there");
+
+    let rescan = scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(rescan.updated, 1, "{rescan:?}");
+    assert_eq!(srt_streams(&db).await, 1);
 }

@@ -1041,7 +1041,11 @@ impl LibraryScanner {
 
         if let Some(images) = &mut images {
             let previous = items.get_image_infos(work.id).await?;
-            image_failures += self.publish_media_artwork(&row, images, &previous).await;
+            // No run listings to forget: the music pass lists album folders
+            // afresh (`discover_local_images`) and nothing after it reads them.
+            image_failures += self
+                .publish_media_artwork(&row, images, &previous, None)
+                .await;
         }
 
         // `RefreshMetadata`'s tail: the stamp and `SaveInternal`.

@@ -982,6 +982,29 @@ mod tests {
         assert_eq!(extensions, expected_extensions, "{paths:?}");
     }
 
+    /// The files [`MediaInfoResolver::file_paths`] leaves out (another
+    /// item's, whatever their case) never change how the item's own
+    /// `.idx`/`.sub` pair: a pair matched ignoring case still pairs, in the
+    /// video folder or the internal metadata folder, and still not across
+    /// the two.
+    #[rstest]
+    #[case(
+        &["my.video.idx", "my.video.sub", "Other.idx", "Other.sub", "Other.srt"],
+        &[],
+        &[".idx"]
+    )]
+    #[case(&["Other.sub"], &["MY.VIDEO.en.idx", "MY.VIDEO.en.sub", "Other.idx"], &[".idx"])]
+    #[case(&["MY.VIDEO.sub", "Other.idx"], &["my.video.idx"], &[".sub"])]
+    fn vob_sub_pairing_ignores_other_items_files(
+        #[case] video_files: &[&str],
+        #[case] metadata_files: &[&str],
+        #[case] expected_extensions: &[&str],
+    ) {
+        let paths = external_paths(video_files, metadata_files);
+        let extensions: Vec<&str> = paths.iter().map(|p| naming_path::extension(p)).collect();
+        assert_eq!(extensions, expected_extensions, "{paths:?}");
+    }
+
     // GetExternalStreams_BadPaths_ReturnsNoSubtitles
     #[rstest]
     #[case("https://url.com/My.Video.mkv")]
