@@ -27,7 +27,7 @@ use ferrofin_core::item_type_lookup::ItemTypeLookup;
 use ferrofin_db::Database;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::ImageType;
-use ferrofin_server::config::{Config, ProviderEndpoints};
+use ferrofin_server::config::Config;
 use ferrofin_server::state::{WiredApp, build_app_state};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::ItemRepository;
@@ -52,27 +52,15 @@ struct Harness {
     _temp: tempfile::TempDir,
 }
 
-/// Boots the composition root with every remote provider pointed at a closed
-/// local port, so the scan and the refresh never leave the machine.
+/// Boots the composition root. [`Config::test_stub`] points every remote
+/// provider at a closed local port, so the scan and the refresh never leave
+/// the machine.
 async fn boot(temp: tempfile::TempDir) -> Harness {
     std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
-    let nowhere = Some("http://127.0.0.1:9".to_owned());
     let config = Config {
         server_name: "ferrofin-generated-images".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
-        musicbrainz_base_url: "http://127.0.0.1:9".to_owned(),
-        studios_repo_url: "http://127.0.0.1:9".to_owned(),
-        provider_endpoints: ProviderEndpoints {
-            tmdb: nowhere.clone(),
-            tmdb_images: nowhere.clone(),
-            omdb: nowhere.clone(),
-            opensubtitles: nowhere.clone(),
-            tvdb: nowhere.clone(),
-            fanart: nowhere.clone(),
-            audiodb: nowhere.clone(),
-            lrclib: nowhere,
-        },
         ..Config::test_stub(temp.path())
     };
     std::fs::create_dir_all(&config.data_dir).expect("data dir");

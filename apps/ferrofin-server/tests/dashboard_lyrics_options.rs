@@ -180,7 +180,7 @@ async fn saved_lyrics_destinations_change_without_restarting() {
         ffprobe_path: Some(ffprobe.clone()),
         provider_endpoints: ProviderEndpoints {
             lrclib: Some(endpoint.clone()),
-            ..Default::default()
+            ..ProviderEndpoints::offline()
         },
         ..Config::test_stub(tmp.path())
     })

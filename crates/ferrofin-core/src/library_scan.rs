@@ -9359,7 +9359,10 @@ impl LibraryScanner {
         let mut found = None;
         'groups: for (source, candidates) in nfo_groups(entity, kind) {
             for cand in candidates {
-                if let Ok(contents) = tokio::fs::read_to_string(&cand).await {
+                // `new StreamReader(fs, Encoding.UTF8)`: BOM-aware and lossy, so
+                // a Latin-1 or UTF-16 NFO still reads.
+                if let Ok(bytes) = tokio::fs::read(&cand).await {
+                    let contents = ferrofin_util::stream_extensions::decode_stream_text(bytes);
                     found = Some((source, cand.to_string_lossy().into_owned(), contents));
                     break 'groups;
                 }

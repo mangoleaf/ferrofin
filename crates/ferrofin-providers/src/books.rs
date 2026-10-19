@@ -226,14 +226,79 @@ fn read_comic_metadata(path: &str) -> Option<BookMetadata> {
 fn read_sidecar(path: &str, stem_extensions: &[&str], fixed_names: &[&str]) -> Option<String> {
     let file = Path::new(path);
     let dir = file.parent()?;
-    for extension in stem_extensions {
-        if let Ok(xml) = std::fs::read_to_string(file.with_extension(extension)) {
-            return Some(xml);
-        }
-    }
-    fixed_names
+    let bytes = stem_extensions
         .iter()
-        .find_map(|name| std::fs::read_to_string(dir.join(name)).ok())
+        .map(|extension| file.with_extension(extension))
+        .chain(fixed_names.iter().map(|name| dir.join(name)))
+        .find_map(|candidate| std::fs::read(candidate).ok())?;
+    decode_xml(&bytes)
+}
+
+/// Decodes an XML document as `XmlReader`/`XmlDocument.Load` do
+/// (`XmlTextReaderImpl.DetectEncoding`): a UTF-32 or UTF-16 byte-order mark,
+/// or a leading `<` in one of those encodings, picks the encoding; then a
+/// UTF-8 BOM; otherwise the `<?xml … encoding="…"?>` declaration does, and
+/// without one it is UTF-8. Bytes invalid in that encoding, or an unknown
+/// declared encoding, fail the read as `XmlException` does.
+///
+/// `encoding_rs` follows WHATWG labels, so a declared `ISO-8859-1` decodes as
+/// windows-1252; the two differ only in 0x80–0x9F (C1 controls upstream,
+/// punctuation here). The unusual-octet UCS-4 orders (2143, 3412) are not
+/// recognised and read as UTF-8.
+fn decode_xml(bytes: &[u8]) -> Option<String> {
+    use encoding_rs::{UTF_8, UTF_16BE, UTF_16LE};
+    // UTF-32LE's BOM and leading `<` start like UTF-16LE's, so they come first.
+    let (encoding, body) = match bytes {
+        [0xFF, 0xFE, 0x00, 0x00, rest @ ..] => return decode_utf32(rest, u32::from_le_bytes),
+        [0x00, 0x00, 0xFE, 0xFF, rest @ ..] => return decode_utf32(rest, u32::from_be_bytes),
+        [b'<', 0x00, 0x00, 0x00, ..] => return decode_utf32(bytes, u32::from_le_bytes),
+        [0x00, 0x00, 0x00, b'<', ..] => return decode_utf32(bytes, u32::from_be_bytes),
+        [0xFF, 0xFE, rest @ ..] => (UTF_16LE, rest),
+        [0xFE, 0xFF, rest @ ..] => (UTF_16BE, rest),
+        [b'<', 0x00, ..] => (UTF_16LE, bytes),
+        [0x00, b'<', ..] => (UTF_16BE, bytes),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => (UTF_8, rest),
+        _ => match declared_xml_encoding(bytes) {
+            Some(label) => (encoding_rs::Encoding::for_label(label)?, bytes),
+            None => (UTF_8, bytes),
+        },
+    };
+    encoding
+        .decode_without_bom_handling_and_without_replacement(body)
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// Strict UTF-32 in `unit`'s byte order (`encoding_rs` has none): an invalid
+/// code point or a partial unit fails the read.
+fn decode_utf32(bytes: &[u8], unit: fn([u8; 4]) -> u32) -> Option<String> {
+    let (units, tail) = bytes.as_chunks::<4>();
+    if !tail.is_empty() {
+        return None;
+    }
+    units
+        .iter()
+        .map(|&quad| char::from_u32(unit(quad)))
+        .collect()
+}
+
+/// The `encoding` label of a leading `<?xml … ?>` declaration, if it has one.
+/// A `<?xml-stylesheet …?>` instruction is not a declaration.
+fn declared_xml_encoding(bytes: &[u8]) -> Option<&[u8]> {
+    let declaration = bytes.strip_prefix(b"<?xml")?;
+    if !declaration.first()?.is_ascii_whitespace() {
+        return None;
+    }
+    let declaration = &declaration[..declaration.windows(2).position(|w| w == b"?>")?];
+    let key: &[u8] = b"encoding";
+    let at = declaration.windows(key.len()).position(|w| w == key)?;
+    let value = declaration[at + key.len()..]
+        .trim_ascii_start()
+        .strip_prefix(b"=")?
+        .trim_ascii_start();
+    let (&quote, value) = value
+        .split_first()
+        .filter(|(q, _)| matches!(q, b'"' | b'\''))?;
+    Some(&value[..value.iter().position(|&b| b == quote)?])
 }
 
 /// An EPUB's metadata: the OPF the container points at.
@@ -930,10 +995,10 @@ fn read_capped_to(
     Some(bytes)
 }
 
-/// One archive entry as UTF-8 text.
+/// One archive entry as XML text, decoded as [`decode_xml`] does.
 fn read_archive_entry_text(path: &str, wanted_lower: &str) -> Option<String> {
     let bytes = read_archive_entry_bytes(path, wanted_lower)?;
-    String::from_utf8(bytes).ok()
+    decode_xml(&bytes)
 }
 
 /// A zip archive's comment, where ComicBookInfo stores its JSON.
@@ -1767,6 +1832,132 @@ mod tests {
         assert_eq!(
             read_book_metadata(&path).and_then(|b| b.name).as_deref(),
             Some("Dune")
+        );
+    }
+
+    /// `XmlDocument.Load` picks the encoding from a BOM, then from the XML
+    /// declaration; without either it is strict UTF-8 and the read fails.
+    #[rstest::rstest]
+    #[case::utf16_le_bom(
+        [&b"\xFF\xFE"[..], &"<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Café</dc:title></metadata></package>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()]
+        .concat(),
+        Some("Café")
+    )]
+    #[case::declared_latin1(
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Caf\xE9</dc:title></metadata></package>".to_vec(),
+        Some("Café")
+    )]
+    #[case::undeclared_latin1(
+        b"<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Caf\xE9</dc:title></metadata></package>".to_vec(),
+        None
+    )]
+    fn an_opf_sidecar_is_decoded_like_the_xml_reader(
+        #[case] bytes: Vec<u8>,
+        #[case] expected: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("dune.mobi"), b"book").expect("write");
+        std::fs::write(dir.path().join("dune.opf"), bytes).expect("write opf");
+        let path = dir.path().join("dune.mobi").to_string_lossy().into_owned();
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            expected
+        );
+    }
+
+    /// `text` in UTF-16 or UTF-32, little- or big-endian, with an optional BOM.
+    fn wide(text: &str, width: usize, little_endian: bool, bom: bool) -> Vec<u8> {
+        let units: Vec<u32> = bom
+            .then_some(0xFEFF)
+            .into_iter()
+            .chain(text.chars().map(u32::from))
+            .collect();
+        units
+            .into_iter()
+            .flat_map(|unit| {
+                let bytes = if little_endian {
+                    unit.to_le_bytes().to_vec()
+                } else {
+                    unit.to_be_bytes().to_vec()
+                };
+                match (width, little_endian) {
+                    (2, true) => bytes[..2].to_vec(),
+                    (2, false) => bytes[2..].to_vec(),
+                    _ => bytes,
+                }
+            })
+            .collect()
+    }
+
+    const DOC: &str = "<a>Café</a>";
+
+    #[rstest::rstest]
+    #[case::utf8(DOC.as_bytes().to_vec(), Some(DOC))]
+    #[case::utf8_bom([&b"\xEF\xBB\xBF"[..], DOC.as_bytes()].concat(), Some(DOC))]
+    #[case::utf16_be_bom(wide(DOC, 2, false, true), Some(DOC))]
+    #[case::utf16_le_bomless(wide(DOC, 2, true, false), Some(DOC))]
+    #[case::utf16_be_bomless(wide(DOC, 2, false, false), Some(DOC))]
+    #[case::utf32_le_bom(wide(DOC, 4, true, true), Some(DOC))]
+    #[case::utf32_be_bom(wide(DOC, 4, false, true), Some(DOC))]
+    #[case::utf32_le_bomless(wide(DOC, 4, true, false), Some(DOC))]
+    #[case::utf32_partial_unit([wide(DOC, 4, true, true), vec![0]].concat(), None)]
+    #[case::single_quoted(
+        b"<?xml version='1.0' encoding = 'windows-1252' ?><a>Caf\xE9</a>".to_vec(),
+        Some("<?xml version='1.0' encoding = 'windows-1252' ?><a>Café</a>")
+    )]
+    #[case::unknown_label(b"<?xml version=\"1.0\" encoding=\"klingon\"?><a/>".to_vec(), None)]
+    #[case::unterminated_label(
+        b"<?xml version=\"1.0\" encoding=\"latin1?><a>Caf\xC3\xA9</a>".to_vec(),
+        Some("<?xml version=\"1.0\" encoding=\"latin1?><a>Café</a>")
+    )]
+    #[case::stylesheet_is_not_a_declaration(
+        b"<?xml-stylesheet encoding=\"latin1\"?><a>Caf\xC3\xA9</a>".to_vec(),
+        Some("<?xml-stylesheet encoding=\"latin1\"?><a>Café</a>")
+    )]
+    #[case::undeclared_invalid_utf8(b"<a>Caf\xE9</a>".to_vec(), None)]
+    #[case::empty(Vec::new(), Some(""))]
+    fn decode_xml_detects_the_encoding_like_xml_text_reader(
+        #[case] bytes: Vec<u8>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(decode_xml(&bytes).as_deref(), expected);
+    }
+
+    /// `OpfProvider.GetXmlFile` takes the first OPF that exists; one that
+    /// fails to load does not fall through to `content.opf`.
+    #[test]
+    fn an_undecodable_opf_sidecar_does_not_fall_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("dune.mobi"), b"book").expect("write");
+        std::fs::write(dir.path().join("dune.opf"), b"<package>\xE9</package>").expect("bad opf");
+        std::fs::write(
+            dir.path().join("content.opf"),
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>Dune</dc:title></metadata></package>"#,
+        )
+        .expect("content.opf");
+        let path = dir.path().join("dune.mobi").to_string_lossy().into_owned();
+        assert!(read_book_metadata(&path).is_none());
+    }
+
+    #[test]
+    fn a_comic_info_entry_declared_latin1_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[(
+                "ComicInfo.xml",
+                b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><ComicInfo><Title>Ast\xE9rix</Title></ComicInfo>",
+            )],
+            None,
+        );
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            Some("Astérix")
         );
     }
 
