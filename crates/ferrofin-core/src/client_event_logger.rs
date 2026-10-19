@@ -14,15 +14,14 @@
 //!   [`write_document`](ferrofin_traits::events::ClientEventLogger::write_document)
 //!   taking owned bytes (`&[u8]`) — the trait already folded the `Stream` to
 //!   `Send`-safe bytes.
-//! - `PathHelper.GetSafeLeafFileName` (strip path separators / invalid chars) is
-//!   ported as the local [`safe_leaf`] helper; `IsContainedIn` becomes the
-//!   [`Path::starts_with`] containment check. Both keep an attacker-supplied
+//! - `PathHelper.GetSafeLeafFileName` and `IsContainedIn` are the shared
+//!   [`ferrofin_util::path_helper`] ports. Both keep an attacker-supplied
 //!   `clientName`/`clientVersion` from escaping the log directory.
 //! - File creation uses `create_new` (fail if it already exists), matching the
 //!   C# `FileMode.CreateNew`; the `Guid` in the name makes a collision
 //!   effectively impossible.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,6 +32,7 @@ use uuid::Uuid;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::ClientEventLogger;
 use ferrofin_traits::system::ServerApplicationPaths;
+use ferrofin_util::path_helper::{get_safe_leaf_file_name, is_contained_in};
 
 /// The UTC timestamp format used in the generated log file name (C#
 /// `yyyyMMddHHmmss`).
@@ -62,31 +62,6 @@ impl FerrofinClientEventLogger {
     }
 }
 
-/// Reduces an arbitrary string to a safe single path segment, or `None` when it
-/// contains no usable characters.
-///
-/// Port of `PathHelper.GetSafeLeafFileName`: it drops path separators and the
-/// characters the host filesystem rejects in a leaf name, so a malicious
-/// `clientName` like `../../etc/passwd` cannot introduce directory traversal.
-fn safe_leaf(value: &str) -> Option<String> {
-    let cleaned: String = value
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(
-                    c,
-                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0'
-                )
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
-}
-
 #[async_trait]
 impl ClientEventLogger for FerrofinClientEventLogger {
     async fn write_document(
@@ -95,10 +70,10 @@ impl ClientEventLogger for FerrofinClientEventLogger {
         client_version: &str,
         contents: &[u8],
     ) -> Result<String, ServiceError> {
-        let safe_client_name =
-            safe_leaf(client_name).unwrap_or_else(|| "unknown-client".to_owned());
-        let safe_client_version =
-            safe_leaf(client_version).unwrap_or_else(|| "unknown-version".to_owned());
+        let safe_client_name = get_safe_leaf_file_name(Some(client_name))
+            .unwrap_or_else(|| "unknown-client".to_owned());
+        let safe_client_version = get_safe_leaf_file_name(Some(client_version))
+            .unwrap_or_else(|| "unknown-version".to_owned());
         let timestamp = Utc::now().format(TIMESTAMP_FORMAT);
         let unique = Uuid::new_v4().simple();
         let file_name =
@@ -107,10 +82,10 @@ impl ClientEventLogger for FerrofinClientEventLogger {
         let log_dir = PathBuf::from(self.paths.log_directory_path());
         let log_file_path = log_dir.join(&file_name);
 
-        // Defence in depth: `safe_leaf` already strips separators, but re-check
+        // Defence in depth: the leaves carry no separator, but re-check
         // containment (C# `PathHelper.IsContainedIn`) so the file can never land
         // outside the log directory.
-        if !is_contained_in(&log_dir, &log_file_path) {
+        if !is_contained_in(&log_dir.to_string_lossy(), &log_file_path.to_string_lossy()) {
             return Err(ServiceError::invalid_input(
                 "path resolved to filename not in log directory",
             ));
@@ -141,16 +116,11 @@ impl ClientEventLogger for FerrofinClientEventLogger {
     }
 }
 
-/// Whether `candidate` resolves to a path inside `parent` (C#
-/// `PathHelper.IsContainedIn`).
-fn is_contained_in(parent: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(parent)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app_paths::FerrofinServerApplicationPaths;
+    use std::path::Path;
 
     fn paths_in(dir: &Path) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(FerrofinServerApplicationPaths::new(
@@ -162,18 +132,18 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn safe_leaf_strips_traversal() {
-        assert_eq!(safe_leaf("../../etc/passwd").as_deref(), Some("etcpasswd"));
-        assert_eq!(safe_leaf("Jellyfin Web").as_deref(), Some("Jellyfin Web"));
-        assert_eq!(safe_leaf("..").as_deref(), None);
-        assert_eq!(safe_leaf("   ").as_deref(), None);
-        assert!(
-            safe_leaf("a/b:c*d")
-                .unwrap()
-                .chars()
-                .all(char::is_alphanumeric)
-        );
+    #[tokio::test]
+    async fn write_document_keeps_the_leaf_of_a_traversal_client_name() {
+        // `ClientEventLogger.WriteDocumentAsync` names the file with
+        // `PathHelper.GetSafeLeafFileName`, so only the leaf survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let logger = FerrofinClientEventLogger::new(paths_in(tmp.path()));
+        let name = logger
+            .write_document("../../etc/passwd", "1.0/../2.0", b"x")
+            .await
+            .unwrap();
+        assert!(name.starts_with("upload_passwd_2.0_"), "{name}");
+        assert!(tmp.path().join("logs").join(&name).is_file());
     }
 
     #[tokio::test]
@@ -228,15 +198,5 @@ mod tests {
         let logger = FerrofinClientEventLogger::new(paths_in(tmp.path()));
         let name = logger.write_document("..", "", b"x").await.unwrap();
         assert!(name.starts_with("upload_unknown-client_unknown-version_"));
-    }
-
-    #[test]
-    fn containment_check_rejects_escape() {
-        let parent = Path::new("/var/log/ferrofin");
-        assert!(is_contained_in(
-            parent,
-            Path::new("/var/log/ferrofin/a.log")
-        ));
-        assert!(!is_contained_in(parent, Path::new("/var/log/other/a.log")));
     }
 }
