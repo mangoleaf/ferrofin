@@ -269,10 +269,13 @@ Jellyfin. Read [`bench/README.md`](bench/README.md) first — it defines every n
 sentence.
 
 ```bash
-# needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
-# ffprobe and Python Pillow to build the test data
-docker pull jellyfin/jellyfin:10.11.8 && docker pull jellyfin/jellyfin:12.0-rc7 && docker pull jellyfin/jellyfin:12.2
-bench/testdata/build.sh                          # once: ~20 min, ~17 GB (gitignored)
+# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
+# plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
+docker pull jellyfin/jellyfin:10.11.8
+docker pull "$(cat bench/testdata/jellyfin-image.txt)"
+bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
+bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
+bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
 bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
 python3 bench/report.py --serve                  # compare runs at 127.0.0.1:8097
@@ -281,7 +284,7 @@ python3 bench/report.py --serve                  # compare runs at 127.0.0.1:809
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are
-90 % idle. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
+90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
 Publishable numbers come from **three** runs — `report.py` takes the median and prints the
 range each cell spanned.
 
@@ -302,7 +305,12 @@ keeps day-to-day work fast:
   fixed or the owner accepts it. So does a `⚠` response-shape note the baseline does not
   have.
 - When chasing a regression, `bench/run.sh --servers ferrofin --only loaded` on two builds is
-  the cheap form, skipping both Jellyfins.
+  the cheap form, skipping Jellyfin.
+
+The fast stdlib reporter correctness tests (`bench/test_report.py`) do run in CI and gate
+releases; they start no servers and impose no performance thresholds. The benchmark
+reference is Jellyfin **12.2**, pinned by digest in `bench/testdata/jellyfin-image.txt`;
+this does not change the source-verification `UPSTREAM_TAG` recorded below.
 
 Parity in the project's sense, implementation compared against the upstream C# and recorded
 in `handlers::VERIFIED`, is still done per change. Only measurement moved.

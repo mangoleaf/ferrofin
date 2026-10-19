@@ -1,6 +1,7 @@
 # built test data (regenerate with build.sh)
-media/
+/media
 config/
 cache/
 ids.json
 __pycache__/
+jellyfin12/
