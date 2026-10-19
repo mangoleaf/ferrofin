@@ -490,9 +490,11 @@ impl LyricManager for FerrofinLyricManager {
         // `GetLyricsAsync`: walk the item's lyric streams and return the first
         // one a parser claims.
         for file in self.lyric_files(item_id).await? {
-            let Ok(content) = std::fs::read_to_string(&file) else {
+            // `File.ReadAllTextAsync(path, Encoding.UTF8)`: BOM-aware and lossy.
+            let Ok(bytes) = std::fs::read(&file) else {
                 continue;
             };
+            let content = ferrofin_util::stream_extensions::decode_stream_text(bytes);
             let name = file.file_name().unwrap_or_default().to_string_lossy();
             if let Some(dto) = parse_by_name(&name, &content) {
                 return Ok(Some(dto));
@@ -1793,6 +1795,35 @@ mod tests {
             mgr.get_lyrics(item_id).await.unwrap().unwrap().lyrics[0].text,
             "fallback"
         );
+    }
+
+    /// `File.ReadAllTextAsync(path, Encoding.UTF8)` honours a UTF-16 BOM and
+    /// turns a stray Latin-1 byte into U+FFFD; neither drops the lyric.
+    #[rstest::rstest]
+    #[case::utf16_le(
+        b"\xFF\xFE[\x000\x000\x00:\x000\x001\x00.\x000\x000\x00]\x00C\x00a\x00f\x00\xE9\x00",
+        "Café"
+    )]
+    #[case::latin1(b"[00:01.00]Caf\xE9", "Caf\u{FFFD}")]
+    #[tokio::test]
+    async fn get_lyrics_reads_a_sidecar_that_is_not_utf8(
+        #[case] bytes: &[u8],
+        #[case] expected: &str,
+    ) {
+        let db = test_support::test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("song.flac");
+        let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        let lrc = media.with_extension("lrc");
+        std::fs::write(&lrc, bytes).expect("write lrc");
+        record_lyric_streams(&db, item_id, &[&lrc]).await;
+
+        let dto = manager_over(&db, Vec::new())
+            .get_lyrics(item_id)
+            .await
+            .expect("get")
+            .expect("lyric read");
+        assert_eq!(dto.lyrics[0].text, expected);
     }
 
     #[tokio::test]
