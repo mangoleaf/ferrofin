@@ -304,6 +304,11 @@ sccache-creds:
     # published before lint/coverage pull it; ignored on runs where it's skipped.
     - job: ci-image
       optional: true
+  # Runs on failure too, in the job's container, so the sccache server started by
+  # .sccache-setup is still up. The creds are re-passed in case it is not. A no-op when
+  # sccache is off (no creds); the stats are informational, so never fail the job on them.
+  after_script:
+    - '[ -z "${SCCACHE_ACCESS_KEY:-}" ] || AWS_ACCESS_KEY_ID="$SCCACHE_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SCCACHE_SECRET_KEY" sccache --show-stats || true'
 
 # Install the sccache binary and enable it when Vault creds are present.
 # !reference'd as the first step of each rust job's before_script.
