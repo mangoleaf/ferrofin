@@ -1347,7 +1347,8 @@ fn add_external_lyrics(
 /// `AudioFileProber.FetchAsync`'s embedded-lyric step (`:143-157`, with
 /// `FetchDataFromTags` `:562-572` and `LyricManager.SaveLyricAsync`), run on an
 /// unlocked track's probe result: the lyrics in its tags
-/// ([`embedded_lyrics::from_tags`]) are saved as `{stem}.lrc` — beside the
+/// ([`embedded_lyrics::from_file`], falling back to the probe's tags) are
+/// saved as `{stem}.lrc` — beside the
 /// track when the library saves lyrics with media, else in its internal
 /// metadata folder — when it has no lyric sidecar yet, or under
 /// `ReplaceAllMetadata`. A track that had none then picks the saved file up as
@@ -1375,11 +1376,19 @@ fn extract_embedded_lyrics(
     if !(try_extract || replace_all) {
         return Ok(());
     }
-    let Some(lyrics) = probed
-        .raw_audio_tags
-        .as_ref()
-        .and_then(crate::embedded_lyrics::from_tags)
-    else {
+    // ATL reads the file's own tags; ffprobe's are the fallback for a file
+    // `lofty` cannot read.
+    let lyrics = match crate::embedded_lyrics::from_file(std::path::Path::new(path)) {
+        Ok(lyrics) => lyrics,
+        Err(e) => {
+            tracing::debug!(path, error = %e, "lyric tags unreadable; using the probe's tags");
+            probed
+                .raw_audio_tags
+                .as_ref()
+                .and_then(crate::embedded_lyrics::from_tags)
+        }
+    };
+    let Some(lyrics) = lyrics else {
         return Ok(());
     };
     let internal = seam.for_item(id).internal_metadata_path;
