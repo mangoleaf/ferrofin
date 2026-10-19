@@ -567,6 +567,10 @@ pub struct HlsStreamRequest {
     /// The negotiated subtitle delivery method name (`subtitleMethod`:
     /// `Encode`/`Embed`/`External`/`Hls`/`Drop`).
     pub subtitle_method: Option<String>,
+    /// Burn the selected subtitle into any video that is not stream-copied,
+    /// whatever its delivery method (`alwaysBurnInSubtitleWhenTranscoding`,
+    /// default `false`). Only the video HLS routes bind it upstream.
+    pub always_burn_in_subtitle_when_transcoding: bool,
     /// The client's transcode reasons (`transcodeReasons`), forwarded into the
     /// master playlist's variant URL when the query lacks it.
     pub transcode_reasons: Option<String>,
@@ -657,6 +661,7 @@ impl Default for HlsStreamRequest {
             min_segments: None,
             subtitle_stream_index: None,
             subtitle_method: None,
+            always_burn_in_subtitle_when_transcoding: false,
             transcode_reasons: None,
             // The master-playlist DTO defaults (`GetMasterHlsVideoPlaylist`):
             // no subtitle group, no adaptive variants, trickplay listed.

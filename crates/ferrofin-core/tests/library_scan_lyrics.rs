@@ -1,7 +1,9 @@
 //! The library scan's lyric discovery, end to end: an audio track's lyric
 //! sidecars become its `Lyric` stream and its `LyricFiles`, as Jellyfin's
 //! `AudioFileProber.AddExternalLyrics` records them, and a change to that set
-//! re-probes the track (`ProbeProvider.HasChanged`'s lyric arm).
+//! re-probes the track (`ProbeProvider.HasChanged`'s lyric arm). Lyrics
+//! embedded in the track's tags are saved as an `.lrc` when it has none
+//! (`AudioFileProber.FetchDataFromTags` → `LyricManager.SaveLyricAsync`).
 //!
 //! Port target: `LyricResolver` (`MediaInfoResolver.GetExternalFiles(Audio)`:
 //! a case-insensitive prefix match on the track's stem plus a media-flag
@@ -9,6 +11,7 @@
 //! run from `AudioFileProber.FetchAsync`. Over the real scanner, repositories
 //! and SQLite schema; the ffprobe seam is a fake that records each probe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +26,7 @@ use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, MediaStreamType, Video3DFormat};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_model::media_info::MediaInfo;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
@@ -32,11 +36,12 @@ use uuid::Uuid;
 /// `MediaStreamType.Lyric` as `MediaStreamInfos.StreamType` stores it.
 const LYRIC: i32 = 5;
 
-/// An ffprobe stand-in: every file is one FLAC audio stream. Records the
-/// probed paths.
+/// An ffprobe stand-in: every file is one FLAC audio stream carrying `tags`.
+/// Records the probed paths.
 #[derive(Default)]
 struct RecordingProbe {
     probed: Mutex<Vec<String>>,
+    tags: Mutex<HashMap<String, String>>,
 }
 
 impl RecordingProbe {
@@ -48,6 +53,15 @@ impl RecordingProbe {
             .drain(..)
             .map(|p| file_name(&p).to_owned())
             .collect()
+    }
+
+    /// Every later probe reports these embedded tags (keys as ffprobe's,
+    /// lowercased).
+    fn set_tags(&self, tags: &[(&str, &str)]) {
+        *self.tags.lock().expect("lock") = tags
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
     }
 }
 
@@ -78,6 +92,16 @@ impl MediaEncoder for RecordingProbe {
                 ..MediaStream::default()
             }],
             ..MediaSourceInfo::default()
+        })
+    }
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<MediaInfo, ServiceError> {
+        Ok(MediaInfo {
+            media_source: self.get_media_info(request).await?,
+            raw_audio_tags: Some(self.tags.lock().expect("lock").clone()),
+            ..MediaInfo::default()
         })
     }
     async fn extract_audio_image(
@@ -126,6 +150,10 @@ struct Harness {
 }
 
 async fn harness(tmp: &Path) -> Harness {
+    harness_with(tmp, LibraryOptions::default()).await
+}
+
+async fn harness_with(tmp: &Path, options: LibraryOptions) -> Harness {
     let media = tmp.join("music");
     let album = media.join("Artist").join("Album");
     std::fs::create_dir_all(&album).expect("album dir");
@@ -146,7 +174,7 @@ async fn harness(tmp: &Path) -> Harness {
             path_infos: vec![MediaPathInfo {
                 path: media.to_string_lossy().into_owned(),
             }],
-            ..LibraryOptions::default()
+            ..options
         },
     )
     .await
@@ -297,4 +325,172 @@ async fn lyric_sidecars_become_the_tracks_lyric_stream_and_changes_reprobe_it() 
     assert_eq!(h.probe.take(), ["01 - Song.flac"]);
     assert!(h.lyric_streams().await.is_empty());
     assert!(h.lyric_files().await.is_empty());
+}
+
+/// An ID3 `USLT` frame, as ffprobe reports it.
+const USLT: (&str, &str) = ("lyrics-eng", "[00:01.00]Hello\r\n[00:02.5]World");
+/// What `FetchDataFromTags` saves for [`USLT`]: ATL's LRC rendering.
+const SAVED: &str = "\n[00:01.00]Hello\n[00:02.01]World\n";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_lyrics_are_saved_to_the_metadata_folder_and_become_the_lyric_stream() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    h.probe.set_tags(&[("title", "Song"), USLT]);
+
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    let saved = h.metadata_folder().await.join("01 - Song.lrc");
+    assert_eq!(std::fs::read_to_string(&saved).expect("saved lrc"), SAVED);
+    assert!(
+        !h.track.with_extension("lrc").exists(),
+        "the media folder is left alone"
+    );
+    assert_eq!(
+        h.lyric_streams().await,
+        [(1, "01 - Song.lrc".to_owned(), None)]
+    );
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+
+    // The saved file is the recorded set: nothing is probed again.
+    h.scanner.scan_all().await.expect("rescan");
+    assert!(h.probe.take().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lyric_sidecar_keeps_the_embedded_lyrics_from_being_saved() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    let sidecar = h.track.with_extension("lrc");
+    std::fs::write(&sidecar, "[00:01.00]mine").expect("lrc");
+    h.probe.set_tags(&[USLT]);
+
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert!(!h.metadata_folder().await.join("01 - Song.lrc").exists());
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("sidecar"),
+        "[00:01.00]mine"
+    );
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn save_lyrics_with_media_saves_embedded_lyrics_beside_the_track() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness_with(
+        tmp.path(),
+        LibraryOptions {
+            save_lyrics_with_media: true,
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    h.probe.set_tags(&[USLT]);
+
+    h.scanner.scan_all().await.expect("scan");
+    let beside = h.track.with_extension("lrc");
+    assert_eq!(std::fs::read_to_string(&beside).expect("saved lrc"), SAVED);
+    // `TrySaveToFiles` stops at the first path that takes the file.
+    assert!(!h.metadata_folder().await.join("01 - Song.lrc").exists());
+    assert_eq!(
+        h.lyric_streams().await,
+        [(1, "01 - Song.lrc".to_owned(), None)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_track_never_saves_its_embedded_lyrics() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Type" LIKE '%Audio.Audio'"#)
+        .execute(h.db.writer())
+        .await
+        .expect("lock");
+
+    // The file changes, so the track is probed again, now with lyrics.
+    h.probe.set_tags(&[USLT]);
+    std::fs::write(&h.track, b"fLaC changed").expect("rewrite");
+    std::fs::File::options()
+        .write(true)
+        .open(&h.track)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        })
+        .expect("mtime");
+    h.scanner.scan_all().await.expect("rescan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert!(!h.metadata_folder().await.join("01 - Song.lrc").exists());
+    assert!(h.lyric_streams().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_all_metadata_saves_embedded_lyrics_despite_a_sidecar() {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    let sidecar = h.track.with_extension("lrc");
+    std::fs::write(&sidecar, "[00:01.00]mine").expect("lrc");
+    h.probe.set_tags(&[USLT]);
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert!(!h.metadata_folder().await.join("01 - Song.lrc").exists());
+
+    // "Replace all metadata": the embedded lyric is saved even though the
+    // track has one, and the stream stays the sidecar it already had.
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        force_save: true,
+        ..MetadataRefreshOptions::default()
+    };
+    h.scanner
+        .scan_with(None, &replace_all)
+        .await
+        .expect("replace all");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    let saved = h.metadata_folder().await.join("01 - Song.lrc");
+    assert_eq!(std::fs::read_to_string(&saved).expect("saved lrc"), SAVED);
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("sidecar"),
+        "[00:01.00]mine"
+    );
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+    assert_eq!(h.lyric_streams().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lyric_that_cannot_be_written_fails_the_probe_and_is_retried() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    // A file where the metadata folder belongs: every save path fails.
+    std::fs::create_dir_all(h.meta_root.parent().expect("parent")).expect("dir");
+    std::fs::write(&h.meta_root, b"not a folder").expect("blocker");
+    h.probe.set_tags(&[USLT]);
+
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    let streams = h
+        .streams
+        .get_media_streams(&MediaStreamQuery {
+            item_id: h.track_id().await,
+            stream_type: None,
+            index: None,
+        })
+        .await
+        .expect("streams");
+    assert!(
+        streams.is_empty(),
+        "the probe result is dropped: {streams:?}"
+    );
+
+    // The refresh did not complete, so the next scan probes again and saves.
+    std::fs::remove_file(&h.meta_root).expect("unblock");
+    h.scanner.scan_all().await.expect("rescan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
 }
