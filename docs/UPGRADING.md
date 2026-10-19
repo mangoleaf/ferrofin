@@ -8,6 +8,21 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — rows of deleted users are removed, once
+
+A long-lived Jellyfin database can still hold rows of users deleted long ago (their
+permissions, preferences, play state, devices and display preferences) and ancestry rows
+of items that no longer exist. Jellyfin 12.1 and later start with them; earlier Ferrofin
+versions refused to open such a database ("foreign-key violation(s)"), on adoption and on
+every boot after.
+
+On first boot migration `0044` deletes those rows, as Jellyfin would have when the user or
+item was deleted, and logs how many it removed from each table. It snapshots the file to
+`jellyfin.db.pre-0044` first, unless an earlier table-rebuilding migration (`0007`,
+`0032`) runs in the same boot and takes the snapshot. Adoption also keeps its
+`jellyfin.db.pre-ferrofin` copy, as always. Nobody can reach the deleted
+rows, so nothing visible changes. A database the earlier version refused now opens.
+
 ## Unreleased — playlists get their own folder and a new id, once
 
 A playlist created in Ferrofin had no folder. Jellyfin gives each playlist one,
