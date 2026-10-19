@@ -1389,7 +1389,9 @@ fn extract_embedded_lyrics(
         internal.as_deref().map(std::path::Path::new),
         "lrc",
     );
-    let saved = crate::lyric_manager::try_save_to_files(&targets, &lyrics)?;
+    let Some(saved) = crate::lyric_manager::try_save_to_files(&targets, &lyrics)? else {
+        return Ok(());
+    };
     tracing::debug!(path = %saved.display(), "saved embedded lyrics");
     // `LyricManager` invalidates the saved path (`LyricManager.cs:455`):
     // the lookup below then lists its folder again and finds the file.
