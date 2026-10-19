@@ -17,6 +17,9 @@ import time
 import urllib.error
 import urllib.request
 
+#: Listed in testdata/seed.py CONTROL_DEVICES, so the session check accounts for it.
+DEVICE = "bench-cold"
+
 
 def started_at(container):
     s = subprocess.check_output(["docker", "inspect", "-f", "{{.State.StartedAt}}", container],
@@ -75,7 +78,7 @@ def main():
     poll_s = (int(sys.argv[6]) if len(sys.argv) > 6 else 10) / 1000
     with open(ids_path) as f:
         ids = json.load(f)
-    hdr = {"Authorization": f'MediaBrowser Client="bench", Device="bench", DeviceId="bench-cold", Version="3", Token="{ids["token"]}"'}
+    hdr = {"Authorization": f'MediaBrowser Client="bench", Device="bench", DeviceId="{DEVICE}", Version="3", Token="{ids["token"]}"'}
     runs = []
     for i in range(reps):
         try:
