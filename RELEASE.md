@@ -64,8 +64,8 @@ from.
      - Use a fresh directory for each attempt (`-N`): `run.sh` never reuses a run directory.
      - Keep the two images under their own tags and `docker tag` the right one to
        `ferrofin:bench` before each run.
-   - In `python3 bench/report.py --serve`, tick the three release runs and pick the
-     baseline directory as the baseline.
+   - In `python3 bench/report.py --serve`, tick the three release runs and tick the
+     baseline directories as the baseline (compared by their median).
 
    A latency or memory regression against the baseline, or a `⚠` response-shape note that
    the baseline does not have, blocks the release until it is fixed or the maintainer

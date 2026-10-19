@@ -238,6 +238,99 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'baseline'):
             report.render_html(self.build(self.a), self.build(self.b))
 
+    def ferrofin_only(self, name, p50=10, oracle=False):
+        run = self.make_run(name)
+        if not oracle:
+            shutil.rmtree(run / 'jellyfin')
+        self.edit(run / 'ferrofin/k6-loaded.json', lambda x: [v.update(p50=p50) for group in ('screens', 'endpoints') for v in x[group].values()])
+        return run
+
+    def test_ferrofin_only_candidate_colours_delta_against_ferrofin_only_baseline(self):
+        model, base = self.build(self.ferrofin_only('cand', p50=20)), self.build(self.ferrofin_only('base'))
+        self.assertIn('no oracle run', self.home(model).flag)  # the oracle ratio stays caveated
+        self.assertIsNone(self.home(model).own_flag)
+        delta = report.delta_html(self.home(model), self.home(base), report.load_gate())
+        self.assertIn("class='delta bad'", delta)
+        self.assertIn('+100%', delta)
+        page = report.render_html(model, base)
+        self.assertIn("delta bad", page)
+        self.assertNotIn("delta provisional", page)
+
+    def test_oracle_problems_leave_the_delta_alone_and_own_problems_caveat_it(self):
+        cand, base = self.ferrofin_only('cand', p50=20, oracle=True), self.ferrofin_only('base', oracle=True)
+        self.edit(cand / 'jellyfin/k6-loaded.json', lambda x: x['endpoints']['home:items'].update(ok=0))
+        self.shapes(cand / 'jellyfin', [{'shape': n, 'url': f'http://jellyfin/{n}', 'status': 200,
+                                          'count': 9, 'fields': ['.Items'], 'bytes': 100}
+                                         for n in [f'{s}:items' for s in report.SCREENS] + ['image']])
+        model, base_model = self.build(cand), self.build(base)
+        self.assertIn('failed', self.home(model).flag)
+        self.assertIsNone(self.home(model).own_flag)
+        self.assertIn('delta bad', report.delta_html(self.home(model), self.home(base_model), report.load_gate()))
+        self.edit(cand / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
+        delta = report.delta_html(self.home(self.build(cand)), self.home(base_model), report.load_gate())
+        self.assertIn('delta provisional', delta)
+        self.assertIn('measured requests failed', delta)
+
+    def test_malformed_gate_file_is_a_readable_error(self):
+        for name, text in [('missing', None), ('not toml', 'screens = ['), ('no absolute', '[screens]\nrelative_pct = 15\n')]:
+            with self.subTest(name):
+                path = self.root / f'{name}.toml'
+                if text is not None:
+                    path.write_text(text)
+                with self.assertRaisesRegex(ValueError, 'gate thresholds unreadable'):
+                    report.load_gate(str(path))
+
+    def test_picker_selects_several_baseline_runs(self):
+        picker = report.picker_html([('a', 'a ·'), ('b', 'b ·'), ('c', 'c ·')], ['a'], ['b', 'c'])
+        self.assertIn("name='baseline' value='b' checked", picker)
+        self.assertIn("name='baseline' value='c' checked", picker)
+        self.assertNotIn("name='baseline' value='a' checked", picker)
+
+    def test_loaded_only_runs_without_a_shape_pass_still_colour(self):
+        cand, base = self.ferrofin_only('cand', p50=20), self.ferrofin_only('base')
+        for run in (cand, base):
+            (run / 'ferrofin/shape.log').unlink()
+        model, base = self.build(cand), self.build(base)
+        self.assertIn('delta bad', report.delta_html(self.home(model), self.home(base), report.load_gate()))
+
+    def test_delta_is_provisional_when_the_server_did_different_work(self):
+        model, base = self.ferrofin_only('cand', p50=20), self.ferrofin_only('base')
+        self.shapes(base / 'ferrofin', [{'shape': n, 'url': f'http://ferrofin/{n}', 'status': 200,
+                                          'count': 2 if n == 'home:items' else 1, 'fields': ['.Items'], 'bytes': 100}
+                                         for n in [f'{s}:items' for s in report.SCREENS] + ['image']])
+        model, base = self.build(model), self.build(base)
+        delta = report.delta_html(self.home(model), self.home(base), report.load_gate())
+        self.assertIn('delta provisional', delta)
+        self.assertIn('responses differ', delta)
+        movies = lambda m: dict(m['levels']['loaded']['screens'])['movies']['ferrofin']
+        self.assertIn('delta bad', report.delta_html(movies(model), movies(base), report.load_gate()))
+
+    def test_baseline_of_three_runs_is_compared_by_its_median(self):
+        # runs[0] alone would read as a 75% improvement; the median says nothing moved.
+        runs = [self.ferrofin_only('base1', p50=25), self.ferrofin_only('base2'), self.ferrofin_only('base3')]
+        model, base = self.build(self.ferrofin_only('cand')), self.build(*runs)
+        delta = report.delta_html(self.home(model), self.home(base), report.load_gate())
+        self.assertIn('+0%', delta)
+        self.assertIn('median of 3 runs', delta)
+        self.assertIn("class='delta '", delta)
+        page = report.render_html(model, base)
+        self.assertIn('1 run: cand', page)
+        self.assertIn('baseline, median of 3 runs: base1, base2, base3', page)
+
+    def test_delta_inside_the_noise_band_stays_uncoloured(self):
+        cell = lambda v, gate, key=None: report.gated(report.Cell([v], report.sig3), gate, key)
+        gate = report.load_gate()
+        for name, now, then, kind in [('relative under 15%', 11, 10, 'screens'),
+                                      ('absolute under 0.5 ms', 1.4, 1, 'endpoints'),
+                                      ('memory under 25%', 120, 100, 'memory'),
+                                      ('no gate row', 200, 100, None)]:
+            with self.subTest(name):
+                self.assertIn("class='delta '", report.delta_html(cell(now, kind), cell(then, kind), gate))
+        self.assertIn('delta bad', report.delta_html(cell(1.6, 'endpoints'), cell(1, 'endpoints'), gate))
+        self.assertIn('delta good', report.delta_html(cell(50, 'memory'), cell(100, 'memory'), gate))
+        noisy = {**gate, 'cells': {'loaded/screens/detail': {'relative_pct': 80, 'absolute': 5}}}
+        self.assertIn("class='delta '", report.delta_html(cell(17, 'screens', 'loaded/screens/detail'), cell(10, 'screens'), noisy))
+
     def test_failed_and_truncated_timing_repetitions(self):
         self.edit(self.b / 'ferrofin/coldstart.json', lambda x: x['runs'][1].update(home_ms=None))
         self.edit(self.b / 'ferrofin/ttfs.json', lambda x: x.update(direct=x['direct'][:1]))
