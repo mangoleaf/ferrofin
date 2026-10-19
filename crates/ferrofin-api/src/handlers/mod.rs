@@ -825,11 +825,6 @@ pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
 /// from this list. `v12.0-rc7` is commit `4910aafa1a`.
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("get", "/Shows/NextUp", "v12.0-rc7"),
-    ("get", "/Artists", "v12.0-rc7"),
-    ("get", "/Artists/AlbumArtists", "v12.0-rc7"),
-    ("get", "/Genres", "v12.0-rc7"),
-    ("get", "/MusicGenres", "v12.0-rc7"),
-    ("get", "/Studios", "v12.0-rc7"),
     ("get", "/UserItems/Resume", "v12.0-rc7"),
 ];
 
@@ -914,7 +909,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery, \
                project_query_result) → ferrofin-core item_repository.rs get_artists \
                (item_values_with_counts, item_counts_by_clean_name)",
-        date: "2026-09-03",
+        date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
     },
     Verified {
@@ -924,7 +919,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetAlbumArtists",
         ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_album_artists (item_values_with_counts)",
-        date: "2026-09-03",
+        date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
     },
     Verified {
@@ -935,7 +930,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
                get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-10-16",
+        date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
     },
     Verified {
@@ -945,7 +940,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetMusicGenres",
         ferrofin: "handlers/music_genres.rs get_music_genres → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-09-03",
+        date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
     },
     Verified {
@@ -955,7 +950,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetStudios",
         ferrofin: "handlers/studios.rs get_studios → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_studios (item_values_with_counts)",
-        date: "2026-09-03",
+        date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
     },
     Verified {
@@ -982,16 +977,6 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
-    "/Artists is the performer (ItemValueType.Artist) tab, and its rows are the \
-     MusicArtist items that exist: Jellyfin's ArtistsValidator materializes a MusicArtist \
-     item for every artist name, Ferrofin's scanner only for album artists \
-     (item_persistence_service by_name_type_name), so a performer credited on tracks alone \
-     is listed by v12 and not here on a Ferrofin-scanned library (an adopted Jellyfin \
-     library has the rows). Un-defer path: materialize MusicArtist rows for \
-     Artist-typed values in save_item_values, sharing the AlbumArtist row by CleanName.",
-    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
-     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
-     alternate-version / owned-item exclusion is.",
     "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
      (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
      append_by_name_filters.",
@@ -1020,9 +1005,6 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
-    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
-     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
-     alternate-version / owned-item exclusion is.",
     "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
      (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
      append_by_name_filters.",

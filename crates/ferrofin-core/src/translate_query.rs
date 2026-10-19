@@ -603,16 +603,22 @@ fn append_max_parental_rating(
     let Some((score, subscore)) = limit else {
         return;
     };
-    qb.push(format!(
-        r#" AND (({alias}."InheritedParentalRatingValue" IS NOT NULL AND "#
-    ));
+    // v12.2 `BuildMaxParentalRatingFilter` (`QueryBuilding.cs:663-689`): the
+    // item's own rating, where it has one, is within the limit, AND a container
+    // is only as visible as its members — an item with Manual links needs one
+    // member within the limit. Only a Manual link makes an item a container,
+    // so alternate-version links never gate a video.
+    let manual = i32::from(LinkedChildType::Manual);
+    qb.push(" AND (");
     push_rating_limit(qb, alias, score, subscore);
-    qb.push(format!(r#") OR ({alias}."InheritedParentalRatingValue" IS NULL AND
-        (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc WHERE lc."ParentId" = {alias}."Id")
+    qb.push(format!(
+        r#" AND (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc
+            WHERE lc."ParentId" = {alias}."Id" AND lc."ChildType" = {manual})
         OR EXISTS (SELECT 1 FROM "LinkedChildren" lc JOIN "BaseItems" rated ON rated."Id" = lc."ChildId"
-        WHERE lc."ParentId" = {alias}."Id" AND "#));
+        WHERE lc."ParentId" = {alias}."Id" AND lc."ChildType" = {manual} AND "#
+    ));
     push_rating_limit(qb, "rated", score, subscore);
-    qb.push("))))");
+    qb.push(")))");
 }
 
 fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, subscore: i64) {
