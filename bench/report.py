@@ -25,9 +25,11 @@ run-to-run noise from a tail that is genuinely long. Nor was it a busy host: an 
 often than the working one — 54 % against 45 %. Read the range and decide.
 Both renderers print, per cell, how it compares with the oracle as `X.Y× faster`
 (memory says lighter), computed from the printed numbers so a reader can check it; the
-viewer adds, with a baseline run chosen, each server's change against an earlier run of
-itself (the before/after of a code change). A comparison drawn from a flagged number is
-shown in amber italics rather than green. Missing phases are named.
+viewer adds, with baseline runs chosen, each server's change against the median of those
+earlier runs of itself (the before/after of a code change), coloured only beyond the
+thresholds in gate.toml. A comparison drawn from a flagged number is shown in amber
+italics rather than green; a missing or different oracle caveats only the oracle
+comparison, never the change against the baseline. Missing phases are named.
 """
 
 import csv
@@ -43,7 +45,9 @@ import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
+#: The thresholds a baseline delta must cross, relative and absolute, before it is
+#: coloured (`delta_html`). One file, changed only by reviewed commit.
+GATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.toml")
 ORACLE = "jellyfin"
 ORACLE_LABEL = "Jellyfin reference"
 SERVERS = [("jellyfin", "Jellyfin"), ("ferrofin", "Ferrofin")]
@@ -405,18 +409,31 @@ def mem_numbers(d):
 class Cell:
     """A number across runs, the range they spanned, and the comparability verdict.
     `vals` are per-run values (None = missing); `flag` is the reason it is not
-    publishable, if any."""
+    publishable, if any. `own_flag` is the part of `flag` about this server's own
+    evidence; the rest (the `oracle_flag` argument) only says it cannot be set beside the oracle, so it
+    caveats the oracle ratio and never a delta against the same server's baseline."""
 
-    def __init__(self, vals, fmt, flag=None, sub=None, unit="ms", context=False):
+    def __init__(self, vals, fmt, flag=None, sub=None, unit="ms", context=False, oracle_flag=None):
         vals = list(vals)
         #: how many runs were selected, whether or not each produced this number
         self.runs = len(vals)
         self.vals = [v for v in vals if number(v)]
         self.fmt = fmt
-        self.flag = flag or ("missing or invalid samples in selected runs" if len(self.vals) != self.runs else None)
+        self.own_flag = flag or ("missing or invalid samples in selected runs" if len(self.vals) != self.runs else None)
+        self.flag = reasons(self.own_flag, oracle_flag)
         self.sub = sub or {}  # extra per-run series, e.g. p95/p99/err for latency
         self.unit = unit
         self.context = context  # describes the run's conditions, not the server: no ratio, no delta
+        #: the gate.toml row a baseline delta is judged by, and the cell's own key there
+        self.gate = self.key = None
+        #: the responses behind the cell (`work_of`); a baseline that did other work is not like for like
+        self.work = None
+
+    def caveat(self, reason, oracle=False):
+        """Add a reason to `flag`; an oracle-only one leaves `own_flag` alone."""
+        if not oracle:
+            self.own_flag = reasons(self.own_flag, reason)
+        self.flag = reasons(self.flag, reason)
 
     @property
     def median(self):
@@ -570,13 +587,35 @@ def window_problem(x):
     return None
 
 
-def latency_cell(per_run, flag, fmt=sig3):
-    flag = reasons(flag, *(latency_problem(x) for x in per_run))
-    return Cell([x.get("p50") if x else None for x in per_run], fmt, flag, {
+def latency_cell(per_run, flags, fmt=sig3):
+    """`flags` is `(own, oracle)`, as `build`'s `flag()` returns them."""
+    own, oracle = flags
+    own = reasons(own, *(latency_problem(x) for x in per_run))
+    return Cell([x.get("p50") if x else None for x in per_run], fmt, own, {
         "p95": Cell([x.get("p95") if x else None for x in per_run], fmt),
         "p99": Cell([x.get("p99") if x else None for x in per_run], fmt),
         "err": max(((1 - x["ok"]) * 100 for x in per_run if x and number(x.get("ok")) and x["ok"] <= 1), default=0.0),
-    })
+    }, oracle_flag=oracle)
+
+
+def work_of(shapes, names):
+    """The statuses and record counts each request behind a cell returned, pooled over the
+    runs so run sets of any size compare. A request some run has no shape record of is
+    left out: unknown work is not different work."""
+    return {n: [sorted(set().union(*(s[n][f] for s in shapes)), key=str) for f in ("status", "count", "total")]
+            for n in names if all(s is not None and n in s for s in shapes)}
+
+
+def other_work(c, base):
+    """Whether the shape pass shows the server answering a request behind the cell
+    differently than in the baseline."""
+    return any(base.work[n] != w for n, w in (c.work or {}).items() if n in (base.work or {}))
+
+
+def gated(cell, gate, key, work=None):
+    """`cell` with the gate.toml row and per-cell key its baseline delta is judged by."""
+    cell.gate, cell.key, cell.work = gate, key, work
+    return cell
 
 
 # Missing legacy fields may agree with other legacy runs, but not with known values.
@@ -711,36 +750,44 @@ def build(runs):
                 for name in shape or {}:
                     names_of[name.split(":")[0]].add(name)
         def flag(k, names):
-            problems = []
+            """`(own, oracle)`: what is wrong with server `k`'s own evidence, and what only
+            stops it being set beside the oracle. A missing or different oracle caveats the
+            oracle ratio, never a delta against `k`'s own baseline."""
+            own, oracle = [], []
             for i, x in enumerate(data[k]):
-                problems.append(window_problem(x))
+                own.append(window_problem(x))
                 for server in {k, ORACLE} & per.keys():
-                    problems.append(isolation_problem(per[server][i], metas[i], ["shape", f"warmup-{level}", level]))
-                    problems.append(phase_problem(per[server][i], metas[i], ["startup", "startup-drain", "shape", f"drain-{level}", f"warmup-{level}", level]))
+                    side = own if server == k else oracle
+                    side.append(isolation_problem(per[server][i], metas[i], ["shape", f"warmup-{level}", level]))
+                    side.append(phase_problem(per[server][i], metas[i], ["startup", "startup-drain", "shape", f"drain-{level}", f"warmup-{level}", level]))
                 for server in {k, ORACLE} & evidence.keys():
-                    problems.append(evidence[server][i][0])
+                    side = own if server == k else oracle
+                    side.append(evidence[server][i][0])
                     for name in names:
                         scr = name.split(":")[0]
-                        problems.append(observed[server][i].get(scr))
+                        side.append(observed[server][i].get(scr))
                         if scr == "image":
-                            problems.extend(observed[server][i].values())
+                            side.extend(observed[server][i].values())
                     for rec in evidence[server][i][1].values():
                         if not rec.get("ok") and any(n.startswith(rec.get("screen", "") + ":") or n == "image" for n in names):
-                            problems.append("shape dependency failed")
-                problems.append(oracle_failed(oracle_shapes[i], names, oracle_label) if k == ORACLE else
-                                comparable(shapes[k][i], oracle_shapes[i], names, oracle_label))
-                if k != ORACLE:
-                    problems.append(window_problem(data.get(ORACLE, [None] * len(runs))[i]))
+                            side.append("shape dependency failed")
+                if k == ORACLE:
+                    own.append(oracle_failed(oracle_shapes[i], names, oracle_label))
+                else:
+                    oracle.append(comparable(shapes[k][i], oracle_shapes[i], names, oracle_label))
+                    oracle.append(window_problem(data.get(ORACLE, [None] * len(runs))[i]))
                 # Inventory is diagnostic only. Request-level counts and shapes above
                 # determine whether a latency cell represents comparable work.
-            return reasons(*problems)
+            return reasons(*own), reasons(*oracle)
 
         # Legacy logs do not associate poster observations with a screen. Keep their
         # image verdict separate; the bounded-slot producer will supply that identity.
-        screens = [(scr, {k: latency_cell([x["screens"].get(scr) if x else None for x in data[k]], flag(k, sorted(names_of[scr])), n0)
+        screens = [(scr, {k: gated(latency_cell([x["screens"].get(scr) if x else None for x in data[k]], flag(k, sorted(names_of[scr])), n0),
+                                   "screens", f"{level}/screens/{scr}", work_of(shapes[k], sorted(names_of[scr])))
                           for k, _ in servers}) for scr in SCREENS]
         names = [n for scr in SCREENS for n in sorted(names_of[scr])] + (["image"] if "image" in names_of else [])
-        endpoints = [(n, {k: latency_cell([x["endpoints"].get(n) if x else None for x in data[k]], flag(k, [n]))
+        endpoints = [(n, {k: gated(latency_cell([x["endpoints"].get(n) if x else None for x in data[k]], flag(k, [n])),
+                                   "endpoints", f"{level}/endpoints/{n}", work_of(shapes[k], [n]))
                           for k, _ in servers}) for n in names]
         # A level no run executed (an older run, or `--only`) is dropped rather than
         # rendered as an empty section by whichever renderer forgets to check. A level
@@ -772,10 +819,10 @@ def build(runs):
         streams[k] = ts
         for group, cell, phase_name in (("runs", cold[k], "coldstart"), ("hls", hls[k], "ttfs"), ("direct", direct[k], "ttfs")):
             for i, d in enumerate(ds):
-                cell.flag = reasons(cell.flag, phase_problem(d, metas[i], ["startup", "startup-drain", phase_name]),
-                                    isolation_problem(d, metas[i], [phase_name]))
+                cell.caveat(reasons(phase_problem(d, metas[i], ["startup", "startup-drain", phase_name]),
+                                    isolation_problem(d, metas[i], [phase_name])))
                 if group != "runs":
-                    cell.flag = reasons(cell.flag, streaming_problem(ts[i], metas[i], group))
+                    cell.caveat(streaming_problem(ts[i], metas[i], group))
     if ORACLE in streams:
         for k, docs in streams.items():
             for i, doc in enumerate(docs):
@@ -783,14 +830,14 @@ def build(runs):
                 expected = (streams[ORACLE][i] or {}).get("hls", [])
                 for j, rep in enumerate(reps):
                     if j >= len(expected):
-                        hls[k].flag = reasons(hls[k].flag, "missing oracle transcode repetition")
+                        hls[k].caveat("missing oracle transcode repetition", oracle=True)
                         continue
                     if transcode_parameters(rep) != transcode_parameters(expected[j]):
-                        hls[k].flag = reasons(hls[k].flag, f"transcode parameters differ (run {i+1}, rep {j+1})")
+                        hls[k].caveat(f"transcode parameters differ (run {i+1}, rep {j+1})", oracle=True)
                     if metas[i].get("streaming_validation") and rep.get("output") != expected[j].get("output"):
-                        hls[k].flag = reasons(hls[k].flag, f"first-segment properties differ (run {i+1}, rep {j+1})")
+                        hls[k].caveat(f"first-segment properties differ (run {i+1}, rep {j+1})", oracle=True)
                     if reps and (transcode_parameters(rep) != transcode_parameters(reps[0]) or rep.get("output") != reps[0].get("output")):
-                        hls[k].flag = reasons(hls[k].flag, "transcode work differs between repetitions")
+                        hls[k].caveat("transcode work differs between repetitions")
     m["ttfs"] = [("cold start (restart → authenticated views; host caches retained)", cold), ("HLS first segment (forced transcode)", hls), ("direct-play TTFB (1 MiB range)", direct)]
 
     m["phases"] = {k: [load(os.path.join(d, "phases.json")) for d in ds] for k, ds in per.items()}
@@ -815,13 +862,13 @@ def build(runs):
         resource_bad += [r.get("error") for i, windows in enumerate(m["resources"][k]) if metas[i].get("resource_schema") for r in windows.values()]
         memory_flags[k] = reasons(mixed, *bad, *resource_bad)
         # the peak is only meaningful if the loaded window that produced it was the specified load
-        peak[k] = Cell([(x or {}).get("peak") for x in mems[k]], mib,
-                       memory_flags[k],
-                       unit="MiB")
+        peak[k] = gated(Cell([(x or {}).get("peak") for x in mems[k]], mib, memory_flags[k], unit="MiB"),
+                        "memory", "memory/peak under load")
     pct = lambda v: f"{v * 100:.0f}%"
     m["memory"] = [
         ("peak under load", peak),
-        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, memory_flags[k], unit="MiB")
+        ("steady idle", {k: gated(Cell([(x or {}).get("steady") for x in mems[k]], mib, memory_flags[k], unit="MiB"),
+                                  "memory", "memory/steady idle")
                          for k, _ in servers}),
         # interference and swap describe the host while that server ran, not the server
         ("interference on the server's cores, p95", {k: Cell([(x or {}).get("interference_p95") for x in mems[k]], pct, unit="%", context=True) for k, _ in servers}),
@@ -1373,20 +1420,53 @@ def comparable_levels(m, base):
     return base is None or not incompatible(m["runs"] + base["runs"], compare_builds=True)
 
 
-def delta_html(c, base):
-    """Change against the same server in the baseline run; lower is better for every non-context
-    number. Only when both numbers stand (a flagged cell is not a valid number to move from or to)."""
+def load_gate(path=GATE_PATH):
+    """The gate.toml thresholds: one row per kind of cell (`screens`, `endpoints`,
+    `memory`), each `relative_pct` and `absolute` (in the cell's unit), and optional
+    per-cell bands under `[cells."<Cell.key>"]` from the A/A noise table."""
+    import tomllib  # Python 3.11+, needed only with a baseline
+    try:
+        with open(path, "rb") as f:
+            gate = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"gate thresholds unreadable: {error}") from error
+    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory")},
+            **{f"cells.{k}": v for k, v in (gate.get("cells") or {}).items()}}
+    for name, row in rows.items():
+        if not isinstance(row, dict) or not all(number(row.get(f)) for f in ("relative_pct", "absolute")):
+            raise ValueError(f"gate thresholds unreadable: {path}: [{name}] needs relative_pct and absolute")
+    return gate
+
+
+def delta_html(c, base, gate=None):
+    """Change against the same server's baseline (the median of its runs); lower is better
+    for every non-context number. Coloured only when it crosses both the relative and the
+    absolute threshold: the cell's own noise band where gate.toml records one, else its
+    kind's row; a kind with no row is shown uncoloured. Amber when either side's own
+    evidence is flagged (failed requests included) or the responses behind the cell
+    (status, record counts) differ from the baseline's — that is other work, not a speed
+    change. An oracle-only flag does not touch it: it compares the server with itself."""
     if c.context or base is None or not c.median or not base.median:
         return ""
-    ch = (c.median - base.median) / base.median * 100
-    if c.flag or base.flag:
-        cls = "provisional"
+    diff = c.median - base.median
+    ch = diff / base.median * 100
+    caveat = reasons(c.own_flag, base.own_flag, "responses differ from the baseline's" if other_work(c, base) else None)
+    gate = gate or {}
+    band = (gate.get("cells", {}).get(c.key) or gate.get(c.gate)) if c.gate else None
+    title = f"vs baseline {base.fmt(base.median)} (median of {base.runs} run{'s' if base.runs != 1 else ''})"
+    cls = ""
+    if caveat:
+        cls, title = "provisional", f"{title} — not like for like: {caveat}"
+    elif band:
+        if abs(ch) > band["relative_pct"] and abs(diff) > band["absolute"]:
+            cls = "good" if diff < 0 else "bad"
+        title += f" — coloured beyond {band['relative_pct']}% and {band['absolute']} {c.unit}"
     else:
-        cls = "good" if ch < -DELTA_NOISE_PCT else "bad" if ch > DELTA_NOISE_PCT else ""
-    return f"<span class='delta {cls}' title='vs baseline {base.fmt(base.median)}'>{ch:+.0f}%</span>"
+        title += " — no gate threshold for this row"
+    return f"<span class='delta {cls}' title='{html.escape(title)}'>{ch:+.0f}%</span>"
 
 
-def td_html(c, oracle_cell, base, notes, source=None, oracle_label=ORACLE_LABEL):
+def td_html(c, oracle_cell, base, notes, source=None, oracle_label=ORACLE_LABEL, gate=None):
     """One table cell: the numbers, then markers. The spread lands in the hover text
     and the comparability reason in a numbered note, because inline they made a
     three-server table unreadable."""
@@ -1404,7 +1484,7 @@ def td_html(c, oracle_cell, base, notes, source=None, oracle_label=ORACLE_LABEL)
         body += " <span class='tail'>/</span> " + one(part, "tail")
     if c.sub.get("err", 0) > 0:
         body += f" <span class='err'>{c.sub['err']:.2f}% err</span>"
-    body += ratio_html(c, oracle_cell, oracle_label) + delta_html(c, base)
+    body += ratio_html(c, oracle_cell, oracle_label) + delta_html(c, base, gate)
     cls = "num"
     if c.flag:
         cls += " flagged"
@@ -1429,7 +1509,7 @@ def notes_html(notes):
     return f"<h2>Notes</h2><ol class='notes'>{lis}</ol>"
 
 
-def table_html(first, rows, servers, base_rows, notes, where=""):
+def table_html(first, rows, servers, base_rows, notes, where="", gate=None):
     e = html.escape
     head = "".join(f"<th class='{k}'>{e(lbl)}</th>" for k, lbl in servers)
     body = []
@@ -1437,7 +1517,7 @@ def table_html(first, rows, servers, base_rows, notes, where=""):
         bcells = base_rows.get(name, {}) if base_rows else {}
         tds = "".join(td_html(cells[k], cells.get(ORACLE) if k != ORACLE else None, bcells.get(k), notes,
                               f"{lbl} · {name}" + (f" ({where})" if where else ""),
-                              oracle_label=dict(servers).get(ORACLE, ORACLE_LABEL))
+                              oracle_label=dict(servers).get(ORACLE, ORACLE_LABEL), gate=gate)
                       for k, lbl in servers)
         body.append(f"<tr><th>{e(name)}</th>{tds}</tr>")
     return f"<div class='scroll'><table><thead><tr><th>{e(first)}</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
@@ -1460,10 +1540,20 @@ def prewalk_notes(m, notes):
                     notes.add(cells[k].flag, f"{lbl} · {name} ({label})")
 
 
-def render_html(m, base=None, picker=""):
+def run_list(runs, noun):
+    """`3 runs: a, b, c`, escaped for the page."""
+    names = ", ".join(os.path.basename(r.rstrip("/")) for r in runs)
+    return html.escape(f"{len(runs)} {noun}{'s' if len(runs) != 1 else ''}: {names}")
+
+
+def render_html(m, base=None, picker="", gate=None):
+    """The comparison page; `base` is a `build()` of the baseline runs (compared by their
+    median), `gate` the thresholds (gate.toml when a baseline is given and none is)."""
     oracle_label = m["oracle_label"]
     if base and not comparable_levels(m, base):
         raise ValueError("incompatible baseline conditions or oracle build")
+    if base and gate is None:
+        gate = load_gate()
     e = html.escape
     notes = Notes()
     prewalk_notes(m, notes)
@@ -1486,11 +1576,14 @@ def render_html(m, base=None, picker=""):
              "and the superscript points at the reason under Notes. "
              f"<b>X.Y× faster</b> compares the cell with {oracle_label} on the same row (memory says lighter); "
              "on an amber cell it is shown in amber italics, because the two servers did not do identical work. "
-             "A coloured % is the change against the baseline run.</p>",
+             "A % is the change against the baseline (the median of its runs), coloured only beyond the "
+             "noise thresholds in <code>bench/gate.toml</code>, and in amber italics when either side's own "
+             "evidence is flagged or the server answered differently than in the baseline. A missing or "
+             f"different {oracle_label} never caveats it.</p>",
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
              f"{e(str(meta.get('memory_limit', '?')))} limit, no swap · test data {e(str(tc.get('movies', '?')))} movies / {e(str(tc.get('series', '?')))} series / {e(str(tc.get('episodes', '?')))} episodes · "
-             f"windows {e(str(meta.get('window_s', '?')))} s · runs: {e(', '.join(os.path.basename(r.rstrip('/')) for r in m['runs']))}"
-             + (f" · baseline: {e(os.path.basename(base['runs'][0].rstrip('/')))}" if base else "") + "</p>"]
+             f"windows {e(str(meta.get('window_s', '?')))} s · {run_list(m['runs'], 'run')}"
+             + (f" · baseline, median of {run_list(base['runs'], 'run')}" if base else "") + "</p>"]
     # tiles: the four headline numbers
     tiles = []
     for name, cells in m["ttfs"][:2] + m["memory"][:2]:
@@ -1499,7 +1592,7 @@ def render_html(m, base=None, picker=""):
             c = cells[k]
             val = sig3(c.median) if c.median is not None else "—"
             unit = c.unit
-            extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None, oracle_label) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
+            extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None, oracle_label) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k), gate)
             why = ""
             if c.flag:
                 n = notes.add(c.flag, f"{lbl} · {name} (headline)")
@@ -1516,8 +1609,8 @@ def render_html(m, base=None, picker=""):
         parts.append(f"<h2>Screens — {level}, {e(str(lv['rate']))} screens/s</h2>")
         parts.append("<div class='legend'><span>p50 <span style='color:var(--muted)'>/ p95 / p99</span> ms per screen (all of its requests, concurrently)</span>" + ("<span>hover a number for the range its runs spanned</span>" if len(m["runs"]) > 1 else "") + "<span><span class='chip'></span>not comparable — superscript links to the reason</span></div>")
         bl = base_l.get(level, {})
-        parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
-        parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
+        parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens", gate))
+        parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints', gate)}</details>")
         parts.append(image_table(m, level, True))
     parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable. Average cores busy is CPU-seconds divided by observed wall seconds; 1.0 means one core fully occupied. Capacity busy divides that by the allocated logical CPU count. CPU milliseconds per completed screen divides total window CPU by completed mixed-screen iterations, including failed screens; it is not per-endpoint attribution. Lower values mean less CPU work only when completed work and validation agree. Each row retains its individual run; flagged workloads cannot support CPU savings claims. See latency/work flags for differences in executed work.</p>")
     for title, rows in cpu_tables(m):
@@ -1526,14 +1619,14 @@ def render_html(m, base=None, picker=""):
             f"<td class='num{' flagged' if '⚠' in cells[k] else ''}'>{e(cells[k])}</td>" for k, _ in servers) + "</tr>" for label, cells in rows)
         parts.append(f"<h3>{e(title)}</h3><div class='scroll'><table><thead><tr><th>Window / metric</th>{head}</tr></thead><tbody>{body}</tbody></table></div>")
     parts.append(phase_table(m, True))
-    parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
+    parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen", gate))
     mem_note = "" if comparable_levels(m, base) else (
         "<p class='lede'>The baseline ran different load levels, so no change is shown on the "
         "memory rows: <em>peak under load</em> spans a different set of windows and "
         "<em>steady idle</em> follows a different one, which would read as a regression.</p>")
     parts.append(coverage_table(m, True))
     parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>"
-                 + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory"))
+                 + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory", gate))
     if m["work"]:
         parts.append(f"<h2>The work list — divergences from {oracle_label}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
         for k, items in m["work"].items():
@@ -1570,11 +1663,10 @@ def list_runs(runs_dir):
 
 def picker_html(runs, selected, baseline):
     e = html.escape
-    boxes = "".join(f"<label><input type='checkbox' name='run' value='{e(n)}'{' checked' if n in selected else ''}> {e(lbl)}</label>" for n, lbl in runs)
-    opts = "<option value=''>— none —</option>" + "".join(f"<option value='{e(n)}'{' selected' if n == baseline else ''}>{e(n)}</option>" for n, _ in runs)
+    boxes = lambda name, chosen, full: "".join(f"<label><input type='checkbox' name='{name}' value='{e(n)}'{' checked' if n in chosen else ''}> {e(lbl if full else n)}</label>" for n, lbl in runs)
     return (f"<style>{PICKER_CSS}</style><form class='picker' method='get' action='/'><div class='row'>"
-            f"<div class='col'><h3>Runs to render (several = median + ranges)</h3>{boxes or '<i>no runs yet</i>'}</div>"
-            f"<div class='col'><h3>Baseline (change vs this run)</h3><select name='baseline'>{opts}</select><div style='margin-top:10px'><button type='submit'>Compare</button></div></div>"
+            f"<div class='col'><h3>Runs to render (several = median + ranges)</h3>{boxes('run', selected, True) or '<i>no runs yet</i>'}</div>"
+            f"<div class='col'><h3>Baseline (change vs the median of these runs)</h3>{boxes('baseline', baseline, False)}<div style='margin-top:10px'><button type='submit'>Compare</button></div></div>"
             f"</div></form>")
 
 
@@ -1590,13 +1682,13 @@ def serve(port, runs_dir):
             runs = list_runs(runs_dir)
             names = {n for n, _ in runs}
             sel = list(dict.fromkeys(r for r in q.get("run", []) if r in names))
-            base = next((b for b in q.get("baseline", []) if b in names), None)
+            base = list(dict.fromkeys(b for b in q.get("baseline", []) if b in names))
             picker = picker_html(runs, sel, base)
             status = 200
             try:
                 if sel:
                     m = build([os.path.join(runs_dir, r) for r in sel])
-                    body = render_html(m, build([os.path.join(runs_dir, base)]) if base else None, picker)
+                    body = render_html(m, build([os.path.join(runs_dir, b) for b in base]) if base else None, picker)
                 else:
                     body = f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main><h1>Ferrofin benchmark runs</h1>{picker}</main></body></html>"
             except Exception as ex:  # a run still being written, or a malformed file: say which, keep the picker

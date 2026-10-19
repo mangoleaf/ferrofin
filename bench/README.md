@@ -326,13 +326,18 @@ resolved name and the dirty flag are also written into `run.json`, so they survi
 renamed directory. `--out` overrides the whole thing.
 
 The viewer lists every run under `bench/runs`; tick the runs to render (several =
-median + ranges) and optionally a baseline. Cells stay numeric in both renderers: the
+median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the
 median, the range its runs spanned (in brackets in the markdown; under the number in the
 viewer's tiles and on the cell's hover text in its tables), and `⚠[n]` pointing at a
 numbered note. Both also print each cell's speed against the recorded Jellyfin reference as
 `X.Y× faster` (memory says lighter), shown only where both numbers stand; with a
-baseline the viewer adds each server's percentage change against an earlier run of
-itself (green = faster/smaller). Localhost only,
+baseline the viewer adds each server's percentage change against the median of those
+earlier runs of itself, and the page says how many runs each side had. A change is
+coloured (green = faster/smaller) only when it crosses both the relative and the
+absolute threshold for its row in [`gate.toml`](gate.toml), so run-to-run noise stays
+uncoloured. It turns amber only when either side's own evidence is flagged or the server
+answered differently than in the baseline; a run without Jellyfin caveats only the
+Jellyfin comparison. Localhost only,
 stdlib only, no JavaScript.
 
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
