@@ -1203,6 +1203,9 @@ struct ExternalProbe {
 struct ExternalProbeSeam {
     resolvers: Arc<ExternalStreamResolvers>,
     metadata_dir: Option<DirectoryPath>,
+    /// The run's directory listings the resolvers read, which a file the
+    /// scan saves beside an item must be forgotten in.
+    dirs: Option<Arc<DirectoryCache>>,
 }
 
 impl ExternalProbeSeam {
@@ -1388,6 +1391,11 @@ fn extract_embedded_lyrics(
     );
     let saved = crate::lyric_manager::try_save_to_files(&targets, &lyrics)?;
     tracing::debug!(path = %saved.display(), "saved embedded lyrics");
+    // `LyricManager` invalidates the saved path (`LyricManager.cs:455`):
+    // the lookup below then lists its folder again and finds the file.
+    if let Some(dirs) = &seam.dirs {
+        dirs.invalidate(&saved.to_string_lossy());
+    }
     if try_extract {
         let target = seam.resolvers.target_for(path, internal);
         add_external_lyrics(&seam.resolvers, &target, probed);
@@ -8960,6 +8968,7 @@ impl LibraryScanner {
                     ),
                 )),
                 metadata_dir: self.metadata_dir.clone(),
+                dirs: dirs.cloned(),
             }
         })
     }
