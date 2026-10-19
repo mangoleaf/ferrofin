@@ -175,7 +175,8 @@ pub struct NextUpEpisodeBatchResult {
 /// manager's to apply — the repository only reads.
 #[derive(Debug, Clone)]
 pub struct PlaylistAccessColumns {
-    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy or API-key playlist).
+    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy playlist, an older
+    /// build's user-less API-key create, or a `Data` naming no owner).
     pub owner_user_id: Option<String>,
     /// `FerrofinPlaylists.OpenAccess` (`None` only when the meta row is absent).
     pub open_access: Option<i64>,
@@ -288,6 +289,22 @@ pub trait ItemRepository: Send + Sync {
     /// as opposed to what a query returns — has to ask this, or it will treat
     /// every library as visible to everybody.
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The item query whose access settings bound what `user` may see through
+    /// the items behind a name, or `None` when no library, parental rating or
+    /// tag rule hides anything from them.
+    ///
+    /// Port of `PersonsController.BuildAccessFilter` (Jellyfin 12.2): an
+    /// `InternalItemsQuery(user) { IncludeOwnedItems = true }` with the user's
+    /// restrictions resolved and `ConfigureUserAccess` applied, built only when
+    /// `User.HasContentRestrictions()`. Repositories must supply policy
+    /// evaluation; the default fails closed.
+    async fn build_access_filter(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Err(ServiceError::backend("access filtering is not configured"))
+    }
 
     /// Returns the ids of every item whose metadata the user has **locked**
     /// (`IsLocked = 1`).
@@ -782,6 +799,25 @@ pub trait ItemPersistenceService: Send + Sync {
     /// then.
     async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
         let _ = groups;
+        Ok(())
+    }
+
+    /// Writes what a library scan read of the playlists it resolved off disk
+    /// (`PlaylistResolver`): each one's ownership row — owned by nobody,
+    /// open to everyone, as the resolver creates it — when it has none, and
+    /// the members its local reader found, when it ran
+    /// ([`ScannedPlaylist::members`]).
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn sync_scanned_playlists(
+        &self,
+        playlists: &[ScannedPlaylist],
+    ) -> Result<(), ServiceError> {
+        let _ = playlists;
         Ok(())
     }
 
@@ -1435,6 +1471,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// Writes an existing row's rating columns from `item` — `OfficialRating`,
+    /// `UnratedType` and the parental score (`InheritedParentalRatingValue` /
+    /// `…SubValue`) — with its `DateLastSaved` stamp and nothing else, then
+    /// announces `ItemUpdated`. The save behind a box set's or playlist's
+    /// re-rate from its members: a whole-row [`save_items`](Self::save_items)
+    /// of a row read earlier would put back every other column as it was
+    /// read, `Data` (the playlist shares) included. Returns whether the row
+    /// was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let _ = item;
+        Ok(false)
+    }
+
     /// The ids of the rows of `kind` never refreshed (`DateLastRefreshed`
     /// unset), in id order — with `by_name_only`, only those in no library
     /// (no `TopParentId`: an artist known only by name). The persisted
@@ -1777,14 +1832,19 @@ pub trait ItemCountService: Send + Sync {
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError>;
 
-    /// Gets played/total counts from the linked-children of `parent_id`.
+    /// Gets played/total counts of the countable leaves below the links of
+    /// `parent_id` (a box set or playlist), following linked folders down
+    /// (`GetPlayedAndTotalCountFromLinkedChildren`).
     async fn get_played_and_total_count_from_linked_children(
         &self,
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError>;
 
-    /// Batch-fetches played/total counts for several folders.
+    /// Batch-fetches played/total counts for several folders. A folder whose
+    /// counts are 0/0 has no entry (`GetPlayedAndTotalCountBatch`): the DTO
+    /// fill counts it per item (`Folder.FillUserDataDtoValues`), while the
+    /// `IsPlayed` filter reads a missing entry as 0/0 (`UserViewBuilder.Filter`).
     async fn get_played_and_total_count_batch(
         &self,
         folder_ids: &[Uuid],
@@ -2094,6 +2154,38 @@ pub struct LocalVersionGroup {
     /// The versions the scan took out of the group: owned by the primary
     /// before the scan's save, and no longer.
     pub released: Vec<Uuid>,
+}
+
+/// One playlist a library scan resolved off disk
+/// ([`ItemPersistenceService::sync_scanned_playlists`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScannedPlaylist {
+    /// The playlist.
+    pub id: Uuid,
+    /// The members its local reader returned, in order — `None` when no
+    /// reader ran or none had anything to say (`HasMetadata` false), which
+    /// leaves the stored members alone. Entries that resolve to no stored
+    /// item are dropped.
+    pub members: Option<Vec<PlaylistMember>>,
+    /// Whether `members` are a playlist file's entries
+    /// (`PlaylistItemsProvider`), which count only when one of them names a
+    /// stored item; a `playlist.xml`'s count whatever they name.
+    pub from_file: bool,
+    /// Whether `members` replace the stored ones, or come first with the
+    /// stored ones not among them appended (`PlaylistMetadataService.
+    /// MergeData` with `replaceData` false).
+    pub replace: bool,
+}
+
+/// One entry a playlist's local reader returned — the C# `LinkedChild`: an
+/// item id, a path, or both (the path wins when it names a stored item).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistMember {
+    /// The item's id (`playlist.xml`'s `<ItemId>`), the fallback when its
+    /// path names no stored item.
+    pub item_id: Option<Uuid>,
+    /// The item's path, resolved as `LibraryManager.FindByPath` does.
+    pub path: Option<String>,
 }
 
 /// One stored item to move to a new identity

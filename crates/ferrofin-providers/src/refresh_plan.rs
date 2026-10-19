@@ -105,9 +105,7 @@ pub enum LocalMetadataFormat {
     Nfo,
     /// A Jellyfin `.xml` (`BaseXmlProvider`). Upstream's XML readers serve
     /// box sets and playlists only (`BoxSetXmlProvider`,
-    /// `PlaylistXmlProvider`), which the library scan does not resolve, so
-    /// the scan never passes one; the arm is ported for their refresh.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `PlaylistXmlProvider`); the library scan passes a playlist's.
     Xml,
     /// A book's Comic/OPF sidecar or `.cbz` file (`ComicProvider.HasChanged`,
     /// `OpfProvider.HasChanged`): newer than the last save, with no tolerance.
@@ -377,6 +375,18 @@ fn local_metadata_changed(stored: &StoredState, fs: &FileFacts) -> bool {
     stored
         .date_last_saved
         .is_none_or(|saved| file.mtime - saved > TimeDelta::milliseconds(tolerance))
+}
+
+/// Upstream's `isFullRefresh` (`MetadataService.cs:150`): `isFirstRefresh ||
+/// ReplaceAllMetadata || FullRefresh || requiresRefresh || ForceSave` — the
+/// gate `UpdateMetadataFromChildren` derives a folder's metadata past.
+#[must_use]
+pub fn full_refresh(plan: &ItemRefreshPlan, request: &RefreshRequest<'_>) -> bool {
+    plan.is_first_refresh
+        || plan.requires_refresh
+        || request.options.replace_all_metadata
+        || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+        || request.force_save
 }
 
 /// Decides which providers run for one item.

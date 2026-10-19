@@ -17,13 +17,15 @@ use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
-use crate::handlers::streaming::{serve_static_file, serve_static_source, static_source};
+use crate::handlers::streaming::{serve_static_file, static_or_transcode};
 use crate::state::AppState;
 
-/// `GET`/`HEAD /Videos/{itemId}/stream` — serve the item's video file.
+/// `GET`/`HEAD /Videos/{itemId}/stream` — stream the requested video source.
 ///
-/// Port of `VideosController.GetVideoStream` (direct-stream path only). Range
-/// requests yield `206 Partial Content`; `HEAD` returns headers only.
+/// Port of `VideosController.GetVideoStream`: `Static=true` serves the version
+/// or open live stream the request names ([`static_or_transcode`]); a disc
+/// folder, and anything else, is transcoded. Range requests yield `206 Partial
+/// Content`; `HEAD` returns headers only.
 async fn get_video_stream(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
@@ -34,11 +36,7 @@ async fn get_video_stream(
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
     crate::handlers::hls::validate_stream_request(&req)?;
-    if req.is_static {
-        let source = static_source(&state, item_id).await?;
-        return serve_static_source(source, request).await;
-    }
-    crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request).await
+    static_or_transcode(&state, item_id, false, req, request).await
 }
 
 /// The extension route has the same Static=false default as the bare route.
@@ -59,11 +57,7 @@ async fn get_video_stream_by_container(
             .to_owned(),
     );
     crate::handlers::hls::validate_stream_request(&req)?;
-    if req.is_static {
-        let source = static_source(&state, item_id).await?;
-        return serve_static_source(source, request).await;
-    }
-    crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request).await
+    static_or_transcode(&state, item_id, false, req, request).await
 }
 
 /// Query parameters for `GET /Videos/{itemId}/AdditionalParts`.

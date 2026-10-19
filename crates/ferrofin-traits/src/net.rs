@@ -42,7 +42,8 @@ pub struct RequestContext {
     pub headers: Vec<(String, String)>,
 
     /// The raw query string (without the leading `?`), if any. Jellyfin also
-    /// accepts the access token via the `api_key`/`ApiKey` query parameter.
+    /// accepts the access token via the `ApiKey` query parameter (`api_key`
+    /// only with `EnableLegacyAuthorization`).
     pub query_string: Option<String>,
 
     /// The remote endpoint (client IP, possibly with port) as a string, if

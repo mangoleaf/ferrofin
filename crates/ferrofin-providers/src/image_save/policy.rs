@@ -42,7 +42,9 @@ fn containing_folder(item: &BaseItemEntity) -> Option<&Path> {
         .unwrap_or_default();
     let disc = matches!(data["VideoType"].as_str(), Some("Dvd" | "BluRay"))
         && data["IsPlaceHolder"].as_bool() != Some(true);
-    if item.is_folder || disc {
+    // `Genre.cs:26`, `MusicGenre.cs:35`: `ContainingFolderPath => Path`.
+    let by_name = matches!(short_kind(item), "Genre" | "MusicGenre");
+    if item.is_folder || disc || by_name {
         Some(path)
     } else {
         path.parent()
@@ -326,6 +328,26 @@ mod tests {
             ),
             vec![PathBuf::from("/music/Album/cdart.png")]
         );
+    }
+    /// A genre's and a music genre's `ContainingFolderPath` is their own path,
+    /// though neither is a folder, so each keeps its own artwork.
+    #[test]
+    fn genres_save_inside_their_own_path() {
+        for kind in ["Genre", "MusicGenre"] {
+            let genre = row(kind, "/meta/Genre/Crime", false);
+            assert_eq!(
+                destination(&genre, ImageSavingConvention::Legacy, ImageType::Primary),
+                vec![PathBuf::from("/meta/Genre/Crime/folder.png")]
+            );
+            assert_eq!(
+                destination(
+                    &genre,
+                    ImageSavingConvention::Compatible,
+                    ImageType::Primary
+                ),
+                vec![PathBuf::from("/meta/Genre/Crime/poster.png")]
+            );
+        }
     }
     #[test]
     fn episodes_mixed_folders_and_discs_use_the_media_path() {

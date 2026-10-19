@@ -22,6 +22,7 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{MediaSourceInfo, MediaSourceType};
+use ferrofin_model::entities::VideoType;
 use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
 use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use ferrofin_model::providers::RemoteSubtitleInfo;
@@ -227,10 +228,39 @@ impl UserManager for OkUsers {
 }
 
 /// A [`MediaSourceManager`] that serves a static source for a temp file.
+#[derive(Default)]
 struct StreamSources {
     /// The on-disk path the static source points at.
     path: String,
+    /// A second version's path, listed under [`ALT_ID`] after the item's own.
+    alternate: Option<String>,
+    /// The path of the live stream open under [`LIVE_STREAM_ID`], if any.
+    live: Option<String>,
+    /// Whether the item's own source is a Blu-ray folder rip.
+    disc: bool,
+    /// The HTTP URL the item's own source is read from instead of its path
+    /// (an in-progress recording's `EncoderPath`), if any.
+    encoder: Option<String>,
 }
+
+impl StreamSources {
+    /// A single-version item read from `path`, with no live stream open.
+    fn at(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The id of the item's second version, when [`StreamSources`] has one.
+const ALT_ID: Uuid = Uuid::from_u128(0x00A1_00A1);
+
+/// The `User-Agent` the open live stream's tuner requires.
+const TUNER_AGENT: &str = "TunerAgent/1.0";
+
+/// The id the open live stream of [`StreamSources`] is known by.
+const LIVE_STREAM_ID: &str = "prov_service_live-1";
 
 fn static_source(path: &str) -> MediaSourceInfo {
     MediaSourceInfo {
@@ -270,7 +300,14 @@ impl MediaSourceManager for StreamSources {
         _allow_media_probe: bool,
         _enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        Ok(vec![static_source(&self.path)])
+        let mut sources = vec![static_source(&self.path)];
+        if let Some(alternate) = &self.alternate {
+            sources.push(MediaSourceInfo {
+                id: Some(ALT_ID.to_string()),
+                ..static_source(alternate)
+            });
+        }
+        Ok(sources)
     }
     async fn get_static_media_sources(
         &self,
@@ -278,7 +315,19 @@ impl MediaSourceManager for StreamSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        Ok(vec![static_source(&self.path)])
+        let mut sources = vec![MediaSourceInfo {
+            video_type: self.disc.then_some(VideoType::BluRay),
+            encoder_protocol: self.encoder.as_ref().map(|_| MediaProtocol::Http),
+            encoder_path: self.encoder.clone(),
+            ..static_source(&self.path)
+        }];
+        if let Some(alternate) = &self.alternate {
+            sources.push(MediaSourceInfo {
+                id: Some(ALT_ID.to_string()),
+                ..static_source(alternate)
+            });
+        }
+        Ok(sources)
     }
     async fn open_live_stream(
         &self,
@@ -286,8 +335,15 @@ impl MediaSourceManager for StreamSources {
     ) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
     }
-    async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
-        unimplemented!()
+    async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
+        match &self.live {
+            Some(path) if id == LIVE_STREAM_ID => Ok(MediaSourceInfo {
+                live_stream_id: Some(LIVE_STREAM_ID.to_owned()),
+                required_http_headers: [("User-Agent".to_owned(), TUNER_AGENT.to_owned())].into(),
+                ..static_source(path)
+            }),
+            _ => Err(ServiceError::NotFound(format!("live stream {id}"))),
+        }
     }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!()
@@ -552,7 +608,7 @@ struct Harness {
 /// The ordinary-user harness.
 fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
     state_with(
-        path,
+        StreamSources::at(path),
         subtitles,
         false,
         Arc::new(ferrofin_api::test_support::FakeDto),
@@ -565,17 +621,17 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
 /// `DELETE /Videos/{itemId}/Subtitles/{index}`.
 fn elevated_state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
     state_with(
-        path,
+        StreamSources::at(path),
         subtitles,
         true,
         Arc::new(ferrofin_api::test_support::FakeDto),
     )
 }
 
-/// Builds a [`Harness`] serving `path` for streams and using `subtitles` for the
-/// subtitle routes.
+/// Builds a [`Harness`] serving `sources` for streams and using `subtitles` for
+/// the subtitle routes.
 fn state_with(
-    path: &str,
+    sources: StreamSources,
     subtitles: Arc<dyn SubtitleManager>,
     elevated: bool,
     dto: Arc<dyn ferrofin_traits::dto::DtoService>,
@@ -592,9 +648,7 @@ fn state_with(
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
-        Arc::new(StreamSources {
-            path: path.to_owned(),
-        }),
+        Arc::new(sources),
         Arc::new(FakeSessions),
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
@@ -881,6 +935,193 @@ async fn a_static_stream_of_another_protocol_is_refused_and_a_dead_origin_fails(
     assert_eq!(down.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
+/// The status and body `GET uri` answers with.
+async fn get_body(router: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = router.clone().oneshot(authed("GET", uri)).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// `StreamingHelpers.GetStreamingState`: a direct-play request plays the
+/// version its `mediaSourceId` names (jellyfin-web puts it on every
+/// `stream.{container}?Static=true` URL), in either GUID spelling. The item's
+/// own id, or none, is its first version; an id naming no version is `404`,
+/// never the wrong file. Video, audio and universal audio all select alike.
+#[tokio::test]
+async fn a_static_stream_plays_the_version_its_media_source_id_names() {
+    let primary = TempMedia::new(b"primary");
+    let alternate = TempMedia::new(b"alternate");
+    let sources = StreamSources {
+        alternate: Some(alternate.path.clone()),
+        ..StreamSources::at(&primary.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let unknown = Uuid::from_u128(0xDEAD);
+    for route in [
+        format!("/Videos/{ITEM_ID}/stream?static=true"),
+        format!("/Videos/{ITEM_ID}/stream.mkv?Static=true"),
+        format!("/Audio/{ITEM_ID}/stream.mp3?static=true"),
+        format!("/Audio/{ITEM_ID}/universal?deviceId=d1"),
+    ] {
+        for (media_source_id, expected) in [
+            (ALT_ID.simple().to_string(), Some(&b"alternate"[..])),
+            (ALT_ID.to_string(), Some(&b"alternate"[..])),
+            (ITEM_ID.simple().to_string(), Some(&b"primary"[..])),
+            (String::new(), Some(&b"primary"[..])),
+            (unknown.simple().to_string(), None),
+        ] {
+            let uri = format!("{route}&mediaSourceId={media_source_id}");
+            let (status, body) = get_body(&router, &uri).await;
+            match expected {
+                Some(expected) => {
+                    assert_eq!(status, StatusCode::OK, "{uri}");
+                    assert_eq!(body, expected, "{uri}");
+                }
+                None => assert_eq!(status, StatusCode::NOT_FOUND, "{uri}"),
+            }
+        }
+    }
+}
+
+/// An origin on a loopback port that answers with the `User-Agent` it was sent
+/// (empty when none), and returns its URL: what a relay sent, and that it was
+/// this origin it read.
+async fn agent_origin() -> String {
+    let app = axum::Router::new().route(
+        "/live.ts",
+        axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            headers
+                .get(header::USER_AGENT)
+                .map(|agent| agent.as_bytes().to_vec())
+                .unwrap_or_default()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}/live.ts")
+}
+
+/// The `User-Agent` the relay names the server with when a source requires
+/// none (`NamedClient.Default`).
+const SERVER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+
+/// `GetStaticRemoteStreamResult`: a remote target that requires no
+/// `User-Agent` is relayed under the server's own, never with none at all
+/// (origins commonly refuse an agentless request).
+#[tokio::test]
+async fn a_static_remote_stream_names_the_server_when_no_agent_is_required() {
+    let url = agent_origin().await;
+    let (status, body) = get_body(
+        &create_router(state(&url, no_subtitles()).app),
+        &format!("/Videos/{ITEM_ID}/stream?static=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, SERVER_AGENT.as_bytes());
+}
+
+/// `EncodingHelper.AttachMediaSourceInfo`: a source naming an encoder path (an
+/// in-progress recording's `LiveRecordings` URL, which follows the file as it
+/// grows) is read from it, not from the partial file on disk.
+#[tokio::test]
+async fn a_static_stream_is_read_from_the_encoder_path_its_source_names() {
+    let partial = TempMedia::new(b"recorded so far");
+    let sources = StreamSources {
+        encoder: Some(agent_origin().await),
+        ..StreamSources::at(&partial.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let (status, body) = get_body(&router, &format!("/Videos/{ITEM_ID}/stream?static=true")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, SERVER_AGENT.as_bytes());
+}
+
+/// `StreamingHelpers.GetStreamingState`: a `LiveStreamId` wins over the
+/// item's static sources, so the stream already open is what plays rather than
+/// a second dial of the channel. A pass-through stream keeps its tuner URL and
+/// is relayed with the tuner's required `User-Agent`
+/// (`GetStaticRemoteStreamResult`); a stream that is no longer open is `404`.
+#[tokio::test]
+async fn a_static_stream_with_a_live_stream_id_plays_the_open_stream() {
+    let channel = TempMedia::new(b"unopened channel");
+    let tuner = agent_origin().await;
+    let sources = StreamSources {
+        live: Some(tuner),
+        ..StreamSources::at(&channel.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let (status, body) = get_body(
+        &router,
+        &format!("/Videos/{ITEM_ID}/stream.ts?static=true&LiveStreamId={LIVE_STREAM_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The tuner's own agent came back: the open stream was read, with it.
+    assert_eq!(body, TUNER_AGENT.as_bytes());
+    let (status, _) = get_body(
+        &router,
+        &format!("/Videos/{ITEM_ID}/stream.ts?static=true&LiveStreamId=prov_service_closed"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `VideosController.GetVideoStream`: a Blu-ray or DVD folder rip is never
+/// served as a static file; the request goes to ffmpeg, which is unavailable
+/// here (`404`). Audio has no such exclusion.
+#[tokio::test]
+async fn a_static_video_stream_of_a_disc_rip_is_transcoded() {
+    let rip = TempMedia::new(b"disc");
+    let sources = StreamSources {
+        disc: true,
+        ..StreamSources::at(&rip.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let (video, _) = get_body(&router, &format!("/Videos/{ITEM_ID}/stream?static=true")).await;
+    assert_eq!(video, StatusCode::NOT_FOUND);
+    let (audio, body) = get_body(&router, &format!("/Audio/{ITEM_ID}/stream?static=true")).await;
+    assert_eq!(audio, StatusCode::OK);
+    assert_eq!(body, b"disc");
+}
+
 // ---- Version-group management ----------------------------------------------
 
 #[tokio::test]
@@ -1061,7 +1302,7 @@ async fn additional_parts_of_a_stack_are_its_other_parts() {
     let (_dir, path) = temp_media();
     let owners = Arc::new(Mutex::new(Vec::new()));
     let app = state_with(
-        &path,
+        StreamSources::at(&path),
         no_subtitles(),
         false,
         Arc::new(PartsDto {

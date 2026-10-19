@@ -1153,7 +1153,9 @@ fn default_probe_concurrency() -> usize {
 fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
     let is_audio = entity.media_type.as_deref() == Some("Audio");
     let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
-    if crate::item_data::path_is_directory(entity) || !is_media {
+    // A folder is never probed — a playlist file's `MediaType` is its
+    // `PlaylistMediaType`, `Audio`, and it is still no track.
+    if entity.is_folder || crate::item_data::path_is_directory(entity) || !is_media {
         return None;
     }
     Some(MediaInfoRequest {
@@ -1211,7 +1213,9 @@ impl ExternalProbeSeam {
 /// subtitle/audio files next to it — each one its own ffprobe — and prepends
 /// them to the embedded streams in upstream's order (external subtitles,
 /// external audio, then the file's own streams, renumbered from 0). That
-/// keeps the sidecar probes off the scan loop like the main probe.
+/// keeps the sidecar probes off the scan loop like the main probe. For an
+/// audio track it appends the lyric sidecars instead ([`add_external_lyrics`]),
+/// which need no probe of their own.
 ///
 /// A probe failure is logged and reported as `None` — exactly what the
 /// inline probe did — so one unreadable file never aborts a scan. The
@@ -1261,6 +1265,10 @@ fn spawn_probe(
             let target = external
                 .resolvers
                 .target_for(path, external.internal_metadata_path);
+            if request.media_is_audio {
+                add_external_lyrics(&external.resolvers, &target, &mut probed);
+                return Some(probed);
+            }
             let externals = external.resolvers.external_streams(&target, 0).await;
             if !externals.is_empty() {
                 tracing::debug!(
@@ -1275,6 +1283,86 @@ fn spawn_probe(
         }
         Some(probed)
     })
+}
+
+/// `AudioFileProber.AddExternalLyrics`: every lyric sidecar of the track is
+/// recorded in [`MediaInfo::lyric_files`], and the first one is appended as a
+/// `Lyric` stream numbered after the probe's last stream.
+fn add_external_lyrics(
+    resolvers: &ExternalStreamResolvers,
+    track: &crate::media_info_resolver::ExternalMediaTarget,
+    probed: &mut MediaInfo,
+) {
+    let streams = &mut probed.media_source.media_streams;
+    let start_index = streams
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .map_or(0, |max| max + 1);
+    let lyrics = resolvers
+        .lyrics()
+        .get_external_lyric_streams(track, start_index);
+    probed.lyric_files = Vec::new();
+    for path in lyrics.iter().filter_map(|s| s.path.clone()) {
+        if !probed.lyric_files.contains(&path) {
+            probed.lyric_files.push(path);
+        }
+    }
+    streams.extend(lyrics.into_iter().take(1));
+}
+
+/// `AudioFileProber.FetchAsync`'s embedded-lyric step (`:143-157`, with
+/// `FetchDataFromTags` `:562-572` and `LyricManager.SaveLyricAsync`), run on an
+/// unlocked track's probe result: the lyrics in its tags
+/// ([`embedded_lyrics::from_tags`]) are saved as `{stem}.lrc` — beside the
+/// track when the library saves lyrics with media, else in its internal
+/// metadata folder — when it has no lyric sidecar yet, or under
+/// `ReplaceAllMetadata`. A track that had none then picks the saved file up as
+/// its lyric stream ([`add_external_lyrics`]).
+///
+/// The save goes by path, not through the lyric manager's item lookup: a
+/// track's row is not stored yet when its first probe returns.
+///
+/// A write that fails everywhere is an error, as `TrySaveToFiles` throws:
+/// the caller then drops the probe result, as upstream loses the whole
+/// `FetchAsync`.
+fn extract_embedded_lyrics(
+    seam: &ExternalProbeSeam,
+    id: Uuid,
+    path: &str,
+    probed: &mut MediaInfo,
+    replace_all: bool,
+    save_with_media: bool,
+) -> Result<(), ServiceError> {
+    let try_extract = !probed
+        .media_source
+        .media_streams
+        .iter()
+        .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric);
+    if !(try_extract || replace_all) {
+        return Ok(());
+    }
+    let Some(lyrics) = probed
+        .raw_audio_tags
+        .as_ref()
+        .and_then(crate::embedded_lyrics::from_tags)
+    else {
+        return Ok(());
+    };
+    let internal = seam.for_item(id).internal_metadata_path;
+    let targets = crate::lyric_manager::save_targets(
+        std::path::Path::new(path),
+        save_with_media,
+        internal.as_deref().map(std::path::Path::new),
+        "lrc",
+    );
+    let saved = crate::lyric_manager::try_save_to_files(&targets, &lyrics)?;
+    tracing::debug!(path = %saved.display(), "saved embedded lyrics");
+    if try_extract {
+        let target = seam.resolvers.target_for(path, internal);
+        add_external_lyrics(&seam.resolvers, &target, probed);
+    }
+    Ok(())
 }
 
 /// The look-ahead probe pipeline: tracks which planned rows probe, keeps a
@@ -1455,19 +1543,15 @@ impl<'a> ProbePipeline<'a> {
                     None
                 };
                 self.next += 1;
-                // Sidecar streams are a video concern (`FFProbeVideoInfo`);
-                // an audio item's probe is the embedded-tag path only.
-                let external = self
-                    .externals
-                    .as_ref()
-                    .filter(|_| !request.media_is_audio)
-                    .map(|seam| {
-                        let mut external = seam.for_item(self.planned[index].id);
-                        // The sidecars sit beside the `.strm`, not its target.
-                        external.sidecar_path =
-                            shortcut.and(self.planned[index].entity.path.clone());
-                        external
-                    });
+                // A video's sidecars are subtitles and audio tracks
+                // (`FFProbeVideoInfo`), an audio track's are its lyrics
+                // (`AudioFileProber.AddExternalLyrics`).
+                let external = self.externals.as_ref().map(|seam| {
+                    let mut external = seam.for_item(self.planned[index].id);
+                    // The sidecars sit beside the `.strm`, not its target.
+                    external.sidecar_path = shortcut.and(self.planned[index].entity.path.clone());
+                    external
+                });
                 let is_audio = request.media_is_audio;
                 self.inflight.push_back((
                     index,
@@ -1700,8 +1784,11 @@ pub enum ScanPasses {
     /// scheduled scan, `POST /Library/Refresh`, a library change).
     Library,
     /// Only what is scoped to the items this scan touched: the music
-    /// refresh of the albums and artists among them, their album covers, and
-    /// the children-derived columns of the folders it planned.
+    /// refresh of the albums and artists among them, their album covers, the
+    /// children-derived columns of the folders it planned, and the generated
+    /// Primaries of the photo albums, folders and playlists among them — plus
+    /// the library tiles for a library's or the root's refresh, and the user
+    /// root's image for the root's.
     /// An item or folder refresh over the API, and the library monitor's
     /// refresh of what a changed path belongs to (the watcher, the
     /// webhooks): upstream's `ProviderManager.RefreshItem` runs no post-scan
@@ -1902,6 +1989,9 @@ pub struct ScanRun<'a> {
     pub lane: Option<&'a dyn PriorityLane>,
     /// Where it records the ids it planned, for the scan serving it.
     touched: Option<&'a TouchedIds>,
+    /// It validates every library from the root ([`ScanTarget::All`]): a
+    /// refresh of the root reaches the user root's image too.
+    from_root: bool,
 }
 
 impl std::fmt::Debug for ScanRun<'_> {
@@ -1935,6 +2025,7 @@ impl<'a> ScanRun<'a> {
             passes: ScanPasses::Library,
             lane: None,
             touched: None,
+            from_root: false,
         }
     }
 
@@ -2545,6 +2636,25 @@ enum ItemSaved {
     Cancelled,
 }
 
+/// Whether a refresh with `options` runs every provider whatever the item's
+/// own state — the options' half of `runAllProviders`
+/// (`MetadataService.cs:654-657`): "Replace all metadata" or a full refresh,
+/// with a metadata mode at all (`:160`).
+///
+/// TODO(parity, open work item — NOT an accepted divergence; gl-594): the
+/// library tiles and the user root's image a library or root refresh
+/// reaches are forced by this alone; upstream also forces a row on its own
+/// first refresh or once its library's `AutomaticRefreshIntervalDays` have
+/// passed (`isFirstRefresh`/`requiresRefresh` at Default or above). Un-defer
+/// path: decide those rows with `plan_item_refresh` from their stored
+/// `DateLastRefreshed` and their library's options, as the walk decides the
+/// rows it plans, and test a Default root refresh of a never-refreshed root.
+fn runs_every_provider(options: &MetadataRefreshOptions) -> bool {
+    options.metadata_refresh_mode != MetadataRefreshMode::None
+        && (options.replace_all_metadata
+            || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh)
+}
+
 /// Whether the external subtitle or audio files beside `item`'s video differ
 /// from the ones its stored streams came from — `ProbeProvider.HasChanged`
 /// comparing `GetExternalFiles` with `Video.SubtitleFiles`/`AudioFiles`
@@ -2573,11 +2683,65 @@ fn sidecars_changed(
         || differs(seam.resolvers.audio(), &links.external_audio)
 }
 
+/// Whether the lyric files beside `item`'s audio track differ from the ones
+/// its last probe recorded — `ProbeProvider.HasChanged` comparing
+/// `LyricResolver.GetExternalFiles` with `Audio.LyricFiles` (ordinal sets).
+/// An unknown stored row counts as changed, and so does a row scanned before
+/// `LyricFiles` was recorded once lyric files sit beside it.
+///
+/// Upstream builds the on-disk set ignoring case and compares it with an
+/// ordinal `LyricFiles`, so `a.lrc` beside `A.lrc` on a case-sensitive
+/// filesystem re-probes the track on every scan; both sets here are ordinal,
+/// as the video arm's are, and settle.
+fn lyrics_changed(
+    seam: &ExternalProbeSeam,
+    item: &Planned,
+    stored: Option<&BaseItemEntity>,
+) -> bool {
+    let (Some(stored), Some(path)) = (stored, item.entity.path.as_deref()) else {
+        return true;
+    };
+    let target = seam
+        .resolvers
+        .target_for(path, seam.for_item(item.id).internal_metadata_path);
+    let now: std::collections::HashSet<String> = seam
+        .resolvers
+        .lyrics()
+        .get_external_files(&target)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    let data = crate::item_data::parse_data(stored.data.as_deref());
+    let recorded: std::collections::HashSet<&str> = data
+        .get("LyricFiles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    now.len() != recorded.len() || !now.iter().all(|p| recorded.contains(p.as_str()))
+}
+
 /// The newest NFO sidecar the local readers would read for `entity`, with its
 /// mtime — each provider's `BaseNfoProvider.GetXmlFile`, whose `HasChanged`
 /// any of them can raise — or `None` (no such file, a kind with no NFO, or
 /// the library disabled the reader).
 fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
+    if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
+        // A playlist folder's `PlaylistXmlProvider` monitors its
+        // `playlist.xml` (`BaseXmlProvider.HasChanged`). A playlist file's
+        // members are its own entries, which `RequiresRefresh` watches
+        // through the file's mtime ([`playlists`]).
+        let path = entity.path.as_deref().filter(|p| Path::new(p).is_dir())?;
+        let xml = ferrofin_providers::playlist_xml_path(path, false);
+        let meta = std::fs::metadata(xml)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        return Some(LocalMetadataFile {
+            mtime: DateTime::<Utc>::from(meta.modified().ok()?),
+            format: LocalMetadataFormat::Xml,
+        });
+    }
     if entity.type_.ends_with(".Book") {
         // A book has no NFO reader; its Comic and OPF providers monitor
         // their own files.
@@ -3113,6 +3277,12 @@ struct ScanWork<'r> {
     served: Served,
     /// The fetcher policy of an item in no library (a by-name artist).
     outside: FetcherPolicy<'r>,
+    /// The rows with a generated Primary (a photo album, folder or playlist,
+    /// [`DynamicImageKind`](crate::dynamic_images::DynamicImageKind)) the walk
+    /// refreshed, each with whether that refresh ran every provider
+    /// (`runAllProviders`, which forces the redraw). Their providers run in
+    /// the closing passes, once the art they draw from is saved.
+    generated_images: Vec<(Uuid, bool)>,
 }
 
 impl ScanWork<'_> {
@@ -4373,6 +4543,7 @@ impl LibraryScanner {
         tracking.started().await;
         let run = ScanRun {
             tracking: Some(&tracking),
+            from_root: only.is_none(),
             ..run
         };
         // One library at a time (sync: `NamingOptions` never crosses an
@@ -5493,6 +5664,7 @@ impl LibraryScanner {
             music: Vec::new(),
             served: Served::new(),
             outside: refresh.outside,
+            generated_images: Vec::new(),
         };
         // The versions the walk took out of a local group, by the primary
         // that owned them ([`released_from`]). A stop still unlinks them: the
@@ -5501,6 +5673,9 @@ impl LibraryScanner {
         // The saved videos that own parts or local versions, which take
         // their metadata once every row is saved ([`Self::copy_to_owned_videos`]).
         let mut owners = OwnedCopies::default();
+        // The playlists whose local readers this walk runs, read once every
+        // row is saved ([`playlists`]).
+        let mut due_playlists: Vec<playlists::DuePlaylist> = Vec::new();
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -5533,6 +5708,7 @@ impl LibraryScanner {
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
                 self.copy_to_owned_videos(&owners).await;
+                self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
                     &mut probes,
                     (&items_added, &moved_away),
@@ -5607,7 +5783,7 @@ impl LibraryScanner {
             let music = MusicKind::of_planned(&item.entity);
             let request = *refresh.request_for(item, !is_new);
             let music_pending = music.is_some_and(|kind| {
-                music::full_refresh(&plan, &request)
+                crate::refresh_plan::full_refresh(&plan, &request)
                     || self.music_fetch(kind, &plan, policy, locked).any()
             });
             let pass = ItemPass {
@@ -5666,11 +5842,54 @@ impl LibraryScanner {
                     // item, cleared by the music pass's save and selected by
                     // the next validation's music pass), and test it with a
                     // scan cancelled after the walk.
-                    aggregate: music::full_refresh(&plan, &request)
+                    aggregate: crate::refresh_plan::full_refresh(&plan, &request)
                         || matches!(saved, ItemSaved::Saved),
                     owns_stamp: music_pending,
                     owns_save: false,
                 });
+            }
+            // A playlist's local readers run with the rest of its refresh
+            // (`RefreshWithProviders`, skipped for a locked item): what they
+            // found is written once every member's row is saved.
+            if !locked
+                && plan.local_metadata
+                && !matches!(saved, ItemSaved::Cancelled)
+                && item_type_lookup::kind_from_type_name(&item.entity.type_)
+                    == Some(BaseItemKind::Playlist)
+                && let Some(path) = item.entity.path.clone()
+            {
+                due_playlists.push(playlists::DuePlaylist {
+                    id: item.id,
+                    path,
+                    replace: playlists::replaces_members(request.options),
+                });
+            }
+            // `RefreshWithProviders`' custom providers (`MetadataService.cs:
+            // 922-925`), skipped for a locked item (`:785-788`) and with
+            // metadata mode `None`: the generated Primary, drawn by the
+            // closing passes. An artist's provider draws nothing
+            // (`ArtistSources`), so it is not asked.
+            //
+            // TODO(parity, open work item — NOT an accepted divergence;
+            // gl-593): the walk has already decided this row's save and stamped its
+            // `DateLastRefreshed` when the closing pass draws, so a failed
+            // draw does not withhold the stamp and a drawn image does not
+            // re-save the row, as `RunCustomProvider` and `SaveInternal` do in
+            // the same `RefreshMetadata` upstream. Un-defer path: leave these
+            // rows' stamp and save to the closing pass, as `music_pending`
+            // leaves an album's to the music pass, which stamps only a
+            // successful draw and saves on `ImageUpdate`; test it with a draw
+            // that fails.
+            if !locked
+                && !undecodable
+                && !matches!(saved, ItemSaved::Cancelled)
+                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
+                && crate::dynamic_images::DynamicImageKind::for_entity(&item.entity).is_some_and(
+                    |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
+                )
+            {
+                work.generated_images
+                    .push((item.id, plan.run_all_providers));
             }
             match saved {
                 ItemSaved::Unchanged => outcome.unchanged += 1,
@@ -5684,6 +5903,7 @@ impl LibraryScanner {
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
                     self.copy_to_owned_videos(&owners).await;
+                    self.sync_playlists(&due_playlists, key_folders).await;
                     return Ok(self
                         .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
                         .await);
@@ -5736,6 +5956,7 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
             self.copy_to_owned_videos(&owners).await;
+            self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
                 &mut probes,
                 (&items_added, &moved_away),
@@ -5752,6 +5973,9 @@ impl LibraryScanner {
         // After the groups are linked, so each local version points at its
         // primary.
         self.copy_to_owned_videos(&owners).await;
+        // After every row is saved, so each entry finds its item, and before
+        // the closing passes, whose collage draws the members.
+        self.sync_playlists(&due_playlists, key_folders).await;
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
@@ -5770,7 +5994,10 @@ impl LibraryScanner {
                 Box::pin(self.post_scan_passes(folders, &planned, &art_cache, &work, run)).await
             }
             ScanPasses::Touched => {
-                Box::pin(self.touched_passes(&planned, &art_cache, &work, run)).await
+                // A library's or the root's refresh validates whole
+                // libraries, whose tiles it refreshes too.
+                let libraries = scope.is_none().then_some(folders);
+                Box::pin(self.touched_passes(&planned, &art_cache, &work, libraries, run)).await
             }
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
@@ -6079,15 +6306,18 @@ impl LibraryScanner {
     /// The closing passes of an item or folder refresh, and of the library
     /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
     /// albums and artists it refreshed, the album covers this pass gathered,
-    /// and the children-derived columns of the folders it planned — never a
-    /// pass over the whole database. (The folders planned for context
-    /// included: see the owner-approved divergence at
+    /// the children-derived columns of the folders it planned, the generated
+    /// Primaries of the photo albums, folders and playlists it refreshed, and
+    /// the tiles of the `libraries` a library's or the root's refresh
+    /// validated whole — never a pass over the whole database. (The folders
+    /// planned for context included: see the owner-approved divergence at
     /// [`update_folder_aggregates`](Self::update_folder_aggregates).)
     async fn touched_passes(
         &self,
         planned: &[Planned],
         art_cache: &ArtworkCache,
         work: &ScanWork<'_>,
+        libraries: Option<&[VirtualFolderInfo]>,
         run: ScanRun<'_>,
     ) -> bool {
         if run.cancel.is_cancelled() {
@@ -6098,6 +6328,50 @@ impl LibraryScanner {
         self.finish_album_artwork(art_cache, run).await;
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
+        }
+        // The custom providers of what it refreshed, after the art they draw
+        // from: the photo albums, folders and playlists it walked. A cancel
+        // stops between two passes, as library validation's do.
+        if let Some(providers) = self.dynamic_image_providers() {
+            let between =
+                || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+                    Box::pin(async move {
+                        Box::pin(self.serve_lane(run)).await;
+                    })
+                };
+            if run.cancel.is_cancelled() {
+                return false;
+            }
+            if let Err(err) = providers
+                .refresh_rows_between(&work.generated_images, &between)
+                .await
+            {
+                tracing::warn!(%err, "dynamic image pass failed");
+            }
+            let runs = run.options.metadata_refresh_mode != MetadataRefreshMode::None;
+            let force = runs_every_provider(run.options);
+            // `CollectionFolderImageProvider`, of each library a library's or
+            // the root's refresh validated.
+            if run.cancel.is_cancelled() {
+                return false;
+            }
+            if runs
+                && let Some(libraries) = libraries
+                && let Err(err) = self.refresh_library_images(libraries, force).await
+            {
+                tracing::warn!(%err, "library image pass failed");
+            }
+            // The user root's image a root's refresh reaches, after the tiles
+            // it copies.
+            if run.cancel.is_cancelled() {
+                return false;
+            }
+            if runs
+                && run.from_root
+                && let Err(err) = providers.refresh_user_root_between(force, &between).await
+            {
+                tracing::warn!(%err, "root image pass failed");
+            }
         }
         run.report(100.0);
         !run.cancel.is_cancelled()
@@ -6229,9 +6503,34 @@ impl LibraryScanner {
             .request_for(item, !matches!(stored, Stored::New));
         let options = request.options;
         let cancel = state.refresh.cancel;
-        let Some(probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
+        let Some(mut probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
             return Ok(ItemSaved::Cancelled);
         };
+        let unsaved_lyrics = if probe.is_audio
+            && !locked
+            && let (Some(info), Some(seam), Some(path)) = (
+                probe.info.as_mut(),
+                state.refresh.externals.as_ref(),
+                item.entity.path.as_deref(),
+            ) {
+            extract_embedded_lyrics(
+                seam,
+                item.id,
+                path,
+                info,
+                options.replace_all_metadata,
+                policy.options.is_some_and(|o| o.save_lyrics_with_media),
+            )
+            .err()
+        } else {
+            None
+        };
+        if let Some(e) = unsaved_lyrics {
+            let path = item.entity.path.as_deref();
+            tracing::warn!(error = %e, ?path, "embedded lyrics not saved; item left unprobed");
+            probe.info = None;
+            probe.failed = true;
+        }
         let probe_ran = probe.info.is_some();
         let mut failures = u32::from(probe.failed);
         let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
@@ -7073,35 +7372,15 @@ impl LibraryScanner {
     }
 
     /// Whether writing `people` would change the credits stored for
-    /// `item_id`. Compared the way `update_people` writes them: deduped on
-    /// (lower-cased name, type) keeping the first ([`dedupe_people`]), names
-    /// trimmed and matched case-insensitively (an existing `Peoples` row keeps
-    /// its casing), then type and role, in credit order. A read failure
-    /// counts as a difference; with no people repository nothing would be
-    /// written, so nothing differs.
-    ///
-    /// [`dedupe_people`]: crate::people_repository::dedupe_people
+    /// `item_id` ([`credits_differ`]). A read failure counts as a difference;
+    /// with no people repository nothing would be written, so nothing
+    /// differs.
     async fn people_differ(&self, item_id: Uuid, people: &[PeopleEntity]) -> bool {
         let Some(repo) = &self.people else {
             return false;
         };
-        let key = |p: &PeopleEntity| {
-            (
-                p.name.trim().to_lowercase(),
-                p.person_type.clone().unwrap_or_default(),
-                p.role.clone().unwrap_or_default(),
-            )
-        };
         match repo.get_people_batch(&[item_id]).await {
-            Ok(mut stored) => {
-                let stored = stored.remove(&item_id).unwrap_or_default();
-                stored
-                    .iter()
-                    .map(key)
-                    .ne(crate::people_repository::dedupe_people(people)
-                        .into_iter()
-                        .map(key))
-            }
+            Ok(mut stored) => credits_differ(&stored.remove(&item_id).unwrap_or_default(), people),
             Err(err) => {
                 tracing::warn!(%err, item_id = %item_id, "failed to read stored credits");
                 true
@@ -7525,15 +7804,15 @@ impl LibraryScanner {
     ///
     /// | pass | selection | upstream |
     /// |---|---|---|
-    /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it | `MetadataService.RefreshMetadata` |
+    /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it; then every album the scan planned, its artist credits written where they moved | `MetadataService.RefreshMetadata`; `AlbumMetadataService.SetPeople` |
     /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
     /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
-    /// | library tiles | their own 7-day staleness (`HasChangedByDate`) | `CollectionFolderImageProvider` |
-    /// | dynamic images | per item: no generated Primary yet, or its file changed (`HasChangedByDate`) | `BaseDynamicImageProvider.HasChanged` |
+    /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
+    /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     // One straight sequence of the closing passes, each timed; a helper per
     // pass would only scatter the table above.
@@ -7640,7 +7919,10 @@ impl LibraryScanner {
         // that fetch that content's artwork — otherwise a first scan sees no
         // art and the "My Media" tile keeps the icon placeholder.
         let started = std::time::Instant::now();
-        if let Err(err) = self.refresh_library_images(folders).await {
+        if let Err(err) = self
+            .refresh_library_images(folders, runs_every_provider(run.options))
+            .await
+        {
             tracing::warn!(%err, "library image pass failed");
         }
         timings.library_images = started.elapsed();
@@ -7652,24 +7934,26 @@ impl LibraryScanner {
         // the end of library validation). Same ordering reason as the library
         // tiles: the collages sample the artwork the passes above produced.
         let started = std::time::Instant::now();
-        if let (Some(items), Some(processor), Some(meta_root)) = (
-            &self.item_repository,
-            &self.image_processor,
-            &self.metadata_dir,
-        ) {
-            let providers = crate::dynamic_images::DynamicImageProviders::new(
-                Arc::clone(items),
-                Arc::clone(&self.persistence),
-                Arc::clone(processor),
-                meta_root.clone(),
-            );
+        if let Some(providers) = self.dynamic_image_providers() {
             let between =
                 || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
                     Box::pin(async move {
                         Box::pin(self.serve_lane(run)).await;
                     })
                 };
-            if let Err(err) = providers.refresh_all_between(&between).await {
+            // The rows the walk refreshed with every provider redraw first;
+            // the gated pass over every other row follows.
+            let forced: Vec<(Uuid, bool)> = work
+                .generated_images
+                .iter()
+                .copied()
+                .filter(|&(_, force)| force)
+                .collect();
+            if let Err(err) = providers.refresh_rows_between(&forced, &between).await {
+                tracing::warn!(%err, "forced dynamic image pass failed");
+            }
+            let drawn = forced.iter().map(|&(id, _)| id).collect();
+            if let Err(err) = providers.refresh_all_between(&drawn, &between).await {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
         }
@@ -7736,6 +8020,24 @@ impl LibraryScanner {
             "retiring by-name MusicArtist rows superseded by resolved artist folders"
         );
         self.persistence.delete_items(&stale).await.map(|_| ())
+    }
+
+    /// The dynamic image providers over this scanner's stores, when it has all
+    /// of them (an item repository, an image processor and an art folder).
+    fn dynamic_image_providers(&self) -> Option<crate::dynamic_images::DynamicImageProviders> {
+        let (Some(items), Some(processor), Some(meta_root)) = (
+            &self.item_repository,
+            &self.image_processor,
+            &self.metadata_dir,
+        ) else {
+            return None;
+        };
+        Some(crate::dynamic_images::DynamicImageProviders::new(
+            Arc::clone(items),
+            Arc::clone(&self.persistence),
+            Arc::clone(processor),
+            meta_root.clone(),
+        ))
     }
 
     /// The children-derived columns of every folder this scan planned: the
@@ -8634,14 +8936,8 @@ impl LibraryScanner {
             mtime: entity.date_modified,
             probe,
             sidecars_changed,
-            // TODO(parity, open work item — NOT an accepted divergence): the
-            // scan's probe records no lyric files (`AudioFileProber`'s lyric
-            // resolver and its `Lyric` streams are not ported; lyrics are read
-            // from their sidecars at request time), so there is no stored set
-            // for `ProbeProvider.HasChanged`'s lyric arm to compare. Porting
-            // the lyric streams into the probe and feeding both sets here
-            // closes it; `plan_item_refresh` already honours the flag.
-            lyrics_changed: false,
+            lyrics_changed: matches!(probe, ProbeKind::Audio)
+                && externals.is_some_and(|seam| lyrics_changed(seam, item, stored)),
             local_metadata: nfo_file(entity, policy),
             supports_cumulative_run_time: matches!(
                 kind,
@@ -8841,6 +9137,19 @@ impl LibraryScanner {
             Vec::new()
         };
         let people = media_is_audio.then(|| audio_credits(entity, probed, policy.options));
+        // `Audio.LyricFiles`, which the lyric arm of the change detection
+        // compares with the sidecars on disk. A track with none stores no key,
+        // which reads back as the same empty set.
+        let lyric_files =
+            (!probed.lyric_files.is_empty()).then(|| serde_json::json!(probed.lyric_files));
+        if media_is_audio
+            && let Some(data) = crate::item_data::merge_data_fields(
+                entity.data.as_deref(),
+                &[("LyricFiles", lyric_files)],
+            )
+        {
+            entity.data = Some(data);
+        }
         let allowed = policy
             .options
             .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
@@ -9558,7 +9867,10 @@ impl LibraryScanner {
                 // pinned an id in an NFO must not be re-matched by fuzzy title.
                 match (own_imdb.as_deref(), name) {
                     (Some(imdb), _) => omdb.item(imdb).await,
-                    (None, Some(name)) => omdb.find_by_title(kind, name, year).await,
+                    (None, Some(name)) => {
+                        let cleaned = ferrofin_providers::tmdb::clean_name(name);
+                        omdb.find_by_title(kind, &cleaned, year).await
+                    }
                     (None, None) => None,
                 }
             }
@@ -9656,11 +9968,11 @@ impl LibraryScanner {
             id
         } else {
             let name = lookup.name(row)?;
-            tmdb.search(kind, name.as_str(), year, lookup.tmdb_language().as_deref())
-                .await
-                .into_iter()
-                .next()
-                .map(|h| h.tmdb_id)?
+            let cleaned = ferrofin_providers::tmdb::clean_name(&name);
+            let results = tmdb
+                .search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
+                .await;
+            ferrofin_providers::tmdb::find_best_match(&results, &name, year).map(|h| h.tmdb_id)?
         };
         // The seasons/episodes below this series key off the cached id.
         // Cached however the id was resolved — a pinned series id serves its
@@ -10060,10 +10372,11 @@ impl LibraryScanner {
                     // (`TvdbSeriesProvider.cs:73-77,422-437`) — a lone Tmdb
                     // id is not one it resolves by.
                     let name = lookup.name(row)?;
+                    let cleaned = ferrofin_providers::tmdb::clean_name(&name);
                     let year = lookup.year(row);
                     let language = lookup.metadata_language(FetcherPolicy::default());
                     let names = self.three_letter_language_names(&language);
-                    tvdb.search(&name, year, &language, &names)
+                    tvdb.search(&cleaned, year, &language, &names)
                         .await
                         .into_iter()
                         .next()?
@@ -10153,10 +10466,7 @@ impl LibraryScanner {
                     .get(&series_id)
                     .map(|d| d.people.as_slice())
                     .unwrap_or_default();
-                answer.people = Some(merge_series_cast(
-                    tvdb_people(&ep.people),
-                    series_people,
-                ));
+                answer.people = Some(merge_series_cast(tvdb_people(&ep.people), series_people));
                 // `TvdbEpisodeProvider` sets the episode's Tvdb id and the
                 // IMDb id its remote ids carry.
                 answer
@@ -11327,9 +11637,14 @@ impl LibraryScanner {
     /// upstream's (`BaseDynamicImageProvider`/`HasChangedByDate`). Without
     /// this, the home screen's "My Media" tiles render the icon-on-blue
     /// fallback forever.
+    ///
+    /// `force` is a library or root refresh that runs every provider
+    /// (`runAllProviders`); [`library_tile_due`](Self::library_tile_due) says
+    /// which tiles it redraws.
     async fn refresh_library_images(
         &self,
         folders: &[VirtualFolderInfo],
+        force: bool,
     ) -> Result<(), ServiceError> {
         let (Some(items), Some(processor), Some(meta_root)) = (
             &self.item_repository,
@@ -11344,14 +11659,7 @@ impl LibraryScanner {
             };
             let out_dir = meta_root.join(guid_to_db(cf));
             let out = out_dir.join("primary.png");
-            // Regenerate only when missing or older than 7 days (upstream's
-            // HasChangedByDate window).
-            let fresh = std::fs::metadata(&out)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
-            if fresh {
+            if !Self::library_tile_due(items, cf, &out, force).await? {
                 continue;
             }
             // Random content sample; over-fetch since not every row has art.
@@ -11424,11 +11732,68 @@ impl LibraryScanner {
                 height: options.height,
                 blur_hash: None,
             };
-            if let Err(err) = self.persistence.save_item_images(cf, &[info]).await {
+            // `ProviderManager.SaveImage` replaces the Primary only; the
+            // library's other images stay.
+            let mut images = match items.get_image_infos(cf).await {
+                Ok(images) => images,
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "failed to read the library images");
+                    continue;
+                }
+            };
+            images.retain(|i| i.image_type != ImageType::Primary);
+            images.insert(0, info);
+            if let Err(err) = self.persistence.save_item_images(cf, &images).await {
                 tracing::warn!(%err, library = %cf, "failed to persist the library image");
             }
         }
         Ok(())
+    }
+
+    /// Whether `library`'s tile at `out` is drawn this pass. Never for a
+    /// locked library: `RefreshWithProviders` returns before its custom
+    /// providers (`MetadataService.cs:785-788`). When missing or older than 7
+    /// days (upstream's `HasChangedByDate` window), as the scan has always
+    /// drawn it. A fresh tile only when `force`d (`runAllProviders`), and,
+    /// as `FetchAsync`, not over a Primary this pass did not draw (a remote
+    /// one, or a file outside the library's art folder).
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-591): a
+    /// missing or stale tile is drawn over such a Primary too, and Jellyfin's
+    /// `{metadata}/library/{xx}/{id}` folder is not taken for the library's
+    /// own. Un-defer path: drop image rows whose file is gone
+    /// (`ValidateImages`), then apply the `FetchAsync` rule before the date
+    /// gate, accepting both folder layouts as `remove_item_images` does.
+    async fn library_tile_due(
+        items: &Arc<dyn ItemRepository>,
+        library: Uuid,
+        out: &Path,
+        force: bool,
+    ) -> Result<bool, ServiceError> {
+        if items
+            .retrieve_item(library)
+            .await?
+            .is_some_and(|row| row.is_locked)
+        {
+            return Ok(false);
+        }
+        let fresh = std::fs::metadata(out)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
+        if !fresh || !force {
+            return Ok(!fresh);
+        }
+        let art_dir = out.parent().unwrap_or(out);
+        Ok(items
+            .get_image_infos(library)
+            .await?
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .is_none_or(|primary| {
+                primary.is_local_file() && Path::new(&primary.path).starts_with(art_dir)
+            }))
     }
 
     /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
@@ -11882,7 +12247,8 @@ impl LibraryScanner {
             ) {
                 (Some(series), Some(season), Some(episode)) => {
                     ferrofin_providers::tmdb::ordered_download_images(
-                        tmdb.episode_images(series, season, episode).await,
+                        tmdb.episode_images(series, season, episode, language.as_deref())
+                            .await,
                         language.as_deref().unwrap_or("en"),
                     )
                 }
@@ -11930,18 +12296,25 @@ impl LibraryScanner {
         current: &[ItemImageInfo],
         preferences: ferrofin_providers::image_policy::ImageAcquisitionPolicy<'_>,
     ) -> Vec<ItemImageInfo> {
+        let request_language = ferrofin_providers::tmdb::normalize_language(
+            Some(&preferred_language(entity, policy)),
+            Some(&policy.country_code()),
+        );
         let images = if policy.image_enabled(short, fetcher_names::TMDB) {
             match (
                 entity.series_id.as_deref(),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
+                // `ProviderManager.GetImages` orders each provider's images by
+                // `OrderByLanguageDescending(preferredLanguage)` (v12.2
+                // ProviderManager.cs:365), as the episode and title paths do
+                // here: TMDB's response order is not a ranking.
                 (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
-                    Some(id) => tmdb
-                        .season_images(id, number)
-                        .await
-                        .into_iter()
-                        .map(RemoteImage::from)
-                        .collect(),
+                    Some(id) => ferrofin_providers::tmdb::ordered_download_images(
+                        tmdb.season_images(id, number, request_language.as_deref())
+                            .await,
+                        request_language.as_deref().unwrap_or("en"),
+                    ),
                     None => Vec::new(),
                 },
                 _ => Vec::new(),
@@ -12464,8 +12837,8 @@ impl LibraryScanner {
             .map(|m| FileTimes::of(m).mtime);
         // A directory's dates are the folder's rule below, whether the item
         // is a folder or a disc rip's `Video` (`IsFolder = 0`) at the rip's
-        // directory.
-        let times = if is_folder {
+        // directory. A playlist FILE is a folder with a file's dates.
+        let times = if is_folder && kind != BaseItemKind::Playlist {
             None
         } else {
             meta.as_ref().filter(|m| !m.is_dir()).map(FileTimes::of)
@@ -12752,6 +13125,19 @@ impl LibraryScanner {
         let kind = walk.kind;
         let extras_folder = is_extras_folder_below_top(dir, root, naming);
         let entries = self.list(dir, ctx);
+        // `PlaylistResolver` (priority First) answers before every other
+        // resolver, in any library — but not inside a title's own folder,
+        // whose subfolders upstream never resolves.
+        if dir != root
+            && !extras_folder
+            && !walk.under_title
+            && let Some(name) =
+                playlists::playlist_folder_name(dir, || playlists::holds_playlist_xml(&entries))
+        {
+            let (parent, ancestors) = walk.parent(cf, ctx);
+            self.plan_playlist(dir, Some(name), cf, (parent, ancestors), ctx, out);
+            return;
+        }
         // Without a collection type a folder `SeriesResolver` takes (priority
         // Second, before `MovieResolver`) is a series, planned as a tvshows
         // library's is.
@@ -12959,6 +13345,16 @@ impl LibraryScanner {
         extras: &mut Vec<MovieExtra>,
     ) {
         let naming = ctx.naming;
+        // An untyped library's playlist file is a playlist (`PlaylistResolver`,
+        // priority First) where its folder's files resolve at all: not in a
+        // title's own folder, nor in an extras folder.
+        if folder.untyped && playlists::is_playlist_file(&entry.path) {
+            if !folder.own_folder && !folder.extras_folder {
+                let parent = folder.walk.parent(folder.cf, ctx);
+                self.plan_playlist(&entry.path, None, folder.cf, parent, ctx, out);
+            }
+            return;
+        }
         // Upstream resolves EXTRAS first, over every file in the folder —
         // `ExtraRuleResolver` has audio rules as well as video ones
         // (`theme.mp3` is `ExtraRuleType.Filename` + `MediaType.Audio`), and
@@ -13216,6 +13612,11 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // A playlist file is the playlist `PlaylistResolver` makes of it.
+        if playlists::is_playlist_file(&entry.path) {
+            self.plan_playlist(&entry.path, None, cf, (parent, ancestors), ctx, out);
+            return;
+        }
         if !is_audio_file(&entry.path, ctx.naming)
             || video_resolver::is_video_file(&entry.path, ctx.naming)
         {
@@ -13867,6 +14268,11 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // `PlaylistResolver` (priority First) answers before `SeriesResolver`.
+        let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+        if self.plan_playlist_folder(&entry.path, holds_xml, cf, (cf, vec![cf]), ctx, out) {
+            return;
+        }
         {
             let info = series_resolver::resolve(ctx.naming, &entry.path);
             let name = info.name.unwrap_or_else(|| entry.name.clone());
@@ -14104,8 +14510,17 @@ impl LibraryScanner {
     ) {
         let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
         if !(season.season_number.is_some() || season.is_season_folder) {
+            // `SeasonResolver` takes no such folder, so `PlaylistResolver`
+            // (priority First) may. A season folder stays a season: both
+            // resolvers have priority First, and a `[playlist]` season is
+            // too rare to bet on their registration order.
+            let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+            let home = (series_id, vec![cf, series_id]);
+            if self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
+                return;
+            }
             // A non-season subfolder: collect its videos as loose episodes.
-            self.collect_videos(&entry.path, ctx, loose);
+            self.collect_videos(&entry.path, (cf, series_id), ctx, out, loose);
             return;
         }
         let num = season.season_number;
@@ -14153,13 +14568,27 @@ impl LibraryScanner {
     /// Collects every video file under `dir` (recursively) into `out_paths` —
     /// the ones `ctx`'s scope keeps, with the rest of a stack or version
     /// group it keeps a file of ([`episode_file_kept`]).
-    fn collect_videos(&self, dir: &str, ctx: &PlanCtx<'_>, out_paths: &mut Vec<String>) {
+    fn collect_videos(
+        &self,
+        dir: &str,
+        (cf, series_id): (Uuid, Uuid),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+        out_paths: &mut Vec<String>,
+    ) {
         let entries = self.list(dir, ctx);
         note_episode_folder(dir, &entries, ctx);
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
-                if ctx.scope.visits(&entry.path) {
-                    self.collect_videos(&entry.path, ctx, out_paths);
+                if !ctx.scope.visits(&entry.path) {
+                    continue;
+                }
+                // A playlist folder below the series: `PlaylistResolver`
+                // (priority First) takes it before any episode resolver.
+                let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+                let home = (series_id, vec![cf, series_id]);
+                if !self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
+                    self.collect_videos(&entry.path, (cf, series_id), ctx, out, out_paths);
                 }
             } else if video_resolver::is_video_file(&entry.path, ctx.naming)
                 && episode_file_kept(&entry.path, ctx)
@@ -14301,6 +14730,16 @@ impl LibraryScanner {
             }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
+                    continue;
+                }
+                // A season's children go through the resolvers too,
+                // `PlaylistResolver` (priority First) before any other.
+                let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
+                let home = match season {
+                    Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
+                    None => (series_id, vec![cf, series_id]),
+                };
+                if self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
                     continue;
                 }
                 self.plan_episodes(
@@ -14789,6 +15228,15 @@ impl LibraryScanner {
         let parent = chain.last().copied().unwrap_or(cf);
         let naming = ctx.naming;
         let entries = self.list(dir, ctx);
+        // A playlist folder (`PlaylistResolver`, priority First, before
+        // `PhotoAlbumResolver`) is no album, and nothing in it resolves: the
+        // movie walk plans it.
+        if dir != root
+            && playlists::playlist_folder_name(dir, || playlists::holds_playlist_xml(&entries))
+                .is_some()
+        {
+            return;
+        }
         let photos = unowned_photos(&entries, naming);
         // A folder that is no album but a disc rip is one video
         // (`FindMovie<Video>`): nothing below it resolves.
@@ -14899,6 +15347,17 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        let ancestors = if parent == cf {
+            vec![cf]
+        } else {
+            vec![cf, parent]
+        };
+        // `PlaylistResolver` (priority First) answers before the artist and
+        // album resolvers.
+        let holds_xml = || playlists::holds_playlist_xml(&self.prelist(dir, ctx));
+        if self.plan_playlist_folder(dir, holds_xml, cf, (parent, ancestors.clone()), ctx, out) {
+            return;
+        }
         if !in_artist
             && self.is_music_artist(dir, ctx)
             && let Some((artist_id, artist)) = self.base_item(
@@ -14951,8 +15410,12 @@ impl LibraryScanner {
         // Below the library's top folder an extras-named folder is never
         // resolved (`CoreResolutionIgnoreRule.cs:46-61`); rows older scans
         // planned in one are reconciled away.
+        let entries = self.list(dir, ctx);
+        // A folder that is neither an artist nor an album plans no row of
+        // its own: its playlist files hang off the nearest one that does.
+        self.plan_playlist_files(&entries, cf, (parent, &ancestors), ctx, out);
         let mut dirs = Vec::new();
-        for entry in self.list(dir, ctx) {
+        for entry in entries {
             if entry.type_ != FileSystemEntryType::Directory {
                 continue;
             }
@@ -15036,7 +15499,7 @@ impl LibraryScanner {
         // an album (`ContainsMusic`), which a cue sheet alone makes it: such
         // an album has no tracks, as upstream's has none.
         let entries = self.list(dir, ctx);
-        let tracks = self.collect_album_tracks(&entries, ctx);
+        let (tracks, playlist_files) = self.collect_album_tracks(&entries, ctx);
         // A directory name is not a filename (`EnsureName` keeps it whole):
         // `file_stem` would cut "Greatest Hits Vol. 2" at the dot.
         let album_name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
@@ -15109,6 +15572,25 @@ impl LibraryScanner {
                 },
             );
         }
+        for path in playlist_files {
+            self.plan_playlist(&path, None, cf, (album_id, ancestors.clone()), ctx, out);
+        }
+        // An album is a folder upstream, so its other subfolders go through
+        // the resolvers too, `PlaylistResolver` first. Its disc folders are
+        // its own (above) and its extras folders are never resolved.
+        let parser = ferrofin_naming::audio::AlbumParser::new(ctx.naming);
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory
+                && !parser.is_multi_part(&entry.path)
+                && !is_extras_dir(entry, ctx.naming)
+                && ctx.scope.visits(&entry.path)
+            {
+                // Nothing else lists these: no look-ahead to keep.
+                let holds_xml = || playlists::holds_playlist_xml(&self.list(&entry.path, ctx));
+                let home = (album_id, ancestors.clone());
+                self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out);
+            }
+        }
     }
 
     /// The audio files sitting directly in `dir` — a resolved artist
@@ -15136,10 +15618,16 @@ impl LibraryScanner {
             vec![cf, parent]
         };
         for entry in self.list(dir, ctx) {
-            if entry.type_ == FileSystemEntryType::Directory
-                || !is_audio_file(&entry.path, ctx.naming)
-                || !ctx.scope.keeps(&entry.path)
-            {
+            if entry.type_ == FileSystemEntryType::Directory {
+                continue;
+            }
+            // A playlist file — a `.pls` is an audio extension too — is the
+            // playlist `PlaylistResolver` makes of it, never a track.
+            if playlists::is_playlist_file(&entry.path) {
+                self.plan_playlist(&entry.path, None, cf, (parent, ancestors.clone()), ctx, out);
+                continue;
+            }
+            if !is_audio_file(&entry.path, ctx.naming) || !ctx.scope.keeps(&entry.path) {
                 continue;
             }
             if is_cue_sheet(&entry.path) || is_theme_song(&entry.path, ctx.naming) {
@@ -15175,19 +15663,27 @@ impl LibraryScanner {
     }
 
     /// The audio files belonging to the album at `dir`: those directly inside,
-    /// plus those in each multi-disc subfolder.
+    /// plus those in each multi-disc subfolder — and, apart, the playlist
+    /// files there, which `PlaylistResolver` takes before `AudioResolver`
+    /// would make a `.pls` a track.
     fn collect_album_tracks(
         &self,
         entries: &[FileSystemEntryInfo],
         ctx: &PlanCtx<'_>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         let naming = ctx.naming;
         // A cue sheet makes a folder an album (`ContainsMusic` counts it) but
         // is no track (`AudioResolver.Resolve` returns null for it); a theme
         // song is never resolved at all.
         // Older scans planned them as tracks; those rows are reconciled.
+        let is_playlist = |e: &FileSystemEntryInfo| {
+            e.type_ != FileSystemEntryType::Directory && playlists::is_playlist_file(&e.path)
+        };
         let is_track = |e: &FileSystemEntryInfo| {
-            if e.type_ == FileSystemEntryType::Directory || !is_audio_file(&e.path, naming) {
+            if e.type_ == FileSystemEntryType::Directory
+                || !is_audio_file(&e.path, naming)
+                || is_playlist(e)
+            {
                 return false;
             }
             if is_cue_sheet(&e.path) || is_theme_song(&e.path, naming) {
@@ -15203,6 +15699,11 @@ impl LibraryScanner {
             .filter(|e| is_track(e))
             .map(|e| e.path.clone())
             .collect();
+        let mut playlist_files: Vec<String> = entries
+            .iter()
+            .filter(|e| is_playlist(e))
+            .map(|e| e.path.clone())
+            .collect();
         let parser = ferrofin_naming::audio::AlbumParser::new(naming);
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && parser.is_multi_part(&entry.path) {
@@ -15211,15 +15712,16 @@ impl LibraryScanner {
                 if ctx.scope.keeps(&entry.path) {
                     ctx.superseded.borrow_mut().push(entry.path.clone());
                 }
-                tracks.extend(
-                    self.list(&entry.path, ctx)
-                        .into_iter()
-                        .filter(|e| is_track(e))
-                        .map(|e| e.path),
+                let disc = self.list(&entry.path, ctx);
+                playlist_files.extend(
+                    disc.iter()
+                        .filter(|e| is_playlist(e))
+                        .map(|e| e.path.clone()),
                 );
+                tracks.extend(disc.into_iter().filter(|e| is_track(e)).map(|e| e.path));
             }
         }
-        tracks
+        (tracks, playlist_files)
     }
 
     /// Whether `dir` resolves as a music album — port of
@@ -15323,6 +15825,12 @@ impl LibraryScanner {
         // year are used here. Every other root shape matches upstream exactly.
         // Recorded as an accepted divergence in `docs/FEATURES.md`.)
         if dir != root {
+            // `PlaylistResolver` shares `BookResolver`'s priority (First) and
+            // takes a folder only by its name or its `playlist.xml`.
+            let holds_xml = || playlists::holds_playlist_xml(&entries);
+            if self.plan_playlist_folder(dir, holds_xml, cf, (cf, vec![cf]), ctx, out) {
+                return;
+            }
             if let Some(book) = single_book_file(&entries) {
                 if ctx.scope.keeps(&book) {
                     self.push_book(&book, folder_name(dir), cf, ctx, out);
@@ -16904,6 +17412,7 @@ fn planner_resolves(item_type: &str) -> bool {
                 | BaseItemKind::Episode
                 | BaseItemKind::MusicAlbum
                 | BaseItemKind::MusicArtist
+                | BaseItemKind::Playlist
         )
     )
 }
@@ -17886,8 +18395,11 @@ impl MergeMode {
 ///   date) from a by-date name.
 ///
 /// No other kind takes anything (a book's year or series never comes back
-/// from its path). Two episode fields upstream may also set here are not
-/// ported yet — see the `TODO(parity)` notes below.
+/// from its path). The embedded MP4 episode info `Episode.BeforeMetadataRefresh`
+/// also reads is applied with the probe ([`embedded_episode_info_enabled`]).
+/// The one field upstream sets here that Ferrofin does not is an episode's
+/// `IndexNumberEnd` (open work item gl-102; see
+/// [`fill_episode_numbers_from_path`]).
 fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
@@ -18418,18 +18930,25 @@ fn overlay_shortcut_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
 /// Restores direct probe properties after the provider metadata merge. A
 /// completed video probe owns its nullable stream index regardless of the
 /// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
-/// must not restore an index from the previous probe.
+/// must not restore an index from the previous probe. An audio probe owns
+/// `LyricFiles` the same way (`AudioFileProber.AddExternalLyrics`), so the
+/// lyric files that are gone do not survive as "existing" data.
 fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     let data = crate::item_data::parse_data(scanned.data.as_deref());
     if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
         row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
     }
-    if scanned.media_type.as_deref() == Some("Video")
-        && let Some(index) = data.get("DefaultVideoStreamIndex").cloned()
-        && let Some(data) = crate::item_data::merge_data_fields(
-            row.data.as_deref(),
-            &[("DefaultVideoStreamIndex", Some(index))],
-        )
+    let field = match scanned.media_type.as_deref() {
+        Some("Video") => data
+            .get("DefaultVideoStreamIndex")
+            .cloned()
+            .map(|index| ("DefaultVideoStreamIndex", Some(index))),
+        // No key: the track has no lyric files now, and the stored list goes.
+        Some("Audio") => Some(("LyricFiles", data.get("LyricFiles").cloned())),
+        _ => None,
+    };
+    if let Some(field) = field
+        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &[field])
     {
         row.data = Some(data);
     }
@@ -19089,6 +19608,30 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
     if entity.community_rating.is_none() {
         entity.community_rating = d.vote_average.map(f64::from);
     }
+}
+
+/// Whether writing `people` would change `stored`, an item's credits as
+/// `get_people_batch` reads them back. Compared the way `update_people`
+/// writes them: deduped on (lower-cased name, type) keeping the first
+/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
+/// existing `Peoples` row keeps its casing), then type and role, in credit
+/// order.
+///
+/// [`dedupe_people`]: crate::people_repository::dedupe_people
+fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
+    let key = |p: &PeopleEntity| {
+        (
+            p.name.trim().to_lowercase(),
+            p.person_type.clone().unwrap_or_default(),
+            p.role.clone().unwrap_or_default(),
+        )
+    };
+    stored
+        .iter()
+        .map(key)
+        .ne(crate::people_repository::dedupe_people(people)
+            .into_iter()
+            .map(key))
 }
 
 /// The credits `AudioFileProber.FetchDataFromTags` writes with
@@ -19839,6 +20382,7 @@ mod artwork;
 mod collections;
 mod fanout;
 mod music;
+mod playlists;
 mod trickplay;
 
 #[cfg(test)]
@@ -25435,6 +25979,9 @@ mod tests {
     /// cast.
     #[tokio::test]
     async fn a_failed_credits_request_is_not_an_answer() {
+        // Every retry of the 500 is still sent; the limiter's own suite tests
+        // the backoff between them.
+        ferrofin_providers::rate_limit::test_support::skip_backoff();
         let tmp = tempfile::tempdir().unwrap();
         let lookup = super::ResolverGuesses::default();
         for (credits, expected) in [
@@ -30633,6 +31180,9 @@ mod tests {
     // every provider for every stored row.
     #[tokio::test]
     async fn a_failed_credits_request_does_not_wipe_a_stored_cast() {
+        // Every retry of the 500 is still sent; the limiter's own suite tests
+        // the backoff between them.
+        ferrofin_providers::rate_limit::test_support::skip_backoff();
         // Season text answers; `/credits` 500s.
         let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), None);
         let tmp = tempfile::tempdir().unwrap();

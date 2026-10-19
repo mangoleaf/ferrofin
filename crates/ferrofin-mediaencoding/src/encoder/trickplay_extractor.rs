@@ -41,6 +41,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::encoder::FfmpegVersion;
+use crate::encoder::encoding_utils::quote;
 use crate::encoding_helper::hw::FfmpegCapabilities;
 use crate::error::MediaEncodingError;
 use async_trait::async_trait;
@@ -198,9 +199,11 @@ pub fn build_trickplay_args(
         ""
     };
     format!(
-        "-loglevel error {skip_frame}-threads {threads} -i file:\"{input_path}\" -an -sn \
+        "-loglevel error {skip_frame}-threads {threads} -i file:{input} -an -sn \
          -vf \"fps=1000/{interval_ms},scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2\" \
-         -threads {threads} -c:v mjpeg -qscale:v {qscale}{sync} -f image2 \"{output_pattern}\""
+         -threads {threads} -c:v mjpeg -qscale:v {qscale}{sync} -f image2 {output}",
+        input = quote(input_path),
+        output = quote(output_pattern),
     )
 }
 
@@ -444,9 +447,11 @@ pub fn build_accelerated_trickplay_args(
     };
     let sync = crate::encoding_helper::helper::video_sync_option("0", caps.ffmpeg_version());
     let args = format!(
-        "-loglevel error{skip_frame}{separator}{hwaccel_args} -i file:\"{input_path}\"\
+        "-loglevel error{skip_frame}{separator}{hwaccel_args} -i file:{input}\
          {noautoscale} -an -sn {flag} \"{graph}\" -threads {threads} \
-         -c:v {video_encoder} {quality_option} {quality}{sync} -f image2 \"{output_pattern}\""
+         -c:v {video_encoder} {quality_option} {quality}{sync} -f image2 {output}",
+        input = quote(input_path),
+        output = quote(output_pattern),
     );
     Some((args, hwaccel.env))
 }
@@ -845,10 +850,8 @@ mod tests {
                 .push(arguments.to_owned());
             self.env.lock().expect("env lock").push(env.to_vec());
             // Recover the output dir from the trailing `"{dir}/%08d.jpg"`.
-            let pattern = arguments
-                .rsplit('"')
-                .nth(1)
-                .expect("quoted output pattern present");
+            let argv = crate::encoder::split_args(arguments)?;
+            let pattern = argv.last().expect("output pattern present");
             let dir = std::path::Path::new(pattern)
                 .parent()
                 .expect("pattern has a parent dir");
@@ -886,6 +889,21 @@ mod tests {
              -vf \"fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2\" \
              -threads 1 -c:v mjpeg -qscale:v 4 -fps_mode passthrough -f image2 \"/tmp/out/%08d.jpg\""
         );
+    }
+
+    /// A file name built to close the quote must stay one `-i` value: before
+    /// the fix this path ended the `file:"…"` span and `-y -i /etc/passwd`
+    /// reached ffmpeg as options.
+    #[rstest::rstest]
+    #[case::quote(r#"/m/a" -y -i /etc/passwd ".mkv"#)]
+    #[case::backslash_quote(r#"/m/a\" -y -i /etc/passwd \".mkv"#)]
+    fn a_hostile_path_stays_one_input(#[case] path: &str) {
+        let args = build_trickplay_args(path, 10_000, 320, 4, 1, "/tmp/o/%08d.jpg", None, false);
+        let tokens = crate::encoder::split_args(&args).unwrap();
+        let i = tokens.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(tokens[i + 1], format!("file:{path}"));
+        assert_eq!(tokens.iter().filter(|a| *a == "-i").count(), 1);
+        assert_eq!(tokens.last().unwrap(), "/tmp/o/%08d.jpg");
     }
 
     #[test]

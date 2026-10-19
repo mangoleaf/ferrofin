@@ -257,6 +257,32 @@ pub fn settle_sort_name(row: &mut BaseItemEntity) {
     }
 }
 
+/// `BaseItem.UpdateRatingToItems` (`BaseItem.cs:2974-2995`, v12.2): the
+/// rating a box set or playlist takes from its members. Their distinct
+/// (ordinal-ignore-case) non-empty official ratings are ordered by `score`'s
+/// score then sub-score, an unknown rating last (as 1001), ties in member
+/// order, and the first — the least restrictive — wins. Unrated members are
+/// ignored; with no rated member the container keeps `current`.
+pub fn rating_to_items<'a>(
+    current: Option<&'a str>,
+    members: impl IntoIterator<Item = Option<&'a str>>,
+    score: impl Fn(&str) -> Option<ferrofin_model::entities_media::ParentalRatingScore>,
+) -> Option<&'a str> {
+    let mut ratings: Vec<&str> = Vec::new();
+    for rating in members.into_iter().flatten().filter(|r| !r.is_empty()) {
+        if !ratings
+            .iter()
+            .any(|seen| ferrofin_util::string_extensions::equals_ordinal_ignore_case(seen, rating))
+        {
+            ratings.push(rating);
+        }
+    }
+    ratings
+        .into_iter()
+        .min_by_key(|rating| score(rating).map_or((1001, Some(1001)), |s| (s.score, s.sub_score)))
+        .or(current)
+}
+
 /// `EnableAlphaNumericSorting` (`BaseItem.cs`, overridden to `false` by
 /// `Person.cs` only): whether `CreateSortName` runs the alphanumeric
 /// pipeline, or keeps the name verbatim apart from `TrimStart()`.

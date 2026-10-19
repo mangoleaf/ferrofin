@@ -11,8 +11,10 @@ These tiers were last derived from the v2 parity ledger, retired with the v2 sui
 `crates/ferrofin-api/tests/contract_superset.rs`, where **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
 equivalence** — the Jellyfin release each row was compared against is `UPSTREAM_TAG` /
-`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs`. That record is early:
-**7 of 412 operations** carry a row today, so the tiers below remain the honest picture and
+`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs` (the latest Jellyfin release,
+`v12.2`), except rows listed in `VERIFIED_AGAINST_EARLIER_PIN`. That record is early:
+**7 of 412 operations** carry a row today, all 7 compared against the earlier pin `v12.0-rc7`
+and owed a re-check against `v12.2`, so the tiers below remain the honest picture and
 the `VERIFIED` count is the one that will replace them as it fills in.
 
 Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin
@@ -50,6 +52,8 @@ Deep-verified against a real Jellyfin server:
 
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
+  As in Jellyfin 12, Emby-era credentials (`X-Emby-Authorization`, `X-Emby-Token`) need
+  `EnableLegacyAuthorization`, off by default ([UPGRADING.md](UPGRADING.md)).
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
   path-scoped ingest; virtual folders; item read + write/edit + delete (a delete removes the
   item's files exactly as Jellyfin does — a video's own folder, prefix-matched sidecars —
@@ -67,18 +71,33 @@ Deep-verified against a real Jellyfin server:
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
-  the immutable-tagged-image caching contract.
+  the immutable-tagged-image caching contract. A user's profile image is stored where
+  Jellyfin stores it, `{config}/users/{Username}/profile{ext}`.
+  - **Accepted divergence (a fix, not a gap):** renaming a user moves their profile image
+    to the new name's folder. Jellyfin leaves it, so a new user who takes the old name
+    overwrites the renamed user's image on upload and deletes it on removal.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
+    the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
+    before the moved entry is taken out and lands it one place short when it moves down past
+    a member hidden from that user. Ferrofin puts it at the position asked for.
+  - **Accepted divergence (a fix, not a gap):** deleting a user hands over or deletes only
+    the playlists that user owned, once the delete has succeeded, and never hands one to a
+    user who no longer exists. Jellyfin also takes from their owners the playlists that were
+    shared with or open to the deleted user, skips one the user owned but could not see past
+    a parental limit, gives away or deletes the playlists even when it then refuses to delete
+    the last user or administrator, and can hand a playlist to a deleted user.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from
   configuration. NVENC is verified on real hardware; VAAPI and QSV are verified against
-  the upstream argument shapes but **have not yet been run on an Intel or AMD GPU**.
+  the upstream argument shapes (except QSV's HLS keyframes, forced as IDR frames like
+  NVENC's) but **have not yet been run on an Intel or AMD GPU**.
   **AMF, VideoToolbox, RKMPP and V4L2M2M are not supported** — see the note in
   `CLAUDE.md`; selecting one falls back to a software transcode and logs a warning.
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed
@@ -93,8 +112,10 @@ Deep-verified against a real Jellyfin server:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — all 20 of Jellyfin's scheduled tasks (including the Live TV
-  guide refresh and the hidden channel refresh) plus the trigger scheduler.
+- **Scheduled tasks** — 19 of Jellyfin's scheduled tasks (including the Live TV guide
+  refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
+  collections and playlists" is gone, as in Jellyfin 12; Jellyfin 12's "Refresh upcoming
+  and missing episodes (TheMovieDb)" task is not ported yet.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
@@ -159,11 +180,19 @@ Wired and working, with a documented limitation or lighter verification:
     worth the dependency. `.cbz` and `.cbt` are fully read.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
-- **`collection.xml` / `playlist.xml` / `.m3u` playlist files** — the readers and writers are
-  ported and tested, but nothing calls them yet: Ferrofin creates collections and playlists as
-  pathless database rows, and its scanner resolves no collection/playlist *folders*, so there
-  is no on-disk file to read or write. Membership lives in `BaseItems."Data"` (Jellyfin's own
-  source of truth), which is what makes in-place adoption of a Jellyfin database work.
+- **Playlist files are read, never written** — a library scan makes a playlist of each
+  `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
+  named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
+  `playlist.xml` only the members and the media type are read so far — its title, overview,
+  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
+  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
+  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
+  saves XML metadata into the library (a library whose metadata savers are unset), the
+  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
+  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  `collection.xml` is still not read or written: Ferrofin's collections are pathless database
+  rows, with membership in the `LinkedChildren` table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 

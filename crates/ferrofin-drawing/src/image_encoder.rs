@@ -38,7 +38,7 @@ use tokio::sync::Semaphore;
 use crate::error::DrawingError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use ferrofin_model::drawing::drawing_utils::{resize, resize_fill};
+use ferrofin_model::drawing::drawing_utils::{resize, resize_fill, scale_down_to_fit};
 use ferrofin_model::drawing::{ImageDimensions, ImageFormat, ImageOrientation};
 use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
@@ -274,12 +274,26 @@ impl ImageCrateEncoder {
     /// Resizes `image` to exactly `size` using a high-quality Lanczos3 filter
     /// (the `image` crate's nearest analogue to Skia's Mitchell/linear
     /// resamplers). Mirrors `SkiaEncoder.ResizeImage` at the dimensional level.
-    fn resize_exact(image: &DynamicImage, size: ImageDimensions) -> DynamicImage {
-        // Non-positive dimensions cannot be requested here: DrawingUtils never
-        // produces them from a decoded (positive) source. Clamp to 1 defensively.
-        let width = u32::try_from(size.width.max(1)).unwrap_or(1);
-        let height = u32::try_from(size.height.max(1)).unwrap_or(1);
-        image.resize_exact(width, height, imageops::FilterType::Lanczos3)
+    ///
+    /// `DrawingUtils.Resize` can round one axis to 0 (an ordinary `width=100` on a
+    /// 10000x10 source, or an extreme `width`x`height` shrunk by `maxWidth`/
+    /// `maxHeight`), and `ScaleDownToFit` passes that through.
+    /// Skia's `SKSurface.Create` returns null for an empty target and the encode
+    /// throws, so that is an error here too (the processor then serves the
+    /// original), never a 1-pixel axis beside an unclamped one.
+    fn resize_exact(
+        image: &DynamicImage,
+        size: ImageDimensions,
+    ) -> Result<DynamicImage, ServiceError> {
+        match (u32::try_from(size.width), u32::try_from(size.height)) {
+            (Ok(width @ 1..), Ok(height @ 1..)) => {
+                Ok(image.resize_exact(width, height, imageops::FilterType::Lanczos3))
+            }
+            _ => Err(ServiceError::invalid_input(format!(
+                "cannot resize to {}x{}",
+                size.width, size.height
+            ))),
+        }
     }
 
     /// The synchronous body of [`get_image_size`](ImageEncoder::get_image_size),
@@ -341,17 +355,9 @@ impl ImageCrateEncoder {
             return Ok(input_path.to_owned());
         }
 
-        // GetNewImageSize: DrawingUtils.Resize then DrawingUtils.ResizeFill.
-        let sized = resize(
-            original,
-            options.width.unwrap_or(0),
-            options.height.unwrap_or(0),
-            options.max_width.unwrap_or(0),
-            options.max_height.unwrap_or(0),
-        );
-        let new_size = resize_fill(sized, options.fill_width, options.fill_height);
+        let new_size = get_new_image_size(options, original);
 
-        let resized = Self::resize_exact(&image, new_size);
+        let resized = Self::resize_exact(&image, new_size)?;
         Self::write(
             &resized,
             output_path,
@@ -360,6 +366,27 @@ impl ImageCrateEncoder {
         )?;
         Ok(output_path.to_owned())
     }
+}
+
+/// Port of `ImageHelper.GetNewImageSize`: `DrawingUtils.Resize`, then
+/// `DrawingUtils.ResizeFill`, then `DrawingUtils.ScaleDownToFit` against the
+/// source, so a caller-supplied `width`/`height` never encodes (or allocates)
+/// larger than the original image.
+fn get_new_image_size(
+    options: &ImageProcessingOptions,
+    original: ImageDimensions,
+) -> ImageDimensions {
+    let new_size = resize(
+        original,
+        options.width.unwrap_or(0),
+        options.height.unwrap_or(0),
+        options.max_width.unwrap_or(0),
+        options.max_height.unwrap_or(0),
+    );
+    let new_size = resize_fill(new_size, options.fill_width, options.fill_height);
+
+    // Never encode larger than the source.
+    scale_down_to_fit(new_size, original)
 }
 
 /// The decodable input extensions this encoder advertises.
@@ -600,8 +627,19 @@ impl ImageEncoder for ImageCrateEncoder {
             _ => i32::try_from(first.height()).unwrap_or(i32::MAX),
         };
 
-        let grid_w = u32::try_from(img_width * tile_width).unwrap_or(u32::MAX);
-        let grid_h = u32::try_from(img_height * tile_height).unwrap_or(u32::MAX);
+        // Checked: a wrapped i32 product would ask RgbaImage::new for a huge buffer.
+        let (Some(grid_w), Some(grid_h)) = (
+            img_width
+                .checked_mul(tile_width)
+                .and_then(|w| u32::try_from(w).ok()),
+            img_height
+                .checked_mul(tile_height)
+                .and_then(|h| u32::try_from(h).ok()),
+        ) else {
+            return Err(ServiceError::invalid_input(format!(
+                "A {tile_width}x{tile_height} grid of {img_width}x{img_height} images is too large.",
+            )));
+        };
         let mut grid = RgbaImage::new(grid_w, grid_h);
 
         let mut img_index = 0usize;
@@ -871,6 +909,109 @@ mod tests {
 
         let dims = enc.get_image_size(&output).await.expect("probe out");
         assert_eq!(dims, ImageDimensions::new(960, 540));
+    }
+
+    /// Transliterated from upstream `ImageHelperTests` (jellyfin#17056): an
+    /// explicit size larger than a 600x336 source is clamped to it.
+    #[rstest]
+    #[case::explicit_size_larger_than_source(Some(23100), Some(23100), None, None, None, 336, 336)]
+    #[case::width_larger_than_source(Some(10000), None, None, None, None, 600, 336)]
+    #[case::fill_larger_than_source(None, None, None, Some(23100), Some(23100), 600, 336)]
+    #[case::smaller_than_source_still_downscales(None, None, Some(300), None, None, 300, 168)]
+    #[case::no_size_requested_returns_source(None, None, None, None, None, 600, 336)]
+    fn get_new_image_size_never_exceeds_source(
+        #[case] width: Option<i32>,
+        #[case] height: Option<i32>,
+        #[case] max_width: Option<i32>,
+        #[case] fill_width: Option<i32>,
+        #[case] fill_height: Option<i32>,
+        #[case] expected_width: i32,
+        #[case] expected_height: i32,
+    ) {
+        let options = ImageProcessingOptions {
+            width,
+            height,
+            max_width,
+            fill_width,
+            fill_height,
+            ..Default::default()
+        };
+        assert_eq!(
+            get_new_image_size(&options, ImageDimensions::new(600, 336)),
+            ImageDimensions::new(expected_width, expected_height)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_request_encodes_at_source_size() {
+        // Regression: width/height went straight to resize_exact, so one
+        // request could ask for an unbounded allocation.
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "src.png", 60, 40);
+        let output = out_path(&dir, "out.png");
+        let enc = ImageCrateEncoder::new();
+
+        let options = ImageProcessingOptions {
+            width: Some(i32::MAX),
+            height: Some(i32::MAX),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        enc.encode_image(
+            &input,
+            Utc::now(),
+            &output,
+            false,
+            None,
+            90,
+            &options,
+            ImageFormat::Png,
+        )
+        .await
+        .expect("encode");
+
+        let dims = enc.get_image_size(&output).await.expect("probe out");
+        assert_eq!(dims, ImageDimensions::new(40, 40));
+    }
+
+    /// `Resize` rounds one axis to 0 and `ScaleDownToFit` passes it through.
+    /// Skia fails on the empty surface (so the original is served); this must
+    /// fail too, never resize to 1 x (unclamped other axis).
+    #[rstest]
+    #[case::zero_width(Some(1), Some(i32::MAX), None, Some(1_000_000_000))]
+    #[case::zero_height(Some(i32::MAX), Some(1), Some(1_000_000_000), None)]
+    #[tokio::test]
+    async fn zero_axis_size_is_an_error(
+        #[case] width: Option<i32>,
+        #[case] height: Option<i32>,
+        #[case] max_width: Option<i32>,
+        #[case] max_height: Option<i32>,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "src.png", 60, 40);
+        let output = out_path(&dir, "out.png");
+        let options = ImageProcessingOptions {
+            width,
+            height,
+            max_width,
+            max_height,
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let result = ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await;
+        assert!(matches!(result, Err(ServiceError::InvalidInput(_))));
+        assert!(!Path::new(&output).exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1270,6 +1411,24 @@ mod tests {
         // Provided img_width (999) does not match the decoded 320.
         assert!(matches!(
             enc.create_trickplay_tile(&options, 90, 999, None).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn trickplay_overflowing_grid_is_invalid() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "g.png", 16, 16);
+        let enc = ImageCrateEncoder::new();
+        let options = ImageCollageOptions {
+            input_paths: vec![input],
+            output_path: out_path(&dir, "g.jpg"),
+            // 16 * (i32::MAX / 8) overflows i32 instead of wrapping into a huge buffer.
+            width: i32::MAX / 8,
+            height: 1,
+        };
+        assert!(matches!(
+            enc.create_trickplay_tile(&options, 90, 16, None).await,
             Err(ServiceError::InvalidInput(_))
         ));
     }

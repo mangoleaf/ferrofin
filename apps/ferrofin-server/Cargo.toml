@@ -55,7 +55,6 @@ clap.workspace = true
 config.workspace = true
 serde.workspace = true
 serde_json.workspace = true   # best-effort system.json pre-read for log retention
-shlex = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
@@ -88,6 +87,12 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # the server's own database file.
 sqlx.workspace = true
 tracing-opentelemetry.workspace = true
+# first_light, elevation: drive the session WebSocket over a real loopback connection.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+# item_refresh_generated_images: writes the artwork a collage is drawn from and
+# reads the drawn pixels back.
+image.workspace = true
 
 # jemalloc's configure script cannot build under MSVC; main.rs cfg-gates the
 # allocator the same way, so Windows falls back to the system allocator.

@@ -56,11 +56,17 @@ pub fn infer_audio_codec(container: &str) -> String {
         return "aac".to_owned();
     }
     let lower = container.to_ascii_lowercase();
+    #[allow(clippy::match_same_arms)]
     match lower.as_str() {
         "ogg" | "oga" | "ogv" | "webm" | "webma" => "opus".to_owned(),
         "m4a" | "m4b" | "mp4" | "mov" | "mkv" | "mka" => "aac".to_owned(),
         "ts" | "avi" | "flv" | "f4v" | "swf" => "mp3".to_owned(),
-        _ => lower,
+        // Containers whose name IS the codec they carry.
+        "aac" | "ac3" | "alac" | "dts" | "eac3" | "flac" | "mp2" | "mp3" | "opus" | "truehd"
+        | "vorbis" => lower,
+        // Anything else (manifests like m3u8/mpd in particular) is not an
+        // audio codec — never hand it to ffmpeg as an encoder.
+        _ => "aac".to_owned(),
     }
 }
 
@@ -364,8 +370,9 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             }
 
             if let Some(b) = bitrate {
+                let compensated = bit_depth_compensated_bitrate(b, stream, 8);
                 let input_codec = stream.codec.as_deref().unwrap_or_default();
-                let mut scaled = scale_bitrate(b, input_codec, output_video_codec);
+                let mut scaled = scale_bitrate(compensated, input_codec, output_video_codec);
                 if let Some(req) = request.video_bit_rate {
                     scaled = min(scaled, req);
                 }
@@ -703,6 +710,26 @@ fn video_bitrate_scale_factor(codec: &str) -> f64 {
         return 0.5;
     }
     1.0
+}
+
+/// Compensates the bitrate when reducing bit depth from 10-bit to a lower target.
+///
+/// 10-bit encoded video is more efficient; reducing depth without compensation
+/// degrades quality at low bitrates. Port of `GetBitDepthCompensatedBitrate`.
+fn bit_depth_compensated_bitrate(bitrate: i32, stream: &MediaStream, target_bit_depth: i32) -> i32 {
+    if target_bit_depth >= 10 || stream.bit_depth.is_some_and(|d| d <= target_bit_depth) {
+        return bitrate;
+    }
+    let Some(source_bitrate) = stream.bit_rate else {
+        return bitrate;
+    };
+    let factor: f64 = match source_bitrate {
+        ..=4_000_000 => 1.5,
+        4_000_001..=8_000_000 => 1.2,
+        8_000_001..=12_000_000 => 1.1,
+        _ => 1.05,
+    };
+    f64_to_i32_round(f64::from(bitrate) * factor)
 }
 
 /// Scales a bitrate for a codec transition. Port of `ScaleBitrate` (public so
@@ -1126,7 +1153,8 @@ pub fn find_index(media_streams: &[MediaStream], stream_to_find: &MediaStream) -
 
 /// Whether the encoded output would embed a burnt-in subtitle. Port of
 /// `ShouldEncodeSubtitle`.
-fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
+#[must_use]
+pub fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
     state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
         || (state.base_request.always_burn_in_subtitle_when_transcoding
             && !EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref()))
@@ -1200,6 +1228,113 @@ pub fn video_sync_option(video_sync: &str, ffmpeg_version: Option<FfmpegVersion>
     }
 
     format!(" -vsync {video_sync}")
+}
+
+/// The GOP-only encoders that can force keyframes after all, once a forced
+/// I-frame is made an IDR frame, and the option that does it.
+const FORCED_IDR_ENCODERS: [(&str, &str); 6] = [
+    ("h264_nvenc", "-forced-idr:v:0"),
+    ("hevc_nvenc", "-forced-idr:v:0"),
+    ("av1_nvenc", "-forced-idr:v:0"),
+    ("h264_qsv", "-forced_idr:v:0"),
+    ("hevc_qsv", "-forced_idr:v:0"),
+    ("av1_qsv", "-forced_idr:v:0"),
+];
+
+/// Upstream's encoders that cannot force a keyframe, so only a pinned GOP
+/// cuts segments. Kept verbatim; [`FORCED_IDR_ENCODERS`] is checked first and
+/// takes its NVENC and QSV entries.
+const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 11] = [
+    "h264_qsv",
+    "h264_nvenc",
+    "h264_amf",
+    "h264_rkmpp",
+    "hevc_qsv",
+    "hevc_nvenc",
+    "hevc_rkmpp",
+    "av1_qsv",
+    "av1_nvenc",
+    "av1_amf",
+    "libsvtav1",
+];
+
+/// Encoders that honour `-force_key_frames` and need no pinned GOP.
+const FORCED_KEYFRAME_ENCODERS: [&str; 5] = [
+    "libx264",
+    "libx265",
+    "h264_vaapi",
+    "hevc_vaapi",
+    "av1_vaapi",
+];
+
+/// The arguments that put a keyframe at every HLS segment boundary, so the
+/// muxer cuts on `-hls_time` and segment N holds the time range the playlist
+/// says it does.
+///
+/// Port of `EncodingHelper.GetHlsVideoKeyFrameArguments`. Some encoders
+/// cannot force a keyframe, so they get a GOP of one segment instead; the
+/// rest get the forced-keyframe expression, and an unknown encoder gets both.
+/// `frame_rate` sizes the GOP in output frames; `None` pins no GOP, as
+/// upstream does without a frame rate. A zero, negative or non-finite rate (a
+/// probed `0/1`) counts as none here, where upstream would emit an all-intra
+/// `-g 0` or an unparseable `NaN`.
+///
+/// Divergence: upstream gives NVENC and QSV the GOP alone, because their
+/// forced I-frames are not IDR frames. Their `forced-idr` (NVENC) or
+/// `forced_idr` (QSV) option makes them so, and a keyframe forced on time
+/// then cuts every segment, where a GOP needs the rate ffmpeg encodes at,
+/// which ffprobe's rates misstate on VFR, doubled-`tbr` and millisecond-grid
+/// sources. NVENC is verified on real hardware; the QSV half rests on
+/// qsvenc's source (`forced_idr` marks a forced frame IDR) and has not yet
+/// been run on an Intel GPU.
+///
+/// The expression is unquoted because the result is split on whitespace into
+/// argv, not handed to a shell. Returns the arguments **with a leading
+/// space**, or the empty string.
+#[must_use]
+pub fn hls_video_key_frame_arguments(
+    caps: &super::hw::capabilities::FfmpegCapabilities,
+    codec: &str,
+    segment_length: i32,
+    frame_rate: Option<f32>,
+) -> String {
+    let key_frame_arg = format!(" -force_key_frames:0 expr:gte(t,n_forced*{segment_length})");
+    // Forcing keyframes is not enough on its own: a scene cut can put a
+    // keyframe mid-segment and push the next forced one past the boundary.
+    let gop_arg = frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .map_or_else(String::new, |rate| {
+            let gop = (f64::from(segment_length) * f64::from(rate)).ceil();
+            format!(" -g:v:0 {gop} -keyint_min:v:0 {gop}")
+        });
+    let is_one_of = |encoders: &[&str]| encoders.iter().any(|e| e.eq_ignore_ascii_case(codec));
+
+    let forced_idr = FORCED_IDR_ENCODERS
+        .iter()
+        .find(|(encoder, _)| encoder.eq_ignore_ascii_case(codec));
+
+    let mut args = if let Some((_, option)) = forced_idr {
+        format!(" {option} 1{key_frame_arg}")
+    } else if is_one_of(&GOP_ONLY_KEYFRAME_ENCODERS) {
+        gop_arg
+    } else if is_one_of(&FORCED_KEYFRAME_ENCODERS) {
+        if codec.eq_ignore_ascii_case("libx264") {
+            // Stops libx264's scene-cut detection from breaking the forced keyframes.
+            key_frame_arg + " -sc_threshold:v:0 0"
+        } else {
+            key_frame_arg
+        }
+    } else {
+        key_frame_arg + &gop_arg
+    };
+
+    // The AMD HEVC VA-API encoder's in-band parameter sets disagree with the
+    // extradata ffmpeg writes, which breaks decoding as `hvc1`; extracting the
+    // extradata from the in-band sets works around it.
+    if codec.eq_ignore_ascii_case("hevc_vaapi") && caps.is_vaapi_device_amd() {
+        args.push_str(" -flags:v -global_header -bsf:v extract_extradata=remove=0");
+    }
+    args
 }
 
 /// The `setparams` filter tagging input frames with their HDR colour metadata,
@@ -1804,6 +1939,112 @@ mod tests {
         assert_eq!(state.map_args_for_test(), "-sn");
     }
 
+    // ----- bit_depth_compensated_bitrate ---------------------------------------
+
+    #[test]
+    fn bit_depth_compensation_at_low_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            3_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_mid_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(6_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(5_000_000, &stream, 8),
+            6_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_high_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(10_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(8_000_000, &stream, 8),
+            8_800_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_very_high_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(20_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(15_000_000, &stream, 8),
+            15_750_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_target_is_10() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 10),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_source_is_8bit() {
+        let stream = MediaStream {
+            bit_depth: Some(8),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_no_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: None,
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_applies_when_bit_depth_unknown() {
+        let stream = MediaStream {
+            bit_depth: None,
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            3_000_000
+        );
+    }
+
     // ----- video_bitrate_param (software) ------------------------------------
 
     #[test]
@@ -1867,10 +2108,11 @@ mod tests {
             stream_type: MediaStreamType::Video,
             ..MediaStream::default()
         };
-        // min(source 4M, requested 10M) = 4M; same codec, > 3M → factor 1; then
-        // capped to request 10M → 4_000_000.
+        // min(source 4M, requested 10M) = 4M; same codec, > 3M → factor 1;
+        // bit_depth is None → compensation factor 1.5 (source ≤ 4M);
+        // 4M × 1.5 = 6M, capped to request 10M → 6_000_000.
         let value = helper(vec![]).video_bitrate_param_value(&request, Some(&stream), "h264");
-        assert_eq!(value, 4_000_000);
+        assert_eq!(value, 6_000_000);
     }
 
     // ----- audio_bitrate_param -----------------------------------------------
@@ -2745,6 +2987,96 @@ mod tests {
         assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
     }
 
+    const FORCED_3S: &str = " -force_key_frames:0 expr:gte(t,n_forced*3)";
+
+    #[rstest]
+    // NVENC and QSV force their keyframes as IDR frames, whatever the rate.
+    #[case(
+        "h264_qsv",
+        Some(23.976),
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "HEVC_QSV",
+        None,
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "av1_qsv",
+        Some(25.0),
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "h264_nvenc",
+        Some(25.0),
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "hevc_nvenc",
+        Some(25.0),
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "av1_nvenc",
+        None,
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    // Unable to force keyframes: the GOP alone, ceil(3 × 23.976) = 72.
+    #[case("libsvtav1", Some(23.976), false, " -g:v:0 72 -keyint_min:v:0 72")]
+    #[case("h264_amf", Some(30.0), false, " -g:v:0 90 -keyint_min:v:0 90")]
+    // No frame rate, no GOP: nothing at all for these encoders.
+    #[case("libsvtav1", None, false, "")]
+    // Nor from a rate that is no rate: never `-g:v:0 0` or `NaN`.
+    #[case("libsvtav1", Some(0.0), false, "")]
+    #[case("libsvtav1", Some(f32::NAN), false, "")]
+    #[case("mpeg4", Some(f32::INFINITY), false, FORCED_3S)]
+    // Forced keyframes, and libx264 also loses its scene-cut detection.
+    #[case(
+        "libx264",
+        Some(25.0),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -sc_threshold:v:0 0"
+    )]
+    #[case("libx265", Some(25.0), false, FORCED_3S)]
+    #[case("h264_vaapi", Some(25.0), true, FORCED_3S)]
+    #[case("hevc_vaapi", Some(25.0), false, FORCED_3S)]
+    // The AMD HEVC VA-API parameter-set workaround.
+    #[case(
+        "hevc_vaapi",
+        Some(25.0),
+        true,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -flags:v -global_header -bsf:v extract_extradata=remove=0"
+    )]
+    // Any other encoder gets both.
+    #[case(
+        "mpeg4",
+        Some(25.0),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -g:v:0 75 -keyint_min:v:0 75"
+    )]
+    #[case("mpeg4", None, false, FORCED_3S)]
+    fn hls_keyframe_arguments_follow_the_encoder(
+        #[case] codec: &str,
+        #[case] frame_rate: Option<f32>,
+        #[case] amd: bool,
+        #[case] expected: &str,
+    ) {
+        // Not AMD means an Intel iHD device, the other common VA-API driver.
+        let caps = super::super::hw::capabilities::FfmpegCapabilities::builder()
+            .vaapi_driver(amd, !amd, false)
+            .build();
+        assert_eq!(
+            hls_video_key_frame_arguments(&caps, codec, 3, frame_rate),
+            expected
+        );
+    }
+
     fn codecs(list: &str) -> Vec<String> {
         list.split(',').map(str::to_owned).collect()
     }
@@ -2809,5 +3141,23 @@ mod tests {
             helper(vec![available]).can_encode_to_audio_codec(codec),
             expected
         );
+    }
+
+    #[rstest]
+    #[case("ogg", "opus")]
+    #[case("webm", "opus")]
+    #[case("mp4", "aac")]
+    #[case("mkv", "aac")]
+    #[case("ts", "mp3")]
+    #[case("flac", "flac")]
+    #[case("ac3", "ac3")]
+    #[case("aac", "aac")]
+    #[case("m3u8", "aac")]
+    #[case("mpd", "aac")]
+    #[case("hls", "aac")]
+    #[case("wtv", "aac")]
+    #[case("", "aac")]
+    fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
+        assert_eq!(infer_audio_codec(container), expected);
     }
 }

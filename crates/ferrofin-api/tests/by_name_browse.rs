@@ -169,6 +169,10 @@ const MUSIC_GENRE_ID: Uuid = Uuid::from_u128(0xAA05);
 const SLUG_GENRE_ID: Uuid = Uuid::from_u128(0xAA07);
 const LITERAL_HYPHEN_GENRE_ID: Uuid = Uuid::from_u128(0xAA08);
 const YEAR_ID: Uuid = Uuid::from_u128(0xAA06);
+const MUSIC_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB01);
+const MUSIC_VIDEOS_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB02);
+const MOVIES_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB03);
+const MUSIC_FOLDER_ID: Uuid = Uuid::from_u128(0xBB04);
 
 fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
     QueryResult::new(
@@ -291,6 +295,13 @@ impl LibraryManager for ByNameLibrary {
         };
         Ok(row.into_iter().collect())
     }
+    /// No content restrictions in this fixture.
+    async fn build_access_filter(
+        &self,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Ok(None)
+    }
     /// Backs the `get_people_items` default for `GET /Persons`.
     async fn get_people(&self, q: &InternalPeopleQuery) -> Result<Vec<PeopleEntity>, ServiceError> {
         // Nobody is favorited in this fixture: a favorites-scoped query (the
@@ -316,10 +327,23 @@ impl LibraryManager for ByNameLibrary {
         })
     }
 
-    // ---- Remaining methods are never reached by these tests. ----
-    async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        unimplemented!()
+    /// The `/Genres?parentId=` parents: libraries of each collection type, plus
+    /// a plain folder whose `Data` claims music (not an `ICollectionFolder`).
+    async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let (type_, collection_type) = match id {
+            MUSIC_LIBRARY_ID => ("CollectionFolder", "music"),
+            MUSIC_VIDEOS_LIBRARY_ID => ("CollectionFolder", "musicvideos"),
+            MOVIES_LIBRARY_ID => ("CollectionFolder", "movies"),
+            MUSIC_FOLDER_ID => ("Folder", "music"),
+            _ => return Ok(None),
+        };
+        let mut row = named_entity(id, "Library");
+        row.type_ = format!("MediaBrowser.Controller.Entities.{type_}");
+        row.data = Some(format!(r#"{{"CollectionType":"{collection_type}"}}"#));
+        Ok(Some(row))
     }
+
+    // ---- Remaining methods are never reached by these tests. ----
     async fn query_items(
         &self,
         _q: &InternalItemsQuery,
@@ -646,6 +670,38 @@ async fn genres_list_folds_counts_when_include_item_types_set() {
     let response = get("/Genres").await;
     let body = json_body(response).await;
     assert!(body["Items"][0].get("ChildCount").is_none());
+}
+
+/// `GenresController.GetGenres` answers from `GetMusicGenres` when the parent
+/// is a music or music-videos collection folder (`GenresController.cs:141-150`);
+/// any other parent, or none, keeps the `Genre` rows. The fake serves "Jazz"
+/// from `get_music_genres` and "Drama" from `get_genres`.
+///
+/// `unknown_parent` pins a recorded divergence, not parity: upstream answers
+/// 400 there (`UNKNOWN_PARENT_ID_DIVERGENCE` in `handlers/mod.rs`). Porting the
+/// 400 flips that case.
+#[rstest::rstest]
+#[case::music_library(Some(MUSIC_LIBRARY_ID), MUSIC_GENRE_ID, "Jazz")]
+#[case::music_videos_library(Some(MUSIC_VIDEOS_LIBRARY_ID), MUSIC_GENRE_ID, "Jazz")]
+#[case::movies_library(Some(MOVIES_LIBRARY_ID), GENRE_ID, "Drama")]
+#[case::plain_folder_claiming_music(Some(MUSIC_FOLDER_ID), GENRE_ID, "Drama")]
+#[case::unknown_parent(Some(Uuid::from_u128(0xBBFF)), GENRE_ID, "Drama")]
+#[case::no_parent(None, GENRE_ID, "Drama")]
+#[tokio::test]
+async fn genres_list_switches_to_music_genres_under_a_music_library(
+    #[case] parent: Option<Uuid>,
+    #[case] id: Uuid,
+    #[case] name: &str,
+) {
+    let uri = parent.map_or_else(
+        || "/Genres".to_owned(),
+        |parent| format!("/Genres?parentId={}", parent.simple()),
+    );
+    let response = get(&uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["Items"][0]["Name"], name, "{uri}");
+    assert_eq!(body["Items"][0]["Id"], id.simple().to_string(), "{uri}");
 }
 
 #[tokio::test]

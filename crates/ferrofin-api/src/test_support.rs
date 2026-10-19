@@ -1730,7 +1730,8 @@ impl QuickConnect for FakeQuickConnect {
     }
 }
 
-/// A fake [`PlaylistManager`]; every method is unused by INFRA-level tests.
+/// A fake [`PlaylistManager`]; every method but `remove_playlists` (a no-op)
+/// is unused by INFRA-level tests.
 pub struct FakePlaylists;
 
 #[async_trait]
@@ -1814,7 +1815,8 @@ impl PlaylistManager for FakePlaylists {
         unimplemented!("fake")
     }
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        unimplemented!("fake")
+        // `DELETE /Users/{userId}` hands over the deleted user's playlists.
+        Ok(())
     }
 }
 
@@ -2061,7 +2063,7 @@ impl DeviceManager for FakeDevices {
         &self,
         _device_id: Option<&str>,
     ) -> Result<ClientCapabilities, ServiceError> {
-        unimplemented!("fake")
+        Ok(ClientCapabilities::default())
     }
     async fn get_device(&self, _id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {
         unimplemented!("fake")
@@ -2619,55 +2621,68 @@ impl VirtualFolderManager for FakeVirtualFolders {
 }
 
 /// Builds an [`AppState`] whose virtual-folder store is `vf` and whose auth
-/// always authenticates ([`AuthedAuthService`]), so the library-structure
-/// handlers are reached (rather than short-circuited with `401`).
+/// always authenticates ([`AuthedAuthService`], an ordinary user). The
+/// library-structure handlers are reached because [`FakeConfig`]'s startup
+/// wizard is incomplete; after setup this user gets `403` (see
+/// [`setup_complete_state`]).
 ///
 /// Every other manager is the panic-on-call [`fake_state`] double — the
 /// library-structure handlers touch only the virtual-folder store and the auth
 /// service.
 #[must_use]
 pub fn authed_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> AppState {
-    AppState::new(
-        Arc::new(FakeLibrary),
-        Arc::new(FakeUsers),
-        Arc::new(FakeUserViews),
-        Arc::new(FakeUserData),
-        Arc::new(FakeMediaSources),
-        Arc::new(FakeSessions),
-        Arc::new(FakeSystem),
-        Arc::new(FakeAppHost),
-        Arc::new(FakeConfig),
-        Arc::new(FakeProviders),
-        Arc::new(FakeMusic),
-        Arc::new(FakeSimilarItems),
-        Arc::new(FakeSearch),
-        Arc::new(FakeDto),
-        Arc::new(FakeAuthContext),
-        Arc::new(AuthedAuthService),
-        Arc::new(FakeQuickConnect),
-        Arc::new(FakePlaylists),
-        Arc::new(FakeCollections),
-        Arc::new(FakeTvSeries),
-        Arc::new(FakeSubtitles),
-        Arc::new(FakeLyrics),
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(FakeDevices),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeApiKeys),
-        Arc::new(FakeLocalization),
-        Arc::new(FakeDisplayPreferences),
-        Arc::new(FakeActivity),
-        Arc::new(FakeFileSystem),
-        Arc::new(FakeTasks),
-    )
-    .with_virtual_folders(vf)
+    fake_state_with(Arc::new(AuthedAuthService), Arc::new(FakeConfig)).with_virtual_folders(vf)
 }
 
 /// Like [`authed_state_with_virtual_folders`] but authenticated as an API key,
 /// for `GET /Library/PhysicalPaths` and the other elevated library routes.
 #[must_use]
 pub fn elevated_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> AppState {
+    fake_state_with(Arc::new(ApiKeyAuthService), Arc::new(FakeConfig)).with_virtual_folders(vf)
+}
+
+/// A [`FakeConfig`] whose startup wizard is complete, so the
+/// `FirstTimeSetupOr*` extractors take their post-setup branch.
+pub struct SetupCompleteConfig;
+
+#[async_trait]
+impl ServerConfigurationManager for SetupCompleteConfig {
+    fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
+        Arc::new(FakePaths)
+    }
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(ServerConfiguration {
+            is_startup_wizard_completed: true,
+            ..ServerConfiguration::default()
+        }))
+    }
+    async fn update_configuration(
+        &self,
+        _configuration: &ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_branding(&self, _branding: &BrandingOptions) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// Builds a [`fake_state`] on a server whose startup wizard is complete,
+/// authenticating every request through `auth`, for the tests that a
+/// `FirstTimeSetupOrElevated` route rejects non-administrators after setup.
+#[must_use]
+pub fn setup_complete_state(auth: Arc<dyn AuthService>) -> AppState {
+    fake_state_with(auth, Arc::new(SetupCompleteConfig))
+}
+
+/// [`fake_state`] with the given auth service and configuration manager.
+fn fake_state_with(
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
@@ -2677,14 +2692,14 @@ pub fn elevated_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) ->
         Arc::new(FakeSessions),
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
-        Arc::new(FakeConfig),
+        config,
         Arc::new(FakeProviders),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(ApiKeyAuthService),
+        auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -2702,7 +2717,6 @@ pub fn elevated_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) ->
         Arc::new(FakeFileSystem),
         Arc::new(FakeTasks),
     )
-    .with_virtual_folders(vf)
 }
 
 /// Builds an authenticating [`AppState`] with the given plugin manager injected,

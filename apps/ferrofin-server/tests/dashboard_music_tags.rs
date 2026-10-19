@@ -6,6 +6,9 @@ use axum::{Json, Router};
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
 const CLIENT: &str =
     r#"MediaBrowser Client="music-tag-test", Device="fixture", DeviceId="music-tags", Version="1""#;
 
@@ -137,15 +140,13 @@ async fn saved_artist_and_delimiter_options_change_http_music_metadata_without_r
             Json(json!({"artists":[],"releases":[],"release-groups":[],"results":[],"data":{"token":"fixture"}}))
         })).await.unwrap();
     });
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = Config {
+    let ffmpeg = probe_stub(tmp.path(), "ffmpeg");
+    let ffprobe = probe_stub(tmp.path(), "ffprobe");
+    let client = reqwest::Client::new();
+    let (server, base, _) = boot::spawn_server(&client, |port| Config {
         port,
-        ffmpeg_path: Some(probe_stub(tmp.path(), "ffmpeg")),
-        ffprobe_path: Some(probe_stub(tmp.path(), "ffprobe")),
+        ffmpeg_path: Some(ffmpeg.clone()),
+        ffprobe_path: Some(ffprobe.clone()),
         musicbrainz_base_url: endpoint.clone(),
         studios_repo_url: endpoint.clone(),
         provider_endpoints: ProviderEndpoints {
@@ -156,35 +157,16 @@ async fn saved_artist_and_delimiter_options_change_http_music_metadata_without_r
             fanart: Some(endpoint.clone()),
             audiodb: Some(endpoint.clone()),
             lrclib: Some(endpoint.clone()),
-            opensubtitles: Some(endpoint),
+            opensubtitles: Some(endpoint.clone()),
         },
         ..Config::test_stub(tmp.path())
-    };
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ferrofin_server::run(config))
-            .unwrap();
-    });
+    })
+    .await;
     let mut api = Api {
-        client: reqwest::Client::new(),
-        base: format!("http://127.0.0.1:{port}"),
+        client,
+        base,
         auth: CLIENT.to_owned(),
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if api
-            .client
-            .get(format!("{}/System/Info/Public", api.base))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "server did not start");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let login: Value = api
         .client
         .post(format!("{}/Users/AuthenticateByName", api.base))
@@ -313,7 +295,7 @@ async fn saved_artist_and_delimiter_options_change_http_music_metadata_without_r
         }
     }
     api.post("/System/Shutdown", &Value::Null).await;
-    tokio::task::spawn_blocking(move || server.join().unwrap())
+    tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())
         .await
         .unwrap();
     mock.abort();

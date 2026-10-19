@@ -31,8 +31,8 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ItemTypeLookup};
 use ferrofin_traits::providers::{
-    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
-    RemoteSearchRequest,
+    GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
+    ProviderManager, RefreshPriority, RemoteSearchRequest,
 };
 use uuid::Uuid;
 
@@ -1150,6 +1150,13 @@ pub struct LocalProviderManager {
     /// The people store a refresh writes a provider's credits to (a
     /// season's TMDB cast). Absent → credits are not written.
     people: Option<Arc<dyn ferrofin_traits::persistence::PeopleRepository>>,
+    /// A box set's or playlist's members, which its refresh takes its
+    /// rating from. Absent → the rating is left as stored.
+    linked_children: Option<Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>>,
+    /// The providers that draw a genre's, music genre's or playlist's Primary
+    /// from other items' artwork, run by the refresh as upstream's custom
+    /// providers. Absent → a refresh draws no such image.
+    generated_images: Option<Arc<dyn GeneratedImageProvider>>,
     /// The culture table TheTVDB's translations are matched against
     /// (`ThreeLetterISOLanguageNames`, `TvdbCultureInfo`). Absent → no
     /// translation matches but TVDB's own `zhtw`/`pt`/`por` codes.
@@ -1231,6 +1238,8 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_omdb", &self.omdb.is_some())
             .field("has_tvdb", &self.tvdb.is_some())
             .field("has_people", &self.people.is_some())
+            .field("has_linked_children", &self.linked_children.is_some())
+            .field("has_generated_images", &self.generated_images.is_some())
             .field("has_localization", &self.localization.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .field(
@@ -1256,6 +1265,15 @@ impl LocalProviderManager {
     #[must_use]
     pub fn with_nfo_saver(mut self, saver: Arc<crate::nfo_save::NfoSaver>) -> Self {
         self.nfo_saver = Some(saver);
+        self
+    }
+
+    /// Attaches the providers that draw an item's Primary from other items'
+    /// artwork (upstream's `BaseDynamicImageProvider` family), so a refresh of
+    /// a genre, music genre or playlist redraws its collage.
+    #[must_use]
+    pub fn with_generated_images(mut self, provider: Arc<dyn GeneratedImageProvider>) -> Self {
+        self.generated_images = Some(provider);
         self
     }
 
@@ -1296,6 +1314,8 @@ impl LocalProviderManager {
             omdb: None,
             tvdb: None,
             people: None,
+            linked_children: None,
+            generated_images: None,
             localization: None,
             kind_by_type_name: HashMap::new(),
             virtual_folders: None,
@@ -1424,6 +1444,18 @@ impl LocalProviderManager {
         people: Arc<dyn ferrofin_traits::persistence::PeopleRepository>,
     ) -> Self {
         self.people = Some(people);
+        self
+    }
+
+    /// Attaches the linked-children store, so a box set's or playlist's
+    /// refresh takes its members' rating
+    /// (`EnableUpdatingOfficialRatingFromChildren`).
+    #[must_use]
+    pub fn with_linked_children(
+        mut self,
+        linked_children: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>,
+    ) -> Self {
+        self.linked_children = Some(linked_children);
         self
     }
 
@@ -1744,6 +1776,32 @@ impl LocalProviderManager {
                 Vec::new()
             }
         }
+    }
+
+    /// A box set's or playlist's members' official ratings, in link order
+    /// (`Folder.GetLinkedChildren`); none without a linked-children store.
+    async fn member_ratings(
+        &self,
+        items: &dyn ItemRepository,
+        item_id: Uuid,
+    ) -> Result<Vec<Option<String>>, ServiceError> {
+        let Some(linked) = &self.linked_children else {
+            return Ok(Vec::new());
+        };
+        let ids = linked.get_linked_children_ids(item_id, None).await?;
+        // Only the ratings are kept, so a long playlist is never held as rows.
+        let mut ratings = HashMap::new();
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            for row in items.retrieve_items(chunk).await? {
+                if let Ok(id) = Uuid::parse_str(&row.id) {
+                    ratings.insert(id, row.official_rating);
+                }
+            }
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| ratings.get(id).cloned())
+            .collect())
     }
 
     /// The item's locked metadata fields. Without a store nothing is
@@ -2466,6 +2524,36 @@ impl LocalProviderManager {
             None => (None, 0),
         };
         let fetched = fetched.unwrap_or_default();
+        // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
+        // scores ratings against its `GetPreferredMetadataCountryCode()`.
+        let rating_scorer = match (
+            BaseItemKind::from_stored_type_name(&stored.type_),
+            &self.localization,
+        ) {
+            (Some(BaseItemKind::BoxSet | BaseItemKind::Playlist), Some(localization)) => Some((
+                localization,
+                self.preferred_metadata_country_code(&stored).await,
+            )),
+            _ => None,
+        };
+        let mut base = stored.clone();
+        // `BeforeSave` → `UpdateMetadataFromChildren` → `UpdateOfficialRating`
+        // (`MetadataService.cs:404-483,623-635`): past the `isFullRefresh`
+        // gate, an unlocked container without a locked `OfficialRating` takes
+        // its members' rating before the providers merge.
+        if let Some((localization, country)) = &rating_scorer
+            && crate::refresh_plan::full_refresh(&plan, &request)
+            && !stored.is_locked
+            && !locked_fields.contains(&MetadataField::OfficialRating)
+        {
+            let members = self.member_ratings(items.as_ref(), item_id).await?;
+            base.official_rating = crate::metadata_merge::rating_to_items(
+                base.official_rating.as_deref(),
+                members.iter().map(Option::as_deref),
+                |rating| localization.get_rating_score(rating, Some(country)),
+            )
+            .map(str::to_owned);
+        }
         // `RefreshWithProviders`: a locked item merges nothing; otherwise the
         // provider result — starting from what upstream's `temp` starts with,
         // the item's `ParentIndexNumber` and preferred metadata language and
@@ -2473,7 +2561,7 @@ impl LocalProviderManager {
         // when a provider answered (`UpdateType > None`).
         let current = MetadataResult {
             provider_ids: stored_ids.clone(),
-            ..MetadataResult::of(stored.clone())
+            ..MetadataResult::of(base)
         };
         let merge = RefreshMerge::of(
             options,
@@ -2514,8 +2602,45 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
+        // `OnMetadataChanged` (`BaseItem.cs:2935-2967`): the container's
+        // stored parental score follows its own custom, else official, rating.
+        if let Some((localization, country)) = &rating_scorer {
+            let score = [&row.custom_rating, &row.official_rating]
+                .into_iter()
+                .find_map(|rating| rating.as_deref().filter(|r| !r.is_empty()))
+                .and_then(|rating| localization.get_rating_score(rating, Some(country)));
+            row.inherited_parental_rating_value = score.map(|s| i64::from(s.score));
+            row.inherited_parental_rating_sub_value =
+                score.and_then(|s| s.sub_score.map(i64::from));
+        }
         crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
+        // `RefreshWithProviders`' custom providers, after the merge
+        // (`MetadataService.cs:922-925`): a genre's, music genre's or
+        // playlist's generated Primary (`BaseDynamicImageProvider`). As an
+        // `IForcedProvider` it ignores the fetcher checkboxes, but a locked
+        // item returns before it (`:785-788`); it runs with every provider
+        // (`runAllProviders`) or when its `HasChanged` gate opens.
+        let generated = match &self.generated_images {
+            Some(provider)
+                if !stored.is_locked
+                    && options.metadata_refresh_mode != MetadataRefreshMode::None =>
+            {
+                match provider
+                    .refresh_generated_image(&row, plan.run_all_providers)
+                    .await
+                {
+                    Ok(update) => update == ItemUpdateType::ImageUpdate,
+                    Err(err) => {
+                        // `RunCustomProvider`: a failure, and the refresh goes on.
+                        failures += 1;
+                        tracing::warn!(%item_id, %err, "generated image failed");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
         let image_saved = if fetch.images && self.image_store.is_some() {
             let (saved, image_failures) = Box::pin(crate::rate_limit::count_request_failures(
                 self.refresh_ordered_images(
@@ -2539,7 +2664,7 @@ impl LocalProviderManager {
             plan,
             &request,
             PassOutcome {
-                changed: metadata_changed || ids_changed || image_saved,
+                changed: metadata_changed || ids_changed || image_saved || generated,
                 failed: failures > 0,
             },
         );
@@ -2589,7 +2714,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved {
+        } else if image_saved || generated {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -2914,10 +3039,15 @@ impl LocalProviderManager {
                 let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
             }
         }
+        // `SetImagePath(…, FileInfo)`: the file's own modification time, so
+        // the dynamic image providers' date gate sees an upload as current.
+        let date_modified = std::fs::metadata(&dest)
+            .and_then(|info| info.modified())
+            .map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
-            date_modified: Utc::now(),
+            date_modified,
             width: 0,
             height: 0,
             blur_hash: None,
@@ -3667,6 +3797,7 @@ impl LocalProviderManager {
     /// The TMDB image providers: a title's poster/backdrop/logo set (by its
     /// stored/found id, else a title search), a box set's collection artwork,
     /// a person's profile.
+    #[allow(clippy::too_many_lines)]
     async fn tmdb_images(
         &self,
         source: RemoteImageSource,
@@ -3676,6 +3807,7 @@ impl LocalProviderManager {
         let Some(tmdb) = &self.tmdb else {
             return Vec::new();
         };
+        let request_language = self.preferred_metadata_language(entity).await;
         let name = entity_name(entity);
         let stored_tmdb_id = provider_id_of_pairs(ids, "Tmdb").and_then(parse_numeric_provider_id);
         match source {
@@ -3694,7 +3826,7 @@ impl LocalProviderManager {
                         .map(|h| h.tmdb_id);
                 }
                 match tmdb_id {
-                    Some(id) => tmdb.all_images(kind, id).await,
+                    Some(id) => tmdb.all_images(kind, id, Some(&request_language)).await,
                     None => Vec::new(),
                 }
             }
@@ -3719,7 +3851,8 @@ impl LocalProviderManager {
                 let Some(collection_id) = collection_id else {
                     return Vec::new();
                 };
-                tmdb.collection_images(collection_id).await
+                tmdb.collection_images(collection_id, Some(&request_language))
+                    .await
             }
             RemoteImageSource::TmdbSeason | RemoteImageSource::TmdbEpisode => {
                 // `TmdbSeason/EpisodeImageProvider`: both hop to the PARENT
@@ -3750,21 +3883,27 @@ impl LocalProviderManager {
                     let Some(season_number) = number(entity.index_number) else {
                         return Vec::new();
                     };
-                    tmdb.season_images(series_tmdb_id, season_number).await
+                    tmdb.season_images(series_tmdb_id, season_number, Some(&request_language))
+                        .await
                 } else {
                     let season_number = number(entity.parent_index_number).unwrap_or(1);
                     let Some(episode_number) = number(entity.index_number) else {
                         return Vec::new();
                     };
-                    tmdb.episode_images(series_tmdb_id, season_number, episode_number)
-                        .await
+                    tmdb.episode_images(
+                        series_tmdb_id,
+                        season_number,
+                        episode_number,
+                        Some(&request_language),
+                    )
+                    .await
                 }
             }
             _ => {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
                 // else the first name-search hit.
                 let language = crate::tmdb::normalize_language(
-                    Some(&self.preferred_metadata_language(entity).await),
+                    Some(&request_language),
                     Some(&self.preferred_metadata_country_code(entity).await),
                 );
                 let id = match (stored_tmdb_id, name) {
@@ -3778,7 +3917,10 @@ impl LocalProviderManager {
                     (None, None) => None,
                 };
                 match id {
-                    Some(id) => tmdb.person_images(id, language.as_deref()).await,
+                    Some(id) => {
+                        tmdb.person_images(id, language.as_deref(), Some(&request_language))
+                            .await
+                    }
                     None => Vec::new(),
                 }
             }
@@ -4764,8 +4906,8 @@ mod tests {
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::options::ItemImageInfo;
     use ferrofin_traits::providers::{
-        ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager,
-        RefreshPriority, RemoteSearchRequest,
+        GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
+        ProviderManager, RefreshPriority, RemoteSearchRequest,
     };
     use uuid::Uuid;
 
@@ -9033,6 +9175,32 @@ mod tests {
         assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
     }
 
+    /// `SetImagePath(…, FileInfo)`: an upload records its file's own
+    /// modification time, so the dynamic image providers' date gate sees an
+    /// upload left in the internal folder as current (gl-590).
+    #[test]
+    fn image_upload_records_the_file_modification_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let image = manager
+            .write_image_file(
+                Uuid::from_u128(0x9590),
+                b"art",
+                "image/png",
+                ImageType::Primary,
+                None,
+            )
+            .unwrap();
+        let modified = std::fs::metadata(&image.path).unwrap().modified().unwrap();
+        assert_eq!(
+            image.date_modified,
+            chrono::DateTime::<chrono::Utc>::from(modified)
+        );
+    }
+
     #[test]
     fn image_upload_backdrop_replacement_preserves_a_case_only_path_change() {
         let directory = tempfile::tempdir().unwrap();
@@ -9453,6 +9621,244 @@ mod tests {
             store.replaced.lock().expect("lock").clone(),
             vec![(item_id, vec![("Tmdb".to_owned(), "2344".to_owned())])]
         );
+    }
+
+    /// A container's members, for its rating (`GetLinkedChildren`).
+    struct Members(Vec<Uuid>);
+
+    #[async_trait]
+    impl ferrofin_traits::persistence::LinkedChildrenService for Members {
+        async fn get_linked_children_ids(
+            &self,
+            _parent_id: Uuid,
+            _child_type: Option<i32>,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(self.0.clone())
+        }
+        async fn find_artists(
+            &self,
+            _artist_names: &[String],
+        ) -> Result<HashMap<String, Vec<BaseItemEntity>>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_manual_linked_parent_ids(
+            &self,
+            _child_id: Uuid,
+            _parent_type: Option<BaseItemKind>,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn reroute_linked_children(
+            &self,
+            _from_child_id: Uuid,
+            _to_child_id: Uuid,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn upsert_linked_child(
+            &self,
+            _parent_id: Uuid,
+            _child_id: Uuid,
+            _child_type: i32,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// Issue #55: past `isFullRefresh` a playlist (as a box set) takes the
+    /// least restrictive of its members' ratings, unrated members ignored, and
+    /// its stored parental score follows. A Default refresh of a refreshed
+    /// playlist, a locked `OfficialRating` and a locked item keep the rating.
+    #[rstest::rstest]
+    #[case::force_save(true, false, &[], Some("PG"), Some(10))]
+    #[case::not_a_full_refresh(false, false, &[], Some("R"), Some(17))]
+    #[case::locked_rating(true, false, &[MetadataField::OfficialRating], Some("R"), Some(17))]
+    #[case::locked_item(true, true, &[], Some("R"), Some(17))]
+    #[tokio::test]
+    async fn a_playlist_refresh_takes_its_members_rating(
+        #[case] force_save: bool,
+        #[case] is_locked: bool,
+        #[case] locked: &[MetadataField],
+        #[case] rating: Option<&str>,
+        #[case] score: Option<i64>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Movies.BoxSet", "Mix");
+        stored.type_ = "MediaBrowser.Controller.Playlists.Playlist".to_owned();
+        stored.id = item_id.to_string();
+        stored.official_rating = Some("R".to_owned());
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        stored.is_locked = is_locked;
+        let mut rows = HashMap::from([(item_id, stored.clone())]);
+        let mut members = Vec::new();
+        for member_rating in [Some("R"), None, Some("PG")] {
+            let mut member = row("Movie", "Member");
+            member.official_rating = member_rating.map(str::to_owned);
+            let id = Uuid::parse_str(&member.id).expect("uuid");
+            members.push(id);
+            rows.insert(id, member);
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore {
+            locked: HashMap::from([(item_id, locked.to_vec())]),
+            ..RecordingStore::default()
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems { rows, seen: tx }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_localization(Arc::new(EnglishAndFrench))
+            .with_linked_children(Arc::new(Members(members)));
+        let options = MetadataRefreshOptions {
+            force_save,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_full_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let row = store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("saved: the stored parental score starts unset");
+        assert_eq!(row.official_rating.as_deref(), rating);
+        assert_eq!(row.inherited_parental_rating_value, score);
+    }
+
+    /// The generated-image providers, recording each call's `force`.
+    #[derive(Default)]
+    struct GeneratedImages {
+        forced: std::sync::Mutex<Vec<bool>>,
+        /// Every draw fails.
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl GeneratedImageProvider for GeneratedImages {
+        async fn refresh_generated_image(
+            &self,
+            _item: &BaseItemEntity,
+            force: bool,
+        ) -> Result<ItemUpdateType, ServiceError> {
+            self.forced.lock().expect("lock").push(force);
+            if self.fail {
+                return Err(ServiceError::backend("the collage could not be drawn"));
+            }
+            Ok(ItemUpdateType::ImageUpdate)
+        }
+    }
+
+    /// gl-576: a genre's refresh runs the generated-image providers as
+    /// upstream's custom providers (`MetadataService.GetProviders`, `:785-788`):
+    /// forced when the refresh runs every provider ("Replace all metadata", a
+    /// full refresh, a first refresh), gated otherwise, never for a locked
+    /// item or with metadata mode `None`. A drawn image saves the row.
+    #[rstest::rstest]
+    #[case::full_refresh(MetadataRefreshMode::FullRefresh, false, true, false, Some(true))]
+    #[case::replace_all(MetadataRefreshMode::Default, true, true, false, Some(true))]
+    #[case::first_refresh(MetadataRefreshMode::Default, false, false, false, Some(true))]
+    #[case::default(MetadataRefreshMode::Default, false, true, false, Some(false))]
+    #[case::validation_only(MetadataRefreshMode::ValidationOnly, false, true, false, Some(false))]
+    #[case::mode_none(MetadataRefreshMode::None, false, true, false, None)]
+    #[case::locked(MetadataRefreshMode::FullRefresh, false, true, true, None)]
+    #[tokio::test]
+    async fn a_genre_refresh_runs_the_generated_image_providers(
+        #[case] mode: MetadataRefreshMode,
+        #[case] replace_all_metadata: bool,
+        #[case] refreshed_before: bool,
+        #[case] is_locked: bool,
+        #[case] forced: Option<bool>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.is_locked = is_locked;
+        stored.date_last_refreshed = refreshed_before.then(chrono::Utc::now);
+        // Settled as the refresh settles it, so only the image changes.
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let generated = Arc::new(GeneratedImages::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_generated_images(Arc::clone(&generated) as _);
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            replace_all_metadata,
+            ..MetadataRefreshOptions::default()
+        };
+        let update = mgr
+            .refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let calls = generated.forced.lock().expect("lock").clone();
+        assert_eq!(calls, forced.into_iter().collect::<Vec<_>>());
+        if forced.is_some() && !replace_all_metadata {
+            assert_eq!(update, ItemUpdateType::ImageUpdate);
+            assert!(
+                !store.saved.lock().expect("lock").is_empty(),
+                "a drawn image saves the row"
+            );
+        }
+    }
+
+    /// A draw that fails is a provider failure (`RunCustomProvider`): the
+    /// refresh goes on, but `DateLastRefreshed` is not stamped, as it is when
+    /// the draw succeeds.
+    #[rstest::rstest]
+    #[case::drawn(false, true)]
+    #[case::failed(true, false)]
+    #[tokio::test]
+    async fn a_failed_generated_image_withholds_the_refresh_stamp(
+        #[case] fail: bool,
+        #[case] stamped: bool,
+    ) {
+        let item_id = Uuid::new_v4();
+        let before = chrono::Utc::now() - chrono::TimeDelta::days(1);
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(before);
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_generated_images(Arc::new(GeneratedImages {
+                fail,
+                ..GeneratedImages::default()
+            }));
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_single_item(item_id, &options)
+            .await
+            .expect("a failed draw does not fail the refresh");
+        let restamped = store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .is_some_and(|row| row.date_last_refreshed.is_some_and(|at| at > before));
+        assert_eq!(restamped, stamped);
     }
 
     /// A season with no folder of its own (a virtual season) refreshes here,

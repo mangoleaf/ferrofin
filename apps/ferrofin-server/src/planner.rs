@@ -36,10 +36,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoder::split_args;
 use ferrofin_mediaencoding::encoding_helper::helper::{
-    shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
+    shift_audio_codecs_if_needed, shift_video_codecs_if_needed, should_encode_subtitle,
 };
-use ferrofin_mediaencoding::encoding_helper::hw;
+use ferrofin_mediaencoding::encoding_helper::{bitstream, hw};
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
 };
@@ -55,7 +56,6 @@ use ferrofin_traits::media_encoding::{
     HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths as _;
-use uuid::Uuid;
 
 /// The default HLS segment length, in seconds.
 ///
@@ -64,11 +64,6 @@ use uuid::Uuid;
 /// this many seconds are encoded, so it directly sets time-to-first-segment.
 /// Used when the request declares no `SegmentLength`.
 const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 3;
-
-/// Assumed output frame rate for the NVENC GOP keyframe calc when the source
-/// frame rate is unknown (probing returned none). Only fires on pathological
-/// sources; `25` is a safe PAL-ish default. Candidate setting.
-const DEFAULT_KEYFRAME_FPS: f32 = 25.0;
 
 /// The default HLS segment container when the request declares none.
 ///
@@ -245,50 +240,20 @@ impl FerrofinStreamStatePlanner {
         self.config.get_encoding_options().await.unwrap_or_default()
     }
 
-    /// Resolves the [`MediaSourceInfo`] for `request`.
-    ///
-    /// Port of the media-source resolution in `StreamingHelpers.GetStreamingState`:
-    /// an open live stream (`live_stream_id`) wins outright and is returned as
-    /// its own source; otherwise fetch the item's static media sources and
-    /// select the one matching the request's `media_source_id` (defaulting to
-    /// the first when unspecified).
+    /// Resolves the [`MediaSourceInfo`] for `request` through
+    /// [`MediaSourceManager::get_stream_media_source`], the selection the
+    /// direct-play routes share.
     async fn resolve_media_source(
         &self,
         request: &HlsStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        // `StreamingHelpers.GetStreamingState`: an open live stream wins over
-        // everything — its source is the buffered copy of the tuner, and going
-        // back to the static sources here would dial the tuner a second time.
-        if let Some(live_stream_id) = request
-            .live_stream_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            return self.media_sources.get_live_stream(live_stream_id).await;
-        }
-
-        let sources = self
-            .media_sources
-            .get_static_media_sources(request.item_id, false, None)
-            .await?;
-
-        // Match the requested id, else when the "media source id" is really the
-        // item id, the first source.
-        let chosen = match request.media_source_id.as_deref() {
-            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
-                Some(i) => sources.into_iter().nth(i),
-                None if Uuid::parse_str(id).is_ok_and(|g| g == request.item_id) => {
-                    sources.into_iter().next()
-                }
-                None => None,
-            },
-            None => sources.into_iter().next(),
-        };
-
-        chosen.ok_or_else(|| {
-            ServiceError::NotFound(format!("no media source for item {}", request.item_id))
-        })
+        self.media_sources
+            .get_stream_media_source(
+                request.item_id,
+                request.media_source_id.as_deref(),
+                request.live_stream_id.as_deref(),
+            )
+            .await
     }
 }
 
@@ -352,6 +317,31 @@ fn warn_unsupported_accelerator(options: &EncodingOptions) {
             "this hardware accelerator is not supported by Ferrofin; transcoding \
              in software instead. Supported: nvenc, vaapi, qsv."
         );
+    }
+}
+
+/// The rate ffmpeg encodes a constant-rate output at when no `-r` is set.
+///
+/// Port of the first rule of libavformat's `av_guess_frame_rate`, whose
+/// constants these are: the source's real rate (`r_frame_rate`), not its
+/// average, which would misplace every cut on a VFR source; but the average
+/// when the real rate is a timestamp-grid artefact (above 210 against an
+/// average below 70, e.g. `1000/1` on a millisecond grid). Divergence:
+/// upstream reads `RealFrameRate` alone, which pins a GOP of 3000 frames
+/// (100 s at the 30 fps ffmpeg encodes at) on such a file. ffmpeg's
+/// field-coding rule is not ported: it needs the codec frame rate, which
+/// ffprobe does not report, so a doubled-`tbr` source (`25 fps, 50 tbr`)
+/// still gets a GOP of two segments on the encoders that take a GOP alone.
+fn guessed_frame_rate(video: &MediaStream) -> Option<f32> {
+    // TODO(parity): the doubled-`tbr` case. Path: give libsvtav1 forced
+    // keyframes like NVENC/QSV (it honours them on ffmpeg n9.0.1 with
+    // SVT-AV1 4.2) once the oldest supported ffmpeg is checked, which leaves
+    // only AMF/RKMPP, never selected here, on a guessed GOP.
+    match (video.real_frame_rate, video.average_frame_rate) {
+        (Some(real), Some(average)) if real > 210.0 && average > 0.0 && average < 70.0 => {
+            Some(average)
+        }
+        (real, _) => real,
     }
 }
 
@@ -573,6 +563,19 @@ fn segment_file_extension(segment_container: &str) -> &'static str {
 /// decode in browser MSE. Port of `EncodingHelper.IsH265`.
 fn is_hevc(codec: &str) -> bool {
     codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265")
+}
+
+/// Selects the HEVC Dolby Vision MP4 sample entry tag.
+///
+/// Profile 8 uses `hvc1` (what Dolby's official streams use; `dvh1` breaks
+/// strict-tag players like Safari). All other profiles use `dvh1`. Port of
+/// `DynamicHlsController.GetDolbyVisionHevcCodecTag`.
+fn dolby_vision_hevc_codec_tag(stream: Option<&MediaStream>) -> &'static str {
+    if stream.and_then(|s| s.dv_profile) == Some(8) {
+        "hvc1"
+    } else {
+        "dvh1"
+    }
 }
 
 /// The HLS `-hls_segment_type` token for `segment_container`.
@@ -824,6 +827,13 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // live MPEG-TS usually probes with no bitrate, so leaving it unset
             // software-transcodes every channel that could have been copied.
             live_stream_id: request.live_stream_id.clone(),
+            // Only the video HLS actions bind `alwaysBurnInSubtitleWhenTranscoding`
+            // upstream; the audio HLS actions pin it false and the progressive
+            // stream actions never read it.
+            always_burn_in_subtitle_when_transcoding: request
+                .always_burn_in_subtitle_when_transcoding
+                && !is_audio
+                && !progressive,
             ..BaseEncodingJobOptions::default()
         };
 
@@ -1060,7 +1070,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // every ffmpeg (re)start — tens of seconds added to every play/seek.
         // On resolution failure fall back to `si=` on the original input.
         let burn_subtitle_path = if !request.is_head_request
-            && state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+            && should_encode_subtitle(&state)
             && let Some(sub) = state
                 .subtitle_stream
                 .as_ref()
@@ -1185,10 +1195,11 @@ impl FerrofinStreamStatePlanner {
     /// The ffmpeg video encoder for `state`. Port of `GetVideoEncoder`.
     ///
     /// One dispatch decides software and hardware alike — it returns the
-    /// vendor encoder when the configured accelerator has one for the target
-    /// codec and the running ffmpeg was built with it, and the software encoder
-    /// otherwise. A copy request short-circuits ahead of it, since `copy` is
-    /// not an encoder at all.
+    /// vendor encoder when hardware encoding is enabled, the configured
+    /// accelerator is a supported one ([`hardware_path_is_ported`]) with an
+    /// encoder for the target codec, and the running ffmpeg was built with it,
+    /// and the software encoder otherwise. A copy request short-circuits ahead
+    /// of it, since `copy` is not an encoder at all.
     fn resolve_video_encoder(&self, state: &EncodingJobInfo, options: &EncodingOptions) -> String {
         let codec = state.output_video_codec.as_deref().unwrap_or("copy");
         if EncodingJobInfo::is_copy_codec(Some(codec)) {
@@ -1231,18 +1242,14 @@ impl FerrofinStreamStatePlanner {
         let is_event_playlist = kind == PlaylistKind::Event;
         let progressive = kind == PlaylistKind::Progressive;
 
-        // Resolve the video encoder up front (it decides input hwaccel too). NVENC
-        // maps the target codec to its hardware encoder; otherwise the software
-        // `EncodingHelper` path (libx264 / copy) is used.
+        // Resolve the video encoder up front (it decides input hwaccel too). A
+        // supported accelerator (NVENC, VAAPI, QSV) with hardware encoding on
+        // maps the target codec to its hardware encoder when the build has
+        // it; otherwise a software encoder (e.g. libx264, libx265, libsvtav1)
+        // or `copy` is used.
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
-        // The encoder is NVENC. Distinct from `hw_filters` below and used only
-        // where a fact about the *encoder* is what matters.
-        let nvenc_video = video_encoder.ends_with("_nvenc");
-        // Everything the ported hardware matrix reads about the job. The
-        // render-node arguments are VAAPI/QSV territory and unused by the CUDA
-        // branch; the hardware-transcoding roadmap phase 4 resolves them from the encoding
-        // options, which are not readable this early today.
+        // Everything the ported hardware matrix reads about the job.
         let caps = probed_caps;
         let requested = hw::decoder::RequestedSize {
             width: state.base_request.width,
@@ -1258,19 +1265,18 @@ impl FerrofinStreamStatePlanner {
             output_video_codec: state.output_video_codec.as_deref(),
             requested,
         };
-        // Only NVENC has a ported filter chain today, so only NVENC may take
+        // Only an accelerator with a ported chain (NVENC, VAAPI, QSV) may take
         // the hardware path at all. This is a **scope gate, not a capability
         // gate**: `input_video_hwaccel_args` happily produces a device graph
-        // for every vendor, and `resolve_video_encoder` happily names their
-        // encoders, but the chain behind them lands with phases 4-7. Letting a
-        // VAAPI or QSV server through today gives it a vendor encoder with no
-        // encoder parameters, no filter graph at all — so the client's
-        // `MaxWidth` is silently ignored and it receives a full-resolution
-        // encode — and a silently dropped subtitle burn-in. That is worse than
-        // the software transcode it has now, not merely less optimal.
-        //
-        // Each vendor's phase removes itself from this gate as its chain and
-        // its `GetEncoderParam`/`GetVideoBitrateParam` arms land.
+        // for AMF, VideoToolbox and RKMPP too, and `hw::encoder::video_encoder`
+        // happily names their encoders, but a server let through would get a
+        // vendor encoder with no encoder parameters and no filter graph at all
+        // — so the client's `MaxWidth` is silently ignored and it receives a
+        // full-resolution encode — and a silently dropped subtitle burn-in.
+        // That is worse than the software transcode it gets instead (with a
+        // one-time warning). `resolve_video_encoder` applies the same gate, so
+        // the encoder, the device graph and the filters fall back together;
+        // see `hardware_path_is_ported`.
         let hw_ported = hardware_path_is_ported(options);
         warn_unsupported_accelerator(options);
         // The configured render node, resolved against the filesystem. An
@@ -1410,11 +1416,16 @@ impl FerrofinStreamStatePlanner {
         }
         // The device graph and the hardware decoder, straight from the ported
         // matrix — `-init_hw_device`, `-filter_hw_device`, `-hwaccel` and
-        // `-hwaccel_output_format` in upstream's order. Splitting on whitespace
-        // is safe because nothing it produces contains any: the device
-        // arguments phase 4 adds do carry paths, but they are render nodes
-        // (`/dev/dri/renderD*`), which cannot contain a space.
-        push_split(&mut args, &hwaccel_input.args);
+        // `-hwaccel_output_format` in upstream's order. The string is
+        // shell-quoted like every other ffmpeg command line (AMD's OpenCL
+        // device is `device_vendor="Advanced Micro Devices"`), so it takes the
+        // shared splitter, with the same one-token fallback as the input. Only
+        // a configured render-node path containing a quote can reach it, and
+        // ffmpeg then rejects the string, so say why.
+        args.extend(split_args(&hwaccel_input.args).unwrap_or_else(|error| {
+            tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
+            vec![hwaccel_input.args.clone()]
+        }));
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
         args.push("200M".to_owned());
@@ -1443,12 +1454,17 @@ impl FerrofinStreamStatePlanner {
         input_source.protocol =
             ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state);
         let input = self.encoder.get_input_argument(media_path, &input_source);
-        // `get_input_argument` shell-quotes the path (`file:"…"`, inner quotes
-        // `\"`-escaped) for the string-command probe path. The segment transcoder
+        // `get_input_argument` shell-quotes the path (`file:"…"`, inner `\` and
+        // `"` escaped) for the string-command probe path. The segment transcoder
         // spawns ffmpeg via argv (no shell), so those quotes would become part of
         // the filename and ffmpeg would fail to open it (exit 254) for any path
-        // containing a space. Unquote it back into a single argv token with shlex.
-        args.extend(shlex::split(&input).unwrap_or_else(|| vec![input]));
+        // containing a space. Unquote it back into a single argv token. `quote`
+        // always balances, and the fallback is one token, which can never add an
+        // option.
+        args.extend(split_args(&input).unwrap_or_else(|error| {
+            tracing::debug!(%error, "input argument does not split; passing it as one");
+            vec![input]
+        }));
 
         // ---- hardware video filters ------------------------------------------
         // The ported vendor chain owns the whole graph on the hardware path —
@@ -1617,19 +1633,37 @@ impl FerrofinStreamStatePlanner {
         // ---- video -----------------------------------------------------------
         push_split(&mut args, "-c:v");
         args.push(video_encoder.clone());
-        // HEVC output needs the `hvc1` codec tag to decode in browser MSE (only
-        // meaningful in fMP4). Keyed on the *output* codec: the source codec when
-        // copying, else the negotiated target (so `hevc_nvenc` tags too). Port of
-        // `DynamicHlsController`'s `-tag:v:0 hvc1`.
+        // Port of `DynamicHlsController.GetVideoArguments` tag selection:
+        // fMP4 HEVC/AV1 needs a codec tag so players can decode it.
         let output_codec = if copying_video {
             state.video_stream.as_ref().and_then(|s| s.codec.as_deref())
         } else {
             state.output_video_codec.as_deref()
         };
         let output_is_hevc = output_codec.is_some_and(is_hevc);
-        if output_is_hevc && segment_container.eq_ignore_ascii_case("mp4") {
-            push_split(&mut args, "-tag:v:0");
-            args.push("hvc1".to_owned());
+        let output_is_av1 = output_codec.is_some_and(|c| c.eq_ignore_ascii_case("av1"));
+        if (output_is_hevc || output_is_av1) && segment_container.eq_ignore_ascii_case("mp4") {
+            let video_is_dovi = hw::tonemap::is_dovi(state.video_stream.as_ref());
+            let actual_codec = state.actual_output_video_codec();
+            let client_supports_dovi = actual_codec
+                .map(|c| state.requested_range_types(c))
+                .is_some_and(|r| r.iter().any(|s| s.eq_ignore_ascii_case("DOVI")));
+            if copying_video
+                && video_is_dovi
+                && client_supports_dovi
+                && !bitstream::is_dovi_removed(caps, state)
+            {
+                push_split(&mut args, "-tag:v:0");
+                if output_is_hevc {
+                    args.push(dolby_vision_hevc_codec_tag(state.video_stream.as_ref()).to_owned());
+                } else {
+                    args.push("dav1".to_owned());
+                }
+                push_split(&mut args, "-strict -2");
+            } else if output_is_hevc {
+                push_split(&mut args, "-tag:v:0");
+                args.push("hvc1".to_owned());
+            }
         }
         // ---- bitstream filters -----------------------------------------------
         // Only on a stream copy: a re-encode produces a fresh bitstream that
@@ -1685,45 +1719,31 @@ impl FerrofinStreamStatePlanner {
                 ),
             );
             let output_framerate = self.encoding_helper.framerate_param(state);
-            // Force a keyframe at every segment boundary so the HLS muxer cuts
+            // Put a keyframe at every segment boundary so the HLS muxer cuts
             // exactly on `-hls_time`. Without this, ffmpeg can only cut at the
             // encoder's natural GOP (libx264 keyint ≈250 frames ≈10 s), so the
             // first segment overruns its target length and time-to-first-segment
-            // — the dominant startup latency — balloons. Port of Jellyfin's
-            // `keyFrameArg`/`gopArg`.
-            if nvenc_video && !progressive {
-                // NVENC ignores the `-force_key_frames` expression; pin the GOP
-                // instead (Jellyfin's gopArg): N = ceil(segment_len × fps).
-                let fps = output_framerate
-                    .or_else(|| {
-                        state
-                            .video_stream
-                            .as_ref()
-                            .and_then(MediaStream::reference_frame_rate)
-                    })
-                    .unwrap_or(DEFAULT_KEYFRAME_FPS);
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "keyint is a small positive frame count"
-                )]
-                let keyint = (f64::from(fps) * f64::from(state.segment_length_secs)).ceil() as i64;
-                push_split(&mut args, "-g:v:0");
-                args.push(keyint.to_string());
-                push_split(&mut args, "-keyint_min:v:0");
-                args.push(keyint.to_string());
-                push_split(&mut args, "-sc_threshold:v:0");
-                args.push("0".to_owned());
+            // — the dominant startup latency — balloons.
+            if progressive {
+                // `GetProgressiveVideoArguments`' fixed five-second interval.
+                push_split(&mut args, "-force_key_frames:0 expr:gte(t,n_forced*5)");
             } else {
-                push_split(&mut args, "-force_key_frames:0");
-                args.push(format!(
-                    "expr:gte(t,n_forced*{})",
-                    if progressive {
-                        5
-                    } else {
-                        state.segment_length_secs
-                    }
-                ));
+                // The GOP counts output frames, and ffmpeg encodes an hls
+                // output at a constant rate: the `-r` this job sets, else the
+                // rate it guesses from the source. Divergence: upstream reads
+                // `RealFrameRate` alone, which pins a GOP of two segments when
+                // `-r` halves the rate; see `guessed_frame_rate` for the other.
+                let frame_rate = output_framerate
+                    .or_else(|| state.video_stream.as_ref().and_then(guessed_frame_rate));
+                push_split(
+                    &mut args,
+                    &ferrofin_mediaencoding::encoding_helper::helper::hls_video_key_frame_arguments(
+                        caps,
+                        &video_encoder,
+                        state.segment_length_secs,
+                        frame_rate,
+                    ),
+                );
             }
             // The plain software filter chain (downscale/tonemap/8-bit); the
             // burn-in branches below fold `sw_filters` into their own graphs
@@ -1776,12 +1796,13 @@ impl FerrofinStreamStatePlanner {
                 push_split(&mut args, &bsf);
             }
             if !EncodingJobInfo::is_copy_codec(Some(&audio_encoder)) {
-                if let Some(bitrate) = self.encoding_helper.audio_bitrate_param(
-                    state.output_audio_bitrate,
-                    Some(&audio_encoder),
-                    state.audio_stream.as_ref(),
-                    state.output_audio_channels,
-                ) {
+                // `-ab state.OutputAudioBitrate` as planned, skipped for a
+                // lossless encoder. Recomputing it from the encoder name
+                // (`libmp3lame`, not `mp3`) dropped the client's bitrate cap.
+                if let Some(bitrate) = state
+                    .output_audio_bitrate
+                    .filter(|_| !is_lossless_audio_codec(&audio_encoder))
+                {
                     push_split(&mut args, "-b:a");
                     args.push(bitrate.to_string());
                 }
@@ -2076,9 +2097,10 @@ fn resolve_output_audio_channels(
 /// via the `subtitles` filter. The graphical (PGS/DVDSUB) counterpart is
 /// [`burns_graphical_subtitle`](ferrofin_mediaencoding::encoding_helper::helper::burns_graphical_subtitle);
 /// text subs are normally delivered externally, so this only fires when the
-/// client explicitly asks for Encode (e.g. the "burn all subtitles" setting).
+/// client asks for Encode or sets `alwaysBurnInSubtitleWhenTranscoding`
+/// (`ShouldEncodeSubtitle`).
 fn burns_text_subtitle(state: &EncodingJobInfo) -> bool {
-    state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+    should_encode_subtitle(state)
         && state.video_stream.is_some()
         && state
             .subtitle_stream
@@ -2153,6 +2175,9 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     // produces different video.
     query_param_i32(&request.query_string, "SubtitleStreamIndex").hash(&mut hasher);
     query_param(&request.query_string, "SubtitleMethod").hash(&mut hasher);
+    request
+        .always_burn_in_subtitle_when_transcoding
+        .hash(&mut hasher);
     // The chosen tracks and the output rate shape the output as well: a
     // re-request on the same session naming another audio track must not
     // replay the previous track's segments.
@@ -2180,8 +2205,25 @@ mod tests {
     use ferrofin_model::configuration::HlsAudioSeekStrategy;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case(Some(8), "hvc1")]
+    #[case(Some(5), "dvh1")]
+    #[case(Some(7), "dvh1")]
+    #[case(None, "dvh1")]
+    fn dolby_vision_hevc_codec_tag_selects_tag_for_profile(
+        #[case] profile: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let stream = MediaStream {
+            dv_profile: profile,
+            ..MediaStream::default()
+        };
+        assert_eq!(dolby_vision_hevc_codec_tag(Some(&stream)), expected);
+    }
 
     #[test]
     fn raw_query_params_match_keys_ignoring_case() {
@@ -2318,8 +2360,13 @@ mod tests {
             Ok(String::new())
         }
         fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
-            // Mirror the real encoder, which shell-quotes the path.
-            format!("file:\"{input_file}\"")
+            // The real encoder's quoting, so the planner's unquoting is tested
+            // against it.
+            ferrofin_mediaencoding::encoder::get_input_argument(
+                "file",
+                input_file,
+                ferrofin_model::media_info::MediaProtocol::File,
+            )
         }
         fn get_time_parameter(&self, ticks: i64) -> String {
             format!("-ss {ticks}")
@@ -2804,6 +2851,49 @@ mod tests {
         assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
         assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
         assert_ne!(limited.playlist_path, audio_limited.playlist_path);
+    }
+
+    /// `GetProgressiveAudioFullCommandLine` emits `-ab state.OutputAudioBitrate`:
+    /// a stereo FLAC transcoded to mp3 under a 128 kbit/s cap is encoded at
+    /// 128 kbit/s, not at the 128 kbit/s-per-channel default the `libmp3lame`
+    /// encoder name would select.
+    #[tokio::test]
+    async fn progressive_audio_honours_the_requested_bitrate() {
+        let mut flac = audio_stream("flac");
+        flac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![flac])]);
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.audio_bitrate = Some(128_000);
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // The audio HLS segments of the same request encode to the same cap.
+        let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        let args = hls.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // A lossless encoder takes no bitrate.
+        let mut alac = audio_stream("alac");
+        alac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![alac])]);
+        req.output_container = Some("flac".to_owned());
+        req.audio_codec = Some("flac".to_owned());
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a flac"), "{args}");
+        assert!(!args.contains("-b:a"), "{args}");
     }
 
     #[tokio::test]
@@ -3564,6 +3654,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn plan_always_burn_in_burns_a_transcoded_video_whatever_the_method() {
+        // `ShouldEncodeSubtitle`: `alwaysBurnInSubtitleWhenTranscoding` burns
+        // the selected track into any video that is not stream-copied, even
+        // when the negotiated method is External.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        req.always_burn_in_subtitle_when_transcoding = true;
+        req.allow_video_stream_copy = false;
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("subtitles=f='/media/movie.mkv':si=0"),
+            "always-burn-in must burn a transcoded video: {args}"
+        );
+
+        // A stream-copied video cannot take a filter, so the flag yields.
+        req.video_codec = Some("hevc".to_owned());
+        req.allow_video_stream_copy = true;
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|a| a == ["-c:v", "copy"]),
+            "the video is copied: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "a copied video is never burned: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_ignores_always_burn_in_outside_video_hls() {
+        // Upstream binds the flag on the video HLS routes only; the
+        // progressive stream routes leave it false.
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![
+                    video_stream("hevc"),
+                    audio_stream("aac"),
+                    subtitle_stream("subrip", 2),
+                ],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut req = request("abc");
+        req.output_container = Some("mp4".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        req.always_burn_in_subtitle_when_transcoding = true;
+        let plan = planner
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "progressive must not burn: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn output_id_keys_on_always_burn_in() {
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        let external = output_id(&req, "ts", false);
+        req.always_burn_in_subtitle_when_transcoding = true;
+        assert_ne!(
+            external,
+            output_id(&req, "ts", false),
+            "burn vs no-burn must not share cache files"
+        );
+    }
+
     #[test]
     fn output_id_keys_on_subtitle_method() {
         let mut req = request("abc");
@@ -4190,7 +4374,7 @@ mod tests {
         // Force a keyframe on every 3 s segment boundary so the HLS muxer cuts on
         // `-hls_time` instead of libx264's ~10 s natural GOP — halving TTFS.
         assert!(
-            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3) -sc_threshold:v:0 0"),
             "segment-boundary keyframes expected: {args}"
         );
         assert!(
@@ -4430,6 +4614,13 @@ mod tests {
         // Gone with the bolt-on: the fixed constant-quality target and `-crf`.
         assert!(!args.contains("-cq"), "{args}");
         assert!(!args.contains("-crf"), "{args}");
+        // NVENC's forced keyframes cut segments once they are IDR frames, and
+        // need no frame rate: this source has none.
+        assert!(
+            args.contains("-forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "{args}"
+        );
+        assert!(!args.contains("-g:v:0"), "{args}");
     }
 
     /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but
@@ -4616,16 +4807,7 @@ mod tests {
     /// planner's VAAPI prober at it.
     fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
         let path = dir.join("stub-ffmpeg");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::stub_script(&path, &format!("echo 'VAAPI driver: {driver}' >&2\n"));
         FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
     }
 
@@ -4766,6 +4948,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_amd_opencl_vendor_reaches_ffmpeg_as_one_argument() {
+        // The device graph is one string, and AMD's OpenCL tonemap names its
+        // vendor with spaces in it. A whitespace split handed ffmpeg
+        // `device_vendor="Advanced`, `Micro` and `Devices"` as three arguments.
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Mesa Gallium driver 24.0.0 for AMD Radeon");
+        let mut video = hdr_4k_video_stream("hevc");
+        video.pixel_format = Some("yuv420p10le".to_owned());
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                enable_tonemapping: true,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|a| a == "opencl=ocl:.0,device_vendor=Advanced Micro Devices"),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
     async fn an_unrecognised_vaapi_driver_gets_no_device_and_no_low_power() {
         // Real hardware lands here: NVIDIA's VAAPI shim reports a driver name
         // none of the three match. The chain still runs, but nothing Intel-only
@@ -4794,6 +5011,50 @@ mod tests {
         // ...but the VAAPI pipeline itself still runs.
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains("scale_vaapi="), "{args}");
+    }
+
+    #[tokio::test]
+    async fn only_an_amd_hevc_vaapi_hls_encode_extracts_the_extradata() {
+        // AMD's HEVC encoder writes in-band parameter sets that disagree with
+        // the extradata, which breaks `hvc1` decoding. The probed driver is the
+        // only source of the AMD flag, so this goes through the prober.
+        const AMD: &str = "Mesa Gallium driver 24.0.0 for AMD Radeon";
+        const EXTRACT: &str = "-flags:v -global_header -bsf:v extract_extradata=remove=0";
+        for (driver, codec, kind, expected) in [
+            (AMD, "hevc", PlaylistKind::Vod, true),
+            (AMD, "h264", PlaylistKind::Vod, false),
+            ("Intel iHD driver", "hevc", PlaylistKind::Vod, false),
+            (AMD, "hevc", PlaylistKind::Progressive, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_vaapi_ffmpeg(dir.path(), driver);
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                vaapi_caps(),
+                EncodingOptions {
+                    allow_hevc_encoding: true,
+                    ..vaapi_options()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some(codec.to_owned());
+            req.allow_video_stream_copy = false;
+            let plan = p.plan(&req, false, None, kind).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains(&format!("-c:v {codec}_vaapi")), "{args}");
+            assert_eq!(
+                args.contains(EXTRACT),
+                expected,
+                "{driver} {codec} {kind:?}: {args}"
+            );
+        }
     }
 
     /// A QSV-capable ffmpeg on `platform`.
@@ -4886,6 +5147,75 @@ mod tests {
             ),
             "{args}"
         );
+        // QSV's forced I-frames are not IDR frames until `forced_idr` says so,
+        // and only IDR frames can cut a segment (not yet run on an Intel GPU).
+        assert!(
+            args.contains("-forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_libsvtav1_gop_is_one_segment_of_output_frames() {
+        // libsvtav1 takes the GOP alone, sized in output frames: the `-r` a
+        // `MaxFramerate` sets, else the rate ffmpeg guesses and encodes at.
+        for (average, real, max_framerate, gop) in [
+            (None, Some(23.976), None, Some(72)),
+            (Some(59.94), Some(59.94), Some(30.0), Some(90)),
+            // A VFR phone clip: its average (24.04) would give 73 and cut
+            // 4.9 s / 2.4 s segments.
+            (Some(24.04), Some(30.0), None, Some(90)),
+            // A millisecond timestamp grid: ffmpeg encodes at the average, not
+            // at the real 1000 that upstream sizes a 100 s GOP by.
+            (Some(30.0), Some(1000.0), None, Some(90)),
+            // ffmpeg's bounds: a real 240 fps source, a real rate of 210 or
+            // less, an average of 70 or more, and no usable average all keep
+            // the real rate.
+            (Some(240.0), Some(240.0), None, Some(720)),
+            (Some(30.0), Some(210.0), None, Some(630)),
+            (Some(70.0), Some(1000.0), None, Some(3000)),
+            (Some(120.0), Some(1000.0), None, Some(3000)),
+            (Some(0.0), Some(1000.0), None, Some(3000)),
+            (None, Some(1000.0), None, Some(3000)),
+            // No real rate, no GOP, as upstream.
+            (Some(23.976), None, None, None),
+        ] {
+            let video = MediaStream {
+                average_frame_rate: average,
+                real_frame_rate: real,
+                ..video_stream("mpeg4")
+            };
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                FfmpegCapabilities::builder()
+                    .encoders(["libx264", "libsvtav1"])
+                    .build(),
+                EncodingOptions {
+                    allow_av1_encoding: true,
+                    ..EncodingOptions::default()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("av1".to_owned());
+            req.allow_video_stream_copy = false;
+            req.max_framerate = max_framerate;
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v libsvtav1"), "{args}");
+            let case = format!("{average:?}/{real:?}/{max_framerate:?}: {args}");
+            match gop {
+                Some(gop) => assert!(
+                    args.contains(&format!("-g:v:0 {gop} -keyint_min:v:0 {gop}")),
+                    "{case}"
+                ),
+                None => assert!(!args.contains("-g:v:0"), "{case}"),
+            }
+            assert!(!args.contains("-force_key_frames"), "{case}");
+        }
     }
 
     #[tokio::test]
@@ -5237,8 +5567,10 @@ mod tests {
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
-    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
-    /// under the harness query. `GetStreamingState` yields
+    /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono
+    /// aac) under the harness query. The bit depth matters: an unknown or 10-bit
+    /// source gets `GetBitDepthCompensatedBitrate`'s factor (×1.2 here).
+    /// `GetStreamingState` yields
     /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
     /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
     /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
@@ -5250,6 +5582,7 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
+        video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);
         let src = source("abc", vec![video, audio]);
@@ -5851,8 +6184,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.state.output_audio_codec.as_deref(),
-            Some(format!("/audio/{}/stream", request.item_id).as_str()),
-            "native inference reads the literal bare URL rather than the Container query"
+            Some("aac"),
+            "extensionless URL falls back to aac rather than passing the URL as a codec"
         );
         request.audio_codec = Some("mp3".to_owned());
         let plan = planner

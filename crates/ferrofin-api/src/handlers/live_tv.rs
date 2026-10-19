@@ -1392,18 +1392,25 @@ async fn get_live_stream_file(
     let Some(container) = route_container(&container) else {
         return Err(ApiError::NotFound("live stream file".into()));
     };
+    live_stream_buffer(&state, &stream_id, &format!("file.{container}")).await
+}
+
+/// Serves the buffer of the open shared live stream `unique_id` progressively,
+/// typed as `file_name`: `ILiveStream.GetStream()` wrapped in a
+/// `ProgressiveFileStream`. `404` when no such stream is open.
+pub(crate) async fn live_stream_buffer(
+    state: &AppState,
+    unique_id: &str,
+    file_name: &str,
+) -> Result<Response, ApiError> {
     let Some(live_tv) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("live stream file".into()));
     };
-    let Some(file) = live_tv.get_live_stream_file(&stream_id).await? else {
+    let Some(file) = live_tv.get_live_stream_file(unique_id).await? else {
         return Err(ApiError::NotFound("live stream file".into()));
     };
     let start_at = live_stream_start_offset(&file).await;
-    Ok(progressive_response(
-        file.path.clone(),
-        start_at,
-        &format!("file.{container}"),
-    ))
+    Ok(progressive_response(file.path.clone(), start_at, file_name))
 }
 
 /// The `POST /LiveTv/ChannelMappings` request body.
@@ -2420,6 +2427,62 @@ mod tests {
             u64::try_from(ferrofin_traits::stubs::TAIL_SEEK_BYTES).expect("tail"),
             "a late reader starts one tail window from the end, not at byte 0"
         );
+    }
+
+    /// A `Static=true` stream of an opened shared live stream reads its buffer
+    /// (upstream's `DirectStreamProvider`) instead of fetching the
+    /// `LiveStreamFiles` URL back over HTTP; a stream since closed is `404`.
+    #[tokio::test]
+    async fn a_static_live_stream_is_read_from_its_buffer() {
+        use crate::handlers::streaming::{StaticSource, serve_static_source};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("buffer.ts");
+        tokio::fs::write(&path, vec![0x47_u8; 188])
+            .await
+            .expect("write buffer");
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            live_stream: Some((
+                "uid-1".to_owned(),
+                ferrofin_traits::stubs::LiveStreamFile {
+                    path,
+                    opened_at: Utc::now(),
+                },
+            )),
+            ..FakeLiveTv::default()
+        }));
+        // Nothing listens on port 9: going over HTTP could not succeed.
+        let source = |unique_id: &str| StaticSource {
+            path: format!("http://127.0.0.1:9/LiveTv/LiveStreamFiles/{unique_id}/stream.ts"),
+            protocol: ferrofin_model::media_info::MediaProtocol::Http,
+            video_type: None,
+            is_live_stream: true,
+            user_agent: None,
+        };
+
+        let response = serve_static_source(
+            &state,
+            source("uid-1"),
+            axum::extract::Request::new(Body::empty()),
+        )
+        .await
+        .expect("stream");
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("video/mp2t")
+        );
+        assert_eq!(first_chunk(response).await, vec![0x47_u8; 188]);
+
+        let closed = serve_static_source(
+            &state,
+            source("uid-2"),
+            axum::extract::Request::new(Body::empty()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(closed.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

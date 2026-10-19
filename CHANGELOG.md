@@ -41,7 +41,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   embedded VobSub subtitles render again
 - Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
   and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
-  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
+  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract. Emby-era credentials
+  (`X-Emby-Authorization`, `X-Emby-Token`, `api_key`) still need `EnableLegacyAuthorization`;
+  see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Serve `GET /Items/{itemId}/Collections` (Jellyfin 12.1's `GetItemCollections`): the
   collections the user can see that include the item, sorted and paged as upstream.
   jellyfin-web's item page calls it and hid its Collections section on the old `404`.
@@ -89,9 +91,35 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Port Jellyfin 12.1's routines and rules: `RepairAlternateVersionLinks` (primaries re-derived
   from `LinkedChildren`), `StripEmbeddedLinkedChildren`, the re-dated rating-level pass with
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
-  the user-view consolidation's reference moves, `HasVisibleChild` (a playlists or boxsets
-  library with nothing the user can see has no view), and `ApplyAlternateVersionFiltering` (a
+  the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
+  `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
+  file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
+  each `[playlist]` folder or folder holding a `playlist.xml` (nothing inside it is an item). Members come
+  from the file's entries in order — relative, absolute or `../`, legacy encodings detected —
+  or from the folder's `playlist.xml`, and follow `PlaylistMetadataService`: read when the
+  playlist is new or its file changes, merged on a full refresh that keeps metadata. Such a
+  playlist is open to everyone and owned by nobody, so it is read-only. Where Jellyfin 12.2
+  writes a `<name>.xml` sidecar beside a playlist file, that sidecar hides the entries and
+  the playlist stays empty; Ferrofin does not port that, and does not take such a sidecar
+  for a folder's `playlist.xml` (#56)
+- Create the internal playlists folder at startup, as `CreateRootFolder` does: a server
+  whose only playlists come from the library scan now lists the Playlists view
+- The Playlists view lists every playlist the user may open, wherever it is, as Jellyfin
+  12.2 does — not only the ones made in the app
+- Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in
+  `GET /UserViews`: a view is listed when the user can see at least one playlist (or box
+  set) anywhere in their libraries, so a playlist inside a music album now shows the
+  Playlists view, and another user's private playlist no longer does
+- Port the rest of `Playlist.IsVisible`: Jellyfin 12.1's `HasParentalAllowedChild` (a user
+  with a maximum parental rating no longer sees a playlist whose members all exceed it) and,
+  for a playlist file, its own rating and tags. It applies in browsing, the Playlists view and
+  every `/Playlists/{id}` endpoint
+- `GET /Playlists/{id}/Items` leaves out the members the user may not see, as upstream's
+  `GetPlaylistItems` does (`GET /Playlists/{id}` still lists every member in `ItemIds`), and
+  its `userId` parameter names another user only for an administrator (`403` otherwise). A
+  move counts positions among the members the user sees (`MoveItemAsync`)
 - Per-field metadata locks (`LockedFields`, stored in `BaseItemMetadataFields`): the
   metadata editor's checkboxes round-trip, and scans and refreshes keep a locked field
   as the user set it. Editing an item no longer locks it; `LockData` is exactly what the
@@ -147,6 +175,23 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- A genre whose movies and series have no poster no longer gets an image drawn from music
+  art of the same genre name, as in Jellyfin, where only movie and series posters are
+  sampled. An image already drawn that way stays until deleted. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
+- "Search for missing metadata" or "Replace all metadata" on a genre, music genre, playlist,
+  photo album, folder, library or the root folder now redraws the image Ferrofin generated
+  for it from the current artwork, as in Jellyfin. Before, only a library scan drew these
+  images, and only when one was missing or out of date. A library scan now also redraws a
+  photo album's, folder's or playlist file's image whenever its own refresh runs every
+  provider (its first refresh, a changed folder, or its library's automatic refresh interval
+  coming due), a library's or the root's refresh redraws a library tile older than a week, and
+  a locked item's image is left alone
+- The "Clean up collections and playlists" scheduled task is removed, as in Jellyfin 12. It
+  ran at every start and removed each collection and playlist member whose file it could not
+  see, so a boot with the media storage not yet mounted emptied every playlist and collection
+  for good. Deleting an item still removes it from them. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - A library on a database adopted from Jellyfin no longer browses empty after Ferrofin's
   first scan, and media deleted from disk is removed from it again. Jellyfin files a
   library's items under the library location's folder, Ferrofin under the library itself.
@@ -165,6 +210,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
   copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
   before that copy makes it on the next boot
+- The `/socket` WebSocket authenticates like every other request, as Jellyfin 12.2's does:
+  Emby-era credentials (`api_key`, `X-Emby-Token`, `X-MediaBrowser-Token`) count only with
+  `EnableLegacyAuthorization`, and a connection without valid credentials is refused with
+  `403` instead of opening. A socket that authenticates with the `Authorization` header, as
+  jellyfin-sdk-kotlin clients' sockets do, now joins its session, so remote control and SyncPlay
+  reach those clients (#75). Opening a socket no longer blanks the session's remote address,
+  so the dashboard and the session activity entries show the client's IP. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
+- `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
+  lowercase name such as `de Niro` lists among the D names instead of after every
+  capitalised one (#60)
 
 ## [1.0.0] - 2026-09-05
 

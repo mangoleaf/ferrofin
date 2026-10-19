@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
 const CLIENT: &str =
     r#"MediaBrowser Client="no-repeat-test", Device="fixture", DeviceId="no-repeat", Version="1""#;
 
@@ -148,74 +151,90 @@ impl Drop for Server {
 }
 
 impl Server {
+    /// Starts the binary on a free port (another if a concurrent test took it
+    /// first, as [`boot::spawn_server`] does in process) and waits until this
+    /// process, known by a unique `ServerName`, answers there.
     async fn boot(root: &Path, ffmpeg: &Path, ffprobe: &Path) -> Self {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let log_path = root.join("server.log");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ferrofin-server"));
-        // Nothing from the developer's shell: a `FERROFIN_CONFIG_DIR` or a
-        // `FERROFIN_DATA_DIR/config.toml` would send this test's config
-        // writes to a real install, an OTLP endpoint its traces to a collector.
-        for (key, _) in std::env::vars_os() {
-            let key = key.to_string_lossy();
-            if key.starts_with("FERROFIN_") || key.starts_with("OTEL_") {
-                command.env_remove(key.as_ref());
+        for _ in 0..boot::BOOT_ATTEMPTS {
+            let port = boot::free_port();
+            let name = boot::unique_name("ferrofin-no-repeat");
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            let logged_before = log.metadata().unwrap().len();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ferrofin-server"));
+            // Nothing from the developer's shell: a `FERROFIN_CONFIG_DIR` or a
+            // `FERROFIN_DATA_DIR/config.toml` would send this test's config
+            // writes to a real install, an OTLP endpoint its traces to a collector.
+            for (key, _) in std::env::vars_os() {
+                let key = key.to_string_lossy();
+                if key.starts_with("FERROFIN_") || key.starts_with("OTEL_") {
+                    command.env_remove(key.as_ref());
+                }
             }
-        }
-        let process = command
-            .arg("--data-dir")
-            .arg(root.join("data"))
-            .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
-            .arg("--ffmpeg")
-            .arg(ffmpeg)
-            .env("FERROFIN_FFPROBE_PATH", ffprobe)
-            .env("FERROFIN_ENABLE_METRICS", "true")
-            .env("FERROFIN_ADMIN_PASSWORD", PASSWORD)
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let mut server = Self {
-            client: reqwest::Client::new(),
-            base: format!("http://127.0.0.1:{port}"),
-            auth: CLIENT.to_owned(),
-            process,
-            log: log_path,
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !server
-            .client
-            .get(format!("{}/System/Info/Public", server.base))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            if let Some(status) = server.process.try_wait().unwrap() {
-                panic!("the server exited during boot: {status}");
+            let process = command
+                .arg("--data-dir")
+                .arg(root.join("data"))
+                .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+                .arg("--ffmpeg")
+                .arg(ffmpeg)
+                .env("FERROFIN_FFPROBE_PATH", ffprobe)
+                .env("FERROFIN_ENABLE_METRICS", "true")
+                .env("FERROFIN_ADMIN_PASSWORD", PASSWORD)
+                .env("FERROFIN_SERVER_NAME", &name)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            let mut server = Self {
+                client: reqwest::Client::new(),
+                base: format!("http://127.0.0.1:{port}"),
+                auth: CLIENT.to_owned(),
+                process,
+                log: log_path.clone(),
+            };
+            let deadline = Instant::now() + boot::STARTUP_DEADLINE;
+            let lost_the_port = loop {
+                if boot::is_up(&server.client, &server.base, &name).await {
+                    break false;
+                }
+                if let Some(status) = server.process.try_wait().unwrap() {
+                    // Only a lost port is worth another try; any other exit is
+                    // the failure to report.
+                    let log = std::fs::read(&log_path).unwrap();
+                    let attempt = &log[usize::try_from(logged_before).unwrap()..];
+                    // `listen::bind_all`'s context names the HTTP port, which
+                    // tells it from a discovery bind failure.
+                    assert!(
+                        String::from_utf8_lossy(attempt)
+                            .contains(&format!("failed to bind 127.0.0.1:{port}")),
+                        "the server exited during boot: {status}"
+                    );
+                    break true;
+                }
+                assert!(Instant::now() < deadline, "server did not start");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            if lost_the_port {
+                continue;
             }
-            assert!(Instant::now() < deadline, "server did not start");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let login = server
+                .send(
+                    reqwest::Method::POST,
+                    "/Users/AuthenticateByName",
+                    Some(&json!({"Username":"admin","Pw":PASSWORD})),
+                )
+                .await;
+            server.auth = format!(
+                "{CLIENT}, Token=\"{}\"",
+                login["AccessToken"].as_str().unwrap()
+            );
+            return server;
         }
-        let login = server
-            .send(
-                reqwest::Method::POST,
-                "/Users/AuthenticateByName",
-                Some(&json!({"Username":"admin","Pw":PASSWORD})),
-            )
-            .await;
-        server.auth = format!(
-            "{CLIENT}, Token=\"{}\"",
-            login["AccessToken"].as_str().unwrap()
-        );
-        server
+        panic!("no free port survived long enough to bind");
     }
 
     async fn send(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Value {

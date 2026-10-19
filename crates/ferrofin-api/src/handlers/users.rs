@@ -9,7 +9,8 @@
 //! - `GET  /Users` — list users (optionally filtered by hidden/disabled).
 //! - `GET  /Users/Public` — the login-screen-visible subset.
 //! - `GET  /Users/{userId}` — a single user by id.
-//! - `DELETE /Users/{userId}` — delete a user (revoking its tokens first).
+//! - `DELETE /Users/{userId}` — delete a user (revoking its tokens first),
+//!   then hand over or delete the playlists it owned.
 //! - `POST /Users/New` — create a user (optionally with a password).
 //! - `POST /Users` — update a user's name/configuration.
 //! - `POST /Users/{userId}/Policy` — update a user's policy.
@@ -31,8 +32,6 @@
 //!   [`is_administrator`].
 //! - `ServerId` (a client-cosmetic display field) is left unset: sourcing it
 //!   needs `IApplicationHost.SystemId`, which is not exposed at this layer.
-//! - The `PlaylistManager.RemovePlaylistsAsync` cleanup on delete is deferred
-//!   (no playlist manager at this layer); token revocation + user deletion run.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -306,7 +305,7 @@ pub(crate) async fn user_policy(
 
 /// Ports C# `RequestHelpers.AssertCanUpdateUser`: the caller may update `target`
 /// when the caller is an administrator, or when the caller *is* the target.
-async fn assert_can_update_user(
+pub(crate) async fn assert_can_update_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     target: &UserEntity,
@@ -646,8 +645,17 @@ async fn get_user_by_id(
 
 /// `DELETE /Users/{userId}` — delete a user.
 ///
-/// Port of `UserController.DeleteUser`: revokes the user's tokens, then deletes
-/// the user. (The playlist cleanup is deferred — see the module note.)
+/// Port of `UserController.DeleteUser`: revokes the user's tokens, deletes the
+/// user, then hands over or deletes the playlists they owned
+/// ([`PlaylistManager::remove_playlists`](ferrofin_traits::collections::PlaylistManager::remove_playlists)).
+///
+/// Upstream does the playlists between the two, before `DeleteUserAsync`,
+/// whose last-user / last-admin refusal then leaves the user in place with
+/// their playlists already given away or deleted. Here a refused delete
+/// touches no playlist (a Jellyfin bug not ported). The deletion's activity
+/// entry and `UserDeleted` message go out before the playlists, as upstream
+/// raises them inside `DeleteUserAsync`, so a failed hand-over (an error
+/// response, the user already deleted) cannot skip them.
 #[utoipa::path(
     delete,
     path = "/Users/{userId}",
@@ -694,6 +702,7 @@ async fn delete_user(
             )
             .await;
     }
+    state.playlists.remove_playlists(user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

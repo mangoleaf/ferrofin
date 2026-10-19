@@ -453,9 +453,10 @@ pub async fn seed_named_item(db: &Database, id: Uuid, kind: BaseItemKind, name: 
 /// optionally parented to `parent`.
 ///
 /// `IsFolder` is what the DTO/count paths branch on (child counts, played
-/// aggregation), and an accessed-by-name row (a genre, or an artist with no
-/// folder on disk) is stored as a folder with a `NULL` `ParentId` — pass `None`
-/// for that shape.
+/// aggregation). An accessed-by-name row (a genre, or an artist with no folder
+/// on disk) is stored with `IsFolder = 0`; seed one here, with a `None`
+/// parent, only to model a row an earlier build wrote (migration 0043 repairs
+/// that shape).
 pub async fn seed_folder_item(
     db: &Database,
     id: Uuid,

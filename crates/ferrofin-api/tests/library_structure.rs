@@ -19,8 +19,9 @@ use axum::http::{Request, StatusCode, header};
 use ferrofin_api::AppState;
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::{
-    FakeVirtualFolders, authed_state_with_virtual_folders, elevated_state_with_virtual_folders,
-    fake_state,
+    ApiKeyAuthService, AuthedAuthService, FakeAuthService, FakeVirtualFolders,
+    authed_state_with_virtual_folders, elevated_state_with_virtual_folders, fake_state,
+    setup_complete_state,
 };
 use tower::ServiceExt;
 
@@ -816,4 +817,88 @@ async fn rename_without_refresh_does_not_queue_a_scan() {
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0].name.as_deref(), Some("New"));
     }
+}
+
+#[tokio::test]
+async fn structure_routes_require_an_administrator_once_setup_is_complete() {
+    // Upstream gates the whole controller `FirstTimeSetupOrElevated`
+    // (LibraryStructureController.cs:31): anonymous only while the wizard runs,
+    // an administrator afterwards. An ordinary account must never reach a
+    // handler that deletes, renames or retargets a library.
+    let routes = [
+        ("GET", "/Library/VirtualFolders", ""),
+        ("POST", "/Library/VirtualFolders?name=Shows", ""),
+        ("DELETE", "/Library/VirtualFolders?name=Movies", ""),
+        (
+            "POST",
+            "/Library/VirtualFolders/Name?name=Movies&newName=Films",
+            "",
+        ),
+        (
+            "POST",
+            "/Library/VirtualFolders/LibraryOptions",
+            r#"{"Name":"Movies","LibraryOptions":{}}"#,
+        ),
+        (
+            "POST",
+            "/Library/VirtualFolders/Paths",
+            r#"{"Name":"Movies","PathInfo":{"Path":"/m"}}"#,
+        ),
+        (
+            "POST",
+            "/Library/VirtualFolders/Paths/Update",
+            r#"{"Name":"Movies","PathInfo":{"Path":"/m"}}"#,
+        ),
+        (
+            "DELETE",
+            "/Library/VirtualFolders/Paths?name=Movies&path=/m",
+            "",
+        ),
+    ];
+    for (method, uri, body) in routes {
+        let state = setup_complete_state(Arc::new(AuthedAuthService))
+            .with_virtual_folders(Arc::new(FakeVirtualFolders::working()));
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("X-Emby-Token", TOKEN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+
+    // Anonymous is only for the wizard: after setup it is `401`.
+    let state = setup_complete_state(Arc::new(FakeAuthService))
+        .with_virtual_folders(Arc::new(FakeVirtualFolders::working()));
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Library/VirtualFolders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // An administrator still gets through (an API key is elevated upstream).
+    let state = setup_complete_state(Arc::new(ApiKeyAuthService))
+        .with_virtual_folders(Arc::new(FakeVirtualFolders::working()));
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Library/VirtualFolders")
+                .header("X-Emby-Token", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

@@ -548,6 +548,43 @@ pub trait DynamicMetadataProvider: Send + Sync {
 
 fn _assert_object_safe_dynamic_metadata_provider(_: &dyn DynamicMetadataProvider) {}
 
+/// The providers that draw an item's Primary from other items' artwork: a
+/// genre's, music genre's or playlist's collage, a photo album's or folder's
+/// copied image.
+///
+/// Port of upstream's `BaseDynamicImageProvider<T>` family as an item refresh
+/// runs it: an `ICustomMetadataProvider` that is also an `IForcedProvider` and
+/// an `IHasItemChangeMonitor` (`MetadataService.GetProviders`). The library
+/// scan calls the implementation directly; this is the seam the provider
+/// manager, below it in the crate graph, reaches it through.
+#[async_trait]
+pub trait GeneratedImageProvider: Send + Sync {
+    /// `FetchAsync` for one item: draws its Primary and reports
+    /// [`ItemUpdateType::ImageUpdate`], or reports [`ItemUpdateType::None`] for
+    /// a kind no provider supports, a Primary outside the item's metadata
+    /// folder (remote, or a local file elsewhere, such as an upload saved
+    /// beside a genre's or playlist's path), or an item with nothing to draw
+    /// from.
+    ///
+    /// `force` is the refresh's `runAllProviders`; without it the provider
+    /// draws only when its `HasChanged` gate opens (no Primary yet, or the
+    /// generated file changed on disk). The caller skips a locked item, as
+    /// `MetadataService.RefreshWithProviders` does: the provider itself does
+    /// not look at the lock.
+    ///
+    /// # Errors
+    ///
+    /// A repository read/write failure, an unwritable art folder, or a
+    /// collage the image processor could not composite.
+    async fn refresh_generated_image(
+        &self,
+        item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        force: bool,
+    ) -> Result<ItemUpdateType, ServiceError>;
+}
+
+fn _assert_object_safe_generated_image_provider(_: &dyn GeneratedImageProvider) {}
+
 #[cfg(test)]
 mod tests {
     use super::{ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};

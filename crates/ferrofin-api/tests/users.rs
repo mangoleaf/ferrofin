@@ -120,6 +120,8 @@ struct MemUsers {
     updated_configuration: Mutex<Option<(Uuid, UserConfiguration)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
+    /// Makes `delete_user` refuse, as the last user or the last admin.
+    refuse_delete: std::sync::atomic::AtomicBool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -172,6 +174,11 @@ impl UserManager for MemUsers {
         Ok(user_entity(Uuid::from_u128(0x0E11), name, None))
     }
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        if self.refuse_delete.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ServiceError::invalid_input(
+                "there must be at least one admin user in the system",
+            ));
+        }
         *self.deleted.lock().unwrap() = Some(user_id);
         Ok(())
     }
@@ -566,6 +573,26 @@ fn state_with_sessions(
     auth: Arc<dyn AuthService>,
     sessions: Arc<dyn SessionManager>,
 ) -> AppState {
+    state_with_playlists(
+        users,
+        config,
+        activity,
+        auth,
+        sessions,
+        Arc::new(ferrofin_api::test_support::FakePlaylists),
+    )
+}
+
+/// [`state_with_sessions`] with a caller-supplied [`PlaylistManager`]
+/// (`ferrofin_traits::collections::PlaylistManager`).
+fn state_with_playlists(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    auth: Arc<dyn AuthService>,
+    sessions: Arc<dyn SessionManager>,
+    playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
@@ -584,7 +611,7 @@ fn state_with_sessions(
         Arc::new(FakeAuthContext),
         auth,
         Arc::new(OkQuickConnect),
-        Arc::new(ferrofin_api::test_support::FakePlaylists),
+        playlists,
         Arc::new(ferrofin_api::test_support::FakeCollections),
         Arc::new(ferrofin_api::test_support::FakeTvSeries),
         Arc::new(ferrofin_api::test_support::FakeSubtitles),
@@ -1543,6 +1570,197 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
         entries[0].user_id, None,
         "UserDeletedLogger passes Guid.Empty"
     );
+}
+
+/// A [`PlaylistManager`](ferrofin_traits::collections::PlaylistManager) that
+/// records each `remove_playlists` call with whether the user was already
+/// deleted then; every other method is unused here.
+struct RecordingPlaylists {
+    users: Arc<MemUsers>,
+    removed: Mutex<Vec<(Uuid, bool)>>,
+    fail: bool,
+}
+
+impl RecordingPlaylists {
+    fn new(users: Arc<MemUsers>, fail: bool) -> Self {
+        Self {
+            users,
+            removed: Mutex::new(Vec::new()),
+            fail,
+        }
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::collections::PlaylistManager for RecordingPlaylists {
+    async fn get_playlist_access(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<ferrofin_traits::collections::PlaylistAccess, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlist_for_user(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<BaseItemEntity, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn create_playlist(
+        &self,
+        _request: &ferrofin_model::playlists::PlaylistCreationRequest,
+    ) -> Result<ferrofin_model::playlists::PlaylistCreationResult, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn update_playlist(
+        &self,
+        _request: &ferrofin_model::playlists::PlaylistUpdateRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlist_items(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn add_user_to_shares(
+        &self,
+        _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn remove_user_from_shares(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+        _share: &ferrofin_model::entities_media::PlaylistUserPermissions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlist_shares(
+        &self,
+        _playlist_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::PlaylistUserPermissions>, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn add_item_to_playlist(
+        &self,
+        _playlist_id: Uuid,
+        _item_ids: &[Uuid],
+        _position: Option<i32>,
+        _user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn remove_item_from_playlist(
+        &self,
+        _playlist_id: &str,
+        _entry_ids: &[String],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn move_item(
+        &self,
+        _playlist_id: &str,
+        _entry_id: &str,
+        _new_index: i32,
+        _calling_user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        let deleted = self.users.deleted.lock().unwrap().is_some();
+        self.removed.lock().unwrap().push((user_id, deleted));
+        if self.fail {
+            return Err(ServiceError::backend("playlist store unavailable"));
+        }
+        Ok(())
+    }
+}
+
+/// The admin's state with `playlists` as the playlist manager.
+fn recording_state(
+    users: Arc<MemUsers>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    playlists: Arc<RecordingPlaylists>,
+) -> AppState {
+    state_with_playlists(
+        users,
+        Arc::new(MemConfig::new(true)),
+        activity,
+        Arc::new(AdminAuth),
+        Arc::new(NoopSessions::default()),
+        playlists,
+    )
+}
+
+async fn delete_bob(state: AppState) -> StatusCode {
+    create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// `UserController.DeleteUser` → `RemovePlaylistsAsync(userId)`: the deleted
+/// user's playlists are handed over or deleted, once the delete has succeeded.
+#[tokio::test]
+async fn delete_user_hands_over_the_users_playlists_after_the_delete() {
+    let users = Arc::new(MemUsers::default());
+    let playlists = Arc::new(RecordingPlaylists::new(users.clone(), false));
+    let state = recording_state(
+        users,
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        playlists.clone(),
+    );
+    assert_eq!(delete_bob(state).await, StatusCode::NO_CONTENT);
+    assert_eq!(*playlists.removed.lock().unwrap(), vec![(BOB_ID, true)]);
+}
+
+/// A refused delete (the last user or the last admin) leaves the user's
+/// playlists alone; upstream has already given them away by then.
+#[tokio::test]
+async fn a_refused_delete_leaves_the_users_playlists_alone() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .refuse_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let playlists = Arc::new(RecordingPlaylists::new(users.clone(), false));
+    let state = recording_state(
+        users,
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        playlists.clone(),
+    );
+    assert_eq!(delete_bob(state).await, StatusCode::BAD_REQUEST);
+    assert!(playlists.removed.lock().unwrap().is_empty());
+}
+
+/// A failed hand-over fails the request, but the deletion it follows still
+/// gets its `UserDeleted` activity entry.
+#[tokio::test]
+async fn a_failed_playlist_hand_over_still_logs_the_deletion() {
+    let users = Arc::new(MemUsers::default());
+    let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
+    let playlists = Arc::new(RecordingPlaylists::new(users.clone(), true));
+    let state = recording_state(users.clone(), activity.clone(), playlists);
+    assert!(delete_bob(state).await.is_server_error());
+    assert_eq!(*users.deleted.lock().unwrap(), Some(BOB_ID));
+    let entries = activity.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].type_, "UserDeleted");
 }
 
 #[tokio::test]

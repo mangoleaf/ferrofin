@@ -10,7 +10,7 @@ setup() {
   TMP="$BATS_TEST_TMPDIR/fixtures"
   mkdir -p "$TMP"
   cd "$TMP" || exit 1
-  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT ADOPTION_ORACLE ADOPTION_MEDIA_MOUNTS ORACLE_VERSION
+  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT ADOPTION_ORACLE ORACLE_VERSION
 }
 
 # A smoke output in the real format: "status  metric  path".
@@ -93,6 +93,19 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
   [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
   ORACLE_VERSION=12.1
   run adoption_compare_smoke oracle.txt fewer.txt
+  [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
+}
+
+@test "compare_smoke: a skipped probe is left out on both sides, every other line still counts" {
+  smoke oracle.txt 120; smoke unscanned.txt 120; smoke fewer.txt 119
+  echo '200  2                                             /Persons?UserId=dddddddddddddddddddddddddddddddd&Limit=0' >> oracle.txt
+  echo '200  0                                             /Persons?UserId=dddddddddddddddddddddddddddddddd&Limit=0' >> unscanned.txt
+  echo '200  0                                             /Persons?UserId=dddddddddddddddddddddddddddddddd&Limit=0' >> fewer.txt
+  run adoption_compare_smoke oracle.txt unscanned.txt
+  [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt unscanned.txt)" ]
+  run adoption_compare_smoke oracle.txt unscanned.txt '/Persons\?'
+  [ -z "$output" ]
+  run adoption_compare_smoke oracle.txt fewer.txt '/Persons\?'
   [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
 }
 
@@ -240,7 +253,7 @@ EOS
 }
 
 @test "run.sh: a missing fixture is skipped, named, and does not fail the run" {
-  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 1 ]
@@ -260,8 +273,22 @@ EOS
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh")" -eq 10 ]
 }
 
+@test "run.sh: only a 10.11 source compares /Persons, and the whole smoke again, after the scan" {
+  grep -qF "case \$expected in 10.11.*) after_scan='/Persons\\?';; *) after_scan=;; esac" "$ADOPTION/run.sh"
+  grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke.txt\" \"\$after_scan\")" "$ADOPTION/run.sh"
+  grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke-scan.txt\" | sed 's/^/after scan: /')" "$ADOPTION/run.sh"
+}
+
+@test "run.sh: the second-boot log starts at the restarted container's own start, and must hold a server start" {
+  # a zone-less `date -u` --since is read as local time: empty west of UTC, the first boot east of it
+  run grep -cF "logs --since \"\$(date" "$ADOPTION/run.sh"
+  [ "$output" = 0 ]
+  grep -qF "docker logs --since \"\$(docker inspect -f '{{.State.StartedAt}}' \"\$name\")\" \"\$name\" > \"\$dst.boot2.log\" 2>&1" "$ADOPTION/run.sh"
+  grep -qF "grep -q '\"ferrofin-server starting\"' \"\$dst.boot2.log\" || why+=(\"second boot log has no server start\")" "$ADOPTION/run.sh"
+}
+
 @test "run.sh: the oracle is Jellyfin 12.2 unless --oracle or ADOPTION_ORACLE picks 12.1" {
-  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 2 ]
   [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
@@ -282,50 +309,114 @@ EOS
   [[ "$output" == *"--oracle must be 12.1 or 12.2, not '12.0'"* ]]
 }
 
-@test "run.sh: a media-mounts file named in ADOPTION_MEDIA_MOUNTS must exist" {
+@test "run.sh: refuses without the synthetic media" {
   fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  ADOPTION_MEDIA_MOUNTS=$TMP/nowhere.sh run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 2 ]
-  [[ "$output" == *"no $TMP/nowhere.sh"* ]]
-  printf 'MEDIA=(-v /x:/y:ro)\n' > mounts.sh
-  ADOPTION_MEDIA_MOUNTS=$TMP/mounts.sh run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [[ "$output" == *"fixtures/media missing"* ]]
+}
+
+fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports these mount types, one per line
+  mkdir -p bin; printf '#!/usr/bin/env bash\nprintf "%%s\\n" %s\n' "${1//,/ }" > bin/findmnt; chmod +x bin/findmnt
+}
+
+@test "adoption_require_local: network filesystems are refused, local ones (FUSE included) accepted" {
+  for fs in nfs nfs4 cifs smb3 9p ceph afs glusterfs fuse.sshfs fuse.rclone autofs,nfs; do
+    fake_findmnt "$fs"
+    run bash -c '. "$1/lib.sh"; PATH="$2:$PATH" adoption_require_local "$3"' _ "$ADOPTION" "$TMP/bin" "$TMP"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"network filesystem (${fs##*,})"* ]]
+  done
+  for fs in ext4 btrfs tmpfs fuseblk fuse.mergerfs; do
+    fake_findmnt "$fs"
+    run bash -c '. "$1/lib.sh"; PATH="$2:$PATH" adoption_require_local "$3"' _ "$ADOPTION" "$TMP/bin" "$TMP"
+    [ "$status" -eq 0 ]
+  done
+  # a directory not created yet is judged by its nearest existing parent
+  run adoption_require_local "$TMP/not/yet/made"
   [ "$status" -eq 0 ]
+  # a filesystem findmnt cannot name is refused, never assumed local
+  printf '#!/usr/bin/env bash\nexit 1\n' > bin/findmnt
+  run bash -c '. "$1/lib.sh"; PATH="$2:$PATH" adoption_require_local "$3"' _ "$ADOPTION" "$TMP/bin" "$TMP"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot tell its filesystem"* ]]
 }
 
-# --- build-fixtures.sh preconditions ----------------------------------------------------
+@test "run.sh: the only media mounted is the fixtures' own media, read-only" {
+  run grep -n 'MEDIA=' "$ADOPTION/run.sh"
+  [ "${#lines[@]}" -eq 1 ]
+  # shellcheck disable=SC2016 # the script's literal source line, not an expansion
+  [[ "$output" == *'MEDIA=(-v "$FIXTURES/media:/media:ro")' ]]
+}
 
-@test "build-fixtures.sh: refuses without the 10.11.8 snapshot" {
-  mkdir fixtures
-  run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
+@test "run.sh, build-fixtures.sh and synthetic.py refuse a network filesystem before creating anything" {
+  fake_docker; fake_findmnt cifs
+  mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any
   [ "$status" -eq 2 ]
-  [[ "$output" == *"no "*"jellyfin-10.11.8/data/jellyfin.db"* ]]
-}
-
-@test "build-fixtures.sh: refuses a snapshot that is not a 10.11.8 database" {
-  mkdir -p fixtures/jellyfin-10.11.8/data
-  sqlite3 fixtures/jellyfin-10.11.8/data/jellyfin.db "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT); INSERT INTO __EFMigrationsHistory VALUES ('a','1'),('b','1'),('c','1');"
-  run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
+  [[ "$output" == *"network filesystem (cifs)"* ]]
+  [ ! -e fixtures/work ]
+  run "$ADOPTION/build-fixtures.sh" --fixtures new-fixtures
   [ "$status" -eq 2 ]
-  [[ "$output" == *"has 3 EF migration ids, a 10.11.8 database has 68"* ]]
+  [[ "$output" == *"network filesystem (cifs)"* ]]
+  [ ! -e new-fixtures ]
+  run python3 "$ADOPTION/synthetic.py" run --fixtures other-fixtures
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"network filesystem (cifs)"* ]]
+  [ ! -e other-fixtures ]
 }
 
-@test "build-fixtures.sh: each 12.2 fixture boots Jellyfin 12.2 on its contract parent" {
-  grep -q ' jellyfin-12.2-from-10:jellyfin-10.11.8:[0-9]*:107 ' "$ADOPTION/build-fixtures.sh"
-  grep -q ' jellyfin-12.2-from-12:jellyfin-12.0:[0-9]*:108 ' "$ADOPTION/build-fixtures.sh"
-  grep -q ' jellyfin-12.2-from-121:jellyfin-12.1-from-12:[0-9]*:109;' "$ADOPTION/build-fixtures.sh"
+# --- build-fixtures.sh ------------------------------------------------------------------
+
+@test "build-fixtures.sh: each 12.2 fixture is built by Jellyfin 12.2 on its contract parent" {
+  grep -q '("jellyfin-12.2-from-10", "12.2", "jellyfin-10.11.8")' "$ADOPTION/synthetic.py"
+  grep -q '("jellyfin-12.2-from-12", "12.2", "jellyfin-12.0")' "$ADOPTION/synthetic.py"
+  grep -q '("jellyfin-12.2-from-121", "12.2", "jellyfin-12.1-from-12")' "$ADOPTION/synthetic.py"
   grep -q '^build_oracle 12.1 jellyfin-12.1-from-12 ' "$ADOPTION/build-fixtures.sh"
   grep -q '^build_oracle 12.2 jellyfin-12.2-from-121 ' "$ADOPTION/build-fixtures.sh"
 }
 
-@test "build-fixtures.sh: with every fixture built it only dumps the 12.2 schema and diffs the other routes" {
-  mkdir -p bin; printf '#!/usr/bin/env bash\necho "unexpected docker $*" >&2; exit 99\n' > bin/docker; chmod +x bin/docker
+built_fixtures() { # every fixture built at the current recipe, carrying its release's EF history id count
+  local recipe f
+  mkdir -p bin fixtures/media fixtures/oracle
+  printf '#!/usr/bin/env bash\necho "unexpected docker $*" >&2; exit 99\n' > bin/docker; chmod +x bin/docker
   PATH="$TMP/bin:$PATH"
-  mkdir -p fixtures/jellyfin-10.11.8/data fixtures/oracle
-  sqlite3 fixtures/jellyfin-10.11.8/data/jellyfin.db "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
-    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 68) INSERT INTO __EFMigrationsHistory SELECT i, '9' FROM n;"
-  for f in 10.11.9 10.11.10 10.11.11 12.0 12.1-from-10 12.1-from-12; do mkdir "fixtures/jellyfin-$f"; done
+  recipe=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import synthetic; print(synthetic.recipe())' "$ADOPTION")
+  for f in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
+           12.2-from-10:107 12.2-from-12:108 12.2-from-121:109; do
+    mkdir -p "fixtures/jellyfin-${f%:*}/data"
+    printf '{"fixture": "jellyfin-%s", "recipe": "%s"}' "${f%:*}" "$recipe" > "fixtures/jellyfin-${f%:*}/synthetic-ready.json"
+    sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
+      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${f#*:}) INSERT INTO __EFMigrationsHistory SELECT i, '9' FROM n;"
+  done
+}
+
+@test "build-fixtures.sh: pulls the release of each fixture still to build, and 10.11.8, before building" {
+  built_fixtures
+  rm fixtures/jellyfin-12.1-from-10/synthetic-ready.json
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+[ "$1" = pull ] && { echo "$*" >> "$PULLS"; exit 0; }
+exit 99
+EOS
+  PULLS="$TMP/pulls" run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
+  [ "$status" -ne 0 ]
+  [ "$(cat pulls)" = "$(printf 'pull -q jellyfin/jellyfin:10.11.8\npull -q jellyfin/jellyfin:12.1')" ]
+}
+
+@test "build-fixtures.sh: a fixture without its release's EF history id count fails the build" {
+  built_fixtures
+  sqlite3 fixtures/jellyfin-12.0/data/jellyfin.db "DELETE FROM __EFMigrationsHistory WHERE MigrationId = '1'"
+  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"jellyfin-12.0 has 101 EF history ids, expected 102"* ]]
+  [[ "$output" != *"unexpected docker"* ]]
+}
+
+@test "build-fixtures.sh: with every fixture built it only dumps the 12.2 schema and diffs the other routes" {
+  built_fixtures
   for f in 12.2-from-10 12.2-from-12 12.2-from-121; do
-    mkdir -p "fixtures/jellyfin-$f/data"
     sqlite3 "fixtures/jellyfin-$f/data/jellyfin.db" 'CREATE TABLE t(a); CREATE INDEX i ON t(a) WHERE a IS NOT NULL;
       INSERT INTO t VALUES (1); ANALYZE; CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO s DEFAULT VALUES;'
   done
@@ -333,7 +424,7 @@ EOS
   smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
   [ "$status" -eq 0 ]
-  [[ "$output" == *"jellyfin-12.2-schema.sql: 3 CREATE statements"* ]]
+  [[ "$output" == *"jellyfin-12.2-schema.sql: 4 CREATE statements"* ]]
   [[ "$output" == *"jellyfin-12.2-from-10: same schema"* ]]
   [[ "$output" == *"jellyfin-12.2-from-12: schema DIFFERS"* ]]
   [[ "$output" != *"unexpected docker"* ]]
@@ -354,13 +445,16 @@ EOS
 
 @test "run.sh: an unreadable metadata baseline fails before starting a container" {
   fake_docker
-  mkdir -p fixtures/oracle fixtures/jellyfin-12.0/data
+  mkdir -p fixtures/oracle fixtures/media fixtures/jellyfin-12.0/data
   smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   printf 'not a database\n' > fixtures/jellyfin-12.0/data/jellyfin.db
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 1 ]
   [[ "$output" == *"metadata baseline: metadata check could not read"* ]]
   [[ "$output" != *"unexpected docker run"* ]]
+  # the copy lands in work/run/, clear of synthetic.py run's work/<fixture>
+  [ -d fixtures/work/run/jellyfin-12.0 ]
+  [ ! -e fixtures/work/jellyfin-12.0 ]
 }
 
 @test "synthetic adoption checks detect missing scenarios, changed membership and redundant writes" {

@@ -23,6 +23,9 @@ workspace = true
 default = ["opensubtitles", "lrclib"]
 opensubtitles = []
 lrclib = []
+# Test-only hooks for other crates' tests (`rate_limit::test_support`). Enable it
+# from `[dev-dependencies]` only: no production build may contain it.
+test-util = []
 
 [dependencies]
 ferrofin-traits.workspace = true
@@ -40,6 +43,8 @@ thiserror.workspace = true
 quick-xml.workspace = true
 regex.workspace = true
 unicode-normalization.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
 zip.workspace = true
 uuid.workspace = true
 chrono.workspace = true

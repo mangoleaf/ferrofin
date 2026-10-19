@@ -290,6 +290,16 @@ pub trait LibraryManager: Send + Sync {
         Ok(Some(item))
     }
 
+    /// The [`InternalPeopleQuery::access_filter`] for `user`: `None` when
+    /// nothing is hidden from them (`PersonsController.BuildAccessFilter`).
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn build_access_filter(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Err(ServiceError::backend("access filtering is not configured"))
+    }
+
     /// `BaseItem.IsVisible`: the item's own policy, used by parent browse gates.
     /// Managers must supply policy evaluation; the default fails closed.
     async fn is_item_visible(
@@ -571,6 +581,25 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
+    /// Saves only `item`'s rating: its `OfficialRating` and the parental score
+    /// [`update_items`](Self::update_items) would re-derive from it, leaving
+    /// the rest of the stored row as it is. A box set or playlist re-rated
+    /// from its members (`BaseItem.UpdateRatingToItems`) saves through this,
+    /// so the rest of a row it read earlier never overwrites a concurrent
+    /// write — a share change to `Data` above all.
+    ///
+    /// The default is a no-op so the API-layer test doubles keep compiling;
+    /// the real manager writes through the item repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the score cannot be derived or the row
+    /// cannot be written.
+    async fn update_item_rating(&self, item: BaseItemEntity) -> Result<(), ServiceError> {
+        let _ = item;
+        Ok(())
+    }
+
     /// The locked metadata fields (upstream's `BaseItem.LockedFields`) of
     /// each of `item_ids`; an item with none is absent.
     ///
@@ -675,6 +704,18 @@ pub trait LibraryManager: Send + Sync {
         &self,
         query: &InternalPeopleQuery,
     ) -> Result<Vec<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError>;
+
+    /// [`Self::get_people`] with the repository's total for the whole filtered
+    /// set (C# `IPeopleRepository.GetPeople` returns a `QueryResult`). The
+    /// default can only report the page it was handed; the concrete manager
+    /// overrides it with the repository's count.
+    async fn get_people_page(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError> {
+        let people = self.get_people(query).await?;
+        Ok(QueryResult::new(query.start_index, None, people))
+    }
 
     /// Gets the credited people for a set of item ids at once, keyed by item —
     /// the batch form used to project a page of DTOs without a per-item
@@ -833,26 +874,41 @@ pub trait LibraryManager: Send + Sync {
 
     /// Resolves the people matching `query` to their by-name `Person` item rows.
     ///
-    /// Port of `ILibraryManager.GetPeopleItems`: it fetches the credited people
-    /// via [`Self::get_people`], then resolves each name to its `Person`
-    /// [`BaseItemEntity`] (dropping any that no longer resolve), preserving the
-    /// people query's paging. The default folds the two calls so every impl gets
-    /// it for free from [`Self::get_people`] + [`Self::get_named_item`].
+    /// Port of `ILibraryManager.GetPeopleItems` (Jellyfin 12.2): it sets
+    /// [`must_have_item`](InternalPeopleQuery::must_have_item), fetches the
+    /// credited people via [`Self::get_people_page`], then resolves each name to
+    /// its `Person` [`BaseItemEntity`] (dropping any that no longer resolve, or
+    /// that the access filter's user may not see), preserving the people
+    /// query's paging. The total is the repository's, so
+    /// it counts exactly the people a page can hand back. The default folds the
+    /// calls so every impl gets it for free.
     async fn get_people_items(
         &self,
         query: &InternalPeopleQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let people = self.get_people(query).await?;
-        let names: Vec<String> = people.into_iter().map(|p| p.name).collect();
+        let query = InternalPeopleQuery {
+            must_have_item: true,
+            ..query.clone()
+        };
+        let page = self.get_people_page(&query).await?;
+        let names: Vec<String> = page.items.into_iter().map(|p| p.name).collect();
         let items: Vec<BaseItemEntity> = self
             .get_named_items(BaseItemKind::Person, &names)
             .await?
             .into_iter()
             .flatten()
             .collect();
+        // C# drops the people that fail `IsVisible(query.User)`. A person skips
+        // the allowed-tags check and an item-by-name is never blocked as
+        // unrated, so only a user with content restrictions — the one the
+        // access filter exists for — can fail it.
+        let items = match query.access_filter.as_ref().and_then(|f| f.user.as_ref()) {
+            Some(user) => self.filter_visible_items(items, user).await?,
+            None => items,
+        };
         Ok(QueryResult::new(
             query.start_index,
-            Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
+            Some(page.total_record_count),
             items,
         ))
     }
@@ -1341,25 +1397,33 @@ pub trait UserManager: Send + Sync {
     /// Updates a user's policy (stopgap; prefer [`Self::update_user`]).
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError>;
 
-    /// Clears a user's profile image.
+    /// Clears a user's profile image: deletes the stored file (a missing file is
+    /// not an error) and the `ImageInfos` row, as `DELETE /UserImage` does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the file cannot be deleted for lack of
+    /// permission (C# `UnauthorizedAccessException`); the row is then kept.
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError>;
 
     /// Stores caller-supplied profile-image bytes for a user.
     ///
-    /// Port of the `POST /UserImage` tail: clear any existing profile image, write
-    /// the decoded bytes to the user's `profile{extension}` path, and persist the
-    /// user (`_providerManager.SaveImage(stream, mime, path)` +
+    /// Port of the `POST /UserImage` tail: replace any existing profile-image row
+    /// (like upstream, a previous file at a different path is left on disk), write
+    /// the decoded bytes to `{UserConfigurationDirectoryPath}/{Username}/profile{extension}`,
+    /// and persist the user (`_providerManager.SaveImage(stream, mime, path)` +
     /// `UpdateUserAsync`). `extension` is the image extension derived from the
     /// upload `Content-Type` (e.g. `.png`).
     ///
-    /// The default implementation reports the image pipeline as deferred (as the
-    /// shell provider manager does for `save_image`), so impls without a
+    /// The default implementation returns an error, so impls without a
     /// profile-image store compile unchanged; the concrete manager overrides it.
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] while the image store is deferred, or whatever
-    /// error the concrete write surfaces.
+    /// [`ServiceError::InvalidInput`] when the username would escape the user
+    /// configuration directory (C# `PathHelper.IsContainedIn` → `400 Invalid
+    /// user.`), [`ServiceError::Backend`] from the default implementation, or
+    /// whatever error the concrete write surfaces.
     async fn save_profile_image(
         &self,
         user: &UserEntity,
@@ -1436,6 +1500,22 @@ pub trait UserDataManager: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = reason;
         self.save_user_data(user_id, item_id, user_data).await
+    }
+
+    /// Gets the remembered audio and subtitle stream indices for an item.
+    ///
+    /// Port of the `UserDataManager.GetUserData(user, item)` call inside
+    /// `SetDefaultAudioAndSubtitleStreamIndices`: only the stream-index fields
+    /// are needed, so this avoids constructing the full DTO.  Returns
+    /// `(audio_stream_index, subtitle_stream_index)`, both `None` when no
+    /// user-data row exists.
+    async fn get_stream_default_data(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
+        let _ = (item_id, user_id);
+        Ok((None, None))
     }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.
@@ -1577,7 +1657,11 @@ pub trait UserDataManager: Send + Sync {
     ///
     /// Port of `BaseItem.MarkPlayed`: sets `Played`, resets the resume position,
     /// stamps `LastPlayedDate` (defaulting to now), and — when `date_played` is
-    /// supplied — increments `PlayCount` (always at least one).
+    /// supplied — increments `PlayCount` (always at least one). A container (a
+    /// series, season, album, box set, playlist or folder) is not marked
+    /// itself: the `Folder`/`BoxSet` overrides mark the items under it. The DTO
+    /// is the container's user data, with its played state rolled up from
+    /// those items where the kind takes it from its children.
     async fn mark_played(
         &self,
         user_id: Uuid,
@@ -1588,7 +1672,9 @@ pub trait UserDataManager: Send + Sync {
     /// Marks an item as unplayed for a user, returning the refreshed data DTO.
     ///
     /// Port of `BaseItem.MarkUnplayed` / `ResetPlayedState`: clears `Played`,
-    /// the play count, the resume position, and `LastPlayedDate`.
+    /// the play count, the resume position, and `LastPlayedDate`. A container
+    /// resets the items under it instead, as [`Self::mark_played`] describes,
+    /// and drops any play state left on its own row.
     async fn mark_unplayed(
         &self,
         user_id: Uuid,
@@ -1907,6 +1993,49 @@ pub trait MediaSourceManager: Send + Sync {
     /// Gets an already-open live stream's media source by id.
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError>;
 
+    /// Resolves the media source a stream request reads, for direct play and
+    /// transcoding alike.
+    ///
+    /// Port of the selection in `StreamingHelpers.GetStreamingState`: an open
+    /// live stream (`live_stream_id`) wins outright, since its source is the
+    /// buffered copy of the tuner and the static sources would dial it again.
+    /// Otherwise the item's static sources (unsubstituted: the server reads
+    /// the file itself), taking the one `media_source_id` names, the first when
+    /// none is named, and the first when the named id is the item's own. An id
+    /// naming no source is `NotFound`, a deliberate divergence: upstream fails
+    /// the request by accident, `400` for an unknown GUID (a null-source
+    /// `ArgumentNullException`) and `500` for a non-GUID (`Guid.Parse`).
+    ///
+    /// TODO: two upstream steps are not ported. Upstream picks from
+    /// `GetPlaybackMediaSources`, whose list has symlinked paths resolved and is
+    /// ordered by `SortMediaSources` (placeholders dropped, widest first after
+    /// the preferred version). It also first reuses the source of the
+    /// `PlaySessionId`'s running transcode job. Fix path: select from
+    /// [`Self::get_playback_media_sources`] once it can be called without a
+    /// user, and look the job up through the transcode manager.
+    async fn get_stream_media_source(
+        &self,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+        live_stream_id: Option<&str>,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        if let Some(live_stream_id) = live_stream_id.map(str::trim).filter(|id| !id.is_empty()) {
+            return self.get_live_stream(live_stream_id).await;
+        }
+        let sources = self.get_static_media_sources(item_id, false, None).await?;
+        let chosen = match media_source_id.filter(|id| !id.is_empty()) {
+            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
+                Some(i) => sources.into_iter().nth(i),
+                None if Uuid::parse_str(id).is_ok_and(|g| g == item_id) => {
+                    sources.into_iter().next()
+                }
+                None => None,
+            },
+            None => sources.into_iter().next(),
+        };
+        chosen.ok_or_else(|| ServiceError::NotFound(format!("no media source for item {item_id}")))
+    }
+
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
 }
@@ -2023,6 +2152,15 @@ fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 /// [`LibraryOptions`]. This trait models exactly that filesystem contract — it
 /// is independent of the DB-backed item tree, so a concrete impl only needs the
 /// root user-views path and is fully testable over a temp directory.
+///
+/// Every caller-supplied library name must denote one directory directly under
+/// that root, as upstream's `FileSystemHelper.GetChildPath` enforces: a blank
+/// name, `.`/`..`, an absolute path or anything with a separator never reaches
+/// the filesystem. A blank name to remove or rename is a
+/// [`ServiceError::InvalidInput`], as is a rename's new name that is not such a
+/// folder (checked before the current name); any other such name is a
+/// [`ServiceError::NotFound`] for the library being looked up. Adding a library
+/// named `.` or `..` de-duplicates it to `.2`/`..2`, as upstream does.
 ///
 /// The `refresh_library` flag and the C# `ILibraryMonitor` stop/start dance are
 /// dropped: the scan pipeline and filesystem watcher are later-wave subsystems,

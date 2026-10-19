@@ -70,6 +70,11 @@ pub struct InternalItemsQuery {
     pub user: Option<UserEntity>,
     /// Whether repository resolution has loaded the user content preferences.
     pub user_preferences_loaded: bool,
+    /// Whether any library, parental rating or tag rule hides content from
+    /// [`user`](Self::user) (C# `UserHasContentRestrictions`). Like the tag and
+    /// unrated restrictions it reads preferences and permissions, so repository
+    /// resolution sets it alongside them.
+    pub user_has_content_restrictions: bool,
 
     // --- boolean tri-state filters ---
     /// Restrict to folders / non-folders.
@@ -325,8 +330,10 @@ pub struct InternalItemsQuery {
     /// the repository ignores it unless the parent really does resolve to the
     /// user root.
     pub user_root_children: bool,
-    /// Apply the Folder display policy on an ItemsController browse. Internal
-    /// repository queries and latest/resume queries leave this false.
+    /// Apply the Folder display policy on an ItemsController browse, and on
+    /// the internal query that lists a folder's members for a played mark
+    /// (`Folder.MarkPlayed` → `GetItemList` runs the same policy). Other
+    /// internal repository queries and latest/resume queries leave this false.
     pub apply_folder_display_options: bool,
     /// The source movie/TV base UserView directly calls Folder.QueryRecursive,
     /// bypassing its parent's Series/Season/Channel GetItemsInternal override.
@@ -486,6 +493,7 @@ impl Default for InternalItemsQuery {
             limit: None,
             user: None,
             user_preferences_loaded: false,
+            user_has_content_restrictions: false,
             is_folder: None,
             is_favorite: None,
             is_favorite_or_liked: None,
@@ -750,9 +758,11 @@ impl InternalItemsQuery {
     /// `exclude_inherited_tags` and `include_inherited_tags` from the user's
     /// **preferences** (`PreferenceKind.*`). Those rows live in a separate
     /// preferences table, not on [`UserEntity`], so repository query resolution populates
-    /// those three fields from a preference lookup before translating SQL.
+    /// those three fields from a preference lookup before translating SQL, along
+    /// with [`user_has_content_restrictions`](Self::user_has_content_restrictions).
     pub fn set_user(&mut self, user: UserEntity) {
         self.user_preferences_loaded = false;
+        self.user_has_content_restrictions = false;
         self.block_unrated_items.clear();
         self.exclude_inherited_tags.clear();
         self.include_inherited_tags.clear();

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::encoder::quote;
 use crate::error::MediaEncodingError;
 use crate::keyed_locks::KeyedLocks;
 use async_trait::async_trait;
@@ -74,7 +75,8 @@ pub trait AttachmentIo: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error string when the process cannot be spawned.
+    /// Returns an error string when `args` does not split into argv
+    /// (unbalanced quoting) or the process cannot be spawned.
     async fn run_ffmpeg(
         &self,
         ffmpeg_path: &str,
@@ -208,9 +210,9 @@ where
             let has_av = Self::has_video_or_audio(media_source);
             let tail = if has_av { "-t 0 -f null null" } else { "" };
             let args = format!(
-                "-dump_attachment:{} \"{}\" -i {} {}",
+                "-dump_attachment:{} {} -i {} {}",
                 attachment.index,
-                normalize_path(&attachment_path),
+                quote(&attachment_path),
                 input_path,
                 tail
             )
@@ -356,10 +358,11 @@ where
             .map_err(MediaEncodingError::process)?;
         let has_av = Self::has_video_or_audio(media_source);
         let tail = if has_av { "-t 0 -f null null" } else { "" };
+        // Trim only: collapsing whitespace would also collapse it inside the
+        // quoted input path.
         let args = format!("-dump_attachment:t \"\" -y {concat} -i {input_path} {tail}")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+            .trim()
+            .to_owned();
 
         let exit_code = self
             .io
@@ -375,14 +378,6 @@ where
 
         Ok(())
     }
-}
-
-/// Escapes embedded double quotes with a leading backslash.
-///
-/// Port of `EncodingUtils.NormalizePath`, duplicated locally so the extractor
-/// does not reach into a sibling module's private helper.
-fn normalize_path(path: &str) -> String {
-    path.replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -440,7 +435,11 @@ mod tests {
             Ok(String::new())
         }
         fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
-            format!("file:\"{input_file}\"")
+            crate::encoder::get_input_argument(
+                "file",
+                input_file,
+                ferrofin_model::media_info::MediaProtocol::File,
+            )
         }
         fn get_time_parameter(&self, _ticks: i64) -> String {
             String::new()
@@ -657,5 +656,29 @@ mod tests {
         );
         assert_eq!(ex_io.created_dir.lock().unwrap().as_deref(), Some("/cache"));
         assert_eq!(ex_io.working_dir.lock().unwrap().as_deref(), Some("/cache"));
+    }
+
+    /// The batch dump used to collapse every run of whitespace in the whole
+    /// command line, including inside the quoted input path. The path must
+    /// reach ffmpeg byte for byte, quotes and double spaces included.
+    #[tokio::test]
+    async fn extract_all_keeps_the_input_path_intact() {
+        let io = FakeIo {
+            folder: Some("/cache".to_owned()),
+            existing: false,
+            exit_code: 0,
+            last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
+        };
+        let source = source_with_attachment();
+        let ex = extractor(Some(source.clone()), io);
+        let path = r#"/media/The  "Best" \ Movie.mkv"#;
+        ex.extract_all_attachments(path, &source).await.unwrap();
+        let args = ex.io.last_args.lock().unwrap().clone().unwrap();
+        let tokens = crate::encoder::split_args(&args).unwrap();
+        let i = tokens.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(tokens[i + 1], format!("file:{path}"));
+        assert_eq!(tokens[..3], ["-dump_attachment:t", "", "-y"]);
     }
 }

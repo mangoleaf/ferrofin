@@ -9,6 +9,9 @@ use axum::{Json, Router, extract::State, http::Uri};
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
 const CLIENT: &str =
     r#"MediaBrowser Client="lyrics-test", Device="fixture", DeviceId="lyrics-test", Version="1""#;
 
@@ -59,7 +62,9 @@ impl Api {
             .unwrap()
             .error_for_status()
             .unwrap();
-        let lyrics = self.get(&format!("/Audio/{item}/Lyrics")).await;
+        // The lyric is read from the track's Lyric stream, which the refresh
+        // queued by the upload records.
+        let lyrics = self.lyrics_after_refresh(item).await;
         assert_eq!(lyrics["Lyrics"][0]["Text"], text, "{lyrics}");
     }
 
@@ -72,6 +77,37 @@ impl Api {
             .unwrap()
             .error_for_status()
             .unwrap();
+        // The refresh queued by the delete drops the stream, and with it
+        // `HasLyrics`.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let items = self.get(&format!("/Items?ids={item}")).await;
+            if items["Items"][0]["HasLyrics"] == json!(false) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "lyrics delete refresh: {items}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Polls `GET /Audio/{item}/Lyrics` until it answers, returning the lyric.
+    async fn lyrics_after_refresh(&self, item: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = self
+                .client
+                .get(format!("{}/Audio/{item}/Lyrics", self.base))
+                .header("Authorization", &self.auth)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            if status.is_success() {
+                return response.json().await.unwrap();
+            }
+            assert!(Instant::now() < deadline, "lyrics refresh: {status}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -132,49 +168,28 @@ async fn saved_lyrics_destinations_change_without_restarting() {
     let mock = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = Config {
+    let ffmpeg = probe_stub(tmp.path(), "ffmpeg");
+    let ffprobe = probe_stub(tmp.path(), "ffprobe");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let (server, base, _) = boot::spawn_server(&client, |port| Config {
         port,
-        ffmpeg_path: Some(probe_stub(tmp.path(), "ffmpeg")),
-        ffprobe_path: Some(probe_stub(tmp.path(), "ffprobe")),
+        ffmpeg_path: Some(ffmpeg.clone()),
+        ffprobe_path: Some(ffprobe.clone()),
         provider_endpoints: ProviderEndpoints {
-            lrclib: Some(endpoint),
+            lrclib: Some(endpoint.clone()),
             ..Default::default()
         },
         ..Config::test_stub(tmp.path())
-    };
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ferrofin_server::run(config))
-            .unwrap();
-    });
+    })
+    .await;
     let mut api = Api {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap(),
-        base: format!("http://127.0.0.1:{port}"),
+        client,
+        base,
         auth: CLIENT.to_owned(),
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Ok(response) = api
-            .client
-            .get(format!("{}/System/Info/Public", api.base))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "server readiness");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let login: Value = api
         .client
         .post(format!("{}/Users/AuthenticateByName", api.base))
@@ -305,8 +320,11 @@ async fn saved_lyrics_destinations_change_without_restarting() {
         adjacent.is_file(),
         "the live task selection did not download lyrics"
     );
+    // The task saves the file only (`LyricScheduledTask`); the next scan sees
+    // the new lyric file and records its stream.
+    api.post("/Library/Refresh", &Value::Null).await;
     assert_eq!(
-        api.get(&format!("/Audio/{item}/Lyrics")).await["Lyrics"][0]["Text"],
+        api.lyrics_after_refresh(&item).await["Lyrics"][0]["Text"],
         "scheduled download"
     );
     assert!(
@@ -332,7 +350,7 @@ async fn saved_lyrics_destinations_change_without_restarting() {
     );
     assert!(!adjacent.exists());
     api.post("/System/Shutdown", &Value::Null).await;
-    tokio::task::spawn_blocking(move || server.join().unwrap())
+    tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())
         .await
         .unwrap();
     mock.abort();

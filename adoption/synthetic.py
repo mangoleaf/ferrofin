@@ -4,10 +4,11 @@
 All media and accounts are invented. Jellyfin creates the source state through its
 API; each supported release supplies its own expected responses before adoption.
 A few states no API produces (non-US ratings, conflicting user data, a dangling parent
-chain) are written into the stopped 10.11.8 fixture and inherited by every later one,
-except that the 12.0 lineage (12.0, 12.1-from-12, 12.2-from-12, 12.2-from-121) starts
-without the dangling chain, which Jellyfin 12.0 cannot migrate (NO_ORPHAN_CLEANUP);
-for those, Jellyfin 12.2's own result is the expectation on every path.
+chain, legacy LinkedChildren entries) are written into the stopped 10.11.8 fixture and
+inherited by every later one, except that the 12.0 lineage (12.0, 12.1-from-12,
+12.2-from-12, 12.2-from-121) starts without the dangling chain, which Jellyfin 12.0
+cannot migrate (NO_ORPHAN_CLEANUP); for those, Jellyfin 12.2's own result is the
+expectation on every path.
 """
 
 import argparse
@@ -160,6 +161,9 @@ def main(argv=None):
     os.umask(0o077)
     root = args.fixtures.resolve()
     try:
+        # Never on a network share: every fixture is booted, scanned and copied repeatedly.
+        subprocess.run(["bash", "-c", '. "$1"; adoption_require_local "$2"', "_",
+                        str(Path(__file__).with_name("lib.sh")), str(root)], check=True)
         if args.mode == "build":
             build(root, args.only, args.port)
         else:

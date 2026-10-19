@@ -85,7 +85,9 @@ async function connect(legacy = false) {
         frames.push({ ...frame, at: performance.now() });
         if (frame.MessageType === 'ForceKeepAlive') socket.send(JSON.stringify({ MessageType: 'KeepAlive' }));
     });
-    await once(socket, 'open');
+    // A refused upgrade never fires 'open'; events.once ignores an EventTarget's 'error'.
+    await Promise.race([once(socket, 'open'),
+        once(socket, 'close').then(() => { throw new Error(`socket refused: ${query.split('=')[0]}`); })]);
     socket.send(JSON.stringify({ MessageType: 'ScheduledTasksInfoStart', Data: legacy ? '1000,1000' : '0,1000' }));
     await until(() => frames.some(f => f.MessageType === 'ScheduledTasksInfo'), 'initial task snapshot');
     return { socket, frames };
@@ -98,6 +100,8 @@ const release = () => rm(join(dir, 'hold'), { force: true });
 try {
     await until(async () => { try { await api('/System/Info/Public'); return true; } catch { return false; } }, 'boot');
     token = (await api('/Users/AuthenticateByName', { Username: 'admin', Pw: '' })).AccessToken;
+    // The legacy socket query (`api_key`) needs EnableLegacyAuthorization, as in Jellyfin 12.
+    await api('/System/Configuration', { ...await api('/System/Configuration'), EnableLegacyAuthorization: true });
     await api('/Library/VirtualFolders?name=ProgressTest&collectionType=movies&refreshLibrary=false', {
         LibraryOptions: { PathInfos: [{ Path: media }], EnableRealtimeMonitor: false,
             EnableChapterImageExtraction: false, EnableTrickplayImageExtraction: false,

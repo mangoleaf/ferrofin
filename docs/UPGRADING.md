@@ -8,6 +8,110 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — playlists get their own folder and a new id, once
+
+A playlist created in Ferrofin had no folder. Jellyfin gives each playlist one,
+`<data>/playlists/<name>` (`<name>1` when that is taken), and derives the playlist's id
+from it. A playlist made in Ferrofin is now stored the same way, so Jellyfin finds it in
+its folder after a switch back.
+
+On the first start after upgrading, each playlist an earlier version created moves to
+its folder and its new id. Its entries, owner, shares, played state and favourite move
+with it. The database file is copied to `<database>.pre-playlist-folders` first.
+
+- **A playlist's id changes once.** A client or script that kept the old id has to look
+  the playlist up again. Reloading the playlist list is enough in jellyfin-web and the apps.
+- **Deleting a playlist now deletes its folder too**, as in Jellyfin.
+- **An image uploaded to one of these playlists before the upgrade stays where it was.**
+  A "Replace all metadata" refresh can still replace it with the generated collage. Upload
+  the image again after upgrading to keep it.
+
+## Unreleased — an API key must name the user a playlist is for
+
+An API key carries no user. Earlier versions let `POST /Playlists` with an API key and
+no `userId` create a playlist with no owner, which every account could then rename, edit,
+share or delete. Ferrofin now answers `400 Bad Request`, as Jellyfin does: pass the id of
+the account the playlist is for as `UserId` in the body (or `userId=`). `GET`/`POST
+/Playlists/{id}/Items` take it as `userId=`. The other playlist routes (`GET`/`POST
+/Playlists/{id}`, `Move` and the `Users` routes) act as the account whose token calls
+them, so an API key always gets `400` from them, as in Jellyfin; call them with that
+account's own token. Removing entries (`DELETE /Playlists/{id}/Items`) still works with an
+API key, as in Jellyfin.
+
+Playlists an API key already created stay ownerless, so every account keeps owner rights
+over them, and only an administrator can delete one. To give one an owner, create it again
+for that account, then delete the old one.
+
+## Unreleased — a genre image drawn from music art stays until you delete it
+
+Through 1.3.x, a genre whose movies and series had no poster could take music art
+(album covers, song or music-video images) carrying the same genre name for its
+generated image, which some clients show as the genre's tile. Jellyfin never draws that
+image, and Ferrofin no longer does either, but an image that was already drawn stays.
+A scan only redraws a generated genre image when its file changes on disk. Ferrofin also
+has no record of which items an image was drawn from, so it cannot remove these
+automatically.
+
+To clear one, as an administrator, send `GET /Genres?searchTerm={name}`, take the `Id`
+of the entry whose `Name` matches exactly, and send `DELETE /Items/{id}/Images/Primary`.
+(`GET /Genres/{name}` cannot find a name containing `-`, such as Hip-Hop, because it
+reads the dash as a URL slug.) The next full library scan (**Scan All Libraries** under
+Dashboard → Libraries, or the scheduled scan) draws a new image from the genre's movie
+and series posters if any exist. Otherwise it leaves the genre without one, as Jellyfin
+does. Scanning a single library does not redraw genre images.
+
+## Unreleased — the "Clean up collections and playlists" task is gone
+
+Jellyfin 12 deleted this task, and Ferrofin has now removed it too. It ran about 3
+seconds after every start and removed each collection and playlist member whose file it
+could not see at that moment. If the media storage was not mounted yet (a late NFS/SMB
+mount, a NAS slower to boot than the server, an empty bind mount), it emptied every
+playlist and collection, and they stayed empty after the storage came back. Upgrading
+does not bring back members it already removed; restore a backup taken before the loss
+for that.
+
+Nothing replaces it. Deleting an item already removes it from every playlist and
+collection it was in. A member whose file you deleted stays listed until the next library
+scan removes the item. Jellyfin 12 behaves the same way. Dashboard → Scheduled Tasks no
+longer lists the task, and a trigger you saved for it is ignored.
+
+## Unreleased — Ferrofin reports Jellyfin 12.2.0; Emby-era sign-in is off by default
+
+`/System/Info` now reports `Version` `12.2.0` (1.3.x reported `10.11.8`). As in Jellyfin 12,
+only the `Authorization: MediaBrowser …` header and the `ApiKey` query parameter
+authenticate by default, on HTTP requests and the `/socket` WebSocket alike. The
+Emby-era forms are refused while `EnableLegacyAuthorization` is `false`, the default on
+a fresh install since 1.2.0:
+
+- the `X-Emby-Authorization` header (sign-in returns `400`, "app is required")
+- the bare `X-Emby-Token` and `X-MediaBrowser-Token` headers (`401`; `403` on the socket)
+- the `api_key` query parameter, and the `Emby` scheme name in place of `MediaBrowser`
+
+1.2.0 through 1.3.x refused them too on a fresh install, while reporting 10.11.8, a
+version that accepts them by default. An install first set up on 1.0.x or 1.1.0 wrote
+that release's default, `true`, into `config/system.json` and still accepts them. A
+configuration adopted from Jellyfin keeps the value its `system.xml` had: on for a 10.11
+server (Jellyfin 12 turns it off when it upgrades one; Ferrofin does not). Set it to
+`false` in either case to match Jellyfin 12.
+
+If a client that sends these forms cannot be updated, turn the flag on (Jellyfin
+deprecated them, so only for such a client). jellyfin-web has no switch for it; use one of:
+
+- **Running server:** as an administrator, `GET /System/Configuration`, set
+  `"EnableLegacyAuthorization": true` and `POST` the whole document back to
+  `/System/Configuration`. It takes effect on the next request, without a restart.
+- **Stopped server:** set `"EnableLegacyAuthorization": true` in `config/system.json`.
+
+The `/socket` WebSocket used to read its token itself: it took `api_key`, `X-Emby-Token`
+and `X-MediaBrowser-Token` whatever the flag said, ignored the `Authorization` header, and
+opened without any credentials (keep-alive only). It now authenticates like every other
+request and, as in Jellyfin 12.2, refuses a connection without valid credentials with
+`403` before the upgrade. The bundled jellyfin-web 12.x is unaffected (it sends
+`?ApiKey=`), but a client whose socket sends `api_key` or a bare token header (jellyfin-web
+10.11, for one) now loses its live updates and remote control unless the flag is on.
+Clients built on jellyfin-sdk-kotlin send only the `Authorization` header on the socket;
+their socket now joins their session, so remote control and SyncPlay reach them.
+
 ## Unreleased — a set-up server no longer starts without its database
 
 This applies if setup has been completed (`IsStartupWizardCompleted` is `true` in
@@ -326,8 +430,9 @@ accounts without deletion rights; three things are refined:
   jellyfin-web shows its delete entry by, so the entry appears only where the delete is
   allowed. A *list* of playlists reports every playlist deletable, as Jellyfin's does;
   deleting a playlist still needs its owner or an administrator. A playlist with no owner
-  (made with an API key, or created before Ferrofin stored playlist owners) can now be
-  deleted by an administrator only; in 1.3.x any signed-in account could delete one.
+  (made with an API key by an earlier version, or created before Ferrofin stored playlist
+  owners) can now be deleted by an administrator only; in 1.3.x any signed-in account
+  could delete one.
 - Some items cannot be deleted at all, as in Jellyfin: an item with no file of its own (a
   season Ferrofin groups from a series folder without season folders, a streamed item), a
   missing (virtual) episode or season, and a video a DVR recording is still writing.
@@ -789,9 +894,16 @@ Behaviour that changed with the shape:
   tests on 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. See the
   [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
-  as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every
-  `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
-  are unchanged and still found by search and `/Items`.
+  as in Jellyfin 12.2 — a playlist file inside a music album counts.
+- **Playlist files in music libraries become playlists.** The next library scan turns each
+  `.m3u`, `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library, and each
+  folder named `… [playlist]` or holding a `playlist.xml`, into a playlist that every user
+  who can see the library can open, but nobody can edit; nothing inside such a folder stays
+  an item. A `.pls` that an older scan listed as a song is removed as a song. The Playlists
+  view now lists these, beside the ones made in the app.
+- An **adopted** Jellyfin database can carry playlist files Jellyfin left empty (where it
+  saved XML metadata beside them). Their entries are read when the file next changes; to read
+  them now, refresh the library's metadata with "Search for missing metadata".
 - Alternate-version groups are re-derived once from `LinkedChildren` (Jellyfin 12.1's
   `RepairAlternateVersionLinks`), and a version is hidden only while its primary exists in the
   same library: an item marked as a version of a row that no longer exists reappears in

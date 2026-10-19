@@ -8,10 +8,27 @@ ADOPTION_IGNORE='/System/Info|/ScheduledTasks|/Plugins|/Devices|/Library/Virtual
 # What a boot repair logs when it did something; a second boot must log none of these.
 ADOPTION_REPAIR_RE='imported playlist|repaired |rewrote |recomputed |merged |backfilled |dropped dead|consolidat|reverted'
 
-# adoption_normalise <smoke-file>: the comparable form of a smoke output — item ids redacted
-# (they differ per copy), image byte counts dropped (encoders differ), ignored paths removed.
+# adoption_require_local <dir>: refuse a directory on a network filesystem, judged by its nearest
+# existing parent so nothing is created before the check. Every fixture is copied, booted and
+# scanned several times; that load belongs on a local disk, never a NAS. findmnt names the real
+# type (fuse.sshfs, not just fuse), so local FUSE disks such as ntfs-3g or mergerfs still pass.
+adoption_require_local() {
+  local dir=$1 types fs
+  until [ -e "$dir" ]; do dir=$(dirname "$dir"); done
+  types=$(findmnt -n -o FSTYPE -T "$dir") || { echo "refusing $1: cannot tell its filesystem" >&2; return 1; }
+  for fs in $types; do
+    case $fs in
+      nfs*|cifs|smb*|9p|ceph|afs|glusterfs|davfs|fuse.sshfs|fuse.rclone|fuse.glusterfs|fuse.s3fs|fuse.davfs2)
+        echo "refusing $1: it is on a network filesystem ($fs); use a local disk" >&2; return 1;;
+    esac
+  done
+}
+
+# adoption_normalise <smoke-file> [skip-re]: the comparable form of a smoke output — item ids
+# redacted (they differ per copy), image byte counts dropped (encoders differ), ignored paths
+# and the probes skip-re matches removed.
 adoption_normalise() {
-  sed -E 's/[0-9a-f]{32}/<id>/g; s/\(bytes=[0-9]+\)/(bytes)/' "$1" | grep -Ev "$ADOPTION_IGNORE"
+  sed -E 's/[0-9a-f]{32}/<id>/g; s/\(bytes=[0-9]+\)/(bytes)/' "$1" | grep -Ev "$ADOPTION_IGNORE${2:+|$2}"
 }
 
 # adoption_check_boot_log <server-log> <expected-generation>: one reason per line, nothing when
@@ -24,11 +41,12 @@ adoption_check_boot_log() {
   if grep -Eq '"level":"ERROR"' "$log"; then echo "ERROR in boot log"; fi
 }
 
-# adoption_compare_smoke <oracle> <smoke>: a reason when the normalised answers differ, naming
-# the oracle's release (ORACLE_VERSION, which run.sh sets from --oracle).
+# adoption_compare_smoke <oracle> <smoke> [skip-re]: a reason when the normalised answers differ,
+# leaving out the probes skip-re matches on both sides, naming the oracle's release
+# (ORACLE_VERSION, which run.sh sets from --oracle).
 adoption_compare_smoke() {
-  local oracle=$1 smoke=$2
-  diff -q <(adoption_normalise "$oracle") <(adoption_normalise "$smoke") >/dev/null \
+  local oracle=$1 smoke=$2 skip=${3:-}
+  diff -q <(adoption_normalise "$oracle" "$skip") <(adoption_normalise "$smoke" "$skip") >/dev/null \
     || echo "smoke differs from Jellyfin ${ORACLE_VERSION:-12.1} (diff $oracle $smoke)"
 }
 

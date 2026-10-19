@@ -20,10 +20,8 @@
 //! (`push_item_version_or_folder_matching`), and the resolution filters
 //! (`IsHD` / `Is4K`, `Min`/`Max` `Width`/`Height`) with v12's
 //! `VersionsMatchingDimension` and, for `IsHD` / `Is4K`, the folder
-//! descendant roll-up. The played filter's folder-descendant `EXISTS` roll-up
-//! is an open work item, named at its predicate with the v12 reference; it
-//! takes the `AncestorIds` walk `push_folders_with_leaf` already spells.
-//! Everything ported matches the C# predicate exactly for non-folder items.
+//! descendant roll-up. The played filter and sort keys take v12.2's
+//! `BuildIsPlayedFilter` folder roll-up (`push_is_played`).
 //!
 //! `Guid` columns are stored as UPPERCASE hyphenated `TEXT` and datetimes as
 //! `YYYY-MM-DD HH:MM:SS.fffffff` (Jellyfin's canonical storage formats), so
@@ -1728,10 +1726,7 @@ fn push_primary_versions_matching(
 /// / played / resumable) scoped to the query's user — the C# `TranslateQuery`
 /// blocks at `BaseItemRepository.TranslateQuery.cs:514-603` (v12).
 ///
-/// `IsPlayed` is the direct per-row rule (`UserData.Played` on the item
-/// itself); v12's `BuildIsPlayedFilter` (`:39-56`) additionally counts a
-/// folder as played once no leaf descendant is unplayed — an open work item
-/// for the played filter, tracked with the other folder roll-ups.
+/// `IsPlayed` is [`push_is_played`]: a leaf's own state, a folder's roll-up.
 fn append_user_data_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let Some(user_id) = filter.user_id() else {
         return;
@@ -1750,48 +1745,110 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
         push_user_data_exists(qb, &uid, r#"ud."Rating" >= 6.5"#, want);
     }
     if let Some(want) = filter.is_played {
-        push_is_played(qb, &uid, want);
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_is_played(qb, "bi", &uid, filter);
     }
     if let Some(want) = filter.is_resumable {
         push_resumable_predicate(qb, &uid, want, filter);
     }
 }
 
-/// `IsPlayed` for a leaf — v12 `BuildLeafIsPlayedFilter`
-/// (`TranslateQuery.cs:50-67`): the item has a played row of its own, OR it
-/// is the primary of a version group in which any version (itself included)
-/// has one, OR it is a version whose group's primary is such a primary.
-/// Alternates are hidden from general queries, so this is what lets the
-/// version that was actually watched mark the title played. Same
-/// uncorrelated-`IN` shape as [`push_user_data_exists`], for the same plan.
-fn push_is_played(qb: &mut QueryBuilder<Sqlite>, user_id: &str, want: bool) {
+/// v12.2 `BuildIsPlayedFilter` (`TranslateQuery.cs:38-48`) on the row
+/// `alias`, the one predicate the `IsPlayed` filter and the
+/// `IsPlayed`/`IsUnplayed` sort keys share: "Folders (Series, Seasons,
+/// BoxSets, albums, ...) carry no played state of their own and count as
+/// played once no descendant is left unplayed", so a folder's own `UserData`
+/// row is never read; a leaf is [`push_leaf_is_played`]. A folder with no
+/// accessible leaf at all is played. Never NULL, so `NOT` inverts it.
+///
+/// `+`: a plan pin on both `IsFolder` terms. Unpinned, a browse of three or
+/// more kinds turns the two disjuncts into a `MULTI-INDEX OR` over
+/// `IX_BaseItems_TopParentId_IsFolder_…`, whose two halves are every row of
+/// every library in scope, instead of its `(Type, TopParentId)` seek.
+pub(crate) fn push_is_played(
+    qb: &mut QueryBuilder<Sqlite>,
+    alias: &str,
+    user_id: &str,
+    filter: &InternalItemsQuery,
+) {
+    qb.push(format!(r#"((+{alias}."IsFolder" = 1 AND NOT "#));
+    push_has_unplayed_leaf(qb, alias, user_id, filter);
+    qb.push(format!(r#") OR (+{alias}."IsFolder" = 0 AND "#));
+    push_leaf_is_played(qb, alias, user_id);
+    qb.push("))");
+}
+
+/// v12 `BuildLeafIsPlayedFilter` (`TranslateQuery.cs:50-67`) on `alias`: the
+/// item has a played row of its own, OR it is the primary of a version group
+/// in which any version (itself included) has one, OR it is a version whose
+/// group's primary is such a primary. Alternates are hidden from general
+/// queries, so this is what lets the version that was actually watched mark
+/// the title played. Same uncorrelated-`IN` shape as
+/// [`push_user_data_exists`]: each list is materialized once per statement.
+fn push_leaf_is_played(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str) {
     let played_groups = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
             .push_bind(user_id.to_owned())
             .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
     };
-    let played_items = |qb: &mut QueryBuilder<Sqlite>| {
-        qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
-            .push_bind(user_id.to_owned())
-            .push(r#" AND ud."Played" = 1)"#);
+    qb.push(format!(
+        r#"({alias}."Id" IN (SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#
+    ))
+    .push_bind(user_id.to_owned())
+    .push(format!(r#" AND ud."Played" = 1) OR {alias}."Id" IN "#));
+    played_groups(qb);
+    qb.push(format!(
+        r#" OR ({alias}."PrimaryVersionId" IS NOT NULL AND {alias}."PrimaryVersionId" IN "#
+    ));
+    played_groups(qb);
+    qb.push("))");
+}
+
+/// v12.2 `BuildHasDescendantFilter` (`QueryBuilding.cs:707-721`) over the
+/// unplayed leaves of `BuildIsPlayedFilter`: `alias` has an
+/// [`ACCESSIBLE_LEAF`] that passes the parental restrictions and is not
+/// [`push_leaf_is_played`] in its `AncestorIds` closure, among its
+/// `LinkedChildren` (a box set's or playlist's members), or in the closure of
+/// a linked child (a series in a collection).
+///
+/// Correlated per folder, unlike [`push_folders_with_leaf`]: the unplayed
+/// leaves have no `UserData` row to drive from. Each arm seeks the folder's
+/// own rows (`IX_AncestorIds_ParentItemId`, the `LinkedChildren` key) and
+/// stops at the first unplayed leaf; `CROSS JOIN` keeps the leaf a primary-key
+/// probe, so the planner never starts from every leaf in the library (the
+/// pin [`push_folder_is_resumable`] measures).
+fn push_has_unplayed_leaf(
+    qb: &mut QueryBuilder<Sqlite>,
+    alias: &str,
+    user_id: &str,
+    filter: &InternalItemsQuery,
+) {
+    let unplayed_leaf = |qb: &mut QueryBuilder<Sqlite>| {
+        qb.push(ACCESSIBLE_LEAF);
+        append_parental_restrictions(qb, filter, "l");
+        qb.push(" AND NOT ");
+        push_leaf_is_played(qb, "l", user_id);
     };
-    if want {
-        qb.push(r#" AND (bi."Id" IN "#);
-        played_items(qb);
-        qb.push(r#" OR bi."Id" IN "#);
-        played_groups(qb);
-        qb.push(r#" OR (bi."PrimaryVersionId" IS NOT NULL AND bi."PrimaryVersionId" IN "#);
-        played_groups(qb);
-        qb.push("))");
-    } else {
-        qb.push(r#" AND bi."Id" NOT IN "#);
-        played_items(qb);
-        qb.push(r#" AND bi."Id" NOT IN "#);
-        played_groups(qb);
-        qb.push(r#" AND (bi."PrimaryVersionId" IS NULL OR bi."PrimaryVersionId" NOT IN "#);
-        played_groups(qb);
-        qb.push(")");
-    }
+    qb.push(format!(
+        r#"(EXISTS (SELECT 1 FROM "AncestorIds" a
+            CROSS JOIN "BaseItems" l ON l."Id" = a."ItemId"
+            WHERE a."ParentItemId" = {alias}."Id" AND "#
+    ));
+    unplayed_leaf(qb);
+    qb.push(format!(
+        r#") OR EXISTS (SELECT 1 FROM "LinkedChildren" lc
+            CROSS JOIN "BaseItems" l ON l."Id" = lc."ChildId"
+            WHERE lc."ParentId" = {alias}."Id" AND "#
+    ));
+    unplayed_leaf(qb);
+    qb.push(format!(
+        r#") OR EXISTS (SELECT 1 FROM "LinkedChildren" lc
+            CROSS JOIN "AncestorIds" a ON a."ParentItemId" = lc."ChildId"
+            CROSS JOIN "BaseItems" l ON l."Id" = a."ItemId"
+            WHERE lc."ParentId" = {alias}."Id" AND "#
+    ));
+    unplayed_leaf(qb);
+    qb.push("))");
 }
 
 /// The in-progress `UserData` rows of the user: `PlaybackPositionTicks > 0`
@@ -1811,24 +1868,28 @@ fn push_in_progress_ids(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
 const COUNTABLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0"#;
 
 /// [`COUNTABLE_LEAF`] as `GetAccessFilteredLeafItemsQuery(context, user)`
-/// (v12 `QueryBuilding.cs:669-679`) returns it without `includeOwnedItems`:
-/// `ApplyAccessFiltering` (`:459-476`) drops alternate versions and owned
-/// non-extras. The caller appends parental restrictions for the same leaf.
-/// `TopParentIds` is empty on the fresh `InternalItemsQuery(user)`.
+/// (v12.2 `QueryBuilding.cs:691-702`) returns it without `includeOwnedItems`:
+/// `ApplyAccessFiltering` (`:459-483`) drops owned non-extras and, through
+/// `ApplyAlternateVersionFiltering`, a version only while its primary exists
+/// in the same library ([`ALTERNATE_VERSION_HIDDEN`]'s rule): a version whose
+/// primary is gone is a leaf of its own. The caller appends parental
+/// restrictions for the same leaf. `TopParentIds` is empty on the fresh
+/// `InternalItemsQuery(user)`.
 const ACCESSIBLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0
-    AND l."PrimaryVersionId" IS NULL
+    AND (l."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p
+         WHERE p."Id" = l."PrimaryVersionId" AND p."TopParentId" IS l."TopParentId"))
     AND (l."OwnerId" IS NULL OR l."OwnerId" = '00000000-0000-0000-0000-000000000000'
          OR l."ExtraType" IS NOT NULL)"#;
 
 /// Pushes `bi."Id" IN (<the folders with a leaf descendant in `leaf_set`>)`:
 /// the `AncestorIds` arm of v12 `BuildHasDescendantFilter`
-/// (`QueryBuilding.cs:685-698`), driven from the user's `UserData` rows that
+/// (v12.2 `QueryBuilding.cs:707-721`), driven from the user's `UserData` rows that
 /// satisfy `ud_cond` rather than correlated per folder — the user's played /
 /// in-progress rows times their ancestors is a few hundred to a few thousand
 /// pairs, materialized once, where the per-folder walk costs every folder its
 /// descendants.
 ///
-/// The `LinkedChildren` arm (`:695-697`) is not emitted: the only kinds this
+/// The `LinkedChildren` arm (`:718-720`) is not emitted: the only kinds this
 /// predicate is ever applied to are `Series` and `Season`
 /// (`_resumableFolderKinds`), and neither has linked children — the arm can
 /// never match for them.
@@ -1858,8 +1919,9 @@ fn push_folders_with_leaf(
 /// `Played` does not exclude a leaf from the in-progress test.
 ///
 /// Alternate versions keep their own progress, so they count towards the
-/// in-progress check ([`COUNTABLE_LEAF`], `includeOwnedItems: true`) but not
-/// towards the played/unplayed one ([`ACCESSIBLE_LEAF`]).
+/// in-progress check ([`COUNTABLE_LEAF`], `includeOwnedItems: true`); towards
+/// the played/unplayed one ([`ACCESSIBLE_LEAF`]) only a version whose primary
+/// is not in its library does.
 fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str, filter: &InternalItemsQuery) {
     // `_resumableFolderKinds` (v12 `BaseItemRepository.cs:66-72`): "the only
     // folder kinds whose children form a single viewing sequence, so playback
@@ -2249,14 +2311,16 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
     .collect()
 }
 
-/// A by-name row remains visible only while related media satisfies the
-/// scoped user's parental restrictions (`ApplyItemByNameAccessFiltering`).
-fn append_by_name_rating_access(
+/// A by-name row remains visible only while related media sits in the scoped
+/// user's libraries and satisfies their parental restrictions
+/// (`ApplyItemByNameAccessFiltering`). Skipped when nothing is hidden from the
+/// user, as upstream gates it on `UserHasContentRestrictions`.
+fn append_by_name_access(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     kinds: &[String],
 ) {
-    if !has_parental_restrictions(filter) {
+    if !filter.user_has_content_restrictions {
         return;
     }
     for (kind, values) in [
@@ -2356,7 +2420,7 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
                 &to_guid_strings(&filter.top_parent_ids),
             );
             qb.push("))");
-            append_by_name_rating_access(qb, filter, &by_name);
+            append_by_name_access(qb, filter, &by_name);
         }
     }
     if !filter.ancestor_ids.is_empty() {
@@ -2610,17 +2674,11 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
     }
 }
 
-/// Maps an [`ItemSortBy`] to the `BaseItems` column it sorts on.
-///
-/// Covers the scalar-column cases of `OrderMapper.MapOrderByField`; the
-/// user-data-correlated cases (`DatePlayed`, `PlayCount`, …) and the
-/// `ItemValues`-correlated cases (`Artist`, `Studio`) fall back to `SortName`,
-/// since they need joins the library manager owns. `Random` uses Ferrofin's
-/// connection-local `ferrofin_random()`.
 /// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
-/// keys (`DatePlayed`, `PlayCount`, played/favorite state) are correlated
+/// keys (`DatePlayed`, `PlayCount`, favorite state) are correlated
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
-/// `UserData`-backed cases); everything else is a plain column.
+/// `UserData`-backed cases), and the played keys are [`push_is_played`];
+/// everything else is a plain column.
 fn push_order_expression(
     qb: &mut QueryBuilder<Sqlite>,
     by: ItemSortBy,
@@ -2669,40 +2727,34 @@ fn push_order_expression(
                 .push(r#" WHERE alt."PrimaryVersionId" = bi."Id") AS d)"#);
                 return;
             }
+            // "Folders carry no played flag of their own, so these two keys go
+            // through the same predicate the isPlayed filter uses rather than
+            // through the stored-column lookup in OrderMapper"
+            // (`QueryBuilding.cs:327-336`, `AsOrderKey(BuildIsPlayedFilter(…))`
+            // and its `.Not()`): ascending puts `false` first.
+            ItemSortBy::IsPlayed | ItemSortBy::IsUnplayed => {
+                qb.push("CASE WHEN ");
+                push_is_played(qb, "bi", &uid, filter);
+                qb.push(if by == ItemSortBy::IsPlayed {
+                    " THEN 1 ELSE 0 END"
+                } else {
+                    " THEN 0 ELSE 1 END"
+                });
+                return;
+            }
             // `e.UserData.Where(f => f.UserId == user).OrderBy(f => f.CustomDataKey)
             // .FirstOrDefault().<column>` (`OrderMapper.cs:57-61`): the item's
             // own first row — alternates do not take part.
-            //
-            // Known divergence for `IsPlayed`/`IsUnplayed` WITH a user: v12
-            // never reaches this arm for those two keys, because `ApplyOrder`
-            // replaces them with `AsOrderKey(BuildIsPlayedFilter(...))`
-            // (`QueryBuilding.cs:327-336`) — the folder-aware predicate that
-            // counts a folder played once no leaf descendant is unplayed. Here
-            // a folder has no `UserData` row of its own and sorts on NULL,
-            // which orders ahead of `0`. Open work item, the same folder
-            // roll-up the `is_played` FILTER still owes
-            // (`append_user_data_predicates`): port `BuildIsPlayedFilter` over
-            // the descendant helper `push_resumable_predicate` already uses,
-            // then call it from both places and delete this arm's two keys.
-            // Reachable only via `sortBy=IsPlayed`/`IsUnplayed`.
-            ItemSortBy::PlayCount
-            | ItemSortBy::IsPlayed
-            | ItemSortBy::IsUnplayed
-            | ItemSortBy::IsFavoriteOrLiked => {
-                let column = match by {
-                    ItemSortBy::PlayCount => r#""PlayCount""#,
-                    ItemSortBy::IsFavoriteOrLiked => r#""IsFavorite""#,
-                    _ => r#""Played""#,
+            ItemSortBy::PlayCount | ItemSortBy::IsFavoriteOrLiked => {
+                let column = if by == ItemSortBy::PlayCount {
+                    r#""PlayCount""#
+                } else {
+                    r#""IsFavorite""#
                 };
-                // `Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`, and
-                // the same for the played flag: an item the user has no row for
-                // is not played, so it ties with one whose row says so (measured
-                // against Jellyfin 12.2: never-played items list by name,
-                // whether or not they carry a row).
-                let nullable_flag = matches!(
-                    by,
-                    ItemSortBy::IsFavoriteOrLiked | ItemSortBy::IsPlayed | ItemSortBy::IsUnplayed
-                );
+                // `Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`: an
+                // item the user has no row for is not a favorite, so it ties
+                // with one whose row says so.
+                let nullable_flag = by == ItemSortBy::IsFavoriteOrLiked;
                 if nullable_flag {
                     qb.push("COALESCE(");
                 }
@@ -2714,10 +2766,6 @@ fn push_order_expression(
                 .push(r#" ORDER BY oud."CustomDataKey" LIMIT 1)"#);
                 if nullable_flag {
                     qb.push(", 0)");
-                }
-                // IsUnplayed inverts the played flag (OrderMapper sorts `!IsPlayed`).
-                if by == ItemSortBy::IsUnplayed {
-                    qb.push(" * -1");
                 }
                 return;
             }
@@ -2857,6 +2905,143 @@ mod tests {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// The candidate read behind the Playlists/Collections views
+    /// (`UserViewManager.HasVisibleItem`, see
+    /// [`crate::user_view_manager::visible_item_query`]), as the repository
+    /// runs it once the user's top parents are resolved: a seek on a
+    /// `(Type, TopParentId)` index and no scan. It is on `GET /UserViews`, the
+    /// first call every client makes. The planner picks among the
+    /// `IX_BaseItems_Type_TopParentId_*` family — the shared builder's
+    /// alternate-version probe and `SortName` order keep any of them from
+    /// covering — so the seek is what is pinned.
+    #[tokio::test]
+    async fn visible_item_candidates_seek_the_type_top_parent_index() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5501)).await;
+        for kind in [BaseItemKind::Playlist, BaseItemKind::BoxSet] {
+            let mut filter = crate::user_view_manager::visible_item_query(kind, &user);
+            filter.top_parent_ids =
+                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)];
+            let mut builder = build_query(&filter, QueryShape::IdsOnly);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|d| d.starts_with("SEARCH bi USING")
+                    && d.contains("IX_BaseItems_Type_TopParentId_")
+                    && d.contains("(Type=? AND TopParentId=?)")),
+                "{kind:?}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN")),
+                "{kind:?}: {plan:?}"
+            );
+        }
+    }
+
+    /// The folder arm of `push_is_played`, as a Series / BoxSet browse
+    /// filters and sorts on it: the page keeps the unfiltered browse's
+    /// `(Type, TopParentId)` seek, and each of the three descendant arms seeks
+    /// the folder's own `AncestorIds` / `LinkedChildren` rows and probes the
+    /// leaf by primary key. Nothing is scanned but the page's own subquery.
+    /// A leaf browse, and a three-kind browse, over two libraries keep the same
+    /// seek: the `IsFolder` disjuncts must not turn the page into a
+    /// `MULTI-INDEX OR` over every folder and every leaf (unpinned, three kinds
+    /// do).
+    #[tokio::test]
+    async fn the_folder_played_roll_up_seeks_each_folders_own_rows() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5511)).await;
+        let browse = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Series, BaseItemKind::BoxSet],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x5512)],
+            limit: Some(100),
+            ..Default::default()
+        };
+        for filter in [
+            InternalItemsQuery {
+                is_played: Some(true),
+                ..browse.clone()
+            },
+            InternalItemsQuery {
+                is_played: Some(false),
+                ..browse.clone()
+            },
+            InternalItemsQuery {
+                order_by: vec![(ItemSortBy::IsUnplayed, SortOrder::Ascending)],
+                ..browse.clone()
+            },
+            InternalItemsQuery {
+                is_played: Some(true),
+                include_item_types: vec![BaseItemKind::Movie],
+                top_parent_ids: vec![uuid::Uuid::from_u128(0x5512), uuid::Uuid::from_u128(0x5513)],
+                ..browse.clone()
+            },
+            InternalItemsQuery {
+                is_played: Some(true),
+                include_item_types: vec![
+                    BaseItemKind::Movie,
+                    BaseItemKind::Series,
+                    BaseItemKind::BoxSet,
+                ],
+                top_parent_ids: vec![uuid::Uuid::from_u128(0x5512), uuid::Uuid::from_u128(0x5513)],
+                ..browse.clone()
+            },
+        ] {
+            let mut builder = build_query(&filter, QueryShape::FullRows);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            let count = |detail: &str| plan.iter().filter(|d| d.starts_with(detail)).count();
+            assert!(
+                plan.iter().any(|d| d
+                    .starts_with("SEARCH bi USING INDEX IX_BaseItems_Type_TopParentId_")
+                    && d.contains("(Type=? AND TopParentId=?)")),
+                "{plan:?}"
+            );
+            assert_eq!(
+                count("SEARCH a USING INDEX IX_AncestorIds_ParentItemId (ParentItemId=?)"),
+                2,
+                "the closure and the linked folder's closure: {plan:?}"
+            );
+            assert_eq!(
+                count("SEARCH lc USING INDEX IX_LinkedChildren_ParentId_ChildType (ParentId=?)"),
+                2,
+                "the members and the linked folders: {plan:?}"
+            );
+            assert_eq!(
+                count("SEARCH l USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                3,
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().all(|d| !d.contains("MULTI-INDEX OR")
+                    && (!d.starts_with("SCAN") || d.starts_with("SCAN (subquery-"))),
+                "{plan:?}"
+            );
+        }
+    }
 
     /// The statement `GetLatestItemList` sends: grouped-threshold subquery
     /// capped at `limit`, the caller's triple ORDER BY verbatim, and no paging

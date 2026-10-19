@@ -9,8 +9,6 @@
 //! - [`DeleteCacheFileTask`] — `DeleteCacheFileTask` (`DeleteCacheFiles`)
 //! - [`DeleteLogFileTask`] — `DeleteLogFileTask` (`CleanLogFiles`)
 //! - [`DeleteTranscodeFileTask`] — `DeleteTranscodeFileTask` (`DeleteTranscodeFiles`)
-//! - [`CleanupCollectionAndPlaylistPathsTask`] —
-//!   `CleanupCollectionAndPlaylistPathsTask` (`CleanCollectionsAndPlaylists`)
 //! - [`OptimizeDatabaseTask`] — `OptimizeDatabaseTask` (`OptimizeDatabaseTask`)
 //! - [`CleanupUserDataTask`] — `CleanupUserDataTask` (`CleanupUserDataTask`)
 //!
@@ -25,15 +23,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ferrofin_db::Database;
 use ferrofin_db::store::datetime_to_db;
-use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::activity::ActivityManager;
-use ferrofin_traits::collections::{CollectionManager, PlaylistManager};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::LibraryManager;
-use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::LinkedChildrenService;
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
@@ -420,135 +413,6 @@ impl ScheduledTask for DeleteTranscodeFileTask {
         })
         .await?;
         tracing::info!(deleted, "cleaned transcode directory");
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Clean up collections and playlists
-// ---------------------------------------------------------------------------
-
-/// "Clean up collections and playlists" — removes items from collections and
-/// playlists that no longer exist. Port of
-/// `CleanupCollectionAndPlaylistPathsTask`: for every box set and playlist,
-/// linked children whose item row is gone or whose path no longer exists on
-/// disk are removed.
-pub struct CleanupCollectionAndPlaylistPathsTask {
-    library: Arc<dyn LibraryManager>,
-    collections: Arc<dyn CollectionManager>,
-    playlists: Arc<dyn PlaylistManager>,
-    linked: Arc<dyn LinkedChildrenService>,
-}
-
-impl CleanupCollectionAndPlaylistPathsTask {
-    /// Builds the task over the library, collection, playlist and
-    /// linked-children seams.
-    #[must_use]
-    pub fn new(
-        library: Arc<dyn LibraryManager>,
-        collections: Arc<dyn CollectionManager>,
-        playlists: Arc<dyn PlaylistManager>,
-        linked: Arc<dyn LinkedChildrenService>,
-    ) -> Self {
-        Self {
-            library,
-            collections,
-            playlists,
-            linked,
-        }
-    }
-
-    /// The linked children of `parent_id` whose item row is missing or whose
-    /// path no longer exists on disk (the C# `CleanupLinkedChildren` check:
-    /// `!File.Exists(path) && !Directory.Exists(path)`).
-    async fn dead_children(&self, parent_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
-        let mut dead = Vec::new();
-        for child_id in self.linked.get_linked_children_ids(parent_id, None).await? {
-            let missing = match self.library.get_item_by_id(child_id).await? {
-                None => true,
-                Some(item) => item
-                    .path
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                    .is_none_or(|p| !Path::new(p).exists()),
-            };
-            if missing {
-                dead.push(child_id);
-            }
-        }
-        Ok(dead)
-    }
-
-    /// Cleans one category (box sets or playlists), reporting progress across
-    /// `progress_base..progress_base + 50`.
-    async fn clean_folders(
-        &self,
-        kind: BaseItemKind,
-        progress: &TaskProgress,
-        progress_base: f64,
-    ) -> Result<(), ServiceError> {
-        let folders = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![kind],
-                recursive: true,
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let total = folders.len();
-        for (index, folder) in folders.into_iter().enumerate() {
-            let Ok(folder_id) = Uuid::parse_str(&folder.id) else {
-                continue;
-            };
-            let dead = self.dead_children(folder_id).await?;
-            if !dead.is_empty() {
-                tracing::info!(
-                    folder = folder.name.as_deref().unwrap_or_default(),
-                    removed = dead.len(),
-                    "removing dead linked children"
-                );
-                if kind == BaseItemKind::BoxSet {
-                    self.collections
-                        .remove_from_collection(folder_id, &dead)
-                        .await?;
-                } else {
-                    let entry_ids: Vec<String> = dead.iter().map(ToString::to_string).collect();
-                    self.playlists
-                        .remove_item_from_playlist(&folder.id, &entry_ids)
-                        .await?;
-                }
-            }
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(progress_base + 50.0 * ((index + 1) as f64 / total as f64));
-        }
-        progress.report(progress_base + 50.0);
-        Ok(())
-    }
-}
-
-#[allow(clippy::unnecessary_literal_bound)]
-#[async_trait]
-impl ScheduledTask for CleanupCollectionAndPlaylistPathsTask {
-    fn key(&self) -> &str {
-        "CleanCollectionsAndPlaylists"
-    }
-    fn name(&self) -> &str {
-        "Clean up collections and playlists"
-    }
-    fn description(&self) -> &str {
-        "Removes items from collections and playlists that no longer exist."
-    }
-    fn category(&self) -> &str {
-        MAINTENANCE
-    }
-    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
-        vec![startup()]
-    }
-    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
-        self.clean_folders(BaseItemKind::BoxSet, progress, 0.0)
-            .await?;
-        self.clean_folders(BaseItemKind::Playlist, progress, 50.0)
-            .await?;
         Ok(())
     }
 }
@@ -1260,110 +1124,6 @@ mod tests {
         assert!(
             old.exists(),
             "a live playback session must protect even day-old transcode files"
-        );
-    }
-
-    // -- Collections/playlists cleanup --------------------------------------
-
-    #[tokio::test]
-    async fn collections_cleanup_removes_dead_children_only() {
-        use crate::test_support::{item_repository_over, library_manager_over, seed_named_item};
-        use crate::{
-            FerrofinCollectionManager, FerrofinLinkedChildrenService, FerrofinPlaylistManager,
-        };
-        use ferrofin_model::data::BaseItemKind;
-        use uuid::Uuid;
-
-        let db = test_db().await;
-        let media_dir = tempfile::tempdir().expect("tempdir");
-        let library = library_manager_over(db.clone());
-        let linked: Arc<dyn LinkedChildrenService> =
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
-        let task_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
-            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-                media_dir.path(),
-                media_dir.path(),
-                media_dir.path(),
-                media_dir.path(),
-                media_dir.path(),
-            ));
-        let collections: Arc<dyn CollectionManager> = Arc::new(FerrofinCollectionManager::new(
-            db.clone(),
-            Arc::clone(&library),
-            Arc::clone(&linked),
-            Arc::clone(&task_paths),
-        ));
-        let playlists: Arc<dyn PlaylistManager> = Arc::new(FerrofinPlaylistManager::new(
-            db.clone(),
-            Arc::clone(&library),
-            item_repository_over(db.clone()),
-            Arc::clone(&task_paths),
-        ));
-
-        // A box set with one live child (file on disk) and one dead child
-        // (path points nowhere), and a playlist with a dead child.
-        let boxset = Uuid::from_u128(0xB0);
-        let live = Uuid::from_u128(0xC1);
-        let dead = Uuid::from_u128(0xC2);
-        let playlist = Uuid::from_u128(0xB1);
-        seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Box").await;
-        seed_named_item(&db, live, BaseItemKind::Movie, "Live").await;
-        seed_named_item(&db, dead, BaseItemKind::Movie, "Dead").await;
-        seed_named_item(&db, playlist, BaseItemKind::Playlist, "List").await;
-
-        let live_path = media_dir.path().join("live.mkv");
-        std::fs::write(&live_path, b"x").expect("write");
-        let set_path = |id: Uuid, path: String| {
-            let db = db.clone();
-            async move {
-                sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
-                    .bind(path)
-                    .bind(guid_to_db(id))
-                    .execute(db.writer())
-                    .await
-                    .expect("set path");
-            }
-        };
-        set_path(live, live_path.to_string_lossy().into_owned()).await;
-        set_path(dead, "/nonexistent/definitely/gone.mkv".to_owned()).await;
-
-        for (parent, child) in [(boxset, live), (boxset, dead), (playlist, dead)] {
-            sqlx::query(
-                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
-                   VALUES (?1, (SELECT COALESCE(MAX("SortOrder"), -1) + 1 FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 0)"#,
-            )
-            .bind(guid_to_db(parent))
-            .bind(guid_to_db(child))
-            .execute(db.writer())
-            .await
-            .expect("link");
-        }
-
-        let task = CleanupCollectionAndPlaylistPathsTask::new(
-            library,
-            collections,
-            playlists,
-            Arc::clone(&linked),
-        );
-        assert_eq!(task.key(), "CleanCollectionsAndPlaylists");
-        assert_eq!(
-            task.default_triggers()[0].type_,
-            TaskTriggerInfoType::StartupTrigger
-        );
-        task.execute(&TaskProgress::default()).await.expect("run");
-
-        let remaining = linked
-            .get_linked_children_ids(boxset, None)
-            .await
-            .expect("children");
-        assert_eq!(remaining, vec![live], "only the live child survives");
-        assert!(
-            linked
-                .get_linked_children_ids(playlist, None)
-                .await
-                .expect("children")
-                .is_empty(),
-            "playlist's dead child is removed"
         );
     }
 

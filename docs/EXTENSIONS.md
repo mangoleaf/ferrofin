@@ -353,7 +353,9 @@ and size-capped:
 
 Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
-(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). A trap or overrun fails that one call
+(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). The deadline also holds while the guest
+waits on a WASI clock (`std::thread::sleep`, `poll`): the wait is cut to the time the call
+has left. A trap or overrun fails that one call
 and the instance is rebuilt; three consecutive failures trip a circuit breaker that
 sidelines the plugin until restart. The server never goes down with a plugin.
 

@@ -88,6 +88,11 @@ def snapshot(admin, manifest):
             "shares": owner.get(f"/Playlists/{playlist}/Users"),
             "items": ids(owner.get(f"/Playlists/{playlist}/Items", userId=owner.user)["Items"]),
         }
+    result["linked_children"] = {
+        "collection": sorted(ids(admin.get("/Items", parentId=manifest["linked_collection"], userId=admin.user)["Items"])),
+        **{role: ids(owner.get(f"/Playlists/{manifest['linked_' + role]}/Items", userId=owner.user)["Items"])
+           for role in ("playlist", "pathless")},
+    }
     for name in USERS[1:]:
         api = admin.login(name)
         visible = api.get("/Items", userId=api.user, recursive="true", includeItemTypes="Movie,Episode,Audio", limit=1000)["Items"]
@@ -211,9 +216,11 @@ def expectation(version, baseline, oracle, upgraded):
 def comparable(data, seeds, orphans):
     """A snapshot as the per-release comparison sees it. Orphaned items leave every list
     on adoption. Whether a seeded movie is visible follows Jellyfin 12.2's scores, and
-    whether the conflicting movie is resumable follows 12.2's harmonize; seed_failures
-    compares those against the 12.2 oracle instead of the source release."""
+    whether the conflicting movie is resumable follows 12.2's harmonize, and the linked
+    containers' members follow 12.2's ResolveChildId; seed_failures compares those against
+    the 12.2 oracle instead of the source release."""
     data = scrub(data, orphans)
+    data.pop("linked_children", None)
     if "visibility" in data:
         data["visibility"] = scrub(data["visibility"], set(seeds["ratings"]))
     if "views" in data:
@@ -262,6 +269,28 @@ def orphan_history(conn, seeds):
     return "item" if row[0] in seeds["orphans"] else None
 
 
+def linked_members(conn, container):
+    """A container's LinkedChildren rows as member ids, in order."""
+    return [row[0] for row in conn.execute(
+        'SELECT lower(replace("ChildId", \'-\', \'\')) FROM "LinkedChildren" '
+        'WHERE lower(replace("ParentId", \'-\', \'\')) = ? ORDER BY "SortOrder"', (container,))]
+
+
+def linked_state(conn, seeds):
+    """Each linked container as a release left it: the Data entries a 10.11 database keeps,
+    or the LinkedChildren rows 12.x migrated them into."""
+    migrated = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'LinkedChildren'").fetchone()
+    state = {}
+    for role, seed in seeds["linked_children"].items():
+        if migrated:
+            state[role] = linked_members(conn, seed["id"])
+        else:
+            data = conn.execute('SELECT "Data" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                                (seed["id"],)).fetchone()
+            state[role] = json.loads(data[0]).get("LinkedChildren") if data and data[0] else None
+    return state
+
+
 def seed_state(db, seeds):
     """What of the seeds a built fixture still holds, recorded beside it (seeds.json):
     each release handles them on its own boot and scan before Ferrofin ever sees them.
@@ -274,7 +303,8 @@ def seed_state(db, seeds):
         return {"ratings": {movie: triples.get(movie, [None])[0] for movie in seeds["ratings"]},
                 "conflict": user_data_state(conn, conflict["item"], conflict["user"]),
                 "orphans": sorted({row[0] for row in survivors} & set(seeds["orphans"])),
-                "history": orphan_history(conn, seeds)}
+                "history": orphan_history(conn, seeds),
+                "linked_children": linked_state(conn, seeds)}
 
 
 def validate_seed_state(state, seeds, version):
@@ -289,6 +319,25 @@ def validate_seed_state(state, seeds, version):
         raise CheckError("Jellyfin 12.2 did not harmonize the seeded conflicting user data")
     if version != "12.2" and agree:
         raise CheckError(f"Jellyfin {version} changed the seeded conflicting user data")
+    # A 10.11 save re-caches a stale ItemId from its path, after which nothing tests it. The
+    # 10.11.8 fixture is seeded stopped; every later 10.11 boot runs the startup
+    # CleanupCollectionAndPlaylistPathsTask, which drops each entry without a Path and saves
+    # that container; the save rewrites the rest (10.11.9 drops their cached ItemId), so only
+    # their paths are left to compare.
+    # Every 12.x runs the same MigrateLinkedChildren, so each must hold what it resolves to.
+    for role, seed in seeds["linked_children"].items():
+        held = state["linked_children"][role]
+        if not version.startswith("10.11"):
+            kept = held == seed["members"]
+        elif version == "10.11.8" or all(entry.get("Path") for entry in seed["entries"]):
+            kept = held == seed["entries"]
+        else:
+            kept = [entry.get("Path") for entry in held or []] == [
+                entry["Path"] for entry in seed["entries"] if entry.get("Path")]
+        if not kept and version.startswith("10.11"):
+            raise CheckError(f"Jellyfin {version} did not keep the seeded {role} LinkedChildren")
+        if not kept:
+            raise CheckError(f"Jellyfin {version} did not resolve the seeded {role} LinkedChildren as expected")
 
 
 def validate_oracle(db, manifest):
@@ -307,7 +356,7 @@ def seed_failures(conn, actual, seeds, state, oracle_conn, oracle):
     """How the adopted database (conn) and API snapshot (actual) differ from Jellyfin 12.2's
     handling of the seeds (oracle_conn, oracle: the oracle fixture's database and baseline).
     state is what the source fixture still held (seed_state): the dangling chain's history
-    is checked only where the source still had it."""
+    and a linked container are checked only where the source still had them."""
     failures = []
     if rating_triples(conn) != rating_triples(oracle_conn):
         failures.append("seeded ratings differ from Jellyfin 12.2")
@@ -328,6 +377,15 @@ def seed_failures(conn, actual, seeds, state, oracle_conn, oracle):
         failures.append("seeded orphaned items survive")
     if state["history"] is not None and orphan_history(conn, seeds) != "placeholder":
         failures.append("seeded orphaned history is not on the placeholder item")
+    for role, seed in seeds["linked_children"].items():
+        # Only where the source still held every seeded entry: 10.11.9+ drops the path-less
+        # ones before Ferrofin ever sees them.
+        if state["linked_children"][role] not in (seed["entries"], seed["members"]):
+            continue
+        if linked_members(conn, seed["id"]) != linked_members(oracle_conn, seed["id"]):
+            failures.append(f"seeded {role} LinkedChildren differ from Jellyfin 12.2")
+        if actual["linked_children"][role] != oracle["linked_children"][role]:
+            failures.append(f"seeded {role} LinkedChildren are served differently from Jellyfin 12.2")
     return failures
 
 

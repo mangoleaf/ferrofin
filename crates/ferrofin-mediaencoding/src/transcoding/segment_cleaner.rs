@@ -24,7 +24,6 @@ use super::throttler::effective_input_protocol;
 
 const CLEAN_INTERVAL: Duration = Duration::from_secs(20);
 const DELETE_DELAY: Duration = Duration::from_millis(1500);
-const TICKS_PER_SECOND: f64 = 10_000_000.0;
 const MIN_RUNTIME_TICKS: i64 = 300 * 10_000_000;
 
 /// The input timestamp-sync options `EncodingHelper.AttachMediaSourceInfo`
@@ -127,24 +126,40 @@ pub(crate) fn eligible(state: &EncodingJobInfo) -> bool {
             .is_some_and(|runtime| runtime >= MIN_RUNTIME_TICKS)
 }
 
+/// Map of `segment_index → end_position_ticks` reported when a client
+/// finishes downloading each HLS segment.
+type ServedSegments = std::sync::Mutex<std::collections::HashMap<i64, i64>>;
+
+/// Returns the highest segment index whose end position is at or before
+/// `position_ticks`. Init segments (index < 0) are ignored.
+fn highest_served_segment_ending_at_or_before(
+    served: &ServedSegments,
+    position_ticks: i64,
+) -> Option<i64> {
+    served
+        .lock()
+        .expect("served_segments lock poisoned")
+        .iter()
+        .filter(|(index, end_ticks)| **index >= 0 && **end_ticks <= position_ticks)
+        .map(|(index, _)| *index)
+        .max()
+}
+
 fn maximum_deleted_index(
     options: &EncodingOptions,
     download_position_ticks: Option<i64>,
-    segment_length_secs: i32,
+    served: &ServedSegments,
 ) -> Option<i64> {
-    if !options.enable_segment_deletion || segment_length_secs <= 0 {
+    if !options.enable_segment_deletion {
         return None;
     }
-    let keep_seconds = i64::from(options.segment_keep_seconds.max(20));
-    // Convert.ToInt64(TimeSpan.TotalSeconds) rounds midpoint ties to even.
-    // An i64 tick count divided by 10,000,000 is safely within i64 seconds.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    let download_seconds =
-        (download_position_ticks.unwrap_or(0) as f64 / TICKS_PER_SECOND).round_ties_even() as i64;
-    if download_seconds <= keep_seconds {
+    let keep_ticks = i64::from(options.segment_keep_seconds.max(20)) * 10_000_000;
+    let download_ticks = download_position_ticks.unwrap_or(0);
+    if download_ticks <= keep_ticks {
         return None;
     }
-    let index = (download_seconds - keep_seconds) / i64::from(segment_length_secs);
+    let boundary = download_ticks - keep_ticks;
+    let index = highest_served_segment_ending_at_or_before(served, boundary)?;
     (index > 0).then_some(index)
 }
 
@@ -225,15 +240,15 @@ impl SegmentCleanerTask {
         child: Arc<dyn TranscodeChild>,
         config: Arc<dyn ServerConfigurationManager>,
         playlist: PathBuf,
-        segment_length_secs: i32,
         download_position: Arc<DownloadPosition>,
+        served_segments: Arc<ServedSegments>,
     ) -> Self {
         Self::start_with_timing(
             child,
             config,
             playlist,
-            segment_length_secs,
             download_position,
+            served_segments,
             CLEAN_INTERVAL,
             DELETE_DELAY,
         )
@@ -243,8 +258,8 @@ impl SegmentCleanerTask {
         child: Arc<dyn TranscodeChild>,
         config: Arc<dyn ServerConfigurationManager>,
         playlist: PathBuf,
-        segment_length_secs: i32,
         download_position: Arc<DownloadPosition>,
+        served_segments: Arc<ServedSegments>,
         interval: Duration,
         delete_delay: Duration,
     ) -> Self {
@@ -267,7 +282,7 @@ impl SegmentCleanerTask {
                     }
                 };
                 let Some(maximum) =
-                    maximum_deleted_index(&options, download_position(), segment_length_secs)
+                    maximum_deleted_index(&options, download_position(), &served_segments)
                 else {
                     continue;
                 };
@@ -430,61 +445,95 @@ mod tests {
         assert!(!eligible(&state));
     }
 
+    fn served_map(entries: &[(i64, i64)]) -> Arc<ServedSegments> {
+        let map: std::collections::HashMap<i64, i64> = entries.iter().copied().collect();
+        Arc::new(Mutex::new(map))
+    }
+
     #[test]
-    fn deletion_uses_finalized_download_retention_floor_and_inclusive_boundary() {
-        let mut options = EncodingOptions {
+    fn no_segments_returns_none() {
+        let served = served_map(&[]);
+        assert_eq!(
+            highest_served_segment_ending_at_or_before(&served, i64::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn init_segment_is_ignored() {
+        let served = served_map(&[(-1, 0), (0, 60_000_000)]);
+        assert_eq!(
+            highest_served_segment_ending_at_or_before(&served, 0),
+            None,
+            "init segment (index -1) must not be returned"
+        );
+    }
+
+    #[test]
+    fn exact_position_is_included() {
+        let served = served_map(&[(0, 60_000_000), (1, 120_000_000), (2, 180_000_000)]);
+        assert_eq!(
+            highest_served_segment_ending_at_or_before(&served, 120_000_000),
+            Some(1),
+            "a segment whose end ticks == the boundary is included"
+        );
+    }
+
+    #[test]
+    fn longer_than_desired_segments_work() {
+        let served = served_map(&[(0, 80_000_000), (1, 200_000_000), (2, 250_000_000)]);
+        assert_eq!(
+            highest_served_segment_ending_at_or_before(&served, 150_000_000),
+            Some(0),
+            "variable-length segments: only the ones fully within boundary"
+        );
+        assert_eq!(
+            highest_served_segment_ending_at_or_before(&served, 200_000_000),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn deletion_uses_served_segments_not_arithmetic() {
+        let options = EncodingOptions {
             enable_segment_deletion: true,
             segment_keep_seconds: 0,
             ..EncodingOptions::default()
         };
-        for (ticks, expected) in [
-            (None, None),
-            (Some(-1), None),
-            (Some(200_000_000), None),
-            (Some(250_000_000), None),
-            (Some(260_000_000), Some(1)),
-            (Some(320_000_000), Some(2)),
-        ] {
-            assert_eq!(maximum_deleted_index(&options, ticks, 6), expected);
-        }
-        for keep in [i32::MIN, -1, 0, 19, 20] {
-            options.segment_keep_seconds = keep;
-            assert_eq!(
-                maximum_deleted_index(&options, Some(260_000_000), 6),
-                Some(1)
-            );
-        }
-        options.segment_keep_seconds = i32::MAX;
-        assert_eq!(maximum_deleted_index(&options, Some(260_000_000), 6), None);
-        options.segment_keep_seconds = 0;
-        assert_eq!(maximum_deleted_index(&options, Some(i64::MIN), 6), None);
-        // The midpoint is rounded to the even second: 25.5 ->26,26.5 ->26,
-        // 31.5 ->32 and32.5 ->32. Truncation would delete a different range.
-        for (ticks, expected) in [
-            (255_000_000, 1),
-            (265_000_000, 1),
-            (315_000_000, 2),
-            (325_000_000, 2),
-        ] {
-            assert_eq!(
-                maximum_deleted_index(&options, Some(ticks), 6),
-                Some(expected)
-            );
-        }
-        options.segment_keep_seconds = 30;
-        assert_eq!(maximum_deleted_index(&options, Some(320_000_000), 6), None);
+        let served = served_map(&[
+            (0, 60_000_000),
+            (1, 120_000_000),
+            (2, 180_000_000),
+            (3, 300_000_000),
+        ]);
         assert_eq!(
-            maximum_deleted_index(&options, Some(360_000_000), 6),
-            Some(1)
+            maximum_deleted_index(&options, None, &served),
+            None,
+            "no download position"
         );
-        options.enable_segment_deletion = false;
         assert_eq!(
-            maximum_deleted_index(&options, Some(3_600_000_000), 6),
-            None
+            maximum_deleted_index(&options, Some(-1), &served),
+            None,
+            "negative download position"
         );
-        options.enable_segment_deletion = true;
-        assert_eq!(maximum_deleted_index(&options, Some(i64::MAX), 0), None);
-        assert!(maximum_deleted_index(&options, Some(i64::MAX), 1).is_some());
+        assert_eq!(
+            maximum_deleted_index(&options, Some(200_000_000), &served),
+            None,
+            "download position equals the keep floor — no room"
+        );
+        assert_eq!(
+            maximum_deleted_index(&options, Some(320_000_000), &served),
+            Some(1),
+            "120M ticks of served data ends at or before (320M - 200M)"
+        );
+
+        let mut opts2 = options.clone();
+        opts2.enable_segment_deletion = false;
+        assert_eq!(
+            maximum_deleted_index(&opts2, Some(3_600_000_000), &served),
+            None,
+            "deletion disabled"
+        );
     }
 
     #[test]
@@ -810,15 +859,24 @@ mod tests {
         let process = child(dir.path()).await;
         let selected = Arc::new(AtomicBool::new(false));
         let selected_by_worker = Arc::clone(&selected);
+        let served = served_map(&[
+            (0, 60_000_000),
+            (1, 120_000_000),
+            (2, 180_000_000),
+            (3, 240_000_000),
+            (4, 300_000_000),
+            (5, 360_000_000),
+            (6, 400_000_000),
+        ]);
         let timer = SegmentCleanerTask::start_with_timing(
             process,
             config,
             dir.path().join("out.m3u8"),
-            6,
             Arc::new(move || {
                 selected_by_worker.store(true, Ordering::Release);
                 Some(400_000_000)
             }),
+            served,
             Duration::from_millis(10),
             Duration::from_secs(3600),
         );
@@ -864,12 +922,21 @@ mod tests {
             reads: AtomicUsize::new(0),
         });
         let process = child(dir.path()).await;
+        let served = served_map(&[
+            (0, 60_000_000),
+            (1, 120_000_000),
+            (2, 180_000_000),
+            (3, 240_000_000),
+            (4, 300_000_000),
+            (5, 360_000_000),
+            (6, 400_000_000),
+        ]);
         let timer = SegmentCleanerTask::start_with_timing(
             Arc::clone(&process),
             config.clone(),
             dir.path().join("out.m3u8"),
-            6,
             Arc::new(|| Some(400_000_000)),
+            Arc::clone(&served),
             Duration::from_millis(10),
             Duration::from_millis(2),
         );
@@ -904,8 +971,8 @@ mod tests {
             process,
             config.clone(),
             dir.path().join("out.m3u8"),
-            6,
             Arc::new(|| Some(400_000_000)),
+            served,
             Duration::from_millis(10),
             Duration::from_millis(2),
         );

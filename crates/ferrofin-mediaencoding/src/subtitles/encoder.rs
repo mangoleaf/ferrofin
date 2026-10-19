@@ -20,6 +20,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 
+use crate::encoder::{get_input_argument, quote};
 use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Subtitle, TimeCode};
@@ -147,7 +148,8 @@ pub trait SubtitleIo: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error message on ffmpeg failure.
+    /// Returns an error message on ffmpeg failure, or when `args` does not
+    /// split into argv (unbalanced quoting).
     async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String>;
 
     /// Whether a cached subtitle file already exists at `path`. Port of the
@@ -510,7 +512,9 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     /// single un-extractable stream cannot abort the caller.
     pub async fn extract_all_extractable_subtitles(&self, media_source: &MediaSourceInfo) {
         let source_path = media_source.path.clone().unwrap_or_default();
-        let input_path = Self::io_input_argument(&source_path, media_source);
+        // TODO(parity): upstream's `GetInputPathArgument` also picks a disc rip's
+        // playlist files, the `bluray:` prefix for an ISO and the source protocol.
+        let input_path = get_input_argument("file", &source_path, MediaProtocol::File);
         let mut args = format!("-y -i {input_path}");
         let mut output_paths: Vec<String> = Vec::new();
         // Guards for the paths this call extracts, held across the ffmpeg run so
@@ -561,7 +565,8 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             output_paths.push(output_path.clone());
             let _ = write!(
                 args,
-                " -map 0:{stream_index} -an -vn -c:s {output_codec}{output_format_option} -flush_packets 1 \"{output_path}\""
+                " -map 0:{stream_index} -an -vn -c:s {output_codec}{output_format_option} -flush_packets 1 {}",
+                quote(&output_path)
             );
         }
 
@@ -665,7 +670,11 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             format!(" -sub_charenc {charset}")
         };
 
-        let args = format!("-y{encoding_param} -i \"{input_path}\" -c:s srt \"{output_path}\"");
+        let args = format!(
+            "-y{encoding_param} -i {} -c:s srt {}",
+            quote(&input_path),
+            quote(output_path)
+        );
         self.io
             .extract(&args, std::slice::from_ref(&output_path.to_owned()))
             .await?;
@@ -717,19 +726,6 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let id = media_source.id.clone().unwrap_or_default();
         self.io
             .subtitle_cache_path(&id, subtitle_stream_index, &format!(".{output_extension}"))
-    }
-
-    /// Builds the ffmpeg `-i` input argument for a source path.
-    ///
-    /// The C# code calls `IMediaEncoder.GetInputArgument`; here the un-ported
-    /// hardware-aware builder is reduced to the file/URL quoting the extraction
-    /// arg-building needs (the full builder lives in the `encoder` module).
-    fn io_input_argument(path: &str, _media_source: &MediaSourceInfo) -> String {
-        if path.contains("://") {
-            format!("\"{path}\"")
-        } else {
-            format!("file:\"{}\"", path.replace('"', "\\\""))
-        }
     }
 }
 

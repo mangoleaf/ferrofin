@@ -11,9 +11,13 @@
 //! **always**; `TrySaveToFiles` then writes the first path that succeeds. That
 //! is why an upload works on a read-only media mount — the normal deployment —
 //! and it is what [`Self::save_lyric`] / [`Self::download_lyrics`] do here.
-//! Reads and deletes look in both places, in the order
-//! `MediaInfoResolver.GetExternalFiles` enumerates them (containing folder,
-//! then internal metadata folder).
+//! Reads and deletes go through the item's `Lyric` media streams, as
+//! `GetLyricsAsync` / `DeleteLyricsAsync` do: the scan's audio probe records
+//! them from the sidecars `LyricResolver` matches in both places, so a saved
+//! lyric is read once the refresh that follows the save has run. A stream
+//! whose file can no longer be read is skipped, where upstream's
+//! `File.ReadAllTextAsync` throws and the request fails with a 500: a lyric
+//! removed behind the scan's back reads as no lyric until the next refresh.
 //!
 //! **What a lyric parses to.** `LrcLyricParser` (priority Fourth) handles
 //! `.lrc`/`.elrc`, then `TxtLyricParser` (Fifth) handles `.lrc`/`.elrc`/`.txt`
@@ -58,20 +62,16 @@ use ferrofin_model::lyrics::{
 use ferrofin_model::providers::LyricProviderInfo;
 use uuid::Uuid;
 
+use ferrofin_model::entities::MediaStreamType;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::{LyricManager, LyricProvider};
 
 use crate::item_type_lookup::kind_from_type_name;
 
 /// The number of ffmpeg ticks (100 ns) per millisecond.
 const TICKS_PER_MS: i64 = 10_000;
-
-/// Sidecar extensions probed for an item's lyrics, in priority order: synced LRC
-/// first, then plain text. Port of `NamingOptions.LyricFileExtensions`
-/// (`.lrc`, `.elrc`, `.txt`).
-const LYRIC_EXTENSIONS: [&str; 3] = ["lrc", "elrc", "txt"];
 
 /// The lyric manager: reads/writes `.lrc`/`.elrc`/`.txt` sidecars for an item
 /// (media folder and/or internal metadata folder, see the module docs), and
@@ -94,6 +94,10 @@ pub struct FerrofinLyricManager {
     /// `LibraryOptions.SaveLyricsWithMedia`. Absent → treated as `false`, the
     /// upstream default: never write into the media folder unasked.
     virtual_folders: Option<Arc<dyn VirtualFolderManager>>,
+    /// The item's stored media streams, whose `Lyric` rows are the lyric
+    /// files read and deleted. Absent → the item has no lyrics (unit-test
+    /// default).
+    media_streams: Option<Arc<dyn MediaStreamRepository>>,
 }
 
 impl std::fmt::Debug for FerrofinLyricManager {
@@ -116,6 +120,7 @@ impl FerrofinLyricManager {
             providers: Vec::new(),
             metadata_path: None,
             virtual_folders: None,
+            media_streams: None,
         }
     }
 
@@ -152,22 +157,20 @@ impl FerrofinLyricManager {
         self
     }
 
+    /// Attaches the media-stream store whose `Lyric` rows locate the lyric
+    /// files read and deleted.
+    #[must_use]
+    pub fn with_media_streams(mut self, streams: Arc<dyn MediaStreamRepository>) -> Self {
+        self.media_streams = Some(streams);
+        self
+    }
+
     /// The item row for `item_id`, or `None` when unknown / no store attached.
     async fn item(&self, item_id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         let Some(items) = &self.items else {
             return Ok(None);
         };
         items.retrieve_item(item_id).await
-    }
-
-    /// The media file path for `item_id`, or `None` when unknown / pathless.
-    async fn item_path(&self, item_id: Uuid) -> Result<Option<PathBuf>, ServiceError> {
-        Ok(self
-            .item(item_id)
-            .await?
-            .and_then(|i| i.path)
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from))
     }
 
     /// The item's internal-metadata folder (`{metadata}/library/{id2}/{idN}`) —
@@ -204,9 +207,8 @@ impl FerrofinLyricManager {
         .is_some_and(|o| o.save_lyrics_with_media)
     }
 
-    /// The save-path list for a lyric, in `TrySaveLyric` order: the media folder
-    /// only when the library opts in, then always the internal metadata folder.
-    /// The file name is the media base name plus the lowercased lyric format.
+    /// The item's save-path list ([`save_targets`]) under its library's live
+    /// `SaveLyricsWithMedia`.
     async fn save_targets(
         &self,
         item_id: Uuid,
@@ -214,59 +216,32 @@ impl FerrofinLyricManager {
         media_path: &Path,
         format: &str,
     ) -> Vec<PathBuf> {
-        let name = sidecar_file_name(media_path, &normalise_format(format));
-        let mut targets = Vec::new();
-        if self.save_with_media(item).await
-            && let Some(folder) = media_path.parent()
-        {
-            targets.push(folder.join(&name));
-        }
-        if let Some(dir) = self.item_metadata_dir(item_id) {
-            targets.push(dir.join(&name));
-        }
-        targets
+        save_targets(
+            media_path,
+            self.save_with_media(item).await,
+            self.item_metadata_dir(item_id).as_deref(),
+            format,
+        )
     }
 
-    /// Writes `content` to the first path that accepts it — port of
-    /// `TrySaveToFiles`, which returns after the first successful write and only
-    /// throws when every candidate failed.
-    fn try_save_to_files(targets: &[PathBuf], content: &str) -> Result<(), ServiceError> {
-        let mut last_error: Option<std::io::Error> = None;
-        for target in targets {
-            let written = target
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(target, content));
-            match written {
-                Ok(()) => {
-                    tracing::info!(path = %target.display(), "saved lyrics");
-                    return Ok(());
-                }
-                Err(e) => last_error = Some(e),
-            }
-        }
-        Err(last_error.map_or_else(
-            || ServiceError::backend("no lyric save path is configured"),
-            |e| ServiceError::backend(format!("write lyrics: {e}")),
-        ))
-    }
-
-    /// Every existing lyric sidecar for the item, in the order
-    /// `MediaInfoResolver.GetExternalFiles` enumerates them: the media's
-    /// containing folder first, then the internal metadata folder.
-    fn lyric_files(&self, item_id: Uuid, media_path: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        for ext in LYRIC_EXTENSIONS {
-            let name = sidecar_file_name(media_path, ext);
-            if let Some(folder) = media_path.parent() {
-                out.push(folder.join(&name));
-            }
-            if let Some(dir) = self.item_metadata_dir(item_id) {
-                out.push(dir.join(&name));
-            }
-        }
-        out.retain(|p| p.is_file());
-        out
+    /// The paths of the item's `Lyric` streams, in stream order —
+    /// `audio.GetMediaStreams().Where(s => s.Type == MediaStreamType.Lyric)`.
+    async fn lyric_files(&self, item_id: Uuid) -> Result<Vec<PathBuf>, ServiceError> {
+        let Some(streams) = &self.media_streams else {
+            return Ok(Vec::new());
+        };
+        let query = MediaStreamQuery {
+            item_id,
+            stream_type: Some(MediaStreamType::Lyric),
+            index: None,
+        };
+        Ok(streams
+            .get_media_streams(&query)
+            .await?
+            .into_iter()
+            .filter_map(|stream| stream.path.filter(|p| !p.is_empty()))
+            .map(PathBuf::from)
+            .collect())
     }
 
     /// The request overload of LyricManager.SearchLyricsAsync: disabled names
@@ -401,6 +376,51 @@ fn sidecar_file_name(media_path: &Path, ext: &str) -> std::ffi::OsString {
     name
 }
 
+/// The save-path list for a lyric of `media_path`, in `TrySaveLyric` order:
+/// the media folder only when the library opts in (`SaveLyricsWithMedia`),
+/// then always the item's internal metadata folder. The file name is the
+/// media base name plus the lowercased lyric format.
+pub(crate) fn save_targets(
+    media_path: &Path,
+    save_with_media: bool,
+    metadata_dir: Option<&Path>,
+    format: &str,
+) -> Vec<PathBuf> {
+    let name = sidecar_file_name(media_path, &normalise_format(format));
+    let mut targets = Vec::new();
+    if save_with_media && let Some(folder) = media_path.parent() {
+        targets.push(folder.join(&name));
+    }
+    if let Some(dir) = metadata_dir {
+        targets.push(dir.join(&name));
+    }
+    targets
+}
+
+/// Writes `content` to the first path that accepts it and returns that path
+/// — port of `TrySaveToFiles`, which returns after the first successful write
+/// and only throws when every candidate failed.
+pub(crate) fn try_save_to_files<'a>(
+    targets: &'a [PathBuf],
+    content: &str,
+) -> Result<&'a Path, ServiceError> {
+    let mut last_error: Option<std::io::Error> = None;
+    for target in targets {
+        let written = target
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(target, content));
+        match written {
+            Ok(()) => return Ok(target),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.map_or_else(
+        || ServiceError::backend("no lyric save path is configured"),
+        |e| ServiceError::backend(format!("write lyrics: {e}")),
+    ))
+}
+
 /// Runs the parser chain over a named lyric file — port of
 /// `LyricManager.InternalParseRemoteLyricsAsync`/`GetLyricsAsync`, which walk
 /// `_lyricParsers` in priority order and take the first non-null result:
@@ -467,12 +487,9 @@ fn is_audio_kind(type_name: &str) -> bool {
 #[async_trait]
 impl LyricManager for FerrofinLyricManager {
     async fn get_lyrics(&self, item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
-        let Some(path) = self.item_path(item_id).await? else {
-            return Ok(None);
-        };
-        // `GetLyricsAsync`: walk the item's lyric files and return the first one
-        // a parser claims.
-        for file in self.lyric_files(item_id, &path) {
+        // `GetLyricsAsync`: walk the item's lyric streams and return the first
+        // one a parser claims.
+        for file in self.lyric_files(item_id).await? {
             let Ok(content) = std::fs::read_to_string(&file) else {
                 continue;
             };
@@ -553,7 +570,8 @@ impl LyricManager for FerrofinLyricManager {
         let targets = self
             .save_targets(item_id, &item, path, &response.format)
             .await;
-        Self::try_save_to_files(&targets, &response.text)?;
+        let saved = try_save_to_files(&targets, &response.text)?;
+        tracing::info!(path = %saved.display(), "saved lyrics");
         Ok(Some(dto))
     }
 
@@ -590,17 +608,15 @@ impl LyricManager for FerrofinLyricManager {
             return Ok(None);
         };
         let targets = self.save_targets(item_id, &item, path, format).await;
-        Self::try_save_to_files(&targets, lyrics)?;
+        let saved = try_save_to_files(&targets, lyrics)?;
+        tracing::info!(path = %saved.display(), "saved lyrics");
         Ok(Some(dto))
     }
 
     async fn delete_lyrics(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        let Some(path) = self.item_path(item_id).await? else {
-            return Ok(());
-        };
-        // `DeleteLyricsAsync` deletes each lyric file with no `catch`: a failed
-        // unlink is an error, never a silent `204`.
-        for file in self.lyric_files(item_id, &path) {
+        // `DeleteLyricsAsync` deletes each lyric stream's file with no
+        // `catch`: a failed unlink is an error, never a silent `204`.
+        for file in self.lyric_files(item_id).await? {
             match std::fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1252,6 +1268,33 @@ mod tests {
         FerrofinLyricManager::new()
             .with_items(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
             .with_providers(providers)
+            .with_media_streams(Arc::new(
+                crate::media_stream_repository::FerrofinMediaStreamRepository::new(db.clone()),
+            ))
+    }
+
+    /// What the refresh after a save or delete leaves behind: the item's
+    /// stream rows become one `Lyric` stream per path (none for `[]`).
+    async fn record_lyric_streams(db: &Database, item_id: Uuid, paths: &[&std::path::Path]) {
+        use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+        use ferrofin_traits::persistence::MediaStreamRepository;
+        let rows: Vec<_> = paths
+            .iter()
+            .zip(0..)
+            .map(|(path, index)| MediaStreamInfoEntity {
+                item_id: item_id.to_string(),
+                stream_index: index,
+                stream_type: crate::db_error::media_stream_type_disc(
+                    ferrofin_model::entities::MediaStreamType::Lyric,
+                ),
+                path: Some(path.to_string_lossy().into_owned()),
+                ..MediaStreamInfoEntity::default()
+            })
+            .collect();
+        crate::media_stream_repository::FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(item_id, &rows)
+            .await
+            .expect("save lyric streams");
     }
 
     /// `{metadata}/library/{id2}/{idN}/{stem}.{ext}` — where a saved lyric lands.
@@ -1586,20 +1629,26 @@ mod tests {
         assert_eq!(dto.metadata, LyricMetadata::default());
         assert_eq!(dto.lyrics[0].text, "I want to live");
 
-        // The local read path now serves the saved lyric…
+        // Nothing is read before the refresh records the saved file's stream…
+        assert!(mgr.get_lyrics(item_id).await.expect("get").is_none());
+        record_lyric_streams(&db, item_id, &[&saved]).await;
+        // …then the local read path serves the saved lyric…
         let read_back = mgr.get_lyrics(item_id).await.expect("get").expect("some");
         assert_eq!(read_back, dto);
         // …and the delete removes it again.
         mgr.delete_lyrics(item_id).await.expect("delete");
         assert!(!saved.exists());
+        record_lyric_streams(&db, item_id, &[]).await;
         assert!(mgr.get_lyrics(item_id).await.expect("get").is_none());
         let replacement = tempfile::tempdir().expect("new metadata");
         *current.write().unwrap() = replacement.path().to_path_buf();
         mgr.download_lyrics(item_id, &lyric_id)
             .await
             .expect("download after change");
-        assert!(metadata_sidecar(replacement.path(), item_id, "song", "lrc").is_file());
+        let moved = metadata_sidecar(replacement.path(), item_id, "song", "lrc");
+        assert!(moved.is_file());
         assert!(!saved.exists());
+        record_lyric_streams(&db, item_id, &[&moved]).await;
         assert_eq!(mgr.get_lyrics(item_id).await.expect("get"), Some(dto));
     }
 
@@ -1688,6 +1737,7 @@ mod tests {
         let first = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
         assert!(first.is_file());
         assert!(!media.with_extension("lrc").exists());
+        record_lyric_streams(&db, item_id, &[&first]).await;
         mgr.delete_lyrics(item_id).await.unwrap();
         options.save_lyrics_with_media = true;
         folders
@@ -1705,6 +1755,7 @@ mod tests {
             !first.exists(),
             "the writable media target ends the fallback list"
         );
+        record_lyric_streams(&db, item_id, &[&media.with_extension("lrc")]).await;
         mgr.delete_lyrics(item_id).await.unwrap();
         options.save_lyrics_with_media = false;
         folders
@@ -1718,6 +1769,7 @@ mod tests {
         let replacement = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
         assert!(replacement.is_file());
         assert!(!first.exists());
+        record_lyric_streams(&db, item_id, &[&replacement]).await;
         assert_eq!(
             mgr.get_lyrics(item_id).await.unwrap().unwrap().lyrics[0].text,
             "new root"
@@ -1775,6 +1827,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "", "beta", ""]
         );
+        let saved = metadata_sidecar(meta.path(), item_id, "song", "txt");
+        record_lyric_streams(&db, item_id, &[&saved]).await;
         assert_eq!(mgr.get_lyrics(item_id).await.expect("get"), Some(dto));
     }
 
@@ -1788,6 +1842,7 @@ mod tests {
         let sidecar = media.with_extension("lrc");
         std::fs::write(&sidecar, "[00:01.00]hi").expect("write sidecar");
         let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        record_lyric_streams(&db, item_id, &[&sidecar]).await;
         let mgr = manager_over(&db, Vec::new()).with_metadata_path(meta.path());
 
         // A read-only parent makes the unlink fail. Upstream

@@ -25,10 +25,11 @@
 //! - `DELETE /Videos/ActiveEncodings` (stop an encoding)
 //! - `GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}` (attachment serve)
 //!
-//! The transcode branch of `/Videos|Audio/{id}/{container}` and
-//! `/Audio/{id}/universal` is folded into the existing direct-play handlers
-//! (`videos`/`audio`), which fall back to [`HlsStreamManager::transcode_stream`]
-//! only when the item has no direct-playable file.
+//! The transcode branch of `/Videos|Audio/{id}/stream[.{container}]` and
+//! `/Audio/{id}/universal` is folded into the direct-play handlers
+//! (`videos`/`audio`), which call [`HlsStreamManager::transcode_stream`] for a
+//! request that is not `Static=true`, a static video request for a disc
+//! folder, and a universal request with no direct-playable source.
 
 use axum::Router;
 use axum::body::Body;
@@ -99,35 +100,42 @@ where
 
 /// Jellyfin's registered NullableEnumModelBinder uses EnumConverter, retaining
 /// undefined Int32 values and comma combinations; FormatException leaves null.
+///
+/// Returns `value`'s number over the enum's `members` (name, value), ignoring
+/// case, or [`None`] where the binder leaves the parameter null.
+pub(crate) fn nullable_enum_value(value: &str, members: &[(&str, i32)]) -> Option<i32> {
+    value.split(',').try_fold(0_i32, |bits, part| {
+        let named = part.trim();
+        let number = match members
+            .iter()
+            .find(|(name, _)| named.eq_ignore_ascii_case(name))
+        {
+            Some(&(_, number)) => number,
+            None => part
+                .trim_start()
+                .trim_end_matches('\0')
+                .trim_end_matches(|character| matches!(character, ' ' | '\t'..='\r'))
+                .parse::<i32>()
+                .ok()?,
+        };
+        Some(bits | number)
+    })
+}
+
+/// Binds a nullable `EncodingContext` ([`nullable_enum_value`]).
 fn optional_encoding_context<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<ferrofin_model::dlna::EncodingContext>, D::Error> {
     use ferrofin_model::dlna::EncodingContext;
     use serde::Deserialize as _;
     let value = Option::<String>::deserialize(deserializer)?;
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let bits = value.split(',').try_fold(0_i32, |bits, part| {
-        let named = part.trim();
-        let number = if named.eq_ignore_ascii_case("Streaming") {
-            0
-        } else if named.eq_ignore_ascii_case("Static") {
-            1
-        } else {
-            part.trim_start()
-                .trim_end_matches('\0')
-                .trim_end_matches(|character| matches!(character, ' ' | '\t'..='\r'))
-                .parse::<i32>()
-                .ok()?
-        };
-        Some(bits | number)
-    });
-    Ok(bits.map(|number| match number {
-        0 => EncodingContext::Streaming,
-        1 => EncodingContext::Static,
-        number => EncodingContext::Unrecognized(number),
-    }))
+    Ok(value
+        .and_then(|value| nullable_enum_value(&value, &[("Streaming", 0), ("Static", 1)]))
+        .map(|number| match number {
+            0 => EncodingContext::Streaming,
+            1 => EncodingContext::Static,
+            number => EncodingContext::Unrecognized(number),
+        }))
 }
 
 /// The `?static` / segment-shaping query parameters common to every HLS route.
@@ -230,6 +238,10 @@ struct HlsQuery {
     /// contract; see [`Self::video_bitrate`] for the spellings).
     #[serde(default)]
     audio_bitrate: Option<i32>,
+    /// The client's overall bitrate cap; the audio routes encode to it when
+    /// no `audioBitRate` is given ([`build_audio_request`]).
+    #[serde(default)]
+    max_streaming_bitrate: Option<i32>,
     /// The per-request encoding thread limit, overriding EncodingThreadCount.
     #[serde(default, deserialize_with = "optional_cpu_core_limit")]
     cpu_core_limit: Option<i32>,
@@ -276,6 +288,10 @@ struct HlsQuery {
     /// The negotiated subtitle delivery method name.
     #[serde(default)]
     subtitle_method: Option<String>,
+    /// Whether the subtitle is burned into any transcoded video
+    /// (`alwaysBurnInSubtitleWhenTranscoding`, default `false`).
+    #[serde(default)]
+    always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The client's transcode reasons (forwarded into the master's variant URL).
     #[serde(default)]
     transcode_reasons: Option<String>,
@@ -319,13 +335,21 @@ impl HlsRequestContext {
         parts: &axum::http::request::Parts,
         subtitles_in_manifest_default: bool,
     ) -> Self {
+        Self::from_extensions(auth, &parts.extensions, subtitles_in_manifest_default)
+    }
+
+    /// Reads the token and peer address off the request extensions.
+    fn from_extensions(
+        auth: &ferrofin_traits::options::AuthorizationInfo,
+        extensions: &axum::http::Extensions,
+        subtitles_in_manifest_default: bool,
+    ) -> Self {
         Self {
             api_key: auth.token.as_ref().map(|t| t.expose().to_owned()),
             playback_permissions: auth.user_policy.as_deref().map(Into::into),
             // Inserted by the server's `with_connect_info`; absent behind a
             // body-consuming extractor or in tests.
-            remote_ip: parts
-                .extensions
+            remote_ip: extensions
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|ci| ci.0.ip()),
             subtitles_in_manifest_default,
@@ -394,6 +418,9 @@ fn build_request(
         min_segments: query.min_segments,
         subtitle_stream_index: query.subtitle_stream_index,
         subtitle_method: query.subtitle_method,
+        always_burn_in_subtitle_when_transcoding: query
+            .always_burn_in_subtitle_when_transcoding
+            .unwrap_or(false),
         transcode_reasons: query.transcode_reasons,
         enable_subtitles_in_manifest: query
             .enable_subtitles_in_manifest
@@ -409,6 +436,20 @@ fn build_request(
         // Fields this route does not read keep their DTO defaults.
         ..HlsStreamRequest::default()
     }
+}
+
+/// [`build_request`] for the audio HLS routes (`GetMasterHlsAudioPlaylist`,
+/// `GetVariantHlsAudioPlaylist`, `GetHlsAudioSegment`), which encode to
+/// `audioBitRate ?? maxStreamingBitrate`. The universal-audio HLS branch hands
+/// its client's cap on through these routes' query string.
+fn build_audio_request(
+    item_id: Uuid,
+    mut query: HlsQuery,
+    raw_query: Option<String>,
+    ctx: HlsRequestContext,
+) -> HlsStreamRequest {
+    query.audio_bitrate = query.audio_bitrate.or(query.max_streaming_bitrate);
+    build_request(item_id, query, raw_query, ctx)
 }
 
 /// The ordinary stream controllers validate these query/route identifiers
@@ -434,11 +475,11 @@ pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), 
 
 /// Serves the transcode branch of a direct-play stream route.
 ///
-/// The `/Videos|Audio/{id}/{container}` (`stream.{container}`) and
-/// `/Audio/{id}/universal` routes first attempt direct play (serving the item's
-/// on-disk file); when the item has no direct-playable file this runs the
+/// The `/Videos|Audio/{id}/stream[.{container}]` and `/Audio/{id}/universal`
+/// routes serve `Static=true` requests directly; this runs their
 /// progressive-transcode branch (`VideosController.GetVideoStream` /
-/// `UniversalAudioController` transcode path) via
+/// `AudioHelper.GetAudioStream` / `UniversalAudioController` transcode path)
+/// for everything else, via
 /// [`HlsStreamManager::transcode_stream`]. Shared by `videos` and `audio` so the
 /// fallback is not duplicated.
 ///
@@ -504,21 +545,31 @@ pub(crate) fn request_from_query(
 #[serde(transparent)]
 pub(crate) struct HlsQueryPub(HlsQuery);
 
-/// Universal audio declares Container as a collection, unlike ordinary streams.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(transparent)]
-pub(crate) struct UniversalHlsQueryPub(HlsQuery);
-
-/// Retains the existing universal-audio fallback while binding its collections.
-/// Container negotiation is separate from the ordinary progressive request.
-pub(crate) fn request_from_universal_query(
+/// The base of the requests `UniversalAudioController` builds for its HLS and
+/// progressive branches: the caller's token, policy and locality and the raw
+/// universal query (the master playlist forwards it into its variant URL), with
+/// every streaming field at its DTO default for the caller to fill in. None is
+/// read from the universal query, which binds its own parameters.
+pub(crate) fn universal_request(
     item_id: Uuid,
-    mut query: UniversalHlsQueryPub,
-    raw_query: Option<String>,
     auth: &ferrofin_traits::options::AuthorizationInfo,
+    request: &Request,
 ) -> HlsStreamRequest {
-    query.0.container = None;
-    request_from_query(item_id, HlsQueryPub(query.0), raw_query, auth)
+    build_request(
+        item_id,
+        HlsQuery::default(),
+        request.uri().query().map(ToOwned::to_owned),
+        HlsRequestContext::from_extensions(auth, request.extensions(), false),
+    )
+}
+
+/// Serves `playlist` as the master playlist of a `GET`/`HEAD` (see
+/// [`master_playlist_response`]); the universal-audio HLS branch answers with it.
+pub(crate) fn universal_master_playlist_response(
+    method: &axum::http::Method,
+    playlist: String,
+) -> Response {
+    master_playlist_response(method, playlist)
 }
 
 /// Serves a playlist string as an HLS `.m3u8` response.
@@ -640,7 +691,7 @@ async fn get_audio_master_playlist(
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
     let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
-    let req = build_request(item_id, query, raw, ctx);
+    let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, true).await?;
     Ok(master_playlist_response(&parts.method, playlist))
 }
@@ -655,7 +706,7 @@ async fn get_audio_variant_playlist(
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
     let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
-    let req = build_request(item_id, query, raw, ctx);
+    let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, true).await?;
     Ok(playlist_response(playlist))
 }
@@ -678,8 +729,9 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 /// with no `[AllowAnonymous]`, so the `hls1` segment routes are gated upstream —
 /// unlike the legacy `hls` segment routes below, which upstream leaves open with
 /// an explicit comment about Chrome omitting the query string. `RequireAuth`
-/// accepts the `api_key`/`ApiKey` query parameter, which is how players that
-/// cannot set an `Authorization` header on a segment URL authenticate.
+/// accepts the `ApiKey` query parameter (`api_key` only with legacy
+/// authorization), which is how players that cannot set an `Authorization`
+/// header on a segment URL authenticate.
 async fn get_video_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
@@ -711,7 +763,7 @@ async fn get_audio_hls_segment(
     let (parts, body) = request.into_parts();
     let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
     let request = Request::from_parts(parts, body);
-    let req = build_request(item_id, query, raw, ctx);
+    let req = build_audio_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, true).await?;
     served_file_response(file, request).await
 }
@@ -902,27 +954,18 @@ crate::query::query_parameters! {
     HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream")];
     StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
     HlsQueryPub {} => [("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/stream")];
-    UniversalHlsQueryPub {"container" => ','} => [("get", "/Audio/{itemId}/universal")];
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The ordinary stream routes bind `Container` as a scalar: the first value.
     #[test]
-    fn ordinary_container_is_scalar_and_universal_container_is_a_collection() {
+    fn the_ordinary_container_is_a_scalar() {
         let uri = "/?Container=mp3&container=flac".parse().unwrap();
         let ordinary = Query::<HlsQueryPub>::try_from_uri(&uri).unwrap();
         assert_eq!(ordinary.0.0.container.as_deref(), Some("mp3"));
-        let universal = Query::<UniversalHlsQueryPub>::try_from_uri(&uri).unwrap();
-        assert_eq!(universal.0.0.container.as_deref(), Some("mp3,flac"));
-        let request = request_from_universal_query(
-            Uuid::nil(),
-            universal.0,
-            None,
-            &ferrofin_traits::options::AuthorizationInfo::default(),
-        );
-        assert!(request.output_container.is_none());
     }
 
     /// Binds `query` the way the routes do, through the shared [`Query`]
@@ -1172,7 +1215,7 @@ mod tests {
             "Profile=high&Level=41&Framerate=30&Width=1280&Height=720&MinSegments=2&\
              SubtitleStreamIndex=3&SubtitleMethod=Hls&TranscodeReasons=ContainerNotSupported&\
              EnableSubtitlesInManifest=true&EnableAdaptiveBitrateStreaming=true&\
-             enableTrickplay=false",
+             enableTrickplay=false&alwaysBurnInSubtitleWhenTranscoding=true",
         )
         .expect("parses");
         let ctx = HlsRequestContext {
@@ -1191,6 +1234,7 @@ mod tests {
         assert_eq!(req.min_segments, Some(2));
         assert_eq!(req.subtitle_stream_index, Some(3));
         assert_eq!(req.subtitle_method.as_deref(), Some("Hls"));
+        assert!(req.always_burn_in_subtitle_when_transcoding);
         assert_eq!(
             req.transcode_reasons.as_deref(),
             Some("ContainerNotSupported")
@@ -1213,5 +1257,9 @@ mod tests {
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
         assert!(req.enable_subtitles_in_manifest);
         assert!(!req.is_in_local_network);
+        assert!(
+            !req.always_burn_in_subtitle_when_transcoding,
+            "defaults false"
+        );
     }
 }

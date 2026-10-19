@@ -16,10 +16,12 @@
 //! *unbounded* wait. A plugin that is slow without ever failing can keep its
 //! queue full and stall a `run-task` call or a scan's per-item
 //! `metadata-lookup` until it drains. That is bounded in practice by the
-//! per-call epoch deadline (each queued call still trips it, driving the
-//! breaker), but a genuinely slow-not-failing metadata plugin can drag a
-//! scan. If that ever bites, give lookups a `try_send` + "plugin busy — skip
-//! this item" fast path rather than making them wait.
+//! per-call deadline (each queued call still trips it, driving the
+//! breaker; [`arm_deadline`] holds WASI clock waits to it as well as wasm
+//! code, though not a host function with no bound of its own), but a
+//! genuinely slow-not-failing metadata plugin can drag a scan. If that ever
+//! bites, give lookups a `try_send` + "plugin busy — skip this item" fast
+//! path rather than making them wait.
 //!
 //! **Containment:** a trap, deadline overrun, or memory-cap hit fails only
 //! the one call; the actor rebuilds a fresh instance for the next call. After
@@ -206,17 +208,31 @@ impl InstanceSpec {
             subtitle_extract_cap: self.subtitle_extract_cap,
             private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
+            call_deadline: std::time::Instant::now(), // placeholder; armed below
             wasi: HostState::empty_wasi(),
             table: wasmtime::component::ResourceTable::new(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
         // Instantiation itself runs guest code (start sections, allocators),
-        // so it gets a deadline too.
-        store.set_epoch_deadline(self.timeout_ticks);
+        // so it gets a deadline too. Loading's identity calls share it.
+        arm_deadline(&mut store, self.timeout_ticks);
         let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)?;
         Ok((store, plugin))
     }
+}
+
+/// Starts a guest call's time budget of `ticks` [`EPOCH_TICK`]s: the epoch
+/// deadline that interrupts wasm code (to within one tick), and the
+/// wall-clock instant that caps the guest's WASI clock waits (host code,
+/// which epochs never interrupt; see
+/// [`DeadlineClocks`](crate::bindings::DeadlineClocks)).
+pub fn arm_deadline(store: &mut Store<HostState>, ticks: u64) {
+    store.set_epoch_deadline(ticks);
+    let budget = EPOCH_TICK.saturating_mul(u32::try_from(ticks).unwrap_or(u32::MAX));
+    let now = std::time::Instant::now();
+    // Unrepresentable only for a budget of centuries; fail closed (no waits).
+    store.data_mut().call_deadline = now.checked_add(budget).unwrap_or(now);
 }
 
 /// The sending half owned by the host: a bounded queue into the plugin's
@@ -482,7 +498,7 @@ fn run_loop(
                 reply,
             } => {
                 store.data_mut().config_json = config;
-                store.set_epoch_deadline(spec.timeout_ticks);
+                arm_deadline(store, spec.timeout_ticks);
                 match instance.call_run_task(&mut *store, &task_id) {
                     // Guest-reported failure: an orderly `err(string)`, not a
                     // trap — the instance is still healthy.
@@ -511,7 +527,7 @@ fn run_loop(
                 reply,
             } => {
                 store.data_mut().config_json = config;
-                store.set_epoch_deadline(spec.timeout_ticks);
+                arm_deadline(store, spec.timeout_ticks);
                 match instance.call_remote_images(&mut *store, &item) {
                     Ok(outcome) => {
                         let _ = reply.send(outcome);
@@ -535,7 +551,7 @@ fn run_loop(
                 reply,
             } => {
                 store.data_mut().config_json = config;
-                store.set_epoch_deadline(spec.timeout_ticks);
+                arm_deadline(store, spec.timeout_ticks);
                 match instance.call_metadata_lookup(&mut *store, &item, &provider_ids) {
                     // An orderly guest err(string) leaves the instance healthy.
                     Ok(outcome) => {
@@ -549,7 +565,7 @@ fn run_loop(
                 }
             }
             Command::OnEvent { name, json } => {
-                store.set_epoch_deadline(spec.timeout_ticks);
+                arm_deadline(store, spec.timeout_ticks);
                 match instance.call_on_event(&mut *store, &name, &json) {
                     Ok(()) => false,
                     Err(trap) => {
@@ -625,7 +641,7 @@ fn dispatch_request(
     reply: tokio::sync::oneshot::Sender<Result<crate::bindings::types::PluginResponse, String>>,
 ) -> bool {
     store.data_mut().config_json = config;
-    store.set_epoch_deadline(spec.timeout_ticks);
+    arm_deadline(store, spec.timeout_ticks);
     match instance.call_handle_request(&mut *store, request) {
         Ok(response) => {
             let _ = reply.send(Ok(response));
@@ -651,7 +667,7 @@ fn dispatch_scan(
 ) -> bool {
     store.data_mut().config_json = config;
     store.data_mut().segment_policy_skipped = false;
-    store.set_epoch_deadline(spec.timeout_ticks);
+    arm_deadline(store, spec.timeout_ticks);
     match instance.call_scan_media(&mut *store, item) {
         Ok(outcome) => {
             let _ = reply.send(Ok(ScanMediaOutcome {

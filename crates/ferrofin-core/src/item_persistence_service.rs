@@ -26,8 +26,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, StoredImageMetadata, StoredItemLinks,
-    VersionPromotion,
+    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, PlaylistMember, ScannedPlaylist,
+    StoredImageMetadata, StoredItemLinks, VersionPromotion,
 };
 use std::collections::HashMap;
 
@@ -197,6 +197,26 @@ pub(crate) async fn insert_named_item(
     is_folder: bool,
     container: Option<Uuid>,
 ) -> Result<BaseItemEntity, ServiceError> {
+    let mut conn = db.writer().acquire().await.map_err(db_err)?;
+    insert_named_item_in(&mut conn, id, kind, name, is_folder, container).await?;
+    drop(conn);
+    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// [`insert_named_item`]'s insert on a connection the caller holds, normally
+/// a writer transaction that commits the rest of the item with it.
+pub(crate) async fn insert_named_item_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    is_folder: bool,
+    container: Option<Uuid>,
+) -> Result<(), ServiceError> {
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
     sqlx::query(
@@ -219,11 +239,14 @@ pub(crate) async fn insert_named_item(
         // keyless row (upstream's only ones are guide airings), so it would
         // vanish from the user's own home query behind whichever row the group
         // happened to elect.
+        // `CleanName` is what `searchTerm` and the search hints match
+        // (`BaseItemMapper.cs:279` derives it on every save); without it a
+        // new box set or playlist is never found by name.
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
-            "PresentationUniqueKey", "ParentId", "TopParentId")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6)"#,
+            "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -239,15 +262,49 @@ pub(crate) async fn insert_named_item(
         None,
         None,
     ))
-    .execute(db.writer())
+    .bind(crate::text_util::get_clean_value(name))
+    .execute(&mut *conn)
     .await
     .map_err(db_err)?;
+    Ok(())
+}
 
-    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+/// Saves what a playlist add stamps on the playlist beside its entries: the
+/// `MediaType` column (`Playlist.MediaType => PlaylistMediaType`, saved by
+/// the create's `SetMediaType`) and `DateLastMediaAdded`
+/// (`AddToPlaylistInternal`). `None` leaves a column as it is.
+pub(crate) async fn stamp_playlist_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    media_type: Option<&str>,
+    media_added: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "MediaType" = COALESCE(?2, "MediaType"),
+               "DateLastMediaAdded" = COALESCE(?3, "DateLastMediaAdded")
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(playlist))
+    .bind(media_type)
+    .bind(opt_datetime_to_db(media_added))
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Stores `path` as item `id`'s `Path`, on a connection the caller holds.
+pub(crate) async fn set_item_path_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    path: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
-        .fetch_one(db.pool())
-        .await
-        .map_err(db_err)
+        .bind(path)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// The id of the container row stored at `path`, or `None`.
@@ -310,7 +367,7 @@ pub(crate) async fn ensure_container(
         // …and the same for the `Data` blob, which an older Ferrofin left NULL:
         // without it the row's `CollectionType` reads as absent forever.
         if let Some(data) = data {
-            backfill_container_data(db, id, data).await?;
+            backfill_container_data(db.writer(), id, data).await?;
         }
         return Ok(Some(id));
     }
@@ -361,11 +418,16 @@ pub(crate) async fn ensure_container(
         Some(p) if row_exists(db, p).await? => Some(p),
         _ => None,
     };
-    insert_named_item(db, id, kind, name, true, parent).await?;
-    set_container_path(db, id, path).await?;
+    // One writer transaction: `container_at` finds the row by its `Path`
+    // only, so a row committed without one would never be found again, and
+    // every later provision would fail to insert the same id.
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    insert_named_item_in(&mut tx, id, kind, name, true, parent).await?;
+    set_container_path(&mut *tx, id, path).await?;
     if let Some(data) = data {
-        backfill_container_data(db, id, data).await?;
+        backfill_container_data(&mut *tx, id, data).await?;
     }
+    tx.commit().await.map_err(db_err)?;
     Ok(Some(id))
 }
 
@@ -403,14 +465,18 @@ pub(crate) async fn container_row(
 /// database: Jellyfin's own blob carries `PhysicalLocationsList`,
 /// `PhysicalFolderIds` and the rest, and overwriting it with a one-key document
 /// would destroy the library's physical paths on swap-back.
-async fn backfill_container_data(db: &Database, id: Uuid, data: &str) -> Result<(), ServiceError> {
+async fn backfill_container_data<'e>(
+    conn: impl sqlx::SqliteExecutor<'e>,
+    id: Uuid,
+    data: &str,
+) -> Result<(), ServiceError> {
     sqlx::query(
         r#"UPDATE "BaseItems" SET "Data" = ?2
            WHERE "Id" = ?1 AND ("Data" IS NULL OR "Data" = '')"#,
     )
     .bind(guid_to_db(id))
     .bind(data)
-    .execute(db.writer())
+    .execute(conn)
     .await
     .map_err(db_err)?;
     Ok(())
@@ -585,11 +651,15 @@ const JELLYFIN_DATA_PATH_TOKEN: &str = "%AppDataPath%";
 
 /// Stamps a provisioned container with its directory and makes it its own top
 /// parent, the shape Jellyfin's `%AppDataPath%/collections` row has.
-async fn set_container_path(db: &Database, id: Uuid, path: &str) -> Result<(), ServiceError> {
+async fn set_container_path<'e>(
+    conn: impl sqlx::SqliteExecutor<'e>,
+    id: Uuid,
+    path: &str,
+) -> Result<(), ServiceError> {
     sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2, "TopParentId" = ?1 WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
         .bind(path)
-        .execute(db.writer())
+        .execute(conn)
         .await
         .map_err(db_err)?;
     Ok(())
@@ -1195,6 +1265,14 @@ impl FerrofinItemPersistenceService {
     /// ([`crate::item_data::date_modified_follows_save`]: a directory's,
     /// which clears a stored one (D2), or a path-less item's); `scan` says
     /// which statement `sql` is.
+    ///
+    /// A playlist's save also rewrites the `OwnerUserId` / `OpenAccess` /
+    /// `Shares` keys of its `Data` from the permission tables when those hold
+    /// its permissions, in the same writer transaction
+    /// ([`crate::item_data::sync_saved_playlist_in`]): the
+    /// row the caller saves was read earlier, and its copy of those keys must
+    /// not undo a share change committed since, which the next boot's
+    /// re-import from `Data` would make real.
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
@@ -1214,7 +1292,18 @@ impl FerrofinItemPersistenceService {
         if scan {
             query = query.bind(crate::item_data::date_modified_follows_save(item));
         }
-        query.execute(self.db.writer()).await.map_err(db_err)?;
+        let playlist = Uuid::parse_str(&item.id).ok().filter(|_| {
+            crate::item_type_lookup::kind_from_type_name(&item.type_)
+                == Some(BaseItemKind::Playlist)
+        });
+        if let Some(playlist) = playlist {
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            query.execute(&mut *tx).await.map_err(db_err)?;
+            crate::item_data::sync_saved_playlist_in(&mut tx, playlist).await?;
+            tx.commit().await.map_err(db_err)?;
+        } else {
+            query.execute(self.db.writer()).await.map_err(db_err)?;
+        }
         if scan {
             self.push_name_to_children(item).await?;
         }
@@ -1730,21 +1819,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .await
             .map_err(db_err)?;
         let closure: Vec<String> = deletion_closure_rows(&mut tx, &given).await?;
-        let known: std::collections::HashSet<String> = closure.iter().cloned().collect();
         detach_user_data(&mut tx, &closure).await?;
-        // The containers whose membership shrinks, for their `Data` re-sync
-        // after the commit (the deleted ones among them no-op there).
-        let mut containers: Vec<String> = Vec::new();
+        // A playlist or collection that loses a member needs no `Data`
+        // re-sync: 12.0 keeps membership out of `Data` (`[JsonIgnore]`), and
+        // the playlist keys it does hold are not changed by a delete.
         for chunk in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ids = numbered_placeholders(chunk.len());
-            let select = format!(
-                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#
-            );
-            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select.as_str()));
-            for id in chunk {
-                query = query.bind(id);
-            }
-            containers.extend(query.fetch_all(&mut *tx).await.map_err(db_err)?);
             for sql in [
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
@@ -1774,13 +1854,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             query.execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
-        containers.sort_unstable();
-        containers.dedup();
-        for container in containers.iter().filter(|c| !known.contains(*c)) {
-            if let Ok(container) = Uuid::parse_str(container) {
-                crate::item_data::sync_container_data(&self.db, container).await?;
-            }
-        }
         Ok(closure
             .iter()
             .filter_map(|id| Uuid::parse_str(id).ok())
@@ -1973,6 +2046,71 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 released = writes.release.len(),
                 "synced local alternate versions"
             );
+        }
+        Ok(())
+    }
+
+    async fn sync_scanned_playlists(
+        &self,
+        playlists: &[ScannedPlaylist],
+    ) -> Result<(), ServiceError> {
+        for playlist in playlists {
+            let id = guid_to_db(playlist.id);
+            // Resolved on a reader, before the writer is taken: one lookup
+            // per entry, and a long playlist must not hold the writer.
+            let resolved = match &playlist.members {
+                Some(members) => {
+                    let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+                    let mut ids = Vec::with_capacity(members.len());
+                    for member in members {
+                        if let Some(id) = resolve_playlist_member(&mut conn, member)
+                            .await
+                            .map_err(db_err)?
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    // `PlaylistItemsProvider` drops the entries it cannot
+                    // find, and with none left has no metadata: the stored
+                    // members stay as they are. A `playlist.xml` that reads
+                    // has metadata whatever its entries name.
+                    (!playlist.from_file || !ids.is_empty()).then_some(ids)
+                }
+                None => None,
+            };
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
+            // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody
+            // owns it, everybody reads it — and `Shares` is empty. A row an
+            // adoption imported, or an earlier scan wrote, is kept.
+            sqlx::query(
+                r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+                   VALUES (?1, ?2, 1) ON CONFLICT("PlaylistId") DO NOTHING"#,
+            )
+            .bind(&id)
+            .bind(guid_to_db(Uuid::nil()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if let Some(ids) = resolved {
+                let written = write_scanned_members(&mut tx, &id, ids, playlist.replace)
+                    .await
+                    .map_err(db_err)?;
+                if let Some(count) = written {
+                    tracing::debug!(item_id = %playlist.id, members = count, "synced playlist members");
+                }
+                // A reader with metadata makes the refresh a
+                // `MetadataImport`, which upstream saves: the saved stamp
+                // settles the `playlist.xml` change monitor
+                // (`BaseXmlProvider.HasChanged` compares with it).
+                sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = ?2 WHERE "Id" = ?1"#)
+                    .bind(&id)
+                    .bind(datetime_to_db(chrono::Utc::now()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+            tx.commit().await.map_err(db_err)?;
         }
         Ok(())
     }
@@ -2222,7 +2360,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
             // (which resolves the id → BaseItems.CleanName) matches. Faithful to
             // Jellyfin, where genres/studios are BaseItems; here their id is the
-            // shared value id the DTO layer already emits for genre_items.
+            // shared value id, and the DTO's genre/studio links find the row by
+            // type and name (`item_repository::by_name_ids_by_clean_name`).
             // A music item's genre materializes ONLY as a `MusicGenre` row.
             // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
             // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
@@ -2253,11 +2392,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     // `music_genre_row`, and the same reason an adopted
                     // Jellyfin database (whose by-name rows carry Jellyfin's
                     // ids) must not get a duplicate laid beside each row.
+                    // `IsFolder` is 0, as in `ensure_by_name_item`: the row has
+                    // no parent, so even a `MusicArtist` is `IsAccessedByName`
+                    // (`MusicArtist.cs:30-33`, `IsFolder => !IsAccessedByName`).
                     r#"INSERT INTO "BaseItems"
                        ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
                         "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       SELECT ?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0
+                       SELECT ?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0
                        WHERE NOT EXISTS (
                            SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
                 )
@@ -2276,14 +2418,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         None,
                     )
                 }))
-                // `IsFolder` follows the C# class, not the by-name-ness:
-                // `MusicArtist : Folder`, but `Genre`/`MusicGenre`/`Studio`
-                // are plain `BaseItem`s, so the controller's
-                // `if (item.IsFolder) result.IsFolder = true;` never fires for
-                // them and a genre hint carries no `IsFolder` at all.
-                .bind(i32::from(
-                    by_name_kind(*type_) == Some(BaseItemKind::MusicArtist),
-                ))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -3310,6 +3444,31 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written.rows_affected() > 0)
     }
 
+    async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "OfficialRating" = ?2, "UnratedType" = ?3,
+                   "InheritedParentalRatingValue" = ?4,
+                   "InheritedParentalRatingSubValue" = ?5, "DateLastSaved" = ?6
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&item.id)
+        .bind(&item.official_rating)
+        .bind(&item.unrated_type)
+        .bind(item.inherited_parental_rating_value)
+        .bind(item.inherited_parental_rating_sub_value)
+        .bind(datetime_to_db(chrono::Utc::now()))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+            > 0;
+        if written && let Some(changed) = self.changed.get() {
+            changed.record_updated(std::slice::from_ref(item));
+        }
+        Ok(written)
+    }
+
     async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
         let written = sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = ?2 WHERE "Id" = ?1"#)
             .bind(guid_to_db(item_id))
@@ -3732,6 +3891,22 @@ pub(crate) async fn rekey_rows(
     moves: &[ItemRekey],
     kind: RekeyKind,
 ) -> Result<Vec<ItemRekey>, ServiceError> {
+    rekey_rows_at(db, moves, &[], kind).await
+}
+
+/// [`rekey_rows`], each move also storing its item at a new path —
+/// `paths[i]` for `moves[i]`, none for a move past its end — in that move's
+/// savepoint, so no item is left moved without its path, or at its path
+/// under the old id.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the transaction cannot be opened or committed.
+pub(crate) async fn rekey_rows_at(
+    db: &Database,
+    moves: &[ItemRekey],
+    paths: &[String],
+    kind: RekeyKind,
+) -> Result<Vec<ItemRekey>, ServiceError> {
     if moves.is_empty() {
         return Ok(Vec::new());
     }
@@ -3759,14 +3934,22 @@ pub(crate) async fn rekey_rows(
             .map(|(table, column)| ((*table).to_owned(), (*column).to_owned(), false)),
     );
     let mut done = Vec::new();
-    for m in moves {
+    for (i, m) in moves.iter().enumerate() {
         // One savepoint per move: a move that fails is undone alone and
         // reported unmade, and the rest go ahead.
         sqlx::query("SAVEPOINT rekey_move")
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        match rekey_one(&mut tx, m, &references, kind).await {
+        match rekey_one_at(
+            &mut tx,
+            m,
+            paths.get(i).map(String::as_str),
+            &references,
+            kind,
+        )
+        .await
+        {
             Ok(made) => {
                 sqlx::query("RELEASE rekey_move")
                     .execute(&mut *tx)
@@ -3900,6 +4083,21 @@ async fn rekey_one(
         merge_one(conn, (loser, m.to), m.extra, references).await?;
     }
     Ok(true)
+}
+
+/// [`rekey_one`], then the moved item's new `path`, if it has one.
+async fn rekey_one_at(
+    conn: &mut sqlx::SqliteConnection,
+    m: &ItemRekey,
+    path: Option<&str>,
+    references: &[RekeyReference],
+    kind: RekeyKind,
+) -> Result<bool, sqlx::Error> {
+    let made = rekey_one(conn, m, references, kind).await?;
+    if made && let Some(path) = path {
+        set_item_path_in(conn, m.to, path).await?;
+    }
+    Ok(made)
 }
 
 /// Whether a `BaseItems` row has the id `id`.
@@ -4663,6 +4861,97 @@ async fn point_version_at(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Writes a scanned playlist's members inside the caller's transaction —
+/// `PlaylistMetadataService.MergeData`: `members` (resolved ids, in order)
+/// replace the stored ones, or — `replace` false and some stored — come
+/// first with the stored ones not among them after, told apart by the item
+/// each resolves to (upstream's `DistinctBy` key; see
+/// `library_scan/playlists.rs` for where it differs).
+/// Returns the member count when it wrote, `None` when the stored members
+/// already were the result.
+async fn write_scanned_members(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: &str,
+    members: Vec<Uuid>,
+    replace: bool,
+) -> Result<Option<usize>, sqlx::Error> {
+    // Manual links (`LinkedChildType.Manual`).
+    let mut ids: Vec<(Uuid, i64)> = members.into_iter().map(|id| (id, 0)).collect();
+    let stored: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "ChildId", "ChildType" FROM "LinkedChildren"
+           WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+    )
+    .bind(playlist)
+    .fetch_all(&mut *conn)
+    .await?;
+    let stored: Vec<(Uuid, i64)> = stored
+        .into_iter()
+        .filter_map(|(id, kind)| Uuid::parse_str(&id).ok().map(|id| (id, kind)))
+        .collect();
+    // `if (replaceData || targetItem.LinkedChildren.Length == 0)` takes the
+    // reader's list whole, its repeats with it.
+    if !replace && !stored.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        ids = ids
+            .into_iter()
+            .chain(stored.iter().copied())
+            .filter(|(id, _)| seen.insert(*id))
+            .collect();
+    }
+    if ids == stored {
+        return Ok(None);
+    }
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+        .bind(playlist)
+        .execute(&mut *conn)
+        .await?;
+    // Dense positions, repeats kept: the key is `(ParentId, SortOrder)`, and
+    // a playlist that lists a track twice plays it twice.
+    for (order, (id, kind)) in (0_i64..).zip(&ids) {
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(playlist)
+        .bind(order)
+        .bind(guid_to_db(*id))
+        .bind(kind)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(Some(ids.len()))
+}
+
+/// The stored item a playlist entry names: the item at its path —
+/// `LibraryManager.FindByPath`, the newest `DateCreated` first — else its id
+/// when that is stored (`ItemPersistenceService` resolves a `LinkedChild` by
+/// `Path` before its `LibraryItemId`).
+async fn resolve_playlist_member(
+    conn: &mut sqlx::SqliteConnection,
+    member: &PlaylistMember,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    if let Some(path) = member.path.as_deref() {
+        let id: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1
+               ORDER BY "DateCreated" DESC LIMIT 1"#,
+        )
+        .bind(path)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(id) = id.and_then(|id| Uuid::parse_str(&id).ok()) {
+            return Ok(Some(id));
+        }
+    }
+    let Some(id) = member.item_id else {
+        return Ok(None);
+    };
+    let stored: Option<i64> = sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(stored.map(|_| id))
 }
 
 /// Writes what [`local_version_writes`] decided for `primary` but its
@@ -7043,6 +7332,63 @@ mod tests {
         );
     }
 
+    /// gl-584: a provision whose `Path` write fails leaves no row behind.
+    /// `container_at` finds a container by its path only, so a row committed
+    /// without one was never found again, and every later provision failed
+    /// to insert the same path-derived id.
+    #[tokio::test]
+    async fn a_failed_container_path_write_leaves_no_row_behind() {
+        let db = test_db().await;
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some("/data".to_owned()),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("playlists").to_string_lossy().into_owned();
+        let provision = || {
+            ensure_container(
+                &db,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                &path,
+                &mode,
+                None,
+                None,
+            )
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER "fail_path" BEFORE UPDATE OF "Path" ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'disk full'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+        assert!(provision().await.is_err(), "the Path write fails");
+        let derived = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::PlaylistsFolder,
+            &path,
+        )
+        .expect("an id");
+        assert!(
+            container_row(&db, derived).await.expect("row").is_none(),
+            "the row is rolled back with it"
+        );
+
+        sqlx::query(r#"DROP TRIGGER "fail_path""#)
+            .execute(db.writer())
+            .await
+            .expect("drop trigger");
+        let id = provision()
+            .await
+            .expect("the next provision succeeds")
+            .expect("an id");
+        assert_eq!(
+            super::container_at(&db, &path).await.expect("lookup"),
+            Some(id)
+        );
+    }
+
     // A playlist (parent) and one of its members (child) both live in
     // `LinkedChildren`, whose BaseItems FK lacks `ON DELETE CASCADE`. Deleting
     // either must clear those links first instead of tripping constraint 787.
@@ -7066,14 +7412,35 @@ mod tests {
             .expect("link b");
 
         let svc = FerrofinItemPersistenceService::new(db.clone());
+        crate::item_data::seed_playlist_owner(&db, playlist, Uuid::new_v4()).await;
+        crate::item_data::sync_container_data(&db, playlist)
+            .await
+            .expect("sync");
+        let playlist_data = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(playlist))
+            .fetch_one(db.pool())
+            .await
+            .expect("playlist Data")
+        };
+        let data_before = playlist_data().await;
 
         // Delete a member (the ChildId FK direction): its link clears, the
-        // playlist and other member survive — no FK 787.
+        // playlist and other member survive — no FK 787. Membership is not in
+        // `Data`, so the playlist's copy is left as it was.
         svc.delete_items(&[member_a])
             .await
             .expect("delete member_a");
         assert!(!svc.item_exists(member_a).await.expect("exists a"));
         assert!(svc.item_exists(playlist).await.expect("playlist survives"));
+        assert_eq!(playlist_data().await, data_before);
+        // A re-sync leaves it as it is too: the delete changed nothing it writes.
+        crate::item_data::sync_container_data(&db, playlist)
+            .await
+            .expect("re-sync");
+        assert_eq!(playlist_data().await, data_before);
 
         // Delete the playlist (the ParentId FK direction) while member_b's link
         // still exists — must clear it instead of tripping FK 787.

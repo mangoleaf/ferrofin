@@ -23,9 +23,9 @@ regex.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 quick-xml.workspace = true
-encoding_rs = "0.8"
-chardetng = "0.1"
-shlex = "1"
+encoding_rs.workspace = true
+chardetng.workspace = true
+shlex.workspace = true
 tracing.workspace = true
 notify.workspace = true
 

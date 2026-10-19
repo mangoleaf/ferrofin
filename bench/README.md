@@ -100,9 +100,12 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
 - **CPU seconds** — change in the raw cgroup `usage_usec` counter between the
   bracketing samples, divided by one million, for the server and its children; load
   windows include k6 setup/teardown and harness overhead, and steady is post-load idle.
-- **Parity** — `N / 412 operations deep-verified`: the number of contract operations whose
-  Ferrofin implementation was compared against the upstream Jellyfin C# (`v12.0-rc7`) for
-  behavioral equivalence, recorded as rows of `handlers::VERIFIED` in
+- **Parity** — `N / 412 operations deep-verified against <UPSTREAM_TAG>, plus M compared
+  against an earlier release`: the number of contract operations whose Ferrofin
+  implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the latest
+  Jellyfin release; M counts rows in `VERIFIED_AGAINST_EARLIER_PIN`, compared against an
+  earlier pin and owed a re-check) for behavioral equivalence, recorded as rows of
+  `handlers::VERIFIED` in
   `crates/ferrofin-api/src/handlers/mod.rs` and printed by
   `cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`.
   Runtime response comparison is supporting evidence for that work, never the number.

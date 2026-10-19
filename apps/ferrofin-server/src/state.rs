@@ -96,7 +96,7 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
 /// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
-/// (12.2.0; handlers are verified against `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// (12.2.0; handlers are ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
 /// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
@@ -283,15 +283,7 @@ pub async fn build_app_state(
     shutdown: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<WiredApp> {
     // ---- paths (concrete) -------------------------------------------------
-    // Sub-directory layout under the program-data root, ported from
-    // `ServerApplicationPaths`: {data}/log, {config}, {cache}, {web}.
-    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-        &config.data_dir,
-        config.data_dir.join("log"),
-        &config.config_dir,
-        &config.cache_dir,
-        &config.web_dir,
-    ));
+    let paths = Arc::new(crate::bootstrap::application_paths(config));
     // The file actually opened (an adopted `jellyfin.db` may live elsewhere) —
     // what a backup archives and a restore writes.
     paths.set_database_path(config.database_path());
@@ -526,12 +518,15 @@ pub async fn build_app_state(
     // with the built-in project key (like TMDB); a user key/PIN override
     // enables their subscription tier. The plugin's `CacheDurationInHours`
     // (FERROFIN_TVDB_CACHE_HOURS, config `tvdb_cache_hours`; a bad value
-    // warns and keeps the one-hour default) bounds its resolved-id caches.
+    // warns and keeps the one-hour default) bounds its resolved-id caches;
+    // FERROFIN_TVDB_TOKEN_DAYS (config `tvdb_token_days`, default the
+    // plugin's 25) bounds how long its bearer token is reused.
     let the_tvdb = ferrofin_providers::TvdbClient::with_config(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
     )
-    .with_cache_duration(config.tvdb_cache_duration());
+    .with_cache_duration(config.tvdb_cache_duration())
+    .with_token_max_age(config.tvdb_token_max_age());
     let the_tvdb = Arc::new(match endpoints.tvdb.as_deref() {
         Some(base) => the_tvdb.with_base_url(base),
         None => the_tvdb,
@@ -708,6 +703,17 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to re-key seasons with no folder")?;
+    // …and a playlist an older Ferrofin created with no folder gets the one
+    // Jellyfin's `CreatePlaylist` makes, and the id Jellyfin keys it by.
+    ferrofin_core::adoption_repairs::run_rekey_pathless_playlists(
+        db,
+        &id_derivation,
+        &format!("{}/playlists", paths.data_path()),
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await
+    .context("failed to give playlists their folders")?;
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
         Arc::new(FerrofinClientEventLogger::new(
             Arc::clone(&paths) as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>
@@ -763,7 +769,8 @@ pub async fn build_app_state(
             .with_network(Arc::clone(&network))
             .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
-            .with_profile_image_dir(metadata_root.child("users"))
+            // Upstream `PostUserImage`: `{UserConfigurationDirectoryPath}/{Username}/`.
+            .with_profile_image_dir(paths.user_configuration_directory_path())
             .with_auth_cache(Arc::clone(&auth_cache))
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
@@ -969,7 +976,8 @@ pub async fn build_app_state(
             .with_items(Arc::clone(&item_repository))
             .with_providers(lyric_providers)
             .with_metadata_path(metadata_root.clone())
-            .with_virtual_folders(Arc::clone(&virtual_folders)),
+            .with_virtual_folders(Arc::clone(&virtual_folders))
+            .with_media_streams(Arc::clone(&media_stream_repository)),
     );
     // Built after the virtual-folder manager: the refresh path reads the
     // owning library's saved options through it (C# `BaseItemManager`). Two
@@ -1023,6 +1031,18 @@ pub async fn build_app_state(
             .with_tvdb(Arc::clone(&the_tvdb))
             .with_localization(Arc::clone(&localization))
             .with_people(Arc::clone(&people_repository))
+            // A box set's or playlist's refresh takes its members' rating.
+            .with_linked_children(Arc::clone(&linked_children_service))
+            // A genre's, music genre's or playlist's refresh redraws its
+            // generated Primary, as the scan's closing pass draws it.
+            .with_generated_images(Arc::new(
+                ferrofin_core::dynamic_images::DynamicImageProviders::new(
+                    Arc::clone(&item_repository),
+                    Arc::clone(&item_persistence_service),
+                    Arc::clone(&image_processor),
+                    metadata_library.clone(),
+                ),
+            ))
             // The SERVER-WIDE per-item-type MetadataOptions. Identify's
             // provider ordering falls back to this array's
             // `MetadataFetcherOrder` for a kind whose library saved no
@@ -1091,8 +1111,8 @@ pub async fn build_app_state(
             .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
-            // 12.1 lists a playlists/boxsets view only when the user can see
-            // a child in it, which needs the user's own visibility rules.
+            // 12.2 lists a playlists/boxsets view only when the user can see
+            // an item of its kind, which needs the user's own visibility rules.
             .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
@@ -1375,15 +1395,21 @@ pub async fn build_app_state(
         .with_app_paths(Arc::clone(&paths)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
+    // Marking a series, season, box set or folder played marks the items
+    // under it (`Folder.MarkPlayed`/`BoxSet.MarkPlayed`), listed through here.
+    user_data_impl.set_container_members(Arc::downgrade(&library), Arc::clone(&item_count_service));
     let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
         Arc::clone(&paths) as Arc<_>;
-    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
-        Arc::new(FerrofinCollectionManager::new(
+    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> = Arc::new(
+        FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
             Arc::clone(&collection_paths),
-        ));
+        )
+        // A box set takes its members' rating when they change.
+        .with_visibility(Arc::clone(&item_visibility)),
+    );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
     // The library monitor drives refreshes from two change sources: the
@@ -1784,13 +1810,16 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> =
-        Arc::new(FerrofinPlaylistManager::new(
+    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = Arc::new(
+        FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&item_repository),
             Arc::clone(&collection_paths),
-        ));
+        )
+        // `Playlist.IsVisible`'s parental half, beside the owner/shares.
+        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users)),
+    );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
     // now that every backing manager exists. Once registered, the scheduler
@@ -1842,6 +1871,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(lib_tasks::LyricDownloadTask::new(
             Arc::clone(&library),
             Arc::clone(&lyrics),
+            Arc::clone(&media_stream_repository),
         )));
         task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
             Arc::clone(&library),
@@ -1859,14 +1889,6 @@ pub async fn build_app_state(
             Arc::clone(&config_trait),
             server_config.log_file_retention_days,
         )));
-        task_manager.register(Arc::new(
-            maint_tasks::CleanupCollectionAndPlaylistPathsTask::new(
-                Arc::clone(&library),
-                Arc::clone(&collections),
-                Arc::clone(&playlists),
-                Arc::clone(&linked_children_service),
-            ),
-        ));
         task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
             Arc::clone(&trickplay_impl),

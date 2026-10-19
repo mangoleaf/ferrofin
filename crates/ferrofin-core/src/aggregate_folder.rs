@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use ferrofin_db::Database;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::persistence::ItemPersistenceService as _;
 use uuid::Uuid;
 
 use crate::item_persistence_service::row_exists;
@@ -197,9 +198,9 @@ impl AggregateFolderStore {
 
     /// `folder.ParentId = rootFolder.Id` for the playlists folder, plus the
     /// one-shot rewrite of a legacy `ManualPlaylistsFolder` row onto 10.11.8's
-    /// identity.
+    /// identity, and the folder's row itself when there is none.
     ///
-    /// Both statements are `UPDATE`s over one row, run once per process.
+    /// Each is a write to one row, run once per process.
     async fn repair_playlists_folder(
         &self,
         aggregate: Uuid,
@@ -223,6 +224,28 @@ impl AggregateFolderStore {
             tracing::info!(from = %legacy, to = %correct,
                 "rewrote the playlists folder onto Jellyfin's PlaylistsFolder identity");
         }
+        // `CreateRootFolder` saves the folder whenever its row is missing, so
+        // a fresh server has it — and a user who can see a playlist the
+        // library scan found has a Playlists view — before any playlist is
+        // made through the API. A row Jellyfin wrote with a moved data
+        // directory is found by its `%AppDataPath%` path and kept.
+        let path = self.playlists_path();
+        if !row_exists(&self.db, correct).await?
+            && crate::item_persistence_service::container_at(&self.db, &path.to_string_lossy())
+                .await?
+                .is_none()
+        {
+            if let Err(e) = tokio::fs::create_dir_all(&path).await {
+                tracing::warn!(path = %path.display(), %e,
+                    "could not create the playlists directory");
+            }
+            let row = playlists_folder_row(correct, &path, Some(aggregate));
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(self.db.clone())
+                .save_items(std::slice::from_ref(&row))
+                .await?;
+            tracing::info!(item_id = %correct, path = %path.display(),
+                "created the playlists folder");
+        }
         // A row A4 parented straight to the `UserRootFolder` (or one left
         // parentless) moves onto the aggregate, where `CreateRootFolder` puts
         // it. Scoped to the two states this server can have produced, so a row
@@ -231,6 +254,38 @@ impl AggregateFolderStore {
             &self.db, correct, aggregate, user_root,
         )
         .await
+    }
+}
+
+/// The `PlaylistsFolder` row `CreateRootFolder` saves for `path` under
+/// `parent` (the aggregate): `Name` "Playlists", its own top parent.
+///
+/// The id goes in through `guid_to_db`, never `to_string()`: Jellyfin stores
+/// GUID columns uppercase-hyphenated and `BaseItems."Id"` has no `COLLATE
+/// NOCASE`, so a lowercase id is another row to SQLite. Writing one once made
+/// the existence probe before this miss the row it had just written, and
+/// every `GET /Library/MediaFolders` re-ran the provisioning through the
+/// single writer connection (1355 ms p50 and 31% errors under load, against
+/// Jellyfin's 0.23 ms), with a lowercase `Id` in the response.
+pub(crate) fn playlists_folder_row(
+    id: Uuid,
+    path: &Path,
+    parent: Option<Uuid>,
+) -> ferrofin_db::entities::base_items::BaseItemEntity {
+    let name = crate::user_view_manager::PLAYLISTS_FOLDER_NAME;
+    ferrofin_db::entities::base_items::BaseItemEntity {
+        id: ferrofin_db::store::guid_to_db(id),
+        type_: item_type_lookup::stored_type_name(BaseItemKind::PlaylistsFolder)
+            .unwrap_or_default()
+            .to_owned(),
+        name: Some(name.to_owned()),
+        sort_name: Some(ferrofin_util::sort_name::create_sort_name(name)),
+        path: Some(path.to_string_lossy().into_owned()),
+        parent_id: parent.map(ferrofin_db::store::guid_to_db),
+        top_parent_id: Some(ferrofin_db::store::guid_to_db(id)),
+        is_folder: true,
+        date_created: Some(chrono::Utc::now()),
+        ..Default::default()
     }
 }
 
@@ -290,6 +345,34 @@ mod tests {
             Some(ids.aggregate.as_simple().to_string().as_str())
         );
         // Idempotent: a second call finds the row and changes nothing.
+        assert_eq!(store.ensure().await.expect("again"), ids);
+    }
+
+    /// `CreateRootFolder` saves the playlists folder on every start where it
+    /// is missing: under the aggregate, at `{data}/playlists`, with
+    /// Jellyfin's `PlaylistsFolder` identity.
+    #[tokio::test]
+    async fn ensure_creates_the_playlists_folder() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+
+        let ids = store.ensure().await.expect("ensure");
+
+        let id = store.playlists_id().expect("id");
+        let row = fetch_item(&db, id).await;
+        assert_eq!(
+            row.type_,
+            "Emby.Server.Implementations.Playlists.PlaylistsFolder"
+        );
+        assert_eq!(row.name.as_deref(), Some("Playlists"));
+        assert_eq!(row.parent_id, Some(db_guid(ids.aggregate)));
+        assert_eq!(row.top_parent_id, Some(db_guid(id)), "its own top parent");
+        assert_eq!(
+            row.path.as_deref(),
+            Some(store.playlists_path().to_string_lossy().as_ref())
+        );
+        assert!(store.playlists_path().is_dir());
         assert_eq!(store.ensure().await.expect("again"), ids);
     }
 

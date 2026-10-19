@@ -1950,3 +1950,42 @@ fn settle_sort_name_follows_create_sort_name_per_kind() {
         Some("zed")
     );
 }
+
+/// A rating table for [`super::rating_to_items`]: case-sensitive, so the
+/// distinct step's casing choice is visible.
+fn test_score(rating: &str) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
+    let (score, sub_score) = match rating {
+        "G" => (0, None),
+        "PG-13" => (13, None),
+        "TV-14" | "TV-14b" => (14, None),
+        "TV-14a" => (14, Some(1)),
+        "R" => (17, None),
+        _ => return None,
+    };
+    Some(ferrofin_model::entities_media::ParentalRatingScore { score, sub_score })
+}
+
+/// `UpdateRatingToItems`: the least restrictive rated member wins, unrated
+/// members are ignored, unknown ratings sort last, a missing sub-score sorts
+/// before a present one, ties keep member order, and with no rated member the
+/// container keeps its own rating.
+#[rstest]
+#[case::least_restrictive(None, &[Some("R"), Some("PG-13"), None], Some("PG-13"))]
+#[case::replaces_current(Some("G"), &[Some("R")], Some("R"))]
+#[case::unrated_keep_current(Some("R"), &[None, Some("")], Some("R"))]
+#[case::no_members(None, &[], None)]
+#[case::unknown_last(None, &[Some("NR"), Some("R")], Some("R"))]
+#[case::only_unknown(None, &[Some("NR")], Some("NR"))]
+#[case::no_sub_score_first(None, &[Some("TV-14a"), Some("TV-14")], Some("TV-14"))]
+#[case::ties_in_member_order(None, &[Some("TV-14b"), Some("TV-14")], Some("TV-14b"))]
+#[case::distinct_keeps_first_casing(None, &[Some("r"), Some("R")], Some("r"))]
+fn rating_to_items_takes_the_least_restrictive_member(
+    #[case] current: Option<&str>,
+    #[case] members: &[Option<&str>],
+    #[case] expected: Option<&str>,
+) {
+    assert_eq!(
+        super::rating_to_items(current, members.iter().copied(), test_score),
+        expected
+    );
+}

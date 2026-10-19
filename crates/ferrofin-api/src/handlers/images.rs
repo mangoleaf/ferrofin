@@ -1093,10 +1093,11 @@ async fn get_user_image(
 ///
 /// Port of `ImageController.PostUserImage`. Resolves the target user (the `userId`
 /// query parameter or the caller; a missing user is `404`, a nil effective user a
-/// `400`), validates the `Content-Type` is an image type (`400` otherwise),
+/// `400`), applies `AssertCanUpdateUser` (`403`), validates the `Content-Type` is an image type (`400` otherwise),
 /// base64-decodes the body, and stores it via
-/// [`UserManager::save_profile_image`], which clears any prior image and persists
-/// the user. Returns `204`.
+/// [`UserManager::save_profile_image`], which writes
+/// `{config}/users/{Username}/profile{ext}` (a username escaping that directory is
+/// a `400`), replaces any prior image row and persists the user. Returns `204`.
 #[utoipa::path(
     post,
     path = "/UserImage",
@@ -1118,6 +1119,7 @@ async fn post_user_image(
     let user = resolve_user_opt(&state, &auth, query.user_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
@@ -1136,8 +1138,9 @@ async fn post_user_image(
 /// `DELETE /UserImage` — clear a user's profile image.
 ///
 /// Port of `ImageController.DeleteUserImage`. Resolves the target user (the
-/// `userId` query parameter or the caller) and clears its profile-image row via
-/// [`UserManager::clear_profile_image`]; a user with no image is still a `204`
+/// `userId` query parameter or the caller), applies `AssertCanUpdateUser`
+/// (`403`), and deletes its profile-image file and
+/// row via [`UserManager::clear_profile_image`]; a user with no image is still a `204`
 /// (idempotent, as in C#). A nil effective user is a `400`, a missing user a
 /// `404`.
 #[utoipa::path(
@@ -1161,6 +1164,7 @@ async fn delete_user_image(
     let user = resolve_user_opt(&state, &auth, query.user_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     state.users.clear_profile_image(&user).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

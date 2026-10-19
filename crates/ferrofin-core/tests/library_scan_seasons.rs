@@ -80,6 +80,15 @@ const TVDB_SEASON: &str = r#"{"data": {"id": 77, "translations": {"overviewTrans
 const TVDB_DVD_SEASON: &str = r#"{"data": {"id": 76, "translations": {"overviewTranslations": [
     {"language": "eng", "overview": "TVDB dvd season."}]}}}"#;
 
+/// TheMovieDb's posters for season 1, in TheMovieDb's own order: the German
+/// one first and best rated, then English, then French. Their files are
+/// requested from the stand-in's `/img` root, which answers each with a 404,
+/// so the scan tries every one and the request log shows its ranked order.
+const TMDB_SEASON_IMAGES: &str = r#"{"posters": [
+    {"file_path": "/season-de.jpg", "iso_639_1": "de", "vote_average": 9.5, "vote_count": 90},
+    {"file_path": "/season-en.jpg", "iso_639_1": "en", "vote_average": 7.0, "vote_count": 40},
+    {"file_path": "/season-fr.jpg", "iso_639_1": "fr", "vote_average": 5.0, "vote_count": 10}]}"#;
+
 /// How the stand-in answers TheMovieDb's series search and season.
 #[derive(Clone, Copy)]
 struct Answers {
@@ -95,7 +104,7 @@ const DEFAULT_ANSWERS: Answers = Answers {
 /// The stand-in's answer to request line `line`; `None` is a 404 (a miss,
 /// not a failure).
 fn answer(line: &str, answers: Answers) -> Option<&'static str> {
-    let routes: [(&str, &str); 14] = [
+    let routes: [(&str, &str); 15] = [
         ("/tvdb/login", r#"{"data": {"token": "tok"}}"#),
         (
             "/tvdb/search",
@@ -126,6 +135,7 @@ fn answer(line: &str, answers: Answers) -> Option<&'static str> {
             "/tmdb/tv/1399/season/1/episode/1",
             r#"{"credits": {"cast": [], "crew": []}}"#,
         ),
+        ("/tmdb/tv/1399/season/1/images", TMDB_SEASON_IMAGES),
         ("/tmdb/tv/1399/season/1?", answers.season),
         ("/tmdb/tv/1399?", TMDB_SERIES),
         // A biography, so the person is complete and not asked again.
@@ -259,7 +269,11 @@ impl Library {
         )
         .with_items(Arc::clone(&self.items))
         .with_metadata(
-            Arc::new(TmdbClient::new().with_base_url(&format!("{the_moviedb}/tmdb"))),
+            Arc::new(
+                TmdbClient::new()
+                    .with_base_url(&format!("{the_moviedb}/tmdb"))
+                    .with_image_root(&format!("{the_moviedb}/img")),
+            ),
             self.metadata.clone(),
         )
         .with_tvdb(Arc::new(
@@ -564,6 +578,40 @@ async fn a_season_asks_fanart_for_its_artwork_only_when_fanart_is_enabled() {
     .await;
     assert!(without >= 1, "the series still asks for its own artwork");
     assert_eq!(with_fanart, without + 1, "one more request, for the season");
+}
+
+/// A season's TheMovieDb posters are ranked like every other provider's
+/// images (`GetImages` → `OrderByLanguageDescending(preferredLanguage)`), not
+/// taken in TheMovieDb's order: a French library asks for the French poster
+/// before the better-rated German and English ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_season_takes_its_tmdb_poster_in_the_preferred_language_first() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(
+        tmp.path(),
+        LibraryOptions {
+            preferred_metadata_language: Some("fr".to_owned()),
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    let (base, log) = spawn_providers(DEFAULT_ANSWERS);
+    library.scanner(&base).scan_all().await.expect("scan");
+    let posters: Vec<&str> = log
+        .lock()
+        .expect("log")
+        .iter()
+        .filter_map(|line| {
+            ["season-fr", "season-en", "season-de"]
+                .into_iter()
+                .find(|name| line.contains("/img/") && line.contains(name))
+        })
+        .collect();
+    assert_eq!(
+        posters,
+        ["season-fr", "season-en", "season-de"],
+        "preferred language, then English, then the rest — not TMDB's order"
+    );
 }
 
 /// TheMovieDb first, with no overview for the season: TheTVDB's translated

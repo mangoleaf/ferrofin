@@ -1971,17 +1971,11 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
             }
             qb.push(")");
         }
-        // The played state of the content row (the direct per-row rule the
-        // browse uses — see `append_user_data_predicates`).
+        // The played state of the content row, as the browse spells it
+        // (`scopeQuery.IsPlayed` through `TranslateQuery`).
         if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_played) {
-            qb.push(if want {
-                r#" AND ci."Id" IN "#
-            } else {
-                r#" AND ci."Id" NOT IN "#
-            })
-            .push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
-            .push_bind(guid_to_db(user_id))
-            .push(r#" AND ud."Played" = 1)"#);
+            qb.push(if want { " AND " } else { " AND NOT " });
+            crate::translate_query::push_is_played(qb, "ci", &guid_to_db(user_id), filter);
         }
     }
     qb.push(
@@ -2220,7 +2214,8 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
 struct PlaylistItemRow {
     /// The member item row.
     item: BaseItemEntity,
-    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy or API-key playlist).
+    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy playlist, an older
+    /// build's user-less API-key create, or a `Data` naming no owner).
     owner: Option<String>,
     /// `FerrofinPlaylists.OpenAccess` (NULL only when the meta row is absent).
     open_access: Option<i64>,
@@ -2314,6 +2309,7 @@ fn by_name_outer_filter(filter: &InternalItemsQuery) -> InternalItemsQuery {
     InternalItemsQuery {
         user: filter.user.clone(),
         user_preferences_loaded: filter.user_preferences_loaded,
+        user_has_content_restrictions: filter.user_has_content_restrictions,
         block_unrated_items: filter.block_unrated_items.clone(),
         exclude_inherited_tags: filter.exclude_inherited_tags.clone(),
         include_inherited_tags: filter.include_inherited_tags.clone(),
@@ -2865,6 +2861,29 @@ impl ItemRepository for FerrofinItemRepository {
 
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
         visible_views(&self.db, user).await
+    }
+
+    async fn build_access_filter(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let mut filter = InternalItemsQuery {
+            include_owned_items: true,
+            ..InternalItemsQuery::default()
+        };
+        filter.set_user(user.clone());
+        // Restrictions first: they decide whether the views lookup is needed.
+        let filter = crate::query_restrictions::resolve(&self.db, &filter)
+            .await?
+            .unwrap_or(filter);
+        if !filter.user_has_content_restrictions {
+            return Ok(None);
+        }
+        Ok(Some(
+            scope_to_user_libraries(&self.db, &filter)
+                .await?
+                .unwrap_or(filter),
+        ))
     }
 
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -8505,6 +8524,62 @@ mod tests {
         assert_eq!(unscoped_names(&repository, &user).await, ["In First"]);
     }
 
+    /// `PersonsController.BuildAccessFilter`: no filter for a user nothing is
+    /// hidden from (`HasContentRestrictions`); otherwise the user's resolved
+    /// restrictions, scoped to their libraries, with owned items admitted.
+    #[tokio::test]
+    async fn the_access_filter_exists_only_for_a_user_with_content_restrictions() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, second, user_id, user) = two_libraries(&db).await;
+        assert_eq!(repository.build_access_filter(&user).await.unwrap(), None);
+
+        let user_key = guid_to_db(user_id);
+        let tags = |values: &[&str]| values.iter().map(|&v| v.to_owned()).collect::<Vec<_>>();
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user_key,
+            PreferenceKind::BlockedTags,
+            &tags(&["gore"]),
+        )
+        .await
+        .expect("block tag");
+        let filter = repository
+            .build_access_filter(&user)
+            .await
+            .unwrap()
+            .expect("a blocked tag restricts");
+        assert!(filter.user_has_content_restrictions && filter.include_owned_items);
+        assert_eq!(filter.exclude_inherited_tags, ["gore"]);
+        let mut scope = filter.top_parent_ids.clone();
+        scope.sort();
+        assert_eq!(scope, [first, second]);
+
+        // Library access alone is a restriction too.
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user_key,
+            PreferenceKind::BlockedTags,
+            &tags(&[]),
+        )
+        .await
+        .expect("clear tag");
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(&user_key)
+            .bind(i32::from(PermissionKind::EnableAllFolders))
+            .execute(db.writer())
+            .await
+            .expect("revoke");
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[first]).await;
+        let filter = repository
+            .build_access_filter(&user)
+            .await
+            .unwrap()
+            .expect("library access restricts");
+        assert!(filter.exclude_inherited_tags.is_empty());
+        assert_eq!(filter.top_parent_ids, [first]);
+    }
+
     /// A Live TV view left behind in an adopted database is not part of the
     /// scope while no tuner is configured — Jellyfin drops it from
     /// `GetUserViews`, so the items under it are outside what an unscoped
@@ -9372,9 +9447,9 @@ mod tests {
 
     /// v12 `OrderMapper.cs:32-48`: an item's played date is the newest of its
     /// own progress and its alternate versions' — the second arm of the
-    /// `DatePlayed` ordering — while `PlayCount` / `IsPlayed` /
-    /// `IsFavoriteOrLiked` read the item's own first `UserData` row only
-    /// (`:57-61`).
+    /// `DatePlayed` ordering — while `PlayCount` / `IsFavoriteOrLiked` read
+    /// the item's own first `UserData` row only (`:57-61`). `IsPlayed` /
+    /// `IsUnplayed` are the played filter's predicate (`played_state_tests`).
     #[tokio::test]
     async fn date_played_spans_alternates_but_play_count_does_not() {
         use ferrofin_model::dto::SortOrder;
@@ -9450,7 +9525,7 @@ mod tests {
             names(ItemSortBy::PlayCount, user.clone()).await,
             vec!["Alpha", "Beta"]
         );
-        // The other first-row keys build and run.
+        // The other user-data keys build and run.
         for sort in [
             ItemSortBy::IsPlayed,
             ItemSortBy::IsUnplayed,
@@ -9949,6 +10024,72 @@ mod tests {
         assert_eq!(
             genres.total_record_count, 1,
             "the total counts GROUPS, not rows — otherwise paging promises rows it cannot serve"
+        );
+    }
+
+    /// The DTO's by-name links pick the same survivor as the list above (the
+    /// lowest id), fall back to a `Genre`/`Studio` name's `ItemValues` id when
+    /// it has no row, never to `Genre`'s value id for a `MusicGenre`, and stay
+    /// on the `(Type, CleanName)` / `(Type, CleanValue)` indexes.
+    #[tokio::test]
+    async fn by_name_link_ids_take_the_lowest_row_then_the_value_id() {
+        use ferrofin_db::enums::ItemValueType;
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0x9C01);
+        let (lo, hi) = (Uuid::from_u128(0x9C02), Uuid::from_u128(0x9C03));
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        crate::test_support::seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" <> ?1"#)
+            .bind(guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("drop the scanner rows");
+        for id in [hi, lo] {
+            seed_named_item(&db, id, BaseItemKind::Genre, "Drama").await;
+            set_clean_name(&db, id, "Drama").await;
+        }
+        let acme_value: String =
+            sqlx::query_scalar(r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Value" = 'Acme'"#)
+                .fetch_one(db.pool())
+                .await
+                .expect("value id");
+
+        let keys = [
+            (BaseItemKind::Genre, "drama".to_owned()),
+            (BaseItemKind::MusicGenre, "drama".to_owned()),
+            (BaseItemKind::Studio, "acme".to_owned()),
+            (BaseItemKind::Studio, "nobody".to_owned()),
+        ];
+        let ids = by_name_ids_by_clean_name(&db, &keys).await.expect("ids");
+        assert_eq!(ids[&BaseItemKind::Genre]["drama"], lo, "Min(Id) survivor");
+        assert!(!ids.contains_key(&BaseItemKind::MusicGenre), "{ids:?}");
+        assert_eq!(
+            ids[&BaseItemKind::Studio]["acme"],
+            Uuid::parse_str(&acme_value).unwrap(),
+            "no row: the value id"
+        );
+        assert!(!ids[&BaseItemKind::Studio].contains_key("nobody"));
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            by_name_ids_sql(1)
+        )))
+        .bind("t")
+        .bind(2)
+        .bind("c")
+        .fetch_all(db.pool())
+        .await
+        .expect("plan");
+        let has = |needle: &str| plan.iter().any(|(_, _, _, line)| line.contains(needle));
+        assert!(
+            has("SEARCH bi USING INDEX IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)")
+                && has(
+                    "SEARCH iv USING INDEX IX_ItemValues_Type_CleanValue (Type=? AND CleanValue=?)"
+                )
+                && !has("SCAN bi")
+                && !has("SCAN iv"),
+            "{plan:?}"
         );
     }
 
@@ -11849,3 +11990,73 @@ pub(crate) async fn music_artist_ids_by_clean_name(
     }
     Ok(ids)
 }
+
+/// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys of three
+/// binds each (stored type name, `ItemValues.Type`, clean name).
+fn by_name_ids_sql(keys: usize) -> String {
+    let values = vec!["(?, ?, ?)"; keys].join(", ");
+    format!(
+        r#"WITH "want"("Type", "ValueType", "CleanName") AS (VALUES {values})
+           SELECT w."Type", w."CleanName", COALESCE(
+               (SELECT MIN(bi."Id") FROM "BaseItems" bi
+                 WHERE bi."Type" = w."Type" AND bi."CleanName" = w."CleanName"),
+               (SELECT iv."ItemValueId" FROM "ItemValues" iv
+                 WHERE iv."Type" = w."ValueType" AND iv."CleanValue" = w."CleanName"
+                 LIMIT 1))
+           FROM "want" w"#
+    )
+}
+
+/// The id of the by-name `Genre`/`MusicGenre`/`Studio` item for each
+/// `(kind, clean name)` key — the item a `GenreItems`/`Studios` link opens
+/// (C# `GetGenreId`/`GetMusicGenreId`/`GetStudioId`).
+///
+/// The row is found by type and clean name, as the by-name queries find it:
+/// on an adopted database it carries Jellyfin's path-derived id, unrelated to
+/// the `ItemValues` id. When several rows share the name the lowest id wins,
+/// the survivor `GetItemValues`' `Min(Id)` collapse lists when they also share
+/// a `PresentationUniqueKey`, and a listed row otherwise. A `Genre`/`Studio` name
+/// with no row falls back to its `ItemValues` id, the id a scan or
+/// `ItemPersistenceService::ensure_by_name_item` gives the row; a key with
+/// neither is absent from the map.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn by_name_ids_by_clean_name(
+    db: &Database,
+    keys: &[(BaseItemKind, String)],
+) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+    let mut ids: HashMap<BaseItemKind, HashMap<String, Uuid>> = HashMap::new();
+    for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
+        let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
+            by_name_ids_sql(chunk.len()),
+        ));
+        for (kind, clean) in chunk {
+            let value_type = match kind {
+                BaseItemKind::Genre => Some(i32::from(ItemValueType::Genre)),
+                BaseItemKind::Studio => Some(i32::from(ItemValueType::Studios)),
+                // A `MusicGenre` shares `Genre`'s value space, whose id belongs
+                // to the `Genre` row (see `music_genre_row`).
+                _ => None,
+            };
+            query = query
+                .bind(stored_type_name(*kind))
+                .bind(value_type)
+                .bind(clean.as_str());
+        }
+        for (type_name, clean, id) in query.fetch_all(db.pool()).await.map_err(db_err)? {
+            if let (Some(kind), Some(Ok(id))) = (
+                BaseItemKind::from_stored_type_name(&type_name),
+                id.as_deref().map(Uuid::parse_str),
+            ) {
+                ids.entry(kind).or_default().insert(clean, id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+#[path = "item_repository/played_state_tests.rs"]
+mod played_state_tests;
