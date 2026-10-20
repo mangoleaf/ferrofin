@@ -197,23 +197,29 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     }
 
     /// Builds the ffprobe argument line for a probe (mirrors
-    /// `GetMediaInfoInternal`'s format string, minus the deferred
-    /// first-video-frame probe).
+    /// `GetMediaInfoInternal`'s format string).
+    ///
+    /// One `format!`, as upstream fills the line with one `string.Format`: the
+    /// input path is inserted once and never re-scanned, so a file name
+    /// holding `{threads}` reaches ffprobe unchanged.
+    ///
+    /// TODO(parity, open work item gl-347): upstream also appends
+    /// `-show_frames -only_first_vframe` for a local, non-audio probe when
+    /// ffprobe supports `only_first_vframe`, which is what sets
+    /// `Hdr10PlusPresentFlag`.
     fn probe_arguments(&self, input_path: &str, extract_chapters: bool, extra: &str) -> String {
-        let template = if extract_chapters {
-            "-i {input} -threads {threads} -v warning -print_format json -show_streams -show_chapters -show_format"
+        let chapters = if extract_chapters {
+            " -show_chapters"
         } else {
-            "-i {input} -threads {threads} -v warning -print_format json -show_streams -show_format"
+            ""
         };
-        let body = template
-            .replace("{input}", input_path)
-            .replace("{threads}", &self.config.threads.to_string());
-        let combined = if extra.is_empty() {
-            body
-        } else {
-            format!("{extra} {body}")
-        };
-        combined.trim().to_owned()
+        let threads = self.config.threads;
+        format!(
+            "{extra} -i {input_path} -threads {threads} -v warning -print_format json \
+             -show_streams{chapters} -show_format"
+        )
+        .trim()
+        .to_owned()
     }
 
     /// Builds the `ExtractImageInternal` argument line (software path only).
@@ -288,8 +294,13 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // which is what upstream passes here.
         let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
         let resolution = image_resolution_parameter(image_resolution);
+        // The graph is quoted, unlike upstream's bare `-vf {3}`: the 3D
+        // scalers contain spaces, so the split into argv would cut them into
+        // stray ffmpeg arguments and 3D sources would get no images (a
+        // Jellyfin bug, not ported).
         let mut args = format!(
             "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 {output}",
+            vf = quote(&vf),
             output = quote(output_path),
         );
 
@@ -1324,6 +1335,43 @@ mod tests {
         }
     }
 
+    // The 3D graphs carry spaces and ffmpeg's `\,` escape, and the argument
+    // string is split into argv by `split_args`. Upstream's bare `-vf {3}`
+    // splits such a graph at every space; quoted, ffmpeg gets it whole.
+    #[test]
+    fn each_3d_scaler_reaches_ffmpeg_as_one_filter_argument() {
+        for threed_format in [
+            Video3DFormat::HalfSideBySide,
+            Video3DFormat::FullSideBySide,
+            Video3DFormat::HalfTopAndBottom,
+            Video3DFormat::FullTopAndBottom,
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "",
+                None,
+                None,
+                Some(threed_format),
+                None,
+                true,
+                "/tmp/out.jpg",
+                None,
+                0,
+                ImageResolution::MatchSource,
+            );
+            let tokens = crate::encoder::split_args(&args).unwrap();
+            let vf = tokens.iter().position(|a| a == "-vf").unwrap() + 1;
+            let graph = &tokens[vf];
+            assert!(
+                graph.starts_with("crop=iw")
+                    && graph.contains(",crop=min(iw\\,ih*dar):min(ih\\,iw/dar):")
+                    && graph.ends_with(":(ih - min (ih\\,ih/sar))/2,setsar=sar=1,thumbnail=n=24"),
+                "{threed_format:?}: {tokens:?}"
+            );
+            assert_eq!(tokens[vf + 1], "-vsync", "{threed_format:?}: {tokens:?}");
+        }
+    }
+
     // An extraction temp directory the process cannot write fails every frame
     // for every video while ffmpeg itself is healthy. Catch it where the path
     // is known and say so, instead of reporting each video as frameless.
@@ -1751,5 +1799,76 @@ mod tests {
             Some("localized Original")
         );
         assert!(!streams[1].is_original);
+    }
+
+    /// A [`Transcoder`] fake that records each ffprobe argument line and
+    /// answers with an empty probe.
+    struct RecordingProbe(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Transcoder for RecordingProbe {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            self.0.lock().unwrap().push(arguments.to_owned());
+            Ok(ProcessOutput {
+                output: r#"{"streams":[],"format":{}}"#.to_owned(),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    // Upstream fills the probe line with one `string.Format`, so a file name
+    // is never re-scanned for the template's own placeholders. A library file
+    // whose name holds `{threads}` or `{input}` must reach ffprobe unchanged,
+    // or it is probed under another name and silently gets no streams.
+    #[rstest]
+    #[case::without_chapters(false)]
+    #[case::with_chapters(true)]
+    #[tokio::test]
+    async fn a_path_holding_template_placeholders_reaches_ffprobe_unchanged(
+        #[case] extract_chapters: bool,
+    ) {
+        let transcoder = Arc::new(RecordingProbe(std::sync::Mutex::new(Vec::new())));
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                threads: 3,
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let path = "/media/{threads} {input} Live.mkv";
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(path.to_owned()),
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters,
+            media_is_audio: false,
+        };
+        enc.get_media_info(&request).await.expect("probe parses");
+
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        let tokens = crate::encoder::split_args(&arguments).unwrap();
+        let input = tokens.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(tokens[input + 1], format!("file:{path}"), "{arguments}");
+        let threads = tokens.iter().position(|a| a == "-threads").unwrap();
+        assert_eq!(tokens[threads + 1], "3", "{arguments}");
+        assert_eq!(
+            tokens.iter().any(|a| a == "-show_chapters"),
+            extract_chapters,
+            "{arguments}"
+        );
     }
 }

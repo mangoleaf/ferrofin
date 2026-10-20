@@ -1,7 +1,8 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 12.2 and Ferrofin, on identical test data, on one host. Archived runs retain
+Jellyfin 12.2 and Ferrofin, on identical test data, on one host. It also holds the
+[release gate](#release-gate), which compares Ferrofin with its previous release. Archived runs retain
 their recorded labels and raw measurements. Re-rendering archived results applies the current
 validation rules: previously published cells can become flagged (including archived
 Ferrofin detail/playback responses missing `IsOriginal`/`LocalizedOriginal`). Review
@@ -32,7 +33,16 @@ printed: agreement is the absence of a range, not a claim about one.
 The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was not a
 reliable pass/fail test. Reports retain ranges for review instead.
 
-The benchmark reference is separate from the C# source-parity pin in `handlers/mod.rs`.
+The benchmark reference is the Jellyfin release named by the C# source-parity pin
+(`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
+in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
+Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
+fails, a release-gate session (`gate.py aa|ab|scan|ramp`) refuses to start and `run.sh` warns and
+continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
+and digest. A run that boots Jellyfin also stops unless the pinned image reports the
+`UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
+Moving the pin means moving `UPSTREAM_TAG`, pinning that release's image and preparing the
+corpus again.
 The owner requested plugin checks and background scan suppression; the isolation
 policy below implements that request on disposable configurations.
 
@@ -60,10 +70,11 @@ recorded and checked; differing selections flag the affected screen.
 Three levels are published: **unloaded** (1 screen/s), **loaded** (5 screens/s — about
 24 API requests/s plus up to ~55 poster requests/s) and **stress** (25 screens/s, five
 times that), which exists to push both servers past a comfortable browse. All three are
-fixed arrival rates rather than a ramp: finding one server's knee is a different question
-from comparing two servers doing the same work, and `RATE_STRESS` is the knob if neither
-bends. Each window is 120 s after a 30 s warm-up at the same rate (different picks) that
-is discarded, and a window in which k6 could not hold its rate is flagged, not published.
+fixed arrival rates, because comparing two servers doing the same work is a different
+question from finding one server's knee; the knee has its own opt-in, Ferrofin-only phase,
+the [saturation ramp](#throughput-ceiling-the-saturation-ramp), and `RATE_STRESS` is the
+knob if neither server bends at the stress rate. Each window is 120 s after a 30 s
+warm-up at the same rate (different picks) that is discarded, and a window in which k6 could not hold its rate is flagged, not published.
 
 ## Definitions (one sentence each)
 
@@ -100,6 +111,9 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
 - **CPU seconds** — change in the raw cgroup `usage_usec` counter between the
   bracketing samples, divided by one million, for the server and its children; load
   windows include k6 setup/teardown and harness overhead, and steady is post-load idle.
+- **Throughput ceiling** — the highest loaded-mix arrival rate, in screens per second,
+  whose worst screen p95 stayed within 100 ms with no failed request and no dropped k6
+  iteration, found by the `ramp` phase.
 - **Parity** — `N / 412 operations deep-verified against <UPSTREAM_TAG>, plus M compared
   against an earlier release`: the number of contract operations whose Ferrofin
   implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the latest
@@ -162,6 +176,15 @@ excluded from keys. Counts, ordered IDs (including duplicates), nested array len
 per-item field types are checked per response; no cross-item field union or arbitrary
 value diff is used. Each image belongs to its screen, and binary byte lengths detect
 empty bodies. Different nonzero JPEG sizes remain valid, unflagged diagnostics.
+`/Items/{id}/Similar` (`detail:similar`, `series:similar`) is the one exception: Jellyfin
+breaks equal similarity scores in arbitrary order (series in random order), and the
+response carries no score, so which items fill the limit is the server's free pick. Those
+responses are checked for status, counts, totals, content type and their own top-level
+fields, not item IDs or per-item fields, and the posters of their items are checked by
+count, status and type per slot and screen rather than by item (which assumes every
+candidate has a Primary poster, as every fixture item does). A Similar response that repeats an item or returns the item
+it was asked about still fails. Which items score as similar is covered by the code
+comparison recorded in `handlers::VERIFIED`, not by this check.
 
 Timed iterations emit one compact selection record after recording screen latency,
 without a full structural comparison. The reporter checks observed keys and request
@@ -265,12 +288,50 @@ validation, not full decoding or sustained playback evidence.
 | cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 
+## Throughput ceiling: the saturation ramp
+
+`run.sh --servers ferrofin --only ramp` (opt-in: no default run includes it, and it
+refuses Jellyfin) steps the loaded mix upward and reports where Ferrofin stops keeping up.
+It drains the server, discards one `WARMUP_S` warm-up at the start rate, then measures
+`RAMP_STEP_S` (30 s) at each rate from `RAMP_START` (25 screens/s, the stress rate Ferrofin
+is known to pass) in steps of `RAMP_STEP_RATE` (10), the last step being the highest
+start-plus-a-multiple-of-the-step not above `RAMP_CAP` (400; so 395). Each step is
+the `screens.js` workload at that rate, with the same picks as every other window.
+
+A step ends the ramp when, in this order of precedence, a screen's request failed
+(`errors`), k6 dropped an iteration so the client rather than the server was the limit
+(`client`), or the **worst screen's p95** went over `RAMP_BOUND_MS` (100 ms; `p95`). The
+ceiling is the last rate before that step. The mix has no single p95 in k6's per-screen
+summary, and the slowest screen is the one a client notices first, so that is the number
+bounded. If no step fails before the cap the ceiling is a lower bound (`cap`); if the first
+step fails there is no ceiling and the phase fails. The phase writes `ramp-params.json`,
+one `k6-ramp-<rate>.json` per step and `ramp.json` (the ceiling, what ended the ramp and
+every step), and the run's `report.html` gets a "Throughput ramp" section with the step
+table. The decisions live in `ramp.py` and are unit-tested in `test_ramp.py`.
+
+The release gate compares the candidate with the previous release in one window,
+interleaved, exactly as the latency gate does:
+
+```bash
+python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:rc --pairs 3
+```
+
+The ceiling is a higher-is-better cell, `ramp/ceiling`, judged by the `[ramp]` row of
+[`gate.toml`](gate.toml) (15 % and 5 screens/s) and the same rule: the median of the
+candidate's ceilings is below the previous release's by more than both thresholds, in at
+least two of three pairs. A ramp that ended on the client or has no passing step cannot be
+judged, and an unjudgeable gated cell blocks like a regression. These are starting values,
+to be re-derived after the first two ramps. The ramp pushes the shared host harder than any
+other phase: `run.sh` still refuses to start unless the server and client cores are idle,
+and a run that fails stops the session.
+
 ## Running it
 
 The reporter has a fast correctness check, also run in CI:
 
 ```sh
 python3 -m unittest discover -s bench -p test_report.py
+python3 -m unittest discover -s bench -p test_ramp.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.
@@ -366,9 +427,59 @@ stdlib only, no JavaScript.
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
 `--only loaded` for a before/after on two builds, or a comma list such as
 `--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
-The default still selects all phases and both servers. A shared host must be quiet: stop
+The default still selects all phases (except the opt-in `ramp`) and both servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.
 
 For repeated comparisons, rotate order explicitly, for example
 `--servers jellyfin,ferrofin` followed by `--servers ferrofin,jellyfin`.
 Use the same phase selection and settings; affinity alone does not make a busy host quiet.
+
+## Release gate
+
+What blocks a release is the interleaved A/B gate in [`gate.py`](gate.py), not the
+Jellyfin comparison above. [`RELEASE.md`](../RELEASE.md) has the gate's command, wall
+time, threshold table and blocking rules. `gate.py ab PREVIOUS CANDIDATE` runs Ferrofin
+only: three adjacent pairs of `run.sh --servers ferrofin --only shape,unloaded,loaded`. It
+judges each cell regressed, within noise or improved against the thresholds in
+[`gate.toml`](gate.toml). `gate.py aa IMAGE` measures the noise floor those thresholds are
+re-derived from. `gate.py scan` and `gate.py ramp` are the same interleaved pairs for the
+[scan and migration](#scan-and-migration) and [throughput ceiling](#throughput-ceiling-the-saturation-ramp)
+phases; RELEASE.md says which of them block. The three-server runs with both Jellyfins are for publication: they produce
+the root README and `docs/BENCHMARKS.md` tables and never decide a release.
+
+Cold start is not part of the gate and keeps the definition above: a restart until the
+first authenticated `GET /UserViews` succeeds, measured in full runs and never replaced by an
+unauthenticated probe such as `/System/Ping`.
+
+## Scan and migration
+
+`gate.py scan PREVIOUS CANDIDATE` measures library-scan and adoption-migration cost, A/B
+against the previous release in the same window: PREVIOUS CANDIDATE … as interleaved pairs
+(`--pairs`, default 3), each run being `scan.py` on that image ID. It needs the same test data
+as `run.sh` (`--testdata`, default `bench/testdata`), and the server gets `run.sh`'s cores and
+memory limit after the same idle-core check.
+
+- **Scan wall time**: seconds from `POST /Library/Refresh` to the RefreshLibrary task
+  reporting a newer successful run (polled every 0.5 s). The server starts on an empty data
+  dir: startup wizard, the three bench libraries set up as `testdata/seed.py` builds them
+  (no remote fetchers, trickplay or chapter images), tasks drained plus `SETTLE_S` idle,
+  then the scan.
+- **Migration wall time**: seconds from the container's start to its first authenticated
+  `200` on `GET /UserViews`, polled every 10 ms, on a fresh copy of the test data's config
+  (its libraries' realtime monitor turned off, as `run.sh` provisions every copy).
+  That is the bench corpus's own Jellyfin 10.11.8 database (about 26,000 items), so the
+  boot runs the whole adoption and migration chain. The synthetic fixtures under
+  `adoption/` hold a few dozen items each: they check correctness, not cost.
+- **Peak anon**: the largest cgroup `anon` sample (`mem_sample.py`, every 100 ms) inside
+  each timed span. For migration, sampling starts once `docker start` returns, so the first
+  moments of the boot can be missed.
+
+After each measurement the movie, series, episode, album and track counts are recorded in
+`scan.json` and must be at least `media/summary.json`'s, so a server that finds or keeps less
+is never faster; a run that fails stops the session. More is allowed and the two images'
+counts are not compared: v1.3.2's fresh scan lists the 40 alternate versions as movies of
+their own (3,041), and it must stay measurable as a previous release. The test data must
+hold at least 10,000 items. Every cell gates: wall time by the `[scan]` row of
+[`gate.toml`](gate.toml), peak anon by the `[memory]` row, with the A/B verdict rule. The
+session directory holds `report.md`, `report.html` and `verdict.json`; each run directory
+holds `scan.json`, and each measurement's `server.log`, `mem.csv` and data dir.

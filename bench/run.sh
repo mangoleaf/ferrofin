@@ -6,7 +6,11 @@
 # is reported and the next one runs; report.py renders whatever exists.
 #
 #   run.sh [--testdata DIR] [--servers jellyfin,ferrofin]
-#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs] [--rate N] [--out DIR]
+#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs,ramp] [--rate N] [--out DIR]
+#
+# `ramp` is opt-in (never part of a default run) and Ferrofin only: it steps the loaded mix
+# upward until a step fails and reports the last passing rate as the throughput ceiling
+# (bench/ramp.py). `gate.py ramp PREVIOUS CANDIDATE` runs it A/B.
 #
 # Requires: docker, k6, python3, jq; the pinned Jellyfin image
 # and ferrofin:bench (docker build -t ferrofin:bench .).
@@ -54,6 +58,17 @@ RATE_LOADED=${RATE_LOADED:-5}
 #: Note k6's dropped-iteration flag guards the CLIENT, not the server, and at this rate
 #: it will not fire — it is not the safety net for choosing this number.
 RATE_STRESS=${RATE_STRESS:-25}
+#: The ramp (`--only ramp`) starts at the stress rate, which Ferrofin is known to pass,
+#: and adds RAMP_STEP_RATE screens/s per step, which is also the ceiling's resolution (under
+#: the 15 % the A/B gate calls a regression once the ceiling is past ~65 screens/s);
+#: RAMP_STEP_S is the measured seconds per step, after one WARMUP_S warm-up at the start
+#: rate. The ramp stops at the first step whose worst-screen p95 exceeds RAMP_BOUND_MS (or
+#: that errors, or that k6 could not hold) and never runs a step above RAMP_CAP.
+RAMP_START=${RAMP_START:-$RATE_STRESS}
+RAMP_STEP_RATE=${RAMP_STEP_RATE:-10}
+RAMP_STEP_S=${RAMP_STEP_S:-30}
+RAMP_CAP=${RAMP_CAP:-400}
+RAMP_BOUND_MS=${RAMP_BOUND_MS:-100}
 export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
@@ -68,7 +83,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
-for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS; do
+for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
 # Reject bad selections before any fixture access or Docker command.
@@ -78,7 +93,7 @@ for selection in "$ONLY" "$SERVERS"; do
 done
 [ -n "$SERVERS" ] || { echo "--servers cannot be empty" >&2; exit 2; }
 for phase in ${ONLY//,/ }; do
-  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
+  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs|ramp) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
 done
 for server in ${SERVERS//,/ }; do
   case "$server" in jellyfin|ferrofin) ;; *) echo "unknown server $server" >&2; exit 2;; esac
@@ -128,8 +143,11 @@ die() { echo "run: $*" >&2; exit 1; }
 image_of() { case "$1" in jellyfin) cat bench/testdata/jellyfin-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
 port_of() { case "$1" in jellyfin) echo 18101;; ferrofin) echo 18103;; esac; }
 want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
+explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by default
 
 # ── preflight ──────────────────────────────────────────────────────────────
+! explicit ramp || [ "$SERVERS" = ferrofin ] || die "the ramp is Ferrofin only: pass --servers ferrofin"
+! explicit ramp || (( RAMP_START <= RAMP_CAP )) || die "RAMP_START must not exceed RAMP_CAP"
 [ ! -e "$OUT" ] || die "$OUT exists — a run directory is never reused"
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum timeout setsid; do command -v $t >/dev/null || die "$t not installed"; done
@@ -156,6 +174,8 @@ awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN {
 mkdir -p "$OUT"
 IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
+# The Jellyfin oracle pin; behind the latest Jellyfin release it only warns here (gate.py refuses).
+ORACLE=$(python3 bench/oracle.py check) || die "cannot read the Jellyfin oracle pin"
 # The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
 FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' ferrofin:bench)
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
@@ -165,12 +185,12 @@ jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(base
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \
   --argjson ready "$READY_TIMEOUT_S" --argjson drain "$DRAIN_TIMEOUT_S" --argjson http "$HTTP_TIMEOUT_S" --argjson stream_http "$STREAM_HTTP_TIMEOUT_S" \
   --argjson phase "$PHASE_TIMEOUT_S" --argjson cleanup "$CLEANUP_TIMEOUT_S" --argjson restarts "$RESTARTS" --argjson ttfs_reps "$TTFS_REPS" \
-  --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
+  --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" --argjson oracle "$ORACLE" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
   '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
-    window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
+    window_s:$window, mem_sample_ms:$sample_ms, oracle:$oracle, date: (now|todate)}' > "$OUT/run.json"
 
 api() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -H "$AUTH" "$URL$1"; }
 wait_ready() {
@@ -395,6 +415,35 @@ phase_load() {
   if (( sampler_ok )); then state sampler completed; else state sampler failed "sampler exit or coverage failed"; FAILED=1; fi
 }
 
+phase_ramp() {
+  local rate=$RAMP_START reason rc
+  jq -n --argjson start "$RAMP_START" --argjson step "$RAMP_STEP_RATE" --argjson step_s "$RAMP_STEP_S" --argjson cap "$RAMP_CAP" --argjson bound_ms "$RAMP_BOUND_MS" \
+    --argjson warmup_s "$WARMUP_S" '$ARGS.named' > "$D/ramp-params.json"
+  drain || return 1
+  k6run --console-output "$D/selections-ramp-warmup.log" -e RATE="$RAMP_START" -e DURATION="${WARMUP_S}s" -e SEED="$WARMUP_SEED" -e OUT="$D/k6-ramp-warmup.json" || return 1
+  while (( rate <= RAMP_CAP )); do
+    # Not k6run: a step past the knee has slow or failed screens, which is the answer, not a broken window.
+    # The per-iteration selection log feeds the picks comparison, which the ramp does not make.
+    client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output /dev/null \
+      -e SLOTS="$SLOTS" -e SHAPE_VUS="$SHAPE_VUS" -e URL="$URL" -e IDS="$IDS" -e RATE="$rate" -e DURATION="${RAMP_STEP_S}s" -e SEED="$SEED" \
+      -e OUT="$D/k6-ramp-$rate.json" bench/screens.js || return 1
+    [ -s "$D/k6-ramp-$rate.json" ] || { FAIL_REASON="no k6 summary for $rate screens/s"; return 1; }
+    rc=0; reason=$(python3 bench/ramp.py check "$D/k6-ramp-$rate.json" "$RAMP_BOUND_MS") || rc=$?
+    case "$rc" in
+      0) echo "  ramp: $rate screens/s passed";;
+      1) echo "  ramp: stopped at $rate screens/s: $reason"; break;;
+      *) FAIL_REASON="ramp.py could not read the $rate screens/s step"; return 1;;
+    esac
+    rate=$((rate + RAMP_STEP_RATE))
+  done
+  rc=0; python3 bench/ramp.py finish "$D" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) FAIL_REASON="the ramp has no passing step"; return 1;;
+    *) FAIL_REASON="ramp.py could not summarise the ramp"; return 1;;
+  esac
+}
+
 phase_ttfs() {
   drain || return 1
   client taskset -c "$CLIENT_CPUS" python3 bench/ttfs.py "$URL" "$IDS" "$D/ttfs.json" "$TTFS_REPS" || return 1
@@ -411,6 +460,7 @@ run_server() {
   echo '{}' > "$D/phases.json"
   state startup pending; state startup-drain pending; state cleanup pending; state isolation-setup pending
   for selected in counts shape coldstart ttfs; do ! want "$selected" || state "$selected" pending; done
+  ! explicit ramp || state ramp pending
   for selected in unloaded loaded stress; do
     if want "$selected"; then
       state "$selected" pending; state "warmup-$selected" pending; state "drain-$selected" pending
@@ -454,6 +504,7 @@ PY_ISOLATION
   if [ "$1" = jellyfin ]; then
     local expected_version; expected_version=$(jq -r '.validation.system_info.Version' "$TESTDATA/jellyfin/preparation.json")
     [ "$(jq -r .Version "$D/system-info.json")" = "$expected_version" ] || die "expected Jellyfin $expected_version"
+    python3 bench/oracle.py matches "$expected_version" || die "the Jellyfin image is not the oracle release"
   fi
   disable_plugins "$cfg"
   disable_schedules || die "$NAME: could not disable automatic tasks"
@@ -471,6 +522,7 @@ PY_ISOLATION
   ! want coldstart || isolated_phase coldstart phase_coldstart || true
   { ! want unloaded && ! want loaded && ! want stress; } || phase_load
   ! want ttfs || isolated_phase ttfs phase_ttfs || true
+  ! explicit ramp || isolated_phase ramp phase_ramp || true
   exit "$FAILED"
 }
 

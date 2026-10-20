@@ -46,6 +46,7 @@ jobs:
           persist-credentials: false
       # Reporter correctness only: no containers, media fixture or timing gate.
       - run: python3 -m unittest discover -s bench -p test_report.py
+      - run: python3 -m unittest discover -s bench -p test_ramp.py
 
   # fmt and clippy. The workspace tests run beside it in lint-tests; the aggregate `lint`
   # job below is the status check main's branch protection requires.
@@ -197,7 +198,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-yaml
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
       - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
       - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats verify/tests/verify.bats
       - run: bats scripts/tests adoption/tests verify/tests
