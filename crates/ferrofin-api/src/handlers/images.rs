@@ -1223,6 +1223,38 @@ async fn delete_user_image_legacy(
     delete_user_image(state, auth, Query(query)).await
 }
 
+/// `POST /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed path-scoped
+/// form of `POST /UserImage` (`PostUserImageByIndexLegacy`).
+///
+/// The image type and index are ignored, as upstream does, but the index must
+/// still be an integer: upstream binds it as an `int`, so anything else fails
+/// model binding with a `400`.
+async fn post_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Query(mut query): Query<ImageQuery>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    query.user_id = Some(user_id);
+    post_user_image(state, auth, Query(query), headers, body).await
+}
+
+/// `DELETE /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed
+/// path-scoped form of `DELETE /UserImage` (`DeleteUserImageByIndexLegacy`),
+/// ignoring the image type and the (integer) index as
+/// [`post_user_image_by_index_legacy`] does.
+async fn delete_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Query(mut query): Query<ImageQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    query.user_id = Some(user_id);
+    delete_user_image(state, auth, Query(query)).await
+}
+
 /// Reads the raw base64 upload body and its image MIME type, then saves it.
 ///
 /// Shared tail of `SetItemImage`/`SetItemImageByIndex`: validates the
@@ -1536,7 +1568,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/Users/{userId}/Images/{imageType}/{imageIndex}",
-            get(get_user_image_by_index_legacy).head(get_user_image_by_index_legacy),
+            get(get_user_image_by_index_legacy)
+                .head(get_user_image_by_index_legacy)
+                .post(post_user_image_by_index_legacy)
+                .delete(delete_user_image_by_index_legacy),
         )
 }
 

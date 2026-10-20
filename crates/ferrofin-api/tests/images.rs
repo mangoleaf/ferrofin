@@ -1502,6 +1502,8 @@ async fn post_user_image_bad_content_type_is_400() {
 #[case::delete_user_image("DELETE", format!("/UserImage?userId={MISSING_ID}"))]
 #[case::post_legacy("POST", format!("/Users/{MISSING_ID}/Images/Primary"))]
 #[case::delete_legacy("DELETE", format!("/Users/{MISSING_ID}/Images/Primary"))]
+#[case::post_indexed_legacy("POST", format!("/Users/{MISSING_ID}/Images/Primary/0"))]
+#[case::delete_indexed_legacy("DELETE", format!("/Users/{MISSING_ID}/Images/Primary/0"))]
 #[tokio::test]
 async fn user_image_writes_for_an_unknown_user_are_404(#[case] method: &str, #[case] uri: String) {
     // Elevated, so the administrator gate of `GetUserId` lets the other id through.
@@ -1745,6 +1747,60 @@ async fn legacy_user_image_upload_and_delete_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// `PostUserImageByIndexLegacy`/`DeleteUserImageByIndexLegacy`: the indexed form
+/// forwards to `PostUserImage`/`DeleteUserImage` and ignores the image type and
+/// index (gl-686).
+#[tokio::test]
+async fn indexed_legacy_user_image_upload_and_delete_forward() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Users/{USER_ID}/Images/Backdrop/7"),
+        Some(("image/png", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.users.saved.lock().expect("lock").as_slice(),
+        [(USER_ID.to_string(), "image/png".to_owned())]
+    );
+
+    let (status, _) = send(
+        &s,
+        "DELETE",
+        &format!("/Users/{USER_ID}/Images/Primary/0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// Upstream binds the indexed form's `{index}` as an `int`: any `int` is
+/// accepted (and ignored), and an index that is not one fails model binding,
+/// which `[ApiController]` answers `400`.
+#[rstest::rstest]
+#[case::post_negative("POST", "-1", StatusCode::NO_CONTENT)]
+#[case::delete_negative("DELETE", "-1", StatusCode::NO_CONTENT)]
+#[case::post_not_a_number("POST", "abc", StatusCode::BAD_REQUEST)]
+#[case::delete_not_a_number("DELETE", "abc", StatusCode::BAD_REQUEST)]
+#[case::post_past_int_max("POST", "2147483648", StatusCode::BAD_REQUEST)]
+#[case::delete_past_int_max("DELETE", "2147483648", StatusCode::BAD_REQUEST)]
+#[tokio::test]
+async fn indexed_legacy_user_image_writes_bind_the_index_as_an_int(
+    #[case] method: &str,
+    #[case] index: &str,
+    #[case] expected: StatusCode,
+) {
+    let s = stubs(String::new(), String::new());
+    let uri = format!("/Users/{USER_ID}/Images/Primary/{index}");
+    let (status, _) = send(&s, method, &uri, Some(("image/png", "aGk="))).await;
+    assert_eq!(status, expected);
+    let saved = s.users.saved.lock().expect("lock").len();
+    let uploaded = method == "POST" && expected == StatusCode::NO_CONTENT;
+    assert_eq!(saved, usize::from(uploaded));
 }
 
 #[tokio::test]
