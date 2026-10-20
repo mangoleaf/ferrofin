@@ -414,6 +414,10 @@ impl EncoderCapabilities for FfmpegCapabilities {
     fn supports_encoder(&self, encoder: &str) -> bool {
         contains_ignore_case(&self.encoders, encoder)
     }
+
+    fn ffmpeg_version(&self) -> Option<FfmpegVersion> {
+        self.ffmpeg_version
+    }
 }
 
 /// `StringComparer.OrdinalIgnoreCase` membership, which is how every C#

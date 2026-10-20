@@ -38,6 +38,15 @@ pub trait EncoderCapabilities: Send + Sync {
     /// Returns whether `encoder` (an ffmpeg encoder name, e.g. `"aac_at"`) is
     /// available. Port of `IMediaEncoder.SupportsEncoder`.
     fn supports_encoder(&self, encoder: &str) -> bool;
+
+    /// The probed ffmpeg version, which gates version-dependent arguments.
+    /// Port of `IMediaEncoder.EncoderVersion`.
+    ///
+    /// `None` (the default) when unprobed. That passes no `>=` gate, as C#'s
+    /// null `Version` compares below every minimum.
+    fn ffmpeg_version(&self) -> Option<crate::encoder::FfmpegVersion> {
+        None
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.

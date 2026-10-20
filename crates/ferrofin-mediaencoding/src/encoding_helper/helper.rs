@@ -510,6 +510,20 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             encoding_options,
         ));
 
+        // Jellyfin's rate-control and film-grain settings for software AV1,
+        // which libsvtav1 takes from ffmpeg 5.1 on (`GetVideoQualityParam`,
+        // :2409-2413).
+        if video_encoder.eq_ignore_ascii_case("libsvtav1")
+            && self
+                .capabilities
+                .ffmpeg_version()
+                .is_some_and(|version| version >= super::hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS)
+        {
+            param.push_str(
+                " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0",
+            );
+        }
+
         param
     }
 
@@ -928,15 +942,6 @@ fn codec_specific_quality_args(
             param.push_str(":subme=3:merange=25:rc-lookahead=10:me=star:ctu=32:max-tu-size=32:min-cu-size=16:rskip=2:rskip-edge-threshold=2:no-sao=1:no-strong-intra-smoothing=1");
         }
     }
-
-    // TODO(PLAN_HWACCEL work item 7): ` -svtav1-params:0 rc=1:tune=0:
-    // film-grain=0:enable-overlays=1:enable-tf=0` is a *software* libsvtav1
-    // argument gated on ffmpeg >= 5.1. Both halves it needs already exist —
-    // `hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS` and
-    // `FfmpegCapabilities::ffmpeg_at_least` — but `EncodingHelper` still holds
-    // only the one-method `EncoderCapabilities` seam and so cannot read a
-    // version. Threading the full capabilities in is what unblocks it; it has
-    // no vendor phase because it is not hardware work.
 
     param
 }
@@ -2309,6 +2314,53 @@ mod tests {
             helper(vec![])
                 .video_bitrate_param(&state, "hevc_qsv")
                 .contains(" -b:v 800"),
+        );
+    }
+
+    /// A helper over the real capability probe, reporting `version` (`None`:
+    /// unprobed) — what the composition root builds.
+    fn probed_helper(
+        version: Option<(i32, i32)>,
+    ) -> EncodingHelper<crate::encoding_helper::hw::FfmpegCapabilities> {
+        let mut caps = crate::encoding_helper::hw::FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            caps = caps.ffmpeg_version(crate::encoder::FfmpegVersion::new(major, minor));
+        }
+        EncodingHelper::with_processor_count(caps.build(), 8)
+    }
+
+    /// v12.2 `GetVideoQualityParam` (:2409-2413): software AV1 through
+    /// `libsvtav1` gets Jellyfin's rate-control and film-grain parameters on
+    /// ffmpeg 5.1 or newer (`_minFFmpegSvtAv1Params`). An unknown version
+    /// compares below it, as C#'s null `EncoderVersion` does.
+    #[rstest]
+    #[case::ffmpeg_7_1("libsvtav1", Some((7, 1)), true)]
+    #[case::ffmpeg_5_1("libsvtav1", Some((5, 1)), true)]
+    #[case::ffmpeg_5_0("libsvtav1", Some((5, 0)), false)]
+    #[case::unknown_version("libsvtav1", None, false)]
+    #[case::other_encoder("libx264", Some((7, 1)), false)]
+    fn video_quality_param_tunes_libsvtav1_on_ffmpeg_5_1(
+        #[case] encoder: &str,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: bool,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("av1".to_owned());
+        let opts = default_encoding_options(0);
+
+        let param = probed_helper(version).video_quality_param(
+            &state,
+            encoder,
+            &opts,
+            EncoderPreset::veryfast,
+        );
+
+        assert_eq!(
+            param.contains(
+                " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0"
+            ),
+            expected,
+            "{param}"
         );
     }
 
