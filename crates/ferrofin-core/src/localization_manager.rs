@@ -31,7 +31,7 @@ fn is_unrated(rating: &str) -> bool {
 const ISO6392: &str = include_str!("data/iso6392.txt");
 
 /// Jellyfin's bundled country dataset, vendored verbatim from
-/// `Emby.Server.Implementations/Localization/countries.json` (v10.11.8, 139 ISO-3166 entries).
+/// `Emby.Server.Implementations/Localization/countries.json` (v12.2, 140 ISO-3166 entries).
 const COUNTRIES_JSON: &str = include_str!("data/countries.json");
 
 #[path = "data/parental_ratings.rs"]
@@ -115,7 +115,7 @@ struct CountryRow {
 
 /// The vendored country table, parsed once from `countries.json` and kept in file order.
 static COUNTRIES: LazyLock<Vec<CountryInfo>> = LazyLock::new(|| {
-    // Port of C# GetCountries: deserialize the bundled countries.json (139 ISO-3166 regions).
+    // Port of C# GetCountries: deserialize the bundled countries.json (140 ISO-3166 regions).
     serde_json::from_str::<Vec<CountryRow>>(COUNTRIES_JSON)
         .unwrap_or_default()
         .into_iter()
@@ -1264,10 +1264,17 @@ mod tests {
     #[test]
     fn vendored_localization_data_matches_jellyfin() {
         let m = LocalizationManager::default();
-        // Countries: the full bundled ISO-3166 set (139), incl. the region codes the old 10-row
-        // table lacked (029 = Caribbean, AT = Austria).
+        // Countries: the full bundled ISO-3166 set (140, upstream `GetCountries_All_Success`),
+        // incl. the region codes the old 10-row table lacked (029 = Caribbean, AT = Austria)
+        // and Tanzania, added in Jellyfin 12.
         let countries = m.get_countries();
-        assert_eq!(countries.len(), 139);
+        assert_eq!(countries.len(), 140);
+        assert!(countries.contains(&CountryInfo {
+            name: "TZ".to_owned(),
+            display_name: "Tanzania".to_owned(),
+            two_letter_iso_region_name: "TZ".to_owned(),
+            three_letter_iso_region_name: "TZA".to_owned(),
+        }));
         assert!(countries.iter().any(|c| c.name == "029"));
         assert!(
             countries
@@ -1314,11 +1321,11 @@ mod tests {
     fn countries_preserve_vendored_file_order() {
         let m = shipped(DEFAULT_METADATA_COUNTRY_CODE);
         let countries = m.get_countries();
-        assert_eq!(countries.len(), 139);
+        assert_eq!(countries.len(), 140);
 
         let head: Vec<&str> = countries.iter().take(6).map(|c| c.name.as_str()).collect();
         assert_eq!(head, ["AF", "AL", "DZ", "AR", "AM", "AU"]);
-        let tail: Vec<&str> = countries[136..].iter().map(|c| c.name.as_str()).collect();
+        let tail: Vec<&str> = countries[137..].iter().map(|c| c.name.as_str()).collect();
         assert_eq!(tail, ["VN", "YE", "ZW"]);
         assert_eq!(
             countries[0],
