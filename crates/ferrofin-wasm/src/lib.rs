@@ -247,6 +247,9 @@ pub struct LoadedPlugin {
     pub scan_targets: Vec<String>,
     /// The plugin's named-provider identity, when it is one.
     pub provider_info: Option<bindings::types::ProviderDescriptor>,
+    /// The `.wasm` file the plugin was loaded from, under whatever name it was
+    /// dropped in as; uninstalling the plugin deletes it.
+    pub artifact: std::path::PathBuf,
     /// Where the plugin's KV state persists — the analysis driver keeps its
     /// offer-once watermark there under a host-reserved key.
     state_path: std::path::PathBuf,
@@ -537,7 +540,8 @@ impl WasmPluginHost {
             .iter()
             .map(|p| {
                 let mut registered = RegisteredPlugin::new(p.descriptor.clone(), None)
-                    .with_default_config(p.default_config.clone());
+                    .with_default_config(p.default_config.clone())
+                    .with_artifact(p.artifact.clone());
                 for page in config_pages_for(&p.descriptor, &p.config_pages) {
                     registered = registered.with_config_page(page);
                 }
@@ -809,6 +813,7 @@ fn load_one(
         web_transforms,
         scan_targets,
         provider_info,
+        artifact: path.to_path_buf(),
         state_path,
         egress,
         private_http_allowed,
