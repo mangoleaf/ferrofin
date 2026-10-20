@@ -30,14 +30,17 @@ copies, as shown below.
 | 12.2.0 | 10.11.8 → 12.2.0 | 107 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.2.0 | 108 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 | 109 | `12.2.0` | PASS (synthetic) |
+| 12.2.0 | Fresh 12.2 install (not upgraded) | 105 | `12.2.0` | pending — Adoption workflow |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
 Both 12.1 paths are accepted because the older rating-level migration ID is optional;
-both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward.
-Unknown or incomplete histories are refused; the listed versions do not imply support
-for other 10.11.x or 12.x releases. Fresh-install databases and other upgrade routes were
-not separately exercised by the live run.
+both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward. A fresh
+12.2 install carries the smallest set (105 ids, without the retired 10.11-era routines) and
+the fresh-install schema (no `IX_CustomItemDisplayPreferences_UserId`), yet still adopts as
+`12.2.0`; `0041` gives it that index. Unknown or incomplete histories are refused; the listed
+versions do not imply support for other 10.11.x or 12.x releases. Other upgrade routes were not
+separately exercised by the live run.
 
 The tested server image for 10.11–12.1 was `ferrofin:adopt121`, supplied as built from
 server commit `1732f97c`, with local image ID
@@ -113,6 +116,19 @@ to the new item id. The fixtures hold rows in only some of the listed tables (Ch
 TrickplayInfos, KeyframeData, MediaSegments and the display-preference tables are empty
 until the fixtures populate them).
 
+### 2026-10-20 fresh-install 12.2 row (gl-632)
+
+A fresh-install Jellyfin 12.2 database (a first run, not upgraded from 10.11) was added as the
+eleventh live `run.sh` row (`jellyfin-12.2-fresh`), seeded from scratch through the 12.2 API and
+compared against its own Jellyfin 12.2 oracle (`smoke-jellyfin-12.2-fresh.txt`), since a clean
+install is a distinct library from the seeded upgrade routes. It carries the fresh-install EF id
+set (105) and schema and adopts as `12.2.0`. The offline gates all pass — `bats adoption/tests`,
+`python3 -m unittest discover -s adoption/tests` (170 tests) and ShellCheck — but the live
+`run.sh`/`build-fixtures.sh` could not run on the author's host (its system `containerd` was
+down). The live result above is therefore recorded as **pending**: the `Adoption` workflow
+exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
+it is green. Update the table row and this note once that run lands.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -156,7 +172,9 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | that item's id in its metadata folder (`/<2>/<id>/`) in `Chapters.ImagePath` | the same repair moves the item's metadata folder, chapter images included, to the new id, as Jellyfin 12.2 does; any other path change still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
 | `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
-| a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |
+| a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
+| a `Devices` row's `Id`, `AccessToken`, `IsActive` and `DateCreated` (as an instant, since 0007 rewrites it) are compared, except on the `DeviceId`s the harness logs in from (`synthetic-login-*`, `account-login-*`) | authenticating again from a device replaces its row with a new id, token, activation and creation date, as Jellyfin does; the harness does this only from its own `DeviceId`s, so on every other device a reset token or a deactivated device fails. `run.sh` logs in from none and compares them all |
+| rows that share a key are a multiset, not one row | `(UserId, DeviceId)` is not unique, so losing or changing one of two devices for the same user and device must still fail |
 | rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
@@ -251,7 +269,9 @@ $FIXTURES/
   jellyfin-12.2-from-10/       built: jellyfin/jellyfin:12.2 on 10.11.8
   jellyfin-12.2-from-12/       built: jellyfin/jellyfin:12.2 on 12.0
   jellyfin-12.2-from-121/      built: jellyfin/jellyfin:12.2 on 12.1-from-12
+  jellyfin-12.2-fresh/         built: jellyfin/jellyfin:12.2 seeded from scratch (a first run)
   oracle/smoke-jellyfin-12.{1,2}.txt  built: each release's own smoke answers
+  oracle/smoke-jellyfin-12.2-fresh.txt  built: Jellyfin 12.2's answers on the fresh-install library
   oracle/user.txt              built: the account those answers were probed as
   jellyfin-12.2-schema.sql     built: the 12.2 schema the other 12.2 routes are diffed against
   work/                        scratch: synthetic.py's copies, work/run/ for run.sh's; failures stay here
@@ -427,9 +447,10 @@ the scan, and the builder runs the keyframe-extraction task, saves display
 preferences and a device name, and writes two media segments under the Intro
 Skipper plugin's provider id (no API creates one). So every table the
 [table digests](#2026-10-19-table-digests-check-7) compare holds rows on every
-fixture, and the builder fails when one of them is empty. Measured on 2026-10-20 on
-an idle host, this made a full `build-fixtures.sh` take 420 s instead of 396 s
-(+6 %), and the fixture directory 29 MB instead of 18 MB.
+fixture, and the builder fails when one of them is empty. The fresh-install fixture skips
+`seed_database`, so it is allowed no media segments. Measured on 2026-10-20 on an idle host,
+before the fresh-install row existed, this made a full `build-fixtures.sh` take 420 s instead
+of 396 s (+6 %), and the fixture directory 29 MB instead of 18 MB.
 
 Seven users provide an administrator, an adult with access to
 every library, a child with library/parental restrictions, an administratively

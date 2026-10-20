@@ -3499,6 +3499,9 @@ pub struct LibraryScanner {
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
     dummy_chapter_duration: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
+    /// Reads the server's `DisplaySpecialsWithinSeasons`
+    /// ([`with_display_specials_within_seasons`](Self::with_display_specials_within_seasons)).
+    display_specials_within_seasons: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// The saved NFO options (`ReleaseDateFormat`, `UserId`), read per sidecar.
     nfo_configuration:
         Option<Arc<dyn Fn() -> ferrofin_providers::xbmc::config::NfoConfiguration + Send + Sync>>,
@@ -3824,6 +3827,7 @@ impl LibraryScanner {
             subtitle_downloader: std::sync::OnceLock::new(),
             chapter_image_extractor: std::sync::OnceLock::new(),
             dummy_chapter_duration: None,
+            display_specials_within_seasons: None,
             nfo_configuration: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
         }
@@ -3879,6 +3883,21 @@ impl LibraryScanner {
         read: impl Fn() -> i32 + Send + Sync + 'static,
     ) -> Self {
         self.dummy_chapter_duration = Some(Arc::new(read));
+        self
+    }
+
+    /// Attaches the reader of the server's `DisplaySpecialsWithinSeasons`,
+    /// which decides a season's episodes when its premiere date is derived
+    /// from them (`Season.GetEpisodes`: with it on, a special airing within
+    /// a numbered season counts as one of its episodes). Read live, so a
+    /// changed setting applies from the next refresh; without a reader the
+    /// server default (`true`) applies.
+    #[must_use]
+    pub fn with_display_specials_within_seasons(
+        mut self,
+        read: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.display_specials_within_seasons = Some(Arc::new(read));
         self
     }
 
@@ -6676,7 +6695,26 @@ impl LibraryScanner {
         } else {
             None
         };
-        let metadata_stored = video_base.as_ref().or(stored_row);
+        // `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`: on a
+        // full refresh (`isFullRefresh`) of an unlocked season, `BeforeSave`
+        // takes its premiere date and year from its episodes before the
+        // providers run, so the merge treats the derived values as stored —
+        // a provider's answer replaces them where the pass replaces, and
+        // "Search for missing metadata" keeps them. The `updateType > None`
+        // half of the gate is judged after the artwork pass, below.
+        let season_base = match stored_row {
+            Some(row)
+                if !locked
+                    && is_season(row)
+                    && crate::refresh_plan::full_refresh(&plan, &request) =>
+            {
+                let mut base = row.clone();
+                self.update_season_premiere_date(&mut base).await?;
+                Some(base)
+            }
+            _ => None,
+        };
+        let metadata_stored = video_base.as_ref().or(season_base.as_ref()).or(stored_row);
         // The providers fill a row that starts WITHOUT the resolver's
         // path guesses (upstream's `temp` starts empty), so every value
         // they leave on it is one they supplied. The guesses ride along
@@ -6963,6 +7001,14 @@ impl LibraryScanner {
             absolute_naming,
             remote_answered: has_remote_metadata,
         };
+        // The season date fields this pass's readers and providers answered
+        // with (the row starts without the resolver's guesses): a value they
+        // supplied replaces a date derived from the episodes, as upstream's
+        // merge of `temp` does (the image-update half below).
+        let supplied_dates = (
+            entity.premiere_date.is_some(),
+            entity.production_year.is_some(),
+        );
         entity = match &local_row {
             // The local change first, by the pass's mode; then the
             // backfill's answers fill what is still empty.
@@ -7120,6 +7166,41 @@ impl LibraryScanner {
         let images_changed = artwork
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
+        // The other half of `UpdateMetadataFromChildren`'s gate for a season
+        // (`isFullRefresh || updateType > None`, `MetadataService.cs:457`):
+        // what `RefreshMetadata` adds to `updateType` before `BeforeSave` is
+        // the image validation (`:112-143`). Upstream derives the date onto
+        // the item before the providers, whose answer then replaces it field
+        // by field (`MergeBaseItemData`): so the derived date fills only the
+        // fields this pass's providers left unanswered (`supplied_dates`).
+        //
+        // TODO(parity, open work item — NOT an accepted divergence): upstream
+        // counts only the local image validation (`RemoveImages`,
+        // `ValidateImages`); `images_changed` also counts the remote image
+        // providers' downloads. The two differ only on an image full refresh
+        // without a full metadata refresh (`ImageRefreshMode=FullRefresh` with
+        // `MetadataRefreshMode=Default`, which no jellyfin-web refresh choice
+        // sends): a season whose new artwork came only from a remote image
+        // provider takes its episodes' date here, where upstream leaves it.
+        // Un-defer path: have `collect_artwork` report whether its local
+        // validation (before `run_ordered_artwork`) changed the stored set,
+        // and gate on that.
+        if images_changed
+            && season_base.is_none()
+            && !locked
+            && let Some(stored) = stored_row.filter(|row| is_season(row))
+        {
+            let mut derived = stored.clone();
+            if self.update_season_premiere_date(&mut derived).await? {
+                let (date_supplied, year_supplied) = supplied_dates;
+                if !date_supplied {
+                    entity.premiere_date = derived.premiere_date;
+                }
+                if !year_supplied {
+                    entity.production_year = derived.production_year;
+                }
+            }
+        }
         let ancestors_changed = ancestors_changed(links, item);
         let row_changed = stored_row.is_none_or(|row| {
             crate::item_persistence_service::scan_save_changes_row(
@@ -9773,6 +9854,39 @@ impl LibraryScanner {
         Ok(())
     }
 
+    /// `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`
+    /// (`SeasonMetadataService.cs:46`): `UpdateMetadataFromChildren` sets the
+    /// season's premiere date and year from its episodes
+    /// ([`update_premiere_date`]). Its children are
+    /// `GetChildrenForMetadataUpdates => item.GetEpisodes()` (`:89-90`): the
+    /// season's episodes as stored, missing ones included, and with "Display
+    /// specials within seasons" on, the specials that air within it
+    /// ([`season_episode_rows`](crate::library_manager::season_episode_rows)).
+    /// The walk refreshes a season before its episodes, as upstream's
+    /// `Series.RefreshAllMetadataInternal` does, so they are the values the
+    /// episodes held before this pass. Returns whether `row` changed.
+    async fn update_season_premiere_date(
+        &self,
+        row: &mut BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
+        let (Some(items), Some(id)) = (&self.item_repository, parse_id(&row.id)) else {
+            return Ok(false);
+        };
+        let include_specials = self
+            .display_specials_within_seasons
+            .as_ref()
+            .is_none_or(|read| read());
+        let episodes = crate::library_manager::season_episode_rows(
+            items.as_ref(),
+            id,
+            row.clone(),
+            &InternalItemsQuery::default(),
+            include_specials,
+        )
+        .await?;
+        Ok(update_premiere_date(row, &episodes))
+    }
+
     /// `EpisodeMetadataService.BeforeSaveInternal` takes the finalized parent
     /// season's name, including locked edits and preserved case. A season's
     /// rename reaches the episodes this scan does not refresh through the
@@ -10293,27 +10407,6 @@ impl LibraryScanner {
     /// cached response (`:238-262`): a season and its episodes cost one
     /// TMDB season request between them. `None` when TMDB has no such
     /// season; a failed request is counted.
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence):
-    /// `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`
-    /// (`SeasonMetadataService.cs:46`) is not ported; Ferrofin derives it for
-    /// albums only ([`apply_album_child_metadata`]). Upstream's `BeforeSave`
-    /// (`MetadataService.cs:150`, before the providers, on a first, required
-    /// or full refresh) sets an unlocked season's `PremiereDate` and
-    /// `ProductionYear` from its earliest episode (`UpdatePremiereDate`,
-    /// `:543-575`). With the providers after it, that date stands wherever no
-    /// provider replaces it: "Search for missing metadata" (fill-only) keeps
-    /// the episode-derived date over TheMovieDb's, and a library running
-    /// TheTVDB alone (which supplies no season date) still gets a date and a
-    /// year; a Default refresh takes TheMovieDb's air date over it. The rule
-    /// (`UpdatePremiereDate`): the earliest episode premiere date sets the
-    /// premiere date and the year; when no episode has one, the year becomes
-    /// `Min(ProductionYear ?? 0)` over the episodes, applied only when above
-    /// zero — so one episode with no year leaves the season's year alone.
-    /// [`apply_album_child_metadata`] already implements exactly this rule
-    /// for albums. To port: the season arm of that child aggregation, applied
-    /// to the stored row before the merge, under the same refresh gate
-    /// (`isFullRefresh || updateType > None`, unlocked).
     async fn fetch_tmdb_season(
         &self,
         row: &BaseItemEntity,
@@ -20098,32 +20191,10 @@ fn apply_album_child_metadata(
             &frequency_ordered_distinct(tracks.iter().map(|t| t.album_artists.as_deref())),
         );
     }
-    // `MetadataService.UpdatePremiereDate`: the earliest child premiere
-    // date wins and re-derives the production year; only when NO child
-    // carries one does it fall back to the minimum child production
-    // year (and `Select(i => i.ProductionYear ?? 0).Min()` means one
-    // undated track suppresses that fallback entirely). This overwrites
-    // — C# does not merely fill a null. It sits below the `IsLocked`
-    // return of `UpdateMetadataFromChildren` (`MetadataService.cs:457-460`).
-    if !album.is_locked && !tracks.is_empty() {
-        if let Some(date) = tracks.iter().filter_map(|t| t.premiere_date).min() {
-            let year = i64::from(date.year());
-            if updated.premiere_date != Some(date) || updated.production_year != Some(year) {
-                updated.premiere_date = Some(date);
-                updated.production_year = Some(year);
-                changed = true;
-            }
-        } else {
-            let year = tracks
-                .iter()
-                .map(|t| t.production_year.unwrap_or(0))
-                .min()
-                .unwrap_or(0);
-            if year > 0 && updated.production_year != Some(year) {
-                updated.production_year = Some(year);
-                changed = true;
-            }
-        }
+    // Below the `IsLocked` return of `UpdateMetadataFromChildren`
+    // (`MetadataService.cs:457-460`).
+    if !album.is_locked {
+        changed |= update_premiere_date(&mut updated, tracks);
     }
     // The album row's name starts as the folder stem, which is usually
     // release noise ("RHCP - Californication (1999) FLAC"). The tracks'
@@ -20141,6 +20212,45 @@ fn apply_album_child_metadata(
         changed = true;
     }
     (updated, changed)
+}
+
+/// Whether `row` is a season.
+fn is_season(row: &BaseItemEntity) -> bool {
+    item_type_lookup::kind_from_type_name(&row.type_) == Some(BaseItemKind::Season)
+}
+
+/// Port of `MetadataService.UpdatePremiereDate` (`MetadataService.cs:543-575`),
+/// which a service with `EnableUpdatingPremiereDateFromChildren` (albums,
+/// seasons) runs over its children: the earliest child premiere date wins and
+/// re-derives the production year; only when NO child carries one does it
+/// fall back to the minimum child production year, applied only above zero
+/// (`Select(i => i.ProductionYear ?? 0).Min()`, so one child without a year
+/// suppresses that fallback entirely). This overwrites — C# does not merely
+/// fill a null — and does nothing without children. Returns whether `row`
+/// changed.
+fn update_premiere_date(row: &mut BaseItemEntity, children: &[BaseItemEntity]) -> bool {
+    if children.is_empty() {
+        return false;
+    }
+    if let Some(date) = children.iter().filter_map(|c| c.premiere_date).min() {
+        let year = i64::from(date.year());
+        if row.premiere_date == Some(date) && row.production_year == Some(year) {
+            return false;
+        }
+        row.premiere_date = Some(date);
+        row.production_year = Some(year);
+        return true;
+    }
+    let year = children
+        .iter()
+        .map(|c| c.production_year.unwrap_or(0))
+        .min()
+        .unwrap_or(0);
+    if year > 0 && row.production_year != Some(year) {
+        row.production_year = Some(year);
+        return true;
+    }
+    false
 }
 
 /// The distinct values of a `|`-joined column across a set of children, deduped
@@ -24412,6 +24522,67 @@ mod tests {
         let silent = [track("Artist 03", 0)];
         let (updated, _) = apply_album_child_metadata(&album, &silent, &[]);
         assert_eq!(updated.run_time_ticks, Some(0));
+    }
+
+    /// `MetadataService.UpdatePremiereDate` (`MetadataService.cs:543-575`),
+    /// as seasons and albums run it: the earliest child premiere date sets the
+    /// date and the year; without one, the lowest child year sets the year
+    /// only when every child has one; no children change nothing. Each case
+    /// is (children's `(premiere day, year)`, stored, expected, changed).
+    #[rstest::rstest]
+    #[case::earliest_date_wins(
+        &[(Some("2011-05-01"), None), (Some("2010-12-31"), Some(2012)), (None, Some(1990))],
+        (Some("2011-04-17"), Some(2011)),
+        (Some("2010-12-31"), Some(2010)),
+        true
+    )]
+    #[case::year_fallback(
+        &[(None, Some(2004)), (None, Some(2003))],
+        (Some("2011-04-17"), Some(2011)),
+        (Some("2011-04-17"), Some(2003)),
+        true
+    )]
+    #[case::one_child_without_a_year(
+        &[(None, Some(2004)), (None, None)],
+        (None, Some(2011)),
+        (None, Some(2011)),
+        false
+    )]
+    #[case::no_children(&[], (Some("2011-04-17"), Some(2011)), (Some("2011-04-17"), Some(2011)), false)]
+    #[case::already_derived(
+        &[(Some("2010-12-31"), None)],
+        (Some("2010-12-31"), Some(2010)),
+        (Some("2010-12-31"), Some(2010)),
+        false
+    )]
+    fn update_premiere_date_follows_the_earliest_child(
+        #[case] children: &[(Option<&str>, Option<i64>)],
+        #[case] stored: (Option<&str>, Option<i64>),
+        #[case] expected: (Option<&str>, Option<i64>),
+        #[case] changed: bool,
+    ) {
+        use super::update_premiere_date;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let day = |d: Option<&str>| {
+            d.map(|d| {
+                format!("{d}T00:00:00Z")
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .expect("day")
+            })
+        };
+        let row = |(premiere, year): (Option<&str>, Option<i64>)| BaseItemEntity {
+            premiere_date: day(premiere),
+            production_year: year,
+            ..Default::default()
+        };
+        let children: Vec<_> = children.iter().copied().map(row).collect();
+        let mut season = row(stored);
+        assert_eq!(update_premiere_date(&mut season, &children), changed);
+        assert_eq!(
+            (season.premiere_date, season.production_year),
+            (day(expected.0), expected.1)
+        );
     }
 
     /// `GroupBy(...).OrderByDescending(g => g.Count())`: the most-credited

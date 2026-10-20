@@ -435,14 +435,19 @@ def segment_provider_id(name):
     return uuid.UUID(bytes_le=hashlib.md5(name.lower().encode("utf-16-le")).digest()).hex
 
 
-def require_populated(db):
+# Tables only seed_database fills; a fixture that skips it (synthetic.FRESH_INSTALL) has none.
+SEEDED_ONLY = ("MediaSegments",)
+
+
+def require_populated(db, unseeded=()):
     """Fail the build unless every table the table digests compare holds a row: an empty
-    table is a check that compares nothing (a task that never ran, a media type lost)."""
+    table is a check that compares nothing (a task that never ran, a media type lost).
+    `unseeded` names the tables a fixture without seed_database may leave empty."""
     from table_digests import TABLES
     with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
         present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        empty = [table for table in TABLES if table not in present
-                 or conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None]
+        empty = [table for table in TABLES if table not in unseeded and (
+                 table not in present or conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None)]
     if empty:
         raise CheckError("synthetic fixture has no rows in " + ", ".join(empty))
 

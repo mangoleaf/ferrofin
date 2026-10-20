@@ -22,8 +22,8 @@ import subprocess
 import sys
 
 from metadata import CheckError
-from synthetic_fixture import (Api, USERS, drop_dangling_chain, require_populated, seed, seed_database,
-                               wait_for_live_members)
+from synthetic_fixture import (Api, SEEDED_ONLY, USERS, drop_dangling_chain, require_populated, seed,
+                               seed_database, wait_for_live_members)
 from synthetic_media import generate
 
 
@@ -38,10 +38,17 @@ VERSIONS = (
     ("jellyfin-12.2-from-10", "12.2", "jellyfin-10.11.8"),
     ("jellyfin-12.2-from-12", "12.2", "jellyfin-12.0"),
     ("jellyfin-12.2-from-121", "12.2", "jellyfin-12.1-from-12"),
+    ("jellyfin-12.2-fresh", "12.2", None),
 )
 # Releases whose own migration cannot start on the seeded dangling chain; their copy
 # drops it first, and every fixture built from them inherits that (drop_dangling_chain).
 NO_ORPHAN_CLEANUP = {"12.0"}
+# Fixtures that are a release's own first run (parent None, version 12.x), seeded only through
+# that release's API. A first-run install has none of the aged states seed_database injects, so
+# these carry no seeds: they are validated live by adoption/run.sh (its FIXTURE_TABLE), which
+# proves the fresh-install EF id set and schema adopt, not by the seed-driven preservation
+# matrix (run_matrix), which has nothing to compare and skips them.
+FRESH_INSTALL = {"jellyfin-12.2-fresh"}
 
 
 def carries_chain(name):
@@ -131,24 +138,28 @@ def build(root, only, port):
             baseline = snapshot(api, manifest)
             validate(baseline, manifest)
             save(config / "preservation.json", baseline)
-        if not parent:
-            # States no API produces, written with the server stopped. The 10.11.8
-            # baseline above predates them; every later fixture inherits them.
-            manifest["seeds"] = seed_database(config / "data/jellyfin.db", manifest)
-            save(config / "synthetic.json", manifest)
-        # What this release left of the seeds: its own boot and scan act on them first.
-        from preservation import seed_state, validate_oracle, validate_seed_state
-        state = seed_state(config / "data/jellyfin.db", manifest["seeds"])
-        validate_seed_state(state, manifest["seeds"], version)
-        if version == "12.2":
-            validate_oracle(config / "data/jellyfin.db", manifest)
-            # The chain's expectation (gone, history on the placeholder) is what real
-            # 12.2 must have done wherever it saw the chain.
-            if carries_chain(name) and (state["orphans"] or state["history"] != "placeholder"):
-                raise CheckError(f"Jellyfin 12.2 left the dangling chain as {state['orphans']}, "
-                                 f"history {state['history']}; the run's expectation is wrong")
-        save(config / "seeds.json", state)
-        require_populated(config / "data/jellyfin.db")
+        # A first-run install (FRESH_INSTALL) has none of the aged states seed_database injects;
+        # it carries no seeds and is validated live by adoption/run.sh, not the preservation
+        # matrix, so the whole seed step is skipped for it.
+        if name not in FRESH_INSTALL:
+            if not parent:
+                # States no API produces, written with the server stopped. The 10.11.8
+                # baseline above predates them; every later fixture inherits them.
+                manifest["seeds"] = seed_database(config / "data/jellyfin.db", manifest)
+                save(config / "synthetic.json", manifest)
+            # What this release left of the seeds: its own boot and scan act on them first.
+            from preservation import seed_state, validate_oracle, validate_seed_state
+            state = seed_state(config / "data/jellyfin.db", manifest["seeds"])
+            validate_seed_state(state, manifest["seeds"], version)
+            if version == "12.2":
+                validate_oracle(config / "data/jellyfin.db", manifest)
+                # The chain's expectation (gone, history on the placeholder) is what real
+                # 12.2 must have done wherever it saw the chain.
+                if carries_chain(name) and (state["orphans"] or state["history"] != "placeholder"):
+                    raise CheckError(f"Jellyfin 12.2 left the dangling chain as {state['orphans']}, "
+                                     f"history {state['history']}; the run's expectation is wrong")
+            save(config / "seeds.json", state)
+        require_populated(config / "data/jellyfin.db", SEEDED_ONLY if name in FRESH_INSTALL else ())
         save(config / "synthetic-ready.json", {"fixture": name, "version": version, "recipe": recipe()})
         print(name + " built and validated", flush=True)
 

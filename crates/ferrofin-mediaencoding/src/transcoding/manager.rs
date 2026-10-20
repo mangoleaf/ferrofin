@@ -322,6 +322,7 @@ impl RunningJob {
             ),
             controller: std::sync::Arc::new(tokio::sync::Mutex::new(ThrottleController {
                 keys: None,
+                timed: false,
                 next_tick: Instant::now() + super::throttler::THROTTLE_INTERVAL,
                 paused: false,
                 stopped: false,
@@ -344,10 +345,28 @@ impl RunningJob {
 /// Per-job control state, serialized with teardown.
 struct ThrottleController {
     keys: Option<super::throttler::PauseKeys>,
+    /// Whether this job was eligible and live when its timer was armed. Only
+    /// such a job may adopt keys the startup probe publishes later.
+    timed: bool,
     next_tick: Instant,
     paused: bool,
     stopped: bool,
     last_progress: Option<super::progress::FfmpegProgress>,
+}
+
+impl ThrottleController {
+    /// The job's pause keys, adopting ones the startup probe published after
+    /// its timer was armed. A job that never got a timer (ineligible) never
+    /// adopts keys.
+    fn keys_now(
+        &mut self,
+        slot: &super::throttler::PauseKeySlot,
+    ) -> Option<super::throttler::PauseKeys> {
+        if self.keys.is_none() && self.timed {
+            self.keys = slot.get();
+        }
+        self.keys
+    }
 }
 
 /// The response-body lifetime keeps the producing job alive and records reads.
@@ -466,7 +485,7 @@ pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileClean
     file_cleaner: C,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
-    pause_keys: Option<super::throttler::PauseKeys>,
+    pause_keys: super::throttler::PauseKeySlot,
 }
 
 /// An active-consumer mark on a transcode job, released on drop.
@@ -503,7 +522,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             reporter,
             file_cleaner,
             encoding_config: None,
-            pause_keys: None,
+            pause_keys: super::throttler::PauseKeySlot::default(),
         }
     }
 
@@ -517,11 +536,18 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self
     }
 
-    /// Sets the startup-probed ffmpeg keyboard controls.
+    /// Fixes the ffmpeg keyboard controls now (`None`: this ffmpeg has none).
     #[must_use]
-    pub fn with_pause_keys(mut self, keys: Option<super::throttler::PauseKeys>) -> Self {
-        self.pause_keys = keys;
+    pub fn with_pause_keys(self, keys: Option<super::throttler::PauseKeys>) -> Self {
+        self.pause_keys.set(keys);
         self
+    }
+
+    /// The slot the startup probe publishes the keyboard controls through, when
+    /// they are not known at construction. Jobs read it on every throttle tick.
+    #[must_use]
+    pub fn pause_key_slot(&self) -> super::throttler::PauseKeySlot {
+        self.pause_keys.clone()
     }
 
     /// Associates a dynamic segment with its exact ending position.
@@ -690,7 +716,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     }
                 }
             }
-            let Some(keys) = controller.keys else {
+            let Some(keys) = controller.keys_now(&self.pause_keys) else {
                 continue;
             };
             if Instant::now() < controller.next_tick {
@@ -961,7 +987,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             });
             if let Some(controller) = controller {
                 let mut controller = controller.lock().await;
-                controller.keys = self.pause_keys;
+                controller.keys = self.pause_keys.get();
+                controller.timed = true;
                 controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
             }
         }
@@ -2871,12 +2898,35 @@ pub(super) mod throttle_tests {
         Arc<ChildState>,
         TranscodingJobHandle,
     ) {
+        fixture_of(TranscodeManagerImpl::new(NoopSessionReporter).with_pause_keys(keys)).await
+    }
+    /// A started job on `manager`, whatever its pause-key state.
+    async fn fixture_of(
+        manager: TranscodeManagerImpl<NoopSessionReporter>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<TranscodeManagerImpl<NoopSessionReporter>>,
+        Arc<ChildState>,
+        TranscodingJobHandle,
+    ) {
+        fixture_job(manager, true).await
+    }
+    /// As [`fixture_of`], for a video (throttle-eligible) or audio-only job.
+    async fn fixture_job(
+        manager: TranscodeManagerImpl<NoopSessionReporter>,
+        is_input_video: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<TranscodeManagerImpl<NoopSessionReporter>>,
+        Arc<ChildState>,
+        TranscodingJobHandle,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("out.m3u8");
-        let manager =
-            Arc::new(TranscodeManagerImpl::new(NoopSessionReporter).with_pause_keys(keys));
+        let manager = Arc::new(manager);
         let child = Arc::new(ChildState::default());
-        let state = state(&path);
+        let mut state = state(&path);
+        state.is_input_video = is_input_video;
         let handle = manager
             .start_ffmpeg(
                 &ControlledTranscoder(Arc::clone(&child)),
@@ -2926,6 +2976,89 @@ pub(super) mod throttle_tests {
             throttle_delay_seconds: delay,
             ..EncodingOptions::default()
         }
+    }
+
+    /// Drives one due tick of a job that is eligible, fully downloaded and over
+    /// its throttle delay, so whether a pause key is written depends only on the
+    /// keys the manager knows by then.
+    async fn tick_over_the_delay(
+        manager: &TranscodeManagerImpl<NoopSessionReporter>,
+        child: &ChildState,
+        handle: &TranscodingJobHandle,
+    ) {
+        encoded(child, 200);
+        progress(manager, handle)
+            .lock()
+            .unwrap()
+            .download_position_ticks = Some(6 * TICKS_PER_SECOND);
+        due(manager, handle).await;
+        manager
+            .update_transcoding_jobs_with_options(Some(&options(60)))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn keys_probed_after_the_job_started_apply_on_a_later_tick() {
+        // The startup probe runs in the background, so a job can start first.
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+        let slot = manager.pause_key_slot();
+        let (_directory, manager, child, handle) = fixture_of(manager).await;
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(
+            child.events.lock().unwrap().is_empty(),
+            "no key is known yet, so nothing is written"
+        );
+        slot.set(Some(PauseKeys::Patched));
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert_eq!(*child.events.lock().unwrap(), vec![b"p".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_found_no_pause_key_leaves_the_job_unthrottled() {
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+        let slot = manager.pause_key_slot();
+        let (_directory, manager, child, handle) = fixture_of(manager).await;
+        slot.set(None);
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(child.events.lock().unwrap().is_empty());
+        slot.set(Some(PauseKeys::Patched));
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(
+            child.events.lock().unwrap().is_empty(),
+            "a published \"no keys\" does not turn into keys later"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_that_was_never_eligible_does_not_adopt_probed_keys() {
+        // An audio-only job gets no throttle timer, so published keys never reach it.
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+        let slot = manager.pause_key_slot();
+        let (_directory, manager, child, handle) = fixture_job(manager, false).await;
+        slot.set(Some(PauseKeys::Patched));
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(child.events.lock().unwrap().is_empty());
+        // The same keys fixed up front behave the same way.
+        let (_directory, manager, child, handle) = fixture_job(
+            TranscodeManagerImpl::new(NoopSessionReporter)
+                .with_pause_keys(Some(PauseKeys::Patched)),
+            false,
+        )
+        .await;
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(child.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_first_probe_result_stands() {
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter).with_pause_keys(None);
+        manager.pause_key_slot().set(Some(PauseKeys::Patched));
+        let (_directory, manager, child, handle) = fixture_of(manager).await;
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(
+            child.events.lock().unwrap().is_empty(),
+            "keys fixed by the composition root are not overwritten by a later probe"
+        );
     }
 
     #[tokio::test]
