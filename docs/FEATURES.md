@@ -67,6 +67,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   - **Accepted divergence (a fix, not a gap):** renaming a user moves their profile image
     to the new name's folder. Jellyfin leaves it, so a new user who takes the old name
     overwrites the renamed user's image on upload and deletes it on removal.
+  - **Accepted divergence (a fix, not a gap):** an item's images of one type (its
+    backdrops) list in the order they were added, and keep that order when the item is
+    saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
+    every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
+    its backdrops in a different order once.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
