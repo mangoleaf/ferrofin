@@ -65,8 +65,9 @@ async fn after_structure_change(state: &AppState, refresh_library: bool, scope: 
     }
 }
 
-/// Resolves a just-mutated virtual folder's `CollectionFolder` id by name, for
-/// scoping the follow-up scan.
+/// Resolves a just-renamed virtual folder's `CollectionFolder` id by name, for
+/// scoping the follow-up scan. Safe only because rename stores `new_name`
+/// verbatim; an add can store another name, so it uses the id its call returns.
 ///
 /// Best-effort. `get_virtual_folders` mints the row (and its path-derived id)
 /// for every directory it enumerates, so a just-renamed library resolves; the
@@ -190,11 +191,13 @@ async fn add_virtual_folder(
         }
     }
 
-    state
+    // Scope by the id the add returns, never by `name`: the stored name can
+    // differ (`Kids: Movies` → `Kids Movies`, a taken `Movies` → `Movies2`), and
+    // a lookup by the requested one would rescan the name-sake library.
+    let scope = state
         .virtual_folders
         .add_virtual_folder(&name, query.collection_type, &options)
         .await?;
-    let scope = library_id_by_name(&state, &name).await;
     after_structure_change(&state, query.refresh_library, scope).await;
     Ok(StatusCode::NO_CONTENT)
 }
