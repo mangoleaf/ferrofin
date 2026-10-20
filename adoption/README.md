@@ -153,6 +153,7 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 |---|---|
 | GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
+| that item's id in its metadata folder (`/<2>/<id>/`) in `Chapters.ImagePath` | the same repair moves the item's metadata folder, chapter images included, to the new id, as Jellyfin 12.2 does; any other path change still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
 | `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
 | a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |

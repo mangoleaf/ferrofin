@@ -148,6 +148,31 @@ class TableDigests(unittest.TestCase):
         self.assertEqual(self.failures(), [])
         self.assertIn("path:/media/a.mkv/x", self.before["tables"]["MediaStreamInfos"]["rows"])
 
+    def test_a_rekeyed_items_metadata_folder_moves_with_its_id(self):
+        old, new = "e24bb924be539d0746ec205b0b9536e6", "ad1cd20859f6c42cfdfd85714b08748d"
+        image = "/config/metadata/library/{}/{}/chapters/1_0.jpg"
+        self.sql(f"ALTER TABLE Chapters ADD COLUMN ImagePath TEXT; "
+                 f"INSERT INTO BaseItems VALUES ('{old}', '/media/a - 720p.mkv', '{GUID}'); "
+                 f"UPDATE Chapters SET ItemId = '{old}', ImagePath = '{image.format(old[:2], old)}'")
+        self.before = digests.snapshot(self.db)
+        self.sql(f"UPDATE BaseItems SET Id = '{new}'; "
+                 f"UPDATE Chapters SET ItemId = '{new}', ImagePath = '{image.format(new[:2], new)}'")
+        self.assertEqual(self.failures(), [])
+        # Any other change to the path still shows: another file, or a folder left at the old id.
+        for path in (image.format(new[:2], new).replace("1_0", "2_0"), image.format(old[:2], old)):
+            self.sql(f"UPDATE Chapters SET ImagePath = '{path}'")
+            self.assertEqual(self.failures(), ["Chapters row path:/media/a - 720p.mkv/x changed"], path)
+
+    def test_an_item_not_reidentified_keeps_its_folder_id_compared(self):
+        old, new = "e24bb924be539d0746ec205b0b9536e6", "ad1cd20859f6c42cfdfd85714b08748d"
+        image = "/config/metadata/library/{}/{}/chapters/1_0.jpg"
+        self.sql(f"ALTER TABLE Chapters ADD COLUMN ImagePath TEXT; "
+                 f"INSERT INTO BaseItems VALUES ('{old}', '/media/a.mkv', NULL); "
+                 f"UPDATE Chapters SET ItemId = '{old}', ImagePath = '{image.format(old[:2], old)}'")
+        self.before = digests.snapshot(self.db)
+        self.sql(f"UPDATE Chapters SET ImagePath = '{image.format(new[:2], new)}'")
+        self.assertEqual(self.failures(), [f"Chapters row {old}/x changed"])
+
     def test_an_item_without_an_owner_is_not_reidentified(self):
         for owner in ("NULL", "'00000000-0000-0000-0000-000000000000'", "'00000000-0000-0000-0000-000000000001'"):
             self.sql(f"DELETE FROM BaseItems; INSERT INTO BaseItems VALUES ('old', '/media/a.mkv', {owner})")
