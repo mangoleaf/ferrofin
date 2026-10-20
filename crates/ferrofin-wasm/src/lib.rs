@@ -81,7 +81,9 @@ pub struct WasmSettings {
     /// marginal RSS per plugin; a `memory.grow` ceiling, never a reservation).
     pub memory_limit_mb: u32,
     /// Per-plugin event queue depth (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`,
-    /// default 256 — inherits the approved bus-capacity setting).
+    /// default 256 — inherits the approved bus-capacity setting). Web
+    /// requests may hold at most half of it
+    /// ([`runtime::web_request_slots`]).
     pub event_queue_capacity: u32,
     /// Per-plugin total KV-state cap in MiB
     /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 — settings/cursors fit
@@ -291,6 +293,7 @@ impl LoadedPlugin {
         self.runtime
             .handle_request(request, String::from("{}"))
             .await
+            .map_err(|err| err.to_string())
     }
 
     /// The cached enabled flag if it is still fresh, else `None` (caller must
@@ -1766,11 +1769,15 @@ impl ferrofin_traits::plugins::PluginRequestHandler for WasmRequestDispatcher {
             is_admin: request.is_admin,
             is_authenticated: request.is_authenticated,
         };
-        let response = plugin
-            .runtime
-            .handle_request(wire, config)
-            .await
-            .map_err(ServiceError::backend)?;
+        let response =
+            plugin
+                .runtime
+                .handle_request(wire, config)
+                .await
+                .map_err(|err| match err {
+                    runtime::RequestError::Busy(why) => ServiceError::unavailable(why),
+                    runtime::RequestError::Failed(why) => ServiceError::backend(why),
+                })?;
         Ok(Some(ferrofin_traits::plugins::PluginWebResponse {
             status: response.status,
             headers: response.headers,
