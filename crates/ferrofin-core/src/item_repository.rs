@@ -2376,6 +2376,20 @@ pub(crate) fn image_type_to_disc(image_type: ImageType) -> i32 {
     image_type.json_value()
 }
 
+/// The image rows of the items bound to `placeholders`, each item's in the
+/// order [`ItemRepository::get_image_infos`] lists them and
+/// `/Images/{type}/{index}` addresses them (type, then `rowid`), which the
+/// `(ItemId, ImageType)` index yields without a sort. `VACUUM` may renumber
+/// this table's rowids (its key is a TEXT `Id`) but copies rows in rowid
+/// order, so their relative order survives.
+pub(crate) fn images_of_items_sql(placeholders: &str) -> String {
+    format!(
+        r#"SELECT * FROM "BaseItemImageInfos"
+           WHERE "ItemId" IN ({placeholders})
+           ORDER BY "ItemId", "ImageType", rowid"#
+    )
+}
+
 /// Projects a persisted [`BaseItemImageInfoEntity`] row into an
 /// [`ItemImageInfo`].
 ///
@@ -3867,6 +3881,29 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    /// A page's image read comes off the `(ItemId, ImageType)` index already
+    /// in `rowid` order; ordering by `Id` added a temp B-tree sort.
+    #[tokio::test]
+    async fn page_image_read_needs_no_sort() {
+        let db = test_db().await;
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            images_of_items_sql("?1,?2")
+        )))
+        .fetch_all(db.pool())
+        .await
+        .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            details.iter().any(|d| d.contains("_ItemId_ImageType")),
+            "{details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("TEMP B-TREE")),
+            "{details:?}"
+        );
+    }
 
     #[tokio::test]
     async fn plain_folder_children_keep_physical_order_then_every_link_kind() {

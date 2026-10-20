@@ -2772,14 +2772,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 changed.push(image);
             }
         }
-        // Every reader lists an item's images by type, then by `Id`
-        // ([`image_rows`]): new rows take fresh ids handed out ascending, so
-        // the images a save adds list in the order it was given them.
+        // Every reader lists an item's images by type, then by `rowid`
+        // ([`image_rows`]), so kept rows keep their place and the images a
+        // save adds list after them, in the order it was given them.
         // Upstream draws a random id per row on every save
-        // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`), which shuffles
-        // a list of backdrops.
-        let mut fresh: Vec<String> = changed.iter().map(|_| guid_to_db(Uuid::new_v4())).collect();
-        fresh.sort_unstable_by(|a, b| b.cmp(a));
+        // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`) and reads them
+        // back by `Id`, which shuffles a list of backdrops.
         for image in changed {
             // A changed file's metadata updates its own row; a new path/type
             // gets a new row. The other images remain untouched.
@@ -2789,7 +2787,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
                 })
                 .map_or_else(
-                    || fresh.pop().unwrap_or_else(|| guid_to_db(Uuid::new_v4())),
+                    || guid_to_db(Uuid::new_v4()),
                     |index| stored.swap_remove(index).id,
                 );
             sqlx::query(
@@ -2897,7 +2895,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             let images = format!(
                 r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
                    FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})
-                   ORDER BY "ItemId", "ImageType", "Id""#
+                   ORDER BY "ItemId", "ImageType", rowid"#
             );
             let mut query = sqlx::query_as::<_, ScanImageRow>(sqlx::AssertSqlSafe(images.as_str()));
             for id in chunk {
@@ -6398,8 +6396,10 @@ async fn provider_id_sets(
 }
 
 /// The image rows of `ids`, each item's in the order every reader lists
-/// them — by type, then by `Id` — as upstream's `Include(e => e.Images!.
-/// OrderBy(i => i.Id))` does (`BaseItemRepository.QueryBuilding.cs:272-275`).
+/// them: by type, then by `rowid` (insertion order). Upstream reads them by
+/// `Id` (`Include(e => e.Images!.OrderBy(i => i.Id))`,
+/// `BaseItemRepository.QueryBuilding.cs:272-275`), but its ids are random
+/// per save, so that order is a shuffle.
 async fn image_rows(
     conn: &mut sqlx::SqliteConnection,
     ids: &[Uuid],
@@ -6414,11 +6414,9 @@ async fn image_rows(
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" IN ({marks})
-               ORDER BY "ItemId", "ImageType", "Id""#
-        );
-        let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(sql));
+        let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
+            crate::item_repository::images_of_items_sql(&marks),
+        ));
         for id in chunk {
             query = query.bind(guid_to_db(*id));
         }
@@ -6725,17 +6723,15 @@ async fn write_owned_relations(
             .await
             .map_err(db_err)?;
         // Fresh ids (upstream's `MapImageToEntity` draws a new one per save),
-        // handed out in ascending order so the copy lists in the primary's
-        // order: every reader orders an item's images by `Id`.
-        let mut ids: Vec<String> = images.iter().map(|_| guid_to_db(Uuid::new_v4())).collect();
-        ids.sort_unstable();
-        for (image, id) in images.iter().zip(ids) {
+        // inserted in the primary's order: every reader orders an item's
+        // images by `rowid`.
+        for image in images {
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
                    ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
             )
-            .bind(id)
+            .bind(guid_to_db(Uuid::new_v4()))
             .bind(&row.id)
             .bind(image.image_type)
             .bind(&image.path)
@@ -9392,9 +9388,9 @@ mod tests {
         assert!(image_writes(&db).await.is_empty());
     }
 
-    /// The images a save adds list in the order it was given them: every
-    /// reader orders an item's images by type, then `Id`, and the new rows'
-    /// ids ascend in list order (a random id per row shuffled backdrops).
+    /// The images a save adds list in the order it was given them, after
+    /// the ones it keeps: every reader orders an item's images by type, then
+    /// `rowid`.
     #[tokio::test]
     async fn added_images_list_in_the_order_saved() {
         use ferrofin_model::entities::ImageType;
@@ -9409,22 +9405,31 @@ mod tests {
             height: 0,
             blur_hash: None,
         };
-        let paths = ["/d.jpg", "/a.jpg", "/c.jpg", "/b.jpg"];
-        let images: Vec<ItemImageInfo> = paths.iter().map(|p| backdrop(p)).collect();
-        for n in 0..16u128 {
-            let item = Uuid::from_u128(0x5100 + n);
-            seed_item(&db, item, BaseItemKind::Movie).await;
-            svc.save_item_images(item, &images).await.unwrap();
-            let listed: Vec<String> = sqlx::query_scalar(
+        let item = Uuid::from_u128(0x5100);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let listed = || async {
+            sqlx::query_scalar::<_, String>(
                 r#"SELECT "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1
-                   ORDER BY "ImageType", "Id""#,
+                   ORDER BY "ImageType", rowid"#,
             )
             .bind(guid_to_db(item))
             .fetch_all(db.pool())
             .await
-            .unwrap();
-            assert_eq!(listed, paths);
-        }
+            .unwrap()
+        };
+        let mut paths = vec!["/d.jpg", "/a.jpg", "/c.jpg", "/b.jpg"];
+        let mut images: Vec<ItemImageInfo> = paths.iter().map(|p| backdrop(p)).collect();
+        svc.save_item_images(item, &images).await.unwrap();
+        assert_eq!(listed().await, paths);
+        // A changed image updates its own row and keeps its index.
+        images[1].width = 99;
+        svc.save_item_images(item, &images).await.unwrap();
+        assert_eq!(listed().await, paths);
+        // An appended backdrop takes the next index; the others keep theirs.
+        images.push(backdrop("/e.jpg"));
+        svc.save_item_images(item, &images).await.unwrap();
+        paths.push("/e.jpg");
+        assert_eq!(listed().await, paths);
     }
 
     #[tokio::test]
