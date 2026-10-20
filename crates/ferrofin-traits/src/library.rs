@@ -2212,12 +2212,17 @@ pub trait VirtualFolderManager: Send + Sync {
     /// exists), each media path must exist on disk (else
     /// [`ServiceError::InvalidInput`]), the collection marker + `options.xml` are
     /// written, and one `.mblink` shortcut is created per media path.
+    ///
+    /// Returns the created library's `CollectionFolder` id (`None` when its
+    /// folder projects none). A caller acting on the new library must use it,
+    /// not `name`: sanitizing and de-duplicating can store it under another
+    /// name, possibly an existing library's.
     async fn add_virtual_folder(
         &self,
         name: &str,
         collection_type: Option<CollectionTypeOptions>,
         options: &LibraryOptions,
-    ) -> Result<(), ServiceError>;
+    ) -> Result<Option<Uuid>, ServiceError>;
 
     /// Removes the named virtual folder (its whole directory).
     ///
