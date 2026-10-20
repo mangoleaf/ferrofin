@@ -1754,8 +1754,8 @@ PICKER_CSS = """
 
 def list_runs(runs_dir):
     """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date.
-    The runs of a `gate.py` session (a directory holding `gate.json`) are one level down and
-    are named `<session>/<run>`."""
+    A `gate.py` session (a directory holding `gate.json`) is searched one level down, and the
+    runs found there are named `<session>/<run>`; a scan session's runs have no run.json."""
     out = []
     for session in os.listdir(runs_dir):
         top = os.path.join(runs_dir, session)

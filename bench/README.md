@@ -349,7 +349,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py` session (a directory with a `gate.json`), listed as `<session>/<run>` |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa` or `ab` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 

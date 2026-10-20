@@ -83,8 +83,10 @@ from.
      quiet hour. TODO: replace this estimate with the
      measured time of the first gate session (`time python3 bench/gate.py ab …`).
    - **Output.** `bench/runs/gate-ab-<date>-<time>/` holds `verdict.json`, `report.md` and a
-     self-contained `report.html` that opens from disk. The command exits `1` when the gate
-     blocks.
+     self-contained `report.html` that opens from disk. Each candidate run's own `report.html`
+     also lists the gated cells' verdicts, and `python3 bench/report.py --serve` shows the
+     session's runs on its Benchmark tab as `gate-ab-<date>-<time>/01-a` … `06-b`.
+     `gate.py ab` exits `1` when the gate blocks.
    - **Scan and migration.** `gate.py scan` runs the same six-run order with
      `bench/scan.py` in place of `run.sh`: a full library scan of the bench corpus on an
      empty data dir, and the adoption boot of a fresh copy of its Jellyfin 10.11.8 database,
@@ -92,7 +94,10 @@ from.
      needs the same idle cores and the same test data (at least 10,000 items), and refuses
      a stale oracle pin the same way, although it never boots Jellyfin. A self-A/B
      of v1.3.2 took 20 minutes from start to report on the shared host. Output goes to
-     `bench/runs/gate-scan-<date>-<time>/` in the same form, and it exits `1` when it blocks.
+     `bench/runs/gate-scan-<date>-<time>/` with the same session files (`verdict.json`,
+     `report.md`, `report.html`), and it exits `1` when it blocks. Its runs hold `scan.json`
+     and no `run.json`, so `report.py --serve` does not list them: open the session's
+     `report.html` from disk.
 
    **Thresholds.** A cell regressed when the median of the candidate's runs exceeds the
    median of the previous release's runs by more than **both** thresholds of its row **and**
