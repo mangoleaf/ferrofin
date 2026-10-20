@@ -582,6 +582,37 @@ impl Database {
         Ok(out)
     }
 
+    /// The `OriginalLanguage` of each of `ids` that has one, as `(Id,
+    /// OriginalLanguage)` pairs in the stored GUID form.
+    ///
+    /// One query for a page of episodes, whose default audio stream follows
+    /// `GetInheritedOriginalLanguage()` — the SERIES' original language when
+    /// the episode has none of its own (v12.2
+    /// MediaBrowser.Controller/Entities/TV/Episode.cs:157-160).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// How many alternate-version rows point at each of `primary_ids` through
     /// `PrimaryVersionId`, keyed by the primary's id in its stored (uppercase,
     /// hyphenated) GUID form. Primaries with no alternate are absent.
