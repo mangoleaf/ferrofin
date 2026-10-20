@@ -1436,7 +1436,7 @@ impl FerrofinLiveTvManager {
                     .push_bind(i32::from(class.is_news))
                     .push_bind(i32::from(class.is_kids))
                     .push_bind(i32::from(class.is_sports))
-                    .push_bind(0_i32)
+                    .push_bind(i32::from(prog.is_live))
                     .push_bind(&row.external_id)
                     .push_bind(&class.external_series_id)
                     .push_bind(class.season_number)
@@ -3482,8 +3482,8 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
-    /// Port of `DefaultLiveTvService.UpdateTimersForSeriesTimer` (v10.11.8
-    /// DefaultLiveTvService.cs:709-800): expand the series timer over the guide,
+    /// Port of `DefaultLiveTvService.UpdateTimersForSeriesTimer` (v12.2
+    /// DefaultLiveTvService.cs:709-804): expand the series timer over the guide,
     /// add a timer for every future airing it should record, refresh the ones
     /// that already exist, and — when asked — drop the pending ones it no longer
     /// matches.
@@ -3564,11 +3564,15 @@ impl FerrofinLiveTvManager {
         }
 
         // `SearchForDuplicateShowIds(enabledTimersForSeries)`: the same showing
-        // scheduled more than once records only the first of them.
-        for mut loser in duplicate_showings_to_cancel(&enabled) {
-            loser.status = RecordingStatus::Cancelled;
-            self.persist_timer(&loser).await?;
-            self.arm_timer(&loser);
+        // scheduled more than once records only the first of them — and only
+        // for a series timer that skips episodes already in the library
+        // (v12.2 DefaultLiveTvService.cs:776-779, jellyfin/jellyfin PR 16220).
+        if stored.dto.skip_episodes_in_library {
+            for mut loser in duplicate_showings_to_cancel(&enabled) {
+                loser.status = RecordingStatus::Cancelled;
+                self.persist_timer(&loser).await?;
+                self.arm_timer(&loser);
+            }
         }
 
         if delete_invalid_timers {
@@ -5015,19 +5019,20 @@ type EnabledShowing = (String, DateTime<Utc>, TimerInfoDto);
 /// timers that lost.
 ///
 /// Port of `DefaultLiveTvService.SearchForDuplicateShowIds` +
-/// `HandleDuplicateShowIds` (v10.11.8 DefaultLiveTvService.cs:671-707): timers
+/// `HandleDuplicateShowIds` (v12.2 DefaultLiveTvService.cs:671-707): timers
 /// are grouped by `ShowId`, a blank group is skipped, a group of one is skipped,
 /// a group whose key ends `"0000"` is skipped (upstream's guard for a
 /// SchedulesDirect show id with no sub-key, jellyfin/jellyfin#5856), and in what
 /// is left every showing after the first is cancelled.
 ///
-/// TODO(work item, not a deferral): upstream orders the group
-/// `OrderByDescending(t => GetLiveTvChannel(t).IsHD).ThenBy(t => t.StartDate)`,
-/// so an HD showing beats an earlier SD one. Ferrofin's Live TV has no `IsHD`
-/// at all — the M3U parser does not read a channel's HD flag and no table stores
-/// one — so only the `StartDate` half is ported and the earliest showing always
-/// wins. Closing it means carrying HD through `crate::m3u` → the channel row →
-/// here. It can only differ on a lineup mixing HD and SD feeds of one channel.
+/// Upstream orders the group
+/// `OrderByDescending(t => GetLiveTvChannel(t).IsHD).ThenBy(t => t.StartDate)`
+/// (v12.2 DefaultLiveTvService.cs:674), but that `IsHD` is the channel library
+/// item's `BaseItem.IsHD` (`Height >= 720`, BaseItem.cs:404), and
+/// `GuideManager.GetChannel` never sets a channel's `Height`: it is false for
+/// every timer. The stable sort is therefore `StartDate` alone, so the stored
+/// `IsHd` channel column (the tuner's `ChannelInfo.IsHD`) deliberately takes no
+/// part here, and the earliest showing always wins.
 fn duplicate_showings_to_cancel(enabled: &[EnabledShowing]) -> Vec<TimerInfoDto> {
     let mut groups: HashMap<&str, Vec<&EnabledShowing>> = HashMap::new();
     for entry in enabled {
@@ -5808,7 +5813,7 @@ mod tests {
             source.id
         );
         assert_eq!(source.container.as_deref(), Some("ts"));
-        assert!(!source.supports_direct_play);
+        assert!(source.supports_direct_play);
         assert!(source.use_most_compatible_transcoding_profile);
         // `isHd` ⇒ the android-tv 1200 condition's dummy resolution.
         assert_eq!(source.media_streams[0].width, Some(1920));
@@ -5990,6 +5995,75 @@ mod tests {
             .total_record_count,
             2
         );
+    }
+
+    /// Flags and ratings as Jellyfin 12 reads them (`Jellyfin.XmlTv`
+    /// 10.12.0-pre1, `XmlTvListingsProvider.GetProgramInfo`): `<live>` and
+    /// `<premiere>` count in either form, the rating comes from `<rating>`
+    /// alone, and programme child names are matched case-insensitively.
+    const FLAGGED_XMLTV: &str = "<tv>\
+        <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+        <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
+        <title>NFL Football</title><live/></programme>\
+        <programme start=\"20260725070000 +0000\" stop=\"20260725090000 +0000\" channel=\"one.tv\">\
+        <title>Cup Final</title><live>yes</live><premiere lang=\"en\">First showing</premiere>\
+        <star-rating system=\"IMDb\"><value>7.2/10</value></star-rating></programme>\
+        <programme start=\"20260725090000 +0000\" stop=\"20260725100000 +0000\" channel=\"one.tv\">\
+        <Title>Shouted</Title><Rating system=\"VCHIP\"><Value>TV-14</Value></Rating></programme>\
+        </tv>";
+
+    #[tokio::test]
+    async fn guide_refresh_reads_live_premiere_and_rating_like_jellyfin_12() {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(FLAGGED_XMLTV));
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let all = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("progs");
+        let by_name = |name: &str| {
+            all.items
+                .iter()
+                .find(|p| p.name.as_deref() == Some(name))
+                .cloned()
+                .expect(name)
+        };
+
+        // `IsLive = program.IsLive`, set by a `<live>` child in either form.
+        let football = by_name("NFL Football");
+        assert_eq!(football.is_live, Some(true));
+        assert_eq!(football.is_premiere, None);
+
+        // `IsPremiere = program.Premiere is not null`: a `<premiere>` with text
+        // counts as much as `<premiere/>`. A star rating is not an
+        // OfficialRating (`Ratings.FirstOrDefault()?.Value`).
+        let final_ = by_name("Cup Final");
+        assert_eq!(
+            (final_.is_live, final_.is_premiere),
+            (Some(true), Some(true))
+        );
+        assert_eq!(final_.official_rating, None);
+
+        // Programme children are lower-cased before matching.
+        let shouted = by_name("Shouted");
+        assert_eq!(shouted.official_rating.as_deref(), Some("TV-14"));
+        assert_eq!(shouted.is_live, None);
     }
 
     #[tokio::test]
@@ -7906,6 +7980,70 @@ mod tests {
         );
     }
 
+    /// The duplicate-showing sweep runs only for a series timer that skips
+    /// episodes already in the library.
+    ///
+    /// Jellyfin 12 gates `SearchForDuplicateShowIds(enabledTimersForSeries)` on
+    /// `seriesTimer.SkipEpisodesInLibrary` (v12.2
+    /// src/Jellyfin.LiveTv/DefaultLiveTvService.cs:776-779, jellyfin/jellyfin
+    /// PR 16220): with jellyfin-web's "Don't record episodes that are already
+    /// in my library" cleared, every airing of a `ShowId` records. Turning it
+    /// off on a timer the sweep already thinned brings the cancelled showings
+    /// back, because the fan-out resets every non-manual existing timer to
+    /// `New` first.
+    #[tokio::test]
+    async fn the_duplicate_sweep_runs_only_when_skipping_library_episodes() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let mut body = defaults_for(&mgr, future).await;
+        body.skip_episodes_in_library = false;
+        let st_id = mgr.create_series_timer(body).await.expect("create st");
+
+        let statuses = |timers: Vec<TimerInfoDto>| {
+            let mut by_start = timers;
+            by_start.sort_by_key(|t| t.base.start_date);
+            by_start.into_iter().map(|t| t.status).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(mgr.get_timers().await.expect("timers")),
+            [RecordingStatus::New; 3],
+            "without SkipEpisodesInLibrary every showing of the ShowId records"
+        );
+
+        let mut stored = mgr
+            .get_series_timer(&st_id)
+            .await
+            .expect("get st")
+            .expect("st row");
+        stored.skip_episodes_in_library = true;
+        mgr.update_series_timer(&st_id, stored.clone())
+            .await
+            .expect("skip on");
+        assert_eq!(
+            statuses(mgr.get_timers().await.expect("timers")),
+            [
+                RecordingStatus::New,
+                RecordingStatus::Cancelled,
+                RecordingStatus::Cancelled
+            ],
+            "with it, only the earliest showing of the ShowId records"
+        );
+
+        stored.skip_episodes_in_library = false;
+        mgr.update_series_timer(&st_id, stored)
+            .await
+            .expect("skip off");
+        assert_eq!(
+            statuses(mgr.get_timers().await.expect("timers")),
+            [RecordingStatus::New; 3],
+            "clearing it again brings the swept showings back"
+        );
+    }
+
     /// A guide refresh RE-EXPANDS every series timer over the airings it just
     /// ingested.
     ///
@@ -8715,6 +8853,44 @@ mod tests {
             sorted.items[0].name.as_deref(),
             Some("Channel Two"),
             "favourites sort first, then SortName"
+        );
+    }
+
+    /// The default channel order follows Jellyfin 12's `CreateSortName`
+    /// (`{0:0000000000.00000}`): six-digit numbers sort numerically, and
+    /// subchannels that agree to one decimal still sort by number.
+    #[tokio::test]
+    async fn channels_sort_by_number_like_jellyfin_12() {
+        let m3u = "#EXTM3U\n\
+            #EXTINF:-1 tvg-id=\"a\" tvg-chno=\"100010\",Hundred Ten\nhttp://tuner/a\n\
+            #EXTINF:-1 tvg-id=\"b\" tvg-chno=\"10002\",Ten Two\nhttp://tuner/b\n\
+            #EXTINF:-1 tvg-id=\"c\" tvg-chno=\"10001\",Ten One\nhttp://tuner/c\n\
+            #EXTINF:-1 tvg-id=\"d\" tvg-chno=\"4.12\",Alpha\nhttp://tuner/d\n\
+            #EXTINF:-1 tvg-id=\"e\" tvg-chno=\"4.11\",Zulu\nhttp://tuner/e\n";
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u.to_owned());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let names: Vec<String> = mgr
+            .get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
+            .await
+            .expect("channels")
+            .items
+            .into_iter()
+            .filter_map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["Zulu", "Alpha", "Ten One", "Ten Two", "Hundred Ten"],
+            "4.11 < 4.12 < 10001 < 10002 < 100010"
         );
     }
 

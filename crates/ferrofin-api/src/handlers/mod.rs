@@ -1064,6 +1064,48 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/UserImage",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "PostUserImage",
+        ferrofin: "handlers/images.rs post_user_image → handlers/items.rs resolve_user, \
+               handlers/users.rs assert_can_update_user, handlers/image_upload.rs \
+               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
+               to_extension, decode_base64) → ferrofin-core user_manager.rs \
+               save_profile_image",
+        date: "2026-10-20",
+        divergences: &[
+            "The body is decoded in full before anything is written, so a body the decoder \
+         rejects is a 400 that changes nothing. Upstream clears the old profile image row \
+         first and decodes while copying, so invalid base64 fails mid-copy with a 500 \
+         (FormatException) and leaves the user with no profile image. FromBase64Transform \
+         also silently drops a trailing partial group (fewer than four characters): an \
+         unpadded or short padded final group (`aGk`, `aG=`) loses its last bytes, and a \
+         third `=` or a partial group after the padding is ignored. Ferrofin decodes the \
+         final group in full and refuses the other two with a 400. Jellyfin bugs not \
+         ported.",
+            "The body is read as UTF-8 text before the user and the Content-Type are \
+         checked, so a body that is not UTF-8 is the extractor's 400 whatever the user or \
+         type; upstream resolves the user and checks the type first, and fails such a body \
+         with a 500 while decoding. Jellyfin bug not ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/UserImage",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "DeleteUserImage",
+        ferrofin: "handlers/images.rs delete_user_image → handlers/items.rs resolve_user, \
+               handlers/users.rs assert_can_update_user → ferrofin-core user_manager.rs \
+               clear_profile_image",
+        date: "2026-10-20",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
@@ -1146,6 +1188,17 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Localization/Countries",
+        upstream_file: "Jellyfin.Api/Controllers/LocalizationController.cs",
+        upstream_method: "GetCountries",
+        ferrofin: "handlers/localization.rs get_countries → ferrofin-core localization_manager.rs \
+               get_countries (COUNTRIES, data/countries.json byte-equal to v12.2)",
+        date: "2026-10-20",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Branding/Splashscreen",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
@@ -1157,13 +1210,14 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
          recorded only after the file is: a body the decoder rejects is a 400 that changes \
-         nothing, and an unpadded final group is decoded. Upstream records the new \
-         SplashscreenLocation first and decodes while copying, so invalid base64 fails \
-         mid-copy with a 500 (FormatException), any write failure leaves the recorded \
-         location pointing at a missing or truncated file, and FromBase64Transform drops \
-         an unpadded final group. Jellyfin bugs not ported.",
-            "decode_base64 skips `=` wherever it appears, so a body with padding inside the \
-         data is decoded and saved where FromBase64Transform refuses it. Fix path: gl-689.",
+         nothing. Upstream records the new SplashscreenLocation first and decodes while \
+         copying, so invalid base64 fails mid-copy with a 500 (FormatException), and any \
+         write failure leaves the recorded location pointing at a missing or truncated \
+         file. FromBase64Transform also silently drops a trailing partial group (fewer \
+         than four characters): an unpadded or short padded final group (`aGk`, `aG=`) \
+         loses its last bytes, and a third `=` or a partial group after the padding is \
+         ignored. Ferrofin decodes the final group in full and refuses the other two with \
+         a 400. Jellyfin bugs not ported.",
             "The body is read as UTF-8 text before the Content-Type is checked, so a body \
          that is not UTF-8 is the extractor's 400 whatever its type; upstream checks the \
          type first and fails such a body with a 500 while decoding. Jellyfin bug not \

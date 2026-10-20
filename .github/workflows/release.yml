@@ -167,7 +167,7 @@ jobs:
           [ "$prev" = v1.0.0 ] || starts="$starts --from $img:v1.0.0"
           # The image build's cache is not needed again; the fixture and three images are.
           docker builder prune --all --force >/dev/null
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pil
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pil python3-icu
           python3 adoption/synthetic.py build --fixtures "$RUNNER_TEMP/adoption" --only jellyfin-10.11.8
           # shellcheck disable=SC2086 # starts is a list of --from arguments
           python3 adoption/synthetic.py upgrade --fixtures "$RUNNER_TEMP/adoption" \

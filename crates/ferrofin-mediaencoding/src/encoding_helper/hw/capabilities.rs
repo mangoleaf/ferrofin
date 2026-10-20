@@ -210,7 +210,7 @@ pub struct FfmpegCapabilities {
     vaapi_vulkan_drm_interop: bool,
     is_videotoolbox_av1_decode: bool,
     low_priority_hwaccel_flag: bool,
-    pkey_pause_supported: bool,
+    validated: bool,
 }
 
 impl FfmpegCapabilities {
@@ -260,12 +260,6 @@ impl FfmpegCapabilities {
             .get(option.index())
             .copied()
             .unwrap_or(false)
-    }
-
-    /// Whether ffmpeg's interactive help reports its explicit pause key.
-    #[must_use]
-    pub fn pkey_pause_supported(&self) -> bool {
-        self.pkey_pause_supported
     }
 
     /// The detected ffmpeg version, or `None` when the probe could not
@@ -404,6 +398,14 @@ impl FfmpegCapabilities {
     pub fn low_priority_hwaccel_flag(&self) -> bool {
         self.low_priority_hwaccel_flag
     }
+
+    /// Whether these capabilities describe an ffmpeg that passed startup
+    /// validation. `false` for the placeholder a failed discovery leaves, whose
+    /// binary name must never be run again.
+    #[must_use]
+    pub fn validated(&self) -> bool {
+        self.validated
+    }
 }
 
 /// Port of `IMediaEncoder.SupportsEncoder`, kept on the pre-existing seam so the
@@ -507,13 +509,6 @@ impl FfmpegCapabilitiesBuilder {
         self
     }
 
-    /// Records the interactive runtime-key probe result.
-    #[must_use]
-    pub fn pkey_pause_supported(mut self, supported: bool) -> Self {
-        self.caps.pkey_pause_supported = supported;
-        self
-    }
-
     /// Sets the detected ffmpeg version.
     #[must_use]
     pub fn ffmpeg_version(mut self, version: FfmpegVersion) -> Self {
@@ -571,6 +566,14 @@ impl FfmpegCapabilitiesBuilder {
     #[must_use]
     pub fn low_priority_hwaccel_flag(mut self, supported: bool) -> Self {
         self.caps.low_priority_hwaccel_flag = supported;
+        self
+    }
+
+    /// Marks these capabilities as coming from an ffmpeg that passed startup
+    /// validation.
+    #[must_use]
+    pub fn validated(mut self, validated: bool) -> Self {
+        self.caps.validated = validated;
         self
     }
 

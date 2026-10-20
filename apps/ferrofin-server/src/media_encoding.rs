@@ -43,6 +43,7 @@ use ferrofin_traits::system::PathManager;
 use uuid::Uuid;
 
 use crate::bootstrap::FfmpegPaths;
+use crate::encoding_options::EncodingOptionsReader;
 use crate::planner::FerrofinStreamStatePlanner;
 
 /// How often the transcode idle reaper sweeps for consumerless jobs.
@@ -170,6 +171,35 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
     }
 }
 
+/// Starts the pause-key probe in the background, publishing into `slot`.
+///
+/// The probe is a real-time ffmpeg job, so it must not delay boot; a transcode
+/// that starts before it finishes picks the keys up on a later throttle tick.
+/// Nothing runs for the placeholder a failed discovery leaves (its capabilities
+/// are not [`validated`](ferrofin_mediaencoding::FfmpegCapabilities::validated)):
+/// that is a binary the server just declared unavailable.
+fn spawn_pause_key_probe(
+    handle: &tokio::runtime::Handle,
+    ffmpeg: &FfmpegPaths,
+    slot: ferrofin_mediaencoding::transcoding::throttler::PauseKeySlot,
+) {
+    if !ffmpeg.capabilities.validated() {
+        return;
+    }
+    handle.spawn(tracing::Instrument::instrument(
+        crate::bootstrap::probe_pause_keys(
+            ffmpeg.ffmpeg.clone(),
+            ffmpeg.capabilities.ffmpeg_version(),
+            slot,
+        ),
+        tracing::info_span!(
+            "ffmpeg_pause_probe",
+            task = "ffmpeg_pause_probe",
+            trigger = "startup"
+        ),
+    ));
+}
+
 /// Builds the concrete media-encoding pair injected via
 /// [`AppState::with_media_encoding`](ferrofin_api::AppState::with_media_encoding).
 ///
@@ -220,6 +250,7 @@ pub fn build_media_encoding(
         path_manager: Arc::clone(&path_manager),
         ffmpeg_path: encoder.encoder_path(),
         config: Arc::clone(&config),
+        encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
     };
     let pure_encoder = Arc::new(PureSubtitleEncoder::new(SubtitleEditParser::new(), sub_io));
     let subtitles: Arc<dyn SubtitleEncoder> =
@@ -249,22 +280,14 @@ pub fn build_media_encoding(
         Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
         None => Arc::new(NoopSessionReporter),
     };
-    let manager = Arc::new(
-        TranscodeManagerImpl::new(reporter)
-            .with_encoding_configuration(config)
-            .with_pause_keys(
-                ferrofin_mediaencoding::transcoding::throttler::PauseKeys::select(
-                    ffmpeg.capabilities.pkey_pause_supported(),
-                    ffmpeg.capabilities.ffmpeg_version(),
-                ),
-            ),
-    );
+    let manager = Arc::new(TranscodeManagerImpl::new(reporter).with_encoding_configuration(config));
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
     // → the job dies and its partial files are cleaned up. Spawned only when a
     // runtime exists so the sync composition unit test can still call this.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        spawn_pause_key_probe(&handle, ffmpeg, manager.pause_key_slot());
         handle.spawn(TranscodeManagerImpl::run_transcode_controls(
             Arc::downgrade(&manager),
         ));
@@ -321,6 +344,8 @@ struct FfmpegSubtitleIo {
     path_manager: Arc<dyn PathManager>,
     ffmpeg_path: String,
     config: Arc<dyn ServerConfigurationManager>,
+    /// Reads `encoding.json` on each extraction and reports a broken file once.
+    encoding_reader: EncodingOptionsReader,
 }
 
 #[async_trait]
@@ -376,10 +401,9 @@ impl SubtitleIo for FfmpegSubtitleIo {
         }
         // `RunSubtitleExtractionProcess` reads the timeout on every run.
         let minutes = self
-            .config
-            .get_encoding_options()
+            .encoding_reader
+            .read(self.config.as_ref())
             .await
-            .unwrap_or_default()
             .subtitle_extraction_timeout_minutes;
         let Some(timeout) = subtitle_extraction_timeout(minutes) else {
             return Err(format!(
@@ -1372,6 +1396,7 @@ mod tests {
             }),
             ffmpeg_path,
             config: Arc::new(FakeConfig(paths, options)),
+            encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
         }
     }
 
@@ -1397,6 +1422,55 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("timed out after 0 minute(s)"), "{error}");
         assert!(!std::path::Path::new(&output).exists());
+    }
+
+    /// A broken `encoding.json` extracts with the default timeout, and says so
+    /// once with the file's path rather than once per extraction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subtitle_extraction_warns_once_about_a_broken_encoding_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            "for arg; do out=\"$arg\"; done; printf 1 > \"$out\"",
+        );
+        let mut io = subtitle_io(tmp.path(), ffmpeg, 1);
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            tmp.path().join("data"),
+            tmp.path().join("log"),
+            tmp.path().join("config"),
+            tmp.path().join("cache"),
+            tmp.path().join("web"),
+        ));
+        io.config = Arc::new(
+            ferrofin_core::FerrofinServerConfigurationManager::load(paths)
+                .await
+                .unwrap(),
+        );
+        let file = tmp.path().join("config/users/named/encoding.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{ \"SubtitleExtractionTimeoutMinutes\": 1, }").unwrap();
+
+        let logs = crate::test_logs::CapturedLogs::default();
+        let guard = logs.install();
+        for name in ["0.srt", "1.srt"] {
+            let output = tmp.path().join(name).to_string_lossy().into_owned();
+            io.extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap();
+            assert!(std::path::Path::new(&output).is_file());
+        }
+        drop(guard);
+
+        let warnings = logs.lines_at("WARN");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains(&file.display().to_string()),
+            "{warnings:#?}"
+        );
     }
 
     /// Within the configured timeout the extraction completes normally.
@@ -1599,5 +1673,43 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pause_key_probe_runs_only_for_a_validated_ffmpeg() {
+        use ferrofin_mediaencoding::transcoding::throttler::{PauseKeySlot, PauseKeys};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("ffmpeg");
+        // Prints Jellyfin-ffmpeg's pause-key help once it has read `?q` on stdin.
+        crate::test_exec::stub_script(
+            &script,
+            "keys=$(dd bs=1 count=2 2>/dev/null)\n\
+             if [ \"$keys\" = '?q' ]; then echo 'p      pause transcoding' >&2; fi\n",
+        );
+        let paths = |validated| FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: script.clone(),
+            ffprobe: "ffprobe".into(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::builder()
+                .ffmpeg_version(ferrofin_mediaencoding::FfmpegVersion::new(8, 0))
+                .validated(validated)
+                .build(),
+            chromaprint_muxer: false,
+        };
+        let (skipped, probed) = (PauseKeySlot::default(), PauseKeySlot::default());
+        let handle = tokio::runtime::Handle::current();
+        spawn_pause_key_probe(&handle, &paths(false), skipped.clone());
+        spawn_pause_key_probe(&handle, &paths(true), probed.clone());
+        for _ in 0..500 {
+            if probed.get().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(probed.get(), Some(PauseKeys::Patched));
+        // Give a wrongly spawned probe time to land too.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(skipped.get(), None, "a placeholder ffmpeg is never run");
     }
 }

@@ -59,7 +59,7 @@ use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
-use crate::handlers::items::resolve_user_opt;
+use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
 /// Parses the `{imageType}` path segment into an [`ImageType`].
@@ -1089,10 +1089,10 @@ async fn get_user_image(
 
 /// `POST /UserImage` — upload a user's profile image.
 ///
-/// Port of `ImageController.PostUserImage`. Resolves the target user (the `userId`
-/// query parameter or the caller; a nil effective user is a `400`, and so is,
-/// for now, an id with no account, which upstream answers `404`: gl-685),
-/// applies `AssertCanUpdateUser` (`403`), validates the `Content-Type`
+/// Port of `ImageController.PostUserImage`. Resolves the target user with
+/// [`resolve_user`] (the `userId` query parameter or the caller; a nil effective
+/// user is `GetUserById(Guid.Empty)`'s `400`, an id with no account the action's
+/// `404`), applies `AssertCanUpdateUser` (`403`), validates the `Content-Type`
 /// with `TryGetImageExtensionFromContentType` (an image type `ToExtension` knows,
 /// else `400 Incorrect ContentType.`), base64-decodes the body, and stores it via
 /// [`UserManager::save_profile_image`], which writes
@@ -1116,9 +1116,7 @@ async fn post_user_image(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    let user = resolve_user_opt(&state, &auth, query.user_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    let user = resolve_user(&state, &auth, query.user_id).await?;
     super::users::assert_can_update_user(&state, &auth, &user).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -1136,12 +1134,12 @@ async fn post_user_image(
 
 /// `DELETE /UserImage` — clear a user's profile image.
 ///
-/// Port of `ImageController.DeleteUserImage`. Resolves the target user (the
-/// `userId` query parameter or the caller), applies `AssertCanUpdateUser`
+/// Port of `ImageController.DeleteUserImage`. Resolves the target user with
+/// [`resolve_user`] (the `userId` query parameter or the caller; a nil effective
+/// user is a `400`, an id with no account a `404`), applies `AssertCanUpdateUser`
 /// (`403`), and deletes its profile-image file and
 /// row via [`UserManager::clear_profile_image`]; a user with no image is still a `204`
-/// (idempotent, as in C#). A nil effective user is a `400`, a missing user a
-/// `404`.
+/// (idempotent, as in C#).
 #[utoipa::path(
     delete,
     path = "/UserImage",
@@ -1158,11 +1156,7 @@ async fn delete_user_image(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    // `resolve_user_opt` keeps the API-key-with-no-user path a 400 below, while a
-    // present-but-missing user is a 404.
-    let user = resolve_user_opt(&state, &auth, query.user_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    let user = resolve_user(&state, &auth, query.user_id).await?;
     super::users::assert_can_update_user(&state, &auth, &user).await?;
     state.users.clear_profile_image(&user).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1221,6 +1215,38 @@ async fn delete_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
     Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Query(mut query): Query<ImageQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    query.user_id = Some(user_id);
+    delete_user_image(state, auth, Query(query)).await
+}
+
+/// `POST /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed path-scoped
+/// form of `POST /UserImage` (`PostUserImageByIndexLegacy`).
+///
+/// The image type and index are ignored, as upstream does, but the index must
+/// still be an integer: upstream binds it as an `int`, so anything else fails
+/// model binding with a `400`.
+async fn post_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Query(mut query): Query<ImageQuery>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    query.user_id = Some(user_id);
+    post_user_image(state, auth, Query(query), headers, body).await
+}
+
+/// `DELETE /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed
+/// path-scoped form of `DELETE /UserImage` (`DeleteUserImageByIndexLegacy`),
+/// ignoring the image type and the (integer) index as
+/// [`post_user_image_by_index_legacy`] does.
+async fn delete_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type, _image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     query.user_id = Some(user_id);
@@ -1541,7 +1567,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/Users/{userId}/Images/{imageType}/{imageIndex}",
-            get(get_user_image_by_index_legacy).head(get_user_image_by_index_legacy),
+            get(get_user_image_by_index_legacy)
+                .head(get_user_image_by_index_legacy)
+                .post(post_user_image_by_index_legacy)
+                .delete(delete_user_image_by_index_legacy),
         )
 }
 

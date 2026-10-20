@@ -386,6 +386,8 @@ fn average_chapter_duration(chapters: &[ChapterInfo]) -> i64 {
     sum / i64::try_from(chapters.len()).unwrap_or(i64::MAX)
 }
 
+/// An item's `DateModified` as .NET `DateTime.Ticks` (100 ns since
+/// `0001-01-01`); unset is `DateTime.MinValue`, 0 ticks.
 pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
     date.map_or(0, |date| {
         621_355_968_000_000_000

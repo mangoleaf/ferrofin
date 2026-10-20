@@ -978,7 +978,7 @@ async fn verify_nfo_savers(
         &nfo,
         saved.replace(
             "</movie>",
-            "<custom><nested>keep me</nested></custom><genre>stale</genre></movie>",
+            "<custom><nested>keep me</nested></custom><genre>cleared-genre-sentinel</genre></movie>",
         ),
     )
     .unwrap();
@@ -993,7 +993,9 @@ async fn verify_nfo_savers(
     assert!(saved.contains("<nested>keep me</nested>"));
     assert!(saved.contains("<customid>changed</customid>"));
     assert!(saved.contains("<lockdata>true</lockdata>"));
-    assert!(!saved.contains("stale"));
+    // The NFO also carries absolute image paths, so the check needs a word no
+    // checkout or temp path contains.
+    assert!(!saved.contains("cleared-genre-sentinel"));
     // Selecting no saver suppresses writes even when the legacy flag is on.
     options["MetadataSavers"] = json!([]);
     options["SaveLocalMetadata"] = json!(true);

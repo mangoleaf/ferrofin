@@ -73,6 +73,9 @@ pub struct NetworkManager {
     excluded_subnets: Vec<IpNetwork>,
     trust_all_ipv6_interfaces: bool,
     interface_source: InterfaceSource,
+    /// Host-name lookups (`Dns.GetHostAddresses`): the OS resolver unless
+    /// [`NetworkManager::with_resolver`] replaced it.
+    resolver: net_utils::HostResolver,
 }
 
 enum InterfaceSource {
@@ -107,6 +110,7 @@ impl NetworkManager {
             excluded_subnets: Vec::new(),
             trust_all_ipv6_interfaces: false,
             interface_source: InterfaceSource::Mock(mock_network_settings.into()),
+            resolver: net_utils::resolve_host,
         };
 
         let config = manager.config.clone();
@@ -143,6 +147,18 @@ impl NetworkManager {
         let mut manager = Self::with_defaults(config, "");
         manager.set_interfaces(interfaces);
         manager
+    }
+
+    /// Looks host names up with `resolver` instead of the operating system's
+    /// resolver, builder-style.
+    ///
+    /// Only the textual-source paths ([`Self::get_bind_address`],
+    /// [`Self::is_in_local_network_str`]) resolve names, so tests use this to
+    /// keep them off live DNS. Every other constructor keeps the OS resolver.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: net_utils::HostResolver) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Replaces the supplied snapshot, including with an intentionally empty list.
@@ -710,9 +726,13 @@ impl NetworkManager {
     /// parsed out of a matching published-server override.
     #[must_use]
     pub fn get_bind_address(&self, source: &str) -> (String, Option<u16>) {
-        let addresses =
-            net_utils::try_parse_host(source, self.is_ipv4_enabled(), self.is_ipv6_enabled())
-                .unwrap_or_default();
+        let addresses = net_utils::try_parse_host_with(
+            source,
+            self.is_ipv4_enabled(),
+            self.is_ipv6_enabled(),
+            self.resolver,
+        )
+        .unwrap_or_default();
         let resolved = self.get_bind_address_for_ip(addresses.first().copied(), false);
         // Per-request published-URL resolution → debug (RULES_LOGGING volume rule);
         // the startup banner already logs the configured result at info. This
@@ -852,8 +872,13 @@ impl NetworkManager {
             return self.is_in_local_network(subnet.address);
         }
 
-        net_utils::try_parse_host(address, self.is_ipv4_enabled(), self.is_ipv6_enabled())
-            .is_some_and(|addresses| addresses.iter().any(|a| self.is_in_local_network(*a)))
+        net_utils::try_parse_host_with(
+            address,
+            self.is_ipv4_enabled(),
+            self.is_ipv6_enabled(),
+            self.resolver,
+        )
+        .is_some_and(|addresses| addresses.iter().any(|a| self.is_in_local_network(*a)))
     }
 
     /// Whether an address is link-local (`IsLinkLocalAddress`).
