@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3 jq curl python3-pil
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3 jq curl python3-pil python3-icu
       # A cache miss needs all seven Jellyfin images (~17 GB) beside the Ferrofin build;
       # the runner has ~14 GB free without this.
       - name: free runner disk (~25 GB of preinstalled toolchains)

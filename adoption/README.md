@@ -154,7 +154,7 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
-| `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
+| `ItemValues.CleanValue` is checked on its own: it must stay what it was or become what `Value` derives to | 0031 and the boot repair `repair_clean_values` (12.0's `RefreshCleanNamesAsync`) re-derive it with `get_clean_value`, ported in `clean_value.py` (needs PyICU) and proven against the Rust oracle; a value NULLed or corrupted by adoption still fails |
 | a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |
 | rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
 
@@ -260,7 +260,8 @@ The probes run as the synthetic administrator, which has a **Jellyfin Web** sess
 `Devices` and an **API key** in `ApiKeys`; `oracle/user.txt` records it, and `--user NAME`
 or `ADOPTION_USER` overrides. Credentials are read from the copy at run time and never
 written. The builder and runner need Docker, Python 3, Pillow (`python3-pil` on
-Debian/Ubuntu), `sqlite3`, `jq` and `curl`. Media encoding uses the Jellyfin image's FFmpeg.
+Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3`, `jq` and
+`curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
@@ -491,7 +492,7 @@ verify that unlisted future policy/configuration fields are compared.
 
 ### Running the synthetic matrix
 
-Requires Docker, Python 3, Pillow, Bash, and jq. Media encoding uses
+Requires Docker, Python 3, Pillow, PyICU (`python3-icu`), Bash, and jq. Media encoding uses
 `/usr/lib/jellyfin-ffmpeg/ffmpeg` from the official Jellyfin container; no host
 FFmpeg installation is needed. Docker must be available to the invoking user.
 Use a fresh fixture directory on a local disk, outside the checkout.

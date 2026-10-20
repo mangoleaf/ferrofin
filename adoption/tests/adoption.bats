@@ -472,6 +472,11 @@ EOS
   [ "$status" -eq 0 ]
 }
 
+@test "clean value: the Python derivation matches the Rust get_clean_value oracle" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_clean_value.py
+  [ "$status" -eq 0 ]
+}
+
 @test "run.sh and synthetic.py run: the table baseline is taken before the container starts and checked at every stage" {
   snapshot=$(grep -nF 'table_digests.py" snapshot' "$ADOPTION/run.sh" | cut -d: -f1)
   start=$(grep -nF 'docker run -d' "$ADOPTION/run.sh" | cut -d: -f1)
