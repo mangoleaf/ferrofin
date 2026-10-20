@@ -174,13 +174,14 @@ class Collect(unittest.TestCase):
         wall, samples = ci_timings.collect(RUNS)
         self.assertEqual(wall, [1066.0])  # run 1 had no successful job; benchmark-report was skipped
         self.assertEqual({k: [round(v, 2) for v in vs] for k, vs in samples["lint"].items()}, {
-            "total": [1064.0], "rust-cache restore": [1.0], "cache hit": [0], "clippy": [193.0],
+            "total": [1064.0], "span": [1064.0], "rust-cache restore": [1.0], "cache hit": [0], "clippy": [193.0],
             "tests": [829.0], "test compile": [272.69], "test execution": [556.31],
             "tests run": [10380]})
         self.assertEqual(samples["shell-tests"], {"total": [65.0]})
         self.assertEqual(ci_timings.report(RUNS[:1], wall, samples).splitlines()[3:], [
             "run wall-clock                          1066 [1066-1066] (1)",
             "lint                                    1064 [1064-1064] (1)",
+            "  span                                  1064 [1064-1064] (1)",
             "  rust-cache restore                    1 [1-1] (1)  cache hit 0/1",
             "  clippy                                193 [193-193] (1)",
             "  tests                                 829 [829-829] (1)",
@@ -188,6 +189,24 @@ class Collect(unittest.TestCase):
             "  test execution                        556 [556-556] (1)",
             "  tests run                             10380 [10380-10380] (1)",
             "shell-tests                             65 [65-65] (1)"])
+
+    def test_an_aggregate_checks_span_runs_from_its_first_gated_job_to_its_own_end(self):
+        def job(name, start, end):
+            return {"id": 0, "name": name, "conclusion": "success", "started_at": start,
+                    "completed_at": end, "steps": []}
+        jobs = [job("clippy", "2026-10-20T10:00:09Z", "2026-10-20T10:05:00Z"),
+                job("lint-tests (1)", "2026-10-20T10:00:05Z", "2026-10-20T10:12:00Z"),
+                job("lint-tests (2)", "2026-10-20T10:00:07Z", "2026-10-20T10:14:00Z"),
+                job("lint", "2026-10-20T10:14:04Z", "2026-10-20T10:14:10Z"),
+                job("coverage-shard (core)", "2026-10-20T10:00:02Z", "2026-10-20T10:09:00Z"),
+                job("coverage", "2026-10-20T10:09:03Z", "2026-10-20T10:09:05Z"),
+                job("shell-tests", "2026-10-20T10:00:00Z", "2026-10-20T10:01:00Z")]
+        run = {"id": 3, "created_at": "2026-10-20T10:00:00Z", "run_started_at": "2026-10-20T10:00:00Z"}
+        with patch.object(ci_timings, "gh", return_value=json.dumps({"jobs": jobs})):
+            _, samples = ci_timings.collect([run])
+        self.assertEqual(samples["lint"], {"total": [6.0], "span": [845.0]})  # 10:00:05 -> 10:14:10
+        self.assertEqual(samples["coverage"], {"total": [2.0], "span": [543.0]})  # 10:00:02 -> 10:09:05
+        self.assertNotIn("span", samples["coverage-shard (core)"])  # only aggregate checks get one
 
 
 class SuccessfulRuns(unittest.TestCase):

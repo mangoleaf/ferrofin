@@ -15,6 +15,9 @@ with a rust-cache or a test step) it also reads the job log to:
   and execution (that line to the step's end), when the step ran one cargo test build;
 - count the tests (nextest's "Summary" lines, or the sum of libtest's "test result:" lines);
 - see whether rust-cache restored a cache (a partial restore-keys match counts as a hit).
+An aggregate check (`lint`, `coverage`) also gets a span: from the first of the jobs it gates
+to start, to its own end, the time the check takes to report. Its total is only its own few
+seconds once it gates other jobs, so a window spanning the split compares spans, not totals.
 Steps are matched by what they run, not by position, so a changed job layout still reports.
 
 Every figure is median [min-max] (samples), in seconds. Jobs are keyed by name, so a window
@@ -38,7 +41,10 @@ STEPS = {
     "clippy": re.compile(r"cargo clippy"),
     "tests": re.compile(r"cargo nextest run|cargo test(?!.*--doc)|^coverage gate|^Run scripts/coverage-gate"),
 }
-METRICS = ["total", "free disk", "rust-cache restore", "clippy",
+# Aggregate check -> the jobs it gates (a matrix job is named "<job> (<value>)"). A run from
+# before a check was split has the check alone, so its span is its total.
+GROUPS = {"lint": ("clippy", "lint-tests"), "coverage": ("coverage-shard",)}
+METRICS = ["total", "span", "free disk", "rust-cache restore", "clippy",
            "tests", "test compile", "test execution", "tests run"]
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -151,6 +157,12 @@ def collect(runs):
             continue
         end = max(ts(j["completed_at"]) for j in jobs)
         wall.append((end - ts(run["run_started_at"])).total_seconds())
+        for check, gated in GROUPS.items():
+            own = [j for j in jobs if j["name"] == check]
+            if own:
+                start = min(ts(j["started_at"]) for j in jobs
+                            if j["name"] == check or j["name"].split(" (")[0] in gated)
+                add(check, "span", (ts(own[0]["completed_at"]) - start).total_seconds())
         for job in jobs:
             name = job["name"]
             add(name, "total", (ts(job["completed_at"]) - ts(job["started_at"])).total_seconds())

@@ -37,7 +37,9 @@ jobs:
       # Reporter correctness only: no containers, media fixture or timing gate.
       - run: python3 -m unittest discover -s bench -p test_report.py
 
-  lint:
+  # fmt and clippy. The workspace tests run beside it in lint-tests; the aggregate `lint`
+  # job below is the status check main's branch protection requires.
+  clippy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,11 +54,6 @@ jobs:
       # df/du steps record the margin, so a future overflow shows in the log.
       - name: disk at start
         run: df -h /
-      # NOTE: the benchmark/parity suite (v2) and its CI gates were retired on
-      # 2026-09-02 by owner decision. Suite v3 (bench/) deliberately does NOT run here:
-      # it needs a quiet machine, pinned cores and ~17 GB of generated test data, and a
-      # number measured on a shared runner would be worse than no number. It runs
-      # before each release — see RELEASE.md.
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
         # the 1.98.1 branch on every master merge (orphaning its SHAs) and moves
@@ -64,29 +61,15 @@ jobs:
         with:
           toolchain: 1.98.1 # = rust-toolchain.toml
           components: rustfmt, clippy
-          # Builds the WASM example guest for the end-to-end plugin-host test.
-          targets: wasm32-wasip2
-      # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
-      # The version matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the
-      # registry and compiled dependencies; sccache serves the workspace crates it discards.
+      # Before rust-cache, so `sccache` is on PATH for any cargo it runs. The version
+      # matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the registry and
+      # compiled dependencies; sccache serves the workspace crates it discards.
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
           version: v0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # Pin a release tag (on install-action's main), never a per-tool tag such as
-      # @nextest: those commits sit off main and are orphaned when the tag moves,
-      # which zizmor reports as an impostor commit.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: nextest
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-        # FERROFIN_WASM_GUEST_TESTS=1 builds+runs the real wasm-hello guest so
-        # the ferrofin:plugin WIT contract can't drift silently. nextest runs the
-        # binaries in parallel, each test in its own process (the gate CLAUDE.md
-        # names); no CI job runs plain `cargo test`'s threads-in-one-process model.
-      - run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --workspace
-      - run: cargo test --workspace --doc # nextest cannot run doctests
       - name: sccache stats
         if: always()
         run: ${SCCACHE_PATH} --show-stats
@@ -96,6 +79,82 @@ jobs:
           df -h /
           du -sh target || true # absent when the job failed before building
 
+  # Every workspace test once, split three ways by nextest's hash partitioning, plus the
+  # doctests in partition 1.
+  lint-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    strategy:
+      fail-fast: false # one failing partition must not hide another's result
+      matrix:
+        partition: [1, 2, 3] # the nextest step's "/3" is this list's length
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # No disk freeing: the build fits the runner's free disk without it. The
+      # df/du steps record the margin, so a future overflow shows in the log.
+      - name: disk at start
+        run: df -h /
+      # NOTE: the benchmark/parity suite (v2) and its CI gates were retired on
+      # 2026-09-02 by owner decision. Suite v3 (bench/) deliberately does NOT run here:
+      # it needs a quiet machine, pinned cores and ~17 GB of generated test data, and a
+      # number measured on a shared runner would be worse than no number. It runs
+      # before each release — see RELEASE.md.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        # Same master-commit pin as clippy (see the note there).
+        with:
+          toolchain: 1.98.1 # = rust-toolchain.toml
+          # Builds the WASM example guest for the end-to-end plugin-host test.
+          targets: wasm32-wasip2
+      # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
+        with:
+          version: v0.16.0
+      # No per-partition key: the three partitions build the same thing, so they share one entry.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Pin a release tag (on install-action's main), never a per-tool tag such as
+      # @nextest: those commits sit off main and are orphaned when the tag moves,
+      # which zizmor reports as an impostor commit.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
+      # FERROFIN_WASM_GUEST_TESTS=1 builds+runs the real wasm-hello guest so the
+      # ferrofin:plugin WIT contract can't drift silently, in whichever partition it
+      # hashes to. nextest runs the binaries in parallel, each test in its own process
+      # (the gate CLAUDE.md names); no CI job runs plain `cargo test`'s
+      # threads-in-one-process model.
+      - env:
+          PARTITION: ${{ matrix.partition }}
+        run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --workspace --partition "hash:$PARTITION/3"
+      - if: matrix.partition == 1
+        run: cargo test --workspace --doc # nextest cannot run doctests
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
+      - name: disk at end
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true # absent when the job failed before building
+
+  lint:
+    needs: [clippy, lint-tests]
+    if: always() # a failed or cancelled job must fail this check, not leave it skipped
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: clippy and every test partition passed
+        env:
+          CLIPPY: ${{ needs.clippy.result }}
+          TESTS: ${{ needs.lint-tests.result }}
+        run: |
+          echo "clippy: $CLIPPY, lint-tests: $TESTS"
+          [ "$CLIPPY" = success ] && [ "$TESTS" = success ]
 
   shell-tests:
     # The shell tooling has its own tests: scripts/version.sh (release versioning),
@@ -158,7 +217,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.shard }} # a cache entry per shard, so they do not overwrite one another
-      # Same release-tag pin as lint (see the note there): never a per-tool tag.
+      # Same release-tag pin as lint-tests (see the note there): never a per-tool tag.
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov,nextest
