@@ -2883,11 +2883,11 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
 
-        let people: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "Peoples""#)
-            .fetch_all(db.pool())
-            .await
-            .expect("people");
-        assert_eq!(people.len(), 2, "the duplicate is not merged during a scan");
+        assert_eq!(
+            crate::people_repository::people_row_count(&db).await,
+            2,
+            "the duplicate is not merged during a scan"
+        );
         assert!(
             providers.refreshed.lock().expect("lock").is_empty(),
             "no person is refreshed during a scan"
