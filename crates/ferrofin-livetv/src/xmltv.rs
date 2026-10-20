@@ -33,6 +33,7 @@ pub struct XmltvChannel {
 
 /// A single programme (an airing on a channel over a time range).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // one field per XMLTV flag element
 pub struct XmltvProgramme {
     /// The `channel` attribute — matches an [`XmltvChannel::id`].
     pub channel_id: String,
@@ -69,12 +70,15 @@ pub struct XmltvProgramme {
     pub season_number: Option<i32>,
     /// `Episode.Episode` — the 1-based episode number from that `<episode-num>`.
     pub episode_number: Option<i32>,
-    /// `true` when a `<new/>` element is present.
+    /// `true` when a `<new>` element is present.
     pub is_new: bool,
-    /// `true` when a `<premiere>` element is present.
+    /// `true` when a `<premiere>` element is present, with or without text.
     pub is_premiere: bool,
     /// `true` when a `<previously-shown>` element is present.
     pub is_previously_shown: bool,
+    /// `true` when a `<live>` element is present (not in the XMLTV DTD, but
+    /// Jellyfin 12 reads it).
+    pub is_live: bool,
     /// `<rating>/<value>` (content rating like `TV-PG`), when present.
     pub rating: Option<String>,
 }
@@ -120,7 +124,7 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                         programme = Some(read_programme(&e));
                     }
                     b"episode-num" => episode_system = attr(&e, b"system"),
-                    _ => {}
+                    name => apply_flag(name, programme.as_mut()),
                 }
                 text.clear();
             }
@@ -236,21 +240,25 @@ fn apply_empty(
                 c.icon = src;
             }
         }
-        b"new" => {
-            if let Some(p) = programme {
-                p.is_new = true;
-            }
-        }
-        b"premiere" => {
-            if let Some(p) = programme {
-                p.is_premiere = true;
-            }
-        }
-        b"previously-shown" => {
-            if let Some(p) = programme {
-                p.is_previously_shown = true;
-            }
-        }
+        _ => apply_flag(name, programme),
+    }
+}
+
+/// Sets the programme flag a `<live>`, `<new>`, `<premiere>` or
+/// `<previously-shown>` element stands for, self-closing or not:
+/// `XmlTvReader`'s `ProcessLive`/`ProcessNew`/`ProcessPremiereNode`/
+/// `ProcessPreviouslyShown` take the element as the flag, whatever its text.
+///
+/// TODO(gl-683): `ProcessPreviouslyShown` also reads a `start` attribute and
+/// leaves an airing whose original-air date equals its own start a first
+/// showing; here every `<previously-shown>` is a repeat.
+fn apply_flag(name: &[u8], programme: Option<&mut XmltvProgramme>) {
+    let Some(p) = programme else { return };
+    match name {
+        b"live" => p.is_live = true,
+        b"new" => p.is_new = true,
+        b"premiere" => p.is_premiere = true,
+        b"previously-shown" => p.is_previously_shown = true,
         _ => {}
     }
 }
@@ -628,5 +636,41 @@ mod episode_num_tests {
         );
         assert_eq!(guide.channels[0].display_name, "News & Sport !");
         assert_eq!(guide.programmes[0].title, "Fish & Chips <live>");
+    }
+}
+
+/// Programme children as `Jellyfin.XmlTv` 10.12.0-pre1 reads them.
+#[cfg(test)]
+mod programme_child_tests {
+    use super::{XmltvProgramme, parse_xmltv};
+
+    /// The single programme of a guide whose `<programme>` holds `children`.
+    fn programme(children: &str) -> XmltvProgramme {
+        let guide = parse_xmltv(&format!(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>{children}</programme></tv>"
+        ));
+        guide.programmes.into_iter().next().expect("one programme")
+    }
+
+    #[test]
+    fn flags_count_in_either_form() {
+        // `ProcessLive`/`ProcessNew`: the element's presence is the signal.
+        let p = programme("<live/><new/><premiere/><previously-shown/>");
+        assert!(p.is_live && p.is_new && p.is_premiere && p.is_previously_shown);
+        // `ProcessPremiereNode` reads the text but keeps a premiere either way.
+        let p = programme(
+            "<live>yes</live><new></new><premiere lang=\"en\">First showing</premiere>\
+             <previously-shown></previously-shown>",
+        );
+        assert!(p.is_live && p.is_new && p.is_premiere && p.is_previously_shown);
+        assert_eq!(p.title, "T", "flag text never leaks into a field");
+        let p = programme("");
+        assert!(!(p.is_live || p.is_new || p.is_premiere || p.is_previously_shown));
+        // A flag outside a programme flags nothing.
+        let guide = parse_xmltv(
+            "<tv><channel id=\"c\"><display-name>C</display-name><live/><new></new></channel>\
+             <programme start=\"20260725060000 +0000\" channel=\"c\"><title>T</title></programme></tv>",
+        );
+        assert!(!(guide.programmes[0].is_live || guide.programmes[0].is_new));
     }
 }

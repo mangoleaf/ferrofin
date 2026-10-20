@@ -1436,7 +1436,7 @@ impl FerrofinLiveTvManager {
                     .push_bind(i32::from(class.is_news))
                     .push_bind(i32::from(class.is_kids))
                     .push_bind(i32::from(class.is_sports))
-                    .push_bind(0_i32)
+                    .push_bind(i32::from(prog.is_live))
                     .push_bind(&row.external_id)
                     .push_bind(&class.external_series_id)
                     .push_bind(class.season_number)
@@ -5989,6 +5989,64 @@ mod tests {
             .expect("series")
             .total_record_count,
             2
+        );
+    }
+
+    /// Flags as Jellyfin 12 reads them (`Jellyfin.XmlTv` 10.12.0-pre1,
+    /// `XmlTvListingsProvider.GetProgramInfo`): `<live>` and `<premiere>` count
+    /// in either form.
+    const FLAGGED_XMLTV: &str = "<tv>\
+        <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+        <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
+        <title>NFL Football</title><live/></programme>\
+        <programme start=\"20260725070000 +0000\" stop=\"20260725090000 +0000\" channel=\"one.tv\">\
+        <title>Cup Final</title><live>yes</live><premiere lang=\"en\">First showing</premiere></programme>\
+        </tv>";
+
+    #[tokio::test]
+    async fn guide_refresh_reads_live_and_premiere_like_jellyfin_12() {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(FLAGGED_XMLTV));
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let all = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("progs");
+        let by_name = |name: &str| {
+            all.items
+                .iter()
+                .find(|p| p.name.as_deref() == Some(name))
+                .cloned()
+                .expect(name)
+        };
+
+        // `IsLive = program.IsLive`, set by a `<live>` child in either form.
+        let football = by_name("NFL Football");
+        assert_eq!(football.is_live, Some(true));
+        assert_eq!(football.is_premiere, None);
+
+        // `IsPremiere = program.Premiere is not null`: a `<premiere>` with text
+        // counts as much as `<premiere/>`.
+        let final_ = by_name("Cup Final");
+        assert_eq!(
+            (final_.is_live, final_.is_premiere),
+            (Some(true), Some(true))
         );
     }
 
