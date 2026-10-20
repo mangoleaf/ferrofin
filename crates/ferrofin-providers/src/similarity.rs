@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::library::{
-    RemoteSimilarItemsProvider, SimilarItemReference, SimilarItemsQuery,
+    RemoteSimilarItemsProvider, SimilarItemReference, SimilarItemsPage, SimilarItemsQuery,
 };
 
 use crate::listenbrainz::ListenBrainzClient;
@@ -71,42 +71,37 @@ impl RemoteSimilarItemsProvider for TmdbSimilarProvider {
         })
     }
 
-    async fn get_similar_items(
+    async fn similar_items_page(
         &self,
         _seed: &BaseItemEntity,
         seed_provider_ids: &HashMap<String, String>,
         _query: &SimilarItemsQuery,
-    ) -> Vec<SimilarItemReference> {
+        page: i32,
+    ) -> SimilarItemsPage {
         // The seed's own TMDB id keys the lookup; without one there is nothing
         // to ask TMDB about (C# `yield break`).
         let Some(tmdb_id) =
             provider_id(seed_provider_ids, "Tmdb").and_then(|v| v.parse::<i64>().ok())
         else {
-            return Vec::new();
+            return SimilarItemsPage::default();
         };
-        let mut out = Vec::new();
-        let mut page = 1;
-        let mut total_pages = 1;
-        // Every page, as C# does: it walks until `page > totalPages`. The
-        // result set is cached for `cache_days`, so the walk happens once per
-        // seed per cache window rather than once per request.
-        while page <= total_pages {
-            let (ids, reported) = self
-                .tmdb
-                .recommendations_page(self.kind, tmdb_id, page)
-                .await;
-            if ids.is_empty() {
-                break;
-            }
-            total_pages = reported.max(1);
-            out.extend(ids.into_iter().map(|id| SimilarItemReference {
-                provider_name: "Tmdb".to_owned(),
-                provider_id: id.to_string(),
-                score: None,
-            }));
-            page += 1;
+        // One page of the C# provider's `while (page <= totalPages)` walk; the
+        // manager decides whether there is a next one.
+        let (ids, total_pages) = self
+            .tmdb
+            .recommendations_page(self.kind, tmdb_id, page)
+            .await;
+        SimilarItemsPage {
+            references: ids
+                .into_iter()
+                .map(|id| SimilarItemReference {
+                    provider_name: "Tmdb".to_owned(),
+                    provider_id: id.to_string(),
+                    score: None,
+                })
+                .collect(),
+            total_pages,
         }
-        out
     }
 }
 
@@ -138,25 +133,32 @@ impl RemoteSimilarItemsProvider for ListenBrainzSimilarArtistProvider {
         self.client.cache_duration()
     }
 
-    async fn get_similar_items(
+    async fn similar_items_page(
         &self,
         _seed: &BaseItemEntity,
         seed_provider_ids: &HashMap<String, String>,
         _query: &SimilarItemsQuery,
-    ) -> Vec<SimilarItemReference> {
-        let Some(mbid) = provider_id(seed_provider_ids, "MusicBrainzArtist") else {
-            return Vec::new();
+        page: i32,
+    ) -> SimilarItemsPage {
+        // ListenBrainz answers the whole list at once: it is page 1, of 1.
+        let Some(mbid) = provider_id(seed_provider_ids, "MusicBrainzArtist").filter(|_| page == 1)
+        else {
+            return SimilarItemsPage::default();
         };
-        self.client
-            .similar_artists(&mbid)
-            .await
-            .into_iter()
-            .map(|id| SimilarItemReference {
-                provider_name: "MusicBrainzArtist".to_owned(),
-                provider_id: id,
-                score: None,
-            })
-            .collect()
+        SimilarItemsPage {
+            references: self
+                .client
+                .similar_artists(&mbid)
+                .await
+                .into_iter()
+                .map(|id| SimilarItemReference {
+                    provider_name: "MusicBrainzArtist".to_owned(),
+                    provider_id: id,
+                    score: None,
+                })
+                .collect(),
+            total_pages: 1,
+        }
     }
 }
 
@@ -206,14 +208,62 @@ mod tests {
         assert!(provider.supports(BaseItemKind::Movie));
         assert!(!provider.supports(BaseItemKind::Series));
         // No id → no request, so this resolves without touching the network.
-        let refs = provider
-            .get_similar_items(
+        let page = provider
+            .similar_items_page(
                 &row("Movies.Movie"),
                 &HashMap::new(),
                 &SimilarItemsQuery::default(),
+                1,
             )
             .await;
-        assert!(refs.is_empty());
+        assert!(page.references.is_empty());
+    }
+
+    /// One call is one TMDB page: the page the manager asks for, with the
+    /// page count TMDB reports, so the manager can stop the walk.
+    #[tokio::test]
+    async fn tmdb_similar_answers_the_page_it_is_asked_for() {
+        let body = r#"{"page":3,"total_pages":16,"results":[{"id":603},{"id":604}]}"#;
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/movie/27205/recommendations?",
+            body.to_owned(),
+        )])
+        .await;
+        let tmdb = Arc::new(TmdbClient::new().with_base_url(&server.base_url));
+        let provider = TmdbSimilarProvider::new(tmdb, TmdbKind::Movie, 7);
+        let page = provider
+            .similar_items_page(
+                &row("Movies.Movie"),
+                &ids(&[("Tmdb", "27205")]),
+                &SimilarItemsQuery::default(),
+                3,
+            )
+            .await;
+        let ids: Vec<&str> = page
+            .references
+            .iter()
+            .map(|r| r.provider_id.as_str())
+            .collect();
+        assert_eq!(ids, ["603", "604"]);
+        assert!(page.references.iter().all(|r| r.provider_name == "Tmdb"));
+        assert_eq!(page.total_pages, 16);
+    }
+
+    /// ListenBrainz has no pages: everything is page 1, and a later page is
+    /// empty without a request.
+    #[tokio::test]
+    async fn listenbrainz_answers_nothing_past_page_one() {
+        let provider =
+            ListenBrainzSimilarArtistProvider::new(Arc::new(ListenBrainzClient::default()));
+        let page = provider
+            .similar_items_page(
+                &row("Audio.MusicArtist"),
+                &ids(&[("MusicBrainzArtist", "a74b1b7f-71a5-4011-9441-d0b5e4122711")]),
+                &SimilarItemsQuery::default(),
+                2,
+            )
+            .await;
+        assert!(page.references.is_empty());
     }
 
     #[test]
@@ -237,13 +287,14 @@ mod tests {
             ListenBrainzSimilarArtistProvider::new(Arc::new(ListenBrainzClient::default()));
         assert!(provider.supports(BaseItemKind::MusicArtist));
         assert!(!provider.supports(BaseItemKind::MusicAlbum));
-        let refs = provider
-            .get_similar_items(
+        let page = provider
+            .similar_items_page(
                 &row("Audio.MusicArtist"),
                 &HashMap::new(),
                 &SimilarItemsQuery::default(),
+                1,
             )
             .await;
-        assert!(refs.is_empty());
+        assert!(page.references.is_empty());
     }
 }
