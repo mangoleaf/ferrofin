@@ -19861,12 +19861,13 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
 
 /// Whether writing `people` would change `stored`, an item's credits as
 /// `get_people_batch` reads them back. Compared the way `update_people`
-/// writes them: deduped on (lower-cased name, type) keeping the first
-/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
-/// existing `Peoples` row keeps its casing), then type and role, in credit
-/// order. Incoming roles are trimmed as `update_people` stores them; stored
-/// roles are compared as read, so a padded role written before roles were
-/// trimmed differs once and is rewritten, as upstream's unchanged check does.
+/// writes them: deduped on (lower-cased name, type, role) keeping the first
+/// ([`dedupe_people`]), names and roles matched case-insensitively (an
+/// existing `Peoples` row and mapping keep their casing), then type, in
+/// credit order. Incoming roles are trimmed as `update_people` stores them;
+/// stored roles are compared as read, so a padded role written before roles
+/// were trimmed differs once and is rewritten, as upstream's unchanged check
+/// does.
 ///
 /// [`dedupe_people`]: crate::people_repository::dedupe_people
 fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
@@ -19875,7 +19876,7 @@ fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
         (
             p.name.trim().to_lowercase(),
             p.person_type.clone().unwrap_or_default(),
-            if trim_role { role.trim() } else { role }.to_owned(),
+            if trim_role { role.trim() } else { role }.to_lowercase(),
         )
     };
     stored
@@ -20691,6 +20692,18 @@ mod tests {
             &[credit("Ann", "Actor", " Himself ")],
             &[credit("Ann", "Actor", "Himself")]
         ));
+        // A case-only change keeps the stored mapping, so it is no change.
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "HIMSELF")]
+        ));
+        // Two roles of one person are two credits.
+        let both = [
+            credit("Ann", "Writer", "Novel"),
+            credit("Ann", "Writer", "Screenplay"),
+        ];
+        assert!(!super::credits_differ(&both, &both));
+        assert!(super::credits_differ(&both[..1], &both));
     }
 
     #[rstest::rstest]
