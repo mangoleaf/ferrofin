@@ -111,6 +111,9 @@ impl ServerApplicationHost for StubHost {
     fn friendly_name(&self) -> String {
         "ferrofin-test".to_owned()
     }
+    fn base_url(&self) -> String {
+        String::new()
+    }
     async fn get_smart_api_url(&self, _request: &RequestContext) -> Result<String, ServiceError> {
         unimplemented!("not routed by these tests")
     }

@@ -180,12 +180,68 @@ impl FerrofinServerApplicationHost {
     pub fn configuration_listener(self: &Arc<Self>) -> Arc<ConfigurationListener> {
         let host = Arc::downgrade(self);
         Arc::new(move |update| {
-            if let ConfigurationUpdate::Server(configuration) = update
-                && let Some(host) = host.upgrade()
-            {
-                host.publish_server_name(&configuration.server_name);
+            let Some(host) = host.upgrade() else {
+                return;
+            };
+            match update {
+                ConfigurationUpdate::Server(configuration) => {
+                    host.publish_server_name(&configuration.server_name);
+                }
+                // `InitializeOverrides` re-runs the check on every network save.
+                ConfigurationUpdate::Named { key, .. } if key == "network" => {
+                    host.warn_if_published_url_base_path_differs();
+                }
+                ConfigurationUpdate::Named { .. } => {}
             }
         })
+    }
+
+    /// `NetworkManager.WarnIfPublishedUrlBasePathDiffers`: logs a warning for
+    /// each full-URL published server override whose public path does not end
+    /// with the mounted base URL, because the base URL is then appended to the
+    /// Live TV stream URLs handed to clients, which a path-translating reverse
+    /// proxy may not serve. The override checked is the bootstrap published URL
+    /// when one is set (upstream's startup override, which wins over the
+    /// others), else the network configuration's per-subnet overrides. Returns
+    /// the `host:port` of each one warned about; user info, query and fragment
+    /// never reach the log.
+    pub fn warn_if_published_url_base_path_differs(&self) -> Vec<String> {
+        let overrides: Vec<String> = match self
+            .network
+            .published_server_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+        {
+            Some(published) => vec![published.to_owned()],
+            None => self
+                .network_manager
+                .as_ref()
+                .and_then(|manager| manager.read().ok())
+                .map(|manager| {
+                    manager
+                        .published_server_urls()
+                        .iter()
+                        .map(|entry| entry.override_uri.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let hosts = ferrofin_networking::published_urls_missing_base_url(
+            overrides.iter().map(String::as_str),
+            &self.network.base_url,
+        );
+        for host in &hosts {
+            tracing::warn!(
+                published_server_host = %host,
+                base_url = %self.network.base_url,
+                "the published server URL for this host does not end with the configured base \
+                 URL; the base URL is appended to the Live TV stream URLs given to clients, which \
+                 fails if a reverse proxy translates public paths. Update the published server \
+                 URIs on the dashboard's Networking page, the published URL setting, or the \
+                 proxy's path mapping"
+            );
+        }
+        hosts
     }
 
     fn publish_server_name(&self, name: &str) {
@@ -304,6 +360,10 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         // C# `ApplicationHost.Name => ApplicationProductName` — a build
         // constant, deliberately NOT the friendly name.
         PRODUCT_NAME.to_owned()
+    }
+
+    fn base_url(&self) -> String {
+        self.network.base_url.clone()
     }
 
     fn friendly_name(&self) -> String {
@@ -450,6 +510,30 @@ mod tests {
                 .unwrap(),
             "https://jelly.example.com"
         );
+    }
+
+    #[tokio::test]
+    async fn a_published_url_off_the_base_url_is_warned_about_by_host_only() {
+        let host = host(HostNetworkInfo {
+            published_server_url: Some(
+                "https://user:password@media.example.com?access_token=secret#fragment".into(),
+            ),
+            base_url: "/jellyfin/".into(),
+            ..HostNetworkInfo::default()
+        })
+        .await;
+        assert_eq!(host.base_url(), "/jellyfin");
+        assert_eq!(
+            host.warn_if_published_url_base_path_differs(),
+            vec!["media.example.com:443".to_owned()]
+        );
+        let at_base = self::host(HostNetworkInfo {
+            published_server_url: Some("https://media.example.com/jellyfin".into()),
+            base_url: "/jellyfin".into(),
+            ..HostNetworkInfo::default()
+        })
+        .await;
+        assert!(at_base.warn_if_published_url_base_path_differs().is_empty());
     }
 
     #[tokio::test]

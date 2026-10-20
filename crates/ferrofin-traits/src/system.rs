@@ -112,6 +112,11 @@ pub trait ServerApplicationHost: Send + Sync {
     /// `GET`/`POST /System/Ping` and `PublicSystemInfo.ProductName` return this.
     fn name(&self) -> String;
 
+    /// The base URL prefix the HTTP API is mounted under (Jellyfin's
+    /// `NetworkConfiguration.BaseUrl`): a leading `/` and no trailing one,
+    /// empty when the server is mounted at the root.
+    fn base_url(&self) -> String;
+
     /// Builds the best externally reachable API URL for a request.
     async fn get_smart_api_url(&self, request: &RequestContext) -> Result<String, ServiceError>;
 
