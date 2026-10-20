@@ -1183,7 +1183,7 @@ impl SessionManager for FakeSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }

@@ -174,7 +174,7 @@ fn fake_media_sources_methods_panic() {
 #[test]
 fn fake_sessions_methods_panic() {
     let f = FakeSessions;
-    assert_panics(f.log_session_activity("a", "v", "d", "n", "e", &user()));
+    assert_panics(f.log_session_activity("a", "v", "d", "n", "e", Some(&user())));
     assert_panics(f.update_device_name("s", "n"));
     assert_panics(f.on_playback_start(&ferrofin_model::session::PlaybackStartInfo::default()));
     assert_panics(f.on_playback_progress(
