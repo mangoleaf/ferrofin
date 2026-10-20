@@ -1214,6 +1214,10 @@ fn push_resolution_buckets(
 /// any directly linked child (`LinkedChildren`, every link type, as upstream)
 /// falls in a selected bucket, bucketed exactly as a top-level item. Selecting
 /// no bucket (`Is4K = false` alone) matches nothing, as upstream.
+///
+/// `+`: the same plan pin as [`push_is_played`] on both `IsFolder` disjuncts,
+/// so a browse of three or more kinds keeps its `(Type, TopParentId)` seek
+/// instead of a `MULTI-INDEX OR` over every row of every library in scope.
 fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let buckets = ResolutionBuckets {
         standard_def: filter.is_hd == Some(false),
@@ -1224,10 +1228,10 @@ fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
         qb.push(" AND 0");
         return;
     }
-    qb.push(r#" AND ((bi."IsFolder" = 0 AND "#);
+    qb.push(r#" AND ((+bi."IsFolder" = 0 AND "#);
     push_resolution_buckets(qb, buckets, "bi", r#"bi."Id""#);
     qb.push(
-        r#") OR (bi."IsFolder" = 1 AND (EXISTS (SELECT 1 FROM "AncestorIds" a JOIN "BaseItems" c ON c."Id" = a."ItemId" WHERE a."ParentItemId" = bi."Id" AND "#,
+        r#") OR (+bi."IsFolder" = 1 AND (EXISTS (SELECT 1 FROM "AncestorIds" a JOIN "BaseItems" c ON c."Id" = a."ItemId" WHERE a."ParentItemId" = bi."Id" AND "#,
     );
     push_resolution_buckets(qb, buckets, "c", r#"a."ItemId""#);
     qb.push(
@@ -1681,6 +1685,10 @@ fn push_stream_match(
 /// `HasSubtitles` takes the same shape; so will the other v12 media criteria
 /// (the `HasNo*TrackWithLanguage` filters, `HasChapterImages`), whose
 /// predicates `TranslateQuery` does not translate yet.
+///
+/// `+`: the same plan pin as [`push_is_played`] on both `IsFolder` disjuncts,
+/// so a browse of three or more kinds keeps its `(Type, TopParentId)` seek
+/// instead of a `MULTI-INDEX OR` over every row of every library in scope.
 fn push_item_version_or_folder_matching(
     qb: &mut QueryBuilder<Sqlite>,
     matches: &dyn Fn(&mut QueryBuilder<Sqlite>, &str),
@@ -1691,13 +1699,13 @@ fn push_item_version_or_folder_matching(
         i32::from(LinkedChildType::LinkedAlternateVersion)
     );
     qb.push(
-        r#"((bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "MediaStreamInfos" ms WHERE ms."ItemId" = bi."Id" AND "#,
+        r#"((+bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "MediaStreamInfos" ms WHERE ms."ItemId" = bi."Id" AND "#,
     );
     matches(qb, "ms");
     qb.push(r#") OR bi."Id" IN ("#);
     push_primary_versions_matching(qb, matches);
     qb.push(
-        r#"))) OR (bi."IsFolder" = 1 AND bi."Id" IN (WITH RECURSIVE matched("Id") AS (SELECT ms."ItemId" FROM "MediaStreamInfos" ms WHERE "#,
+        r#"))) OR (+bi."IsFolder" = 1 AND bi."Id" IN (WITH RECURSIVE matched("Id") AS (SELECT ms."ItemId" FROM "MediaStreamInfos" ms WHERE "#,
     );
     matches(qb, "ms");
     qb.push(" UNION ");
@@ -3164,6 +3172,96 @@ mod tests {
                 "IsResumable={want}: {plan:#?}"
             );
         }
+    }
+
+    /// The `IsFolder` disjuncts of `append_resolution_predicate` (`IsHD` /
+    /// `Is4K`) and `push_item_version_or_folder_matching` (`HasSubtitles`,
+    /// `SubtitleLanguages`, `AudioLanguages`) on a three-kind browse over two
+    /// libraries: every access of the page's own `bi` row is its
+    /// `(Type, TopParentId)` seek or the hydration's primary key. Unpinned,
+    /// three kinds turn the disjuncts into a `MULTI-INDEX OR` over
+    /// `IX_BaseItems_TopParentId_IsFolder_…`, whose two halves are every row of
+    /// every library in scope. The roll-ups' own `AncestorIds` /
+    /// `LinkedChildren` index ORs are theirs to keep.
+    #[tokio::test]
+    async fn the_media_filters_keep_the_type_seek_over_three_kinds() {
+        use sqlx::{Execute, Row};
+        type Shape = (&'static str, fn(&mut InternalItemsQuery));
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5531)).await;
+        let browse = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::BoxSet,
+            ],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x5532), uuid::Uuid::from_u128(0x5533)],
+            limit: Some(100),
+            ..Default::default()
+        };
+        let shapes: [Shape; 9] = [
+            ("IsHD=true", |f| f.is_hd = Some(true)),
+            ("IsHD=false", |f| f.is_hd = Some(false)),
+            ("Is4K=true", |f| f.is_4k = Some(true)),
+            ("IsHD=true&Is4K=true", |f| {
+                f.is_hd = Some(true);
+                f.is_4k = Some(true);
+            }),
+            ("HasSubtitles=true", |f| f.has_subtitles = Some(true)),
+            ("HasSubtitles=false", |f| f.has_subtitles = Some(false)),
+            ("SubtitleLanguages=eng", |f| {
+                f.subtitle_languages = vec!["eng".to_owned()];
+            }),
+            ("AudioLanguages=eng", |f| {
+                f.audio_languages = vec!["eng".to_owned()];
+            }),
+            ("AudioLanguages=und", |f| {
+                f.audio_languages = vec!["und".to_owned()];
+            }),
+        ];
+        let mut lost = Vec::new();
+        for (label, set) in shapes {
+            let mut filter = browse.clone();
+            set(&mut filter);
+            let mut builder = build_query(&filter, QueryShape::FullRows);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            let type_seek = |d: &str| {
+                d.starts_with("SEARCH bi USING INDEX IX_BaseItems_Type_TopParentId_")
+                    && d.contains("(Type=? AND TopParentId=?)")
+            };
+            let bi: Vec<&String> = plan
+                .iter()
+                .filter(|d| d.starts_with("SEARCH bi ") || d.starts_with("SCAN bi"))
+                .collect();
+            if !bi.iter().any(|d| type_seek(d))
+                || !bi.iter().all(|d| {
+                    type_seek(d)
+                        || *d == "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"
+                })
+                || plan
+                    .iter()
+                    .any(|d| d.contains("IX_BaseItems_TopParentId_IsFolder_"))
+            {
+                lost.push(format!("{label}: {plan:#?}"));
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "lost the (Type, TopParentId) seek:\n{}",
+            lost.join("\n")
+        );
     }
 
     /// The statement `GetLatestItemList` sends: grouped-threshold subquery
