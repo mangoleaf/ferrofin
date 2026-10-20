@@ -612,6 +612,17 @@ pub(crate) fn runtime_is_folder(item: &BaseItemEntity) -> bool {
     }
 }
 
+/// A leaf's played numbers — `BaseItem.FillUserDataDtoValues` (v12.2
+/// BaseItem.cs:2746-2767): a positive resume position over a known runtime
+/// becomes `PlayedPercentage`.
+pub(crate) fn fill_leaf_played_percentage(ud: &mut UserItemDataDto, run_time_ticks: Option<i64>) {
+    if ud.playback_position_ticks > 0
+        && let Some(runtime) = run_time_ticks.filter(|rt| *rt > 0)
+    {
+        ud.played_percentage = Some(percent_of_ticks(ud.playback_position_ticks, runtime));
+    }
+}
+
 /// A folder's played numbers from its leaf counts — the `SupportsPlayedStatus`
 /// half of `Folder.FillUserDataDtoValues` (v12.2 Folder.cs:2067-2081).
 ///
@@ -2246,11 +2257,8 @@ impl FerrofinDtoService {
                 // (Folder.cs:2024), so a by-name artist never gets one.
                 if !kinds::is_folder(kind)
                     && let Some(ud) = dto.user_data.as_mut()
-                    && ud.playback_position_ticks > 0
-                    && let Some(runtime) = item.run_time_ticks.filter(|rt| *rt > 0)
                 {
-                    ud.played_percentage =
-                        Some(percent_of_ticks(ud.playback_position_ticks, runtime));
+                    fill_leaf_played_percentage(ud, item.run_time_ticks);
                 }
                 // Folder UserData carries UnplayedItemCount = unplayed leaf
                 // descendants; leaf items leave it unset. The branch keys on the
