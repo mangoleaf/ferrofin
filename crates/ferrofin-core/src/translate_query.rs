@@ -694,7 +694,20 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 
     if let Some(is_folder) = filter.is_folder {
-        qb.push(r#" AND bi."IsFolder" = "#).push_bind(is_folder);
+        // `+`: a plan pin for the `DescendantOfId` shape. Its descendant set
+        // (`append_linked_descendant_predicate`) is one container's contents,
+        // so it must drive the statement, reaching `BaseItems` by id — as
+        // upstream's materialized `WhereOneOrMany(descendantIds, b => b.Id)`
+        // does. Left to itself SQLite seeds from `IX_BaseItems_IsFolder_…`
+        // (`IsFolder=?`), every non-folder row in the library, and probes the
+        // set per row: ~10 ms per leaf count of one series on the bench
+        // library against ~0.05 ms driven by the set. Other shapes keep the
+        // plain term, which their own plans may use.
+        if filter.descendant_of_id.is_some() {
+            qb.push(r#" AND +bi."IsFolder" = "#).push_bind(is_folder);
+        } else {
+            qb.push(r#" AND bi."IsFolder" = "#).push_bind(is_folder);
+        }
     }
 
     append_type_filters(qb, filter);
