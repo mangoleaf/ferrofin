@@ -957,17 +957,16 @@ fn container_of(item: &BaseItemEntity) -> Option<String> {
         .filter(|ext| !ext.is_empty())
 }
 
-/// A stable `ETag` for a static media source.
+/// The `ETag` of a static (file) media source.
 ///
-/// Mirrors Jellyfin's `BaseItem.GetEtag`, which MD5-hashes a pipe-joined value
-/// list (there, the item's `DateLastSaved.Ticks`) and renders it as a 32-char
-/// dashless hex string (`Guid.ToString("N")`). Ferrofin hashes the item id plus
-/// its last-modified time, so the tag changes whenever the item's media does.
-/// The MD5-over-UTF-16LE helper is the same one Jellyfin uses (`GetMD5`).
+/// Port of `BaseItem.GetVersionInfo` (v12.2 `BaseItem.cs:1226-1229`):
+/// `DateModified.Ticks.ToString(InvariantCulture).GetMD5().ToString("N")`, the
+/// MD5 of the UTF-16LE decimal tick count in .NET `Guid` byte order, as 32
+/// dashless hex digits. An unset `DateModified` is `DateTime.MinValue`, 0 ticks.
+/// This is not the DTO `Etag` (`BaseItem.GetEtag`, over `DateLastSaved`).
 fn source_etag(item: &BaseItemEntity) -> String {
-    let modified = item.date_modified.map_or(0, |d| d.timestamp_millis());
-    let input = format!("{}|{modified}", item.id);
-    ferrofin_common::extensions::get_md5(&input)
+    let ticks = crate::chapter_image_extractor::date_modified_ticks(item.date_modified);
+    ferrofin_common::extensions::get_md5(&ticks.to_string())
         .simple()
         .to_string()
 }
@@ -3441,11 +3440,37 @@ mod tests {
         assert_eq!(source.default_audio_stream_index, Some(1));
         // Total bitrate = sum of the internal streams.
         assert_eq!(source.bitrate, Some(4_128_000));
-        // ETag is a 32-char dashless MD5 hex, stable for the same id+modified.
+        // ETag is a 32-char dashless MD5 hex, stable for the same DateModified.
         let etag = source.e_tag.expect("etag");
         assert_eq!(etag.len(), 32);
         assert!(etag.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(source_etag(&item), etag);
+    }
+
+    /// `BaseItem.GetVersionInfo` (v12.2 `BaseItem.cs:1226-1229`): a file source's
+    /// `ETag` is `DateModified.Ticks.ToString().GetMD5().ToString("N")`. The first
+    /// case is a stream fixture's `DateModified`: Jellyfin 12.2 served a tag starting
+    /// `39ef891c` for it, and the full value is that formula computed
+    /// independently. An unset `DateModified` is `DateTime.MinValue`, 0 ticks.
+    #[rstest::rstest]
+    #[case::jellyfin_known_answer(
+        chrono::DateTime::from_timestamp(1_788_386_986, 261_738_800),
+        "39ef891cc16ec4f86777a8768b4aba77"
+    )]
+    #[case::unset_is_zero_ticks(None, "543b6ca4c9f21c87d81daf7a932499c0")]
+    fn static_source_etag_is_md5_of_date_modified_ticks(
+        #[case] date_modified: Option<chrono::DateTime<chrono::Utc>>,
+        #[case] expected: &str,
+    ) {
+        let item = BaseItemEntity {
+            id: "a54e1a6d-3bd5-4c6d-9c1b-5b0f4f7f8e21".to_owned(),
+            path: Some("/media/stream.mkv".to_owned()),
+            media_type: Some("Video".to_owned()),
+            date_modified,
+            ..Default::default()
+        };
+        let source = FerrofinMediaSourceManager::static_source(&item, Vec::new(), Vec::new());
+        assert_eq!(source.e_tag.as_deref(), Some(expected));
     }
 
     #[test]

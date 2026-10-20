@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use common::CapturingLogger;
 use ferrofin_networking::net_utils;
@@ -18,6 +18,14 @@ fn split(s: &str, sep: char) -> Vec<String> {
 }
 
 const MOCK_INTERFACES: &str = "192.168.1.208/24,-16,eth16|200.200.200.200/24,11,eth11";
+
+/// Stands in for DNS, as [`MOCK_INTERFACES`] stands in for the host's
+/// interfaces: `jellyfin.org` is a public address (from `TEST-NET-3`), and
+/// every other name, `invalid.domain.test` included, resolves to nothing.
+/// Upstream resolves `jellyfin.org` live, so its cases need working DNS.
+fn fake_dns(host: &str) -> Option<Vec<IpAddr>> {
+    (host == "jellyfin.org").then(|| vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))])
+}
 
 /// `IgnoreVirtualInterfaces`.
 #[rstest]
@@ -250,10 +258,11 @@ fn test_bind_interfaces(
         enable_ipv4: true,
         ..Default::default()
     };
-    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
+    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES).with_resolver(fake_dns);
 
-    // Check to see if DNS resolution is working. If not, skip test.
-    if net_utils::try_parse_host(source, true, ipv6enabled).is_none() {
+    // Upstream skips a source DNS cannot resolve (`invalid.domain.test`); with
+    // `fake_dns` that is every name but `jellyfin.org`.
+    if net_utils::try_parse_host_with(source, true, ipv6enabled, fake_dns).is_none() {
         return;
     }
 
@@ -340,7 +349,7 @@ fn test_bind_interface_overrides(
         published_server_uri_by_subnet: vec![published_servers.to_owned()],
         ..Default::default()
     };
-    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
+    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES).with_resolver(fake_dns);
 
     let mut result = result.to_owned();
     if let Some(result_obj) = nm.try_parse_interface(&result) {

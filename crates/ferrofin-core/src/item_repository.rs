@@ -1702,7 +1702,8 @@ impl FerrofinItemRepository {
         qb.push(r#") AS bi WHERE bi."rep_rank" = 1"#);
         // C# `GetItemValues` runs the same `ApplyOrder(query, filter, context)`
         // the main browse does, so the caller's `sortBy`/`sortOrder` apply and
-        // the no-`sortBy` default is `OrderBy(e => e.SortName)` — not `Name`.
+        // the no-`sortBy` default is `OrderBy(e => e.SortName)` — not `Name` —
+        // or, with a `searchTerm`, the relevance rank alone.
         // It runs on the COLLAPSED set (`ApplyOrder` is applied to the query
         // over `representativeIds`, ByName.cs:232-236), which is why it is
         // pushed at this level and not inside the derived table. Every
@@ -7134,6 +7135,92 @@ mod tests {
         let w = repository.get_genres(&wild).await.expect("wild");
         assert_eq!(w.items.len(), 1);
         assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
+    }
+
+    /// Gives the named rows a `SortName`/`CleanName` (the lowercased name) and
+    /// the `DateCreated` of their position in `oldest_first`, so a sort by
+    /// `DateCreated` and a sort by name disagree.
+    async fn date_rows_by_name(db: &Database, oldest_first: &[&str]) {
+        for (day, name) in (1..).zip(oldest_first) {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "SortName" = lower("Name"), "CleanName" = lower("Name"),
+                   "DateCreated" = ?1 WHERE "Name" = ?2"#,
+            )
+            .bind(format!("2020-01-{day:02} 00:00:00"))
+            .bind(*name)
+            .execute(db.writer())
+            .await
+            .expect("date row");
+        }
+    }
+
+    /// The by-name search order is v12.2 `ApplyOrder`'s: relevance, then the
+    /// caller's `sortBy`. 10.11.8 put `SortName, Name` between the two, so
+    /// `/Genres?searchTerm=…&sortBy=DateCreated` came back in name order within
+    /// each relevance band.
+    #[tokio::test]
+    async fn by_name_search_orders_equal_relevance_hits_by_the_callers_sort() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xA101);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Carrier").await;
+        // Name order is Alpha, Bravo, Charlie; creation order is the reverse.
+        let oldest_first = ["Blade Charlie", "Blade Bravo", "Blade Alpha"];
+        for genre in oldest_first {
+            seed_item_genre(&db, movie, genre).await;
+        }
+        date_rows_by_name(&db, &oldest_first).await;
+
+        let genres = repo(&db)
+            .get_genres(&InternalItemsQuery {
+                search_term: Some("blade".to_owned()),
+                order_by: vec![(ItemSortBy::DateCreated, SortOrder::Ascending)],
+                ..Default::default()
+            })
+            .await
+            .expect("genres");
+        let names: Vec<_> = genres
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.as_deref())
+            .collect();
+        assert_eq!(names, oldest_first);
+    }
+
+    /// The same v12.2 rule on the item query (`/UserItems/Resume?searchTerm=…`
+    /// orders by `DatePlayed` this way; `/Items` leads its keys with `SortName`
+    /// in the handler): the relevance band leads, the caller's key orders
+    /// within it.
+    #[tokio::test]
+    async fn item_search_orders_equal_relevance_hits_by_the_callers_sort() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+
+        let db = test_db().await;
+        // "Blade" is the exact match (band 0) and stays first whatever the
+        // sort; the other three share the word-prefix band.
+        let oldest_first = ["Blade Alpha", "Blade Bravo", "Blade", "Blade Charlie"];
+        for (n, name) in (0xA201_u128..).zip(oldest_first) {
+            seed_named_item(&db, Uuid::from_u128(n), BaseItemKind::Movie, name).await;
+        }
+        date_rows_by_name(&db, &oldest_first).await;
+
+        let found = repo(&db)
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                search_term: Some("blade".to_owned()),
+                order_by: vec![(ItemSortBy::DateCreated, SortOrder::Descending)],
+                ..Default::default()
+            })
+            .await
+            .expect("items");
+        let names: Vec<_> = found.iter().filter_map(|i| i.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            ["Blade", "Blade Charlie", "Blade Bravo", "Blade Alpha"]
+        );
     }
 
     #[tokio::test]

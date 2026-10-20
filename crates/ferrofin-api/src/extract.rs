@@ -124,6 +124,21 @@ impl ProblemDetails {
         }
     }
 
+    /// A 400 naming one member of a body that bound but failed a validation
+    /// attribute (`[StringLength]`, …): ASP.NET keys it by the member name
+    /// alone, with no `body` entry, because the parameter itself bound.
+    #[must_use]
+    pub fn member_validation(member: &str, message: impl Into<String>) -> Self {
+        let mut errors = BTreeMap::new();
+        errors.insert(member.to_owned(), vec![message.into()]);
+        Self {
+            type_: VALIDATION_TYPE,
+            title: VALIDATION_TITLE,
+            status: StatusCode::BAD_REQUEST.as_u16(),
+            errors: Some(errors),
+        }
+    }
+
     /// The rejection for an absent, blank or `null` body.
     #[must_use]
     fn empty_body() -> Self {

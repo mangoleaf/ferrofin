@@ -171,7 +171,7 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
 | that item's id in its metadata folder (`/<2>/<id>/`) in `Chapters.ImagePath` | the same repair moves the item's metadata folder, chapter images included, to the new id, as Jellyfin 12.2 does; any other path change still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
-| `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
+| `ItemValues.CleanValue` is checked on its own: it must stay what it was or become what `Value` derives to | 0031 and the boot repair `repair_clean_values` (12.0's `RefreshCleanNamesAsync`) re-derive it with `get_clean_value`, ported in `clean_value.py` (needs PyICU) and proven against the Rust oracle; a value NULLed or corrupted by adoption still fails |
 | a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
 | a `Devices` row's `Id`, `AccessToken`, `IsActive` and `DateCreated` (as an instant, since 0007 rewrites it) are compared, except on the `DeviceId`s the harness logs in from (`synthetic-login-*`, `account-login-*`) | authenticating again from a device replaces its row with a new id, token, activation and creation date, as Jellyfin does; the harness does this only from its own `DeviceId`s, so on every other device a reset token or a deactivated device fails. `run.sh` logs in from none and compares them all |
 | rows that share a key are a multiset, not one row | `(UserId, DeviceId)` is not unique, so losing or changing one of two devices for the same user and device must still fail |
@@ -281,7 +281,8 @@ The probes run as the synthetic administrator, which has a **Jellyfin Web** sess
 `Devices` and an **API key** in `ApiKeys`; `oracle/user.txt` records it, and `--user NAME`
 or `ADOPTION_USER` overrides. Credentials are read from the copy at run time and never
 written. The builder and runner need Docker, Python 3, Pillow (`python3-pil` on
-Debian/Ubuntu), `sqlite3`, `jq` and `curl`. Media encoding uses the Jellyfin image's FFmpeg.
+Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3`, `jq` and
+`curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
@@ -524,7 +525,7 @@ verify that unlisted future policy/configuration fields are compared.
 
 ### Running the synthetic matrix
 
-Requires Docker, Python 3, Pillow, Bash, and jq. Media encoding uses
+Requires Docker, Python 3, Pillow, PyICU (`python3-icu`), Bash, and jq. Media encoding uses
 `/usr/lib/jellyfin-ffmpeg/ffmpeg` from the official Jellyfin container; no host
 FFmpeg installation is needed. Docker must be available to the invoking user.
 Use a fresh fixture directory on a local disk, outside the checkout.
