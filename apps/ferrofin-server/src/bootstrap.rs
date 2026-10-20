@@ -1119,6 +1119,7 @@ async fn validate_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::CapturedLogs;
 
     #[test]
     fn derive_ffprobe_replaces_basename_in_dir() {
@@ -1338,25 +1339,6 @@ mod tests {
         );
     }
 
-    /// An in-memory `MakeWriter` capturing fmt-layer output for assertions.
-    #[derive(Clone, Default)]
-    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn json_stdout_line_carries_trace_id_for_in_span_events() {
         // The headline correlation requirement: with the OTel layer active and the
@@ -1368,7 +1350,7 @@ mod tests {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let provider = SdkTracerProvider::builder()
             .with_sampler(Sampler::AlwaysOn)
             .with_simple_exporter(InMemorySpanExporter::default())
@@ -1388,7 +1370,7 @@ mod tests {
             tracing::info!("inside the request");
         });
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         let line = out
             .lines()
             .find(|l| l.contains("inside the request"))
@@ -1516,7 +1498,7 @@ mod tests {
         // sink). catch_unwind still fires the hook on this thread, where the scoped
         // subscriber captures it.
         use tracing_subscriber::layer::SubscriberExt as _;
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -1526,7 +1508,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let _ = std::panic::catch_unwind(|| panic!("kaboom"));
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         assert!(
             out.contains("panicked"),
             "hook emitted the error line: {out}"

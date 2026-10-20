@@ -57,6 +57,8 @@ use ferrofin_traits::media_encoding::{
 };
 use ferrofin_traits::system::ServerApplicationPaths as _;
 
+use crate::encoding_options::EncodingOptionsReader;
+
 /// The default HLS segment length, in seconds.
 ///
 /// Matches Jellyfin's `StreamState.SegmentLength` default of `3` for H.264/HEVC
@@ -114,6 +116,8 @@ pub struct FerrofinStreamStatePlanner {
     /// The server config manager — read for the persisted `encoding` options
     /// (hardware-acceleration type, presets) on each plan.
     config: Arc<dyn ServerConfigurationManager>,
+    /// Reads `encoding.json` for each plan and reports a broken file once.
+    encoding_reader: EncodingOptionsReader,
     paths: Arc<FerrofinServerApplicationPaths>,
     /// The subtitle encoder — resolves a burned **text** subtitle to its small
     /// extracted/external file (cached across requests), so the `subtitles`
@@ -171,6 +175,7 @@ impl FerrofinStreamStatePlanner {
             encoder,
             encoding_helper,
             config,
+            encoding_reader: EncodingOptionsReader::new("transcode planner"),
             paths,
             subtitles,
             supports_tonemapx,
@@ -234,10 +239,10 @@ impl FerrofinStreamStatePlanner {
 
     /// The effective [`EncodingOptions`] for this planner, read from the persisted
     /// named `encoding` config (falling back to [`EncodingOptions::default`] when
-    /// unset or unreadable). This is what carries the user's hardware-acceleration
-    /// choice (e.g. NVENC) into the transcode arg builder.
+    /// unset or unreadable, and saying so). This is what carries the user's
+    /// hardware-acceleration choice (e.g. NVENC) into the transcode arg builder.
     async fn encoding_options(&self) -> EncodingOptions {
-        self.config.get_encoding_options().await.unwrap_or_default()
+        self.encoding_reader.read(self.config.as_ref()).await
     }
 
     /// Resolves the [`MediaSourceInfo`] for `request` through
@@ -2608,6 +2613,34 @@ mod tests {
         );
         planner.paths = paths;
         (planner, file)
+    }
+
+    /// A broken `encoding.json` plans on the defaults, as upstream's
+    /// `BaseConfigurationManager.LoadConfiguration` does, which turns a
+    /// configured hardware accelerator off. That must leave a trace naming the
+    /// file — once, not once per job (LOGGING.md §1).
+    #[tokio::test]
+    async fn a_broken_encoding_file_is_warned_about_once_with_its_path() {
+        let root = tempfile::tempdir().expect("owned configuration");
+        let (planner, file) = planner_with_persisted_encoding(Vec::new(), root.path()).await;
+        std::fs::create_dir_all(file.parent().expect("named dir")).expect("named dir");
+        std::fs::write(&file, b"{ \"HardwareAccelerationType\": \"nvenc\", }")
+            .expect("encoding.json");
+
+        let logs = crate::test_logs::CapturedLogs::default();
+        let guard = logs.install();
+        let first = planner.encoding_options().await;
+        let second = planner.encoding_options().await;
+        drop(guard);
+
+        assert_eq!(first, EncodingOptions::default());
+        assert_eq!(second, EncodingOptions::default());
+        let warnings = logs.lines_at("WARN");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains(&file.display().to_string()),
+            "{warnings:#?}"
+        );
     }
 
     #[tokio::test]
