@@ -1,5 +1,6 @@
 """Reporter correctness only: python3 -m unittest discover -s bench -p test_report.py."""
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 import urllib.error
 
 import gate
+import oracle
 import report
 import coldstart
 import mem_sample
@@ -338,7 +340,7 @@ class ReportTests(unittest.TestCase):
         self.edit(self.b / 'ferrofin/ttfs.json', lambda x: x.update(direct=x['direct'][:1]))
         m = self.build(self.a, self.b)
         for name, cells in m['ttfs']:
-            if name in report.README_TTFS:
+            if name.startswith(('cold start', 'direct-play')):  # the two rows edited above
                 self.assertIn('successful repetitions', cells['ferrofin'].flag)
                 self.assertIsNotNone(cells['ferrofin'].median)
 
@@ -543,6 +545,12 @@ class ReportTests(unittest.TestCase):
         model=self.build()
         cell=dict(model['ttfs'])['HLS first segment (forced transcode)']['ferrofin']
         self.assertIn('parameters differ',cell.flag)
+
+    def test_hls_headlines_the_readme_unless_its_transcode_differs(self):
+        row = lambda: next(line for line in self.readme().splitlines() if line.startswith('| HLS first segment'))
+        self.assertNotIn('⚠', row())
+        self.edit(self.a/'ferrofin/ttfs.json', lambda t: t['hls'][1].update(transcoding_url='/master.m3u8?VideoCodec=hevc'))
+        self.assertIn('— ⚠', row())
 
     def test_stream_probe_failure_in_later_run_is_not_ignored(self):
         self.edit(self.b/'run.json', lambda m:m.update(streaming_validation=1))
@@ -774,6 +782,49 @@ class BoundedEvidenceTests(unittest.TestCase):
         response['types']['$.Items[1].Name'] = 'null'
         self.log(self.root/'shape.log', [response])
         self.assertIn('per-item', report.comparable(report.load_shape(self.root), original, ['movies:items']))
+
+    def test_similar_ties_compare_only_what_upstream_specifies(self):
+        # Upstream breaks equal similarity scores arbitrarily (series: randomly), so which
+        # items fill the limit, and their own fields, cannot match; the response still must.
+        response = {'shape': 'detail:similar', 'key': 'pick', 'status': 200, 'count': 2,
+                    'ids': ['a', 'b'], 'total': 2,
+                    'types': {'$.TotalRecordCount': 'number', '$.Items[0].Name': 'string',
+                              '$.Items[1].ImageTags.Logo': 'string'}}
+        self.log(self.root/'shape.log', [response])
+        original = report.load_shape(self.root)
+        response['ids'] = ['c', 'a']
+        response['types'] = {'$.TotalRecordCount': 'number', '$.Items[0].Name': 'string',
+                             '$.Items[1].Name': 'string'}
+        self.log(self.root/'shape.log', [response])
+        self.assertIsNone(report.comparable(report.load_shape(self.root), original, ['detail:similar']))
+        response['types']['$.TotalRecordCount'] = 'string'
+        self.log(self.root/'shape.log', [response])
+        self.assertIn('fields/types', report.comparable(report.load_shape(self.root), original, ['detail:similar']))
+        response['types']['$.TotalRecordCount'] = 'number'
+        response.update(count=1, ids=['c'])
+        self.log(self.root/'shape.log', [response])
+        self.assertIn('items', report.comparable(report.load_shape(self.root), original, ['detail:similar']))
+
+    def test_posters_of_similar_items_compare_by_count(self):
+        def detail(similar, posters, last=None):
+            key = lambda name, i, path: json.dumps([0, name, i, 'GET', path, {}])
+            records = [{'shape': 'detail:similar', 'key': key('detail:similar', 0, '/Items/m/Similar'),
+                        'status': 200, 'count': len(similar), 'ids': similar, 'types': {}}]
+            records += [{'shape': 'detail:image', 'key': key('detail:image', i, f'/Items/{p}/Images/Primary'),
+                         'status': 200, 'content_type': 'image/jpeg', 'bytes': 9} for i, p in enumerate(posters)]
+            records[-1].update(last or {})  # the last poster is always a Similar item's
+            self.log(self.root/'shape.log', records)
+            return report.load_shape(self.root)
+        oracle = detail(['x', 'y'], ['m', 'x', 'y'])
+        for name in ('detail:image', 'image'):
+            self.assertIsNone(report.comparable(detail(['y', 'z'], ['m', 'z', 'y']), oracle, [name]))
+            self.assertIn('picks differ', report.comparable(detail(['x', 'y'], ['n', 'x', 'y']), oracle, [name]))
+            self.assertIn('picks differ', report.comparable(detail(['x', 'y'], ['m', 'x']), oracle, [name]))
+            self.assertIn('status', report.comparable(detail(['y', 'z'], ['m', 'z', 'y'], {'status': 404}), oracle, [name]))
+            self.assertIn('empty', report.comparable(detail(['y', 'z'], ['m', 'z', 'y'], {'bytes': 0}), oracle, [name]))
+        self.assertIsNone(report.comparable(detail(['y', 'z'], ['m', 'z', 'y']), oracle, ['detail:similar']))
+        for similar in (['m', 'z'], ['z', 'z']):
+            self.assertIn('seed or duplicate', report.comparable(detail(similar, ['m', 'z', 'y']), oracle, ['detail:similar']))
 
     def test_pool_export_uses_source_ids_and_fixed_cutoff(self):
         api = Mock()
@@ -1251,6 +1302,116 @@ class GateTests(unittest.TestCase):
         self.assertEqual(noise['proposed_cells'], {})
         self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
         self.assertIn('Noise per cell', (aa / 'report.html').read_text())
+
+    def test_a_gate_run_refuses_a_stale_oracle_pin_before_anything_starts(self):
+        out = self.root / 'session'
+        with patch.object(gate.oracle, 'check', return_value=({'tag': 'v12.2', 'image': 'jf@sha256:x'},
+                                                              'Jellyfin v12.3 is out; the oracle pin is v12.2')), \
+                patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
+            with self.assertRaisesRegex(SystemExit, 'v12.3 is out'):
+                gate.main(['ab', 'old', 'new', '--out', str(out)])
+        self.assertFalse(out.exists())
+
+    def test_a_gate_run_records_the_oracle_it_checked_in_gate_json(self):
+        out = self.root / 'session'
+        pin = {'tag': 'v12.2', 'image': 'jf@sha256:x'}
+        with patch.object(gate.oracle, 'check', return_value=(pin, None)), \
+                patch.object(gate, 'image_ref', return_value='sha256:img'), \
+                patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
+            self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out)]), 0)
+        self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
+
+    def test_the_session_report_names_the_oracle(self):
+        out = self.session('ab', [10, 10, 10, 10, 10, 10])
+        self.edit(out / 'gate.json', lambda p: p.update(oracle={'tag': 'v12.2', 'image': 'jf@sha256:abc'}))
+        gate.render(str(out))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', (out / 'report.html').read_text())
+
+
+class OracleTests(unittest.TestCase):
+    """The Jellyfin oracle pin (oracle.py): release-tag parsing, the stale-pin check, and where it shows."""
+    write, make_run, shapes = ReportTests.write, ReportTests.make_run, ReportTests.shapes
+    LS_REMOTE = '\n'.join(f'{"0" * 40}\trefs/tags/{t}' for t in (
+        'v10.11.8', 'v10.11.11', 'v12.0-rc7', 'v12.0', 'v12.0^{}', 'v12.1', 'v12.2', 'v12.3-rc1', 'nightly'))
+
+    def test_release_tags_skip_release_candidates_peeled_refs_and_non_versions(self):
+        self.assertEqual(sorted(oracle.release_tags(self.LS_REMOTE), key=oracle.version),
+                         ['v10.11.8', 'v10.11.11', 'v12.0', 'v12.1', 'v12.2'])
+        self.assertEqual(oracle.latest(oracle.release_tags(self.LS_REMOTE)), 'v12.2')
+
+    def test_versions_compare_numerically_and_ignore_trailing_zeros(self):
+        self.assertLess(oracle.version('v10.11.8'), oracle.version('v10.11.11'))
+        self.assertLess(oracle.version('v12.9'), oracle.version('v12.10'))
+        self.assertEqual(oracle.version('v12.2'), oracle.version('v12.2.0'))
+
+    def check(self, upstream, *tags):
+        listing = '\n'.join(f'{"0" * 40}\trefs/tags/{t}' for t in tags)
+        with patch.object(oracle, 'upstream_tag', return_value=upstream), \
+                patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+            return oracle.check(ls_remote=lambda: listing)
+
+    def test_a_pin_behind_the_latest_release_is_a_problem_and_equal_or_newer_is_not(self):
+        info, problem = self.check('v12.2', 'v12.1', 'v12.2', 'v12.3')
+        self.assertEqual(info, {'tag': 'v12.2', 'image': 'jf@sha256:abc'})
+        self.assertIn('Jellyfin v12.3 is out', problem)
+        self.assertIsNone(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3-rc1')[1])
+        self.assertIsNone(self.check('v12.2.0', 'v12.2')[1])
+        self.assertIsNone(self.check('v12.3', 'v12.2')[1])
+
+    def test_a_failed_or_empty_lookup_is_a_problem(self):
+        failures = (OSError('network unreachable'), subprocess.TimeoutExpired(['git'], 10),
+                    subprocess.CalledProcessError(128, ['git'], stderr='fatal: unable to access\n'))
+
+        for failure, reason in zip(failures, ('network unreachable', 'timed out', 'fatal: unable to access')):
+            def lookup():
+                raise failure
+            with self.subTest(reason), patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                    patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+                self.assertIn(reason, oracle.check(ls_remote=lookup)[1])
+        with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+            self.assertIn('no Jellyfin release tags', oracle.check(ls_remote=lambda: '')[1])
+
+    def test_matches_accepts_only_the_oracle_release_the_pinned_image_reports(self):
+        with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(oracle.main(['matches', '12.2.0']), 0)
+            self.assertEqual(oracle.main(['matches', '12.1.0']), 1)
+            self.assertEqual(oracle.main(['matches', '12.2.0-beta']), 1)
+        self.assertIn('reports Jellyfin 12.1.0, not the oracle v12.2', err.getvalue())
+
+    def test_gate_refuses_and_an_ad_hoc_run_warns_and_continues(self):
+        stale = ({'tag': 'v12.2', 'image': 'jf@sha256:abc'}, 'Jellyfin v12.3 is out')
+        for flags, code in (([], 0), (['--gate'], 1)):
+            with self.subTest(flags), patch.object(oracle, 'check', return_value=stale), \
+                    patch('sys.stdout', new_callable=io.StringIO) as out, \
+                    patch('sys.stderr', new_callable=io.StringIO) as err:
+                self.assertEqual(oracle.main(['check', *flags]), code)
+            self.assertEqual(json.loads(out.getvalue()), stale[0])
+            self.assertIn('v12.3 is out', err.getvalue())
+            self.assertIn('refusing' if code else 'warning', err.getvalue())
+
+    def test_upstream_tag_is_read_from_the_rust_source_and_fails_clearly_without_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / oracle.UPSTREAM_SOURCE
+            src.parent.mkdir(parents=True)
+            src.write_text('/// The tag.\npub const UPSTREAM_TAG: &str = "v12.2";\n')
+            self.assertEqual(oracle.upstream_tag(tmp), 'v12.2')
+            src.write_text('pub const OTHER: &str = "v1";\n')
+            with self.assertRaisesRegex(ValueError, 'UPSTREAM_TAG'):
+                oracle.upstream_tag(tmp)
+        self.assertRegex(oracle.upstream_tag(), r'^v\d+(\.\d+)*$')  # the real source still matches
+        self.assertIn('@sha256:', oracle.pinned_image())
+
+    def test_a_run_report_names_the_oracle_tag_and_digest(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        run = self.make_run('r')
+        meta = json.loads((run / 'run.json').read_text())
+        meta['oracle'] = {'tag': 'v12.2', 'image': 'jf@sha256:abc'}
+        (run / 'run.json').write_text(json.dumps(meta))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', report.render_html(report.build([str(run)])))
 
 
 if __name__ == '__main__':
