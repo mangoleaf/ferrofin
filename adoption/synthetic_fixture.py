@@ -99,9 +99,14 @@ class Api:
                 time.sleep(1)
 
     def ready(self, timeout=300):
+        """Wait until the main host has started. Jellyfin 10.11+ first serves a SetupServer
+        while it migrates (SetupServer.cs): it answers /System/Info/Public and 503s everything
+        else, then hands the port over, resetting connections. Only the main host answers
+        /System/Ping, and its /System/Info/Public is 503 until startup completes."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
+                self.get("/System/Ping")
                 self.get("/System/Info/Public")
                 return
             except (OSError, CheckError):

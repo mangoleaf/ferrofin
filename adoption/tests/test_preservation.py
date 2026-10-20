@@ -2,6 +2,7 @@
 
 from contextlib import closing
 import copy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import posixpath
@@ -332,6 +333,39 @@ class OracleExpectationTest(unittest.TestCase):
         upgraded = {'versions': [self.PRIMARY, self.AS_VIDEO]}
         with self.assertRaisesRegex(CheckError, 'serve different versions'):
             expectation('10.11.8', self.baseline, self.oracle, upgraded)
+
+
+class ServerReadyTest(unittest.TestCase):
+    def test_ready_waits_out_the_10_11_setup_server(self):
+        # 10.11's SetupServer answers /System/Info/Public during migrations and 503s the
+        # rest (SetupServer.cs); a seed call sent then is reset at the hand-over (gl-662).
+        # The main host then answers /System/Ping before startup completes.
+        phase = ['setup']
+        answers = {'setup': '/System/Info/Public', 'starting': '/System/Ping'}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200 if phase[0] == 'main' or self.path == answers[phase[0]] else 503)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{}')
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        ready = threading.Thread(target=synthetic_fixture.Api(f'http://127.0.0.1:{server.server_port}').ready,
+                                 kwargs={'timeout': 30}, daemon=True)
+        ready.start()
+        for current in answers:
+            phase[0] = current
+            ready.join(1.5)
+            self.assertTrue(ready.is_alive(), f'ready() returned in the {current} phase')
+        phase[0] = 'main'
+        ready.join(10)
+        self.assertFalse(ready.is_alive())
 
 
 class SeededAdoptionTest(unittest.TestCase):
