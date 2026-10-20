@@ -39,6 +39,28 @@ use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
 #[cfg(test)]
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// Jellyfin's default `FFmpeg:analyzeduration` (`ConfigurationOptions.cs:19`):
+/// how long ffmpeg and ffprobe analyse an input to find its streams, when the
+/// source names no duration of its own.
+pub const DEFAULT_ANALYZE_DURATION: &str = "200M";
+
+/// Jellyfin's default `FFmpeg:probesize` (`ConfigurationOptions.cs:18`): how
+/// much of an input ffmpeg and ffprobe read to find its streams.
+pub const DEFAULT_PROBE_SIZE: &str = "1G";
+
+/// The `-analyzeduration` value upstream picks for an input
+/// (`EncodingHelper.GetFfmpegAnalyzeDurationArg` and
+/// `MediaEncoder.GetExtraArguments`): the source's own `AnalyzeDurationMs` in
+/// microseconds when it is positive, else `configured`. Empty when neither is
+/// set, which omits the flag.
+#[must_use]
+pub fn analyze_duration_value(source_ms: Option<i32>, configured: &str) -> String {
+    match source_ms {
+        Some(ms) if ms > 0 => (i64::from(ms) * 1000).to_string(),
+        _ => configured.to_owned(),
+    }
+}
+
 /// Tunable knobs read from the encoding configuration.
 ///
 /// Groups the handful of `IConfiguration`/`EncodingOptions`-derived values the
@@ -151,18 +173,11 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         let ffmpeg_probe_size = self.config.probe_size.as_deref().unwrap_or_default();
         let source = &request.media_source;
 
-        let mut analyze_duration = String::new();
-        if source.analyze_duration_ms.unwrap_or(0) > 0 {
-            // C# multiplies the millisecond value by 1000 (into microseconds).
-            let micros = i64::from(source.analyze_duration_ms.unwrap_or(0)) * 1000;
-            analyze_duration = format!("-analyzeduration {micros}");
-        } else if !ffmpeg_analyze_duration.is_empty() {
-            analyze_duration = format!("-analyzeduration {ffmpeg_analyze_duration}");
-        }
-
+        let analyze_duration =
+            analyze_duration_value(source.analyze_duration_ms, ffmpeg_analyze_duration);
         let mut extra_args = String::new();
         if !analyze_duration.is_empty() {
-            extra_args = analyze_duration;
+            extra_args = format!("-analyzeduration {analyze_duration}");
         }
 
         if !ffmpeg_probe_size.is_empty() {
@@ -818,6 +833,23 @@ mod tests {
         };
         let extra = enc.get_extra_arguments(&request);
         assert!(extra.contains("-rtsp_transport tcp+udp -rtsp_flags prefer_tcp"));
+    }
+
+    #[rstest::rstest]
+    #[case(Some(3000), "200M", "3000000")]
+    #[case(Some(0), "200M", "200M")]
+    #[case(Some(-1), "200M", "200M")]
+    #[case(None, "200M", "200M")]
+    #[case(None, "", "")]
+    fn analyze_duration_prefers_a_positive_source_value(
+        #[case] source_ms: Option<i32>,
+        #[case] configured: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            super::analyze_duration_value(source_ms, configured),
+            expected
+        );
     }
 
     #[test]
