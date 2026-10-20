@@ -286,8 +286,8 @@ Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are
 90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
-Publishable numbers come from **three** runs — `report.py` takes the median and prints the
-range each cell spanned.
+Publishable numbers (the Jellyfin comparison) come from **three** runs — `report.py` takes
+the median and prints the range each cell spanned.
 
 `bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
 run deliberately. **Measurement gates releases, not PRs** (owner decision 2026-10-16), which
@@ -300,11 +300,14 @@ keeps day-to-day work fast:
     moves until it is frozen for the release;
   - patch releases of the released line come from `main`.
 
-  `RELEASE.md` has the procedure: three full `bench/run.sh` runs on the release commit, plus
-  the previous release's image as a baseline measured in the same window.
-- A latency or memory regression against that baseline blocks the release until it is
-  fixed or the owner accepts it. So does a `⚠` response-shape note the baseline does not
-  have.
+  `RELEASE.md` has the procedure: the interleaved A/B gate
+  (`bench/gate.py ab <previous release image> <candidate>`), Ferrofin only, three pairs.
+  The three-server runs against Jellyfin produce the published tables and never decide a
+  release.
+- A gated cell that regresses past both of its `bench/gate.toml` thresholds in at least 2 of
+  the 3 pairs blocks the release until it is fixed or the owner accepts it. So does a gated
+  cell that cannot be judged because the candidate's responses differ from the previous
+  release's.
 - When chasing a regression, `bench/run.sh --servers ferrofin --only loaded` on two builds is
   the cheap form, skipping Jellyfin.
 
