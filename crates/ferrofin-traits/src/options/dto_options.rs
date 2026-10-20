@@ -118,7 +118,7 @@ pub struct DtoOptions {
 
 impl DtoOptions {
     /// The set of all populatable fields, i.e. every [`ItemFields`] variant
-    /// minus [`DEFAULT_EXCLUDED_FIELDS`]. Mirrors C# `AllItemFields`.
+    /// minus `DEFAULT_EXCLUDED_FIELDS`. Mirrors C# `AllItemFields`.
     #[must_use]
     pub fn all_fields() -> Vec<ItemFields> {
         ALL_ITEM_FIELDS

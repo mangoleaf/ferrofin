@@ -14,9 +14,15 @@ use ferrofin_model::net::mime_types;
 /// Decodes a standard (RFC 4648) base64 string into bytes, returning `None` on
 /// any invalid character.
 ///
-/// Port of the `GetFromBase64Stream` decode the image/user/splashscreen upload
-/// handlers apply to the request body (the workspace has no base64 dependency).
-/// Whitespace is ignored and `=` padding is accepted.
+/// Port of the `FromBase64Transform` decode the image/user/splashscreen and
+/// subtitle upload handlers apply to the request body (the workspace has no
+/// base64 dependency). Whitespace is ignored. `=` is accepted only as trailing
+/// padding, at most two followed by nothing but whitespace, and refused inside
+/// the data, as `Base64.DecodeFromUtf8` refuses it. `FromBase64Transform` also
+/// silently drops a trailing partial group (fewer than four characters): an
+/// unpadded or short padded final group (`aGk`, `aG=`), a third `=`, or a partial
+/// group after the padding. This decodes the final group in full and refuses the
+/// other two (Jellyfin bugs not ported).
 #[must_use]
 pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     fn val(b: u8) -> Option<u8> {
@@ -32,9 +38,20 @@ pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
+    let mut padding = 0u8;
     for &b in input.as_bytes() {
-        if b == b'=' || b.is_ascii_whitespace() {
+        if b.is_ascii_whitespace() {
             continue;
+        }
+        if b == b'=' {
+            padding += 1;
+            if padding > 2 {
+                return None;
+            }
+            continue;
+        }
+        if padding > 0 {
+            return None;
         }
         let v = val(b)?;
         acc = (acc << 6) | u32::from(v);
@@ -82,6 +99,26 @@ mod tests {
         // "hi" == aGk=
         assert_eq!(decode_base64("aGk=").as_deref(), Some(&b"hi"[..]));
         assert_eq!(decode_base64("aG k=\n").as_deref(), Some(&b"hi"[..]));
+    }
+
+    /// `FromBase64Transform` (`Base64.DecodeFromUtf8`) takes `=` only as the
+    /// final padding; inside the data it is invalid (gl-689). The trailing
+    /// partial group upstream silently drops is decoded in full when it is data
+    /// and refused when it is a third `=` or data after the padding.
+    #[rstest::rstest]
+    #[case::empty("", Some(&b""[..]))]
+    #[case::one_padding_char("aGk=", Some(&b"hi"[..]))]
+    #[case::two_padding_chars("aA==", Some(&b"h"[..]))]
+    #[case::longer_padded("aGVsbG8=", Some(&b"hello"[..]))]
+    #[case::unpadded("aGk", Some(&b"hi"[..]))]
+    #[case::whitespace_after_padding("aGk= \r\n", Some(&b"hi"[..]))]
+    #[case::whitespace_between_padding_chars("aA= =", Some(&b"h"[..]))]
+    #[case::padding_inside_a_group("aG=k", None)]
+    #[case::padding_between_groups("aGk=aGk=", None)]
+    #[case::data_after_the_padding("aGk=x", None)]
+    #[case::three_padding_chars("aG===", None)]
+    fn padding_is_accepted_only_at_the_end(#[case] input: &str, #[case] expected: Option<&[u8]>) {
+        assert_eq!(decode_base64(input).as_deref(), expected);
     }
 
     #[test]

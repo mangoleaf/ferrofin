@@ -1041,7 +1041,7 @@ fn sql_of(filter: &InternalItemsQuery, shape: QueryShape) -> (String, usize) {
 
 /// The stream predicate's first and last bytes, as emitted.
 const PREDICATE_HEAD: &str =
-    r#" AND ((bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "MediaStreamInfos" ms"#;
+    r#" AND ((+bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "MediaStreamInfos" ms"#;
 const PREDICATE_TAIL: &str = r#"(SELECT "Id" FROM link_ancestors))))"#;
 
 /// Hot-path guard: with no language the statement carries no trace of the

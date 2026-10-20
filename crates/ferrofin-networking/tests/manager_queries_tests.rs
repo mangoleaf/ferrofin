@@ -79,6 +79,23 @@ fn is_in_local_network_str_accepts_addresses_and_hosts() {
     assert!(!nm.is_in_local_network_str("8.8.8.8"));
 }
 
+/// Stands in for DNS: one LAN name, one public name, nothing else.
+fn stub_dns(host: &str) -> Option<Vec<IpAddr>> {
+    match host {
+        "lan.test" => Some(vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))]),
+        "wan.test" => Some(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]),
+        _ => None,
+    }
+}
+
+#[test]
+fn is_in_local_network_str_resolves_names_with_the_injected_resolver() {
+    let nm = NetworkManager::with_defaults(conf(), MOCK_INTERFACES).with_resolver(stub_dns);
+    assert!(nm.is_in_local_network_str("lan.test"));
+    assert!(!nm.is_in_local_network_str("wan.test"));
+    assert!(!nm.is_in_local_network_str("unknown.test"));
+}
+
 #[test]
 fn update_settings_reapplies_configuration() {
     let mut nm = NetworkManager::with_defaults(conf(), MOCK_INTERFACES);

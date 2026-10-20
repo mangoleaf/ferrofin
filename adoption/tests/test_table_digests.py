@@ -50,6 +50,14 @@ class TableDigests(unittest.TestCase):
         finally:
             conn.close()
 
+    def executemany(self, statement, rows):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.executemany(statement, rows)
+            conn.commit()
+        finally:
+            conn.close()
+
     def failures(self):
         return digests.compare(self.before, digests.snapshot(self.db, self.before))
 
@@ -109,11 +117,68 @@ class TableDigests(unittest.TestCase):
         self.sql("UPDATE ActivityLogs SET DateCreated = '2026-01-02 03:04:06.500'")
         self.assertEqual(len(self.failures()), 1)
 
-    def test_clean_value_is_rederived_0031(self):
-        self.sql("UPDATE ItemValues SET CleanValue = 'rederived'")
+    def test_clean_value_rewrite_to_the_derivation_passes_0031(self):
+        # The boot repair rewrites CleanValue to get_clean_value(Value); a rewrite to that value
+        # is legitimate even though it differs from what the source stored.
+        self.sql("UPDATE ItemValues SET Value = 'Mötley Crüe', CleanValue = 'mötley crüe'")
+        self.before = digests.snapshot(self.db)
+        self.sql("UPDATE ItemValues SET CleanValue = 'motley crue'")  # get_clean_value('Mötley Crüe')
         self.assertEqual(self.failures(), [])
+
+    def test_clean_value_corrupted_to_an_unrelated_value_fails_0031(self):
+        self.sql("UPDATE ItemValues SET CleanValue = 'garbage'")  # Value 'x' derives to 'x'
+        self.assertEqual(self.failures(), ["ItemValues row x CleanValue changed"])
+
+    def test_clean_value_blanked_is_caught_0031(self):
+        # Value 'x' derives to 'x', so a CleanValue NULLed or emptied is adoption damage.
+        self.sql("UPDATE ItemValues SET CleanValue = NULL")
+        self.assertEqual(self.failures(), ["ItemValues row x CleanValue changed"])
+        self.setUp()
+        self.sql("UPDATE ItemValues SET CleanValue = ''")
+        self.assertEqual(self.failures(), ["ItemValues row x CleanValue changed"])
+
+    def test_clean_value_blanked_for_an_all_punctuation_value_passes_0031(self):
+        # An all-punctuation Value derives to '', so the boot repair blanking CleanValue is legitimate.
+        self.sql("UPDATE ItemValues SET Value = '!!!', CleanValue = '!!!'")
+        self.before = digests.snapshot(self.db)
+        self.sql("UPDATE ItemValues SET CleanValue = ''")  # get_clean_value('!!!') == ''
+        self.assertEqual(self.failures(), [])
+
+    def test_clean_value_filled_in_by_the_repair_passes_0031(self):
+        # A source with an empty CleanValue for a real Value: the boot repair fills it in.
+        self.sql("UPDATE ItemValues SET Value = 'Action', CleanValue = ''")
+        self.before = digests.snapshot(self.db)
+        self.sql("UPDATE ItemValues SET CleanValue = 'action'")  # get_clean_value('Action')
+        self.assertEqual(self.failures(), [])
+
+    def test_clean_value_blanked_for_a_whitespace_only_value_passes_0031(self):
+        # The boot repair stores '' for a whitespace-only Value, unlike get_clean_value which keeps it.
+        self.sql("UPDATE ItemValues SET Value = '  ', CleanValue = '  '")
+        self.before = digests.snapshot(self.db)
+        self.sql("UPDATE ItemValues SET CleanValue = ''")  # refresh_clean_values' `want` for '  '
+        self.assertEqual(self.failures(), [])
+
+    def test_a_changed_item_value_still_fails(self):
         self.sql("UPDATE ItemValues SET Value = 'other'")
-        self.assertEqual(len(self.failures()), 1)
+        self.assertEqual(self.failures(), ["ItemValues row x changed"])
+
+    def test_every_legitimate_rederivation_passes(self):
+        # The boot repair sets CleanValue to get_clean_value(Value) for every row, whatever the
+        # source stored, so the rule only fails when the Python derivation disagrees with Rust's
+        # (guarded by test_clean_value.py). Model a 10.11 source and its repaired form.
+        from clean_value import get_clean_value
+
+        values = ["Mötley Crüe: Greatest Hits!", "Spider-Man", "2001: A Space Odyssey", "!!!", "Béla Tarr"]
+        self.executemany(
+            "INSERT INTO ItemValues(ItemValueId, Value, CleanValue) VALUES (?, ?, ?)",
+            [(f"v{n}", value, value.lower()) for n, value in enumerate(values)],  # a plausible 10.11 key
+        )
+        self.before = digests.snapshot(self.db)
+        self.executemany(
+            "UPDATE ItemValues SET CleanValue = ? WHERE ItemValueId = ?",
+            [(get_clean_value(value), f"v{n}") for n, value in enumerate(values)],
+        )
+        self.assertEqual(self.failures(), [])
 
     def test_activity_advances_last_activity_only(self):
         self.sql("UPDATE Devices SET DateLastActivity = 'later'; UPDATE ApiKeys SET DateLastActivity = 'later'")

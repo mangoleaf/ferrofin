@@ -17,6 +17,7 @@ import oracle
 import report
 import coldstart
 import mem_sample
+import scan
 import ttfs
 from testdata import seed
 
@@ -1335,6 +1336,122 @@ class GateTests(unittest.TestCase):
         self.assertEqual(noise['proposed_cells'], {})
         self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
         self.assertIn('Noise per cell', (aa / 'report.html').read_text())
+
+    def scan_session(self, name, candidate_walls):
+        """A scan session: the previous release scans in 100 s every run, the candidate in
+        `candidate_walls` (one per pair); memory and migration are equal on both sides."""
+        out = self.root / name
+        plan = {'mode': 'scan', 'name': name, 'date': '2026-10-20T00:00:00+00:00',
+                'schedule': gate.schedule('scan', {'a': 'old', 'b': 'new'}, len(candidate_walls)),
+                'images': {'a': {'ref': 'old', 'id': 'sha256:old'}, 'b': {'ref': 'new', 'id': 'sha256:new'}}}
+        walls = iter(w for b in candidate_walls for w in (100, b))
+        for run, _, _ in plan['schedule']:
+            self.write(out / run / 'scan.json', {'scan': {'wall_s': next(walls), 'peak_anon_mib': 500},
+                                                 'migration': {'wall_s': 2.5, 'peak_anon_mib': 300}})
+        self.write(out / 'gate.json', plan)
+        return out
+
+    def test_scan_session_blocks_a_slower_scan_and_passes_a_self_ab(self):
+        md, block = gate.render(str(self.scan_session('slower', [120, 118, 121])))
+        self.assertEqual(block, ['scan/wall time'])
+        self.assertIn('**BLOCKED**', md)
+        page = (self.root / 'slower' / 'report.html').read_text()
+        self.assertIn("class='delta bad'>regressed", page)
+        self.assertIn('migration/peak anon', page)
+        md, block = gate.render(str(self.scan_session('self', [101, 99, 100])))
+        self.assertEqual(block, [])
+        rows = json.loads((self.root / 'self' / 'verdict.json').read_text())['verdicts']
+        self.assertEqual({r['verdict'] for r in rows.values()}, {'within noise'})
+        self.assertEqual(set(rows), {c[0] for c in gate.SCAN_CELLS})
+
+    def test_scan_session_without_a_measurement_is_a_readable_error(self):
+        out = self.scan_session('partial', [100, 100, 100])
+        (out / '06-b' / 'scan.json').unlink()
+        with self.assertRaisesRegex(ValueError, '06-b has no scan.json'):
+            gate.render(str(out))
+
+    def test_scan_driver_runs_scan_py_on_the_image_id_and_stops_at_a_failure(self):
+        plan = {'mode': 'scan', 'schedule': gate.schedule('scan', {'a': 'old', 'b': 'new'}, 3),
+                'images': {'a': {'ref': 'old', 'id': 'sha256:old'}, 'b': {'ref': 'new', 'id': 'sha256:new'}}}
+        cmds = []
+
+        def run(cmd, wrong=None, fail=None):
+            cmds.append(cmd)
+            out = Path(cmd[-1])
+            if out.name == fail:
+                return 1
+            self.write(out / 'scan.json', {'image_id': 'sha256:old' if out.name == wrong else cmd[2]})
+            return 0
+
+        with patch.object(gate, 'docker', Mock(side_effect=AssertionError('nothing is retagged'))):
+            with patch.object(gate, 'run_sh', lambda cmd: run(cmd, fail='02-b')):
+                with self.assertRaisesRegex(SystemExit, r'02-b failed \(scan.py exit 1\)'):
+                    gate.run_session(str(self.root / 's1'), plan, '/data')
+            self.assertEqual([c[1:] for c in cmds],
+                             [[str(Path(gate.BENCH) / 'scan.py'), 'sha256:old', '/data', str(self.root / 's1' / '01-a')],
+                              [str(Path(gate.BENCH) / 'scan.py'), 'sha256:new', '/data', str(self.root / 's1' / '02-b')]])
+            with patch.object(gate, 'run_sh', lambda cmd: run(cmd, wrong='04-b')):
+                with self.assertRaisesRegex(SystemExit, '04-b measured sha256:old, not new'):
+                    gate.run_session(str(self.root / 's2'), plan, '/data')
+
+    def test_scan_dry_run_lists_scan_runs_and_starts_nothing(self):
+        out = self.root / 'session'
+        result = subprocess.run([sys.executable, str(Path(__file__).parent / 'gate.py'), 'scan', 'old', 'new',
+                                 '--dry-run', '--out', str(out)], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=''))  # no docker reachable
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count('scan.py'), 6)
+        self.assertNotIn('run.sh', result.stdout)
+        self.assertFalse(out.exists())
+
+    def test_scan_peak_is_the_largest_anon_sample_inside_the_span(self):
+        path = self.root / 'mem.csv'
+        mib = 2 ** 20
+        path.write_text('t,anon,file\n' + ''.join(f'{t},{a * mib},0\n' for t, a in
+                                                  [(9.9, 900), (10.0, 100), (10.5, 400), (11.0, 300), (11.1, 800)]))
+        self.assertEqual(scan.peak_anon_mib(path, 10.0, 11.0), 400)
+        with self.assertRaisesRegex(RuntimeError, 'no memory sample'):
+            scan.peak_anon_mib(path, 12, 13)
+
+    def test_scan_cleanup_never_masks_the_measurement_error_and_always_removes_the_container(self):
+        def server():
+            s = scan.Server.__new__(scan.Server)  # no docker create
+            s.d, s.sampler = str(self.root), None
+            return s
+
+        calls = []
+
+        def docker(*args):
+            calls.append(args)
+            raise RuntimeError('docker rm: no such container')
+
+        with patch.object(scan, 'docker', docker), patch.object(scan.subprocess, 'run'), \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(ValueError, 'the measurement failed'):
+                with server():
+                    raise ValueError('the measurement failed')
+            with self.assertRaisesRegex(RuntimeError, 'docker rm'):
+                with server():
+                    pass
+        self.assertEqual(calls, [('rm', '-f', 'bench-scan')] * 2)
+
+    def test_migration_copy_turns_the_realtime_monitor_off(self):
+        lib = self.root / 'root' / 'default' / 'Movies'
+        lib.mkdir(parents=True)
+        (lib / 'options.xml').write_text('<LibraryOptions><EnableRealtimeMonitor>true</EnableRealtimeMonitor></LibraryOptions>')
+        scan.disable_realtime_monitor(self.root)
+        self.assertIn('<EnableRealtimeMonitor>false</EnableRealtimeMonitor>', (lib / 'options.xml').read_text())
+        with self.assertRaisesRegex(RuntimeError, 'no library options'):
+            scan.disable_realtime_monitor(self.root / 'empty')
+
+    def test_scan_counts_fail_on_fewer_items_and_record_more(self):
+        summary = {'movies': 3001, 'series': 250, 'episodes': 7490, 'albums': 800, 'tracks': 8000}
+        by_type = {'Movie': 3041, 'Series': 250, 'Episode': 7490, 'MusicAlbum': 800, 'Audio': 8000}
+        api = Mock(get=lambda path, includeItemTypes, **q: {'TotalRecordCount': by_type[includeItemTypes]})
+        self.assertEqual(scan.counts(api, 'u', summary)['movies'], 3041)  # v1.3.2 lists alternate versions
+        by_type['Episode'] = 7489
+        with self.assertRaisesRegex(RuntimeError, r"fewer items.*'episodes': '7489 \(fixture 7490\)'"):
+            scan.counts(api, 'u', summary)
 
     def test_a_gate_run_refuses_a_stale_oracle_pin_before_anything_starts(self):
         out = self.root / 'session'

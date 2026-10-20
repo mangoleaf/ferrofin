@@ -7,7 +7,7 @@
 //!
 //! Port rules applied throughout:
 //! - `HttpRequest` arguments become the transport-agnostic
-//!   [`RequestContext`](crate::net::RequestContext).
+//!   [`RequestContext`].
 //! - `IServerApplicationHost`/`IServerApplicationPaths` extend the generic
 //!   `IApplicationHost`/`IApplicationPaths` bases. Those bases carry plugin/DI
 //!   machinery that is out of scope here; only the server-relevant members plus
