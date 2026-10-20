@@ -60,6 +60,9 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
+use ferrofin_traits::providers::{
+    MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+};
 use ferrofin_traits::system::ServerApplicationPaths;
 
 use crate::db_error::db_err;
@@ -82,6 +85,35 @@ enum Rerate {
     /// change (`MetadataService.UpdateOfficialRating`, `:623-635`): a locked
     /// item keeps its rating, and a failure is logged, never the request's.
     Refresh,
+}
+
+/// `_providerManager.QueueRefresh(id, options, RefreshPriority.High)`, which
+/// upstream queues after every box-set and playlist membership change, so the
+/// container's metadata, images (a box set's TMDB overview and artwork, a
+/// playlist's collage) and rating follow its members. Nothing is queued
+/// without a provider manager (unit tests).
+async fn queue_refresh(
+    providers: Option<&dyn ProviderManager>,
+    container: Uuid,
+    options: MetadataRefreshOptions,
+) -> Result<(), ServiceError> {
+    match providers {
+        Some(providers) => {
+            providers
+                .queue_refresh(container, &options, RefreshPriority::High)
+                .await
+        }
+        None => Ok(()),
+    }
+}
+
+/// `new MetadataRefreshOptions(…) { ForceSave = true }`, the refresh a
+/// membership change queues.
+fn force_save_refresh() -> MetadataRefreshOptions {
+    MetadataRefreshOptions {
+        force_save: true,
+        ..MetadataRefreshOptions::default()
+    }
 }
 
 /// `UpdateRatingToItems` (`BaseItem.cs:2974`) for a box set or playlist whose
@@ -457,6 +489,9 @@ pub struct FerrofinCollectionManager {
     /// Scores the members' ratings a box set takes
     /// ([`update_rating_to_items`]). `None` in unit tests: the rating stays.
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
+    /// Queues the box set's refresh after a membership change
+    /// ([`queue_refresh`]). `None` in unit tests: nothing is queued.
+    providers: Option<Arc<dyn ProviderManager>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -481,7 +516,17 @@ impl FerrofinCollectionManager {
             linked_children,
             paths,
             visibility: None,
+            providers: None,
         }
+    }
+
+    /// Queues a box set's provider refresh after it is created or its members
+    /// change, as `CollectionManager` does. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_providers(mut self, providers: Arc<dyn ProviderManager>) -> Self {
+        self.providers = Some(providers);
+        self
     }
 
     /// Lets a box set take its members' rating when they change. Called once
@@ -543,9 +588,28 @@ impl CollectionManager for FerrofinCollectionManager {
                 .await?;
         }
         if options.item_id_list.is_empty() {
+            // `CreateCollectionAsync` with no items: a default refresh.
+            queue_refresh(
+                self.providers.as_deref(),
+                id,
+                MetadataRefreshOptions::default(),
+            )
+            .await?;
             return Ok(row);
         }
         self.update_rating_to_items(id, Rerate::Direct).await?;
+        // `AddToCollectionAsync` with the `FullRefresh` options create passes
+        // ("the initial adding of items is going to create a local metadata
+        // file"), which it then marks `ForceSave`.
+        queue_refresh(
+            self.providers.as_deref(),
+            id,
+            MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+                ..force_save_refresh()
+            },
+        )
+        .await?;
         Ok(self
             .library_manager
             .get_item_by_id(id)
@@ -568,10 +632,17 @@ impl CollectionManager for FerrofinCollectionManager {
                 .upsert_linked_child(collection_id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
-        // `AddToCollectionAsync` re-rates only when an item was new.
+        // `AddToCollectionAsync` re-rates and queues its refresh only when an
+        // item was new.
         if item_ids.iter().any(|id| !current.contains(id)) {
             self.update_rating_to_items(collection_id, Rerate::Direct)
                 .await?;
+            queue_refresh(
+                self.providers.as_deref(),
+                collection_id,
+                force_save_refresh(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -594,7 +665,14 @@ impl CollectionManager for FerrofinCollectionManager {
             .map_err(db_err)?;
         }
         self.update_rating_to_items(collection_id, Rerate::Refresh)
-            .await
+            .await?;
+        // `RemoveFromCollectionAsync` queues its refresh whatever it removed.
+        queue_refresh(
+            self.providers.as_deref(),
+            collection_id,
+            force_save_refresh(),
+        )
+        .await
     }
 
     async fn get_collections_containing_item(
@@ -745,7 +823,8 @@ pub struct FerrofinPlaylistManager {
         Arc<crate::item_visibility::ItemVisibility>,
         Arc<dyn UserManager>,
     )>,
-    /// Held for the whole of an add, remove, move or update: each reads the
+    /// Held across the read-modify-write of an add, remove, move or update
+    /// (the refresh they queue runs after it is released): each reads the
     /// entries and writes them back, so two overlapping edits would both
     /// start from the same state and lose one of the changes (parallel
     /// per-track adds do exactly that). Share writes made outside an update
@@ -755,6 +834,9 @@ pub struct FerrofinPlaylistManager {
     /// transaction, so neither can put an older `Shares` back.
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
+    /// Queues the playlist's refresh after its entries change
+    /// ([`queue_refresh`]). `None` in unit tests: nothing is queued.
+    providers: Option<Arc<dyn ProviderManager>>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -780,7 +862,17 @@ impl FerrofinPlaylistManager {
             paths,
             visibility: None,
             entry_edits: Arc::default(),
+            providers: None,
         }
+    }
+
+    /// Queues a playlist's provider refresh after entries are added or
+    /// removed, as `PlaylistManager` does. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_providers(mut self, providers: Arc<dyn ProviderManager>) -> Self {
+        self.providers = Some(providers);
+        self
     }
 
     /// Adds `Playlist.IsVisible`'s parental half to every access decision.
@@ -1182,6 +1274,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         }
         if !entries.is_empty() {
             self.update_rating_to_items(id).await?;
+            // `AddToPlaylistInternal`'s refresh, reached from `CreatePlaylist`.
+            queue_refresh(self.providers.as_deref(), id, force_save_refresh()).await?;
         }
         Ok(PlaylistCreationResult { id: id.to_string() })
     }
@@ -1210,7 +1304,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             ),
             None => None,
         };
-        let _edit = self.entry_edits.lock().await;
+        let edit = self.entry_edits.lock().await;
         // C# `UpdatePlaylist` saves the name, shares and open access together
         // (the last `UpdatePlaylistInternal`). Every change here commits with
         // the `Data` sync in one writer transaction, so a failed update
@@ -1266,6 +1360,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
         tx.commit().await.map_err(db_err)?;
         if entries.as_ref().is_some_and(|entries| !entries.is_empty()) {
             self.update_rating_to_items(request.id).await?;
+            // `AddToPlaylistInternal`'s refresh, reached from `UpdatePlaylist`,
+            // queued after the edit guard is released, so the queue call never
+            // runs under it.
+            drop(edit);
+            queue_refresh(self.providers.as_deref(), request.id, force_save_refresh()).await?;
         }
         Ok(())
     }
@@ -1433,7 +1532,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         if added.is_empty() {
             return Ok(());
         }
-        let _edit = self.entry_edits.lock().await;
+        let edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist_id);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
         let at = position.map_or(entries.len(), |pos| {
@@ -1452,7 +1551,10 @@ impl PlaylistManager for FerrofinPlaylistManager {
         )
         .await?;
         tx.commit().await.map_err(db_err)?;
-        self.update_rating_to_items(playlist_id).await
+        self.update_rating_to_items(playlist_id).await?;
+        drop(edit);
+        // "Refresh playlist metadata" (`AddToPlaylistInternal`).
+        queue_refresh(self.providers.as_deref(), playlist_id, force_save_refresh()).await
     }
 
     async fn remove_item_from_playlist(
@@ -1469,7 +1571,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // C# `RemoveItemFromPlaylistAsync` (12.0): every entry whose item id
         // is in the request goes — all occurrences, not the first.
         let playlist = self.require_playlist_argument(playlist_id).await?;
-        let _edit = self.entry_edits.lock().await;
+        let edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist);
         let removals: Vec<String> = entry_ids
             .iter()
@@ -1482,7 +1584,10 @@ impl PlaylistManager for FerrofinPlaylistManager {
         if entries.len() != before {
             write_entries(self.db.writer(), &pid, &entries).await?;
         }
-        self.update_rating_to_items(playlist).await
+        self.update_rating_to_items(playlist).await?;
+        drop(edit);
+        // `RemoveItemFromPlaylistAsync` queues its refresh whatever it removed.
+        queue_refresh(self.providers.as_deref(), playlist, force_save_refresh()).await
     }
 
     async fn move_item(
@@ -4481,5 +4586,239 @@ mod tests {
             result[3].id, items[4].id,
             "an orphan BoxSet outside Collections is not discovered; local alternates are not duplicated"
         );
+    }
+
+    /// A [`ProviderManager`] recording `queue_refresh` calls; nothing else on
+    /// these paths reaches it.
+    #[derive(Default)]
+    struct QueuedRefreshes(
+        std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshOptions)>>,
+    );
+
+    impl QueuedRefreshes {
+        /// The queued `(item, mode, force_save)` triples, emptied.
+        fn take(&self) -> Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshMode, bool)> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+                .into_iter()
+                .map(|(id, options)| (id, options.metadata_refresh_mode, options.force_save))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::providers::ProviderManager for QueuedRefreshes {
+        async fn queue_refresh(
+            &self,
+            item_id: Uuid,
+            options: &ferrofin_traits::providers::MetadataRefreshOptions,
+            priority: ferrofin_traits::providers::RefreshPriority,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            assert_eq!(priority, ferrofin_traits::providers::RefreshPriority::High);
+            self.0.lock().unwrap().push((item_id, options.clone()));
+            Ok(())
+        }
+        async fn refresh_full_item(
+            &self,
+            _item_id: Uuid,
+            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("not on these paths")
+        }
+        async fn refresh_single_item(
+            &self,
+            _item_id: Uuid,
+            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+        ) -> Result<ferrofin_traits::providers::ItemUpdateType, ferrofin_traits::error::ServiceError>
+        {
+            unreachable!("not on these paths")
+        }
+        async fn save_image_from_url(
+            &self,
+            _item_id: Uuid,
+            _url: &str,
+            _image_type: ferrofin_model::entities::ImageType,
+            _image_index: Option<i32>,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("not on these paths")
+        }
+        async fn save_image(
+            &self,
+            _item_id: Uuid,
+            _content: &[u8],
+            _mime_type: &str,
+            _image_type: ferrofin_model::entities::ImageType,
+            _image_index: Option<i32>,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("not on these paths")
+        }
+        async fn get_available_remote_images(
+            &self,
+            _item_id: Uuid,
+            _query: &ferrofin_model::providers::RemoteImageQuery,
+        ) -> Result<
+            Vec<ferrofin_model::providers::RemoteImageInfo>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            unreachable!("not on these paths")
+        }
+        async fn get_remote_image_provider_info(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<
+            Vec<ferrofin_model::providers::ImageProviderInfo>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            unreachable!("not on these paths")
+        }
+        async fn save_metadata(
+            &self,
+            _item_id: Uuid,
+            _update_type: ferrofin_traits::providers::ItemUpdateType,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("not on these paths")
+        }
+        async fn get_external_id_infos(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<
+            Vec<ferrofin_model::providers::ExternalIdInfo>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            unreachable!("not on these paths")
+        }
+        async fn get_all_metadata_plugins(
+            &self,
+        ) -> Result<
+            Vec<ferrofin_model::configuration::MetadataPluginSummary>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            unreachable!("not on these paths")
+        }
+        async fn get_metadata_options(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<
+            ferrofin_model::configuration::MetadataOptions,
+            ferrofin_traits::error::ServiceError,
+        > {
+            unreachable!("not on these paths")
+        }
+        async fn get_refresh_queue(
+            &self,
+        ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+            unreachable!("not on these paths")
+        }
+    }
+
+    /// `CollectionManager` queues a High-priority refresh on every create and
+    /// membership change: a default one for an empty create, `FullRefresh`
+    /// (+`ForceSave`) for a create with items, `ForceSave` for an add that
+    /// brings a new item and for every remove. An add of members already
+    /// there queues nothing.
+    #[tokio::test]
+    async fn collection_changes_queue_the_box_set_refresh() {
+        use ferrofin_traits::providers::MetadataRefreshMode::{Default, FullRefresh};
+        let db = test_db().await;
+        let (movie_a, movie_b) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, movie_a, BaseItemKind::Movie).await;
+        seed_item(&db, movie_b, BaseItemKind::Movie).await;
+        let queued = Arc::new(QueuedRefreshes::default());
+        let mgr = collection_manager_over(&db).with_providers(Arc::clone(&queued) as Arc<_>);
+
+        let empty = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Empty".to_owned(),
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create empty");
+        let empty = Uuid::parse_str(&empty.id).expect("uuid");
+        assert_eq!(queued.take(), vec![(empty, Default, false)]);
+
+        let full = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Full".to_owned(),
+                item_id_list: vec![movie_a],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create with items");
+        let full = Uuid::parse_str(&full.id).expect("uuid");
+        assert_eq!(queued.take(), vec![(full, FullRefresh, true)]);
+
+        mgr.add_to_collection(full, &[movie_a])
+            .await
+            .expect("re-add");
+        assert_eq!(queued.take(), Vec::new(), "nothing new, nothing queued");
+        mgr.add_to_collection(full, &[movie_b]).await.expect("add");
+        assert_eq!(queued.take(), vec![(full, Default, true)]);
+        mgr.remove_from_collection(full, &[movie_a])
+            .await
+            .expect("remove");
+        assert_eq!(queued.take(), vec![(full, Default, true)]);
+        mgr.remove_from_collection(full, &[movie_a])
+            .await
+            .expect("remove a non-member");
+        assert_eq!(
+            queued.take(),
+            vec![(full, Default, true)],
+            "a remove queues its refresh whatever it removed"
+        );
+    }
+
+    /// `PlaylistManager.AddToPlaylistInternal` (reached from create, update
+    /// and add) and `RemoveItemFromPlaylistAsync` queue a High-priority
+    /// `ForceSave` refresh; an add or create with no entries queues nothing.
+    #[tokio::test]
+    async fn playlist_entry_changes_queue_the_playlist_refresh() {
+        use ferrofin_traits::providers::MetadataRefreshMode::Default;
+        let db = test_db().await;
+        let (track_a, track_b) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, track_a, BaseItemKind::Audio).await;
+        seed_item(&db, track_b, BaseItemKind::Audio).await;
+        let queued = Arc::new(QueuedRefreshes::default());
+        let (mgr, _root) = playlist_manager(&db);
+        let mgr = mgr.with_providers(Arc::clone(&queued) as Arc<_>);
+        let owner = Uuid::new_v4();
+
+        let empty = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Empty".to_owned()),
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create empty");
+        assert_eq!(queued.take(), Vec::new());
+        let empty = Uuid::parse_str(&empty.id).expect("uuid");
+
+        let mix = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![track_a],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create with items");
+        let mix = Uuid::parse_str(&mix.id).expect("uuid");
+        assert_eq!(queued.take(), vec![(mix, Default, true)]);
+
+        mgr.add_item_to_playlist(empty, &[track_b], None, owner)
+            .await
+            .expect("add");
+        assert_eq!(queued.take(), vec![(empty, Default, true)]);
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: mix,
+            ids: Some(vec![track_b]),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("replace entries");
+        assert_eq!(queued.take(), vec![(mix, Default, true)]);
+        mgr.remove_item_from_playlist(&mix.to_string(), &[track_b.simple().to_string()])
+            .await
+            .expect("remove");
+        assert_eq!(queued.take(), vec![(mix, Default, true)]);
     }
 }

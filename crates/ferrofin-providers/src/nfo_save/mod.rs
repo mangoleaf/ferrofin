@@ -29,12 +29,14 @@ use crate::xbmc::{
     saver,
 };
 
+/// The credit's kind as upstream's saver sees it: the `PersonInfo.Type`
+/// `PeopleRepository` read back with `Enum.TryParse<PersonKind>` (case-sensitive,
+/// `Unknown` when it does not parse).
 fn person_kind(person: &PeopleEntity) -> ferrofin_model::data::PersonKind {
-    person
-        .person_type
-        .as_ref()
-        .and_then(|kind| serde_json::from_value(serde_json::Value::String(kind.clone())).ok())
-        .unwrap_or(ferrofin_model::data::PersonKind::Unknown)
+    person.person_type.as_deref().map_or(
+        ferrofin_model::data::PersonKind::Unknown,
+        ferrofin_model::data::PersonKind::from_stored,
+    )
 }
 
 type SaveLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
@@ -503,5 +505,29 @@ impl ferrofin_traits::library::UserDataSaveListener for NfoSaver {
         // Save applies live owning-library saver selection and the source
         // filesystem/local-metadata eligibility before writing Nfo alone.
         self.save(item_id, ItemUpdateType::MetadataDownload).await
+    }
+}
+
+#[cfg(test)]
+mod person_kind_tests {
+    use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_model::data::PersonKind;
+
+    /// The saver reads a stored `PersonType` as `PeopleRepository` does:
+    /// case-sensitively, an integer as its C# value, anything else `Unknown`.
+    #[rstest::rstest]
+    #[case(Some("Penciller"), PersonKind::Penciller)]
+    #[case(Some("actor"), PersonKind::Unknown)]
+    #[case(Some("27"), PersonKind::Unrecognized(27))]
+    #[case(None, PersonKind::Unknown)]
+    fn stored_person_types_read_like_people_repository(
+        #[case] stored: Option<&str>,
+        #[case] expected: PersonKind,
+    ) {
+        let person = PeopleEntity {
+            person_type: stored.map(str::to_owned),
+            ..PeopleEntity::default()
+        };
+        assert_eq!(super::person_kind(&person), expected);
     }
 }

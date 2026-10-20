@@ -1445,7 +1445,9 @@ pub async fn build_app_state(
             Arc::clone(&collection_paths),
         )
         // A box set takes its members' rating when they change.
-        .with_visibility(Arc::clone(&item_visibility)),
+        .with_visibility(Arc::clone(&item_visibility))
+        // …and its metadata and artwork, through a queued refresh.
+        .with_providers(Arc::clone(&providers)),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
@@ -1855,7 +1857,9 @@ pub async fn build_app_state(
             Arc::clone(&collection_paths),
         )
         // `Playlist.IsVisible`'s parental half, beside the owner/shares.
-        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users)),
+        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users))
+        // The refresh an entry change queues (collage, rating).
+        .with_providers(Arc::clone(&providers)),
     );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),

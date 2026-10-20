@@ -3,7 +3,8 @@
 //! `AncestorIds` rows whose item is gone. Jellyfin 12.1+ boots on such a database;
 //! without 0044 the boot's `foreign_key_check` refuses it. Migrations run with
 //! foreign keys OFF, so nothing cascades: these tests hold 0044 to every foreign key
-//! to `Users` and to the children of the rows it deletes.
+//! to `Users` and to the children of the rows it deletes. 0045 re-points an `OwnerId`
+//! that names no item at the placeholder item, which the boot repair then deletes.
 
 use std::path::Path;
 
@@ -20,6 +21,14 @@ const KEPT_USER: &str = "CCCCCCCC-0000-0000-0000-000000000001";
 const GONE_USER: &str = "CCCCCCCC-0000-0000-0000-00000000DEAD";
 const ITEM: &str = "BBBBBBBB-0000-0000-0000-000000000001";
 const GONE_ITEM: &str = "BBBBBBBB-0000-0000-0000-00000000DEAD";
+const EXTRA: &str = "BBBBBBBB-0000-0000-0000-0000000000E1";
+const ORPHAN: &str = "BBBBBBBB-0000-0000-0000-0000000000E2";
+const CASED: &str = "BBBBBBBB-0000-0000-0000-0000000000E3";
+const EMPTY_OWNER: &str = "BBBBBBBB-0000-0000-0000-0000000000E4";
+const ZERO_OWNER: &str = "BBBBBBBB-0000-0000-0000-0000000000E5";
+const ZERO_GUID: &str = "00000000-0000-0000-0000-000000000000";
+/// The item Jellyfin re-points detached `UserData` and dangling owners at.
+const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000001";
 
 /// The tables holding per-user rows that 0044 clears, with their user column.
 const PER_USER: [&str; 9] = [
@@ -206,6 +215,143 @@ async fn adoption_removes_rows_of_deleted_users_and_items(
         count(pool, "AncestorIds", "1").await,
         1,
         "only the ancestry between existing items stays"
+    );
+}
+
+/// An extra whose `OwnerId` names no item, in a Jellyfin database that never ran 0032's
+/// re-pointing (a 12.x file already has the 12.x shape), adopts: 0045 re-points it at the
+/// placeholder item, as 0032 does on the 10.11 chain, so the boot's `foreign_key_check`
+/// passes and the `cleanup_orphaned_extras` boot repair (ferrofin-core, its own test)
+/// finds it and deletes it. An extra whose owner exists is left alone, also when the
+/// owner is spelled in another case. The 10.11.8 case is a control: 0032 already does
+/// all of this there, so it holds the two chains to one end state.
+#[rstest::rstest]
+#[case::jellyfin_10_11_8("10.11.8", SCHEMA_10_11_8)]
+#[case::jellyfin_12_2("12.2.0", SCHEMA_12_2)]
+#[tokio::test]
+async fn adoption_re_points_a_dangling_owner_at_the_placeholder(
+    #[case] generation: &str,
+    #[case] schema: &str,
+) {
+    let generation = JELLYFIN_GENERATIONS
+        .iter()
+        .find(|g| g.name == generation)
+        .expect("generation");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("jellyfin.db");
+    let mut history = generation.migration_ids.to_vec();
+    history.extend(generation.additional_ids);
+    seed_jellyfin_fixture(&path, schema, &history).await;
+    {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .foreign_keys(false),
+            )
+            .await
+            .expect("open fixture");
+        insert(
+            &pool,
+            "BaseItems",
+            &[("Id", PLACEHOLDER), ("Type", "PLACEHOLDER")],
+        )
+        .await;
+        insert(&pool, "BaseItems", &[("Id", ITEM), ("Type", "Movie")]).await;
+        insert(
+            &pool,
+            "BaseItems",
+            &[("Id", EXTRA), ("Type", "Video"), ("OwnerId", ITEM)],
+        )
+        .await;
+        insert(
+            &pool,
+            "BaseItems",
+            &[("Id", ORPHAN), ("Type", "Video"), ("OwnerId", GONE_ITEM)],
+        )
+        .await;
+        // An owner that exists, spelled in lower case: SQLite's key compares bytes.
+        let lower_owner = ITEM.to_lowercase();
+        insert(
+            &pool,
+            "BaseItems",
+            &[("Id", CASED), ("Type", "Video"), ("OwnerId", &lower_owner)],
+        )
+        .await;
+        // Owners that are no Guid at all: 0032 maps them to NULL, an unowned item.
+        for (id, owner) in [(EMPTY_OWNER, ""), (ZERO_OWNER, ZERO_GUID)] {
+            insert(
+                &pool,
+                "BaseItems",
+                &[("Id", id), ("Type", "Video"), ("OwnerId", owner)],
+            )
+            .await;
+        }
+        assert_eq!(
+            foreign_key_violations(&pool).await,
+            4 * usize::from(generation.name != "10.11.8"),
+            "a 12.x fixture really dangles: the dangling, lower-case, empty and all-zero \
+             owners (the 10.11.8 table has no key to violate)"
+        );
+        pool.close().await;
+    }
+
+    let url = format!("sqlite://{}", path.display());
+    let db = Database::connect_sized(&url, Some(2))
+        .await
+        .expect("adoption succeeds: the boot's foreign_key_check passed");
+    let pool = db.pool();
+
+    assert_eq!(foreign_key_violations(pool).await, 0);
+    let owner = |id: &str| format!(r#"upper("Id") = '{id}'"#);
+    assert_eq!(
+        count(
+            pool,
+            "BaseItems",
+            &format!(r#"{} AND "OwnerId" = '{PLACEHOLDER}'"#, owner(ORPHAN))
+        )
+        .await,
+        1,
+        "the dangling owner is re-pointed at the placeholder"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "BaseItems",
+            &format!(r#"{} AND "OwnerId" = '{ITEM}'"#, owner(EXTRA))
+        )
+        .await,
+        1,
+        "an existing owner stays"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "BaseItems",
+            &format!(r#"{} AND "OwnerId" = '{ITEM}'"#, owner(CASED))
+        )
+        .await,
+        1,
+        "an owner spelled in another case is the same item: it keeps its extra, \
+         which takes the spelling of the owner's Id"
+    );
+    for id in [EMPTY_OWNER, ZERO_OWNER] {
+        assert_eq!(
+            count(
+                pool,
+                "BaseItems",
+                &format!(r#"{} AND "OwnerId" IS NULL"#, owner(id))
+            )
+            .await,
+            1,
+            "an owner that is no Guid is dropped, not handed to the repair: {id}"
+        );
+    }
+    assert_eq!(
+        count(pool, "BaseItems", "1").await,
+        7,
+        "the migration deletes nothing: the repair does, later"
     );
 }
 

@@ -268,6 +268,11 @@ pub struct TrickplayExtraction<'a> {
     /// The source video stream, or `None` when the item has none recorded —
     /// which forces the software path.
     pub video_stream: Option<&'a MediaStream>,
+    /// Every stream of the source, in stream order (`mediaSource.MediaStreams`).
+    /// The extractor finds `video_stream`'s ffmpeg index among them
+    /// (`EncodingHelper.FindIndex`) and maps it explicitly, so ffmpeg cannot
+    /// pick a cover image or another video track instead.
+    pub media_streams: &'a [MediaStream],
     /// Milliseconds between thumbnails.
     pub interval_ms: i32,
     /// The thumbnail width bound in pixels, forced even, aspect preserved.
