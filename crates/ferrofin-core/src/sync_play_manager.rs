@@ -248,7 +248,14 @@ impl PlayQueue {
     }
 
     /// Advances to the next item; returns whether a next item exists.
+    ///
+    /// An empty queue has no next item (`Next`, PlayQueueManager.cs:459-462):
+    /// `max_index()` is 0 for it, so without the guard a group with nothing
+    /// playing "advanced" to index 0 of nothing.
     fn next(&mut self) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
         if self.playing_index < self.max_index() {
             self.playing_index += 1;
             true
@@ -258,7 +265,12 @@ impl PlayQueue {
     }
 
     /// Steps back to the previous item; returns whether one exists.
+    ///
+    /// Same empty-queue guard as [`PlayQueue::next`] (PlayQueueManager.cs:494-497).
     fn previous(&mut self) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
         if self.playing_index > 0 {
             self.playing_index -= 1;
             true
@@ -315,20 +327,29 @@ impl PlayQueue {
     /// one of them — which is what `AbstractGroupState` needs to decide whether
     /// the group falls to `Idle`.
     ///
-    /// When the playing item goes, upstream steps BACK one slot ("picking
-    /// previous item") and only falls forward to 0 if it was the first; an empty
-    /// remainder leaves no playing item at all.
+    /// When the playing item goes, upstream steps BACK to the item before it
+    /// ("picking previous item") and only falls forward to 0 if it was the
+    /// first; an empty remainder leaves no playing item at all. Removed items
+    /// in front of the playing item shift its index as well
+    /// (`removedBeforePlayingItem`, PlayQueueManager.cs:299-306, :318).
     fn remove(&mut self, ids: &[Uuid]) -> bool {
         let Some(playing) = self.current().copied() else {
             self.items.retain(|i| !ids.contains(&i.playlist_item_id));
             return false;
         };
+        let playing_at = usize::try_from(self.playing_index).unwrap_or_default();
+        let removed_before_playing = self.items[..playing_at]
+            .iter()
+            .filter(|i| ids.contains(&i.playlist_item_id))
+            .count();
         self.items.retain(|i| !ids.contains(&i.playlist_item_id));
         if !ids.contains(&playing.playlist_item_id) {
             self.reanchor(playing.playlist_item_id);
             return false;
         }
-        self.playing_index -= 1;
+        // At most `playing_at` items were counted, and that came from an i32.
+        self.playing_index -=
+            i32::try_from(removed_before_playing).unwrap_or(self.playing_index) + 1;
         if self.playing_index < 0 {
             self.playing_index = if self.items.is_empty() {
                 NO_PLAYING_ITEM_INDEX
@@ -3202,6 +3223,171 @@ mod tests {
         );
         assert_eq!(q.playing_index, NO_PLAYING_ITEM_INDEX);
         assert!(!q.is_item_playing());
+    }
+
+    /// `len` queued items with the one at `playing` playing — `CreateQueue`
+    /// plus `SetPlayingItemByIndex` in v12.2 `PlayQueueManagerTests`.
+    fn queue_playing(len: usize, playing: i32) -> PlayQueue {
+        let ids: Vec<Uuid> = (0..len).map(|_| Uuid::new_v4()).collect();
+        let mut q = PlayQueue::default();
+        q.set(&ids, playing);
+        q
+    }
+
+    /// v12.2 `PlayQueueManagerTests` (PR 17234): removed items in front of the
+    /// playing item shift its index too (`removedBeforePlayingItem`,
+    /// PlayQueueManager.cs:299-306, :318), so removing the playing item picks
+    /// the item that was before it in the ORIGINAL queue.
+    #[rstest::rstest]
+    // RemoveFromPlaylist_PlayingItemAndPrecedingItemRemoved_PicksPreviousItem
+    #[case::preceding_item_removed(5, 3, &[0, 3], 2, 1)]
+    // RemoveFromPlaylist_PlayingItemAndAllPrecedingItemsRemoved_PicksFirstRemainingItem
+    #[case::all_preceding_items_removed(3, 2, &[0, 2], 1, 0)]
+    fn removing_the_playing_item_picks_the_item_before_it(
+        #[case] len: usize,
+        #[case] playing: i32,
+        #[case] removed: &[usize],
+        #[case] expected_item: usize,
+        #[case] expected_index: i32,
+    ) {
+        let mut q = queue_playing(len, playing);
+        let before = q.items.clone();
+        let ids: Vec<Uuid> = removed
+            .iter()
+            .map(|&i| before[i].playlist_item_id)
+            .collect();
+
+        assert!(q.remove(&ids));
+        assert_eq!(q.items.len(), len - removed.len());
+        assert_eq!(q.playing_index, expected_index);
+        assert_eq!(
+            q.current().map(|i| i.item_id),
+            Some(before[expected_item].item_id)
+        );
+    }
+
+    /// v12.2 `RemoveFromPlaylist_AllItemsRemoved_ResetsPlayingItem`.
+    #[test]
+    fn removing_every_item_leaves_nothing_playing() {
+        let mut q = queue_playing(2, 1);
+        let ids: Vec<Uuid> = q.items.iter().map(|i| i.playlist_item_id).collect();
+
+        assert!(q.remove(&ids));
+        assert!(q.items.is_empty());
+        assert!(!q.is_item_playing());
+        assert_eq!(q.playing_item_id(), Uuid::nil());
+    }
+
+    /// v12.2 `RemoveFromPlaylist_PlayingItemNotRemoved_RestoresPlayingItem`.
+    #[test]
+    fn removing_an_earlier_item_keeps_the_playing_item() {
+        let mut q = queue_playing(3, 2);
+        let before = q.items.clone();
+
+        assert!(!q.remove(&[before[0].playlist_item_id]));
+        assert_eq!(q.playing_index, 1);
+        assert_eq!(q.current().map(|i| i.item_id), Some(before[2].item_id));
+    }
+
+    /// v12.2 `Next_EmptyPlaylist_ReturnsFalse` / `Previous_EmptyPlaylist_ReturnsFalse`:
+    /// an empty queue has nowhere to go in any repeat mode
+    /// (PlayQueueManager.cs:459-462, :494-497).
+    #[rstest::rstest]
+    fn stepping_an_empty_queue_goes_nowhere(
+        #[values(
+            GroupRepeatMode::RepeatNone,
+            GroupRepeatMode::RepeatOne,
+            GroupRepeatMode::RepeatAll
+        )]
+        repeat: GroupRepeatMode,
+        #[values(true, false)] forward: bool,
+    ) {
+        let mut q = PlayQueue {
+            repeat,
+            ..PlayQueue::default()
+        };
+
+        let moved = if forward { q.next() } else { q.previous() };
+
+        assert!(!moved);
+        assert!(!q.is_item_playing());
+        assert_eq!(q.playing_item_id(), Uuid::nil());
+    }
+
+    /// The issue's case end to end: [A, B, C] with C playing, and one request
+    /// removes A and C. Upstream picks B at index 0; stepping back one slot
+    /// left the index past the end of the one-item queue, in the update every
+    /// member receives.
+    #[tokio::test]
+    async fn removing_the_playing_item_with_an_earlier_one_stays_in_the_queue() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        m.new_group(&a, "g").await.unwrap();
+        m.handle_request(
+            &a,
+            PlaybackRequest::Play {
+                playing_queue: (0..3).map(|_| Uuid::new_v4()).collect(),
+                playing_item_position: 2,
+                start_position_ticks: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let queue = last_playlist(&bus);
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::RemoveFromPlaylist {
+                playlist_item_ids: vec![queue[0], queue[2]],
+                clear_playlist: false,
+                clear_playing_item: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(last_playlist(&bus), [queue[1]]);
+        assert_eq!(playing_item_id(&bus), queue[1]);
+    }
+
+    /// The issue's other case: after a clear that removed the playing item, a
+    /// NextItem (jellyfin-web sends `PlaylistItemId: null` with nothing
+    /// playing) must not "advance" into the empty queue. Upstream's `Next()`
+    /// returns false, so `WaitingGroupState.cs:609-622` broadcasts nothing and
+    /// returns the group to `Idle`.
+    #[tokio::test]
+    async fn next_item_on_a_cleared_queue_changes_nothing() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(3)).await.unwrap();
+        m.handle_request(
+            &a,
+            PlaybackRequest::RemoveFromPlaylist {
+                playlist_item_ids: vec![],
+                clear_playlist: true,
+                clear_playing_item: true,
+            },
+        )
+        .await
+        .unwrap();
+        let at = mark(&bus);
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::NextItem {
+                playlist_item_id: Uuid::nil(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (caller, _) = since(&bus, at);
+        assert!(caller.is_empty(), "{caller:?}");
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Idle
+        );
     }
 
     #[tokio::test]
