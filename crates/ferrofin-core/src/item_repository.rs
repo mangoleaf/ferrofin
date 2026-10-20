@@ -379,25 +379,13 @@ impl FerrofinItemRepository {
         // Adjacency includes the selected item, runs after sorting, and precedes
         // paging. A missing selected item has no neighbours in this result set.
         if let Some(adjacent) = filter.adjacent_to.filter(|id| !id.is_nil()) {
-            rows = rows
-                .iter()
-                .position(|row| Uuid::parse_str(&row.id).ok() == Some(adjacent))
-                .map_or_else(Vec::new, |index| {
-                    rows[index.saturating_sub(1)..(index + 2).min(rows.len())].to_vec()
-                });
+            rows = adjacent_window(rows, |row| Uuid::parse_str(&row.id).ok() == Some(adjacent));
         }
         let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
-        let start = usize::try_from(filter.start_index.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
-        let take = filter
-            .limit
-            .filter(|limit| *limit > 0)
-            .and_then(|limit| usize::try_from(limit).ok())
-            .unwrap_or(usize::MAX);
-        let rows = rows.into_iter().skip(start).take(take).collect();
         Ok(Some(QueryResult::new(
             Some(filter.start_index.unwrap_or(0)),
             Some(total),
-            rows,
+            page(rows, filter),
         )))
     }
 
@@ -1231,8 +1219,56 @@ impl FerrofinItemRepository {
         let resolved = self
             .resolve_views_with_parent(filter, parent.as_ref())
             .await?;
-        self.fetch_rows_resolved(resolved.as_ref().unwrap_or(filter), shape)
+        let filter = resolved.as_ref().unwrap_or(filter);
+        // The window is whole rows whatever the shape: every caller asks for
+        // `FullRows`, the one shape this function's row type can carry.
+        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+            return Ok(sql_page(self.rows_in_order(&window).await?, filter));
+        }
+        self.fetch_rows_resolved(filter, shape).await
+    }
+
+    /// The SQL path's `AdjacentTo` (v12.2 `ApplyAdjacencyFilter`, which
+    /// `GetItems`, `GetItemList` and `GetItemIdsList` run after the grouping
+    /// filter and before paging): the ids of the item and its neighbours
+    /// within this filter's own unpaged, ordered result, or `None` when the
+    /// filter asks for no adjacency. The filter's views must be resolved.
+    async fn adjacent_ids_resolved(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        let Some(adjacent) = filter.adjacent_to.filter(|id| !id.is_nil()) else {
+            return Ok(None);
+        };
+        let unpaged = InternalItemsQuery {
+            start_index: None,
+            limit: None,
+            ..filter.clone()
+        };
+        let mut qb = build_query(&unpaged, QueryShape::IdsOnly);
+        let ids: Vec<Uuid> = qb
+            .build_query_scalar::<String>()
+            .fetch_all(self.db.pool())
             .await
+            .map_err(db_err)?
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        Ok(Some(adjacent_window(ids, |id| *id == adjacent)))
+    }
+
+    /// The rows of an adjacency window, in the window's order. Upstream
+    /// re-reads the window by id alone and orders it again; keeping the first
+    /// pass's order is the same for every deterministic sort, and keeps a
+    /// `Random` or linked-order window as the pass that chose it.
+    async fn rows_in_order(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut rows = self.retrieve_items(ids).await?;
+        rows.sort_by_key(|row| {
+            Uuid::parse_str(&row.id)
+                .ok()
+                .and_then(|id| ids.iter().position(|window_id| *window_id == id))
+        });
+        Ok(rows)
     }
 
     /// [`Self::fetch_rows`] for a filter whose views are already resolved.
@@ -1295,6 +1331,9 @@ impl FerrofinItemRepository {
             .resolve_views_with_parent(filter, parent.as_ref())
             .await?;
         let filter = resolved.as_ref().unwrap_or(filter);
+        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+            return Ok(sql_page(window, filter));
+        }
         let mut qb = build_query(filter, QueryShape::IdsOnly);
         let ids: Vec<String> = qb
             .build_query_scalar::<String>()
@@ -2170,6 +2209,46 @@ pub(crate) async fn library_top_parents_by_view(
     Ok(by_view)
 }
 
+/// `AdjacentTo` over an ordered result (v12.2 `ApplyAdjacencyFilter`,
+/// `UserViewBuilder.FilterForAdjacency`): the item and its immediate
+/// neighbours, in `items`' order, or nothing when the item is not in `items`.
+pub(crate) fn adjacent_window<T>(items: Vec<T>, is_item: impl Fn(&T) -> bool) -> Vec<T> {
+    let Some(index) = items.iter().position(is_item) else {
+        return Vec::new();
+    };
+    let start = index.saturating_sub(1);
+    items
+        .into_iter()
+        .skip(start)
+        .take(index + 2 - start)
+        .collect()
+}
+
+/// Pages an in-memory result as `UserViewBuilder.SortAndPage` does:
+/// `start_index` rows skipped, then at most a positive `limit` (a limit of 0
+/// or less only skips; compare [`sql_page`]).
+pub(crate) fn page<T>(rows: Vec<T>, filter: &InternalItemsQuery) -> Vec<T> {
+    let start = usize::try_from(filter.start_index.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+    let take = filter
+        .limit
+        .filter(|limit| *limit > 0)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(usize::MAX);
+    rows.into_iter().skip(start).take(take).collect()
+}
+
+/// Pages an in-memory result as the SQL builder's `LIMIT`/`OFFSET` would
+/// (`ApplyQueryPaging`): a `limit` of 0 takes nothing, a negative one is
+/// SQLite's "no limit".
+fn sql_page<T>(rows: Vec<T>, filter: &InternalItemsQuery) -> Vec<T> {
+    let start = usize::try_from(filter.start_index.unwrap_or(0)).unwrap_or(0);
+    let take = filter
+        .limit
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(usize::MAX);
+    rows.into_iter().skip(start).take(take).collect()
+}
+
 /// Reads `PhysicalFolderIds` out of a Jellyfin `BaseItems.Data` blob.
 ///
 /// The ids are written N-format (32 lowercase hex, no hyphens) where the `Id`
@@ -3038,10 +3117,23 @@ impl ItemRepository for FerrofinItemRepository {
             .resolve_views_with_parent(filter, parent.as_ref())
             .await?;
         let filter = resolved.as_ref().unwrap_or(filter);
+        let start_index = filter.start_index.unwrap_or(0);
+        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+            // `GetItems` counts the trimmed set, then pages it.
+            let window_len = window.len();
+            let items = sql_page(self.rows_in_order(&window).await?, filter);
+            let total = if filter.enable_total_record_count
+                && (filter.limit.is_some() || start_index > 0)
+            {
+                i32::try_from(window_len).unwrap_or(i32::MAX)
+            } else {
+                i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+            };
+            return Ok(QueryResult::new(Some(start_index), Some(total), items));
+        }
         let items = self
             .fetch_rows_resolved(filter, QueryShape::FullRows)
             .await?;
-        let start_index = filter.start_index.unwrap_or(0);
         let page_len = i32::try_from(items.len()).unwrap_or(i32::MAX);
         // A page that came back SHORT of its own `LIMIT` has nothing after it,
         // so the total is already in hand: `start_index + page_len`, exactly what
@@ -4165,6 +4257,24 @@ mod tests {
             .unwrap();
         assert_eq!(beyond.total_record_count, 4);
         assert!(beyond.items.is_empty());
+        // `AdjacentTo` trims the collapsed result: a substituted set has its
+        // neighbours there, and a member the set replaced has none.
+        let around = |id: Uuid| InternalItemsQuery {
+            adjacent_to: Some(id),
+            ..query.clone()
+        };
+        assert_eq!(
+            names(repository.get_items(&around(second_set)).await.unwrap()),
+            ["Bravo movie", "Charlie set", "Series"]
+        );
+        assert!(
+            repository
+                .get_items(&around(member))
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
         let alpha = InternalItemsQuery {
             name_starts_with: Some("A".into()),
             ..query.clone()
@@ -5045,6 +5155,139 @@ mod tests {
         let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
         persistence.save_items(&[row]).await.unwrap();
         persistence.set_ancestors(id, ancestors).await.unwrap();
+    }
+
+    /// v12.2 `ApplyAdjacencyFilter`: on the SQL path `AdjacentTo` trims the
+    /// query's own ordered result to the item and its neighbours before paging,
+    /// for `GetItems`, `GetItemList` and `GetItemIdsList` alike.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture walks every adjacency case across the three query methods"
+    )]
+    async fn adjacent_to_trims_a_recursive_sql_query_to_the_item_and_its_neighbours() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        let db = test_db().await;
+        let repository = repo(&db);
+        let root = Uuid::new_v4();
+        seed_linked_descendant_item(&db, root, BaseItemKind::Folder, "Root", None, &[]).await;
+        let [alpha, bravo, charlie, delta] = std::array::from_fn(|_| Uuid::new_v4());
+        for (id, name) in [
+            (alpha, "Alpha"),
+            (bravo, "Bravo"),
+            (charlie, "Charlie"),
+            (delta, "Delta"),
+        ] {
+            seed_linked_descendant_item(&db, id, BaseItemKind::Movie, name, Some(root), &[root])
+                .await;
+        }
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..linked_descendant_query(root)
+        };
+        let ids = |result: &[BaseItemEntity]| -> Vec<String> {
+            result.iter().map(|row| row.id.clone()).collect()
+        };
+        let adjacent = |id: Uuid| InternalItemsQuery {
+            adjacent_to: Some(id),
+            ..query.clone()
+        };
+
+        let middle = repository.get_items(&adjacent(bravo)).await.unwrap();
+        assert_eq!(
+            ids(&middle.items),
+            [alpha, bravo, charlie].map(guid_to_db),
+            "previous, the item, next"
+        );
+        assert_eq!(middle.total_record_count, 3);
+        let first = repository.get_items(&adjacent(alpha)).await.unwrap();
+        assert_eq!(ids(&first.items), [alpha, bravo].map(guid_to_db));
+        let missing = repository
+            .get_items(&adjacent(Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(missing.items.is_empty());
+        assert_eq!(missing.total_record_count, 0);
+        // Paging applies to the trimmed set, and the total counts it.
+        let paged = repository
+            .get_items(&InternalItemsQuery {
+                start_index: Some(1),
+                limit: Some(1),
+                ..adjacent(charlie)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(&paged.items), [guid_to_db(charlie)]);
+        assert_eq!(paged.total_record_count, 3);
+        // Neighbours follow the order the query asked for.
+        let descending = repository
+            .get_item_list(&InternalItemsQuery {
+                order_by: vec![(ItemSortBy::SortName, SortOrder::Descending)],
+                ..adjacent(bravo)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(&descending), [charlie, bravo, alpha].map(guid_to_db));
+        assert_eq!(
+            ids(&repository.get_item_list(&adjacent(delta)).await.unwrap()),
+            [charlie, delta].map(guid_to_db)
+        );
+        assert_eq!(
+            repository.get_item_ids(&adjacent(bravo)).await.unwrap(),
+            [alpha, bravo, charlie]
+        );
+        // A nil id is no adjacency request at all.
+        assert_eq!(
+            repository
+                .get_items(&adjacent(Uuid::nil()))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            4
+        );
+
+        // The trim runs after grouping: two versions sharing a presentation
+        // key are one row, so the hidden version has no window at all.
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'shared' WHERE "Id" IN (?, ?)"#,
+        )
+        .bind(guid_to_db(alpha))
+        .bind(guid_to_db(bravo))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let grouped = InternalItemsQuery {
+            user: Some(seed_user_with_defaults(&db, Uuid::new_v4()).await),
+            group_by_presentation_unique_key: true,
+            ..query.clone()
+        };
+        assert!(crate::translate_query::group_by_presentation_unique_key(
+            &grouped
+        ));
+        let shown = repository.get_item_ids(&grouped).await.unwrap();
+        assert_eq!(shown.len(), 3, "{shown:?}");
+        let (kept, hidden) = if shown.contains(&alpha) {
+            (alpha, bravo)
+        } else {
+            (bravo, alpha)
+        };
+        let around_kept = repository
+            .get_items(&InternalItemsQuery {
+                adjacent_to: Some(kept),
+                ..grouped.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(&around_kept.items), [kept, charlie].map(guid_to_db));
+        let around_hidden = repository
+            .get_items(&InternalItemsQuery {
+                adjacent_to: Some(hidden),
+                ..grouped
+            })
+            .await
+            .unwrap();
+        assert!(around_hidden.items.is_empty());
     }
 
     async fn seed_descendant_link(db: &Database, parent: Uuid, child: Uuid, kind: i32) {
@@ -9424,6 +9667,40 @@ mod tests {
                 .iter()
                 .filter_map(|r| r.name.as_deref())
                 .collect::<Vec<_>>()
+        );
+
+        // `AdjacentTo` trims the view's resolved result like any other.
+        for (id, name) in [
+            (Uuid::from_u128(0x9E04), "Alpha Mix"),
+            (Uuid::from_u128(0x9E05), "Bravo Beats"),
+            (Uuid::from_u128(0x9E06), "Zed Tunes"),
+        ] {
+            seed_top_parented_item(&db, id, BaseItemKind::Playlist, name, folder).await;
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = lower("Name")"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let around = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Playlist],
+                order_by: vec![(
+                    ferrofin_model::live_tv::ItemSortBy::SortName,
+                    ferrofin_model::dto::SortOrder::Ascending,
+                )],
+                adjacent_to: Some(playlist),
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("adjacent browse");
+        assert_eq!(
+            around
+                .iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["Bravo Beats", "Road Trip", "Zed Tunes"]
         );
     }
 
