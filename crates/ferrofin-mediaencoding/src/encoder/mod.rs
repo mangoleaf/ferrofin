@@ -25,7 +25,8 @@ pub use encoder_validator::{
     bsf_option_probe, filter_option_probe,
 };
 pub use encoding_utils::{
-    escape_process_argument, get_input_argument, get_input_argument_multi, quote, split_args,
+    escape_process_argument, get_input_argument, get_input_argument_multi, quote, quote_if_needed,
+    split_args,
 };
 pub use media_encoder::{MediaEncoderConfig, MediaEncoderImpl};
 pub use tokio_transcoder::TokioTranscoder;

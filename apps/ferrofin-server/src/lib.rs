@@ -21,6 +21,7 @@
 mod base_url;
 pub mod bootstrap;
 pub mod config;
+mod encoding_options;
 mod existing_database;
 pub mod listen;
 pub mod media_encoding;
@@ -30,6 +31,8 @@ pub mod seed;
 pub mod state;
 #[cfg(test)]
 mod test_exec;
+#[cfg(test)]
+mod test_logs;
 pub mod vaapi_probe;
 
 use std::net::SocketAddr;

@@ -38,6 +38,7 @@ FIXTURES=$(cd "$FIXTURES" && pwd)
 WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work/run}  # synthetic.py run owns work/<fixture>
 for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
 python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is required for artwork checks" >&2; exit 2; }
+python3 -c 'import icu' 2>/dev/null || { echo "run: Python PyICU (python3-icu) is required for the CleanValue check" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
 ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }

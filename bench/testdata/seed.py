@@ -97,7 +97,7 @@ def drain(api, settle=30, label=""):
     time.sleep(settle)
 
 
-def refresh_and_wait(api, timeout):
+def refresh_and_wait(api, timeout, poll=2):
     """The refresh POST is asynchronous: Idle alone does not prove a scan ran."""
     tasks = [t for t in api.get("/ScheduledTasks") if t.get("Key") == "RefreshLibrary"]
     if len(tasks) != 1:
@@ -116,7 +116,7 @@ def refresh_and_wait(api, timeout):
                 raise RuntimeError(f"library scan failed: {result.get('Status')}")
             if task.get("State") == "Idle":
                 return result
-        time.sleep(2)
+        time.sleep(poll)
     raise RuntimeError("library scan did not complete before its deadline")
 
 
@@ -381,9 +381,9 @@ def export_existing_pools(url, ids_path):
     print("exported source pools: " + json.dumps({k: len(ids["pools"][k]) for k in ("movies", "series", "terms")}))
 
 
-def main():
-    url, out = sys.argv[1], sys.argv[2]
-    api = Api(url)
+def setup(api):
+    """Startup wizard (admin bench/bench) and the three libraries, without a scan; returns
+    the admin's id and leaves `api` authenticated. bench/scan.py times the scan after it."""
     wait_ready(api)
     print("wizard", flush=True)
     api.post("/Startup/Configuration", {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
@@ -403,7 +403,14 @@ def main():
             "TypeOptions": [{"Type": t, "MetadataFetchers": [], "ImageFetchers": []} for t in TYPES]}
     for name, ctype, path in LIBS:
         api.post("/Library/VirtualFolders", {"LibraryOptions": {**opts, "PathInfos": [{"Path": path}]}},
-                 name=name, collectionType=ctype, paths=[path], refreshLibrary=False)
+                 name=name, collectionType=ctype, paths=[path], refreshLibrary="false")  # v1.3.2 and older reject "False"
+    return uid
+
+
+def main():
+    url, out = sys.argv[1], sys.argv[2]
+    api = Api(url)
+    uid = setup(api)
     api.post("/Library/Refresh")
     time.sleep(5)  # let the scan task leave Idle before drain() looks at it
     drain(api, settle=5, label="scan: ")
