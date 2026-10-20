@@ -69,6 +69,11 @@ from.
      `ferrofin:bench` before each run, checks that the run measured the intended image, and
      restores the tag at the end. A failed run stops the session. It is never retried: start
      a new session.
+   - **Oracle pin.** Before the first run, the session checks that `UPSTREAM_TAG` (the
+     Jellyfin oracle, pinned by digest in `bench/testdata/jellyfin-image.txt`) is the latest
+     Jellyfin release. It refuses to start when a newer release exists or the lookup fails
+     (it needs network access to GitHub). Moving the pin is then a work item: move
+     `UPSTREAM_TAG`, pin that release's image and prepare the corpus again.
    - **Wall time.** Not yet measured on the shared host. The fixed waits alone add up to
      8 minutes per run: four 30 s settles (after startup and before each window and the
      steady phase), two 30 s warm-ups with 120 s windows, and the 60 s steady window. Six
