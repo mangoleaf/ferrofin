@@ -6,7 +6,12 @@
     report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + prose);
                                              with a README path, replaces the block between the
                                              BEGIN/END GENERATED BENCHMARKS markers in place
-    report.py --serve [PORT] [RUNS_DIR]      the comparison viewer on http://127.0.0.1:PORT (default 8097, bench/runs)
+    report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained; run.sh does this)
+    report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR]
+                                             the viewer on http://127.0.0.1:PORT (default 8097, bench/runs):
+                                             Benchmark, Adoption and Parity tabs, each listing that harness's
+                                             runs (a report.html each) and comparing two side by side. The
+                                             directories also come from FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS.
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
 where the runs disagreed at the precision published, the range they spanned; a cell that
@@ -1337,6 +1342,7 @@ sup.fn{margin-left:3px}sup.fn a{color:var(--flag);font-weight:600;text-decoratio
 ol.notes{font-size:13px;color:var(--muted);max-width:90ch;padding-left:22px}
 ol.notes li{margin:8px 0;overflow-wrap:anywhere}ol.notes li:target{color:var(--ink);font-weight:500}
 ol.notes .src{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);opacity:.85;margin-top:2px}
+td.verdict{font-weight:600;white-space:nowrap}td.verdict.regressed{color:var(--bad)}td.verdict.improved{color:var(--good)}td.verdict.within-noise{color:var(--muted);font-weight:400}
 """
 
 
@@ -1540,9 +1546,51 @@ def run_list(runs, noun):
     return html.escape(f"{len(runs)} {noun}{'s' if len(runs) != 1 else ''}: {names}")
 
 
-def render_html(m, base=None, picker="", gate=None):
+VERDICTS = ("regressed", "within noise", "improved")
+
+
+def load_verdicts(runs):
+    """The A/B gate's verdicts, from the first of `runs` holding an `ab-verdicts.json`, else
+    None. The file is `{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
+    "delta_pct"}]}` with `verdict` one of `VERDICTS` (the A/B driver writes it; the
+    cell's `unit` (a string) and numbers are optional). A file that does not say so is an error:
+    a gate verdict that silently vanished from the report would read as a pass."""
+    for run in runs:
+        path = os.path.join(run, "ab-verdicts.json")
+        if not os.path.isfile(path):
+            continue
+        doc = load(path)
+        cells = doc.get("cells") if isinstance(doc, dict) else None
+        if not isinstance(cells, list) or not all(
+                isinstance(c, dict) and isinstance(c.get("cell"), str) and c.get("verdict") in VERDICTS
+                and isinstance(c.get("unit", ""), str) for c in cells):
+            raise ValueError(f"{path}: expected {{\"cells\": [{{\"cell\": name, \"verdict\": one of {', '.join(VERDICTS)}}}]}}")
+        return cells
+    return None
+
+
+def verdict_html(cells):
+    """The A/B gate section: the tally, then one row per cell, regressions first."""
+    e = html.escape
+    tally = Counter(c["verdict"] for c in cells)
+    head = ", ".join(f"{tally[v]} {v}" for v in VERDICTS) if cells else ""
+    finite = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    num = lambda v, unit: f"{sig3(v)} {e(unit or '')}".strip() if finite(v) else "—"
+    rows = "".join(
+        f"<tr><th>{e(c['cell'])}</th><td class='verdict {c['verdict'].replace(' ', '-')}'>{c['verdict']}</td>"
+        f"<td class='num'>{num(c.get('baseline'), c.get('unit'))}</td><td class='num'>{num(c.get('candidate'), c.get('unit'))}</td>"
+        f"<td class='num'>{format(c['delta_pct'], '+.1f') + '%' if finite(c.get('delta_pct')) else '—'}</td></tr>"
+        for c in sorted(cells, key=lambda c: (VERDICTS.index(c["verdict"]), c["cell"])))
+    return (f"<h2>A/B gate — {head or 'no cells'}</h2><p class='lede'>The verdict of each gated cell, regressions first; "
+            "<code>bench/gate.toml</code> holds the thresholds the verdicts were judged by.</p>"
+            "<div class='scroll'><table><thead><tr><th>Cell</th><th>Verdict</th><th>Baseline</th><th>Candidate</th><th>Change</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div>")
+
+
+def render_html(m, base=None, picker="", gate=None, verdicts=None):
     """The comparison page; `base` is a `build()` of the baseline runs (compared by their
-    median), `gate` the thresholds (gate.toml when a baseline is given and none is)."""
+    median), `gate` the thresholds (gate.toml when a baseline is given and none is),
+    `verdicts` the A/B gate's cells (`load_verdicts`), shown after the headline numbers when the run was an A/B."""
     oracle_label = m["oracle_label"]
     if base and not comparable_levels(m, base):
         raise ValueError("incompatible baseline conditions or oracle build")
@@ -1560,7 +1608,7 @@ def render_html(m, base=None, picker="", gate=None):
     tc = meta.get("testdata_counts", {})
     title = f"Ferrofin Benchmark {meta.get('sha', '')}".strip()
     parts = ["<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>",
-             f"<title>{e(title)}</title><style>{CSS}</style></head><body><main>{picker}",
+             f"<title>{e(title)}</title><style>{CSS}{VIEWER_CSS}</style></head><body><main>{picker}",
              f"<h1>Ferrofin vs Jellyfin — {len(m['runs'])} run{'s' if len(m['runs']) != 1 else ''}, commit {e(meta.get('sha', '?'))}</h1>",
              "<p class='lede'>Every number is the median across the runs given"
              + (", and where those runs disagreed you can hover a cell for the range they spanned"
@@ -1597,6 +1645,8 @@ def render_html(m, base=None, picker="", gate=None):
             stats += f"<div class='stat {k}'><div class='who'>{e(lbl)}</div><div class='val'>{val}<span class='unit'>{unit}</span>{extra}</div>{why}</div>"
         tiles.append(f"<section class='tile'><h3>{e(name)}</h3><div class='stats'>{stats}</div></section>")
     parts.append(f"<div class='tiles'>{''.join(tiles)}</div>")
+    if verdicts is not None:
+        parts.append(verdict_html(verdicts))
     for level, lv in m["levels"].items():
         if not lv["any_data"]:
             continue
@@ -1655,44 +1705,179 @@ def list_runs(runs_dir):
     return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
 
 
+VIEWER_CSS = """
+nav.tabs{display:flex;gap:4px;margin:0 0 26px;border-bottom:1px solid var(--rule)}
+nav.tabs a{padding:8px 16px;color:var(--muted);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px}
+nav.tabs a.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+.runs td.act{width:1%;white-space:nowrap}.runs td.act a{margin-right:12px}.runs a,.runs-note a{color:var(--accent-ink)}
+.compare{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:22px 0 14px}
+.compare select,.compare button{font:inherit;padding:3px 8px}.compare button{background:var(--accent);color:#fff;border:0;border-radius:4px;padding:5px 12px;cursor:pointer}
+.sbs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+@media (max-width:900px){.sbs{grid-template-columns:1fr}}
+.sbs figure{margin:0}.sbs figcaption{font:12.5px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);margin-bottom:6px}
+.sbs iframe{width:100%;height:80vh;border:1px solid var(--rule);border-radius:6px;background:var(--panel)}
+"""
+
+#: The viewer's tabs, in order: the harness key, its tab label, the flag and the
+#: environment variable that name the directory holding its runs. The benchmark's runs
+#: are `bench/runs` (or the `--serve` argument); the other two harnesses decide where
+#: their runs go, so the viewer is told.
+HARNESSES = (("benchmark", "Benchmark", None, None),
+             ("adoption", "Adoption", "--adoption-dir", "FERROFIN_ADOPTION_RUNS"),
+             ("parity", "Parity", "--parity-dir", "FERROFIN_PARITY_RUNS"))
+HTML = "text/html; charset=utf-8"
+
+
+def run_dir(root, name):
+    """The directory of adoption/parity run `name`, or None: a subdirectory of `root`
+    holding a `report.html`, else `root` itself when `name` is its own name (a harness
+    writes its report into its work directory)."""
+    sub = os.path.join(root, name)
+    if os.path.isfile(os.path.join(sub, "report.html")):
+        return sub
+    return root if name == os.path.basename(os.path.abspath(root)) else None
+
+
+def discover(harness, root):
+    """`[(run name, label)]`, newest first, for the runs of `harness` under `root`.
+
+    A benchmark run is a directory with a `run.json` (it has a `report.html` only once
+    `--html` or `run.sh` wrote one; the viewer renders it otherwise). An adoption or parity
+    run is a directory holding a `report.html`; `root` itself counts as a run when it holds
+    one, because a harness writes its report into its work directory."""
+    if not root or not os.path.isdir(root):
+        return []
+    if harness == "benchmark":
+        return list_runs(root)
+    out, seen = [], set()
+    for name in sorted(os.listdir(root)) + [os.path.basename(os.path.abspath(root))]:
+        d = run_dir(root, name)
+        page = d and os.path.join(d, "report.html")
+        if name not in seen and page and os.path.isfile(page):
+            seen.add(name)
+            when = datetime.fromtimestamp(os.path.getmtime(page)).strftime("%Y-%m-%d %H:%M")
+            out.append((os.path.getmtime(page), name, f"{name}  ·  {when}"))
+    return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
+
+
+def tabs_html(active):
+    return "<nav class='tabs'>" + "".join(
+        f"<a href='/{key}'{' class=on' if key == active else ''}>{label}</a>" for key, label, _, _ in HARNESSES) + "</nav>"
+
+
+def page_html(title, body, active=None):
+    nav = tabs_html(active) if active else ""
+    return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+            f"<title>{html.escape(title)}</title><style>{CSS}{VIEWER_CSS}</style></head><body><main>{nav}{body}</main></body></html>")
+
+
+def tab_html(harness, runs, a, b, picker=""):
+    """One harness's tab: its runs, the side-by-side compare form, and the compare."""
+    e = html.escape
+    _, label, flag, env = next(h for h in HARNESSES if h[0] == harness)
+    body = [f"<h1>{label} runs</h1>"]
+    if not runs:
+        where = (f"Run the benchmark (<code>bench/run.sh</code>) to create one." if harness == "benchmark"
+                 else f"Point the viewer at the directory holding them with <code>{flag} DIR</code> or <code>{env}=DIR</code>.")
+        body.append(f"<p class='lede runs-note'>No {e(label.lower())} runs yet. {where}</p>")
+        return page_html(f"Ferrofin {label}", "".join(body) + picker, harness)
+    names = {n for n, _ in runs}
+    a, b = (x if x in names else None for x in (a, b))
+    rows = "".join(f"<tr><th>{e(lbl)}</th><td class='act'><a href='/report/{harness}/{e(urllib.parse.quote(n))}' target='_blank'>open</a>"
+                   f"<a href='/{harness}?a={e(urllib.parse.quote(n))}" + (f"&amp;b={e(urllib.parse.quote(b))}" if b else "") + "'>as A</a>"
+                   f"<a href='/{harness}?" + (f"a={e(urllib.parse.quote(a))}&amp;" if a else "") + f"b={e(urllib.parse.quote(n))}'>as B</a></td></tr>"
+                   for n, lbl in runs)
+    body.append(f"<div class='scroll'><table class='runs'><tbody>{rows}</tbody></table></div>")
+    options = lambda chosen: "<option value=''>—</option>" + "".join(
+        f"<option value='{e(n)}'{' selected' if n == chosen else ''}>{e(n)}</option>" for n, _ in runs)
+    body.append(f"<form class='compare' method='get' action='/{harness}'><b>Compare</b> A <select name='a'>{options(a)}</select> "
+                f"with B <select name='b'>{options(b)}</select> <button type='submit'>Side by side</button></form>")
+    if a or b:
+        figs = "".join(f"<figure><figcaption>{side} · {e(n)}</figcaption><iframe src='/report/{harness}/{e(urllib.parse.quote(n))}' title='{e(n)}'></iframe></figure>"
+                       for side, n in (("A", a), ("B", b)) if n)
+        body.append(f"<div class='sbs'>{figs}</div>")
+    return page_html(f"Ferrofin {label}", "".join(body) + picker, harness)
+
+
 def picker_html(runs, selected, baseline):
     e = html.escape
     boxes = lambda name, chosen, full: "".join(f"<label><input type='checkbox' name='{name}' value='{e(n)}'{' checked' if n in chosen else ''}> {e(lbl if full else n)}</label>" for n, lbl in runs)
-    return (f"<style>{PICKER_CSS}</style><form class='picker' method='get' action='/'><div class='row'>"
+    return (f"<style>{PICKER_CSS}</style><form class='picker' method='get' action='/benchmark'><div class='row'>"
             f"<div class='col'><h3>Runs to render (several = median + ranges)</h3>{boxes('run', selected, True) or '<i>no runs yet</i>'}</div>"
             f"<div class='col'><h3>Baseline (change vs the median of these runs)</h3>{boxes('baseline', baseline, False)}<div style='margin-top:10px'><button type='submit'>Compare</button></div></div>"
             f"</div></form>")
 
 
-def serve(port, runs_dir):
-    runs_dir = os.path.abspath(runs_dir)
+def error_html(what, ex, picker=""):
+    """A run still being written, or a malformed file: say which, keep the tabs (and the picker)."""
+    return page_html("Ferrofin Benchmark", f"<h1>Could not render {html.escape(what)}</h1><p class='lede'>"
+                     f"{html.escape(type(ex).__name__)}: {html.escape(str(ex))} — a run that is still in progress renders once it finishes.</p>{picker}", "benchmark")
 
+
+def benchmark_report(root, name):
+    """A benchmark run's `report.html`: the file its run wrote, else the run rendered now."""
+    run = os.path.join(root, name)
+    static = os.path.join(run, "report.html")
+    if os.path.isfile(static):
+        with open(static, encoding="utf-8") as f:
+            return 200, f.read()
+    try:
+        return 200, render_html(build([run]), verdicts=load_verdicts([run]))
+    except Exception as ex:
+        return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
+
+
+def handle(target, roots):
+    """`(status, content type, body bytes)` for a request path and query.
+
+    `roots` maps each harness to the directory holding its runs (or None). Run names are
+    only ever taken from `discover`, so a name from the URL cannot reach another path."""
+    url = urllib.parse.urlparse(target)
+    q = urllib.parse.parse_qs(url.query)
+    path = url.path.rstrip("/") or "/"
+    parts = [urllib.parse.unquote(p) for p in path.split("/")[1:]]
+
+    def reply(status, text):
+        return status, HTML, text.encode("utf-8")
+
+    keys = [h[0] for h in HARNESSES]
+    if parts[0] == "report" and len(parts) == 3 and parts[1] in keys:
+        harness, name = parts[1], parts[2]
+        if name not in {n for n, _ in discover(harness, roots.get(harness))}:
+            return reply(404, page_html("Not found", "<h1>No such run</h1>"))
+        if harness == "benchmark":
+            return reply(*benchmark_report(roots["benchmark"], name))
+        with open(os.path.join(run_dir(roots[harness], name), "report.html"), "rb") as f:
+            return 200, HTML, f.read()
+    harness = "benchmark" if path == "/" else parts[0]
+    if len(parts) != 1 or harness not in keys:
+        return reply(404, page_html("Not found", "<h1>Not found</h1>"))
+    runs = discover(harness, roots.get(harness))
+    names = {n for n, _ in runs}
+    sel = list(dict.fromkeys(r for r in q.get("run", []) if r in names))
+    if harness == "benchmark" and sel:
+        base = list(dict.fromkeys(b for b in q.get("baseline", []) if b in names))
+        picker = tabs_html("benchmark") + picker_html(runs, sel, base)
+        try:
+            m = build([os.path.join(roots["benchmark"], r) for r in sel])
+            return reply(200, render_html(m, build([os.path.join(roots["benchmark"], b) for b in base]) if base else None, picker,
+                                          verdicts=load_verdicts(m["runs"])))
+        except Exception as ex:
+            return reply(400 if isinstance(ex, ValueError) else 500, error_html(", ".join(sel), ex, picker))
+    picker = picker_html(runs, [], []) if harness == "benchmark" and runs else ""
+    return reply(200, tab_html(harness, runs, (q.get("a") or [None])[0], (q.get("b") or [None])[0], picker))
+
+
+def make_server(port, roots):
+    """The viewer's HTTP server, bound to loopback only."""
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            if urllib.parse.urlparse(self.path).path != "/":
-                self.send_error(404)
-                return
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            runs = list_runs(runs_dir)
-            names = {n for n, _ in runs}
-            sel = list(dict.fromkeys(r for r in q.get("run", []) if r in names))
-            base = list(dict.fromkeys(b for b in q.get("baseline", []) if b in names))
-            picker = picker_html(runs, sel, base)
-            status = 200
             try:
-                if sel:
-                    m = build([os.path.join(runs_dir, r) for r in sel])
-                    body = render_html(m, build([os.path.join(runs_dir, b) for b in base]) if base else None, picker)
-                else:
-                    body = f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main><h1>Ferrofin benchmark runs</h1>{picker}</main></body></html>"
-            except Exception as ex:  # a run still being written, or a malformed file: say which, keep the picker
-                status = 400 if isinstance(ex, ValueError) else 500
-                body = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main>"
-                        f"<h1>Could not render {html.escape(', '.join(sel))}</h1><p class='lede'>{html.escape(type(ex).__name__)}: {html.escape(str(ex))} — "
-                        f"a run that is still in progress renders once it finishes.</p>{picker}</main></body></html>")
-            data = body.encode("utf-8")
+                status, kind, data = handle(self.path, roots)
+            except Exception as ex:  # a report deleted or unreadable mid-request: answer, don't drop the connection
+                status, kind, data = 500, HTML, page_html("Error", f"<h1>Could not serve {html.escape(self.path)}</h1><p class='lede'>{html.escape(type(ex).__name__)}: {html.escape(str(ex))}</p>").encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1700,12 +1885,28 @@ def serve(port, runs_dir):
         def log_message(self, fmt, *args):  # one line per request is enough
             sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
-    print(f"viewer: http://127.0.0.1:{port}/  (runs from {runs_dir}; Ctrl-C to stop)")
+    return http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+
+
+def serve(port, roots):
+    srv = make_server(port, roots)
+    shown = "; ".join(f"{key}: {os.path.abspath(d) if d else 'no directory given'}" for key, d in roots.items())
+    print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  ({shown}; Ctrl-C to stop)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+def write_html(run):
+    """Write `report.html` beside the run (self-contained: opens from disk, uploads as a
+    CI artifact) and return its path."""
+    path = os.path.join(run, "report.html")
+    page = render_html(build([run]), verdicts=load_verdicts([run]))  # before the file is touched: a failure leaves no empty report
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(page)
+    os.replace(path + ".tmp", path)
+    return path
 
 
 def main():
@@ -1743,12 +1944,37 @@ def main():
         if any(not r.get("ok") for r in selection_records(os.path.join(d, "shape.log"))):
             raise ValueError("shape dependency failed")
         return
+    if args and args[0] == "--html":
+        if len(args) != 2:
+            sys.exit(__doc__)
+        if not os.path.isfile(os.path.join(args[1], "run.json")):
+            sys.exit(f"{args[1]} is not a run dir (no run.json)")
+        print(write_html(args[1]))
+        return
     if args and args[0] == "--serve":
-        port = int(args[1]) if len(args) > 1 and args[1].isdigit() else 8097
-        runs_dir = args[2] if len(args) > 2 else (args[1] if len(args) > 1 and not args[1].isdigit() else os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs"))
+        rest = args[1:]
+        roots = {}
+        for key, _, flag, env in HARNESSES[1:]:
+            if flag in rest:
+                i = rest.index(flag)
+                if i + 1 >= len(rest):
+                    sys.exit(f"{flag} needs a directory")
+                roots[key] = rest[i + 1]
+                del rest[i:i + 2]
+                if not os.path.isdir(roots[key]):
+                    sys.exit(f"{roots[key]} is not a directory")
+            else:  # a variable may be set for every shell: a missing directory is an empty tab
+                roots[key] = os.environ.get(env) or None
+                if roots[key] and not os.path.isdir(roots[key]):
+                    sys.stderr.write(f"{env}={roots[key]} is not a directory: the {key} tab stays empty\n")
+                    roots[key] = None
+        port = int(rest.pop(0)) if rest and rest[0].isdigit() else 8097
+        runs_dir = rest.pop(0) if rest else os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+        if rest:
+            sys.exit(__doc__)
         if not os.path.isdir(runs_dir):
             sys.exit(f"{runs_dir} is not a directory")
-        serve(port, runs_dir)
+        serve(port, {"benchmark": runs_dir, **roots})
         return
     if args and args[0] == "--readme":
         target = None
