@@ -186,9 +186,10 @@ async fn music_genre_row(
 }
 
 /// Inserts a minimal `BaseItems` row of the given folder-ish kind and returns
-/// the persisted row. Only the schema-required columns are set; richer metadata
-/// is populated by later refreshes (mirrors how the C# path creates a stub item
-/// then refreshes it).
+/// the persisted row. Only the schema-required columns and the ones every save
+/// derives or stamps (keys, names, dates) are set; richer metadata is populated
+/// by later refreshes (mirrors how the C# path creates a stub item then
+/// refreshes it).
 pub(crate) async fn insert_named_item(
     db: &Database,
     id: Uuid,
@@ -242,17 +243,25 @@ pub(crate) async fn insert_named_item_in(
         // `CleanName` is what `searchTerm` and the search hints match
         // (`BaseItemMapper.cs:279` derives it on every save); without it a
         // new box set or playlist is never found by name.
+        // The dates are `Folder.AddChild`'s: `DateCreated`/`DateModified`
+        // from the folder `CreatePlaylist`/`CreateCollectionAsync` just made
+        // (this instant), else `DateTime.UtcNow`. `DateLastSaved` is stamped
+        // on create too, by the first save after it (`UpdateItemsAsync`: the
+        // playlist's `ForceSave` refresh, the box set's member add or queued
+        // refresh). Undated, the row sorted anywhere by date added and never
+        // matched `minDateLastSaved`.
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
-            "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8)"#,
+            "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName",
+            "DateCreated", "DateModified", "DateLastSaved")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
     .bind(i64::from(is_folder))
     .bind(name)
-    .bind(ferrofin_util::sort_name::create_sort_name(name))
+    .bind(crate::kinds::saved_sort_name(kind, name, None))
     .bind(container.map(guid_to_db))
     .bind(crate::kinds::presentation_unique_key(
         kind,
@@ -263,6 +272,39 @@ pub(crate) async fn insert_named_item_in(
         None,
     ))
     .bind(crate::text_util::get_clean_value(name))
+    .bind(datetime_to_db(chrono::Utc::now()))
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Renames the [`insert_named_item`] row `id` of `kind`, on a connection the
+/// caller holds, the way a save after the C# `Name` setter does: `Name`, the
+/// `CleanName` the save derives (`BaseItemMapper.cs:279`), which is what a
+/// search by name matches, and the `SortName` the setter makes it re-derive
+/// (`BaseItem.cs:200-209`), from the stored sort title when one is set, else
+/// from the new name ([`crate::kinds::saved_sort_name`]).
+pub(crate) async fn rename_named_item_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+) -> Result<(), ServiceError> {
+    let forced: Option<String> =
+        sqlx::query_scalar(r#"SELECT "ForcedSortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Name" = ?2, "CleanName" = ?3, "SortName" = ?4
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(name)
+    .bind(get_clean_value(name))
+    .bind(crate::kinds::saved_sort_name(kind, name, forced.as_deref()))
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -1004,6 +1046,89 @@ impl FerrofinItemPersistenceService {
             }
         }
         self.mark_repair_done(META_KEY).await?;
+        Ok(repaired)
+    }
+
+    /// One-shot startup pass over the box sets and playlists an older
+    /// Ferrofin created through `insert_named_item`, which wrote neither the
+    /// dates nor, on a rename, the derived keys.
+    ///
+    /// Those rows are the ones with no `DateCreated`. Jellyfin stores NULL
+    /// only for `DateTime.MinValue` (`BaseItemMapper.cs:307`), and its create
+    /// paths always date the item (`Folder.AddChild`), so an adopted row is
+    /// selected only if Jellyfin itself left it undated; it then gets what
+    /// Jellyfin's next save of it would store. For each one, in one
+    /// transaction:
+    /// - `CleanName` is re-derived from `Name` (empty for a whitespace-only
+    ///   name, as in [`Self::repair_clean_values`]): a playlist renamed by the
+    ///   old bare `UPDATE "Name"` still matched its old name, and one the old insert
+    ///   wrote after that pass ran had none, so search never found it.
+    /// - `SortName` is re-derived from `ForcedSortName`, or else from `Name`,
+    ///   the way the C# getter does on every save.
+    /// - `DateCreated`, `DateModified` and `DateLastSaved` are set to now
+    ///   where NULL. The creation time is lost; now is when the row starts
+    ///   being dated.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under `named_item_rows_v1`.
+    /// Returns the number of rows repaired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the read or the transaction fails. The
+    /// marker is written inside the transaction, so a failure retries on the
+    /// next boot.
+    pub async fn repair_named_item_rows(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "named_item_rows_v1";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let mut rows = Vec::new();
+        for kind in [BaseItemKind::BoxSet, BaseItemKind::Playlist] {
+            let type_name = stored_type_name(kind).ok_or_else(|| {
+                ServiceError::backend(format!("no stored type name for {kind:?}"))
+            })?;
+            let found: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                r#"SELECT "Id", "Name", "ForcedSortName" FROM "BaseItems"
+                   WHERE "Type" = ?1 AND "DateCreated" IS NULL"#,
+            )
+            .bind(type_name)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            rows.extend(found.into_iter().map(|row| (kind, row)));
+        }
+        let now = datetime_to_db(chrono::Utc::now());
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut repaired: u64 = 0;
+        for (kind, (id, name, forced)) in &rows {
+            let name = name.as_deref().unwrap_or_default();
+            let clean = if name.trim().is_empty() {
+                String::new()
+            } else {
+                get_clean_value(name)
+            };
+            let written = sqlx::query(
+                r#"UPDATE "BaseItems" SET "CleanName" = ?2, "SortName" = ?3,
+                       "DateCreated" = ?4,
+                       "DateModified" = COALESCE("DateModified", ?4),
+                       "DateLastSaved" = COALESCE("DateLastSaved", ?4)
+                   WHERE "Id" = ?1 AND "DateCreated" IS NULL"#,
+            )
+            .bind(id)
+            .bind(&clean)
+            .bind(crate::kinds::saved_sort_name(
+                *kind,
+                name,
+                forced.as_deref(),
+            ))
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            repaired += written.rows_affected();
+        }
+        Self::mark_repair_done_in(&mut tx, META_KEY).await?;
+        tx.commit().await.map_err(db_err)?;
         Ok(repaired)
     }
 
@@ -10331,6 +10456,175 @@ mod tests {
                 .expect("meta")
                 .as_deref(),
             Some("1")
+        );
+    }
+
+    /// Puts row `id` in the shape an older `insert_named_item` left it: no
+    /// `DateCreated` or `DateLastSaved`, and the given keys, sort title and
+    /// `DateModified`.
+    async fn undated_named_row(
+        db: &ferrofin_db::Database,
+        id: Uuid,
+        clean: Option<&str>,
+        sort: &str,
+        forced: Option<&str>,
+        modified: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "DateCreated" = NULL, "DateLastSaved" = NULL,
+                   "CleanName" = ?2, "SortName" = ?3, "ForcedSortName" = ?4,
+                   "DateModified" = ?5
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .bind(clean)
+        .bind(sort)
+        .bind(forced)
+        .bind(modified)
+        .execute(db.writer())
+        .await
+        .expect("old row");
+    }
+
+    /// Row `id`'s stored `CleanName` and `SortName`.
+    async fn clean_and_sort_names(
+        db: &ferrofin_db::Database,
+        id: Uuid,
+    ) -> (Option<String>, Option<String>) {
+        sqlx::query_as(r#"SELECT "CleanName", "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .expect("read back")
+    }
+
+    /// The box sets and playlists an older `insert_named_item` wrote (no
+    /// `DateCreated`) get the columns a save derives (`CleanName` and
+    /// `SortName` from the current name) and their missing dates; the pass
+    /// runs once.
+    #[tokio::test]
+    async fn the_named_item_repair_fills_created_box_sets_and_playlists_once() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let named = |id, kind, name| super::insert_named_item(&db, id, kind, name, true, None);
+        // Renamed by the old bare `UPDATE "Name"`: both keys hold the old name.
+        let renamed = Uuid::from_u128(0xC0A1);
+        named(renamed, BaseItemKind::Playlist, "New Name")
+            .await
+            .expect("renamed");
+        undated_named_row(
+            &db,
+            renamed,
+            Some("old name"),
+            "old name",
+            None,
+            Some("2026-01-02 03:04:05.0000000"),
+        )
+        .await;
+        // Created with no `CleanName` after the 12.0 clean-name pass ran.
+        let empty = Uuid::from_u128(0xC0A2);
+        named(empty, BaseItemKind::BoxSet, "The Box")
+            .await
+            .expect("empty");
+        undated_named_row(&db, empty, None, "box", None, None).await;
+        // A sort title outranks the name.
+        let forced = Uuid::from_u128(0xC0A3);
+        named(forced, BaseItemKind::Playlist, "Mix")
+            .await
+            .expect("forced");
+        undated_named_row(&db, forced, Some("mix"), "mix", Some("Zed"), None).await;
+
+        let before = chrono::Utc::now();
+        assert_eq!(service.repair_named_item_rows().await.expect("repair"), 3);
+        let after = chrono::Utc::now();
+
+        assert_eq!(
+            clean_and_sort_names(&db, renamed).await,
+            (Some("new name".to_owned()), Some("new name".to_owned()))
+        );
+        assert_eq!(
+            clean_and_sort_names(&db, empty).await,
+            (Some("the box".to_owned()), Some("box".to_owned()))
+        );
+        assert_eq!(
+            clean_and_sort_names(&db, forced).await.1.as_deref(),
+            Some("zed")
+        );
+        for id in [renamed, empty, forced] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            let created = row.date_created.expect("dated");
+            assert!((before..=after).contains(&created), "{created}");
+            assert_eq!(row.date_last_saved, Some(created));
+            if id == renamed {
+                assert_eq!(
+                    row.date_modified.map(|d| d.to_rfc3339()).as_deref(),
+                    Some("2026-01-02T03:04:05+00:00"),
+                    "a stored date is kept"
+                );
+            } else {
+                assert_eq!(row.date_modified, Some(created));
+            }
+        }
+
+        // Second boot: the marker skips the pass, even over a row it would take.
+        let later = Uuid::from_u128(0xC0A6);
+        named(later, BaseItemKind::Playlist, "Later")
+            .await
+            .expect("later");
+        undated_named_row(&db, later, Some("later"), "later", None, None).await;
+        assert_eq!(service.repair_named_item_rows().await.expect("repair"), 0);
+        assert_eq!(
+            db.meta_get("named_item_rows_v1")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
+        assert!(
+            crate::test_support::fetch_item(&db, later)
+                .await
+                .date_created
+                .is_none()
+        );
+    }
+
+    /// A dated box set (every one Jellyfin creates) and an undated row of any
+    /// other kind are not the repair's to touch.
+    #[tokio::test]
+    async fn the_named_item_repair_leaves_adopted_rows_and_other_kinds_alone() {
+        let db = test_db().await;
+        let adopted = Uuid::from_u128(0xC0A4);
+        super::insert_named_item(&db, adopted, BaseItemKind::BoxSet, "Adopted", true, None)
+            .await
+            .expect("adopted");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "CleanName" = 'kept',
+                   "DateCreated" = '2025-05-05 00:00:00.0000000'
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(adopted))
+        .execute(db.writer())
+        .await
+        .expect("adopted row");
+        let movie = Uuid::from_u128(0xC0A5);
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Heat").await;
+        undated_named_row(&db, movie, Some("stale"), "heat", None, None).await;
+
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        assert_eq!(service.repair_named_item_rows().await.expect("repair"), 0);
+        assert_eq!(
+            clean_and_sort_names(&db, adopted).await.0.as_deref(),
+            Some("kept")
+        );
+        assert_eq!(
+            clean_and_sort_names(&db, movie).await.0.as_deref(),
+            Some("stale")
+        );
+        assert!(
+            crate::test_support::fetch_item(&db, movie)
+                .await
+                .date_created
+                .is_none()
         );
     }
 

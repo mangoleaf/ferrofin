@@ -411,6 +411,21 @@ pub async fn build_app_state(
             tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
+    // One-shot: box sets and playlists an older build created had no dates,
+    // and a renamed playlist kept its old name's `CleanName`/`SortName`, so a
+    // search for its new name missed it.
+    match item_persistence_impl.repair_named_item_rows().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "backfilled dates and re-derived names of created box sets and playlists"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "box set and playlist repair failed; a renamed playlist may not be found by its new name until the next boot retries it");
+        }
+    }
     // One-shot: fold every localized `UserView` (id derived from its translated
     // name, the 10.11 rule) onto the name-independent id Jellyfin 12.0 derives
     // from the view type, moving children, ancestors and per-user settings.
