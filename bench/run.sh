@@ -6,7 +6,15 @@
 # is reported and the next one runs; report.py renders whatever exists.
 #
 #   run.sh [--testdata DIR] [--servers jellyfin,ferrofin]
-#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs] [--rate N] [--out DIR]
+#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs,ramp,soak] [--rate N] [--out DIR]
+#
+# `ramp` is opt-in (never part of a default run) and Ferrofin only: it steps the loaded mix
+# upward until a step fails and reports the last passing rate as the throughput ceiling
+# (bench/ramp.py). `gate.py ramp PREVIOUS CANDIDATE` runs it A/B.
+#
+# `soak` is opt-in (never part of a default run) and Ferrofin only: it holds the loaded mix
+# for an hour and reports the slope of anon memory (bench/soak.py). `gate.py soak PREVIOUS
+# CANDIDATE` runs it A/B.
 #
 # Requires: docker, k6, python3, jq; the pinned Jellyfin image
 # and ferrofin:bench (docker build -t ferrofin:bench .).
@@ -54,6 +62,24 @@ RATE_LOADED=${RATE_LOADED:-5}
 #: Note k6's dropped-iteration flag guards the CLIENT, not the server, and at this rate
 #: it will not fire — it is not the safety net for choosing this number.
 RATE_STRESS=${RATE_STRESS:-25}
+#: The ramp (`--only ramp`) starts at the stress rate, which Ferrofin is known to pass,
+#: and adds RAMP_STEP_RATE screens/s per step, which is also the ceiling's resolution (under
+#: the 15 % the A/B gate calls a regression once the ceiling is past ~65 screens/s);
+#: RAMP_STEP_S is the measured seconds per step, after one WARMUP_S warm-up at the start
+#: rate. The ramp stops at the first step whose worst-screen p95 exceeds RAMP_BOUND_MS (or
+#: that errors, or that k6 could not hold) and never runs a step above RAMP_CAP.
+RAMP_START=${RAMP_START:-$RATE_STRESS}
+RAMP_STEP_RATE=${RAMP_STEP_RATE:-10}
+RAMP_STEP_S=${RAMP_STEP_S:-30}
+RAMP_CAP=${RAMP_CAP:-400}
+RAMP_BOUND_MS=${RAMP_BOUND_MS:-100}
+#: The soak (`--only soak`, D7 of the "Benchmark coverage" milestone) holds RATE_SOAK screens
+#: per second (the loaded rate) for SOAK_S seconds (an hour: a leak of a few MiB an hour is
+#: invisible in a two-minute window) and fits a slope to the anon samples after the first
+#: SOAK_SKIP_S seconds, which are warm-up growth rather than a leak.
+SOAK_S=${SOAK_S:-3600}
+RATE_SOAK=${RATE_SOAK:-5}
+SOAK_SKIP_S=${SOAK_SKIP_S:-600}
 export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
@@ -68,7 +94,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
-for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS; do
+for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS SOAK_S RATE_SOAK SOAK_SKIP_S; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
 # Reject bad selections before any fixture access or Docker command.
@@ -78,7 +104,7 @@ for selection in "$ONLY" "$SERVERS"; do
 done
 [ -n "$SERVERS" ] || { echo "--servers cannot be empty" >&2; exit 2; }
 for phase in ${ONLY//,/ }; do
-  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
+  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs|ramp|soak) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
 done
 for server in ${SERVERS//,/ }; do
   case "$server" in jellyfin|ferrofin) ;; *) echo "unknown server $server" >&2; exit 2;; esac
@@ -128,8 +154,13 @@ die() { echo "run: $*" >&2; exit 1; }
 image_of() { case "$1" in jellyfin) cat bench/testdata/jellyfin-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
 port_of() { case "$1" in jellyfin) echo 18101;; ferrofin) echo 18103;; esac; }
 want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
+explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by default
 
 # ── preflight ──────────────────────────────────────────────────────────────
+! explicit ramp || [ "$SERVERS" = ferrofin ] || die "the ramp is Ferrofin only: pass --servers ferrofin"
+! explicit ramp || (( RAMP_START <= RAMP_CAP )) || die "RAMP_START must not exceed RAMP_CAP"
+! explicit soak || [ "$SERVERS" = ferrofin ] || die "the soak is Ferrofin only: pass --servers ferrofin"
+! explicit soak || (( SOAK_SKIP_S < SOAK_S )) || die "SOAK_SKIP_S must be shorter than SOAK_S"
 [ ! -e "$OUT" ] || die "$OUT exists — a run directory is never reused"
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum timeout setsid; do command -v $t >/dev/null || die "$t not installed"; done
@@ -358,7 +389,7 @@ phase_coldstart() {
   client python3 bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$IDS"
 }
 phase_load() {
-  local level rate t0 t1 sampler_ok=1 deadline
+  local level rate t0 t1 sampler_ok=1 deadline window_s client_timeout
   state sampler running
   taskset -c "$CLIENT_CPUS" python3 bench/mem_sample.py "$CONTAINER" "$D/mem.csv" "$MEM_SAMPLE_MS" "$SERVER_CPUS" &
   SAMPLER_PID=$!
@@ -366,9 +397,10 @@ phase_load() {
   while [ ! -s "$D/mem.csv" ] && kill -0 "$SAMPLER_PID" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
   [ -s "$D/mem.csv" ] || sampler_ok=0
   echo '{}' > "$D/windows.json"
-  for level in unloaded loaded stress; do
-    want "$level" || continue
-    case "$level" in unloaded) rate=$RATE_UNLOADED;; loaded) rate=$RATE_LOADED;; stress) rate=$RATE_STRESS;; esac
+  for level in unloaded loaded stress soak; do
+    if [ "$level" = soak ]; then explicit soak || continue; else want "$level" || continue; fi
+    window_s=$WINDOW_S
+    case "$level" in unloaded) rate=$RATE_UNLOADED;; loaded) rate=$RATE_LOADED;; stress) rate=$RATE_STRESS;; soak) rate=$RATE_SOAK; window_s=$SOAK_S;; esac
     if ! phase "drain-$level" drain; then
       state "warmup-$level" skipped "drain failed"; state "$level" skipped "drain failed"; continue
     fi
@@ -379,9 +411,15 @@ phase_load() {
       state "$level" skipped "state isolation prerequisite failed"; continue
     fi
     sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
+    client_timeout=$PHASE_TIMEOUT_S
+    if [ "$level" = soak ]; then   # the client must outlive the hour it is asked to run
+      PHASE_TIMEOUT_S=$((SOAK_S + client_timeout))
+      jq -n --argjson rate "$RATE_SOAK" --argjson soak_s "$SOAK_S" --argjson skip_s "$SOAK_SKIP_S" --argjson warmup_s "$WARMUP_S" '$ARGS.named' > "$D/soak-params.json"
+    fi
     t0=$(date +%s.%N)
-    phase "$level" k6run --console-output "$D/selections-$level.log" -e RATE="$rate" -e DURATION="${WINDOW_S}s" -e SEED="$SEED" -e OUT="$D/k6-$level.json" || true
+    phase "$level" k6run --console-output "$D/selections-$level.log" -e RATE="$rate" -e DURATION="${window_s}s" -e SEED="$SEED" -e OUT="$D/k6-$level.json" || true
     t1=$(date +%s.%N)
+    PHASE_TIMEOUT_S=$client_timeout
     jq --arg l "$level" --argjson start "$t0" --argjson end "$t1" '. + {($l): {start:$start,end:$end}}' "$D/windows.json" > "$D/windows.tmp" && mv "$D/windows.tmp" "$D/windows.json"
     # Ensure a bracketing sample is captured before observer requests start.
     sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
@@ -394,7 +432,37 @@ phase_load() {
   sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
   stop_sampler || sampler_ok=0
   python3 bench/report.py --resource-check "$D" || sampler_ok=0
+  ! explicit soak || phase soak-slope python3 bench/soak.py finish "$D" || true
   if (( sampler_ok )); then state sampler completed; else state sampler failed "sampler exit or coverage failed"; FAILED=1; fi
+}
+
+phase_ramp() {
+  local rate=$RAMP_START reason rc
+  jq -n --argjson start "$RAMP_START" --argjson step "$RAMP_STEP_RATE" --argjson step_s "$RAMP_STEP_S" --argjson cap "$RAMP_CAP" --argjson bound_ms "$RAMP_BOUND_MS" \
+    --argjson warmup_s "$WARMUP_S" '$ARGS.named' > "$D/ramp-params.json"
+  drain || return 1
+  k6run --console-output "$D/selections-ramp-warmup.log" -e RATE="$RAMP_START" -e DURATION="${WARMUP_S}s" -e SEED="$WARMUP_SEED" -e OUT="$D/k6-ramp-warmup.json" || return 1
+  while (( rate <= RAMP_CAP )); do
+    # Not k6run: a step past the knee has slow or failed screens, which is the answer, not a broken window.
+    # The per-iteration selection log feeds the picks comparison, which the ramp does not make.
+    client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output /dev/null \
+      -e SLOTS="$SLOTS" -e SHAPE_VUS="$SHAPE_VUS" -e URL="$URL" -e IDS="$IDS" -e RATE="$rate" -e DURATION="${RAMP_STEP_S}s" -e SEED="$SEED" \
+      -e OUT="$D/k6-ramp-$rate.json" bench/screens.js || return 1
+    [ -s "$D/k6-ramp-$rate.json" ] || { FAIL_REASON="no k6 summary for $rate screens/s"; return 1; }
+    rc=0; reason=$(python3 bench/ramp.py check "$D/k6-ramp-$rate.json" "$RAMP_BOUND_MS") || rc=$?
+    case "$rc" in
+      0) echo "  ramp: $rate screens/s passed";;
+      1) echo "  ramp: stopped at $rate screens/s: $reason"; break;;
+      *) FAIL_REASON="ramp.py could not read the $rate screens/s step"; return 1;;
+    esac
+    rate=$((rate + RAMP_STEP_RATE))
+  done
+  rc=0; python3 bench/ramp.py finish "$D" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) FAIL_REASON="the ramp has no passing step"; return 1;;
+    *) FAIL_REASON="ramp.py could not summarise the ramp"; return 1;;
+  esac
 }
 
 phase_ttfs() {
@@ -413,8 +481,9 @@ run_server() {
   echo '{}' > "$D/phases.json"
   state startup pending; state startup-drain pending; state cleanup pending; state isolation-setup pending
   for selected in counts shape coldstart ttfs; do ! want "$selected" || state "$selected" pending; done
-  for selected in unloaded loaded stress; do
-    if want "$selected"; then
+  ! explicit ramp || state ramp pending
+  for selected in unloaded loaded stress soak; do
+    if { [ "$selected" != soak ] && want "$selected"; } || { [ "$selected" = soak ] && explicit soak; }; then
       state "$selected" pending; state "warmup-$selected" pending; state "drain-$selected" pending
       state sampler pending; state steady pending; state drain-steady pending
     fi
@@ -472,8 +541,9 @@ PY_ISOLATION
   ! want counts || phase counts || true
   ! want shape || isolated_phase shape phase_shape || true
   ! want coldstart || isolated_phase coldstart phase_coldstart || true
-  { ! want unloaded && ! want loaded && ! want stress; } || phase_load
+  { ! want unloaded && ! want loaded && ! want stress && ! explicit soak; } || phase_load
   ! want ttfs || isolated_phase ttfs phase_ttfs || true
+  ! explicit ramp || isolated_phase ramp phase_ramp || true
   exit "$FAILED"
 }
 

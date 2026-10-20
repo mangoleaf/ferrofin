@@ -133,8 +133,8 @@ pub struct FerrofinStreamStatePlanner {
     /// ffmpeg path and the boot capabilities — is already held, and it is
     /// pure cache in front of a probe.
     vaapi_prober: crate::vaapi_probe::VaapiProber,
-    /// Resolves item/series/library display names onto the plan's
-    /// [`TranscodeDisplayNames`] so transcode logs name what they play.
+    /// Resolves item/series/library display names for a starting job (see
+    /// `display_names`) so transcode logs name what they play.
     /// Optional: `None` (the composition unit test) leaves the names empty —
     /// they are logging metadata, never load-bearing.
     library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
@@ -204,37 +204,6 @@ impl FerrofinStreamStatePlanner {
     ) -> Self {
         self.virtual_folders = Some(folders);
         self
-    }
-
-    /// Resolves the human-readable names for the playing item — its own title,
-    /// its series (episodes), and its library — for the transcode logs.
-    /// Best-effort by design: any miss leaves the field empty.
-    async fn display_names(
-        &self,
-        item_id: uuid::Uuid,
-    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
-        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
-        let Some(library) = &self.library else {
-            return names;
-        };
-        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
-            return names;
-        };
-        names.item_name = item.name.clone();
-        names.series_name = item.series_name.clone();
-        // The library whose location holds the item (its `TopParentId` is
-        // that location's folder; a row an older scan wrote names the library).
-        if let Some(folders) = &self.virtual_folders
-            && let Ok(folders) = folders.get_virtual_folders().await
-        {
-            names.library_name = ferrofin_model::entities_media::owning_library(
-                &folders,
-                item.top_parent_id.as_deref(),
-                item.path.as_deref(),
-            )
-            .and_then(|folder| folder.name.clone());
-        }
-        names
     }
 
     /// The effective [`EncodingOptions`] for this planner, read from the persisted
@@ -596,6 +565,38 @@ fn hls_segment_type(segment_container: &str) -> &'static str {
 
 #[async_trait]
 impl StreamStatePlanner for FerrofinStreamStatePlanner {
+    /// Resolves the human-readable names for the playing item — its own title,
+    /// its series (episodes), and its library — for the transcode logs.
+    /// Best-effort by design: any miss leaves the field empty. Asked only when
+    /// a job starts: the library lookup walks every configured library.
+    async fn display_names(
+        &self,
+        item_id: uuid::Uuid,
+    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
+        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
+        let Some(library) = &self.library else {
+            return names;
+        };
+        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
+            return names;
+        };
+        names.item_name = item.name.clone();
+        names.series_name = item.series_name.clone();
+        // The library whose location holds the item (its `TopParentId` is
+        // that location's folder; a row an older scan wrote names the library).
+        if let Some(folders) = &self.virtual_folders
+            && let Ok(folders) = folders.get_virtual_folders().await
+        {
+            names.library_name = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path.as_deref(),
+            )
+            .and_then(|folder| folder.name.clone());
+        }
+        names
+    }
+
     // The plan is the linear `GetStreamingState` → `GetCommandLineArguments`
     // orchestration: five clearly-labelled steps (resolve source, copy-vs-
     // transcode, populate state, build args, return). Splitting it would only
@@ -852,7 +853,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // A probe state used only for the copy decision (the final state is
         // populated below with the resolved output codecs).
         let mut probe_state = EncodingJobInfo {
-            display: self.display_names(request.item_id).await,
+            display: ferrofin_mediaencoding::TranscodeDisplayNames::default(),
             base_request: base_request.clone(),
             video_stream: video_stream.clone(),
             audio_stream: audio_stream.clone(),

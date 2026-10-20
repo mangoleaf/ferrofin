@@ -1237,7 +1237,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(out.exists())
 
     def test_driver_retags_each_run_stops_on_a_wrong_image_and_restores_the_tag(self):
-        plan = {'schedule': gate.schedule('ab', {'a': 'old', 'b': 'new'}, 3),
+        plan = {'mode': 'ab', 'schedule': gate.schedule('ab', {'a': 'old', 'b': 'new'}, 3),
                 'images': {'a': {'id': 'sha256:old'}, 'b': {'id': 'sha256:new'}}}
         calls = []
 
@@ -1262,7 +1262,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse((self.root / '03-a').exists())
 
     def test_a_run_that_cannot_start_stops_the_session_with_its_own_exit(self):
-        plan = {'schedule': gate.schedule('aa', {'a': 'x'}, 2), 'images': {'a': {'id': 'sha256:x'}}}
+        plan = {'mode': 'aa', 'schedule': gate.schedule('aa', {'a': 'x'}, 2), 'images': {'a': {'id': 'sha256:x'}}}
         with patch.object(gate, 'docker', lambda *a: ''), patch.object(gate, 'run_sh', lambda cmd: 1):
             with self.assertRaisesRegex(SystemExit, r'01-a failed \(run.sh exit 1\)'):
                 gate.run_session(str(self.root), plan, None)

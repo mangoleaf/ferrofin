@@ -57,7 +57,7 @@ use crate::projection::{
 };
 use crate::schedules_direct::SchedulesDirect;
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
-use crate::xmltv::parse_xmltv;
+use crate::xmltv::{Xmltv, parse_xmltv};
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
 /// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
@@ -1136,7 +1136,14 @@ impl FerrofinLiveTvManager {
     ) -> Result<Vec<EpgChannel>, ServiceError> {
         Self::listings_provider_name(info.type_.as_deref())?;
         let body = self.xmltv.get_xml(info).await?;
-        Ok(parse_xmltv(&body)
+        let guide = parse_xmltv(&body);
+        // Upstream's `GetChannels` throws on a bad document, so the mapping
+        // dialog shows an error instead of "no channels".
+        if let Some(e) = guide.error {
+            let path = info.path.as_deref().unwrap_or_default();
+            return Err(ServiceError::Backend(format!("{path}: {e}")));
+        }
+        Ok(guide
             .channels
             .into_iter()
             .map(|c| EpgChannel {
@@ -1304,7 +1311,7 @@ impl FerrofinLiveTvManager {
         Ok(by_epg_channel)
     }
 
-    /// Inserts programmes from an XMLTV body, binding each to every channel that
+    /// Inserts programmes from a parsed XMLTV guide, binding each to every channel that
     /// takes its listings from the programme's guide channel, classified against
     /// the listings provider's category lists as
     /// `XmlTvListingsProvider.GetProgramInfo` does. Returns the ids it wrote, for
@@ -1316,15 +1323,14 @@ impl FerrofinLiveTvManager {
     /// `tvg-id`.
     async fn insert_programs(
         &self,
-        xmltv_body: &str,
+        guide: &Xmltv,
         provider: &ListingsProviderInfo,
         window: (DateTime<Utc>, DateTime<Utc>),
     ) -> Result<Vec<String>, ServiceError> {
-        let guide = parse_xmltv(xmltv_body);
         let classes = CategoryClasses::from_provider(provider);
         let (window_start, window_end) = window;
 
-        let by_epg_channel = self.bind_guide_channels(&guide, provider).await?;
+        let by_epg_channel = self.bind_guide_channels(guide, provider).await?;
         // The channels this document is authoritative for — the ones the ladder
         // actually bound, so `clean_programs` replaces only those and a second
         // listings provider's airings survive this pass.
@@ -2174,14 +2180,26 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let start = Utc::now() - chrono::Duration::hours(GUIDE_WINDOW_LEAD_IN_HOURS);
         let window = (start, start + chrono::Duration::days(days));
         tracing::info!(days, "live tv: refreshing guide");
-        let mut guide_bodies: Vec<(ListingsProviderInfo, String)> = Vec::new();
+        let mut guides: Vec<(ListingsProviderInfo, Xmltv)> = Vec::new();
         for provider in self.get_listing_providers().await? {
             let Some(path) = provider.path.as_deref() else {
                 clean_database = false;
                 continue;
             };
             match self.xmltv.get_xml(&provider).await {
-                Ok(body) => guide_bodies.push((provider.clone(), body)),
+                // Jellyfin 12.1's `hasErrors` (`cleanDatabase &= !hasErrors`): an
+                // empty or unreadable document is a listings error like a failed
+                // fetch. The provider writes nothing, so `clean_programs` cannot
+                // replace its channels' airings with a partial read either.
+                Ok(body) => {
+                    let guide = parse_xmltv(&body);
+                    if let Some(e) = &guide.error {
+                        clean_database = false;
+                        tracing::warn!(%path, error = %e, "live tv: guide document unreadable; keeping the stored guide");
+                    } else {
+                        guides.push((provider.clone(), guide));
+                    }
+                }
                 Err(e) => {
                     clean_database = false;
                     tracing::warn!(%path, error = %e, "live tv: guide fetch failed");
@@ -2197,8 +2215,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
             kept_channels.extend(self.replace_channels(id, channels).await?);
         }
         let mut kept_programs: HashSet<String> = HashSet::new();
-        for (provider, body) in &guide_bodies {
-            kept_programs.extend(self.insert_programs(body, provider, window).await?);
+        for (provider, guide) in &guides {
+            kept_programs.extend(self.insert_programs(guide, provider, window).await?);
         }
         if clean_database {
             // `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
@@ -9913,6 +9931,89 @@ mod tests {
             .expect("channels2");
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, kept_id, "the surviving channel keeps its id");
+    }
+
+    /// Jellyfin 12.1's `hasErrors` rule (`GuideManager.RefreshGuide`,
+    /// `cleanDatabase &= !hasErrors`): a guide body that is empty or not a
+    /// readable XMLTV document is a listings error, so the stored airings stay
+    /// and the provider writes nothing. A well-formed guide with no programmes
+    /// is not an error and still prunes.
+    #[rstest::rstest]
+    #[case::empty("", 1)]
+    #[case::whitespace("  \n", 1)]
+    #[case::truncated_mid_tag(
+        "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel><programme start=\"2026",
+        1
+    )]
+    #[case::truncated_after_channels(
+        "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>",
+        1
+    )]
+    #[case::html_page(
+        "<!DOCTYPE html><html><head><title>503</title></head><body>Down for maintenance</body></html>",
+        1
+    )]
+    #[case::well_formed_empty("<tv></tv>", 0)]
+    #[tokio::test]
+    async fn an_unreadable_guide_body_keeps_the_stored_guide(
+        #[case] body: &str,
+        #[case] programs_after: usize,
+    ) {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
+        let fetcher = Arc::new(SwappableFetcher(std::sync::Mutex::new(sources)));
+        let mgr = manager_with_fetcher(Arc::clone(&fetcher) as Arc<dyn SourceFetcher>).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        let provider_id = mgr
+            .save_listing_provider(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            })
+            .await
+            .expect("provider")
+            .id
+            .expect("provider id");
+        mgr.refresh_guide().await.expect("refresh");
+        let count = || async {
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len()
+        };
+        assert_eq!(count().await, 1);
+
+        fetcher
+            .0
+            .lock()
+            .unwrap()
+            .insert("http://guide/xmltv.xml".to_owned(), body.to_owned());
+        // The first refresh cached the document for `MAX_CACHE_AGE`; drop it, as
+        // saving the provider does, so the second refresh downloads the new body.
+        mgr.xmltv.invalidate(&provider_id).await;
+        mgr.refresh_guide().await.expect("refresh2");
+        assert_eq!(count().await, programs_after);
+        assert_eq!(
+            crate::guide_repository::channel_rows(&mgr.db)
+                .await
+                .expect("channels")
+                .len(),
+            2,
+            "the tuner lineup is untouched by the guide's state"
+        );
+        // Upstream's `GetChannels` throws on a bad document, so the mapping
+        // dialog errors instead of listing no guide channels.
+        let unreadable = programs_after == 1;
+        assert_eq!(
+            mgr.get_channel_mapping_options(&provider_id).await.is_err(),
+            unreadable
+        );
     }
 
     #[tokio::test]

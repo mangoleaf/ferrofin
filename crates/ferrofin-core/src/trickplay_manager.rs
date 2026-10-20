@@ -122,6 +122,9 @@ struct WidthRefreshContext<'a> {
     video_stream: Option<MediaStream>,
     /// The selected trickplay directory for the item.
     trickplay_dir: &'a str,
+    /// Whether `trickplay_dir` is beside the media (`SaveTrickplayWithMedia`),
+    /// so generation probes it for write access first.
+    save_with_media: bool,
 }
 
 impl FerrofinTrickplayManager {
@@ -389,6 +392,13 @@ impl FerrofinTrickplayManager {
             }
         }
 
+        // Check for write permission before generating images
+        // (`TrickplayManager.cs:482-488`), so an unwritable media folder fails
+        // before any ffmpeg work rather than when the packed tiles are moved.
+        if ctx.save_with_media {
+            probe_write_access(&output_dir)?;
+        }
+
         // Generate: extract thumbnails into a temp dir, pack them into tiles.
         let _slot = self
             .generation_slots
@@ -411,8 +421,16 @@ impl FerrofinTrickplayManager {
         let frames_dir =
             std::env::temp_dir().join(format!("ferrofin_trickplay_{}", Uuid::new_v4().simple()));
         let _frames_cleanup = TemporaryTrickplayDirectory(frames_dir.clone());
-        self.extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
-            .await
+        let result = self
+            .extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
+            .await;
+        if result.is_err() && ctx.save_with_media {
+            // Drop the probed width folder when nothing was written into it;
+            // a non-empty or already removed folder makes this a no-op, and
+            // `prune_unexpected_folders` sweeps any row-less folder afterwards.
+            let _ = std::fs::remove_dir(&output_dir);
+        }
+        result
     }
 
     /// Runs the frame extraction plus [`Self::create_tiles`], saving the
@@ -919,6 +937,7 @@ impl FerrofinTrickplayManager {
             media_path: &media_path,
             video_stream,
             trickplay_dir: &trickplay_dir,
+            save_with_media: library_options.save_trickplay_with_media,
         };
         for width in &options.width_resolutions {
             if *width <= 0 {
@@ -1366,6 +1385,26 @@ fn jpg_files_sorted(dir: &Path) -> Vec<String> {
         .collect();
     files.sort();
     files
+}
+
+/// The write-permission check `RefreshTrickplayDataInternal` runs before
+/// extracting into a media folder: creates `dir` and an empty probe file in
+/// it. Unlike upstream, the probe is removed again so it never sits beside
+/// the tiles; a concurrent refresh of the same width may remove it first.
+fn probe_write_access(dir: &Path) -> Result<(), ServiceError> {
+    tracing::debug!(directory = %dir.display(), "verifying write permission in media directory");
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ServiceError::backend(format!("cannot create {}: {e}", dir.display())))?;
+    let probe = dir.join(".jellyfin-trickplay");
+    std::fs::File::create(&probe)
+        .map_err(|e| ServiceError::backend(format!("cannot write {}: {e}", probe.display())))?;
+    match std::fs::remove_file(&probe) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ServiceError::backend(format!(
+            "cannot remove {}: {e}",
+            probe.display()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Moves the flat directory `src` to `dst`, replacing `dst` if present; falls
@@ -2795,6 +2834,55 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "failed writing cannot leave a manifest pointing at absent tiles"
+        );
+    }
+
+    /// A regular file where the `.trickplay` folder belongs blocks the
+    /// destination the way a read-only media folder does, and still blocks it
+    /// when the tests run as root.
+    #[tokio::test]
+    async fn unwritable_sidecar_destination_fails_before_any_frame_extraction() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320, 640]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, options) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
+        std::fs::write(&sidecar, b"blocked output destination").unwrap();
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "the write probe stops every width before ffmpeg runs"
+        );
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_file(&sidecar).unwrap();
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert_eq!(r.extractor.calls(), 2);
+        let mut names: Vec<String> = std::fs::read_dir(sidecar.join("320 - 2x2"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["0.jpg", "1.jpg"],
+            "the probe file is not left behind"
         );
     }
 

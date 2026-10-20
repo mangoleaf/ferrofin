@@ -169,6 +169,7 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 |---|---|
 | GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
+| that item's id in its metadata folder (`/<2>/<id>/`) in `Chapters.ImagePath` | the same repair moves the item's metadata folder, chapter images included, to the new id, as Jellyfin 12.2 does; any other path change still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
 | `ItemValues.CleanValue` is checked on its own: it must stay what it was or become what `Value` derives to | 0031 and the boot repair `repair_clean_values` (12.0's `RefreshCleanNamesAsync`) re-derive it with `get_clean_value`, ported in `clean_value.py` (needs PyICU) and proven against the Rust oracle; a value NULLed or corrupted by adoption still fails |
 | a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
@@ -437,10 +438,22 @@ own setup, library, user, metadata, and playlist APIs. It uses invented accounts
 titles, tags, provider IDs, solid-color images, silent video, and generated tones.
 It neither reads nor modifies a personal media server.
 
-The fixture has five movie titles (one with two versions), one extra, one series
-with two seasons and six episodes, and six music tracks across two artists and
-two albums. One album spans two discs. English subtitle files accompany every
-movie and episode. Seven users provide an administrator, an adult with access to
+The fixture has eight movie titles (one with two versions, one HDR10, one with two
+audio languages and an attached font, one under a non-ASCII path), one extra, one
+series with two seasons and six episodes, six music tracks across two artists and
+two albums, a book and two photos. One album spans two discs. English subtitle files
+accompany every movie and episode, every video has chapters, and every movie and
+episode NFO credits two actors. Chapter-image and trickplay extraction run during
+the scan, and the builder runs the keyframe-extraction task, saves display
+preferences and a device name, and writes two media segments under the Intro
+Skipper plugin's provider id (no API creates one). So every table the
+[table digests](#2026-10-19-table-digests-check-7) compare holds rows on every
+fixture (bar media segments on the fresh install, which skips `seed_database`), and the
+builder fails when one of them is empty. Measured on 2026-10-20 on an idle host,
+before the fresh-install row existed, this made a full `build-fixtures.sh` take 420 s instead
+of 396 s (+6 %), and the fixture directory 29 MB instead of 18 MB.
+
+Seven users provide an administrator, an adult with access to
 every library, a child with library/parental restrictions, an administratively
 disabled account, an account locked by failed logins, a passwordless account, and
 a dedicated account with populated policy and configuration settings. Downloads
