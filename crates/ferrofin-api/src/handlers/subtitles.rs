@@ -766,5 +766,7 @@ mod tests {
     #[test]
     fn base64_rejects_invalid_chars() {
         assert!(decode_base64("!!!!").is_none());
+        // `=` is padding only at the end; FromBase64Transform refuses it inside.
+        assert!(decode_base64("aG=k").is_none());
     }
 }

@@ -105,8 +105,9 @@ pub(crate) async fn effective_user_id(
 ///
 /// The id itself comes from [`effective_user_id`] (the full
 /// `RequestHelpers.GetUserId` port, nil-fallback *and* the administrator gate).
-/// A `user_id` that resolves to no account is a `400`; a caller with neither an
-/// explicit id nor an authenticated user is likewise rejected.
+/// A caller with neither an explicit id nor an authenticated user (a nil
+/// effective id) is a `400`, as `GetUserById(Guid.Empty)` throws
+/// `ArgumentException`; an id that resolves to no account is a `404`.
 pub(crate) async fn resolve_user(
     state: &AppState,
     auth: &AuthorizationInfo,
