@@ -466,6 +466,61 @@ async fn seasons_are_named_by_the_library_and_the_server_culture() {
     }
 }
 
+/// Only the path below the library is read for an episode's numbers: a
+/// folder above it named like `1-12` (here `media-v12-2`) is no season 12,
+/// neither when the scan plans the episode nor when a refresh re-reads it.
+/// Upstream reads the whole path (`FillMissingEpisodeNumbersFromPath`), so
+/// its `([0-9]+)-([0-9]+)` expression matches there.
+#[tokio::test]
+async fn digits_above_the_library_are_no_season() {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::scanned_with(
+        &tmp.path().join("media-v12-2"),
+        Setup {
+            files: &["Flat S01E01.mkv", "Bonus/Making of.mkv"],
+            culture: Some("de"),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let read = || async {
+        let mut seasons: Vec<(Option<i64>, Option<String>)> =
+            sqlx::query_as(r#"SELECT "IndexNumber", "Name" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(SEASON)
+                .fetch_all(fx.db.pool())
+                .await
+                .expect("seasons");
+        seasons.sort();
+        let bonus: Option<i64> = sqlx::query_scalar(
+            r#"SELECT "ParentIndexNumber" FROM "BaseItems" WHERE "Path" LIKE '%/Making of.mkv'"#,
+        )
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("bonus episode");
+        (seasons, bonus)
+    };
+    let scanned = (
+        vec![
+            (None, Some("Staffel unbekannt".to_owned())),
+            (Some(1), Some("Staffel 1".to_owned())),
+        ],
+        None,
+    );
+    assert_eq!(read().await, scanned, "planned");
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        force_save: true,
+        ..MetadataRefreshOptions::default()
+    };
+    fx.scanner
+        .scan_with(None, &replace_all)
+        .await
+        .expect("replace all");
+    assert_eq!(read().await, scanned, "refreshed");
+}
+
 /// The repair leaves an older scan's season alone when the id it would move
 /// to is stored already (another season holds it): the scan settles it.
 #[tokio::test]

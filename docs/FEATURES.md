@@ -289,6 +289,13 @@ its file lands (5.1 s with a 5 s delay), and the scan itself takes about 50 ms. 
 requests come on top: the new episode's first refresh asks every checked downloader, and
 the season's folder change asks the season providers.
 
+### Accepted divergences (fixes, not gaps)
+
+- **An episode's season and episode numbers are read only from its path below the library
+  folder.** Jellyfin reads the whole path, so a folder above the library named like
+  `media-v12-2` or `disk1-2` puts an episode whose own name has no numbers (a bonus video,
+  say) into season 12 or 1. In Ferrofin that episode stays in the unnumbered season.
+
 ### Known limits
 
 - **A file that disappears takes its item's user data with it.** A deleted, renamed or moved
