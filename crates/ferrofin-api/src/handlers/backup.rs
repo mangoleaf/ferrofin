@@ -123,6 +123,12 @@ static BACKUP_IN_FLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_
 /// The subdirectory of the data path that holds the backup archives.
 const BACKUPS_DIR: &str = "backups";
 
+/// The archive entry holding the writer's [`ferrofin_db::schema_head`]. It
+/// sits beside `manifest.json`, which keeps upstream's `BackupManifestDto`
+/// shape. An archive without it predates the entry, so it is no newer than
+/// any build that reads it.
+const SCHEMA_HEAD_ENTRY: &str = "ferrofin-schema-head";
+
 /// The manifest entry stored inside each archive (as `manifest.json`) and returned
 /// by the list/create/inspect routes. Port of `BackupManifestDto`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +218,51 @@ fn io_err(context: &str, e: &impl std::fmt::Display) -> ApiError {
 fn restorable(manifest: &BackupManifest) -> bool {
     manifest.backup_engine_version.is_empty()
         || manifest.backup_engine_version == BACKUP_ENGINE_VERSION
+}
+
+/// Why `archive` cannot be restored, or `None` when it can: a foreign or
+/// unreadable archive, or one written by a newer Ferrofin. Upstream refuses a
+/// newer `ServerVersion`; every Ferrofin build writes the same crate version,
+/// so the newer-build test compares the recorded schema head (its database
+/// would not open here) instead.
+fn restore_refusal(archive: &Path) -> Option<String> {
+    let name = archive.file_name().map_or_else(
+        || archive.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    if !read_manifest(archive).is_some_and(|m| restorable(&m)) {
+        return Some(format!(
+            "backup {name} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive"
+        ));
+    }
+    let head = ferrofin_db::schema_head();
+    match read_schema_head(archive) {
+        Ok(Some(written)) if written > head => Some(format!(
+            "backup {name} was written by a newer version of Ferrofin (database schema \
+             {written}, this version knows up to {head}) and cannot be restored by this version"
+        )),
+        Ok(_) => None,
+        Err(reason) => Some(format!("backup {name} cannot be restored: {reason}")),
+    }
+}
+
+/// The [`SCHEMA_HEAD_ENTRY`] recorded in one archive: `Ok(None)` when it has
+/// none (it predates the entry), `Err` when it has one that cannot be read as
+/// a version. That case fails closed: it might come from a newer build.
+fn read_schema_head(archive: &Path) -> Result<Option<i64>, String> {
+    let unreadable = |e: &dyn std::fmt::Display| format!("unreadable {SCHEMA_HEAD_ENTRY}: {e}");
+    let file = std::fs::File::open(archive).map_err(|e| unreadable(&e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| unreadable(&e))?;
+    let mut entry = match zip.by_name(SCHEMA_HEAD_ENTRY) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(unreadable(&e)),
+    };
+    let mut text = String::new();
+    entry
+        .read_to_string(&mut text)
+        .map_err(|e| unreadable(&e))?;
+    text.trim().parse().map(Some).map_err(|e| unreadable(&e))
 }
 
 /// Reads the `manifest.json` embedded in one archive, if it parses.
@@ -418,10 +469,11 @@ fn write_backup(
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-
     zip.start_file("manifest.json", opts)?;
     let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap_or_default();
     zip.write_all(&manifest_json)?;
+    zip.start_file(SCHEMA_HEAD_ENTRY, opts)?;
+    zip.write_all(ferrofin_db::schema_head().to_string().as_bytes())?;
 
     // The database (skipped if absent — e.g. an in-memory test DB).
     if manifest.options.database {
@@ -480,11 +532,10 @@ async fn restore_backup(
         return Err(ApiError::NotFound(format!("backup {name}")));
     }
     // Refuse an archive this engine cannot restore BEFORE scheduling a restart
-    // for nothing (a Jellyfin archive in a shared backups dir, a stray zip).
-    if !read_manifest(&archive).is_some_and(|m| restorable(&m)) {
-        return Err(ApiError::BadRequest(format!(
-            "backup {name} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive"
-        )));
+    // for nothing (a Jellyfin archive in a shared backups dir, a stray zip, an
+    // archive from a newer Ferrofin).
+    if let Some(reason) = restore_refusal(&archive) {
+        return Err(ApiError::BadRequest(reason));
     }
     std::fs::write(dir.join(RESTORE_PENDING_FILE), &name)
         .map_err(|e| io_err("schedule restore", &e))?;
@@ -555,14 +606,8 @@ pub fn apply_pending_restore(roots: &TreeRoots) -> Result<Option<PathBuf>, Resto
             )
         })?;
     let archive = dir.join(name);
-    if !read_manifest(&archive).is_some_and(|m| restorable(&m)) {
-        return Err(untouched(
-            Some(archive.clone()),
-            std::io::Error::other(format!(
-                "{} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive",
-                archive.display()
-            )),
-        ));
+    if let Some(reason) = restore_refusal(&archive) {
+        return Err(untouched(Some(archive), std::io::Error::other(reason)));
     }
     restore_archive(&archive, roots).map_err(|error| RestoreFailure {
         archive: Some(archive.clone()),
@@ -789,6 +834,88 @@ mod tests {
         assert!(!nameless.partially_applied);
         assert!(nameless.archive.is_none());
         assert!(nameless.to_string().starts_with("restoring a backup:"));
+    }
+
+    /// An archive from a newer Ferrofin, whose database is migrated past this
+    /// binary's last migration, is refused before anything is touched: the
+    /// next boot could not open that database. Upstream refuses an archive
+    /// whose `ServerVersion` is newer than the running one; every Ferrofin
+    /// build writes the same crate version, so the schema head stands in.
+    #[test]
+    fn an_archive_from_a_newer_schema_is_refused_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let boot = tmp.path().join("boot");
+        let backups = boot.join("data").join(super::BACKUPS_DIR);
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(boot.join("ferrofin.db"), b"LIVE").unwrap();
+        let manifest = format!(
+            r#"{{"DateCreated":"2024-01-01T00:00:00Z","ServerVersion":"0.4.1","BackupEngineVersion":"{}","Options":{{}}}}"#,
+            super::BACKUP_ENGINE_VERSION
+        );
+        {
+            let file = std::fs::File::create(backups.join("newer.zip")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(manifest.as_bytes()).unwrap();
+            // The entry name is part of the archive format: archives already
+            // written must keep matching it.
+            zip.start_file("ferrofin-schema-head", opts).unwrap();
+            zip.write_all(b"999999999999").unwrap();
+            zip.start_file("data/ferrofin.db", opts).unwrap();
+            zip.write_all(b"NEWER").unwrap();
+            zip.finish().unwrap();
+        }
+        std::fs::write(backups.join(super::RESTORE_PENDING_FILE), "newer.zip").unwrap();
+        let roots = TreeRoots::defaults(&boot, &boot.join("config"), &boot.join("ferrofin.db"));
+
+        let refused = super::apply_pending_restore(&roots).unwrap_err();
+        assert!(!refused.partially_applied, "{refused}");
+        assert!(refused.to_string().contains("newer"), "{refused}");
+        assert_eq!(std::fs::read(boot.join("ferrofin.db")).unwrap(), b"LIVE");
+
+        // A head entry that cannot be read fails closed: it may be newer.
+        let garbled = backups.join("garbled.zip");
+        {
+            let file = std::fs::File::create(&garbled).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(manifest.as_bytes()).unwrap();
+            zip.start_file("ferrofin-schema-head", opts).unwrap();
+            zip.write_all(b"v2").unwrap();
+            zip.finish().unwrap();
+        }
+        let reason = super::restore_refusal(&garbled).expect("refused");
+        assert!(reason.contains("unreadable"), "{reason}");
+
+        // An archive this build writes records its own head and is restorable.
+        let written = super::write_backup(
+            &backups,
+            &roots,
+            BackupOptions::default(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        let written = std::path::PathBuf::from(&written.path);
+        assert_eq!(
+            super::read_schema_head(&written),
+            Ok(Some(ferrofin_db::schema_head()))
+        );
+        assert_eq!(super::restore_refusal(&written), None);
+
+        // An archive from before the entry existed is no newer than this build.
+        let legacy = backups.join("legacy.zip");
+        {
+            let file = std::fs::File::create(&legacy).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(manifest.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(super::restore_refusal(&legacy), None);
     }
 
     /// A backup whose configuration relocates the metadata tree restores its
@@ -1054,6 +1181,56 @@ mod tests {
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         drop(held);
+    }
+
+    /// The restore route refuses an archive from a newer Ferrofin with a 400
+    /// and schedules nothing.
+    #[tokio::test]
+    async fn restore_route_refuses_an_archive_from_a_newer_schema() {
+        use crate::create_router;
+        use crate::test_support::elevated_fake_state;
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = std::env::temp_dir()
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
+            .join("backups");
+        let _ = std::fs::remove_dir_all(&backups);
+        std::fs::create_dir_all(&backups).unwrap();
+        {
+            let file = std::fs::File::create(backups.join("newer.zip")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("manifest.json", opts).unwrap();
+            let manifest = format!(
+                r#"{{"DateCreated":"2024-01-01T00:00:00Z","ServerVersion":"0.4.1","BackupEngineVersion":"{}","Options":{{}}}}"#,
+                super::BACKUP_ENGINE_VERSION
+            );
+            zip.write_all(manifest.as_bytes()).unwrap();
+            zip.start_file(super::SCHEMA_HEAD_ENTRY, opts).unwrap();
+            zip.write_all(b"999999999999").unwrap();
+            zip.finish().unwrap();
+        }
+        let resp = create_router(elevated_fake_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Backup/Restore")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"ArchiveFileName":"newer.zip"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Refused by the schema check, not as a foreign archive.
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("newer version of Ferrofin"), "{body}");
+        assert!(!backups.join(super::RESTORE_PENDING_FILE).exists());
+        let _ = std::fs::remove_dir_all(&backups);
     }
 
     #[tokio::test]
