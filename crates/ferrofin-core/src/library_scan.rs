@@ -719,6 +719,16 @@ impl<'a> FetcherPolicy<'a> {
         ferrofin_providers::library_options::global_metadata_options(self.global?, kind)
     }
 
+    /// Whether a metadata saver will rewrite `row`'s metadata
+    /// ([`ferrofin_providers::nfo_save::saves_metadata`]), with this policy's
+    /// library and server-wide options. It reads the configuration only, not
+    /// whether this scanner was given savers: the composition root always
+    /// wires the Nfo saver, as upstream always registers it.
+    fn saves_metadata(self, row: &BaseItemEntity) -> bool {
+        let kind = row.type_.rsplit('.').next().unwrap_or_default();
+        ferrofin_providers::nfo_save::saves_metadata(row, self.options, self.global_for(kind))
+    }
+
     /// Whether the library enabled metadata fetcher `name` for `kind`.
     ///
     /// Delegates to the shared gate so the scan and the on-demand refresh in
@@ -6765,9 +6775,14 @@ impl LibraryScanner {
         // plus the external ids the file pins. It runs only when the plan
         // runs the local readers (`BaseNfoProvider.HasChanged`: the NFO is
         // newer than the last save by over a minute, or every provider runs).
-        // Identifying skips the local readers ("Do not execute local
-        // providers if we are identifying", `MetadataService.cs:802-803`).
-        let run_local = plan.local_metadata && !locked && search.is_none();
+        // Identifying skips the local readers, and so does "Replace all
+        // metadata" for an item a saver will rewrite ("Do not execute local
+        // providers if we are identifying or replacing with local metadata
+        // saving enabled", `MetadataService.cs:802-803`).
+        let run_local = plan.local_metadata
+            && !locked
+            && search.is_none()
+            && !(options.replace_all_metadata && policy.saves_metadata(&entity));
         let local = if run_local {
             self.fetch_local_nfo(&mut entity, policy).await
         } else {
@@ -31463,19 +31478,29 @@ mod tests {
     /// returns a list, `BaseNfoParser` → `ResetPeople`) clears the stored cast
     /// only under "Replace all metadata", where `RemoveOldMetadata` skips
     /// "add existing metadata to provider result" (`:905`); every other mode
-    /// turns the empty list into null there and keeps the cast.
+    /// turns the empty list into null there and keeps the cast. That needs a
+    /// library that saves no metadata: where the Nfo saver is on (the existing
+    /// NFO turns it on), "Replace all metadata" reads no NFO at all
+    /// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`),
+    /// and with no provider answering the cast stands.
     #[rstest::rstest]
-    #[case::scan("scan", 2)]
-    #[case::missing("missing", 2)]
-    #[case::replace_all("replace", 0)]
+    #[case::scan("scan", false, 2)]
+    #[case::missing("missing", false, 2)]
+    #[case::replace_all("replace", false, 0)]
+    #[case::replace_all_with_a_saver("replace", true, 2)]
     #[tokio::test]
     async fn an_nfo_naming_no_actors_clears_the_cast_only_under_replace_all(
         #[case] choice: &str,
+        #[case] saving: bool,
         #[case] expected: usize,
     ) {
         let tmp = tempfile::tempdir().unwrap();
+        let options = LibraryOptions {
+            metadata_savers: (!saving).then(Vec::new),
+            ..LibraryOptions::default()
+        };
         let (vf, persistence, people, episode_id, items) =
-            library_with_a_stale_episode_cast(tmp.path()).await;
+            library_with_a_stale_episode_cast_in(tmp.path(), options).await;
         let nfo = tmp.path().join("tv/GoT/Season 01/GoT S01E01.nfo");
         std::fs::write(
             &nfo,
@@ -34807,6 +34832,9 @@ mod tests {
                         path_infos: vec![MediaPathInfo {
                             path: media.to_string_lossy().into_owned(),
                         }],
+                        // No saver, so "Replace all metadata" still reads
+                        // the NFO (`isSavingMetadata`, `MetadataService.cs:803`).
+                        metadata_savers: Some(Vec::new()),
                         ..Default::default()
                     },
                 )
