@@ -117,8 +117,9 @@ from.
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
    that commit and runs the full adoption validation in
-   [`adoption/README.md`](adoption/README.md): `adoption/run.sh` **and** the synthetic
-   preservation matrix, all ten paths. Every push to `release/**` starts it; for a patch
+   [`adoption/README.md`](adoption/README.md): `adoption/run.sh` (eleven paths, including the
+   fresh-install 12.2 row) **and** the synthetic preservation matrix (ten paths; the seedless
+   fresh-install row is validated by `run.sh` alone). Every push to `release/**` starts it; for a patch
    release from `main`, start it with **Actions → Adoption → Run workflow** on `main`. Keep
    the run's link for step 5. A manual run of the same commands is for debugging only and
    does not replace the CI run. An adoption failure is never waived; fix it, which means

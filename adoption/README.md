@@ -30,14 +30,17 @@ copies, as shown below.
 | 12.2.0 | 10.11.8 → 12.2.0 | 107 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.2.0 | 108 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 | 109 | `12.2.0` | PASS (synthetic) |
+| 12.2.0 | Fresh 12.2 install (not upgraded) | 105 | `12.2.0` | pending — Adoption workflow |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
 Both 12.1 paths are accepted because the older rating-level migration ID is optional;
-both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward.
-Unknown or incomplete histories are refused; the listed versions do not imply support
-for other 10.11.x or 12.x releases. Fresh-install databases and other upgrade routes were
-not separately exercised by the live run.
+both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward. A fresh
+12.2 install carries the smallest set (105 ids, without the retired 10.11-era routines) and
+the fresh-install schema (no `IX_CustomItemDisplayPreferences_UserId`), yet still adopts as
+`12.2.0`; `0041` gives it that index. Unknown or incomplete histories are refused; the listed
+versions do not imply support for other 10.11.x or 12.x releases. Other upgrade routes were not
+separately exercised by the live run.
 
 The tested server image for 10.11–12.1 was `ferrofin:adopt121`, supplied as built from
 server commit `1732f97c`, with local image ID
@@ -112,6 +115,19 @@ alternate version (as Jellyfin 12.2 does), moving its MediaStreamInfos and ItemV
 to the new item id. The fixtures hold rows in only some of the listed tables (Chapters,
 TrickplayInfos, KeyframeData, MediaSegments and the display-preference tables are empty
 until the fixtures populate them).
+
+### 2026-10-20 fresh-install 12.2 row (gl-632)
+
+A fresh-install Jellyfin 12.2 database (a first run, not upgraded from 10.11) was added as the
+eleventh live `run.sh` row (`jellyfin-12.2-fresh`), seeded from scratch through the 12.2 API and
+compared against its own Jellyfin 12.2 oracle (`smoke-jellyfin-12.2-fresh.txt`), since a clean
+install is a distinct library from the seeded upgrade routes. It carries the fresh-install EF id
+set (105) and schema and adopts as `12.2.0`. The offline gates all pass — `bats adoption/tests`,
+`python3 -m unittest discover -s adoption/tests` (170 tests) and ShellCheck — but the live
+`run.sh`/`build-fixtures.sh` could not run on the author's host (its system `containerd` was
+down). The live result above is therefore recorded as **pending**: the `Adoption` workflow
+exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
+it is green. Update the table row and this note once that run lands.
 
 ## What the live suite checks
 
@@ -252,7 +268,9 @@ $FIXTURES/
   jellyfin-12.2-from-10/       built: jellyfin/jellyfin:12.2 on 10.11.8
   jellyfin-12.2-from-12/       built: jellyfin/jellyfin:12.2 on 12.0
   jellyfin-12.2-from-121/      built: jellyfin/jellyfin:12.2 on 12.1-from-12
+  jellyfin-12.2-fresh/         built: jellyfin/jellyfin:12.2 seeded from scratch (a first run)
   oracle/smoke-jellyfin-12.{1,2}.txt  built: each release's own smoke answers
+  oracle/smoke-jellyfin-12.2-fresh.txt  built: Jellyfin 12.2's answers on the fresh-install library
   oracle/user.txt              built: the account those answers were probed as
   jellyfin-12.2-schema.sql     built: the 12.2 schema the other 12.2 routes are diffed against
   work/                        scratch: synthetic.py's copies, work/run/ for run.sh's; failures stay here

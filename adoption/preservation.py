@@ -446,7 +446,7 @@ def verify_boot(work, version, stage, previous_logs):
 
 
 def run_matrix(root, image, only, port):
-    from synthetic import VERSIONS, server, recipe
+    from synthetic import VERSIONS, FRESH_INSTALL, server, recipe
     import metadata
     import watch_history
     import table_digests
@@ -463,6 +463,9 @@ def run_matrix(root, image, only, port):
     upgraded = json.loads((root / UPGRADED_FROM_10 / "preservation.json").read_text())
     for name, version, _ in VERSIONS:
         if only and only != name:
+            continue
+        if name in FRESH_INSTALL:
+            # A first-run install carries no seeds; adoption/run.sh validates it live.
             continue
         source = root / name
         ready = source / "synthetic-ready.json"
