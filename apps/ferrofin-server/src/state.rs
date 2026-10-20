@@ -1444,7 +1444,9 @@ pub async fn build_app_state(
             Arc::clone(&collection_paths),
         )
         // A box set takes its members' rating when they change.
-        .with_visibility(Arc::clone(&item_visibility)),
+        .with_visibility(Arc::clone(&item_visibility))
+        // …and its metadata and artwork, through a queued refresh.
+        .with_providers(Arc::clone(&providers)),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
@@ -1854,7 +1856,9 @@ pub async fn build_app_state(
             Arc::clone(&collection_paths),
         )
         // `Playlist.IsVisible`'s parental half, beside the owner/shares.
-        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users)),
+        .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users))
+        // The refresh an entry change queues (collage, rating).
+        .with_providers(Arc::clone(&providers)),
     );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
@@ -1898,6 +1902,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(lib_tasks::PeopleValidationTask::new(
             db.clone(),
             Arc::clone(&providers),
+            Arc::clone(&library),
         )));
         task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
             Arc::clone(&library),
@@ -2217,6 +2222,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(maint_tasks::OptimizeDatabaseTask::new(
             db.clone(),
             Arc::clone(&sessions),
+            Arc::clone(&library),
         )));
     }
     let tv_series: Arc<dyn ferrofin_traits::tv::TvSeriesManager> =

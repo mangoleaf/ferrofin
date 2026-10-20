@@ -48,6 +48,9 @@ use crate::user_data_keys::{KeySource, user_data_keys, uses_provider_ids};
 /// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// The rating from which an item counts as liked (`UserItemData.MinLikeValue`).
+const MIN_LIKE_VALUE: f64 = 6.5;
+
 /// Where the user-data manager announces user data it saved on its own —
 /// the other versions [`FerrofinUserDataManager`]'s played-state propagation
 /// wrote — as the `UserDataChanged` message the request paths push for the
@@ -291,7 +294,50 @@ impl FerrofinUserDataManager {
         for key in &keys {
             Self::upsert_one(&mut tx, row, key).await?;
         }
+        // An unparseable id has no derived keys to tell retired rows from.
+        if item_id.is_some() {
+            Self::update_retired(&mut tx, row, &keys).await?;
+        }
         tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Brings the user's rows of the item under keys it no longer reports to
+    /// `row`'s values, as `SaveUserData` does after its per-key upserts (v12.2
+    /// `UserDataManager.cs:79-92`). They are kept, not deleted: the key set
+    /// is briefly incomplete mid-refresh, and a deleted and re-added item
+    /// reattaches by them. Without this the any-row filters (`IsFavorite`,
+    /// `IsPlayed`, `IsResumable`) match a stale row the item's DTO no longer
+    /// reads. `RetentionDate` stays untouched, as on [`Self::upsert_one`].
+    async fn update_retired(
+        tx: &mut sqlx::SqliteConnection,
+        row: &UserDataEntity,
+        keys: &[String],
+    ) -> Result<(), ServiceError> {
+        let keys = serde_json::to_string(keys).map_err(|e| ServiceError::backend(e.to_string()))?;
+        sqlx::query(
+            r#"UPDATE "UserData" SET
+                 "AudioStreamIndex" = ?4, "IsFavorite" = ?5, "LastPlayedDate" = ?6,
+                 "Likes" = ?7, "PlayCount" = ?8, "PlaybackPositionTicks" = ?9,
+                 "Played" = ?10, "Rating" = ?11, "SubtitleStreamIndex" = ?12
+               WHERE "ItemId" = ?1 AND "UserId" = ?2
+                 AND "CustomDataKey" NOT IN (SELECT value FROM json_each(?3))"#,
+        )
+        .bind(&row.item_id)
+        .bind(&row.user_id)
+        .bind(keys)
+        .bind(row.audio_stream_index)
+        .bind(row.is_favorite)
+        .bind(opt_datetime_to_db(row.last_played_date))
+        .bind(row.rating.map(|rating| rating >= MIN_LIKE_VALUE))
+        .bind(row.play_count)
+        .bind(row.playback_position_ticks)
+        .bind(row.played)
+        .bind(row.rating)
+        .bind(row.subtitle_stream_index)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -333,7 +379,7 @@ impl FerrofinUserDataManager {
         .bind(row.audio_stream_index)
         .bind(row.is_favorite)
         .bind(opt_datetime_to_db(row.last_played_date))
-        .bind(row.rating.map(|rating| rating >= 6.5))
+        .bind(row.rating.map(|rating| rating >= MIN_LIKE_VALUE))
         .bind(row.play_count)
         .bind(row.playback_position_ticks)
         .bind(row.played)
@@ -956,7 +1002,7 @@ fn to_dto(row: &UserDataEntity, item_id: Uuid) -> UserItemDataDto {
         playback_position_ticks: row.playback_position_ticks,
         play_count: row.play_count,
         is_favorite: row.is_favorite,
-        likes: row.rating.map(|rating| rating >= 6.5),
+        likes: row.rating.map(|rating| rating >= MIN_LIKE_VALUE),
         last_played_date: row.last_played_date,
         played: row.played,
         key: row.custom_data_key.clone(),
@@ -2151,6 +2197,127 @@ mod tests {
                 .await
                 .expect("read");
         assert!(favorited.iter().all(|f| *f), "every row carries it");
+    }
+
+    /// `UserDataManagerTests.SaveUserData_RowUnderRetiredKey_IsKeptInAgreement`
+    /// (v12.2): a save keeps the user's row under a key the item no longer
+    /// reports, which a re-added item reattaches by, but brings it to the
+    /// saved values, so a stale position cannot hold the item in Continue
+    /// Watching once it is played.
+    #[tokio::test]
+    async fn a_save_keeps_a_retired_key_row_in_agreement() {
+        let db = test_db().await;
+        let (user, item, other) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        seed_user(&db, user).await;
+        crate::test_support::seed_named_user(&db, other, "other").await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        for who in [user, other] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                       "PlayCount","PlaybackPositionTicks","Played")
+                   VALUES (?1, ?2, 'Old Key', 0, 0, 111, 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(who))
+            .execute(db.writer())
+            .await
+            .expect("seed retired row");
+        }
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(
+            user,
+            item,
+            &UpdateUserItemDataDto {
+                played: Some(true),
+                playback_position_ticks: Some(0),
+                ..UpdateUserItemDataDto::default()
+            },
+        )
+        .await
+        .expect("save");
+
+        let rows: Vec<(String, String, bool, i64)> = sqlx::query_as(
+            r#"SELECT "UserId", "CustomDataKey", "Played", "PlaybackPositionTicks"
+               FROM "UserData" WHERE "ItemId" = ?1 ORDER BY 1, 2"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("rows");
+        let (mine, theirs): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|row| row.0 == guid_to_db(user));
+        let mut keys: Vec<&str> = mine.iter().map(|row| row.1.as_str()).collect();
+        keys.sort_unstable();
+        let mut expected = vec![item.to_string(), "700391".to_owned(), "Old Key".to_owned()];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "the retired row is kept");
+        assert!(
+            mine.iter().all(|row| row.2 && row.3 == 0),
+            "every row agrees: {mine:?}"
+        );
+        assert_eq!(
+            theirs,
+            [(guid_to_db(other), "Old Key".to_owned(), false, 111)],
+            "another user's row is left alone"
+        );
+    }
+
+    /// The resume list matches any row of the user, so a retired-key row's
+    /// stale position kept a finished movie in Continue Watching
+    /// (upstream issue 12195) until the save brought that row along.
+    #[tokio::test]
+    async fn a_finished_item_leaves_resume_despite_a_retired_key_row() {
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        crate::test_support::seed_library_over(&db, &[item]).await;
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                   "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1, ?2, 'Old Key', 0, 0, 24000000000, 0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user_id))
+        .execute(db.writer())
+        .await
+        .expect("seed retired row");
+        let repository = crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let resume = || async {
+            repository
+                .get_item_list(&InternalItemsQuery {
+                    user: Some(user.clone()),
+                    is_resumable: Some(true),
+                    ..InternalItemsQuery::default()
+                })
+                .await
+                .expect("resume")
+                .len()
+        };
+        assert_eq!(resume().await, 1, "half watched under the old key");
+
+        FerrofinUserDataManager::new(db.clone(), config())
+            .save_user_data(
+                user_id,
+                item,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    playback_position_ticks: Some(0),
+                    ..UpdateUserItemDataDto::default()
+                },
+            )
+            .await
+            .expect("finish");
+        assert_eq!(resume().await, 0, "finished");
     }
 
     /// A row written by Jellyfin under a provider key alone must be readable.
