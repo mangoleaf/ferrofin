@@ -15,15 +15,19 @@
 #   oracle/user.txt                the account both oracles (and run.sh) probe as
 #   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat*/sqlite_sequence,
 #                                  rewritten every run; the other 12.2 routes are diffed against it
+#   jellyfin-10.11.11-messy/  jellyfin-12.2-messy/   copies of 10.11.11 and 12.2-from-121 plus rows of
+#                                  shapes no API produces, each with Jellyfin 12.2's end state for it
+#                                  (messy.py: messy.json, messy-oracle.json)
 # Existing fixtures and oracles are kept; synthetic.py refuses fixtures from an older recipe, so
 # build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
-# can leave a copy under DIR/work/oracle-*; work/ is scratch and may be deleted between runs.
+# can leave a copy under DIR/work/oracle-* (or messy-oracle-*); work/ is scratch and may be deleted
+# between runs. A failed messy build removes its own derived copy, so only that step is repeated.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
-while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,18p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,24p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || { echo "--fixtures DIR is required" >&2; exit 2; }
 adoption_require_local "$FIXTURES" || exit 2
 mkdir -p "$FIXTURES"; FIXTURES=$(cd "$FIXTURES" && pwd)
@@ -116,4 +120,7 @@ if [ -d "$FIXTURES/jellyfin-12.2-from-121" ]; then
     fi
   done
 fi
+# The messy copies of the latest 10.11.x and 12.x fixtures, with the end state Jellyfin 12.2 gave
+# each shape (messy.py). Kept apart from the clean fixtures above, which stay the control.
+python3 "$HERE/messy.py" build --fixtures "$FIXTURES"
 echo "fixtures ready under $FIXTURES"
