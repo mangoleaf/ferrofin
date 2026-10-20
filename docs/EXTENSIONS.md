@@ -213,6 +213,10 @@ plugins like Home Screen Sections possible):
   controllers); the caller's resolved identity (`user-id`, `is-admin`,
   `is-authenticated`) is forwarded — never a token — and the plugin gates its own
   sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+  Requests never wait for the plugin: together they may hold at most half of its queue
+  (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`), queued or running, and past that, or when the
+  queue is full, the server answers `503` at once. So a flood of anonymous requests cannot
+  starve the scans, tasks and events that share the queue.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
   text). This is how a plugin injects its client-side hooks into jellyfin-web.

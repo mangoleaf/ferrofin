@@ -1463,18 +1463,20 @@ async fn seed_ancestor(db: &Database, child: Uuid, parent: Uuid) {
         .expect("set ancestors");
 }
 
-/// Sets an item's `SortName` through the production writer — the fixture insert
-/// leaves it NULL, which makes a `SortName` ordering assertion meaningless.
+/// Sets an item's `SortName` through the production repository save, which
+/// keeps a key the caller supplies (the scanner's path) — the fixture insert
+/// leaves it NULL, which makes a `SortName` ordering assertion meaningless. Not
+/// through `LibraryManager::update_items`: an edit's save re-derives the key
+/// from the name, as upstream's does.
 async fn set_sort_name(db: &Database, id: Uuid, sort_name: &str) {
-    let library = library_manager(db);
-    let mut row = library
+    let mut row = library_manager(db)
         .get_item_by_id(id)
         .await
         .expect("load item")
         .expect("item present");
     row.sort_name = Some(sort_name.to_owned());
-    library
-        .update_items(std::slice::from_ref(&row), None)
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(std::slice::from_ref(&row))
         .await
         .expect("set sort name");
 }

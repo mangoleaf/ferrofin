@@ -12,9 +12,9 @@
 //!   pre-resolved user, and [`AuthenticationManager::new_user_policy`] exposes
 //!   the default policy. `ProviderAuthenticationResult` is ported as
 //!   [`ProviderAuthenticationResult`].
-//! - [`QuickConnect::get_authorized_request`] returns a [`SessionInfoDto`]
-//!   pending a ported `AuthenticationResult` envelope (missing from
-//!   `ferrofin-model`; flagged in the port report).
+//! - [`QuickConnect::get_authorized_request`] returns the
+//!   [`AuthenticationResultData`] (session and token) of the C#
+//!   `AuthenticationResult`; the API layer adds its `User` and `ServerId`.
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; the `IsEnabled` property
 //!   becomes an `async fn` so implementations may consult live configuration.
 //!
@@ -22,7 +22,6 @@
 
 use async_trait::async_trait;
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::SessionInfoDto;
 use ferrofin_model::quick_connect::QuickConnectResult;
 use ferrofin_model::security::AuthenticationInfo;
 use ferrofin_model::users::UserPolicy;
@@ -30,6 +29,7 @@ use uuid::Uuid;
 
 use crate::error::ServiceError;
 use crate::options::AuthorizationInfo;
+use crate::session::AuthenticationResultData;
 
 /// The result of a successful provider authentication.
 ///
@@ -86,8 +86,7 @@ fn _assert_object_safe_authentication_manager(_: &dyn AuthenticationManager) {}
 /// Drives the Quick Connect pairing flow.
 ///
 /// Port of `IQuickConnect`. The `AuthorizationInfo` initiator argument is the
-/// ported [`AuthorizationInfo`] context; [`Self::get_authorized_request`]
-/// returns a [`SessionInfoDto`] pending a ported `AuthenticationResult`.
+/// ported [`AuthorizationInfo`] context.
 #[async_trait]
 pub trait QuickConnect: Send + Sync {
     /// Whether Quick Connect is currently enabled.
@@ -105,8 +104,13 @@ pub trait QuickConnect: Send + Sync {
     /// Authorizes a request to connect as the given user, by its short code.
     async fn authorize_request(&self, user_id: Uuid, code: &str) -> Result<bool, ServiceError>;
 
-    /// Gets the authenticated session for an authorized request's secret.
-    async fn get_authorized_request(&self, secret: &str) -> Result<SessionInfoDto, ServiceError>;
+    /// Gets the authentication result (session and access token) opened when
+    /// the request's code was authorized (C# `GetAuthorizedRequest`). The
+    /// secret exchange returns it as is and never authenticates again.
+    async fn get_authorized_request(
+        &self,
+        secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError>;
 }
 
 fn _assert_object_safe_quick_connect(_: &dyn QuickConnect) {}
