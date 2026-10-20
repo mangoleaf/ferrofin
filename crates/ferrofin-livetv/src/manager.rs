@@ -323,7 +323,6 @@ pub struct LiveTvPaths {
 #[derive(Clone)]
 pub struct FerrofinLiveTvManager {
     db: Database,
-    fetcher: Arc<dyn SourceFetcher>,
     server_id: String,
     /// The user manager, for `LiveTvInfo.EnabledUsers` (C# `IUserManager.Users`
     /// filtered by the `EnableLiveTvAccess` permission). Absent in unit tests
@@ -397,6 +396,9 @@ pub struct FerrofinLiveTvManager {
     /// The account-less Schedules Direct surface (country list), sharing the
     /// fetcher and caching under the application cache directory.
     schedules_direct: SchedulesDirect,
+    /// The XMLTV document cache every guide reader goes through
+    /// (`XmlTvListingsProvider.GetXml`).
+    xmltv: crate::xmltv_cache::XmlTvCache,
     /// The `BaseItems` seam the guide refresh mirrors the channel lineup
     /// through, and the Live TV `UserView` the rows parent to.
     ///
@@ -625,7 +627,8 @@ impl FerrofinLiveTvManager {
         server_id: String,
         cache_dir: impl Into<ferrofin_util::directory_path::DirectoryPath>,
     ) -> Self {
-        let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
+        let cache_dir: ferrofin_util::directory_path::DirectoryPath = cache_dir.into();
+        let xmltv = crate::xmltv_cache::XmlTvCache::new(Arc::clone(&fetcher), cache_dir.clone());
         // The same two hosts, in the same order, that
         // `LiveTvServiceCollectionExtensions.AddLiveTvServices` registers
         // (v10.11.8 LiveTvServiceCollectionExtensions.cs:41-42): HDHomeRun
@@ -636,9 +639,9 @@ impl FerrofinLiveTvManager {
             Arc::new(crate::hdhomerun::HdHomerunHost::new(Arc::clone(&fetcher))),
             Arc::new(crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))),
         ];
+        let schedules_direct = SchedulesDirect::new(fetcher, cache_dir);
         Self {
             db,
-            fetcher,
             hosts,
             users: None,
             server_id,
@@ -657,6 +660,7 @@ impl FerrofinLiveTvManager {
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             schedules_direct,
+            xmltv,
         }
     }
 
@@ -1131,8 +1135,7 @@ impl FerrofinLiveTvManager {
         info: &ListingsProviderInfo,
     ) -> Result<Vec<EpgChannel>, ServiceError> {
         Self::listings_provider_name(info.type_.as_deref())?;
-        let path = info.path.clone().unwrap_or_default();
-        let body = self.fetcher.fetch(&path).await?;
+        let body = self.xmltv.get_xml(info).await?;
         Ok(parse_xmltv(&body)
             .channels
             .into_iter()
@@ -1714,6 +1717,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
+        // keep serving the old document; `Validate` drops the path's download
+        // backoff, since a save is an explicit retry.
+        self.xmltv.forget_failure(&path);
+        self.xmltv.invalidate(&id).await;
         Ok(info)
     }
 
@@ -1726,6 +1734,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        self.xmltv.invalidate(id).await;
         Ok(())
     }
 
@@ -2171,7 +2180,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 clean_database = false;
                 continue;
             };
-            match self.fetcher.fetch(path).await {
+            match self.xmltv.get_xml(&provider).await {
                 Ok(body) => guide_bodies.push((provider.clone(), body)),
                 Err(e) => {
                     clean_database = false;
@@ -9602,6 +9611,146 @@ mod tests {
             mgr.set_channel_mapping("nope", &two, "one.tv").await,
             Err(ServiceError::NotFound(_))
         ));
+    }
+
+    /// A [`SourceFetcher`] that counts its fetches and fails while no body is
+    /// set — a remote guide host that can go down.
+    #[derive(Default)]
+    struct CountingFetcher {
+        body: std::sync::Mutex<Option<String>>,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingFetcher {
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for CountingFetcher {
+        async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.body
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| ServiceError::Backend(format!("{url} is down")))
+        }
+    }
+
+    /// A manager over `fetcher` with one saved remote XMLTV provider.
+    async fn cached_guide_manager(
+        fetcher: &Arc<CountingFetcher>,
+    ) -> (FerrofinLiveTvManager, ListingsProviderInfo) {
+        let mgr = manager_with_fetcher(Arc::clone(fetcher) as Arc<dyn SourceFetcher>).await;
+        let provider = mgr
+            .save_listing_provider(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            })
+            .await
+            .expect("provider");
+        (mgr, provider)
+    }
+
+    /// `XmlTvListingsProvider.GetXml`: within `_maxCacheAge` every reader —
+    /// lineups, the mapping dialog, the guide refresh — shares one download.
+    #[tokio::test]
+    async fn guide_readers_share_one_download_within_the_cache_age() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        let id = provider.id.clone().expect("id");
+
+        for _ in 0..3 {
+            let lineups = mgr
+                .get_lineups(Some(&id), Some("xmltv"), None, None)
+                .await
+                .expect("lineups");
+            assert_eq!(lineups.len(), 1);
+        }
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(fetcher.fetches(), 1);
+
+        // `SaveListingProvider` → `InvalidateListingsProviderCache`: the next
+        // read downloads again, so a changed Path never serves the old guide.
+        mgr.save_listing_provider(provider).await.expect("resave");
+        mgr.get_lineups(Some(&id), Some("xmltv"), None, None)
+            .await
+            .expect("lineups after save");
+        assert_eq!(fetcher.fetches(), 2);
+    }
+
+    /// A failed download falls back to the previous document, and a remote
+    /// path that failed is not retried within `_maxCacheAge`.
+    #[tokio::test]
+    async fn a_failed_download_falls_back_and_is_not_retried() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        mgr.xmltv.get_xml(&provider).await.expect("first download");
+
+        // Age the cached file past `_maxCacheAge`, then take the host down.
+        let cache_file = mgr
+            .xmltv
+            .cache_file_for_test(provider.id.as_deref().expect("id"));
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_hours(2);
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("cache file")
+            .set_modified(stale)
+            .expect("age");
+        *fetcher.body.lock().unwrap() = None;
+
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("backoff"), XMLTV);
+        assert_eq!(fetcher.fetches(), 2, "the failed path is not retried");
+
+        // With no cached copy the recent failure is an error, still unfetched.
+        std::fs::remove_file(&cache_file).expect("remove");
+        assert!(matches!(
+            mgr.xmltv.get_xml(&provider).await,
+            Err(ServiceError::Backend(_))
+        ));
+        assert_eq!(fetcher.fetches(), 2);
+
+        // Saving the provider is an explicit retry (`Validate`).
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let provider = mgr.save_listing_provider(provider).await.expect("resave");
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("retried"), XMLTV);
+        assert_eq!(fetcher.fetches(), 3);
+    }
+
+    /// `UnzipIfNeededAndCopy` throws on an empty document: it never replaces
+    /// the cached copy, and it counts as a failed download.
+    #[tokio::test]
+    async fn an_empty_download_keeps_the_previous_document() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        mgr.xmltv.get_xml(&provider).await.expect("first download");
+        let cache_file = mgr
+            .xmltv
+            .cache_file_for_test(provider.id.as_deref().expect("id"));
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("cache file")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("age");
+
+        *fetcher.body.lock().unwrap() = Some(String::new());
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
+        assert_eq!(std::fs::read_to_string(&cache_file).expect("kept"), XMLTV);
+        mgr.xmltv.get_xml(&provider).await.expect("backoff");
+        assert_eq!(
+            fetcher.fetches(),
+            2,
+            "the empty download counts as a failure"
+        );
     }
 
     #[tokio::test]

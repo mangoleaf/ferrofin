@@ -34,6 +34,7 @@ pub mod schedules_direct;
 pub mod stream;
 pub mod tuner_host;
 pub mod xmltv;
+pub mod xmltv_cache;
 
 pub use dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 pub use error::LiveTvError;
