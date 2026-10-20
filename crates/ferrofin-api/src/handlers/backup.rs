@@ -110,18 +110,38 @@ impl TreeRoots {
 ///
 /// Two reasons, either sufficient. The archive name is second-granular
 /// (`ferrofin-backup-%Y%m%d-%H%M%S.zip`), so two creates in the same second
-/// write the *same* path and one silently destroys the other. And
-/// [`write_backup`] reads the whole SQLite file into memory, so N concurrent
-/// creates hold N x database-size — on a large library that is an OOM.
+/// write the *same* path and one silently destroys the other. And each create
+/// writes a database-sized snapshot beside its archive, so N concurrent creates
+/// need N x database-size of free disk on top of the archives.
 ///
 /// Before this handler moved onto the blocking pool the runtime's worker count
 /// bounded that implicitly; dispatching to a 512-thread pool removed the bound,
 /// so it is made explicit here. A caller that loses the race gets the `503` the
-/// contract already documents for this operation rather than queueing.
+/// contract already documents for this operation rather than queueing. Holding
+/// the only permit is also what lets a create sweep the scratch files it finds
+/// ([`sweep_scratch_files`]): no other create can be writing them.
 static BACKUP_IN_FLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// The subdirectory of the data path that holds the backup archives.
 const BACKUPS_DIR: &str = "backups";
+
+/// The name prefix of the database snapshot a create zips into its archive.
+const SNAPSHOT_PREFIX: &str = ".snapshot-";
+
+/// The name suffix of an archive still being written. Not a `.zip`, so the
+/// listing never shows it.
+const PARTIAL_SUFFIX: &str = ".partial";
+
+/// The least free space, in bytes, the backups directory must have for
+/// `POST /Backup/Create` to start: `BackupService.CreateBackupAsync`'s
+/// `FiveGigabyte`, copied verbatim (it is 5 bytes short of 5 GiB).
+///
+/// A build that cannot read free space (non-unix: `free_space_of` reports
+/// `-1`) refuses every create, as upstream's catch arm would.
+///
+/// FLAGGED as a candidate setting — plausible range 1 GiB…10 GiB, default
+/// upstream's.
+const BACKUP_MIN_FREE_SPACE: i64 = 5_368_709_115;
 
 /// The manifest entry stored inside each archive (as `manifest.json`) and returned
 /// by the list/create/inspect routes. Port of `BackupManifestDto`.
@@ -337,9 +357,11 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 
 /// `POST /Backup/Create` — writes a backup archive and returns its manifest.
 ///
-/// Port of `BackupController.CreateBackup`: zips the SQLite database file and the
-/// configuration directory (plus a `manifest.json`) into a timestamped `.zip`
-/// under `{data}/backups/`.
+/// Port of `BackupController.CreateBackup` + `BackupService.CreateBackupAsync`:
+/// zips the SQLite database file and the configuration directory (plus a
+/// `manifest.json`) into a timestamped `.zip` under `{data}/backups/`. Refused
+/// while a library scan runs, and when the backups directory has less than
+/// [`BACKUP_MIN_FREE_SPACE`] free; a create that fails leaves nothing behind.
 #[utoipa::path(
     post,
     path = "/Backup/Create",
@@ -351,31 +373,131 @@ async fn create_backup(
     RequireAdmin(_auth): RequireAdmin,
     body: Option<JsonBody<BackupOptions>>,
 ) -> Result<Json<BackupManifest>, ApiError> {
-    let Ok(_permit) = BACKUP_IN_FLIGHT.try_acquire() else {
+    let Ok(permit) = BACKUP_IN_FLIGHT.try_acquire() else {
         return Err(ApiError::ServiceUnavailable(
             "a backup is already in progress".to_owned(),
         ));
     };
     let options = body.map(|JsonBody(b)| b).unwrap_or_default();
+    // The create runs to its end on a task of its own, which holds the permit:
+    // a caller that goes away mid-backup (dropping this future) must not free
+    // it while the snapshot or the archive is still being written, or the next
+    // create would sweep them from under it. Upstream's create runs on
+    // regardless of the request too (`CancellationToken.None`), and so, as
+    // there, a snapshot that never returns (a stalled filesystem) keeps every
+    // later create refused until the server restarts.
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_create(&state, options).await
+    })
+    .await
+    .unwrap_or_else(|e| Err(io_err("create backup", &e)))
+    .map(Json)
+}
+
+/// The body of [`create_backup`], run while it holds [`BACKUP_IN_FLIGHT`].
+async fn run_create(state: &AppState, options: BackupOptions) -> Result<BackupManifest, ApiError> {
+    // Upstream refuses while a library scan runs (`IsScanRunning`): a backup
+    // contends with the scan's writes and could capture the library half
+    // written. Its `InvalidOperationException` is a `500`; this answers the
+    // `503` the contract documents for the operation, as the in-flight refusal.
+    if state.library.is_scan_running() {
+        return Err(ApiError::ServiceUnavailable(
+            "cannot create a backup while a library scan is running; try again once \
+             the scan has finished"
+                .to_owned(),
+        ));
+    }
     let roots = TreeRoots::from_paths(state.config.application_paths().as_ref());
-    let dir = backups_dir(&state);
+    let dir = backups_dir(state);
     let now = Utc::now();
+    let prepared = dir.clone();
+    blocking(move || {
+        std::fs::create_dir_all(&prepared)?;
+        sweep_scratch_files(&prepared);
+        Ok(())
+    })
+    .await
+    .map_err(|e| io_err("create backup", &e))?;
+    // Upstream's free-space floor, checked once the directory exists; free
+    // space that cannot be read (`-1`) is below it, as upstream.
+    let free_space = state.system.free_space_of(&dir).await;
+    if free_space < BACKUP_MIN_FREE_SPACE {
+        let message = if free_space < 0 {
+            format!(
+                "the free space of the backup directory '{}' could not be read; cannot \
+                 create backup",
+                dir.display()
+            )
+        } else {
+            format!(
+                "the backup directory '{}' has {free_space} bytes free, under the \
+                 {BACKUP_MIN_FREE_SPACE} a backup needs; cannot create backup",
+                dir.display()
+            )
+        };
+        return Err(ferrofin_traits::error::ServiceError::backend(message).into());
+    }
     // The database goes into the archive from a consistent `VACUUM INTO`
     // snapshot, never from the live WAL-mode file (a checkpoint can tear a
-    // file copy mid-read). The snapshot lives beside the archive until zipped.
+    // file copy mid-read). The snapshot lives beside the archive until zipped,
+    // and goes with the job that zips it whatever becomes of the create.
     let snapshot = options
         .database
-        .then(|| dir.join(format!(".snapshot-{}.db", now.timestamp())));
+        .then(|| ScratchFile(dir.join(format!("{SNAPSHOT_PREFIX}{}.db", now.timestamp()))));
     if let Some(snapshot) = &snapshot {
-        std::fs::create_dir_all(&dir).map_err(|e| io_err("create backup", &e))?;
-        let _ = std::fs::remove_file(snapshot);
-        state.system.snapshot_database(snapshot).await?;
+        state.system.snapshot_database(&snapshot.0).await?;
     }
     // Deflating the SQLite snapshot (tens to hundreds of MB) plus the whole
     // config tree is seconds of CPU + disk: it must not run on a runtime worker.
-    let result =
-        blocking(move || write_backup(&dir, &roots, options, now, snapshot.as_deref())).await;
-    result.map(Json).map_err(|e| io_err("create backup", &e))
+    blocking(move || {
+        let snapshot = snapshot.as_ref().map(|s| s.0.as_path());
+        write_backup(&dir, &roots, options, now, snapshot)
+    })
+    .await
+    .map_err(|e| io_err("create backup", &e))
+}
+
+/// A create's scratch file — the database snapshot, the archive being
+/// written — removed when dropped, so no error path and no panic leaves it
+/// behind. Dropped once the archive is in place, it finds nothing to remove.
+struct ScratchFile(PathBuf);
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Removes the scratch files an interrupted create left in `dir` (the server
+/// stopped between the snapshot and the finished archive): the snapshots and
+/// the archives still being written. Nothing else is touched. Best effort: a
+/// file that cannot be removed only stays where it was.
+///
+/// Only sound under [`BACKUP_IN_FLIGHT`], which no other create holds: a
+/// create keeps it until its job has run, even when its caller went away.
+fn sweep_scratch_files(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let scratch = (name.starts_with(SNAPSHOT_PREFIX)
+            && Path::new(name)
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("db")))
+            || (name.starts_with("ferrofin-backup-") && name.ends_with(PARTIAL_SUFFIX));
+        if scratch && entry.file_type().is_ok_and(|t| t.is_file()) {
+            let path = entry.path();
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not remove a stale backup scratch file"
+                );
+            }
+        }
+    }
 }
 
 /// Runs a blocking filesystem job on tokio's blocking pool, mapping a lost pool
@@ -394,8 +516,11 @@ where
 /// `manifest.json`) under `backups_dir`, returning the manifest. The database
 /// comes from `snapshot` when given (a consistent copy the caller produced,
 /// consumed — deleted — here), else from the live file (tests with no server).
-/// Pure over paths — no `AppState` — so it is unit-testable and shared by the
-/// handler.
+/// The archive is written under a scratch name and renamed into place once
+/// complete, so a failure, or a crash, never leaves a truncated archive under a
+/// backup's name; on an error the scratch file is removed (upstream deletes
+/// its partial archive in `CreateBackupAsync`'s catch). Pure over paths — no
+/// `AppState` — so it is unit-testable and shared by the handler.
 fn write_backup(
     backups_dir: &Path,
     roots: &TreeRoots,
@@ -413,14 +538,26 @@ fn write_backup(
         backup_engine_version: BACKUP_ENGINE_VERSION.to_owned(),
         options,
     };
+    let partial = ScratchFile(backups_dir.join(format!("{file_name}{PARTIAL_SUFFIX}")));
+    write_archive(&partial.0, roots, &manifest, snapshot)?;
+    std::fs::rename(&partial.0, &archive_path)?;
+    Ok(manifest)
+}
 
-    let file = std::fs::File::create(&archive_path)?;
+/// Writes the archive [`write_backup`] describes to `path`.
+fn write_archive(
+    path: &Path,
+    roots: &TreeRoots,
+    manifest: &BackupManifest,
+    snapshot: Option<&Path>,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
     zip.start_file("manifest.json", opts)?;
-    let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap_or_default();
+    let manifest_json = serde_json::to_vec_pretty(manifest).unwrap_or_default();
     zip.write_all(&manifest_json)?;
 
     // The database (skipped if absent — e.g. an in-memory test DB).
@@ -431,6 +568,7 @@ fn write_backup(
             std::io::copy(&mut file, &mut zip)?;
         }
     }
+    // Zipped: the snapshot's disk goes back before the trees are read.
     if let Some(snapshot) = snapshot {
         let _ = std::fs::remove_file(snapshot);
     }
@@ -443,7 +581,7 @@ fn write_backup(
     }
 
     zip.finish()?;
-    Ok(manifest)
+    Ok(())
 }
 
 /// `POST /Backup/Restore` — schedules a backup restore and restarts.
@@ -1025,7 +1163,8 @@ mod tests {
     ///
     /// Two creates in the same second write the SAME archive path (the name is
     /// second-granular), so one would silently destroy the other; and each
-    /// holds the whole database in memory, so N in flight is N x database size.
+    /// writes a database-sized snapshot, so N in flight need N x database size
+    /// of disk.
     #[tokio::test]
     async fn a_second_concurrent_create_is_refused() {
         use crate::create_router;
@@ -1169,6 +1308,348 @@ mod tests {
         let _ = std::fs::remove_dir_all(&backups);
     }
 
+    /// The fake states' backups directory, emptied for a test.
+    fn clean_test_backups_dir() -> std::path::PathBuf {
+        let backups = std::env::temp_dir()
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
+            .join("backups");
+        let _ = std::fs::remove_dir_all(&backups);
+        backups
+    }
+
+    /// The file names in `dir`, sorted (none for a missing directory).
+    fn file_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `POST /Backup/Create` on `state`, with the default options.
+    async fn create_on(state: crate::state::AppState) -> axum::http::StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        crate::create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Backup/Create")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+            .status()
+    }
+
+    /// A [`SystemManager`] fake for the create guards: reports `free_space`
+    /// for the backups directory and, with `failing_snapshot`, writes part of
+    /// the snapshot and then fails, as `VACUUM INTO` does when the disk fills
+    /// mid-copy. With `stall`, the snapshot says it started (the first
+    /// `Notify`) and finishes only once released (the second).
+    ///
+    /// [`SystemManager`]: ferrofin_traits::system::SystemManager
+    struct DiskSystem {
+        free_space: i64,
+        failing_snapshot: bool,
+        stall: Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    }
+
+    impl DiskSystem {
+        /// A disk with `free_space` free, whose snapshots succeed at once.
+        fn with_free_space(free_space: i64) -> Self {
+            Self {
+                free_space,
+                failing_snapshot: false,
+                stall: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::system::SystemManager for DiskSystem {
+        async fn get_system_info(
+            &self,
+            _request: &ferrofin_traits::net::RequestContext,
+        ) -> Result<ferrofin_model::system::SystemInfo, ferrofin_traits::error::ServiceError>
+        {
+            unreachable!("not used by backup create")
+        }
+        async fn get_public_system_info(
+            &self,
+            _request: &ferrofin_traits::net::RequestContext,
+        ) -> Result<ferrofin_model::system::PublicSystemInfo, ferrofin_traits::error::ServiceError>
+        {
+            unreachable!("not used by backup create")
+        }
+        async fn restart(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("not used by backup create")
+        }
+        async fn shutdown(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("not used by backup create")
+        }
+        async fn get_system_storage_info(
+            &self,
+        ) -> Result<ferrofin_model::system::SystemStorageInfo, ferrofin_traits::error::ServiceError>
+        {
+            unreachable!("not used by backup create")
+        }
+        async fn snapshot_database(
+            &self,
+            dest: &std::path::Path,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            if self.failing_snapshot {
+                std::fs::write(dest, b"half a database").expect("partial snapshot");
+                return Err(ferrofin_traits::error::ServiceError::backend(
+                    "database or disk is full",
+                ));
+            }
+            if let Some((started, release)) = &self.stall {
+                std::fs::write(dest, b"half a database").expect("partial snapshot");
+                started.notify_one();
+                release.notified().await;
+            }
+            Ok(())
+        }
+        async fn free_space_of(&self, _path: &std::path::Path) -> i64 {
+            self.free_space
+        }
+    }
+
+    /// `BackupService.CreateBackupAsync` refuses while a library scan runs
+    /// (`IsScanRunning`): the backup would contend with the scan's writes and
+    /// could capture a library half-written. Ferrofin answers the `503` the
+    /// contract documents for this operation, and writes nothing.
+    #[tokio::test]
+    async fn create_is_refused_while_a_library_scan_runs() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let state = crate::test_support::elevated_state_with(
+            std::sync::Arc::new(crate::test_support::ScanningLibrary),
+            std::sync::Arc::new(crate::test_support::FakeSystem),
+        );
+
+        assert_eq!(
+            create_on(state).await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            file_names(&backups),
+            Vec::<String>::new(),
+            "nothing written"
+        );
+    }
+
+    /// `CreateBackupAsync` refuses when the backups directory has less free
+    /// space than its `FiveGigabyte` floor, before anything is written; the
+    /// `InvalidOperationException` is upstream's `500`. At the floor it goes
+    /// ahead.
+    #[tokio::test]
+    async fn create_is_refused_below_the_free_space_floor() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let with_free_space = |free_space| {
+            crate::test_support::elevated_state_with(
+                std::sync::Arc::new(crate::test_support::FakeLibrary),
+                std::sync::Arc::new(DiskSystem::with_free_space(free_space)),
+            )
+        };
+
+        assert_eq!(
+            create_on(with_free_space(super::BACKUP_MIN_FREE_SPACE - 1)).await,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            file_names(&backups),
+            Vec::<String>::new(),
+            "nothing written"
+        );
+        // Unknown free space (`-1`, the C# catch arm) is below the floor too.
+        assert_eq!(
+            create_on(with_free_space(-1)).await,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        assert_eq!(
+            create_on(with_free_space(super::BACKUP_MIN_FREE_SPACE)).await,
+            axum::http::StatusCode::OK
+        );
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// A snapshot that fails part-way is removed: each failed create used to
+    /// leave a database-sized `.snapshot-*.db` behind, so retries on a nearly
+    /// full disk filled it.
+    #[tokio::test]
+    async fn a_failed_snapshot_is_removed() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let state = crate::test_support::elevated_state_with(
+            std::sync::Arc::new(crate::test_support::FakeLibrary),
+            std::sync::Arc::new(DiskSystem {
+                failing_snapshot: true,
+                ..DiskSystem::with_free_space(i64::MAX)
+            }),
+        );
+
+        assert_eq!(
+            create_on(state).await,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(file_names(&backups), Vec::<String>::new(), "nothing left");
+    }
+
+    /// A create whose caller goes away mid-backup runs on to its end, still
+    /// holding the in-flight permit: the next create is refused rather than
+    /// sweeping the snapshot and the archive from under it (which would zip
+    /// the live database file in the snapshot's place). Upstream's create runs
+    /// on regardless of the request too (`CancellationToken.None`).
+    #[tokio::test]
+    async fn a_create_whose_caller_went_away_still_holds_the_permit() {
+        use std::sync::Arc;
+
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let state = crate::test_support::elevated_state_with(
+            Arc::new(crate::test_support::FakeLibrary),
+            Arc::new(DiskSystem {
+                stall: Some((Arc::clone(&started), Arc::clone(&release))),
+                ..DiskSystem::with_free_space(i64::MAX)
+            }),
+        );
+
+        // The caller gives up while the snapshot is being written.
+        let first = tokio::spawn(create_on(state.clone()));
+        started.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        let second =
+            tokio::time::timeout(std::time::Duration::from_secs(2), create_on(state.clone())).await;
+        assert_eq!(
+            second.ok(),
+            Some(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            "the abandoned create still holds the permit"
+        );
+
+        // Released, the abandoned create finishes its archive and cleans up.
+        release.notify_one();
+        let mut names = Vec::new();
+        for _ in 0..500 {
+            names = file_names(&backups);
+            if names.len() == 1
+                && names[0].starts_with("ferrofin-backup-")
+                && !names[0].ends_with(super::PARTIAL_SUFFIX)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("ferrofin-backup-"), "{names:?}");
+        // The permit comes back once the abandoned create has ended.
+        for _ in 0..500 {
+            if super::BACKUP_IN_FLIGHT.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(super::BACKUP_IN_FLIGHT.available_permits(), 1);
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// The scratch files an interrupted create left behind (a crash between
+    /// the snapshot and the finished archive) are swept by the next create;
+    /// anything else in the directory is left alone.
+    #[tokio::test]
+    async fn a_create_sweeps_the_scratch_files_an_interrupted_one_left() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        std::fs::create_dir_all(&backups).expect("backups dir");
+        for leftover in [
+            ".snapshot-1700000000.db",
+            "ferrofin-backup-20240101-000000.zip.partial",
+            "notes.txt",
+        ] {
+            std::fs::write(backups.join(leftover), b"x").expect("leftover");
+        }
+
+        assert_eq!(
+            create_on(crate::test_support::elevated_fake_state()).await,
+            axum::http::StatusCode::OK
+        );
+        let names = file_names(&backups);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(names[1], "notes.txt", "{names:?}");
+        assert!(
+            names[0].starts_with("ferrofin-backup-")
+                && std::path::Path::new(&names[0])
+                    .extension()
+                    .is_some_and(|x| x == "zip"),
+            "{names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// A write that fails part-way leaves no partial archive: it is written
+    /// under a scratch name, renamed into place only once complete, and the
+    /// scratch file is removed on every error path (upstream deletes its
+    /// partial archive in `CreateBackupAsync`'s catch).
+    #[cfg(unix)]
+    #[test]
+    fn a_write_failing_part_way_leaves_no_partial_archive() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("pd");
+        std::fs::create_dir_all(program_data.join("config")).unwrap();
+        std::fs::write(program_data.join("config/system.json"), b"{}").unwrap();
+        // An unreadable directory in the configuration tree: the walk fails
+        // on it with the archive half written.
+        let locked = program_data.join("config/locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Permission bits do not bind root; nothing fails to test.
+            return;
+        }
+        let roots = TreeRoots::defaults(
+            &program_data,
+            &program_data.join("config"),
+            &program_data.join("ferrofin.db"),
+        );
+        let backups = tmp.path().join("backups");
+
+        let written = super::write_backup(
+            &backups,
+            &roots,
+            BackupOptions::default(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(written.is_err(), "the configuration tree could not be read");
+        assert_eq!(
+            file_names(&backups),
+            Vec::<String>::new(),
+            "no partial archive is left"
+        );
+    }
+
     /// Writing a backup archive must be dispatched to the blocking pool, never
     /// run inline on a runtime worker.
     ///
@@ -1178,19 +1659,18 @@ mod tests {
     ///
     /// Discriminates by starving the pool, the same way
     /// `image_info_size_stat_goes_through_the_blocking_pool` does: the runtime
-    /// gets exactly one blocking thread and that thread is held busy, so a
-    /// `spawn_blocking` job is *queued* and the request cannot finish — while an
-    /// inline `write_backup` runs on the worker itself and answers regardless of
-    /// the pool. Asserting the request makes no progress is what fails if the
-    /// inline call comes back.
+    /// gets exactly one blocking thread, and once the create has prepared its
+    /// directory and is inside its snapshot, that thread is held busy, so the
+    /// write's `spawn_blocking` job is *queued* and the request cannot finish —
+    /// while an inline `write_backup` runs on the worker itself and answers
+    /// regardless of the pool. Asserting the request makes no progress is what
+    /// fails if the inline call comes back. Starving the pool only after the
+    /// snapshot keeps the directory preparation, also on the pool, from
+    /// stalling the request in its place.
     #[test]
     fn creating_a_backup_goes_through_the_blocking_pool() {
-        use crate::create_router;
-        use crate::test_support::elevated_fake_state;
-        use axum::body::Body;
-        use axum::http::Request;
+        use std::sync::Arc;
         use std::time::Duration;
-        use tower::ServiceExt as _;
 
         // Only bounds the failing direction: an inline `write_backup` over the
         // fake state's (tiny, DB-less) program-data dir returns in well under a
@@ -1200,6 +1680,7 @@ mod tests {
 
         // Taken BEFORE the runtime exists, so `blocking_lock` cannot panic.
         let _serial = TEST_SERIAL.blocking_lock();
+        let backups = clean_test_backups_dir();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1208,10 +1689,22 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let router = create_router(elevated_fake_state());
+            let (in_snapshot, finish_snapshot) = (
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            let state = crate::test_support::elevated_state_with(
+                Arc::new(crate::test_support::FakeLibrary),
+                Arc::new(DiskSystem {
+                    stall: Some((Arc::clone(&in_snapshot), Arc::clone(&finish_snapshot))),
+                    ..DiskSystem::with_free_space(i64::MAX)
+                }),
+            );
+            let mut request = tokio::spawn(create_on(state));
+            in_snapshot.notified().await;
 
             // Occupy the single blocking thread, and wait until it is provably
-            // busy so the backup job cannot win the race for it.
+            // busy so the write job cannot win the race for it.
             let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let hog = tokio::task::spawn_blocking(move || {
@@ -1219,32 +1712,20 @@ mod tests {
                 release_rx.recv().ok();
             });
             busy_rx.await.unwrap();
+            finish_snapshot.notify_one();
 
-            let create = |router: axum::Router| async move {
-                router
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/Backup/Create")
-                            .header("Content-Type", "application/json")
-                            .body(Body::from("{}"))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap()
-            };
-
-            let starved = tokio::time::timeout(STARVED_WAIT, create(router.clone())).await;
+            let starved = tokio::time::timeout(STARVED_WAIT, &mut request).await;
             assert!(
                 starved.is_err(),
                 "POST /Backup/Create answered with the blocking pool starved, so the archive \
                  was written inline on the async worker thread"
             );
 
-            // Free the pool and confirm the same request now answers.
+            // Free the pool: the same request now answers.
             release_tx.send(()).unwrap();
             hog.await.unwrap();
-            let _ = create(router).await;
+            assert_eq!(request.await.unwrap(), axum::http::StatusCode::OK);
         });
+        let _ = std::fs::remove_dir_all(&backups);
     }
 }

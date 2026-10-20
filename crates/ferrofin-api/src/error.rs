@@ -59,8 +59,9 @@ pub enum ApiError {
 
     /// The operation cannot run right now because a conflicting one already is
     /// → `503`. The contract documents this for `POST /Backup/Create`, which is
-    /// serialized: two creates in the same second would write the same archive
-    /// path, and each holds the whole database in memory.
+    /// serialized (two creates in the same second would write the same archive
+    /// path, and each writes a database-sized snapshot) and refused while a
+    /// library scan runs.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 

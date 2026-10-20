@@ -1162,7 +1162,7 @@ fn subtitle_map_args(state: &EncodingJobInfo) -> String {
         return format!(" -map 0:{idx}");
     }
 
-    if sub.is_external && !is_text_subtitle_stream(sub) {
+    if sub.is_external && !sub.is_text_subtitle_stream() {
         let idx = find_index(&state.media_source.media_streams, sub);
         return format!(" -map 1:{idx} -sn");
     }
@@ -1235,7 +1235,7 @@ pub fn burns_graphical_subtitle(state: &EncodingJobInfo) -> bool {
         && state
             .subtitle_stream
             .as_ref()
-            .is_some_and(|s| !is_text_subtitle_stream(s))
+            .is_some_and(|s| !s.is_text_subtitle_stream())
 }
 
 /// The software HDR→SDR tonemap filter chain, ending in 8-bit `yuv420p`.
@@ -1591,19 +1591,8 @@ fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
     state.subtitle_stream.as_ref().is_some_and(|sub| {
         sub.is_external
             && (state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed
-                || (should_encode_subtitle(state) && !is_text_subtitle_stream(sub)))
+                || (should_encode_subtitle(state) && !sub.is_text_subtitle_stream()))
     })
-}
-
-/// Whether a subtitle stream is a text (rather than graphical) subtitle. Port of
-/// `MediaStream.IsTextSubtitleStream`: text subtitles have a codec ffmpeg can
-/// render to text (srt/ass/ssa/subrip/…) rather than an image (pgs/dvbsub/…).
-fn is_text_subtitle_stream(stream: &MediaStream) -> bool {
-    let codec = stream.codec.as_deref().unwrap_or_default();
-    matches!(
-        codec.to_ascii_lowercase().as_str(),
-        "ass" | "ssa" | "srt" | "subrip" | "microdvd" | "mov_text" | "text" | "webvtt" | "vtt"
-    )
 }
 
 /// The score (ascending-quality index) of a profile for a codec. Port of
@@ -1986,6 +1975,32 @@ mod tests {
         assert_eq!(state.subtitle_stream, None);
         // No subtitle → " -map -0:s"; both streams at file indices 0 and 1.
         assert_eq!(state.map_args_for_test(), "-map 0:0 -map 0:1 -map -0:s");
+    }
+
+    #[test]
+    fn a_burned_external_text_file_is_neither_an_input_nor_an_overlay() {
+        // SAMI is text (`MediaStream.IsTextSubtitleStream`): the `subtitles`
+        // filter reads the file, so it is no second input, no graphical burn
+        // and no `[v]` map.
+        let sami = MediaStream {
+            codec: Some("sami".to_owned()),
+            index: 2,
+            stream_type: MediaStreamType::Subtitle,
+            is_external: true,
+            path: Some("/media/movie.smi".to_owned()),
+            ..MediaStream::default()
+        };
+        let mut state = job(&[
+            video_stream("h264", 0),
+            audio_stream("aac", 1),
+            sami.clone(),
+        ]);
+        state.subtitle_stream = Some(sami);
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Encode;
+        assert!(!burns_graphical_subtitle(&state));
+        assert!(!needs_external_subtitle_muxing(&state));
+        let args = state.map_args_for_test();
+        assert!(!args.contains("[v]") && !args.contains("-map 1:"), "{args}");
     }
 
     #[test]
