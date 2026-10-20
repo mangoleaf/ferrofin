@@ -172,6 +172,15 @@ excluded from keys. Counts, ordered IDs (including duplicates), nested array len
 per-item field types are checked per response; no cross-item field union or arbitrary
 value diff is used. Each image belongs to its screen, and binary byte lengths detect
 empty bodies. Different nonzero JPEG sizes remain valid, unflagged diagnostics.
+`/Items/{id}/Similar` (`detail:similar`, `series:similar`) is the one exception: Jellyfin
+breaks equal similarity scores in arbitrary order (series in random order), and the
+response carries no score, so which items fill the limit is the server's free pick. Those
+responses are checked for status, counts, totals, content type and their own top-level
+fields, not item IDs or per-item fields, and the posters of their items are checked by
+count, status and type per slot and screen rather than by item (which assumes every
+candidate has a Primary poster, as every fixture item does). A Similar response that repeats an item or returns the item
+it was asked about still fails. Which items score as similar is covered by the code
+comparison recorded in `handlers::VERIFIED`, not by this check.
 
 Timed iterations emit one compact selection record after recording screen latency,
 without a full structural comparison. The reporter checks observed keys and request
