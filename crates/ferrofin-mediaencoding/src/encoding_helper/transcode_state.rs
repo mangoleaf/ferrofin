@@ -38,6 +38,29 @@ pub trait EncoderCapabilities: Send + Sync {
     /// Returns whether `encoder` (an ffmpeg encoder name, e.g. `"aac_at"`) is
     /// available. Port of `IMediaEncoder.SupportsEncoder`.
     fn supports_encoder(&self, encoder: &str) -> bool;
+
+    /// The probed ffmpeg version, which gates version-dependent arguments.
+    /// Port of `IMediaEncoder.EncoderVersion`.
+    ///
+    /// `None` (the default) when unprobed. That passes no `>=` gate, as C#'s
+    /// null `Version` compares below every minimum.
+    fn ffmpeg_version(&self) -> Option<crate::encoder::FfmpegVersion> {
+        None
+    }
+
+    /// Whether the probed ffmpeg is at least `min`: the shape every
+    /// `_minFFmpeg*` gate in C# takes. False when the version is unknown.
+    fn ffmpeg_at_least(&self, min: crate::encoder::FfmpegVersion) -> bool {
+        self.ffmpeg_version().is_some_and(|version| version >= min)
+    }
+
+    /// Whether the VAAPI device runs Intel's iHD driver, the one VAAPI driver
+    /// whose `-compression_level` upstream trusts. Port of
+    /// `IMediaEncoder.IsVaapiDeviceInteliHD`; `false` (the default) when
+    /// nothing was probed.
+    fn is_vaapi_device_intel_ihd(&self) -> bool {
+        false
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.
@@ -289,6 +312,11 @@ pub struct EncodingJobInfo {
     pub supported_video_codecs: Vec<String>,
     /// The audio codecs the target supports (`SupportedAudioCodecs`).
     pub supported_audio_codecs: Vec<String>,
+    /// The subtitle codecs an `Embed` delivery may write
+    /// (`SupportedSubtitleCodecs`): the request's `subtitleCodec`, split on
+    /// commas with empty entries dropped. The first names the embedded
+    /// track's codec ([`crate::encoding_helper::helper::subtitle_embed_arguments`]).
+    pub supported_subtitle_codecs: Vec<String>,
     /// The segment cut length, in seconds (`StreamState.SegmentLength`).
     ///
     /// Drives the segment cache filenames and the forward-gap heuristic. `0`
@@ -636,6 +664,7 @@ mod derived_state_tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 3,
             wait_for_path: None,
             segment_container: None,
