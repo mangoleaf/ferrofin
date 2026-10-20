@@ -3482,8 +3482,8 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
-    /// Port of `DefaultLiveTvService.UpdateTimersForSeriesTimer` (v10.11.8
-    /// DefaultLiveTvService.cs:709-800): expand the series timer over the guide,
+    /// Port of `DefaultLiveTvService.UpdateTimersForSeriesTimer` (v12.2
+    /// DefaultLiveTvService.cs:709-804): expand the series timer over the guide,
     /// add a timer for every future airing it should record, refresh the ones
     /// that already exist, and — when asked — drop the pending ones it no longer
     /// matches.
@@ -3564,11 +3564,15 @@ impl FerrofinLiveTvManager {
         }
 
         // `SearchForDuplicateShowIds(enabledTimersForSeries)`: the same showing
-        // scheduled more than once records only the first of them.
-        for mut loser in duplicate_showings_to_cancel(&enabled) {
-            loser.status = RecordingStatus::Cancelled;
-            self.persist_timer(&loser).await?;
-            self.arm_timer(&loser);
+        // scheduled more than once records only the first of them — and only
+        // for a series timer that skips episodes already in the library
+        // (v12.2 DefaultLiveTvService.cs:776-779, jellyfin/jellyfin PR 16220).
+        if stored.dto.skip_episodes_in_library {
+            for mut loser in duplicate_showings_to_cancel(&enabled) {
+                loser.status = RecordingStatus::Cancelled;
+                self.persist_timer(&loser).await?;
+                self.arm_timer(&loser);
+            }
         }
 
         if delete_invalid_timers {
@@ -5015,19 +5019,20 @@ type EnabledShowing = (String, DateTime<Utc>, TimerInfoDto);
 /// timers that lost.
 ///
 /// Port of `DefaultLiveTvService.SearchForDuplicateShowIds` +
-/// `HandleDuplicateShowIds` (v10.11.8 DefaultLiveTvService.cs:671-707): timers
+/// `HandleDuplicateShowIds` (v12.2 DefaultLiveTvService.cs:671-707): timers
 /// are grouped by `ShowId`, a blank group is skipped, a group of one is skipped,
 /// a group whose key ends `"0000"` is skipped (upstream's guard for a
 /// SchedulesDirect show id with no sub-key, jellyfin/jellyfin#5856), and in what
 /// is left every showing after the first is cancelled.
 ///
-/// TODO(work item, not a deferral): upstream orders the group
-/// `OrderByDescending(t => GetLiveTvChannel(t).IsHD).ThenBy(t => t.StartDate)`,
-/// so an HD showing beats an earlier SD one. Ferrofin's Live TV has no `IsHD`
-/// at all — the M3U parser does not read a channel's HD flag and no table stores
-/// one — so only the `StartDate` half is ported and the earliest showing always
-/// wins. Closing it means carrying HD through `crate::m3u` → the channel row →
-/// here. It can only differ on a lineup mixing HD and SD feeds of one channel.
+/// Upstream orders the group
+/// `OrderByDescending(t => GetLiveTvChannel(t).IsHD).ThenBy(t => t.StartDate)`
+/// (v12.2 DefaultLiveTvService.cs:674), but that `IsHD` is the channel library
+/// item's `BaseItem.IsHD` (`Height >= 720`, BaseItem.cs:404), and
+/// `GuideManager.GetChannel` never sets a channel's `Height`: it is false for
+/// every timer. The stable sort is therefore `StartDate` alone, so the stored
+/// `IsHd` channel column (the tuner's `ChannelInfo.IsHD`) deliberately takes no
+/// part here, and the earliest showing always wins.
 fn duplicate_showings_to_cancel(enabled: &[EnabledShowing]) -> Vec<TimerInfoDto> {
     let mut groups: HashMap<&str, Vec<&EnabledShowing>> = HashMap::new();
     for entry in enabled {
@@ -5808,7 +5813,7 @@ mod tests {
             source.id
         );
         assert_eq!(source.container.as_deref(), Some("ts"));
-        assert!(!source.supports_direct_play);
+        assert!(source.supports_direct_play);
         assert!(source.use_most_compatible_transcoding_profile);
         // `isHd` ⇒ the android-tv 1200 condition's dummy resolution.
         assert_eq!(source.media_streams[0].width, Some(1920));
@@ -7972,6 +7977,70 @@ mod tests {
                 Err(ServiceError::NotFound(_))
             ),
             "cancelling an unknown series timer is a 404, not a silent 204"
+        );
+    }
+
+    /// The duplicate-showing sweep runs only for a series timer that skips
+    /// episodes already in the library.
+    ///
+    /// Jellyfin 12 gates `SearchForDuplicateShowIds(enabledTimersForSeries)` on
+    /// `seriesTimer.SkipEpisodesInLibrary` (v12.2
+    /// src/Jellyfin.LiveTv/DefaultLiveTvService.cs:776-779, jellyfin/jellyfin
+    /// PR 16220): with jellyfin-web's "Don't record episodes that are already
+    /// in my library" cleared, every airing of a `ShowId` records. Turning it
+    /// off on a timer the sweep already thinned brings the cancelled showings
+    /// back, because the fan-out resets every non-manual existing timer to
+    /// `New` first.
+    #[tokio::test]
+    async fn the_duplicate_sweep_runs_only_when_skipping_library_episodes() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let mut body = defaults_for(&mgr, future).await;
+        body.skip_episodes_in_library = false;
+        let st_id = mgr.create_series_timer(body).await.expect("create st");
+
+        let statuses = |timers: Vec<TimerInfoDto>| {
+            let mut by_start = timers;
+            by_start.sort_by_key(|t| t.base.start_date);
+            by_start.into_iter().map(|t| t.status).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(mgr.get_timers().await.expect("timers")),
+            [RecordingStatus::New; 3],
+            "without SkipEpisodesInLibrary every showing of the ShowId records"
+        );
+
+        let mut stored = mgr
+            .get_series_timer(&st_id)
+            .await
+            .expect("get st")
+            .expect("st row");
+        stored.skip_episodes_in_library = true;
+        mgr.update_series_timer(&st_id, stored.clone())
+            .await
+            .expect("skip on");
+        assert_eq!(
+            statuses(mgr.get_timers().await.expect("timers")),
+            [
+                RecordingStatus::New,
+                RecordingStatus::Cancelled,
+                RecordingStatus::Cancelled
+            ],
+            "with it, only the earliest showing of the ShowId records"
+        );
+
+        stored.skip_episodes_in_library = false;
+        mgr.update_series_timer(&st_id, stored)
+            .await
+            .expect("skip off");
+        assert_eq!(
+            statuses(mgr.get_timers().await.expect("timers")),
+            [RecordingStatus::New; 3],
+            "clearing it again brings the swept showings back"
         );
     }
 

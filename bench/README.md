@@ -37,7 +37,7 @@ The benchmark reference is the Jellyfin release named by the C# source-parity pi
 (`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
 in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
 Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab|ramp`) refuses to start and `run.sh` warns and
+fails, a release-gate session (`gate.py aa|ab|scan|ramp`) refuses to start and `run.sh` warns and
 continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
 and digest. A run that boots Jellyfin also stops unless the pinned image reports the
 `UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
@@ -448,3 +448,36 @@ the root README and `docs/BENCHMARKS.md` tables and never decide a release.
 Cold start is not part of the gate and keeps the definition above: a restart until the
 first authenticated `GET /UserViews` succeeds, measured in full runs and never replaced by an
 unauthenticated probe such as `/System/Ping`.
+
+## Scan and migration
+
+`gate.py scan PREVIOUS CANDIDATE` measures library-scan and adoption-migration cost, A/B
+against the previous release in the same window: PREVIOUS CANDIDATE … as interleaved pairs
+(`--pairs`, default 3), each run being `scan.py` on that image ID. It needs the same test data
+as `run.sh` (`--testdata`, default `bench/testdata`), and the server gets `run.sh`'s cores and
+memory limit after the same idle-core check.
+
+- **Scan wall time**: seconds from `POST /Library/Refresh` to the RefreshLibrary task
+  reporting a newer successful run (polled every 0.5 s). The server starts on an empty data
+  dir: startup wizard, the three bench libraries set up as `testdata/seed.py` builds them
+  (no remote fetchers, trickplay or chapter images), tasks drained plus `SETTLE_S` idle,
+  then the scan.
+- **Migration wall time**: seconds from the container's start to its first authenticated
+  `200` on `GET /UserViews`, polled every 10 ms, on a fresh copy of the test data's config
+  (its libraries' realtime monitor turned off, as `run.sh` provisions every copy).
+  That is the bench corpus's own Jellyfin 10.11.8 database (about 26,000 items), so the
+  boot runs the whole adoption and migration chain. The synthetic fixtures under
+  `adoption/` hold a few dozen items each: they check correctness, not cost.
+- **Peak anon**: the largest cgroup `anon` sample (`mem_sample.py`, every 100 ms) inside
+  each timed span. For migration, sampling starts once `docker start` returns, so the first
+  moments of the boot can be missed.
+
+After each measurement the movie, series, episode, album and track counts are recorded in
+`scan.json` and must be at least `media/summary.json`'s, so a server that finds or keeps less
+is never faster; a run that fails stops the session. More is allowed and the two images'
+counts are not compared: v1.3.2's fresh scan lists the 40 alternate versions as movies of
+their own (3,041), and it must stay measurable as a previous release. The test data must
+hold at least 10,000 items. Every cell gates: wall time by the `[scan]` row of
+[`gate.toml`](gate.toml), peak anon by the `[memory]` row, with the A/B verdict rule. The
+session directory holds `report.md`, `report.html` and `verdict.json`; each run directory
+holds `scan.json`, and each measurement's `server.log`, `mem.csv` and data dir.

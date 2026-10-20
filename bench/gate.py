@@ -12,6 +12,9 @@
         the saturation ramp (`run.sh --only ramp`, Ferrofin only) interleaved the same way: the
         throughput ceiling in screens/s per run, regressed / within noise / improved on the
         same rule with the ceiling as a higher-is-better cell (gate.toml `[ramp]`)
+    gate.py scan PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
+        the same interleaved pairs, each run `scan.py` (library-scan and adoption-migration
+        wall time and peak anon memory, B7/B8) instead of run.sh; every cell gates (D6)
     gate.py render SESSION_DIR
         rewrite a finished session's report.md and report.html from its run dirs
 
@@ -54,6 +57,11 @@ PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": 
 GATED_LEVELS = ("unloaded", "loaded")
 #: An endpoint cell whose medians are both under this many ms is reported, never gated (B5).
 SUB_MS = 1.0
+#: A scan session's cells: (cell, scan.json part, field, unit, gate.toml row).
+SCAN_CELLS = (("scan/wall time", "scan", "wall_s", "s", "scan"),
+              ("scan/peak anon", "scan", "peak_anon_mib", "MiB", "memory"),
+              ("migration/wall time", "migration", "wall_s", "s", "scan"),
+              ("migration/peak anon", "migration", "peak_anon_mib", "MiB", "memory"))
 
 
 # ── the pure part: cells, noise, verdicts ───────────────────────────────────
@@ -193,6 +201,19 @@ def verdicts(model_a, model_b, gate):
     return out
 
 
+def scan_verdicts(results, gate):
+    """Per SCAN_CELLS cell: the D4 verdict over each role's scan.json values in schedule
+    order (`results[role]`), judged by the cell's own band or its gate.toml row."""
+    out = {}
+    for key, part, field, unit, kind in SCAN_CELLS:
+        a, b = ([r[part][field] for r in results[role]] for role in ("a", "b"))
+        band = (gate.get("cells") or {}).get(key) or gate.get(kind)
+        v, diff, pct, slower = verdict(a, b, band)
+        out[key] = {"kind": kind, "unit": unit, "a": a, "b": b, "band": band, "verdict": v, "diff": diff, "pct": pct,
+                    "slower": slower, "a_median": statistics.median(a), "b_median": statistics.median(b), "gated": True}
+    return out
+
+
 def blocking(rows):
     """The gated cells that stop the release: regressed, or not judgeable."""
     return sorted(k for k, r in rows.items() if r["gated"] and r["verdict"] in ("regressed", "not comparable"))
@@ -219,9 +240,9 @@ def image_ref(image):
 
 
 def run_sh(cmd):
-    """run.sh to completion. On Ctrl-C it gets SIGTERM and time to run its own cleanup
-    (stop its container, finish phases.json): a killed run.sh would leave a bench-*
-    container behind that refuses the next run."""
+    """A run (run.sh or scan.py) to completion. On Ctrl-C it gets SIGTERM and time to run
+    its own cleanup (stop its container, finish phases.json): a killed run would leave a
+    bench-* container behind that refuses the next run."""
     proc = subprocess.Popen(cmd)
     try:
         return proc.wait()
@@ -233,6 +254,8 @@ def run_sh(cmd):
 
 def run_session(session, plan, testdata):
     """Run the schedule; stop at the first run that fails or measured the wrong image."""
+    if plan.get("mode") == "scan":
+        return scan_session(session, plan, testdata)
     original = image_ref(TAG)
     try:
         for name, role, image in plan["schedule"]:
@@ -262,6 +285,21 @@ def run_session(session, plan, testdata):
             print(f"gate: {TAG} did not exist before the session; it now names the last image run", file=sys.stderr)
 
 
+def scan_session(session, plan, testdata):
+    """scan.py per run, given the image ID itself, so nothing is retagged; the ID its
+    containers ran is checked all the same."""
+    for name, role, image in plan["schedule"]:
+        out = os.path.join(session, name)
+        print(f"== {name}: {role} = {image}", flush=True)
+        rc = run_sh([sys.executable, os.path.join(BENCH, "scan.py"), plan["images"][role]["id"],
+                     testdata or os.path.join(BENCH, "testdata"), out])
+        if rc:
+            sys.exit(f"gate: {name} failed (scan.py exit {rc}); the session stops here, see {out}")
+        measured = (report.load(os.path.join(out, "scan.json")) or {}).get("image_id")
+        if measured != plan["images"][role]["id"]:
+            sys.exit(f"gate: {name} measured {measured or 'no image'}, not {image}. The session stops here.")
+
+
 def run_dirs(session, plan):
     by_role = {}
     for name, role, _ in plan["schedule"]:
@@ -285,6 +323,15 @@ def render(session):
         docs = {role: [report.load(os.path.join(d, "ferrofin", "ramp.json")) for d in dirs]
                 for role, dirs in run_dirs(session, plan).items()}
         result = {"verdicts": ramp_verdicts(docs["a"], docs["b"], gate), "ramps": docs}
+        name, block = "verdict.json", blocking(result["verdicts"])
+    elif plan["mode"] == "scan":
+        results = {}
+        for run, role, _ in plan["schedule"]:
+            measured = report.load(os.path.join(session, run, "scan.json"))
+            if not measured:
+                raise ValueError(f"{session}/{run} has no scan.json")
+            results.setdefault(role, []).append(measured)
+        result = {"verdicts": scan_verdicts(results, gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     elif plan["mode"] == "aa":
         built, by_role = models(session, plan)
@@ -450,7 +497,7 @@ def render_html(plan, result):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "render"):
+    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "scan", "render"):
         sys.exit(__doc__)
     mode, args = argv[0], argv[1:]
     if mode == "render":
@@ -483,8 +530,9 @@ def main(argv):
     plan = {"mode": mode, "name": os.path.basename(session), "date": stamp.isoformat(timespec="seconds"),
             "schedule": schedule(mode, images, count)}
     print(f"{mode} session {session}:")
+    what = "scan.py" if mode == "scan" else f"run.sh --servers ferrofin --only {PHASES[mode]}"
     for name, role, image in plan["schedule"]:
-        print(f"  {name}  {role}  {image}  run.sh --servers ferrofin --only {PHASES[mode]}")
+        print(f"  {name}  {role}  {image}  {what}")
     if flags:
         return 0
     if os.path.exists(session):
