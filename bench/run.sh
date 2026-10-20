@@ -6,7 +6,11 @@
 # is reported and the next one runs; report.py renders whatever exists.
 #
 #   run.sh [--testdata DIR] [--servers jellyfin,ferrofin]
-#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs] [--rate N] [--out DIR]
+#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs,soak] [--rate N] [--out DIR]
+#
+# `soak` is opt-in (never part of a default run) and Ferrofin only: it holds the loaded mix
+# for an hour and reports the slope of anon memory (bench/soak.py). `gate.py soak PREVIOUS
+# CANDIDATE` runs it A/B.
 #
 # Requires: docker, k6, python3, jq; the pinned Jellyfin image
 # and ferrofin:bench (docker build -t ferrofin:bench .).
@@ -54,6 +58,13 @@ RATE_LOADED=${RATE_LOADED:-5}
 #: Note k6's dropped-iteration flag guards the CLIENT, not the server, and at this rate
 #: it will not fire — it is not the safety net for choosing this number.
 RATE_STRESS=${RATE_STRESS:-25}
+#: The soak (`--only soak`, D7 of the "Benchmark coverage" milestone) holds RATE_SOAK screens
+#: per second (the loaded rate) for SOAK_S seconds (an hour: a leak of a few MiB an hour is
+#: invisible in a two-minute window) and fits a slope to the anon samples after the first
+#: SOAK_SKIP_S seconds, which are warm-up growth rather than a leak.
+SOAK_S=${SOAK_S:-3600}
+RATE_SOAK=${RATE_SOAK:-5}
+SOAK_SKIP_S=${SOAK_SKIP_S:-600}
 export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
@@ -68,7 +79,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
-for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS; do
+for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS SOAK_S RATE_SOAK SOAK_SKIP_S; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
 # Reject bad selections before any fixture access or Docker command.
@@ -78,7 +89,7 @@ for selection in "$ONLY" "$SERVERS"; do
 done
 [ -n "$SERVERS" ] || { echo "--servers cannot be empty" >&2; exit 2; }
 for phase in ${ONLY//,/ }; do
-  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
+  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs|soak) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
 done
 for server in ${SERVERS//,/ }; do
   case "$server" in jellyfin|ferrofin) ;; *) echo "unknown server $server" >&2; exit 2;; esac
@@ -128,8 +139,11 @@ die() { echo "run: $*" >&2; exit 1; }
 image_of() { case "$1" in jellyfin) cat bench/testdata/jellyfin-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
 port_of() { case "$1" in jellyfin) echo 18101;; ferrofin) echo 18103;; esac; }
 want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
+explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by default
 
 # ── preflight ──────────────────────────────────────────────────────────────
+! explicit soak || [ "$SERVERS" = ferrofin ] || die "the soak is Ferrofin only: pass --servers ferrofin"
+! explicit soak || (( SOAK_SKIP_S < SOAK_S )) || die "SOAK_SKIP_S must be shorter than SOAK_S"
 [ ! -e "$OUT" ] || die "$OUT exists — a run directory is never reused"
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum timeout setsid; do command -v $t >/dev/null || die "$t not installed"; done
@@ -356,7 +370,7 @@ phase_coldstart() {
   client python3 bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$IDS"
 }
 phase_load() {
-  local level rate t0 t1 sampler_ok=1 deadline
+  local level rate t0 t1 sampler_ok=1 deadline window_s client_timeout
   state sampler running
   taskset -c "$CLIENT_CPUS" python3 bench/mem_sample.py "$CONTAINER" "$D/mem.csv" "$MEM_SAMPLE_MS" "$SERVER_CPUS" &
   SAMPLER_PID=$!
@@ -364,9 +378,10 @@ phase_load() {
   while [ ! -s "$D/mem.csv" ] && kill -0 "$SAMPLER_PID" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
   [ -s "$D/mem.csv" ] || sampler_ok=0
   echo '{}' > "$D/windows.json"
-  for level in unloaded loaded stress; do
-    want "$level" || continue
-    case "$level" in unloaded) rate=$RATE_UNLOADED;; loaded) rate=$RATE_LOADED;; stress) rate=$RATE_STRESS;; esac
+  for level in unloaded loaded stress soak; do
+    if [ "$level" = soak ]; then explicit soak || continue; else want "$level" || continue; fi
+    window_s=$WINDOW_S
+    case "$level" in unloaded) rate=$RATE_UNLOADED;; loaded) rate=$RATE_LOADED;; stress) rate=$RATE_STRESS;; soak) rate=$RATE_SOAK; window_s=$SOAK_S;; esac
     if ! phase "drain-$level" drain; then
       state "warmup-$level" skipped "drain failed"; state "$level" skipped "drain failed"; continue
     fi
@@ -377,9 +392,15 @@ phase_load() {
       state "$level" skipped "state isolation prerequisite failed"; continue
     fi
     sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
+    client_timeout=$PHASE_TIMEOUT_S
+    if [ "$level" = soak ]; then   # the client must outlive the hour it is asked to run
+      PHASE_TIMEOUT_S=$((SOAK_S + client_timeout))
+      jq -n --argjson rate "$RATE_SOAK" --argjson soak_s "$SOAK_S" --argjson skip_s "$SOAK_SKIP_S" --argjson warmup_s "$WARMUP_S" '$ARGS.named' > "$D/soak-params.json"
+    fi
     t0=$(date +%s.%N)
-    phase "$level" k6run --console-output "$D/selections-$level.log" -e RATE="$rate" -e DURATION="${WINDOW_S}s" -e SEED="$SEED" -e OUT="$D/k6-$level.json" || true
+    phase "$level" k6run --console-output "$D/selections-$level.log" -e RATE="$rate" -e DURATION="${window_s}s" -e SEED="$SEED" -e OUT="$D/k6-$level.json" || true
     t1=$(date +%s.%N)
+    PHASE_TIMEOUT_S=$client_timeout
     jq --arg l "$level" --argjson start "$t0" --argjson end "$t1" '. + {($l): {start:$start,end:$end}}' "$D/windows.json" > "$D/windows.tmp" && mv "$D/windows.tmp" "$D/windows.json"
     # Ensure a bracketing sample is captured before observer requests start.
     sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
@@ -392,6 +413,7 @@ phase_load() {
   sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
   stop_sampler || sampler_ok=0
   python3 bench/report.py --resource-check "$D" || sampler_ok=0
+  ! explicit soak || phase soak-slope python3 bench/soak.py finish "$D" || true
   if (( sampler_ok )); then state sampler completed; else state sampler failed "sampler exit or coverage failed"; FAILED=1; fi
 }
 
@@ -411,8 +433,8 @@ run_server() {
   echo '{}' > "$D/phases.json"
   state startup pending; state startup-drain pending; state cleanup pending; state isolation-setup pending
   for selected in counts shape coldstart ttfs; do ! want "$selected" || state "$selected" pending; done
-  for selected in unloaded loaded stress; do
-    if want "$selected"; then
+  for selected in unloaded loaded stress soak; do
+    if { [ "$selected" != soak ] && want "$selected"; } || { [ "$selected" = soak ] && explicit soak; }; then
       state "$selected" pending; state "warmup-$selected" pending; state "drain-$selected" pending
       state sampler pending; state steady pending; state drain-steady pending
     fi
@@ -469,7 +491,7 @@ PY_ISOLATION
   ! want counts || phase counts || true
   ! want shape || isolated_phase shape phase_shape || true
   ! want coldstart || isolated_phase coldstart phase_coldstart || true
-  { ! want unloaded && ! want loaded && ! want stress; } || phase_load
+  { ! want unloaded && ! want loaded && ! want stress && ! explicit soak; } || phase_load
   ! want ttfs || isolated_phase ttfs phase_ttfs || true
   exit "$FAILED"
 }

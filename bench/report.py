@@ -50,6 +50,8 @@ import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+import soak
+
 #: The thresholds a baseline delta must cross, relative and absolute, before it is
 #: coloured (`delta_html`). One file, changed only by reviewed commit.
 GATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.toml")
@@ -1034,6 +1036,24 @@ def phase_table(m, as_html=False):
                             "Start (UTC)", "End (UTC)", "Reason"], rows, as_html)
 
 
+def soak_table(m, as_html=False):
+    """The memory soak of every run that has one (`run.sh --only soak`): the anon-memory
+    slope and what it was fitted on."""
+    out = []
+    for i, run in enumerate(m["runs"], 1):
+        doc = load(os.path.join(run, "ferrofin", "soak.json"))
+        if not doc:
+            continue
+        title = f"Memory soak, run {i}"
+        rows = soak.rows(doc)
+        if as_html:
+            body = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>" for k, v in rows)
+            out.append(f"<h2>{html.escape(title)}</h2><div class='scroll'><table><tbody>{body}</tbody></table></div>")
+        else:
+            out.append(diagnostic_table(title, ["Measure", "Value"], rows))
+    return "\n".join(out)
+
+
 # ── markdown (the README tables) ────────────────────────────────────────────
 def render_md(m):
     oracle_label = m["oracle_label"]
@@ -1078,6 +1098,8 @@ def render_md(m):
             escape = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
             p("| " + escape(label) + " | " + " | ".join(escape(cells[k]) for k, _ in servers) + " |")
         p("")
+    if table := soak_table(m):
+        p(table)
     p(phase_table(m))
     p("### Time to first screen\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
@@ -1435,6 +1457,8 @@ def load_gate(path=GATE_PATH):
     for name, row in rows.items():
         if not isinstance(row, dict) or not all(number(row.get(f)) for f in ("relative_pct", "absolute")):
             raise ValueError(f"gate thresholds unreadable: {path}: [{name}] needs relative_pct and absolute")
+    if not isinstance(gate.get("soak"), dict) or not number(gate["soak"].get("max_slope_mib_per_hour")):
+        raise ValueError(f"gate thresholds unreadable: {path}: [soak] needs max_slope_mib_per_hour")
     return gate
 
 
@@ -1673,6 +1697,8 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
         body = "".join("<tr><th>" + e(label) + "</th>" + "".join(
             f"<td class='num{' flagged' if '⚠' in cells[k] else ''}'>{e(cells[k])}</td>" for k, _ in servers) + "</tr>" for label, cells in rows)
         parts.append(f"<h3>{e(title)}</h3><div class='scroll'><table><thead><tr><th>Window / metric</th>{head}</tr></thead><tbody>{body}</tbody></table></div>")
+    if table := soak_table(m, True):
+        parts.append(table)
     parts.append(phase_table(m, True))
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen", gate))
     mem_note = "" if comparable_levels(m, base) else (

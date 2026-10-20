@@ -266,12 +266,52 @@ validation, not full decoding or sustained playback evidence.
 | cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 
+## Memory soak
+
+`run.sh --servers ferrofin --only soak` (opt-in: no default run includes it, and it refuses
+Jellyfin) holds the loaded mix at `RATE_SOAK` (5 screens/s) for `SOAK_S` (3600 s, one hour)
+while the cgroup sampler records anon memory every `MEM_SAMPLE_MS`. It drains, discards the
+usual `WARMUP_S` warm-up, checks isolation before and after like the other levels, and
+then runs the usual 60 s steady window. A two-minute window cannot see a leak of a few MiB
+an hour, and steady anon memory has drifted by that much between releases without any gate
+noticing.
+
+The **soak slope** is the least-squares line through the anon samples of the hour after its
+first `SOAK_SKIP_S` seconds (600), in MiB per hour: heap growth in the first minutes is
+warm-up, not a leak. The phase writes `soak-params.json` and, once the sampler has stopped,
+`soak.json` (the slope, the samples it was fitted on, the fit window and the peak); the
+run's `report.html` gets a "Memory soak" section. The client timeout is extended by
+`SOAK_S` for this level only. Like every window, the soak's sampler coverage is checked
+(a gap of more than five sample intervals fails the run), and over an hour that is a
+stricter test of the sampler than the two-minute windows are; a run that fails is reported
+and never retried. The decisions live in `soak.py` and are unit-tested in
+`test_soak.py`.
+
+The release gate soaks the previous release and then the candidate back to back (one pair
+by default; the cost is two hours of a quiet host):
+
+```bash
+python3 bench/gate.py soak ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+```
+
+The cell is `soak/slope`, judged by the `[soak]` row of [`gate.toml`](gate.toml): the
+candidate **regressed** when its slope exceeds `max_slope_mib_per_hour` (20) and the previous
+release's does not, **improved** when it is the other way round, and *within noise* in every
+other case, so a candidate that leaks faster than a previous release that already leaked
+is not a new problem (both numbers are in the table). With more than one pair each side's
+median slope is used. A soak that left no slope cannot be judged and blocks like a
+regression. The 20 MiB/h limit and the 600 s skip are starting values, to be re-derived
+after the first two soaks. Memory is compared only between runs in one window: transparent
+huge pages shift anon memory by about 50 MiB between time windows, which is why the pair runs
+back to back.
+
 ## Running it
 
 The reporter has a fast correctness check, also run in CI:
 
 ```sh
 python3 -m unittest discover -s bench -p test_report.py
+python3 -m unittest discover -s bench -p test_soak.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.

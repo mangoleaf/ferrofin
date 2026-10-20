@@ -8,10 +8,14 @@
         PREVIOUS CANDIDATE PREVIOUS CANDIDATE … (default 3 pairs), Ferrofin only: per cell,
         regressed / within noise / improved; exits 1 when a gated cell regressed or could
         not be judged
+    gate.py soak PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
+        the one-hour memory soak (`run.sh --only soak`, Ferrofin only) back to back, default one
+        pair: the anon-memory slope in MiB/h per run, regressed when the candidate's exceeds the
+        gate.toml `[soak]` limit and the previous release's does not (soak.py has the rule)
     gate.py render SESSION_DIR
         rewrite a finished session's report.md and report.html from its run dirs
 
-Each run is `run.sh --servers ferrofin --only shape,unloaded,loaded` into SESSION_DIR/NN-a or
+Each run is `run.sh --servers ferrofin --only PHASES` (below) into SESSION_DIR/NN-a or
 NN-b. The shape pass is what makes a cell comparable: without it every cell is caveated
 for a missing phase and the change in the responses behind a cell cannot be seen.
 `ferrofin:bench` is only ever inspected by run.sh, so the driver retags it before every run,
@@ -37,10 +41,11 @@ import sys
 from datetime import datetime, timezone
 
 import report
+import soak
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 TAG = "ferrofin:bench"
-PHASES = "shape,unloaded,loaded"
+PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "soak": "soak"}
 #: The levels whose cells can block a release; `stress` is reported, never gated (B5).
 GATED_LEVELS = ("unloaded", "loaded")
 #: An endpoint cell whose medians are both under this many ms is reported, never gated (B5).
@@ -209,7 +214,7 @@ def run_session(session, plan, testdata):
             out = os.path.join(session, name)
             print(f"== {name}: {role} = {image}", flush=True)
             docker("tag", plan["images"][role]["id"], TAG)
-            cmd = ["bash", os.path.join(BENCH, "run.sh"), "--servers", "ferrofin", "--only", PHASES, "--out", out]
+            cmd = ["bash", os.path.join(BENCH, "run.sh"), "--servers", "ferrofin", "--only", PHASES[plan["mode"]], "--out", out]
             if testdata:
                 cmd += ["--testdata", testdata]
             rc = run_sh(cmd)
@@ -232,11 +237,24 @@ def run_session(session, plan, testdata):
             print(f"gate: {TAG} did not exist before the session; it now names the last image run", file=sys.stderr)
 
 
-def models(session, plan):
+def run_dirs(session, plan):
     by_role = {}
     for name, role, _ in plan["schedule"]:
         by_role.setdefault(role, []).append(os.path.join(session, name))
+    return by_role
+
+
+def models(session, plan):
+    by_role = run_dirs(session, plan)
     return {role: report.build(runs) for role, runs in by_role.items()}, by_role
+
+
+def soak_session(session, plan, gate):
+    """The soak A/B's result: its cell, and each run's `soak.json` by role."""
+    soaks = {role: [report.load(os.path.join(d, "ferrofin", "soak.json")) for d in dirs]
+             for role, dirs in run_dirs(session, plan).items()}
+    rows = soak.session_rows(soaks["a"], soaks["b"], gate)
+    return {"verdicts": rows, "soaks": soaks, "blocking": soak.blocking(rows)}
 
 
 def render(session):
@@ -246,6 +264,16 @@ def render(session):
     if not plan:
         raise ValueError(f"{session} has no gate.json")
     gate = report.load_gate()
+    if plan["mode"] == "soak":
+        result = soak_session(session, plan, gate)
+        with open(os.path.join(session, "verdict.json"), "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        md = soak.render_md(header(plan), result)
+        with open(os.path.join(session, "report.md"), "w") as f:
+            f.write(md)
+        with open(os.path.join(session, "report.html"), "w") as f:
+            f.write(soak.render_html(header(plan), result, report.CSS))
+        return md, result["blocking"]
     built, by_role = models(session, plan)
     if plan["mode"] == "aa":
         runs = by_role["a"]
@@ -385,7 +413,7 @@ def render_html(plan, result):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("aa", "ab", "render"):
+    if len(argv) < 2 or argv[0] not in ("aa", "ab", "soak", "render"):
         sys.exit(__doc__)
     mode, args = argv[0], argv[1:]
     if mode == "render":
@@ -394,7 +422,8 @@ def main(argv):
         md, block = render(os.path.abspath(args[0]))
         print(md)
         return 1 if block else 0
-    opts = {"--runs": "6", "--pairs": "3", "--testdata": None, "--out": None}
+    # One soak pair: each is an hour long (D7 of the "Benchmark coverage" milestone).
+    opts = {"--runs": "6", "--pairs": "1" if mode == "soak" else "3", "--testdata": None, "--out": None}
     flags, positional = {"--dry-run"} & set(args), []
     rest = [a for a in args if a != "--dry-run"]
     while rest:
@@ -419,7 +448,7 @@ def main(argv):
             "schedule": schedule(mode, images, count)}
     print(f"{mode} session {session}:")
     for name, role, image in plan["schedule"]:
-        print(f"  {name}  {role}  {image}  run.sh --servers ferrofin --only {PHASES}")
+        print(f"  {name}  {role}  {image}  run.sh --servers ferrofin --only {PHASES[mode]}")
     if flags:
         return 0
     if os.path.exists(session):

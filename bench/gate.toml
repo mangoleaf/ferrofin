@@ -20,6 +20,11 @@ absolute = 0.5
 relative_pct = 25
 absolute = 40
 
+# One-hour anon-memory slope, MiB/h (soak.py): the candidate regresses only when its slope
+# exceeds this and the previous release's does not.
+[soak]
+max_slope_mib_per_hour = 20
+
 # A per-cell band from the A/A noise table replaces its row for that one cell, keyed
 # `<level>/screens/<screen>`, `<level>/endpoints/<endpoint>` or `memory/<row>`:
 #
