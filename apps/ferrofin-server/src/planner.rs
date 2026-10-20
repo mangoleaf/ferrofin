@@ -1442,6 +1442,15 @@ impl FerrofinStreamStatePlanner {
         args.push("200M".to_owned());
         push_split(&mut args, "-probesize");
         args.push("1G".to_owned());
+        // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
+        // source (a tuner, a playlist channel) requires, as the probe sends
+        // them. Each value is one argv element, never parsed as options.
+        for (header, flag) in [("User-Agent", "-user_agent"), ("Referer", "-referer")] {
+            if let Some(value) = state.media_source.required_http_headers.get(header) {
+                args.push(flag.to_owned());
+                args.push(value.clone());
+            }
+        }
         // `GetInputModifier`: timestamp sync, then pacing, then the options
         // the live-TV source settings drive (ignore DTS, stream looping).
         args.extend(
@@ -3554,6 +3563,54 @@ mod tests {
                 .unwrap();
             assert_eq!(plan.media_path, "/media/movie.mkv", "{id}");
         }
+    }
+
+    /// `GetInputModifier`'s `GetUserAgentParam` and `GetRefererParam`: the
+    /// source's `RequiredHttpHeaders` reach ffmpeg after `-probesize`, each
+    /// value one argv element however it is spelled (a tuner or playlist sets
+    /// them).
+    #[tokio::test]
+    async fn plan_sends_the_sources_user_agent_and_referer_to_ffmpeg() {
+        let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        src.required_http_headers = [
+            ("User-Agent", r#"TunerBox/1.0 (Linux; "x")"#),
+            ("Referer", "http://portal.example/tv"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let p = planner(vec![src]);
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let at = |flag: &str| args.iter().position(|a| a == flag).expect(flag);
+        assert_eq!(args[at("-user_agent") + 1], r#"TunerBox/1.0 (Linux; "x")"#);
+        assert_eq!(args[at("-referer") + 1], "http://portal.example/tv");
+        assert!(at("-probesize") < at("-user_agent"), "{args:?}");
+        assert!(at("-user_agent") < at("-referer"), "{args:?}");
+        assert!(at("-referer") < at("-i"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn plan_without_http_headers_sends_none() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            !plan
+                .arguments
+                .iter()
+                .any(|a| a == "-user_agent" || a == "-referer"),
+            "{:?}",
+            plan.arguments
+        );
     }
 
     #[tokio::test]
