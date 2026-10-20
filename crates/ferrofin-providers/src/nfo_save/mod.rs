@@ -232,7 +232,8 @@ impl NfoSaver {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            ferrofin_util::file_helper::atomic_write(&path, xml.as_bytes())
+            // A media-folder file: Kodi or a share's other users read it.
+            ferrofin_util::file_helper::atomic_write_media(&path, xml.as_bytes())
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))?
