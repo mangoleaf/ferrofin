@@ -134,13 +134,32 @@ impl Drop for InProgress<'_> {
     }
 }
 
+/// The `method` label: the nine standard methods by name, anything else
+/// `_OTHER` (OTel HTTP semantic conventions). prometheus-net reports the raw
+/// method, but hyper accepts any token, so that would let any client mint
+/// series (METRICS.md rule 5).
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::CONNECT => "CONNECT",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        Method::PATCH => "PATCH",
+        _ => "_OTHER",
+    }
+}
+
 /// The labels shared by every `http_*` instrument (in-progress omits `code`,
 /// which the caller appends for the other two). `page` is always empty — it is a
 /// Razor-Pages artifact prometheus-net emits on every series (fixture parity);
 /// Ferrofin has no pages, so it is a constant `""`.
 fn shared_labels(method: &Method, controller: &str, action: &str, endpoint: &str) -> Vec<KeyValue> {
     vec![
-        KeyValue::new("method", method.as_str().to_owned()),
+        KeyValue::new("method", method_label(method)),
         KeyValue::new("controller", controller.to_owned()),
         KeyValue::new("action", action.to_owned()),
         KeyValue::new("page", ""),

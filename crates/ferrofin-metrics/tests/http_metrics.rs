@@ -62,6 +62,7 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
     assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
 
     drop_mid_handler(&app).await;
+    send_extension_method(&app).await;
 
     let out = handle.render();
 
@@ -109,6 +110,7 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
         "in-progress did not return to 0:\n{out}"
     );
     assert_dropped_request_left_in_progress(&out);
+    assert_extension_method_is_other(&out);
     // Unmatched request rendered with empty-string labels (prometheus-net convention).
     assert!(
         out.contains(r#"endpoint="""#) && out.contains(r#"code="404""#),
@@ -156,6 +158,30 @@ fn assert_dropped_request_left_in_progress(out: &str) {
     assert!(
         hang.trim_end().ends_with(" 0"),
         "a dropped request left the in-progress gauge raised: {hang}"
+    );
+}
+
+/// Sends a request with a non-standard method to a matched route.
+async fn send_extension_method(app: &Router) {
+    let extension = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::from_bytes(b"ZZZ1").unwrap())
+                .uri("/Items/abc-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(extension.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// A non-standard method is reported as `_OTHER`, never verbatim.
+fn assert_extension_method_is_other(out: &str) {
+    assert!(
+        !out.contains("ZZZ1") && out.contains(r#"method="_OTHER""#),
+        "a non-standard method leaked into the method label:\n{out}"
     );
 }
 
