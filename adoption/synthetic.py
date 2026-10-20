@@ -129,7 +129,10 @@ def build(root, only, port):
                     api.scan(300, interval=1)
             else:
                 manifest = seed(api.base)
-                wait_for_live_members(config / "data/jellyfin.db", manifest)
+                # Only seed_database reads the live members, from 10.11's LinkedChildren JSON;
+                # 12.2 keeps them in their own table, where this wait would never see them.
+                if name not in FRESH_INSTALL:
+                    wait_for_live_members(config / "data/jellyfin.db", manifest)
                 api = api.login(USERS[0])
             save(config / "synthetic.json", manifest)
             # Added by the preservation checker; a source-version baseline is

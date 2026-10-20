@@ -832,7 +832,7 @@ class FreshInstallBuildTest(unittest.TestCase):
         server.return_value.__enter__.return_value = api
         with patch.object(self.synthetic, "server", server), \
                 patch.object(self.synthetic, "seed", return_value={"version": 1}) as seed, \
-                patch.object(self.synthetic, "wait_for_live_members"), \
+                patch.object(self.synthetic, "wait_for_live_members") as wait_for_live_members, \
                 patch.object(self.synthetic, "seed_database") as seed_database, \
                 patch.object(self.synthetic, "require_populated") as require_populated, \
                 patch("preservation.snapshot", return_value={}), \
@@ -841,6 +841,9 @@ class FreshInstallBuildTest(unittest.TestCase):
         config = self.root / self.fresh
         seed.assert_called_once()                       # seeded through the 12.2 API
         seed_database.assert_not_called()               # but none of the aged stopped-DB states
+        # 12.2 keeps linked children in their own table, so the 10.11 wait would never end;
+        # only seed_database needs it.
+        wait_for_live_members.assert_not_called()
         # Every digest table must hold rows, bar those only seed_database fills.
         require_populated.assert_called_once_with(config / "data/jellyfin.db", synthetic_fixture.SEEDED_ONLY)
         self.assertFalse((config / "seeds.json").exists())
