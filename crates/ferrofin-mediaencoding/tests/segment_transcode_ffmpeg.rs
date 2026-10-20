@@ -187,6 +187,7 @@ fn state(output_path: &Path, wait_for: &Path, segment_container: &str) -> Encodi
         transcoding_type: TranscodingJobType::Hls,
         supported_video_codecs: Vec::new(),
         supported_audio_codecs: Vec::new(),
+        supported_subtitle_codecs: Vec::new(),
         segment_length_secs: 2,
         wait_for_path: Some(wait_for.to_path_buf()),
         segment_container: Some(segment_container.to_owned()),

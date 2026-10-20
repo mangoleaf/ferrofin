@@ -288,6 +288,9 @@ struct HlsQuery {
     /// The negotiated subtitle delivery method name.
     #[serde(default)]
     subtitle_method: Option<String>,
+    /// The subtitle codecs an embedded subtitle may be written as (`subtitleCodec`).
+    #[serde(default)]
+    subtitle_codec: Option<String>,
     /// Whether the subtitle is burned into any transcoded video
     /// (`alwaysBurnInSubtitleWhenTranscoding`, default `false`).
     #[serde(default)]
@@ -418,6 +421,7 @@ fn build_request(
         min_segments: query.min_segments,
         subtitle_stream_index: query.subtitle_stream_index,
         subtitle_method: query.subtitle_method,
+        subtitle_codec: query.subtitle_codec,
         always_burn_in_subtitle_when_transcoding: query
             .always_burn_in_subtitle_when_transcoding
             .unwrap_or(false),
@@ -460,6 +464,9 @@ pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), 
         &request.segment_container,
         &request.video_codec,
         &request.audio_codec,
+        // `[RegularExpression(ContainerValidationRegexStr)]` on `subtitleCodec`
+        // too: its first entry is written into the ffmpeg command line.
+        &request.subtitle_codec,
     ]
     .into_iter()
     .flatten()
