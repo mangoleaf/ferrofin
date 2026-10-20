@@ -21,6 +21,7 @@ import sqlite3
 import sys
 import uuid
 
+from clean_value import repaired_clean_value
 from metadata import CheckError
 from watch_history import timestamp
 
@@ -33,7 +34,6 @@ TABLES = (
 )
 # Columns dropped before hashing, with the reason.
 IGNORED = {
-    "ItemValues": ("CleanValue",),  # 0031 re-derives keys that matched the previous derivation
     # Every authenticated request re-announces these, so they move on any device the harness
     # touches. The device's own identity (Id, token, activation, creation date) is kept and
     # compared below, so a reset token or a deactivated device fails.
@@ -45,6 +45,15 @@ IGNORED = {
 # date, as Jellyfin does. On every other device these are compared, so an adoption bug that
 # reset a token or deactivated a device — logging that client out — fails the check.
 REAUTH_VOLATILE = ("Id", "AccessToken", "IsActive", "DateCreated")
+# Columns re-derived from a sibling raw column, as {table: (derived, source)}. Migration 0031
+# and the boot repair repair_clean_values (the port of 12.0's RefreshCleanNamesAsync) rewrite
+# ItemValues.CleanValue to what repaired_clean_value(Value) yields, changing nearly every row of
+# a 10.11 source (an all-punctuation or whitespace-only Value derives to ''). A whole-row hash
+# would see every rewrite as a change, so the derived column is excluded from the hash and
+# checked on its own (compare()): the stored value must stay what it was or become what the
+# derivation yields, so a rewrite passes but a value NULLed or corrupted by adoption fails. The
+# derivation is ported in clean_value.py and proven against the Rust oracle.
+DERIVED = {"ItemValues": ("CleanValue", "Value")}
 # 0007 rewrites ISO 'T' timestamps to the space form; both spell one instant.
 TIMESTAMPS = {
     "ActivityLogs": ("DateCreated",),
@@ -53,8 +62,8 @@ TIMESTAMPS = {
     "Devices": ("DateCreated",),  # compared on devices the harness did not re-authenticate
 }
 # Bumped when the baseline's shape changes so a stale file is rejected, not mis-read. 2: rows
-# sharing a key became a list (multiset).
-SNAPSHOT_VERSION = 2
+# sharing a key became a list (multiset). 3: a re-derived column carries a `clean` map (DERIVED).
+SNAPSHOT_VERSION = 3
 KEYS = {"Devices": ("UserId", "DeviceId")}
 # Tables whose ItemId names a library item. The rehome repair re-keys a local alternate version
 # to the id its primary's type derives, as Jellyfin 12.2 does, so an item is identified by its
@@ -104,16 +113,23 @@ def identities(conn):
 
 
 def table_rows(conn, table, only=None, identity=None, users=None, reauthenticated=frozenset()):
-    """(columns, {key: sorted row hashes}) of one table, normalised; `only` limits the hashed
-    columns. Rows that share a key are kept as a multiset so losing one of them still fails."""
+    """(columns, {key: sorted row hashes}, {key: [stored, derived]}) of one table, normalised.
+
+    `only` limits the hashed columns. Rows that share a key are kept as a multiset so losing one
+    of them still fails. The third map carries a re-derived column (DERIVED) and the value its
+    source column derives to, so compare() can tell a rewrite from damage.
+    """
     info = list(conn.execute(f'PRAGMA table_info("{table}")'))
     if not info:
         raise CheckError(f"table {table} is missing")
+    present = {row[1] for row in info}
     columns = [row[1] for row in info if row[1] not in IGNORED.get(table, ()) and (only is None or row[1] in only)]
     keys = KEYS.get(table) or [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5]]
     if not keys:
         raise CheckError(f"table {table} has no primary key to name its rows by")
+    derived_col, source_col = DERIVED.get(table, (None, None))
     rows = {}
+    clean = {}
     for record in conn.execute(f'SELECT * FROM "{table}"'):
         if table in USER_OWNED and record["UserId"] is not None and normalize(record["UserId"]) not in users:
             continue
@@ -130,9 +146,15 @@ def table_rows(conn, table, only=None, identity=None, users=None, reauthenticate
                 row[name] = timestamp(row[name])
             except ValueError:
                 pass  # not a date: hashed as stored, so any change to it still shows
+        if derived_col in row:
+            # Still hashed (so a dropped column shows as lost) but as a constant, so a legitimate
+            # re-derivation is not a row change; its real check is in compare() via `clean`.
+            row[derived_col] = None
         key = "/".join(str(row[name]) for name in keys)
         rows.setdefault(key, []).append(digest(row))
-    return columns, {key: sorted(digests) for key, digests in rows.items()}
+        if derived_col in present and source_col in present:
+            clean[key] = [record[derived_col], repaired_clean_value(record[source_col])]
+    return columns, {key: sorted(digests) for key, digests in rows.items()}, clean
 
 
 def snapshot(db, baseline=None, reauthenticated=frozenset()):
@@ -146,7 +168,7 @@ def snapshot(db, baseline=None, reauthenticated=frozenset()):
         identity = identities(conn)
         users = {normalize(user) for (user,) in conn.execute('SELECT "Id" FROM "Users"')}
         return {"version": SNAPSHOT_VERSION, "tables": {
-            table: dict(zip(("columns", "rows"), table_rows(
+            table: dict(zip(("columns", "rows", "clean"), table_rows(
                 conn, table, baseline and baseline["tables"][table]["columns"], identity, users,
                 reauthenticated))) for table in TABLES}}
 
@@ -174,6 +196,15 @@ def compare(before, after):
                 if lost:
                     failures.append(
                         f"{table} row {key}: {sum(lost.values())} of {len(before_digests)} rows sharing its key gone or changed")
+        # A re-derived column (DERIVED): the stored value may stay as it was or become what the
+        # source derives to; anything else — a value NULLed or corrupted by adoption — is damage.
+        for key, (stored_before, _) in was.get("clean", {}).items():
+            after_clean = now.get("clean", {}).get(key)
+            if after_clean is None:
+                continue  # the row is gone or new: the row check above already covers it
+            stored_after, derived_after = after_clean
+            if stored_after != stored_before and stored_after != derived_after:
+                failures.append(f"{table} row {key} CleanValue changed")
     return failures
 
 
