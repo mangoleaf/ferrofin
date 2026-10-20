@@ -1,7 +1,8 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 12.2 and Ferrofin, on identical test data, on one host. Archived runs retain
+Jellyfin 12.2 and Ferrofin, on identical test data, on one host. It also holds the
+[release gate](#release-gate), which compares Ferrofin with its previous release. Archived runs retain
 their recorded labels and raw measurements. Re-rendering archived results applies the current
 validation rules: previously published cells can become flagged (including archived
 Ferrofin detail/playback responses missing `IsOriginal`/`LocalizedOriginal`). Review
@@ -32,7 +33,16 @@ printed: agreement is the absence of a range, not a claim about one.
 The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was not a
 reliable pass/fail test. Reports retain ranges for review instead.
 
-The benchmark reference is separate from the C# source-parity pin in `handlers/mod.rs`.
+The benchmark reference is the Jellyfin release named by the C# source-parity pin
+(`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
+in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
+Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
+fails, a release-gate session (`gate.py aa|ab`) refuses to start and `run.sh` warns and
+continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
+and digest. A run that boots Jellyfin also stops unless the pinned image reports the
+`UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
+Moving the pin means moving `UPSTREAM_TAG`, pinning that release's image and preparing the
+corpus again.
 The owner requested plugin checks and background scan suppression; the isolation
 policy below implements that request on disposable configurations.
 
@@ -372,3 +382,18 @@ anything that would compete for the chosen cores before a release run.
 For repeated comparisons, rotate order explicitly, for example
 `--servers jellyfin,ferrofin` followed by `--servers ferrofin,jellyfin`.
 Use the same phase selection and settings; affinity alone does not make a busy host quiet.
+
+## Release gate
+
+What blocks a release is the interleaved A/B gate in [`gate.py`](gate.py), not the
+Jellyfin comparison above. [`RELEASE.md`](../RELEASE.md) has the gate's command, wall
+time, threshold table and blocking rules. `gate.py ab PREVIOUS CANDIDATE` runs Ferrofin
+only: three adjacent pairs of `run.sh --servers ferrofin --only shape,unloaded,loaded`. It
+judges each cell regressed, within noise or improved against the thresholds in
+[`gate.toml`](gate.toml). `gate.py aa IMAGE` measures the noise floor those thresholds are
+re-derived from. The three-server runs with both Jellyfins are for publication: they produce
+the root README and `docs/BENCHMARKS.md` tables and never decide a release.
+
+Cold start is not part of the gate and keeps the definition above: a restart until the
+first authenticated `GET /UserViews` succeeds, measured in full runs and never replaced by an
+unauthenticated probe such as `/System/Ping`.
