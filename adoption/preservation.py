@@ -486,7 +486,11 @@ def run_matrix(root, image, only, port):
             orphans = watch_history.orphaned_items(conn) | set(seeds["orphans"])
         history = watch_history.snapshot(db, expected=True)
         accounts_before = user_accounts.database_snapshot(db)
-        tables_before = table_digests.snapshot(db)
+        # This runner logs back in from the fixture's own DeviceIds after the baseline, so
+        # those devices' tokens and ids are expected to change; every other device is held to
+        # its exact row. run.sh re-authenticates from none and so passes no exclusions.
+        reauth = table_digests.reauthenticated_devices(USERS, user_accounts.ACCOUNT_NAMES["passwordless"])
+        tables_before = table_digests.snapshot(db, reauthenticated=reauth)
         metadata_before = metadata.snapshot(db, expected=True)
         with server(image, work, root / "media", "synthetic-adoption", port, ferrofin=True) as api:
             api = api.login(USERS[0])
@@ -516,7 +520,8 @@ def run_matrix(root, image, only, port):
                         closing(metadata.connect(oracle_dir / "data/jellyfin.db")) as oracle_conn:
                     changed += seed_failures(conn, actual, seeds, state, oracle_conn, oracle)
                 changed += user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db))
-                changed += table_digests.compare(tables_before, table_digests.snapshot(db, tables_before))
+                changed += table_digests.compare(
+                    tables_before, table_digests.snapshot(db, tables_before, reauthenticated=reauth))
                 changed += list(watch_history.compare_db(history, watch_history.snapshot(db)))
                 changed += list(watch_history.compare_api(history, metadata.Api(api.base, db)))
                 changed += list(metadata.compare(metadata_before, metadata.snapshot(db), "database"))

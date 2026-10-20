@@ -479,7 +479,8 @@ EOS
   grep -qF 'table_digests.py" check' "$ADOPTION/run.sh"
   # metadata_check runs after adoption, after restart and after scan
   [ "$(grep -c '^  metadata_check "after' "$ADOPTION/run.sh")" -eq 3 ]
-  grep -qF 'table_digests.compare(tables_before, table_digests.snapshot(db, tables_before))' "$ADOPTION/preservation.py"
+  grep -qF 'changed += table_digests.compare(' "$ADOPTION/preservation.py"
+  grep -qF 'tables_before, table_digests.snapshot(db, tables_before, reauthenticated=reauth))' "$ADOPTION/preservation.py"
 }
 
 @test "populated upgrade: user state, boot checks and the runner's refusals" {
