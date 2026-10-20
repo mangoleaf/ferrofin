@@ -1511,8 +1511,9 @@ def comparable_levels(m, base):
 
 def load_gate(path=GATE_PATH):
     """The gate.toml thresholds: one row per kind of cell (`screens`, `endpoints`,
-    `memory`, `scan`, `ramp`), each `relative_pct` and `absolute` (in the cell's unit), and optional
-    per-cell bands under `[cells."<Cell.key>"]` from the A/A noise table."""
+    `memory`, `scan`, `ramp`), each `relative_pct` and `absolute` (in the cell's unit), plus
+    the soak's `max_slope_mib_per_hour` under `[soak]`, and optional per-cell bands under
+    `[cells."<Cell.key>"]` from the A/A noise table."""
     import tomllib  # Python 3.11+, needed only with a baseline
     try:
         with open(path, "rb") as f:

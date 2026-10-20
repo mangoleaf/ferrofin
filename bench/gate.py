@@ -38,7 +38,8 @@ candidate's runs exceeds the median of the previous release's by more than BOTH 
 of its row (relative and absolute) AND the candidate is slower in at least 2 of the 3
 adjacent pairs; improved is the mirror image; anything else is within noise. Only the
 unloaded and loaded levels gate, and an endpoint cell gates only when a median is 1 ms or
-more (B5); the rest is reported.
+more (B5); the rest is reported. The ramp ceiling is the same rule with higher being better,
+and the soak slope has its own limit rule (both described above).
 """
 
 import html
