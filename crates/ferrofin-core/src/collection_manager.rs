@@ -442,6 +442,47 @@ pub(crate) async fn new_playlist_folder_and_id(
     }
 }
 
+/// The folder C# `CollectionManager.CreateCollectionAsync` gives a new box set
+/// named `name`, `Path.Combine(collections, GetValidFilename(name) +
+/// " [boxset]")`, made if absent (`Directory.CreateDirectory`), and the id
+/// `Folder.AddChild` derives from it under `mode`.
+///
+/// Upstream reuses the folder, and so the id, of a box set already there by
+/// that name. Here a folder whose id a row already owns is passed over for
+/// `<name>1 [boxset]`, `<name>2 [boxset]`, …, so a second box set of the same
+/// name is a box set of its own.
+///
+/// # Errors
+/// The I/O error that kept the folder from being made, or a failed lookup.
+async fn new_box_set_folder_and_id(
+    db: &Database,
+    mode: &crate::item_type_lookup::IdDerivation,
+    collections: &str,
+    name: &str,
+) -> Result<(String, Uuid), ServiceError> {
+    let base = crate::item_type_lookup::get_valid_filename(name);
+    for attempt in 0_u32.. {
+        let folder = if attempt == 0 {
+            format!("{base} [boxset]")
+        } else {
+            format!("{base}{attempt} [boxset]")
+        };
+        let path = std::path::Path::new(collections)
+            .join(folder)
+            .to_string_lossy()
+            .into_owned();
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create the box set folder: {e}")))?;
+        let id = crate::item_type_lookup::derive_item_id_with(mode, BaseItemKind::BoxSet, &path)
+            .ok_or_else(|| ServiceError::backend("no stored type name for BoxSet"))?;
+        if !crate::item_persistence_service::row_exists(db, id).await? {
+            return Ok((path, id));
+        }
+    }
+    Err(ServiceError::backend("no free box set folder"))
+}
+
 /// Linked membership and local alternates are read in bounded batches rather
 /// than one SQLite round trip per movie in an unpaged plain-folder browse.
 async fn linked_children_for_parents(
@@ -572,16 +613,44 @@ impl CollectionManager for FerrofinCollectionManager {
         &self,
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
-        let id = Uuid::new_v4();
-        let row = crate::item_persistence_service::insert_named_item(
-            &self.db,
-            id,
-            BaseItemKind::BoxSet,
-            &options.name,
-            true,
-            collections_folder(&self.db, &self.paths).await?,
-        )
-        .await?;
+        let parent = collections_folder(&self.db, &self.paths).await?;
+        let (mode, _) = container_identity(&self.db, &self.paths).await?;
+        // `GetCollectionsFolderPath()`: `{data}/collections`.
+        let collections = format!("{}/collections", self.paths.data_path());
+        let (path, id) =
+            new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
+        // The row and its path commit together, so no box set is ever
+        // stored without the folder it was made with.
+        let written = async {
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            crate::item_persistence_service::insert_named_item_in(
+                &mut tx,
+                id,
+                BaseItemKind::BoxSet,
+                &options.name,
+                true,
+                parent,
+            )
+            .await?;
+            crate::item_persistence_service::set_item_path_in(&mut tx, id, &path)
+                .await
+                .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)
+        }
+        .await;
+        if let Err(err) = written {
+            // A folder with no row would come back as an empty box set on a
+            // Jellyfin rescan. `remove_dir` leaves a folder that has content.
+            if let Err(e) = tokio::fs::remove_dir(&path).await {
+                tracing::warn!(%e, path = %path, "could not remove an unused box set folder");
+            }
+            return Err(err);
+        }
+        let row = self
+            .library_manager
+            .get_item_by_id(id)
+            .await?
+            .ok_or_else(|| ServiceError::backend(format!("box set {id} vanished after create")))?;
         for item_id in &options.item_id_list {
             self.linked_children
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
@@ -2280,6 +2349,54 @@ mod tests {
             container.type_,
             crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
                 .expect("kind is known")
+        );
+    }
+
+    /// C# `CreateCollectionAsync` gives a new box set its own folder,
+    /// `{data}/collections/<GetValidFilename(name)> [boxset]`, stores it as
+    /// its `Path`, and `Folder.AddChild` derives its id from that path. A
+    /// second box set of the same name takes the next free folder instead of
+    /// the first one's id.
+    #[tokio::test]
+    async fn a_created_collection_gets_its_boxset_folder_and_path_derived_id() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths_in(tmp.path());
+        let mgr = FerrofinCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            Arc::clone(&paths),
+        );
+        let create = |name: &'static str| {
+            let mgr = mgr.clone();
+            async move {
+                mgr.create_collection(&CollectionCreationOptions {
+                    name: name.to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .expect("create")
+            }
+        };
+        let (mode, _) = super::container_identity(&db, &paths).await.expect("mode");
+        let collections = format!("{}/collections", paths.data_path());
+
+        // `GetValidFilename` turns the `:` into a space, trimming nothing.
+        let first = create("My: Collection").await;
+        let expected = format!("{collections}/My  Collection [boxset]");
+        assert_eq!(first.path.as_deref(), Some(expected.as_str()));
+        assert!(std::path::Path::new(&expected).is_dir());
+        assert_eq!(
+            Uuid::parse_str(&first.id).ok(),
+            crate::item_type_lookup::derive_item_id_with(&mode, BaseItemKind::BoxSet, &expected)
+        );
+
+        let second = create("My: Collection").await;
+        assert_ne!(second.id, first.id);
+        assert_eq!(
+            second.path.as_deref(),
+            Some(format!("{collections}/My  Collection1 [boxset]").as_str())
         );
     }
 

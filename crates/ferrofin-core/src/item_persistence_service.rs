@@ -189,7 +189,10 @@ async fn music_genre_row(
 /// the persisted row. Only the schema-required columns and the ones every save
 /// derives or stamps (keys, names, dates) are set; richer metadata is populated
 /// by later refreshes (mirrors how the C# path creates a stub item then
-/// refreshes it).
+/// refreshes it). Box sets and playlists are created through
+/// [`insert_named_item_in`] with their path in the same transaction; this is
+/// the tests' shortcut for a path-less row.
+#[cfg(test)]
 pub(crate) async fn insert_named_item(
     db: &Database,
     id: Uuid,
@@ -208,7 +211,7 @@ pub(crate) async fn insert_named_item(
         .map_err(db_err)
 }
 
-/// [`insert_named_item`]'s insert on a connection the caller holds, normally
+/// `insert_named_item`'s insert on a connection the caller holds, normally
 /// a writer transaction that commits the rest of the item with it.
 pub(crate) async fn insert_named_item_in(
     conn: &mut sqlx::SqliteConnection,
@@ -279,7 +282,7 @@ pub(crate) async fn insert_named_item_in(
     Ok(())
 }
 
-/// Renames the [`insert_named_item`] row `id` of `kind`, on a connection the
+/// Renames the `insert_named_item` row `id` of `kind`, on a connection the
 /// caller holds, the way a save after the C# `Name` setter does: `Name`, the
 /// `CleanName` the save derives (`BaseItemMapper.cs:279`), which is what a
 /// search by name matches, and the `SortName` the setter makes it re-derive
