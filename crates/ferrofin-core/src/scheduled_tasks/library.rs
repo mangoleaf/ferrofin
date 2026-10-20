@@ -654,15 +654,17 @@ impl ScheduledTask for ChapterImagesTask {
         // A set, and lowercased once: the lookup is per video, and a history
         // that has grown to thousands of entries turns a linear scan per video
         // into O(videos × history).
-        let mut failed: std::collections::BTreeSet<String> =
-            std::fs::read_to_string(&fail_history_path)
-                .map(|text| {
-                    text.split('|')
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_lowercase)
-                        .collect()
-                })
-                .unwrap_or_default();
+        // Lossy: the file is only ever appended to, so a key torn mid-write by
+        // a crash must cost that one key, not the whole history.
+        let mut failed: std::collections::BTreeSet<String> = std::fs::read(&fail_history_path)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .split('|')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // A blocklist this large is almost always the fingerprint of a past
         // systemic failure (an unwritable temp directory failing every
@@ -679,7 +681,6 @@ impl ScheduledTask for ChapterImagesTask {
         }
 
         let total = videos.len().max(1);
-        let mut history_dirty = false;
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -688,57 +689,49 @@ impl ScheduledTask for ChapterImagesTask {
             };
             let modified = crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
             let history_key = format!("{path}{modified}").to_lowercase();
-            let success = match self
+            // Source records extraction failures, not repository/service
+            // errors: those fail the run and blocklist nothing. Only an
+            // attempted extraction can fail, so a key is never appended twice.
+            let success = self
                 .refresh_video(video, !failed.contains(&history_key))
-                .await
-            {
-                Ok(success) => success,
-                Err(error) => {
-                    // Source records extraction failures, not repository/service
-                    // errors. Flush genuine failures already seen before failing.
-                    write_failure_history(&fail_history_path, &failed, history_dirty)?;
-                    return Err(error);
-                }
-            };
+                .await?;
             if !success {
+                append_failure_history(&fail_history_path, &history_key)?;
                 failed.insert(history_key);
-                history_dirty = true;
             }
         }
-        write_failure_history(&fail_history_path, &failed, history_dirty)?;
         progress.report(100.0);
         Ok(())
     }
 }
 
-/// Persists the chapter-image failure history, if the run added to it.
-///
-/// Written once per run rather than per failure: rewriting the whole file each
-/// time made a systemic failure quadratic in the history's own size.
-fn write_failure_history(
-    path: &Path,
-    failed: &std::collections::BTreeSet<String>,
-    dirty: bool,
-) -> Result<(), ServiceError> {
-    if dirty {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ServiceError::backend(format!(
-                    "cannot create chapter failure history directory `{}`: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        std::fs::write(path, failed.iter().cloned().collect::<Vec<_>>().join("|")).map_err(
-            |error| {
-                ServiceError::backend(format!(
-                    "cannot write chapter failure history `{}`: {error}",
-                    path.display()
-                ))
-            },
-        )?;
+/// Records one extraction failure in the chapter-image failure history as soon
+/// as it happens, as upstream does, so a run the scheduler stops (max runtime,
+/// dashboard Stop, shutdown: its future is dropped) keeps every failure it
+/// found. An append (`|key`, the `|`-separated format upstream reads) instead
+/// of upstream's whole-file rewrite: rewriting per failure made a systemic
+/// failure quadratic in the history's own size.
+fn append_failure_history(path: &Path, key: &str) -> Result<(), ServiceError> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ServiceError::backend(format!(
+                "cannot create chapter failure history directory `{}`: {error}",
+                parent.display()
+            ))
+        })?;
     }
-    Ok(())
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| write!(file, "|{key}"))
+        .map_err(|error| {
+            ServiceError::backend(format!(
+                "cannot write chapter failure history `{}`: {error}",
+                path.display()
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +1816,11 @@ mod tests {
         chapters: Mutex<Vec<ChapterInfo>>,
         fail_read: std::sync::atomic::AtomicBool,
         fail_save: std::sync::atomic::AtomicBool,
+        /// Reads past this many never return (a hung extraction), after
+        /// notifying `stalled`.
+        stall_after_reads: std::sync::atomic::AtomicUsize,
+        reads: std::sync::atomic::AtomicUsize,
+        stalled: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1851,6 +1849,15 @@ mod tests {
         async fn get_chapters(&self, _item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
             if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ServiceError::backend("temporary chapter read failure"));
+            }
+            let reads = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if reads
+                >= self
+                    .stall_after_reads
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.stalled.notify_one();
+                std::future::pending::<()>().await;
             }
             Ok(self.chapters.lock().expect("lock").clone())
         }
@@ -3037,25 +3044,45 @@ mod tests {
         Arc<FakeChapters>,
         ChapterImagesTask,
     ) {
+        chapter_task_fixture_for(fail_extract, &["film.mkv"]).await
+    }
+
+    /// [`chapter_task_fixture`] over one video per file name; returns the
+    /// first video's id.
+    async fn chapter_task_fixture_for(
+        fail_extract: bool,
+        files: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        Uuid,
+        Arc<FakeChapters>,
+        ChapterImagesTask,
+    ) {
         let db = test_db().await;
         let media = tempfile::tempdir().expect("tempdir");
         let library = library_manager_over(db.clone());
 
         let movie = Uuid::from_u128(0xC1);
-        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
-        set_media_type(&db, movie, "Video").await;
-        let path = media.path().join("film.mkv");
-        std::fs::write(&path, b"x").expect("write");
-        set_path(&db, movie, &path.to_string_lossy()).await;
-        let mut video = crate::test_support::fetch_item(&db, movie).await;
-        video.run_time_ticks = Some(1_800_000_000);
-        video.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
-        crate::test_support::save_item(&db, &video).await;
+        for (offset, file) in (0u128..).zip(files) {
+            let id = Uuid::from_u128(0xC1 + offset);
+            seed_named_item(&db, id, BaseItemKind::Movie, file).await;
+            set_media_type(&db, id, "Video").await;
+            let path = media.path().join(file);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+            let mut video = crate::test_support::fetch_item(&db, id).await;
+            video.run_time_ticks = Some(1_800_000_000);
+            video.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
+            crate::test_support::save_item(&db, &video).await;
+        }
 
         let chapters = Arc::new(FakeChapters {
             chapters: Mutex::new(vec![chapter_at(0), chapter_at(600_000_000)]),
             fail_read: std::sync::atomic::AtomicBool::new(false),
             fail_save: std::sync::atomic::AtomicBool::new(false),
+            stall_after_reads: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            stalled: tokio::sync::Notify::new(),
         });
         let streams = FakeStreams(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
@@ -3131,6 +3158,36 @@ mod tests {
                 .expect("history written");
         assert!(history.contains("film.mkv"));
         drop(media);
+    }
+
+    // The scheduler stops a run (4 h max runtime, dashboard Stop, shutdown) by
+    // aborting its future; a failure found before that must already be on
+    // disk, or the next run retries it — upstream writes it per failure.
+    #[tokio::test]
+    async fn a_failure_is_recorded_before_an_aborted_run_reaches_the_end() {
+        let (media, _movie, chapters, task) =
+            chapter_task_fixture_for(true, &["first.mkv", "second.mkv"]).await;
+        chapters
+            .stall_after_reads
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let run = tokio::spawn(async move { task.execute(&TaskProgress::default()).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            chapters.stalled.notified(),
+        )
+        .await
+        .expect("the second video's read stalls");
+        run.abort();
+        assert!(run.await.expect_err("aborted").is_cancelled());
+
+        let history =
+            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
+                .expect("history written before the abort");
+        assert_eq!(
+            history.split('|').filter(|key| !key.is_empty()).count(),
+            1,
+            "exactly the one video that failed before the abort: {history}"
+        );
     }
 
     #[tokio::test]
@@ -3263,18 +3320,32 @@ mod tests {
     }
 
     #[test]
-    fn failure_history_write_errors_are_reported_and_clean_runs_need_no_history_write() {
+    fn failure_history_appends_create_the_directory_and_report_write_errors() {
         let temp = tempfile::tempdir().unwrap();
         let history = temp.path().join("chapter-failures.txt");
         std::fs::create_dir(&history).unwrap();
-        let failures = std::collections::BTreeSet::from(["film.mkv123".to_owned()]);
-        assert!(write_failure_history(&history, &failures, false).is_ok());
-        let error = write_failure_history(&history, &failures, true)
+        let error = append_failure_history(&history, "film.mkv123")
             .expect_err("history I/O failure fails execution");
         assert!(error.to_string().contains("chapter-failures.txt"));
+
+        // An existing history (upstream's or an earlier run's) keeps its
+        // entries; each failure adds one `|`-separated key.
         let nested = temp.path().join("new-cache/chapter-failures.txt");
-        write_failure_history(&nested, &failures, true).unwrap();
-        assert_eq!(std::fs::read_to_string(nested).unwrap(), "film.mkv123");
+        append_failure_history(&nested, "film.mkv123").unwrap();
+        append_failure_history(&nested, "other.mkv456").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(nested).unwrap(),
+            "|film.mkv123|other.mkv456"
+        );
+        // A whole-file history (upstream's `Join('|')`, or this task's before
+        // it appended) keeps its entries.
+        let rewritten = temp.path().join("rewritten.txt");
+        std::fs::write(&rewritten, "a.mkv1|b.mkv2").unwrap();
+        append_failure_history(&rewritten, "c.mkv3").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rewritten).unwrap(),
+            "a.mkv1|b.mkv2|c.mkv3"
+        );
     }
 
     // The failure mode that cost a real library every chapter image: the
