@@ -20,7 +20,8 @@
         pair: the anon-memory slope in MiB/h per run, regressed when the candidate's exceeds the
         gate.toml `[soak]` limit and the previous release's does not (soak.py has the rule)
     gate.py render SESSION_DIR
-        rewrite a finished session's report.md and report.html from its run dirs
+        rewrite a finished session's report.md and report.html from its run dirs (an A/B
+        also rewrites each candidate run's ab-verdicts.json and report.html)
 
 Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
 latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
@@ -226,6 +227,20 @@ def blocking(rows):
     return sorted(k for k, r in rows.items() if r["gated"] and r["verdict"] in ("regressed", "not comparable"))
 
 
+def viewer_cells(rows):
+    """The gated cells in the shape the benchmark viewer reads from a run's `ab-verdicts.json`
+    (`report.load_verdicts`); a `not comparable` cell has no numbers, only its reason."""
+    out = []
+    for key, r in rows.items():
+        if r["gated"]:
+            cell = {"cell": key, "verdict": r["verdict"], "baseline": r.get("a_median"), "candidate": r.get("b_median"),
+                    "unit": r["unit"], "delta_pct": r.get("pct")}
+            if "reason" in r:
+                cell["reason"] = r["reason"]
+            out.append(cell)
+    return out
+
+
 # ── the driver ──────────────────────────────────────────────────────────────
 def schedule(mode, images, count):
     """`(run dir name, role, image)` in run order. A/A: one image `count` times; A/B: the
@@ -329,7 +344,9 @@ def soak_session(session, plan, gate):
 
 def render(session):
     """Compute the session's tables, write report.md, report.html and the machine-readable
-    noise.json (A/A) or verdict.json (A/B); returns the blocking cells."""
+    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B also gives
+    every candidate run the gated verdicts as `ab-verdicts.json` and rewrites its
+    report.html, which is how they reach the viewer (`report.py --serve`)."""
     plan = report.load(os.path.join(session, "gate.json"))
     if not plan:
         raise ValueError(f"{session} has no gate.json")
@@ -369,7 +386,7 @@ def render(session):
         result["kinds"] = kind_summary(result["noise"], gate)
         name, block = "noise.json", []
     else:
-        built, _ = models(session, plan)
+        built, by_role = models(session, plan)
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
@@ -380,6 +397,12 @@ def render(session):
         f.write(md)
     with open(os.path.join(session, "report.html"), "w") as f:
         f.write(render_html(plan, result))
+    if plan["mode"] == "ab":
+        cells = {"cells": viewer_cells(result["verdicts"])}
+        for run in by_role["b"]:
+            with open(os.path.join(run, "ab-verdicts.json"), "w") as f:
+                json.dump(cells, f, indent=2)
+            report.write_html(run)
     return md, block
 
 

@@ -431,7 +431,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json` |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab` or `ramp` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -442,12 +442,13 @@ on demand. The adoption and parity tabs list whatever `report.html` files those 
 their directory, and a tab with no runs says so and names the flag. Pick an A and a B of the same harness to see their reports side by side;
 runs of different harnesses are never compared. If a benchmark run directory holds an
 `ab-verdicts.json` (`{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
-"delta_pct"}]}`, `verdict` one of `regressed`, `within noise`, `improved`), its
+"delta_pct", "reason"}]}`, `verdict` one of `regressed`, `not comparable`, `within noise`,
+`improved`, and `reason` saying why a cell was not comparable), its
 `report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
-regressions first; a malformed file is an error, not an omitted section. When several runs are rendered together the
-file of the first run that has one is used. A `report.html` written
-before the file existed does not show it: whatever writes `ab-verdicts.json` reruns
-`report.py --html RUN_DIR`.
+the blocking ones first; a malformed file is an error, not an omitted section. When several runs are rendered together the
+file of the first run that has one is used. `gate.py ab` (and `gate.py render`) writes the
+session's gated cells into every candidate run and rewrites that run's `report.html`, since a
+`report.html` written before the file existed does not show it.
 
 On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the
