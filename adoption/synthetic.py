@@ -22,7 +22,8 @@ import subprocess
 import sys
 
 from metadata import CheckError
-from synthetic_fixture import Api, USERS, drop_dangling_chain, seed, seed_database, wait_for_live_members
+from synthetic_fixture import (Api, SEEDED_ONLY, USERS, drop_dangling_chain, require_populated, seed,
+                               seed_database, wait_for_live_members)
 from synthetic_media import generate
 
 
@@ -128,7 +129,10 @@ def build(root, only, port):
                     api.scan(300, interval=1)
             else:
                 manifest = seed(api.base)
-                wait_for_live_members(config / "data/jellyfin.db", manifest)
+                # Only seed_database reads the live members, from 10.11's LinkedChildren JSON;
+                # 12.2 keeps them in their own table, where this wait would never see them.
+                if name not in FRESH_INSTALL:
+                    wait_for_live_members(config / "data/jellyfin.db", manifest)
                 api = api.login(USERS[0])
             save(config / "synthetic.json", manifest)
             # Added by the preservation checker; a source-version baseline is
@@ -158,6 +162,7 @@ def build(root, only, port):
                     raise CheckError(f"Jellyfin 12.2 left the dangling chain as {state['orphans']}, "
                                      f"history {state['history']}; the run's expectation is wrong")
             save(config / "seeds.json", state)
+        require_populated(config / "data/jellyfin.db", SEEDED_ONLY if name in FRESH_INSTALL else ())
         save(config / "synthetic-ready.json", {"fixture": name, "version": version, "recipe": recipe()})
         print(name + " built and validated", flush=True)
 
