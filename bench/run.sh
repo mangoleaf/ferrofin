@@ -492,5 +492,6 @@ for s in ${SERVERS//,/ }; do
   (( status == 0 )) || rc=1
 done
 python3 bench/report.py "$OUT" > "$OUT/report.md" || rc=1
-echo "report: $OUT/report.md  —  compare in the browser: python3 bench/report.py --serve"
+python3 bench/report.py --html "$OUT" > /dev/null || rc=1
+echo "report: $OUT/report.md, $OUT/report.html  —  compare in the browser: python3 bench/report.py --serve"
 exit "$rc"
