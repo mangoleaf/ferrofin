@@ -2508,8 +2508,9 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// repairs that re-key items after [`run_all`] (`run_rehome_local_versions`
 /// and `run_rekey_virtual_seasons`, called from
 /// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
-/// Keeping keys in agreement at save time is a separate work item (parity
-/// review A6).
+/// Every save brings them back into agreement, as upstream's
+/// `SaveUserData` does (`FerrofinUserDataManager::upsert_row`); keeping a fold itself
+/// in agreement is open work item gl-714.
 ///
 /// Returns the number of rows updated, and logs one summary when it
 /// changed something.

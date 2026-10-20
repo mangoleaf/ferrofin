@@ -1122,10 +1122,9 @@ impl FerrofinLiveTvManager {
     /// A listings provider's own channel list.
     ///
     /// Port of `XmlTvListingsProvider.GetChannels`: the guide document's
-    /// `<channel>` elements, with the number falling back to the id when the
-    /// document carries none (Ferrofin's XMLTV reader parses no channel number,
-    /// so that fallback always applies) — the fallback matters because it is
-    /// what feeds the by-number arm of the match ladder.
+    /// `<channel>` elements, numbered from their display-names and falling
+    /// back to the id when none is numeric ([`crate::xmltv::XmltvChannel::listings_number`]).
+    /// The number feeds the by-number arm of the match ladder.
     async fn provider_channels(
         &self,
         info: &ListingsProviderInfo,
@@ -1143,7 +1142,7 @@ impl FerrofinLiveTvManager {
             .channels
             .into_iter()
             .map(|c| EpgChannel {
-                number: c.id.clone(),
+                number: c.listings_number().to_owned(),
                 id: c.id,
                 name: c.display_name,
             })
@@ -1287,7 +1286,7 @@ impl FerrofinLiveTvManager {
             .channels
             .iter()
             .map(|c| EpgChannel {
-                number: c.id.clone(),
+                number: c.listings_number().to_owned(),
                 id: c.id.clone(),
                 name: c.display_name.clone(),
             })
@@ -9860,6 +9859,52 @@ mod tests {
         assert_eq!(
             mgr.get_channel_mapping_options(&provider_id).await.is_err(),
             unreadable
+        );
+    }
+
+    /// `ListingsManager.GetEpgChannelFromTunerChannel`'s number arm: a tuner
+    /// channel numbered `4.1` binds to the guide channel whose display-names
+    /// carry `4.1`, though its id (`I4.1.12345.zap2it.com`) and name differ.
+    #[tokio::test]
+    async fn a_tuner_channel_binds_to_the_guide_by_display_name_number() {
+        let mut sources = HashMap::new();
+        sources.insert(
+            "http://tuner/playlist.m3u".to_owned(),
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"nomatch\" tvg-chno=\"4.1\",WNBC-HD\nhttp://tuner/wnbc\n"
+                .to_owned(),
+        );
+        sources.insert(
+            "http://guide/xmltv.xml".to_owned(),
+            dated(
+                "<tv><channel id=\"I4.1.12345.zap2it.com\">\
+                 <display-name>4.1 WNBC</display-name><display-name>4.1</display-name>\
+                 <display-name>WNBC</display-name></channel>\
+                 <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" \
+                 channel=\"I4.1.12345.zap2it.com\"><title>Today</title></programme></tv>",
+            ),
+        );
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1,
+            "the airing binds to the tuner channel by number"
         );
     }
 
