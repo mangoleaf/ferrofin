@@ -810,13 +810,20 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
 /// Owner decisions: Jellyfin 12 (10.12 in all but name) is the source of truth,
 /// and where 10.11.8 differs from it, 10.11.8 is the one that is wrong
 /// (2026-09-02). The pin is always the **latest Jellyfin release**, never a
-/// release candidate: when a newer one ships, move this tag and commit to it and
-/// list every row not already listed in [`VERIFIED_AGAINST_EARLIER_PIN`] under
-/// the old tag (2026-10-16). The vendored OpenAPI contract stays 10.11.8: that is
-/// the API clients speak, even though Jellyfin 12 dropped operations from it.
+/// release candidate: when a newer one ships, move this tag and the commit to
+/// it, set [`UPSTREAM_PIN_DATE`] to that day, and list every row not already
+/// listed in [`VERIFIED_AGAINST_EARLIER_PIN`] (or, for a subsystem row,
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`]) under the old tag (2026-10-16).
+/// The vendored OpenAPI contract stays 10.11.8: that is the API clients speak,
+/// even though Jellyfin 12 dropped operations from it.
 pub const UPSTREAM_TAG: &str = "v12.2";
 /// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
 pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
+/// The day [`UPSTREAM_TAG`] became the pin, `YYYY-MM-DD`; move it with the tag.
+/// A row dated on or after it was compared against [`UPSTREAM_TAG`], so it can
+/// never be listed in [`VERIFIED_AGAINST_EARLIER_PIN`] or
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`].
+pub const UPSTREAM_PIN_DATE: &str = "2026-10-16";
 
 /// [`VERIFIED`] rows last compared against an earlier pin, as
 /// `(method, path, tag compared against)`. They are completed verification work,
@@ -824,6 +831,49 @@ pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
 /// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
 /// from this list. `v12.0-rc7` is commit `4910aafa1a`.
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[];
+
+/// [`VERIFIED_SUBSYSTEMS`] rows last compared against an earlier pin, as
+/// `(key, tag compared against)` — the same rules as
+/// [`VERIFIED_AGAINST_EARLIER_PIN`].
+pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
+
+/// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
+/// operation crosses several of them, so one row states their divergences once
+/// and operation rows name it in [`Verified::refs`].
+pub const SUBSYSTEM_KEYS: &[&str] = &[
+    "query-translation",
+    "dto-fields",
+    "user-data",
+    "access-filtering",
+    "images",
+    "paging-sort",
+];
+
+/// One shared subsystem whose Ferrofin implementation was compared against the
+/// upstream Jellyfin C# — see [`VERIFIED_SUBSYSTEMS`].
+#[derive(Debug)]
+pub struct VerifiedSubsystem {
+    /// One of [`SUBSYSTEM_KEYS`], unique in [`VERIFIED_SUBSYSTEMS`].
+    pub key: &'static str,
+    /// The C# file compared, relative to the upstream repository root —
+    /// `"Jellyfin.Server.Implementations/Item/BaseItemRepository.cs"`.
+    pub upstream_file: &'static str,
+    /// The method in that file the comparison centres on — `"TranslateQuery"`.
+    pub upstream_method: &'static str,
+    /// The Ferrofin code path compared, for the next reader.
+    pub ferrofin: &'static str,
+    /// Date of the comparison, `YYYY-MM-DD`.
+    pub date: &'static str,
+    /// Accepted divergences, one sentence each, under the same rules as
+    /// [`Verified::divergences`].
+    pub divergences: &'static [&'static str],
+}
+
+/// **Per-subsystem parity rows.** A row exists only once its subsystem was
+/// compared against the upstream C# at [`UPSTREAM_TAG`] (or the earlier tag
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
+/// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
+pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -849,6 +899,9 @@ pub struct Verified {
     /// written. An entry with divergences still counts as verified — the text
     /// is the published statement of what is *not* done.
     pub divergences: &'static [&'static str],
+    /// Keys of the [`VERIFIED_SUBSYSTEMS`] rows this operation relies on, whose
+    /// divergences apply here too and are not repeated in `divergences`.
+    pub refs: &'static [&'static str],
 }
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
@@ -868,7 +921,11 @@ pub struct Verified {
 /// - `tests/contract_superset.rs` checks every row is a [`REAL_ROUTES`]
 ///   operation with a well-formed `upstream_file`/`upstream_method`/`date`,
 ///   checks every [`VERIFIED_AGAINST_EARLIER_PIN`] entry is a distinct row with
-///   a tag other than [`UPSTREAM_TAG`], and prints `N / 412 operations
+///   a tag other than [`UPSTREAM_TAG`] dated before [`UPSTREAM_PIN_DATE`],
+///   checks every `refs` key names a [`VERIFIED_SUBSYSTEMS`] row (which obey
+///   the same rules), and — with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin
+///   checkout at [`UPSTREAM_COMMIT`] — checks each row's `upstream_file`
+///   exists there and contains `upstream_method`, and prints `N / 412 operations
 ///   deep-verified against <UPSTREAM_TAG>, plus M compared against an earlier
 ///   release` plus the per-controller table — that printout is the README
 ///   parity section. N moves when a row is written or re-checked, and when the
@@ -895,6 +952,7 @@ pub const VERIFIED: &[Verified] = &[
             VERSION_RESUME_DATA_DIVERGENCE,
             USER_DATA_RETIRED_KEYS_DIVERGENCE,
         ],
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -906,6 +964,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -916,6 +975,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -927,6 +987,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -937,6 +998,7 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -947,6 +1009,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_studios (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -958,6 +1021,7 @@ pub const VERIFIED: &[Verified] = &[
                push_order_expression DatePlayed)",
         date: "2026-10-19",
         divergences: RESUME_DIVERGENCES,
+        refs: &[],
     },
 ];
 
