@@ -72,6 +72,31 @@ adoption_check_db() {
   fi
 }
 
+# adoption_check_messy <jellyfin.db> <fixture copy>: one reason per line for each messy shape
+# (messy.py) whose end state is not what Jellyfin 12.2 left it, or the divergence written down for
+# it. A checker that cannot run is a reason too, never a pass.
+adoption_check_messy() {
+  local out rc=0
+  out=$(python3 "$(dirname "${BASH_SOURCE[0]}")/messy.py" check "$1" "$2" 2>&1) || rc=$?
+  case $rc in
+    0) ;;
+    1) printf '%s\n' "$out" | sed 's/^/messy: /';;
+    *) echo "messy: the checker failed: $(printf '%s' "$out" | head -n 1)";;
+  esac
+}
+
+# adoption_check_tables <jellyfin.db> <baseline.json> [log]: one line when a row of a table
+# table_digests.py covers is gone or changed since the baseline (the count and the first
+# difference; every difference goes to [log] when given); a checker that cannot run is a reason too.
+adoption_check_tables() {
+  local out rc=0
+  out=$(python3 "$(dirname "${BASH_SOURCE[0]}")/table_digests.py" check "$1" "$2" 2>&1) || rc=$?
+  [ "$rc" = 0 ] && return 0
+  [ -z "${3:-}" ] || printf '%s\n' "$out" > "$3"
+  printf 'tables: %s difference(s), first: %s%s\n' "$(printf '%s\n' "$out" | wc -l)" "$(printf '%s\n' "$out" | head -n 1)" \
+    "${3:+; all in $3}"
+}
+
 # adoption_second_boot_repairs <log-since-restart>: the first repair line a second boot logged,
 # or nothing. Ignore a repair only when all its numeric counters are zero;
 # alternate-version repairs can promote items even when "repaired" is zero.

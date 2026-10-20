@@ -14,7 +14,11 @@
 //! - `create_items`/`update_items` collapse to `save_items` on the persistence
 //!   service (the row upsert is idempotent); the `parent_id` argument is accepted
 //!   for API parity but the parent linkage is already carried on each row's
-//!   `ParentId` column.
+//!   `ParentId` column. `update_items` is the edit's save, so first it does
+//!   what `UpdateItemsAsync` and the mapper do to a loaded item: it re-derives
+//!   `SortName` (a caller that must keep a key it supplies saves through the
+//!   persistence service instead), re-scores the parental rating and re-indexes
+//!   the item values.
 //! - `delete_item` honors [`DeleteOptions`] in upstream's order: a primary
 //!   video's versions first (a missing one deleted, the first remaining one
 //!   promoted in its place) or an alternate version's references moved to
@@ -540,6 +544,15 @@ impl ScanRequest {
             && (whole_libraries || self.ancestors == other.ancestors)
     }
 
+    /// Whether this is a full library validation — upstream's
+    /// `ValidateMediaLibraryInternal`, the span its `IsScanRunning` covers:
+    /// every library, with the library's closing passes. A refresh of the
+    /// root folder over the API covers every library too, but it is
+    /// `ProviderManager.RefreshItem` upstream, not a validation.
+    fn is_library_validation(&self) -> bool {
+        self.scope == ScanTarget::All && self.passes == ScanPasses::Library
+    }
+
     /// Whether two requests refresh alike, so that one may cover the other.
     fn refreshes_like(&self, other: &Self) -> bool {
         self.options == other.options
@@ -608,6 +621,9 @@ struct RunningScan {
     waiters: Waiters,
     /// Stops it between two items once nobody wants it any more.
     cancel: ScanCancel,
+    /// It is a full library validation ([`ScanRequest::is_library_validation`]),
+    /// what `is_scan_running` reports.
+    validation: bool,
 }
 
 /// How a scan a caller waited for ended.
@@ -956,6 +972,7 @@ impl ScanWorker {
                     queue.running = Some(RunningScan {
                         waiters: pending.waiters,
                         cancel: cancel.clone(),
+                        validation: pending.request.is_library_validation(),
                     });
                     Some((pending.request, cancel, waited))
                 } else {
@@ -1978,7 +1995,7 @@ impl FerrofinLibraryManager {
 
     /// Attaches a scan stand-in in place of the filesystem scanner.
     #[cfg(test)]
-    fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
+    pub(crate) fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
         self.scanner = Some(runner);
         self
     }
@@ -2812,6 +2829,15 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(());
         }
         let mut rated = items.to_vec();
+        // C# re-derives `SortName` on every save of a loaded item: the mapper
+        // sets `ForcedSortName` after `SortName` (`BaseItemMapper.cs:94-95`),
+        // and that setter, like `Name`'s, nulls the cached key, so the save
+        // reads the getter (`BaseItem.cs:540-561`). An edit of the name, the
+        // sort title or an episode number re-keys the row; keeping the stored
+        // key left it sorting and filtering under the old one.
+        for item in &mut rated {
+            settle_saved_sort_name(item);
+        }
         if let Some(visibility) = &self.visibility {
             visibility.update_rating_scores(&mut rated).await?;
         }
@@ -3310,6 +3336,13 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
+    fn is_scan_running(&self) -> bool {
+        lock_queue(&self.scan_queue)
+            .running
+            .as_ref()
+            .is_some_and(|running| running.validation)
+    }
+
     async fn shutdown_scans(&self) {
         let mut progress = self.scan_progress.subscribe();
         {
@@ -3542,6 +3575,33 @@ fn box_set_sort_by(stored: Option<&str>) -> ferrofin_model::live_tv::ItemSortBy 
     by_name
         .or(by_number)
         .map_or(ItemSortBy::PremiereDate, ItemSortBy::from_json_value)
+}
+
+/// The `SortName` the C# getter reads on a save: from `ForcedSortName` when
+/// one is set, else the per-kind `CreateSortName()`
+/// ([`ferrofin_providers::metadata_merge::settle_sort_name`]).
+///
+/// A `LiveTvChannel` without a sort title keeps its stored key: its
+/// `CreateSortName` starts with the channel number, which lives in the live TV
+/// store and not on the row, and the guide refresh re-derives that key. So
+/// clearing a channel's sort title keeps the key it gave until that refresh.
+/// TODO(parity, open work item — NOT an accepted divergence): read the number
+/// from `FerrofinLiveTvChannels` and key the row with the live TV crate's
+/// `channel_sort_name`, so an edit re-keys a channel at once as upstream's does.
+///
+/// Unlike [`crate::kinds::saved_sort_name`], this applies the per-kind
+/// `CreateSortName` overrides (episode, season, track numbers).
+fn settle_saved_sort_name(item: &mut BaseItemEntity) {
+    let forced = item
+        .forced_sort_name
+        .as_deref()
+        .is_some_and(|f| !f.is_empty());
+    if !forced
+        && BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::LiveTvChannel)
+    {
+        return;
+    }
+    ferrofin_providers::metadata_merge::settle_sort_name(item);
 }
 
 #[cfg(test)]
@@ -3800,6 +3860,54 @@ mod tests {
         runner.release(2 * GatedRunner::ITEMS);
         waiter.await.expect("joined");
         assert_eq!(runner.runs().len(), 3, "the queued run scanned");
+        until_idle(&mgr).await;
+    }
+
+    /// `is_scan_running` is upstream's `IsScanRunning`: it holds for the whole
+    /// of a full library validation and for nothing that never enters
+    /// `ValidateMediaLibraryInternal` — one library's scan, the library
+    /// monitor's changed paths, a refresh of every library over the API.
+    #[tokio::test]
+    async fn only_a_full_library_validation_reports_the_scan_running() {
+        use crate::library_monitor::LibraryScanTrigger as _;
+
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        assert!(!mgr.is_scan_running(), "nothing is running");
+
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        assert!(
+            mgr.is_scan_running(),
+            "a full library validation is running"
+        );
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert!(!mgr.is_scan_running(), "the validation finished");
+
+        mgr.queue_library_scan_scoped(Uuid::new_v4())
+            .await
+            .expect("queued");
+        runner.started(2).await;
+        assert!(!mgr.is_scan_running(), "one library's scan");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+
+        mgr.queue_scan_paths(vec!["/m/a.mkv".to_owned()], ScanTrigger::Watcher)
+            .await
+            .expect("queued");
+        runner.started(3).await;
+        assert!(!mgr.is_scan_running(), "the library monitor's scan");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+
+        mgr.queue_refresh_scan(ScanTarget::All, &MetadataRefreshOptions::default())
+            .await
+            .expect("queued");
+        runner.started(4).await;
+        assert!(!mgr.is_scan_running(), "a refresh of every library");
+        runner.release(GatedRunner::ITEMS);
         until_idle(&mgr).await;
     }
 
@@ -4866,6 +4974,7 @@ mod tests {
             running: Some(RunningScan {
                 waiters: Waiters { tickets, detached },
                 cancel: ScanCancel::new(),
+                validation: true,
             }),
             ..ScanQueue::default()
         };
@@ -5265,6 +5374,96 @@ mod tests {
             .expect("facets");
         assert_eq!(facets.genres, vec!["Sci-Fi".to_owned()]);
         assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
+    }
+
+    /// C# re-derives `SortName` on every save of a loaded item: the mapper
+    /// sets `ForcedSortName` after `SortName`, and that setter (like `Name`'s)
+    /// nulls the cached key, so the save reads it back from `ForcedSortName` or
+    /// the per-kind `CreateSortName()`. A metadata edit of the name, the sort
+    /// title or an episode number therefore re-keys the row.
+    #[tokio::test]
+    async fn update_items_rederives_the_sort_name() {
+        async fn stored(db: &Database, id: Uuid) -> Option<String> {
+            crate::test_support::fetch_item(db, id).await.sort_name
+        }
+        /// Stores `key` as the row's `SortName` through the repository save,
+        /// which keeps a key the caller supplies (the scanner's path).
+        async fn keyed(db: &Database, id: Uuid, key: &str) {
+            let mut row = crate::test_support::fetch_item(db, id).await;
+            row.sort_name = Some(key.to_owned());
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(std::slice::from_ref(&row))
+                .await
+                .expect("stored key");
+        }
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let edit = |id: Uuid, change: fn(&mut BaseItemEntity)| {
+            let mgr = &mgr;
+            async move {
+                let mut row = mgr.get_item_by_id(id).await.expect("read").expect("row");
+                change(&mut row);
+                mgr.update_items(std::slice::from_ref(&row), None)
+                    .await
+                    .expect("update");
+            }
+        };
+
+        let movie = Uuid::from_u128(0x7C);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Solaris").await;
+        keyed(&db, movie, "solaris").await;
+        edit(movie, |row| row.name = Some("The Matrix".to_owned())).await;
+        assert_eq!(stored(&db, movie).await.as_deref(), Some("matrix"));
+        edit(movie, |row| row.forced_sort_name = Some("Zed".to_owned())).await;
+        assert_eq!(stored(&db, movie).await.as_deref(), Some("zed"));
+        edit(movie, |row| row.forced_sort_name = None).await;
+        assert_eq!(stored(&db, movie).await.as_deref(), Some("matrix"));
+
+        // `Episode.CreateSortName`: the season and episode numbers lead, so a
+        // renumbered episode leaves its old position.
+        let episode = Uuid::from_u128(0x7D);
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
+        keyed(&db, episode, "001 - 0003 - Pilot").await;
+        edit(episode, |row| {
+            row.parent_index_number = Some(1);
+            row.index_number = Some(4);
+        })
+        .await;
+        assert_eq!(
+            stored(&db, episode).await.as_deref(),
+            Some("001 - 0004 - Pilot")
+        );
+
+        // A person sorts by the name as given, a sort title included.
+        let person = Uuid::from_u128(0x7F);
+        seed_named_item(&db, person, BaseItemKind::Person, "Alice Parity").await;
+        edit(person, |row| {
+            row.forced_sort_name = Some("Parity, Alice".to_owned());
+        })
+        .await;
+        assert_eq!(stored(&db, person).await.as_deref(), Some("Parity, Alice"));
+        edit(person, |row| row.forced_sort_name = None).await;
+        assert_eq!(stored(&db, person).await.as_deref(), Some("Alice Parity"));
+
+        // A channel's derived key needs its number, which the live TV store
+        // holds and the row does not: the stored key is kept (the guide
+        // refresh re-derives it). A sort title needs no number.
+        let channel = Uuid::from_u128(0x7E);
+        seed_named_item(&db, channel, BaseItemKind::LiveTvChannel, "One").await;
+        keyed(&db, channel, "0000000001.00000-One").await;
+        edit(channel, |row| row.name = Some("Uno".to_owned())).await;
+        assert_eq!(
+            stored(&db, channel).await.as_deref(),
+            Some("0000000001.00000-One")
+        );
+        edit(channel, |row| row.forced_sort_name = Some("Zed".to_owned())).await;
+        assert_eq!(stored(&db, channel).await.as_deref(), Some("zed"));
+        edit(channel, |row| row.forced_sort_name = None).await;
+        assert_eq!(
+            stored(&db, channel).await.as_deref(),
+            Some("zed"),
+            "kept until the guide refresh re-derives it"
+        );
     }
 
     /// The metadata editor's external ids reach the `BaseItemProviders` table and

@@ -411,6 +411,16 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             .map_err(|e| ServiceError::backend(format!("database snapshot: {e}")))
     }
 
+    async fn free_space_of(&self, path: &std::path::Path) -> i64 {
+        // `statvfs` (and the mount-table read) can block on a stalled network
+        // filesystem, so it stays off the runtime's workers.
+        let probe = Arc::clone(&self.storage_probe);
+        let path = path.to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || probe.probe(&path).free_space)
+            .await
+            .unwrap_or(-1)
+    }
+
     async fn get_system_storage_info(&self) -> Result<SystemStorageInfo, ServiceError> {
         // Every folder goes through one `probe_all` pass so the real probe reads
         // the mount table once per request rather than once per folder.
@@ -616,6 +626,16 @@ mod tests {
         assert_eq!(storage.cache_folder.used_space, 50);
         assert!(storage.libraries.is_empty());
         assert!(storage.transcoding_temp_folder.path.ends_with("transcodes"));
+    }
+
+    /// The backup's free-space check reads the storage probe's free space.
+    #[tokio::test]
+    async fn free_space_of_reports_the_probed_free_space() {
+        let (mgr, _) = build().await;
+        assert_eq!(
+            mgr.free_space_of(std::path::Path::new("/backups")).await,
+            100
+        );
     }
 
     #[tokio::test]

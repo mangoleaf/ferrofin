@@ -37,7 +37,7 @@ The benchmark reference is the Jellyfin release named by the C# source-parity pi
 (`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
 in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
 Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab|scan|ramp`) refuses to start and `run.sh` warns and
+fails, a release-gate session (`gate.py aa|ab|scan|ramp|soak`) refuses to start and `run.sh` warns and
 continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
 and digest. A run that boots Jellyfin also stops unless the pinned image reports the
 `UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
@@ -325,6 +325,45 @@ to be re-derived after the first two ramps. The ramp pushes the shared host hard
 other phase: `run.sh` still refuses to start unless the server and client cores are idle,
 and a run that fails stops the session.
 
+## Memory soak
+
+`run.sh --servers ferrofin --only soak` (opt-in: no default run includes it, and it refuses
+Jellyfin) holds the loaded mix at `RATE_SOAK` (5 screens/s) for `SOAK_S` (3600 s, one hour)
+while the cgroup sampler records anon memory every `MEM_SAMPLE_MS`. It drains, discards the
+usual `WARMUP_S` warm-up, checks isolation before and after like the other levels, and
+then runs the usual 60 s steady window. A two-minute window cannot see a leak of a few MiB
+an hour, and steady anon memory has drifted by that much between releases without any gate
+noticing.
+
+The **soak slope** is the least-squares line through the anon samples of the hour after its
+first `SOAK_SKIP_S` seconds (600), in MiB per hour: heap growth in the first minutes is
+warm-up, not a leak. The phase writes `soak-params.json` and, once the sampler has stopped,
+`soak.json` (the slope, the samples it was fitted on, the fit window and the peak); the
+run's `report.html` gets a "Memory soak" section. The client timeout is extended by
+`SOAK_S` for this level only. Like every window, the soak's sampler coverage is checked
+(a gap of more than five sample intervals fails the run), and over an hour that is a
+stricter test of the sampler than the two-minute windows are; a run that fails is reported
+and never retried. The decisions live in `soak.py` and are unit-tested in
+`test_soak.py`.
+
+The release gate soaks the previous release and then the candidate back to back (one pair
+by default; the cost is two hours of a quiet host):
+
+```bash
+python3 bench/gate.py soak ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+```
+
+The cell is `soak/slope`, judged by the `[soak]` row of [`gate.toml`](gate.toml): the
+candidate **regressed** when its slope exceeds `max_slope_mib_per_hour` (20) and the previous
+release's does not, **improved** when it is the other way round, and *within noise* in every
+other case, so a candidate that leaks faster than a previous release that already leaked
+is not a new problem (both numbers are in the table). With more than one pair each side's
+median slope is used. A soak that left no slope cannot be judged and blocks like a
+regression. The 20 MiB/h limit and the 600 s skip are starting values, to be re-derived
+after the first two soaks. Memory is compared only between runs in one window: transparent
+huge pages shift anon memory by about 50 MiB between time windows, which is why the pair runs
+back to back.
+
 ## Running it
 
 The reporter has a fast correctness check, also run in CI:
@@ -332,6 +371,7 @@ The reporter has a fast correctness check, also run in CI:
 ```sh
 python3 -m unittest discover -s bench -p test_report.py
 python3 -m unittest discover -s bench -p test_ramp.py
+python3 -m unittest discover -s bench -p test_soak.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.
@@ -391,7 +431,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json` |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab` or `ramp` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -402,12 +442,13 @@ on demand. The adoption and parity tabs list whatever `report.html` files those 
 their directory, and a tab with no runs says so and names the flag. Pick an A and a B of the same harness to see their reports side by side;
 runs of different harnesses are never compared. If a benchmark run directory holds an
 `ab-verdicts.json` (`{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
-"delta_pct"}]}`, `verdict` one of `regressed`, `within noise`, `improved`), its
+"delta_pct", "reason"}]}`, `verdict` one of `regressed`, `not comparable`, `within noise`,
+`improved`, and `reason` saying why a cell was not comparable), its
 `report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
-regressions first; a malformed file is an error, not an omitted section. When several runs are rendered together the
-file of the first run that has one is used. A `report.html` written
-before the file existed does not show it: whatever writes `ab-verdicts.json` reruns
-`report.py --html RUN_DIR`.
+the blocking ones first; a malformed file is an error, not an omitted section. When several runs are rendered together the
+file of the first run that has one is used. `gate.py ab` (and `gate.py render`) writes the
+session's gated cells into every candidate run and rewrites that run's `report.html`, since a
+`report.html` written before the file existed does not show it.
 
 On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the

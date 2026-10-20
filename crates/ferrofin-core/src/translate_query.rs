@@ -553,12 +553,18 @@ fn append_inherited_tags(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQu
                 qb.push(")");
             }
         }
+        // `ItemsBelowTaggedAncestor` (v12.2): the items below a tagged
+        // ancestor as one uncorrelated set read by `ParentItemId`, built once
+        // and probed per row. A correlated `EXISTS` seeks `(ItemId,
+        // ParentItemId)` for every tagged id on every row. `AncestorIds.ItemId`
+        // is `NOT NULL`, so `NOT IN` is exact.
         qb.push(join)
-            .push(if blocked { "NOT EXISTS (" } else { "EXISTS (" });
-        qb.push(format!(
-            r#"SELECT 1 FROM "AncestorIds" tag_parent
-            WHERE tag_parent."ItemId" = {alias}."Id" AND tag_parent."ParentItemId" IN ("#
-        ));
+            .push(format!(r#"{alias}."Id""#))
+            .push(membership)
+            .push(
+                r#"SELECT tag_parent."ItemId" FROM "AncestorIds" tag_parent
+            WHERE tag_parent."ParentItemId" IN ("#,
+            );
         append_tagged_item_ids(qb, &tags);
         qb.push("))");
         if !blocked {
@@ -2145,8 +2151,16 @@ pub(crate) fn push_user_data_exists(
 /// Appends the credited-person predicates: `person` (by name) and `person_ids`
 /// (a person's filmography). Each is an `EXISTS` over the `PeopleBaseItemMap`
 /// join, so `/Items?PersonIds=<id>` returns everything that person is credited
-/// on (port of C# `WhereContainsPerson` / the `people` sub-query).
+/// on (port of C# `WhereContainsPerson` / the `people` sub-query). A non-empty
+/// `person_types` restricts the matching credit to those types in both arms
+/// (`personTypes.Length == 0 || personTypes.Contains(…PersonType)`).
 fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    let push_person_types = |qb: &mut QueryBuilder<Sqlite>| {
+        if !filter.person_types.is_empty() {
+            qb.push(" AND ");
+            push_in_list(qb, r#"pp."PersonType""#, &filter.person_types);
+        }
+    };
     if let Some(name) = non_blank(filter.person.as_ref()) {
         qb.push(
             r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
@@ -2154,6 +2168,7 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
                 WHERE pm."ItemId" = bi."Id" AND pp."Name" = "#,
         );
         qb.push_bind(name.to_owned());
+        push_person_types(qb);
         qb.push(")");
     }
     if !filter.person_ids.is_empty() {
@@ -2172,7 +2187,9 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
         push_in_list(qb, r#"pm."PeopleId""#, &ids);
         qb.push(r#" OR pp."Name" IN (SELECT "Name" FROM "BaseItems" WHERE "#);
         push_in_list(qb, r#""Id""#, &ids);
-        qb.push(")))");
+        qb.push("))");
+        push_person_types(qb);
+        qb.push(")");
     }
 }
 
@@ -2559,6 +2576,8 @@ fn push_search_relevance(qb: &mut QueryBuilder<Sqlite>, term: &str) {
 ///   alone is not a total order here (7,093 of 9,862 rows are people/studios/
 ///   genres with a NULL `SortName`), and the index reorders 7,189 positions.
 ///
+/// `Name` (`CleanName`) is pinned for a different index: see [`pins_sort_plan`].
+///
 /// The ascending `(SortName, Name)` ordering is the one case proven identical:
 /// all 9,679 rows come back in the same order with and without the index,
 /// because SQLite's sorter and the index agree on rowid order within a tie.
@@ -2571,11 +2590,16 @@ const SORT_PLAN_PIN: &str = "+";
 /// A key that renders as anything else (`DateCreated`, a correlated user-data
 /// sub-select, `ferrofin_random()`, …) can never be served by
 /// `FerrofinIX_BaseItems_SortName_Name`, so it is left alone.
+///
+/// `Name` (`CleanName`) is pinned too, keeping the sort it had while it fell
+/// back to `SortName`: unpinned, `IX_BaseItems_Type_CleanName` turns a typed
+/// browse into an index walk that reads every row of that type, in every
+/// library, to fill a page of one.
 fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery) -> bool {
     if by == ItemSortBy::SortName && order == SortOrder::Ascending {
         return false;
     }
-    orders_by_sort_name_column(by, filter)
+    by == ItemSortBy::Name || orders_by_sort_name_column(by, filter)
 }
 
 /// Whether [`push_order_expression`] renders `by` as the bare
@@ -2905,8 +2929,11 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,
-        // Name/SortName fall back to SortName (the join-backed keys `Artist`,
-        // `AlbumArtist` and `Studio` are expressions of their own).
+        // `(ItemSortBy.Name, _) => e => e.CleanName`: a track's or episode's
+        // `SortName` leads with its numbers, so "Track name" must not use it.
+        ItemSortBy::Name => r#"bi."CleanName""#,
+        // Everything else falls back to SortName (the join-backed keys
+        // `Artist`, `AlbumArtist` and `Studio` are expressions of their own).
         _ => r#"bi."SortName""#,
     }
 }
@@ -3557,12 +3584,18 @@ mod tests {
             order_by(&InternalItemsQuery::default()),
             r#"ORDER BY +bi."SortName""#
         );
-        // A key that falls back to the SortName column without being SortName
-        // (upstream maps `Name` to `CleanName`, so it gets no Name tiebreaker)
-        // is pinned for the same reason as the bare default.
+        // `Name` orders by `CleanName` (upstream `OrderMapper`), takes no Name
+        // or SortName tiebreaker, and keeps its pinned sort.
         assert_eq!(
             order_by(&sorted_by(&[(ItemSortBy::Name, SortOrder::Ascending)])),
-            r#"ORDER BY +bi."SortName" ASC"#
+            r#"ORDER BY +bi."CleanName" ASC"#
+        );
+        // A key that falls back to the SortName column without being SortName
+        // is pinned for the same reason as the bare default, and takes
+        // upstream's final SortName tiebreaker.
+        assert_eq!(
+            order_by(&sorted_by(&[(ItemSortBy::AirTime, SortOrder::Ascending)])),
+            r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
         );
         // A leading key on another column can never be served by the index, so
         // it is left unpinned — and takes no Name tiebreaker.
