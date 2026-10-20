@@ -16,6 +16,8 @@
 //! key an M3U tuner exposes as `tvg-id` — that is how guide data binds to tuner
 //! channels.
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, FixedOffset, TimeZone};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -27,12 +29,14 @@ pub struct XmltvChannel {
     pub id: String,
     /// The first `<display-name>`.
     pub display_name: String,
-    /// The `<icon src>` URL, when present.
+    /// The `src` of the channel's first own `<icon>` that has a `src`, `width`
+    /// or `height` (`Icons.FirstOrDefault()?.Source`), when it has one.
     pub icon: Option<String>,
 }
 
 /// A single programme (an airing on a channel over a time range).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // one field per XMLTV flag element
 pub struct XmltvProgramme {
     /// The `channel` attribute — matches an [`XmltvChannel::id`].
     pub channel_id: String,
@@ -58,7 +62,9 @@ pub struct XmltvProgramme {
     pub desc: Option<String>,
     /// All `<category>` values.
     pub categories: Vec<String>,
-    /// `<icon src>` artwork URL, when present.
+    /// The `src` of the programme's first own `<icon>` that has a `src`,
+    /// `width` or `height` (`Icons.FirstOrDefault()?.Source`), when it has one.
+    /// Icons inside `<rating>` and `<star-rating>` belong to those.
     pub icon: Option<String>,
     /// Production year from `<date>` (first four digits), when present.
     pub year: Option<i32>,
@@ -69,13 +75,18 @@ pub struct XmltvProgramme {
     pub season_number: Option<i32>,
     /// `Episode.Episode` — the 1-based episode number from that `<episode-num>`.
     pub episode_number: Option<i32>,
-    /// `true` when a `<new/>` element is present.
+    /// `true` when a `<new>` element is present.
     pub is_new: bool,
-    /// `true` when a `<premiere>` element is present.
+    /// `true` when a `<premiere>` element is present, with or without text.
     pub is_premiere: bool,
     /// `true` when a `<previously-shown>` element is present.
     pub is_previously_shown: bool,
-    /// `<rating>/<value>` (content rating like `TV-PG`), when present.
+    /// `true` when a `<live>` element is present (not in the XMLTV DTD, but
+    /// Jellyfin 12 reads it).
+    pub is_live: bool,
+    /// The content rating (`TV-PG`) of the programme's first `<rating>`
+    /// (`Ratings.FirstOrDefault()?.Value`), when it has a value. A
+    /// `<star-rating>` never supplies it.
     pub rating: Option<String>,
 }
 
@@ -103,32 +114,56 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     let mut text = String::new();
     // The `system` of the `<episode-num>` being read, if any.
     let mut episode_system: Option<String> = None;
-    let mut channel: Option<XmltvChannel> = None;
-    let mut programme: Option<XmltvProgramme> = None;
+    // The number of elements open around the current one. An unbalanced tag
+    // (`check_end_names` is off) skews it until the programme or channel it
+    // sits in ends, losing that one's later children; upstream's `XmlReader`
+    // rejects the whole guide instead.
+    let mut depth = 0_usize;
+    let mut channel: Option<OpenChannel> = None;
+    let mut programme: Option<OpenProgramme> = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 match e.local_name().as_ref().as_bytes() {
                     b"channel" => {
-                        channel = Some(XmltvChannel {
-                            id: attr(&e, b"id").unwrap_or_default(),
-                            ..XmltvChannel::default()
-                        });
+                        channel = Some(OpenChannel::new(
+                            attr(&e, b"id").unwrap_or_default(),
+                            depth + 1,
+                        ));
                     }
                     b"programme" => {
-                        programme = Some(read_programme(&e));
+                        programme = Some(OpenProgramme::new(read_programme(&e), depth + 1));
                     }
-                    b"episode-num" => episode_system = attr(&e, b"system"),
-                    _ => {}
+                    name => apply_start(
+                        name,
+                        &e,
+                        depth,
+                        &mut episode_system,
+                        channel.as_mut(),
+                        programme.as_mut(),
+                    ),
                 }
+                depth += 1;
                 text.clear();
             }
             Ok(Event::Empty(e)) => {
+                // A self-closing element is its own start and end, with no text.
                 let name = e.local_name();
-                apply_empty(
-                    name.as_ref().as_bytes(),
+                let name = name.as_ref().as_bytes();
+                apply_start(
+                    name,
                     &e,
+                    depth,
+                    &mut episode_system,
+                    channel.as_mut(),
+                    programme.as_mut(),
+                );
+                apply_end(
+                    name,
+                    "",
+                    depth,
+                    episode_system.take().as_deref(),
                     channel.as_mut(),
                     programme.as_mut(),
                 );
@@ -145,11 +180,13 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                 text.push_str(e.as_ref());
             }
             Ok(Event::End(e)) => {
+                depth = depth.saturating_sub(1);
                 let name = e.local_name();
                 let name = name.as_ref().as_bytes();
                 apply_end(
                     name,
                     &text,
+                    depth,
                     episode_system.take().as_deref(),
                     channel.as_mut(),
                     programme.as_mut(),
@@ -157,12 +194,12 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                 match name {
                     b"channel" => {
                         if let Some(c) = channel.take() {
-                            out.channels.push(c);
+                            out.channels.push(c.channel);
                         }
                     }
                     b"programme" => {
                         if let Some(p) = programme.take() {
-                            out.programmes.push(p);
+                            out.programmes.push(p.programme);
                         }
                     }
                     _ => {}
@@ -219,60 +256,186 @@ fn read_programme(e: &BytesStart<'_>) -> XmltvProgramme {
     p
 }
 
-/// Applies a self-closing element (`<icon .../>`, `<new/>`, …) to the channel or
-/// programme currently being built.
-fn apply_empty(
-    name: &[u8],
-    e: &BytesStart<'_>,
-    channel: Option<&mut XmltvChannel>,
-    programme: Option<&mut XmltvProgramme>,
-) {
-    match name {
-        b"icon" => {
-            let src = attr(e, b"src");
-            if let Some(p) = programme {
-                p.icon = src;
-            } else if let Some(c) = channel {
-                c.icon = src;
-            }
+/// A `<channel>` being read.
+struct OpenChannel {
+    channel: XmltvChannel,
+    /// The depth of the channel's own children.
+    child_depth: usize,
+    /// Whether its first populated `<icon>` has been read.
+    icon_read: bool,
+}
+
+impl OpenChannel {
+    fn new(id: String, child_depth: usize) -> Self {
+        Self {
+            channel: XmltvChannel {
+                id,
+                ..XmltvChannel::default()
+            },
+            child_depth,
+            icon_read: false,
         }
-        b"new" => {
-            if let Some(p) = programme {
-                p.is_new = true;
-            }
-        }
-        b"premiere" => {
-            if let Some(p) = programme {
-                p.is_premiere = true;
-            }
-        }
-        b"previously-shown" => {
-            if let Some(p) = programme {
-                p.is_previously_shown = true;
-            }
-        }
-        _ => {}
     }
 }
 
-/// Applies the closing of a text-bearing element to the channel or programme
-/// currently being built, using the accumulated `text`.
+/// A `<programme>` being read.
+struct OpenProgramme {
+    programme: XmltvProgramme,
+    /// The depth of the programme's own children.
+    child_depth: usize,
+    /// Whether its first populated `<icon>` has been read.
+    icon_read: bool,
+    /// Whether its first kept `<rating>` has been read.
+    rating_read: bool,
+    /// The `<rating>` being read, if one is open.
+    rating: Option<OpenRating>,
+}
+
+impl OpenProgramme {
+    fn new(programme: XmltvProgramme, child_depth: usize) -> Self {
+        Self {
+            programme,
+            child_depth,
+            icon_read: false,
+            rating_read: false,
+            rating: None,
+        }
+    }
+}
+
+/// A `<rating>` being read, as `XmlTvReader.ProcessRating` builds it.
+#[derive(Default)]
+struct OpenRating {
+    /// Its last `<value>`.
+    value: Option<String>,
+    /// Set by an empty `<value>`: `ProcessRating` then returns without adding
+    /// the rating, so it is never the programme's first.
+    dropped: bool,
+}
+
+/// An `<icon>` that `XmlTvReader.ProcessIconNode` keeps: one with a `src`, a
+/// `width` or a `height`.
+struct PopulatedIcon {
+    /// Its `src`, when not empty.
+    src: Option<String>,
+}
+
+/// The `<icon>` `e` as `ProcessIconNode` reads it, or `None` when it is no icon
+/// at all.
+fn populated_icon(e: &BytesStart<'_>) -> Option<PopulatedIcon> {
+    let src = attr(e, b"src").filter(|s| !s.is_empty());
+    let sized = |name: &[u8]| attr(e, name).is_some_and(|v| v.trim().parse::<i32>().is_ok());
+    (src.is_some() || sized(b"width") || sized(b"height")).then_some(PopulatedIcon { src })
+}
+
+/// A programme child's name as `GetProgramme` matches it
+/// (`xmlProg.Name.ToLower(...)`), borrowed when it is already lower-case.
+fn programme_child_name(name: &[u8]) -> Cow<'_, [u8]> {
+    if name.iter().any(u8::is_ascii_uppercase) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Applies the start of an element, or a self-closing one, to the channel or
+/// programme being read. `depth` is the number of elements open around it.
+///
+/// Only the channel's or programme's own children count, as in
+/// `XmlTvReader.GetChannel`/`GetProgramme`, which hand any other element to its
+/// parent's handler or skip it.
+fn apply_start(
+    name: &[u8],
+    e: &BytesStart<'_>,
+    depth: usize,
+    episode_system: &mut Option<String>,
+    channel: Option<&mut OpenChannel>,
+    programme: Option<&mut OpenProgramme>,
+) {
+    if let Some(p) = programme {
+        if depth != p.child_depth {
+            return;
+        }
+        // `GetProgramme` matches on `xmlProg.Name.ToLower(...)`.
+        match programme_child_name(name).as_ref() {
+            b"episode-num" => *episode_system = attr(e, b"system"),
+            // `ProcessLive`/`ProcessNew`/`ProcessPremiereNode`/
+            // `ProcessPreviouslyShown`: the element is the flag, whatever its
+            // text. TODO(gl-683): `ProcessPreviouslyShown` also reads a `start`
+            // attribute and leaves an airing whose original-air date equals its
+            // own start a first showing; here every `<previously-shown>` is a
+            // repeat.
+            b"live" => p.programme.is_live = true,
+            b"new" => p.programme.is_new = true,
+            b"premiere" => p.programme.is_premiere = true,
+            b"previously-shown" => p.programme.is_previously_shown = true,
+            b"icon" => {
+                if !p.icon_read
+                    && let Some(icon) = populated_icon(e)
+                {
+                    p.icon_read = true;
+                    p.programme.icon = icon.src;
+                }
+            }
+            b"rating" => p.rating = Some(OpenRating::default()),
+            _ => {}
+        }
+    } else if let Some(c) = channel
+        // `GetChannel` matches its children case-sensitively.
+        && depth == c.child_depth
+        && name == b"icon"
+        && !c.icon_read
+        && let Some(icon) = populated_icon(e)
+    {
+        c.icon_read = true;
+        c.channel.icon = icon.src;
+    }
+}
+
+/// Applies the end of an element, or a self-closing one, to the channel or
+/// programme being read, using the accumulated `text`. `depth` is the number
+/// of elements open around it.
 fn apply_end(
     name: &[u8],
     text: &str,
+    depth: usize,
     episode_system: Option<&str>,
-    channel: Option<&mut XmltvChannel>,
-    programme: Option<&mut XmltvProgramme>,
+    channel: Option<&mut OpenChannel>,
+    programme: Option<&mut OpenProgramme>,
 ) {
     let text = text.trim();
     if let Some(c) = channel {
+        let c = &mut c.channel;
         if name == b"display-name" && c.display_name.is_empty() && !text.is_empty() {
             text.clone_into(&mut c.display_name);
         }
         return;
     }
-    let Some(p) = programme else { return };
-    match name {
+    let Some(open) = programme else { return };
+    if depth == open.child_depth + 1 {
+        // `ProcessRating` reads a `<value>` (matched ignoring case) of the open
+        // rating: an empty one drops the rating, a later one replaces an
+        // earlier one. Two upstream quirks are not mirrored: a whitespace-only
+        // value counts as empty here (text is trimmed), and upstream's
+        // `Skip()` after reading a value swallows a second `<value>` written
+        // with no whitespace before it (the DTD allows one value).
+        if let Some(rating) = open.rating.as_mut()
+            && !rating.dropped
+            && name.eq_ignore_ascii_case(b"value")
+        {
+            if text.is_empty() {
+                rating.dropped = true;
+            } else {
+                rating.value = Some(text.to_owned());
+            }
+        }
+        return;
+    }
+    if depth != open.child_depth {
+        return;
+    }
+    let p = &mut open.programme;
+    match programme_child_name(name).as_ref() {
         b"title" if p.title.is_empty() => text.clone_into(&mut p.title),
         b"sub-title" if !text.is_empty() => p.sub_title = Some(text.to_owned()),
         b"desc" if !text.is_empty() => p.desc = Some(text.to_owned()),
@@ -293,8 +456,18 @@ fn apply_end(
                 }
             }
         }
-        // <rating><value>TV-PG</value></rating> — the value carries the text.
-        b"value" if p.rating.is_none() && !text.is_empty() => p.rating = Some(text.to_owned()),
+        // `XmlTvListingsProvider` takes `Ratings.FirstOrDefault()?.Value`: the
+        // first rating `ProcessRating` kept decides, with or without a value.
+        // `<rating/>` reads as `<rating></rating>`.
+        b"rating" => {
+            if let Some(rating) = open.rating.take()
+                && !rating.dropped
+                && !open.rating_read
+            {
+                open.rating_read = true;
+                p.rating = rating.value;
+            }
+        }
         _ => {}
     }
 }
@@ -628,5 +801,170 @@ mod episode_num_tests {
         );
         assert_eq!(guide.channels[0].display_name, "News & Sport !");
         assert_eq!(guide.programmes[0].title, "Fish & Chips <live>");
+    }
+}
+
+/// Programme and channel children as `Jellyfin.XmlTv` 10.12.0-pre1 reads them,
+/// and as v12.2 `XmlTvListingsProvider` uses the result
+/// (`Ratings.FirstOrDefault()?.Value`, `Icons.FirstOrDefault()?.Source`).
+#[cfg(test)]
+mod programme_child_tests {
+    use super::{XmltvProgramme, parse_xmltv};
+
+    /// The single programme of a guide whose `<programme>` holds `children`.
+    fn programme(children: &str) -> XmltvProgramme {
+        let guide = parse_xmltv(&format!(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>{children}</programme></tv>"
+        ));
+        guide.programmes.into_iter().next().expect("one programme")
+    }
+
+    #[test]
+    fn flags_count_in_either_form() {
+        // `ProcessLive`/`ProcessNew`: the element's presence is the signal.
+        let p = programme("<live/><new/><premiere/><previously-shown/>");
+        assert!(p.is_live && p.is_new && p.is_premiere && p.is_previously_shown);
+        // `ProcessPremiereNode` reads the text but keeps a premiere either way.
+        let p = programme(
+            "<live>yes</live><new></new><premiere lang=\"en\">First showing</premiere>\
+             <previously-shown></previously-shown>",
+        );
+        assert!(p.is_live && p.is_new && p.is_premiere && p.is_previously_shown);
+        assert_eq!(p.title, "T", "flag text never leaks into a field");
+        let p = programme("");
+        assert!(!(p.is_live || p.is_new || p.is_premiere || p.is_previously_shown));
+        // A flag outside a programme flags nothing.
+        let guide = parse_xmltv(
+            "<tv><channel id=\"c\"><display-name>C</display-name><live/><new></new></channel>\
+             <programme start=\"20260725060000 +0000\" channel=\"c\"><title>T</title></programme></tv>",
+        );
+        assert!(!(guide.programmes[0].is_live || guide.programmes[0].is_new));
+    }
+
+    #[test]
+    fn programme_children_match_case_insensitively() {
+        // `GetProgramme` switches on `xmlProg.Name.ToLower(...)`.
+        let guide = parse_xmltv(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><Title>Upper</Title>\
+             <DESC>Synopsis</DESC><Category>News</Category><LIVE/><Icon src=\"http://x/p.png\"/>\
+             <RATING><VALUE>TV-G</VALUE></RATING></programme></tv>",
+        );
+        let p = &guide.programmes[0];
+        assert_eq!(p.title, "Upper");
+        assert_eq!(p.desc.as_deref(), Some("Synopsis"));
+        assert_eq!(p.categories, vec!["News"]);
+        assert!(p.is_live);
+        assert_eq!(p.icon.as_deref(), Some("http://x/p.png"));
+        assert_eq!(p.rating.as_deref(), Some("TV-G"));
+    }
+
+    #[test]
+    fn only_the_programmes_own_children_are_read() {
+        // `GetProgramme` hands each child element to its handler or skips it
+        // whole, so a grandchild with a programme child's name is never read.
+        let p = programme(
+            "<credits><desc>nested</desc><sub-title>nested</sub-title><category>Movie</category>\
+             <date>1999</date><episode-num system=\"xmltv_ns\">0.5.</episode-num><live/></credits>\
+             <review><title>nested</title><icon src=\"http://x/r.png\"/></review>",
+        );
+        assert_eq!((p.desc, p.sub_title), (None, None));
+        assert!(p.categories.is_empty());
+        assert_eq!((p.year, p.episode_num), (None, None));
+        assert!(!p.is_live);
+        assert_eq!(p.icon, None);
+        // A nested title ahead of the programme's own is not its title.
+        let guide = parse_xmltv(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"x\">\
+             <review><title>nested</title></review><title>Own</title></programme></tv>",
+        );
+        assert_eq!(guide.programmes[0].title, "Own");
+    }
+
+    #[test]
+    fn the_rating_comes_from_rating_alone() {
+        // A star rating is a community rating, never the OfficialRating.
+        let p = programme("<star-rating system=\"IMDb\"><value>7.2/10</value></star-rating>");
+        assert_eq!(p.rating, None);
+        let p = programme(
+            "<star-rating><value>4/5</value></star-rating><rating system=\"MPAA\"><value>PG</value></rating>",
+        );
+        assert_eq!(p.rating.as_deref(), Some("PG"));
+        // A `<value>` outside any rating is nobody's rating.
+        assert_eq!(
+            programme("<review><value>bad</value></review>").rating,
+            None
+        );
+    }
+
+    #[test]
+    fn the_first_rating_kept_decides() {
+        // `ProcessRating` drops a rating whose `<value>` is empty, so the next
+        // one is first.
+        let p = programme("<rating><value></value></rating><rating><value>PG</value></rating>");
+        assert_eq!(p.rating.as_deref(), Some("PG"));
+        let p = programme("<rating><value/></rating><rating><value>PG</value></rating>");
+        assert_eq!(p.rating.as_deref(), Some("PG"));
+        // A rating with no value is kept, so it is first and has no value.
+        let p = programme("<rating system=\"x\"></rating><rating><value>PG</value></rating>");
+        assert_eq!(p.rating, None);
+        // `<rating/>` reads as `<rating></rating>`.
+        let p = programme("<rating system=\"x\"/><rating><value>PG</value></rating>");
+        assert_eq!(p.rating, None);
+        // Two kept ratings: the first wins.
+        let p =
+            programme("<rating><value>TV-14</value></rating><rating><value>12</value></rating>");
+        assert_eq!(p.rating.as_deref(), Some("TV-14"));
+        // Within one (pretty-printed) rating a later value replaces an earlier
+        // one.
+        let p = programme("<rating>\n  <value>A</value>\n  <value>B</value>\n</rating>");
+        assert_eq!(p.rating.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn the_programme_icon_is_its_first_own_populated_icon() {
+        // A rating's badge belongs to the rating, not the programme.
+        let p = programme(
+            "<icon src=\"http://x/art.png\"/>\
+             <rating system=\"MPAA\"><value>PG</value><icon src=\"http://x/pg.png\"/></rating>\
+             <star-rating><value>3/4</value><icon src=\"http://x/stars.png\"/></star-rating>",
+        );
+        assert_eq!(p.icon.as_deref(), Some("http://x/art.png"));
+        let p = programme("<rating><value>PG</value><icon src=\"http://x/pg.png\"/></rating>");
+        assert_eq!(p.icon, None);
+        // The first icon wins, in either form; one with no src, width or height
+        // is not an icon at all.
+        let p =
+            programme("<icon/><icon src=\"http://x/a.png\"></icon><icon src=\"http://x/b.png\"/>");
+        assert_eq!(p.icon.as_deref(), Some("http://x/a.png"));
+        // A sized icon without a source is still the first icon: no image.
+        let p = programme("<icon width=\"100\"/><icon src=\"http://x/b.png\"/>");
+        assert_eq!(p.icon, None);
+        let p = programme("<icon width=\"wide\"/><icon src=\"\"/><icon src=\"http://x/b.png\"/>");
+        assert_eq!(p.icon.as_deref(), Some("http://x/b.png"));
+    }
+
+    #[test]
+    fn the_channel_icon_is_its_first_own_populated_icon() {
+        let guide = parse_xmltv(
+            "<tv><channel id=\"c\"><display-name>C</display-name><icon/>\
+             <icon src=\"http://x/first.png\"></icon><icon src=\"http://x/second.png\"/>\
+             <extra><icon src=\"http://x/nested.png\"/></extra></channel></tv>",
+        );
+        assert_eq!(
+            guide.channels[0].icon.as_deref(),
+            Some("http://x/first.png")
+        );
+        let guide = parse_xmltv(
+            "<tv><channel id=\"c\"><display-name>C</display-name>\
+             <extra><icon src=\"http://x/nested.png\"/></extra></channel></tv>",
+        );
+        assert_eq!(guide.channels[0].icon, None);
+        // Unlike a programme's, a channel's children match case-sensitively
+        // (`GetChannel` switches on `xmlChannel.Name`).
+        let guide = parse_xmltv(
+            "<tv><channel id=\"c\"><display-name>C</display-name>\
+             <Icon src=\"http://x/upper.png\"/></channel></tv>",
+        );
+        assert_eq!(guide.channels[0].icon, None);
     }
 }
