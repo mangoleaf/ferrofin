@@ -188,7 +188,10 @@ async fn music_genre_row(
 /// Inserts a minimal `BaseItems` row of the given folder-ish kind and returns
 /// the persisted row. Only the schema-required columns are set; richer metadata
 /// is populated by later refreshes (mirrors how the C# path creates a stub item
-/// then refreshes it).
+/// then refreshes it). `is_locked` stamps the `IsLocked` column, the way
+/// `CreateCollectionAsync` sets `IsLocked = options.IsLocked`; callers that
+/// create an always-unlocked row (playlists, the auto-provisioned folders) pass
+/// `false`.
 pub(crate) async fn insert_named_item(
     db: &Database,
     id: Uuid,
@@ -196,9 +199,10 @@ pub(crate) async fn insert_named_item(
     name: &str,
     is_folder: bool,
     container: Option<Uuid>,
+    is_locked: bool,
 ) -> Result<BaseItemEntity, ServiceError> {
     let mut conn = db.writer().acquire().await.map_err(db_err)?;
-    insert_named_item_in(&mut conn, id, kind, name, is_folder, container).await?;
+    insert_named_item_in(&mut conn, id, kind, name, is_folder, container, is_locked).await?;
     drop(conn);
     sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
@@ -216,6 +220,7 @@ pub(crate) async fn insert_named_item_in(
     name: &str,
     is_folder: bool,
     container: Option<Uuid>,
+    is_locked: bool,
 ) -> Result<(), ServiceError> {
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
@@ -246,7 +251,7 @@ pub(crate) async fn insert_named_item_in(
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
             "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8)"#,
+           VALUES (?1, ?2, ?3, 0, ?9, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -263,6 +268,7 @@ pub(crate) async fn insert_named_item_in(
         None,
     ))
     .bind(crate::text_util::get_clean_value(name))
+    .bind(i64::from(is_locked))
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -422,7 +428,7 @@ pub(crate) async fn ensure_container(
     // only, so a row committed without one would never be found again, and
     // every later provision would fail to insert the same id.
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    insert_named_item_in(&mut tx, id, kind, name, true, parent).await?;
+    insert_named_item_in(&mut tx, id, kind, name, true, parent, false).await?;
     set_container_path(&mut *tx, id, path).await?;
     if let Some(data) = data {
         backfill_container_data(&mut *tx, id, data).await?;

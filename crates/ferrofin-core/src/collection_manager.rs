@@ -535,6 +535,7 @@ impl CollectionManager for FerrofinCollectionManager {
             &options.name,
             true,
             collections_folder(&self.db, &self.paths).await?,
+            options.is_locked,
         )
         .await?;
         for item_id in &options.item_id_list {
@@ -1136,6 +1137,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 &name,
                 true,
                 parent,
+                false,
             )
             .await?;
             crate::item_persistence_service::set_item_path_in(&mut tx, id, &path)
@@ -2021,6 +2023,7 @@ mod tests {
             "Playlists",
             true,
             None,
+            false,
         )
         .await
         .expect("seed the existing folder");
@@ -2224,6 +2227,7 @@ mod tests {
             "Old Collection",
             true,
             None,
+            false,
         )
         .await
         .expect("orphan");
@@ -2241,6 +2245,46 @@ mod tests {
             "the orphan was taken into the library"
         );
         assert_eq!(adopted.parent_id, adopted.top_parent_id);
+    }
+
+    /// `CollectionCreationOptions.is_locked` reaches the stored row, as
+    /// upstream's `CreateCollectionAsync` sets `IsLocked = options.IsLocked`.
+    #[tokio::test]
+    async fn create_collection_honours_is_locked() {
+        let db = test_db().await;
+        let mgr = collection_manager_over(&db);
+
+        let locked = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Locked".to_owned(),
+                is_locked: true,
+                ..Default::default()
+            })
+            .await
+            .expect("create locked");
+        assert!(locked.is_locked, "the returned row carries the flag");
+        let locked_id = Uuid::parse_str(&locked.id).expect("uuid");
+        assert!(
+            crate::test_support::fetch_item(&db, locked_id)
+                .await
+                .is_locked,
+            "a box set created with isLocked=true is stored IsLocked = 1"
+        );
+
+        let unlocked = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Unlocked".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("create unlocked");
+        let unlocked_id = Uuid::parse_str(&unlocked.id).expect("uuid");
+        assert!(
+            !crate::test_support::fetch_item(&db, unlocked_id)
+                .await
+                .is_locked,
+            "the flag defaults to false"
+        );
     }
 
     #[tokio::test]
