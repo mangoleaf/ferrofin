@@ -1432,6 +1432,18 @@ def load_gate(path=GATE_PATH):
     return gate
 
 
+def band(c, gate):
+    """The thresholds a cell's change is judged by: its own A/A band where gate.toml records
+    one, else its kind's row, else None."""
+    return ((gate.get("cells") or {}).get(c.key) or gate.get(c.gate)) if c.gate else None
+
+
+def baseline_caveat(c, base):
+    """Why `c` cannot be set beside the same server's `base`: either side's own evidence is
+    flagged, or the server answered a request behind the cell differently."""
+    return reasons(c.own_flag, base.own_flag, "responses differ from the baseline's" if other_work(c, base) else None)
+
+
 def delta_html(c, base, gate=None):
     """Change against the same server's baseline (the median of its runs); lower is better
     for every non-context number. Coloured only when it crosses both the relative and the
@@ -1444,17 +1456,16 @@ def delta_html(c, base, gate=None):
         return ""
     diff = c.median - base.median
     ch = diff / base.median * 100
-    caveat = reasons(c.own_flag, base.own_flag, "responses differ from the baseline's" if other_work(c, base) else None)
-    gate = gate or {}
-    band = (gate.get("cells", {}).get(c.key) or gate.get(c.gate)) if c.gate else None
+    caveat = baseline_caveat(c, base)
+    limits = band(c, gate or {})
     title = f"vs baseline {base.fmt(base.median)} (median of {base.runs} run{'s' if base.runs != 1 else ''})"
     cls = ""
     if caveat:
         cls, title = "provisional", f"{title} — not like for like: {caveat}"
-    elif band:
-        if abs(ch) > band["relative_pct"] and abs(diff) > band["absolute"]:
+    elif limits:
+        if abs(ch) > limits["relative_pct"] and abs(diff) > limits["absolute"]:
             cls = "good" if diff < 0 else "bad"
-        title += f" — coloured beyond {band['relative_pct']}% and {band['absolute']} {c.unit}"
+        title += f" — coloured beyond {limits['relative_pct']}% and {limits['absolute']} {c.unit}"
     else:
         title += " — no gate threshold for this row"
     return f"<span class='delta {cls}' title='{html.escape(title)}'>{ch:+.0f}%</span>"

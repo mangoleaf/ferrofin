@@ -156,8 +156,10 @@ awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN {
 mkdir -p "$OUT"
 IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
+# The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
+FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' ferrofin:bench)
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
-jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
+jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
   --arg browse_user "$U" --arg playback_user "$(jq -r .viewer "$IDS")" --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \
@@ -166,7 +168,7 @@ jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" 
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
-  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
 
