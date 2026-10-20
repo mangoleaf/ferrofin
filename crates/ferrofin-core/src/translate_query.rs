@@ -2015,6 +2015,12 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str, filter: &I
 /// `want == true` additionally keeps, of several in-progress versions of one
 /// item, only the most recently played (`:586-602`) — id as the tiebreaker;
 /// `want == false` operates on primaries only (`:604-613`).
+///
+/// `+`: the same plan pin as [`push_is_played`] on the two `IsFolder`
+/// disjuncts of each `want` arm, so a browse of three or more kinds keeps its
+/// `(Type, TopParentId)` seek instead of a `MULTI-INDEX OR` over every row of
+/// every library in scope. The `want == true` dedupe term needs none: its
+/// other disjuncts are not indexable, so it can never become an index OR.
 fn push_resumable_predicate(
     qb: &mut QueryBuilder<Sqlite>,
     uid: &str,
@@ -2022,9 +2028,9 @@ fn push_resumable_predicate(
     filter: &InternalItemsQuery,
 ) {
     if want {
-        qb.push(r#" AND ((bi."IsFolder" = 0 AND bi."Id" IN "#);
+        qb.push(r#" AND ((+bi."IsFolder" = 0 AND bi."Id" IN "#);
         push_in_progress_ids(qb, uid);
-        qb.push(r#") OR (bi."IsFolder" = 1 AND "#);
+        qb.push(r#") OR (+bi."IsFolder" = 1 AND "#);
         push_folder_is_resumable(qb, uid, filter);
         qb.push("))");
         // "When several versions of the same item are in progress, keep only
@@ -2077,10 +2083,10 @@ fn push_resumable_predicate(
         // `append_predicates`), so the row's own primary is what is tested —
         // an in-progress alternate must not resurface as its group's last
         // representative.
-        qb.push(r#" AND ((bi."IsFolder" = 1 AND NOT "#);
+        qb.push(r#" AND ((+bi."IsFolder" = 1 AND NOT "#);
         push_folder_is_resumable(qb, uid, filter);
         qb.push(
-            r#") OR (bi."IsFolder" = 0 AND COALESCE(bi."PrimaryVersionId", bi."Id") NOT IN (SELECT COALESCE(x."PrimaryVersionId", x."Id") FROM "UserData" ud JOIN "BaseItems" x ON x."Id" = ud."ItemId" WHERE ud."UserId" = "#,
+            r#") OR (+bi."IsFolder" = 0 AND COALESCE(bi."PrimaryVersionId", bi."Id") NOT IN (SELECT COALESCE(x."PrimaryVersionId", x."Id") FROM "UserData" ud JOIN "BaseItems" x ON x."Id" = ud."ItemId" WHERE ud."UserId" = "#,
         )
         .push_bind(uid.to_owned())
         .push(r#" AND ud."PlaybackPositionTicks" > 0)))"#);
@@ -3074,6 +3080,63 @@ mod tests {
                 plan.iter().all(|d| !d.contains("MULTI-INDEX OR")
                     && (!d.starts_with("SCAN") || d.starts_with("SCAN (subquery-"))),
                 "{plan:?}"
+            );
+        }
+    }
+
+    /// `push_resumable_predicate`'s `IsFolder` disjuncts, both arms, on a
+    /// three-kind browse over two libraries: the page keeps its
+    /// `(Type, TopParentId)` seek, and nothing is scanned but the page's own
+    /// subquery and the played-leaf list. Unpinned, three kinds turn the disjuncts
+    /// into a `MULTI-INDEX OR` over `IX_BaseItems_TopParentId_IsFolder_…`,
+    /// whose two halves are every row of every library in scope.
+    #[tokio::test]
+    async fn the_resumable_filter_keeps_the_type_seek_over_three_kinds() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5521)).await;
+        let browse = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::BoxSet,
+            ],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x5522), uuid::Uuid::from_u128(0x5523)],
+            limit: Some(100),
+            ..Default::default()
+        };
+        for want in [false, true] {
+            let filter = InternalItemsQuery {
+                is_resumable: Some(want),
+                ..browse.clone()
+            };
+            let mut builder = build_query(&filter, QueryShape::FullRows);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|d| d
+                    .starts_with("SEARCH bi USING INDEX IX_BaseItems_Type_TopParentId_")
+                    && d.contains("(Type=? AND TopParentId=?)")),
+                "IsResumable={want}: {plan:#?}"
+            );
+            assert!(
+                plan.iter().all(|d| !d.contains("MULTI-INDEX OR")
+                    && !d.contains("IX_BaseItems_TopParentId_IsFolder_")
+                    && (!d.starts_with("SCAN")
+                        || d.starts_with("SCAN (subquery-")
+                        || d == "SCAN pl")),
+                "IsResumable={want}: {plan:#?}"
             );
         }
     }
