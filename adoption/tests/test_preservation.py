@@ -2,6 +2,7 @@
 
 from contextlib import closing
 import copy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import posixpath
@@ -9,6 +10,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import uuid
@@ -20,7 +22,7 @@ from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, comparable, compare,
                           verify_database)
 from synthetic import VERSIONS
 import synthetic_fixture
-from synthetic_fixture import USERS, drop_dangling_chain, seed_database
+from synthetic_fixture import USERS, drop_dangling_chain, seed_database, wait_for_live_members
 from watch_history import orphaned_items
 from unchanged_scan import TABLES, audit, assert_unchanged, check
 from test_user_accounts import fixture as account_fixture
@@ -333,6 +335,39 @@ class OracleExpectationTest(unittest.TestCase):
             expectation('10.11.8', self.baseline, self.oracle, upgraded)
 
 
+class ServerReadyTest(unittest.TestCase):
+    def test_ready_waits_out_the_10_11_setup_server(self):
+        # 10.11's SetupServer answers /System/Info/Public during migrations and 503s the
+        # rest (SetupServer.cs); a seed call sent then is reset at the hand-over (gl-662).
+        # The main host then answers /System/Ping before startup completes.
+        phase = ['setup']
+        answers = {'setup': '/System/Info/Public', 'starting': '/System/Ping'}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200 if phase[0] == 'main' or self.path == answers[phase[0]] else 503)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{}')
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        ready = threading.Thread(target=synthetic_fixture.Api(f'http://127.0.0.1:{server.server_port}').ready,
+                                 kwargs={'timeout': 30}, daemon=True)
+        ready.start()
+        for current in answers:
+            phase[0] = current
+            ready.join(1.5)
+            self.assertTrue(ready.is_alive(), f'ready() returned in the {current} phase')
+        phase[0] = 'main'
+        ready.join(10)
+        self.assertFalse(ready.is_alive())
+
+
 class SeededAdoptionTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -433,6 +468,22 @@ class SeededAdoptionTest(unittest.TestCase):
         self.sql(source, "UPDATE BaseItems SET Data = '{\"LinkedChildren\":[]}' WHERE Name = 'linked_collection'")
         with self.assertRaisesRegex(CheckError, 'the linked collection has no live member'):
             seed_database(source, manifest)
+
+    def test_the_seed_waits_until_10_11_8_has_saved_each_live_member(self):
+        # 10.11.8 first saves a new playlist's member with its Path only; the ItemId comes
+        # with the queued refresh, which no API reports (gl-603).
+        source = self.dir / 'pending.db'
+        manifest = canned_10_11_8(source)
+        member = uuid.UUID(guid(0xa2)).hex
+        self.sql(source, "UPDATE BaseItems SET Data = json_remove(Data, '$.LinkedChildren[0].ItemId') "
+                         "WHERE Name = 'linked_playlist'")
+        with self.assertRaisesRegex(CheckError, 'the linked playlist has no live member after 0 s'):
+            wait_for_live_members(source, manifest, timeout=0)
+        refresh = threading.Timer(0.2, self.sql, (source, "UPDATE BaseItems SET Data = json_set(Data, "
+                                  "'$.LinkedChildren[0].ItemId', ?) WHERE Name = 'linked_playlist'", member))
+        refresh.start()
+        self.addCleanup(refresh.cancel)
+        wait_for_live_members(source, manifest, timeout=30, interval=0.1)
 
     def test_a_linked_container_is_checked_only_where_the_source_held_its_seeds(self):
         pathless = self.seeds['linked_children']['pathless']

@@ -413,10 +413,11 @@ pub(crate) fn save_targets(
 /// — port of `TrySaveToFiles`, which returns after the first successful write
 /// and only throws when every candidate failed. With no target at all,
 /// `TrySaveLyric` logs an error and saves nothing (`None`), without failing.
-pub(crate) fn try_save_to_files<'a>(
-    targets: &'a [PathBuf],
-    content: &str,
-) -> Result<Option<&'a Path>, ServiceError> {
+pub(crate) fn try_save_to_files(
+    targets: &[PathBuf],
+    content: impl AsRef<[u8]>,
+) -> Result<Option<&Path>, ServiceError> {
+    let content = content.as_ref();
     if targets.is_empty() {
         tracing::error!("lyric could not be saved because the resulting paths were invalid");
         return Ok(None);
@@ -608,7 +609,7 @@ impl LyricManager for FerrofinLyricManager {
         &self,
         item_id: Uuid,
         format: &str,
-        lyrics: &str,
+        lyrics: &[u8],
     ) -> Result<Option<LyricDto>, ServiceError> {
         let item = self
             .item(item_id)
@@ -624,7 +625,10 @@ impl LyricManager for FerrofinLyricManager {
         };
         // `SaveLyricAsync` parses FIRST and returns null — the controller's
         // `400` — when no parser claims the format. Nothing is written then.
-        let Some(dto) = parse_by_format(format, lyrics) else {
+        // `InternalParseRemoteLyricsAsync` reads it with a `StreamReader`;
+        // `TrySaveLyric` copies the original bytes.
+        let text = ferrofin_util::stream_extensions::decode_stream_text(lyrics.to_vec());
+        let Some(dto) = parse_by_format(format, &text) else {
             return Ok(None);
         };
         let targets = self.save_targets(item_id, &item, path, format).await;
@@ -1605,6 +1609,40 @@ mod tests {
         assert_eq!(results[0].id, format!("{}_7_synced", provider_id("Second")));
     }
 
+    /// `LyricsController.SearchRemoteLyrics` builds its request with
+    /// `SearchAllProviders` at its initialiser, `true`: every provider is
+    /// asked, not just the first that answers.
+    #[tokio::test]
+    async fn a_manual_search_asks_every_provider() {
+        let db = test_support::test_db().await;
+        let item_id = seed_audio(&db, "/nonexistent/song.mp3").await;
+
+        let mut first = FakeLyricProvider::new("First");
+        first.search_results = vec![synced_result("1_synced", "[00:01.00]One")];
+        let first = Arc::new(first);
+        let mut second = FakeLyricProvider::new("Second");
+        second.search_results = vec![synced_result("2_synced", "[00:02.00]Two")];
+        let mgr = manager_over(
+            &db,
+            vec![
+                Arc::clone(&first) as Arc<dyn LyricProvider>,
+                Arc::new(second) as Arc<dyn LyricProvider>,
+            ],
+        );
+
+        let results = mgr.search_lyrics(item_id).await.expect("search");
+        let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                format!("{}_1_synced", provider_id("First")),
+                format!("{}_2_synced", provider_id("Second")),
+            ]
+        );
+        let seen = first.last_request.lock().expect("lock").clone();
+        assert!(seen.expect("request").search_all_providers);
+    }
+
     #[tokio::test]
     async fn download_saves_into_the_internal_metadata_folder() {
         let db = test_support::test_db().await;
@@ -1691,7 +1729,7 @@ mod tests {
             .with_metadata_path(meta.path())
             .with_virtual_folders(folders);
 
-        mgr.save_lyric(item_id, "lrc", "[00:01.00]hi")
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]hi".as_bytes())
             .await
             .expect("save")
             .expect("parsed");
@@ -1753,7 +1791,7 @@ mod tests {
             .with_metadata_path(ferrofin_util::directory_path::DirectoryPath::live(
                 move || source.read().unwrap().clone(),
             ));
-        mgr.save_lyric(item_id, "lrc", "[00:01.00]internal")
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]internal".as_bytes())
             .await
             .unwrap();
         let first = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
@@ -1766,7 +1804,7 @@ mod tests {
             .update_library_options("Z inner", &options)
             .await
             .unwrap();
-        mgr.save_lyric(item_id, "lrc", "[00:01.00]adjacent")
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]adjacent".as_bytes())
             .await
             .unwrap();
         assert_eq!(
@@ -1785,7 +1823,7 @@ mod tests {
             .await
             .unwrap();
         *current.write().unwrap() = tmp.path().join("metadata-b");
-        mgr.save_lyric(item_id, "lrc", "[00:01.00]new root")
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]new root".as_bytes())
             .await
             .unwrap();
         let replacement = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
@@ -1804,7 +1842,7 @@ mod tests {
             .unwrap();
         // A directory reliably blocks the media filename even in elevated tests.
         std::fs::create_dir(media.with_extension("lrc")).unwrap();
-        mgr.save_lyric(item_id, "lrc", "[00:01.00]fallback")
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]fallback".as_bytes())
             .await
             .unwrap();
         assert_eq!(
@@ -1858,7 +1896,7 @@ mod tests {
 
         // `x.foo`: no parser claims it → null → the controller's 400, no file.
         assert!(
-            mgr.save_lyric(item_id, "foo", "hello")
+            mgr.save_lyric(item_id, "foo", "hello".as_bytes())
                 .await
                 .expect("runs")
                 .is_none()
@@ -1867,7 +1905,7 @@ mod tests {
 
         // A `.txt` upload is stored and read back through the plain parser.
         let dto = mgr
-            .save_lyric(item_id, "txt", "alpha\n\nbeta\n")
+            .save_lyric(item_id, "txt", "alpha\n\nbeta\n".as_bytes())
             .await
             .expect("save")
             .expect("parsed");
@@ -1881,6 +1919,38 @@ mod tests {
         let saved = metadata_sidecar(meta.path(), item_id, "song", "txt");
         record_lyric_streams(&db, item_id, &[&saved]).await;
         assert_eq!(mgr.get_lyrics(item_id).await.expect("get"), Some(dto));
+    }
+
+    /// `SaveLyricAsync(Audio, string, Stream)`: the parse reads the upload
+    /// with a `StreamReader` (a byte-order mark picks the encoding and is
+    /// dropped), and `TrySaveLyric` writes the uploaded bytes unchanged.
+    #[rstest::rstest]
+    #[case::utf8_bom(b"\xEF\xBB\xBF[00:02.00]bom".to_vec(), "bom")]
+    #[case::utf16le_bom(
+        [&[0xFF, 0xFE][..], &"[00:03.00]é".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()].concat(),
+        "é"
+    )]
+    #[tokio::test]
+    async fn save_lyric_decodes_the_upload_and_keeps_its_bytes(
+        #[case] upload: Vec<u8>,
+        #[case] text: &str,
+    ) {
+        let db = test_support::test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meta = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("song.flac");
+        std::fs::write(&media, b"flac").expect("write media");
+        let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        let mgr = manager_over(&db, Vec::new()).with_metadata_path(meta.path());
+
+        let dto = mgr
+            .save_lyric(item_id, "lrc", &upload)
+            .await
+            .expect("save")
+            .expect("parsed");
+        assert_eq!(dto.lyrics[0].text, text);
+        let saved = metadata_sidecar(meta.path(), item_id, "song", "lrc");
+        assert_eq!(std::fs::read(saved).expect("saved"), upload);
     }
 
     #[tokio::test]
@@ -2567,7 +2637,11 @@ mod tests {
                 .is_empty()
         );
         // A pathless item cannot be written to or deleted from.
-        assert!(mgr.save_lyric(Uuid::new_v4(), "lrc", "x").await.is_err());
+        assert!(
+            mgr.save_lyric(Uuid::new_v4(), "lrc", "x".as_bytes())
+                .await
+                .is_err()
+        );
         mgr.delete_lyrics(Uuid::new_v4()).await.expect("no-op");
     }
 }

@@ -100,6 +100,19 @@ Two earlier builds on the same host, under a load average near 27, stopped in th
 with "the linked … has no live member"; each was rebuilt into a new directory. That seeding
 failure is tracked separately.
 
+### 2026-10-19 table digests (check 7)
+
+Fixtures built fresh by `build-fixtures.sh` (recipe at this commit). Image `ferrofin:bench`,
+id `4961433c3034`, built 2026-10-19 18:26 MDT from `release/v1.4.0` (its commit was not
+recorded; the harness-only change here does not depend on it). `run.sh`: **PASS** on all ten
+paths. `synthetic.py run`: **PASS** on all ten paths at all four stages (40 of 40). The first
+runs failed on three things the normaliser now names, none a Ferrofin data loss: a re-login
+replaces a `Devices` row, a client re-announces itself, and the rehome repair re-keys a local
+alternate version (as Jellyfin 12.2 does), moving its MediaStreamInfos and ItemValuesMap rows
+to the new item id. The fixtures hold rows in only some of the listed tables (Chapters,
+TrickplayInfos, KeyframeData, MediaSegments and the display-preference tables are empty
+until the fixtures populate them).
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -125,6 +138,25 @@ failure is tracked separately.
    result does not pass this check.
 6. Each user's watch history remains unchanged at all three stages, in both the
    database and movie/episode API responses, including watched flags and progress.
+7. Every row of the Jellyfin-owned tables no other check covers survives each stage, bar
+   the rewrites listed under the table digests below.
+
+The table digests (`table_digests.py`) hash every row of those tables whole, keyed by its
+primary key, and take the baseline from each fixture copy before Ferrofin starts. A row that
+is gone, or whose hash moved, fails and names the table and key; a row only the later
+database holds does not (a scan or login adds some), and neither does a column only the later
+database holds (0032 adds some to MediaStreamInfos). The normaliser removes only what the
+migration chain or the running server rewrites by design, and each rule is a change the check
+stops seeing, so add one only with a migration or server behaviour to point at:
+
+| Rule | Why |
+|---|---|
+| GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
+| `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
+| the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
+| `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
+| a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |
+| rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
 It checks overview, original title, tagline, community/critic ratings, official rating,
@@ -285,6 +317,9 @@ history, changes to each playback field, deleted provider-keyed rows, progress f
 another user, unwatched-to-watched changes, missing API history, hidden versions,
 date/GUID normalization, private baselines, fixtures missing watched/resume data, and
 failure reporting. Its fixtures contain only invented IDs and playback data.
+`tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
+lost and an added column, and a case per normaliser rule (each with the unrewritten change
+next to it that must still fail).
 CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.
@@ -499,6 +534,71 @@ the cache to the branch, so each new release branch builds once), and runs
 `run.sh` and `synthetic.py run`. A failed run uploads `work/` as the `adoption-work`
 artifact. Its green run on the frozen release commit is the release's adoption evidence,
 linked from the test record above (`RELEASE.md`, "Validate adoption").
+
+### Populated Ferrofin upgrade
+
+`synthetic.py upgrade` checks that a release candidate keeps a populated install of an
+earlier Ferrofin release: the previous release and v1.0.0, the oldest. The previous
+release moves with each release. The release workflow (`release.yml`, step "upgrade a
+populated install from earlier releases") runs it on every tag: it builds the
+`jellyfin-10.11.8` fixture on the runner and upgrades from the latest published release
+and from v1.0.0 to the pushed image (about two minutes). A failure (after the image is
+pushed) blocks the GitHub Release and the chart, and uploads `work/` as the `upgrade-work`
+artifact.
+
+```bash
+python3 adoption/synthetic.py build --fixtures /path/to/fixtures --only jellyfin-10.11.8
+python3 adoption/synthetic.py upgrade --fixtures /path/to/fixtures --image ferrofin:bench \
+  --from ghcr.io/mangoleaf/ferrofin:v1.3.2 --from ghcr.io/mangoleaf/ferrofin:v1.0.0
+```
+
+For each `--from` image, the check works on a copy of the `jellyfin-10.11.8` fixture,
+the one generation every release adopts:
+
+1. The earlier release boots on the copy, adopts it, and runs a scan.
+2. Through that release's API, the check adds user state: a played movie, a resume
+   position, a favourite, a user created with an avatar, and a user created then
+   deleted. It reads that state back.
+3. The candidate boots on the same data directory.
+4. The `synthetic.py run` checks compare the candidate with what the earlier release
+   stored and served, once after the upgrade and again after a scan. Those checks cover
+   the account rows, watch history, metadata, and the API snapshot of visibility, views,
+   playlists, collections and accounts.
+
+Both sides are Ferrofin, so every comparison is exact, with these exceptions:
+- **Seeds the start releases cannot boot on.** The copy loses the seeded dangling
+  parent chain and the stale LinkedChildren entries first. Releases before v1.4.0 have
+  no orphan clean-up and fail on both, on a foreign key. `synthetic.py run` covers the
+  candidate on those seeds.
+- **Changes the candidate's boot repairs make by design, following Jellyfin 12.2.**
+  These are the seeded ratings' visibility, the harmonized conflicting user data, and the
+  re-keyed id of the local alternate version, for which only the version count is
+  compared. `synthetic.py run` holds each of these against Jellyfin 12.2.
+- **Avatars.** They are fetched with the admin's token, because v1.0.0 serves them to no
+  anonymous client.
+- **A start release with a known API bug.** v1.0.0 lets a restricted user download an
+  item (`KNOWN_API_GAPS` in `upgrade.py`), so it cannot serve the API snapshot. It gets a
+  `NOTE` line, and the API snapshot comparison (visibility, denials, views, playlists,
+  collections, account answers) is skipped for it. Its stored state, and the candidate's
+  watch-history and metadata answers measured against that state, are still compared. Any
+  other snapshot failure fails the run.
+
+A failed copy keeps `start-served.json`, `<stage>-actual.json` and the server logs in
+`work/` for inspection; a passing one removes them. `--only` picks another fixture, which
+every `--from` release must be able to adopt (v1.0.0 adopts 10.11.8 only).
+
+**2026-10-19 run.** The candidate was built from `release/v1.4.0` at `d2bb9306` (image
+`sha256:6c46acb78fc140838dbc17ffe7088579a6b3efd8bc3d39d1053c608844c4f395`). The
+`jellyfin-10.11.8` fixture was freshly built.
+
+| Start release | After the upgrade | After a scan |
+|---|---|---|
+| v1.3.2 | PASS | PASS |
+| v1.0.0 (stored state only, see the `NOTE` above) | **FAIL**: database and API missing item | PASS |
+
+The v1.0.0 failure is a server bug, gl-663. v1.0.0 leaves a 10.11 local alternate version
+as a standalone movie, and the candidate's boot deletes that row. Only the next scan
+re-creates it.
 
 ### Initial synthetic matrix validation
 

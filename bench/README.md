@@ -325,7 +325,30 @@ With no tags, or outside git, the name falls back to `20260903-1412-7e80268`. Th
 resolved name and the dirty flag are also written into `run.json`, so they survive a
 renamed directory. `--out` overrides the whole thing.
 
-The viewer lists every run under `bench/runs`; tick the runs to render (several =
+`python3 bench/report.py --serve [PORT] [RUNS_DIR]` is the one local viewer
+(127.0.0.1:8097, loopback only) for every harness's runs, with three tabs:
+
+| Tab | Runs come from |
+|---|---|
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json` |
+| Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
+| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
+
+Each run is one self-contained `report.html` (no external assets, so it opens from disk
+and works as a CI artifact). `run.sh` writes the benchmark's beside `report.md`
+(`report.py --html RUN_DIR` rewrites it); the viewer renders a benchmark run that has none
+on demand. The adoption and parity tabs list whatever `report.html` files those harnesses leave in
+their directory, and a tab with no runs says so and names the flag. Pick an A and a B of the same harness to see their reports side by side;
+runs of different harnesses are never compared. If a benchmark run directory holds an
+`ab-verdicts.json` (`{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
+"delta_pct"}]}`, `verdict` one of `regressed`, `within noise`, `improved`), its
+`report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
+regressions first; a malformed file is an error, not an omitted section. When several runs are rendered together the
+file of the first run that has one is used. A `report.html` written
+before the file existed does not show it: whatever writes `ab-verdicts.json` reruns
+`report.py --html RUN_DIR`.
+
+On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the
 median, the range its runs spanned (in brackets in the markdown; under the number in the
 viewer's tiles and on the cell's hover text in its tables), and `⚠[n]` pointing at a

@@ -51,6 +51,46 @@ pub(crate) async fn queue_high_priority_refresh(
     Ok(())
 }
 
+/// Runs an item's default metadata refresh and returns once it has run —
+/// `item.RefreshMetadata(CancellationToken.None)`, which a handler awaits
+/// rather than queues. A file item refreshes through the scan queue's
+/// priority lane ([`LibraryManager::run_refresh_scan`]), on a task of its own
+/// so a client that hangs up does not withdraw it; an item with no file of
+/// its own is queued as [`queue_high_priority_refresh`] does.
+///
+/// [`LibraryManager::run_refresh_scan`]: ferrofin_traits::library::LibraryManager::run_refresh_scan
+pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+    use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::MetadataRefreshOptions;
+    let item = state.library.get_item_by_id(item_id).await?;
+    let Some(path) = item.as_ref().and_then(refresh_scan_path) else {
+        return queue_high_priority_refresh(state, item_id).await;
+    };
+    let library = std::sync::Arc::clone(&state.library);
+    // In the request's span: the request awaits it (LOGGING.md §4).
+    let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+        library
+            .run_refresh_scan(
+                ScanTarget::Items(vec![path]),
+                &MetadataRefreshOptions::default(),
+            )
+            .await
+    }))
+    .await
+    .map_err(|err| {
+        ApiError::Service(ServiceError::backend(format!(
+            "item refresh task failed: {err}"
+        )))
+    })??;
+    if !ran {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "the refresh of item {item_id} was stopped before it finished"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether the library scan can reach `target`: every path of it lies under
 /// a location of a configured library (the scan plans nothing anywhere
 /// else). A library or the root always can.
@@ -810,13 +850,20 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
 /// Owner decisions: Jellyfin 12 (10.12 in all but name) is the source of truth,
 /// and where 10.11.8 differs from it, 10.11.8 is the one that is wrong
 /// (2026-09-02). The pin is always the **latest Jellyfin release**, never a
-/// release candidate: when a newer one ships, move this tag and commit to it and
-/// list every row not already listed in [`VERIFIED_AGAINST_EARLIER_PIN`] under
-/// the old tag (2026-10-16). The vendored OpenAPI contract stays 10.11.8: that is
-/// the API clients speak, even though Jellyfin 12 dropped operations from it.
+/// release candidate: when a newer one ships, move this tag and the commit to
+/// it, set [`UPSTREAM_PIN_DATE`] to that day, and list every row not already
+/// listed in [`VERIFIED_AGAINST_EARLIER_PIN`] (or, for a subsystem row,
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`]) under the old tag (2026-10-16).
+/// The vendored OpenAPI contract stays 10.11.8: that is the API clients speak,
+/// even though Jellyfin 12 dropped operations from it.
 pub const UPSTREAM_TAG: &str = "v12.2";
 /// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
 pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
+/// The day [`UPSTREAM_TAG`] became the pin, `YYYY-MM-DD`; move it with the tag.
+/// A row dated on or after it was compared against [`UPSTREAM_TAG`], so it can
+/// never be listed in [`VERIFIED_AGAINST_EARLIER_PIN`] or
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`].
+pub const UPSTREAM_PIN_DATE: &str = "2026-10-16";
 
 /// [`VERIFIED`] rows last compared against an earlier pin, as
 /// `(method, path, tag compared against)`. They are completed verification work,
@@ -824,6 +871,49 @@ pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
 /// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
 /// from this list. `v12.0-rc7` is commit `4910aafa1a`.
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[];
+
+/// [`VERIFIED_SUBSYSTEMS`] rows last compared against an earlier pin, as
+/// `(key, tag compared against)` — the same rules as
+/// [`VERIFIED_AGAINST_EARLIER_PIN`].
+pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
+
+/// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
+/// operation crosses several of them, so one row states their divergences once
+/// and operation rows name it in [`Verified::refs`].
+pub const SUBSYSTEM_KEYS: &[&str] = &[
+    "query-translation",
+    "dto-fields",
+    "user-data",
+    "access-filtering",
+    "images",
+    "paging-sort",
+];
+
+/// One shared subsystem whose Ferrofin implementation was compared against the
+/// upstream Jellyfin C# — see [`VERIFIED_SUBSYSTEMS`].
+#[derive(Debug)]
+pub struct VerifiedSubsystem {
+    /// One of [`SUBSYSTEM_KEYS`], unique in [`VERIFIED_SUBSYSTEMS`].
+    pub key: &'static str,
+    /// The C# file compared, relative to the upstream repository root —
+    /// `"Jellyfin.Server.Implementations/Item/BaseItemRepository.cs"`.
+    pub upstream_file: &'static str,
+    /// The method in that file the comparison centres on — `"TranslateQuery"`.
+    pub upstream_method: &'static str,
+    /// The Ferrofin code path compared, for the next reader.
+    pub ferrofin: &'static str,
+    /// Date of the comparison, `YYYY-MM-DD`.
+    pub date: &'static str,
+    /// Accepted divergences, one sentence each, under the same rules as
+    /// [`Verified::divergences`].
+    pub divergences: &'static [&'static str],
+}
+
+/// **Per-subsystem parity rows.** A row exists only once its subsystem was
+/// compared against the upstream C# at [`UPSTREAM_TAG`] (or the earlier tag
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
+/// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
+pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -849,6 +939,9 @@ pub struct Verified {
     /// written. An entry with divergences still counts as verified — the text
     /// is the published statement of what is *not* done.
     pub divergences: &'static [&'static str],
+    /// Keys of the [`VERIFIED_SUBSYSTEMS`] rows this operation relies on, whose
+    /// divergences apply here too and are not repeated in `divergences`.
+    pub refs: &'static [&'static str],
 }
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
@@ -868,7 +961,11 @@ pub struct Verified {
 /// - `tests/contract_superset.rs` checks every row is a [`REAL_ROUTES`]
 ///   operation with a well-formed `upstream_file`/`upstream_method`/`date`,
 ///   checks every [`VERIFIED_AGAINST_EARLIER_PIN`] entry is a distinct row with
-///   a tag other than [`UPSTREAM_TAG`], and prints `N / 412 operations
+///   a tag other than [`UPSTREAM_TAG`] dated before [`UPSTREAM_PIN_DATE`],
+///   checks every `refs` key names a [`VERIFIED_SUBSYSTEMS`] row (which obey
+///   the same rules), and — with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin
+///   checkout at [`UPSTREAM_COMMIT`] — checks each row's `upstream_file`
+///   exists there and contains `upstream_method`, and prints `N / 412 operations
 ///   deep-verified against <UPSTREAM_TAG>, plus M compared against an earlier
 ///   release` plus the per-controller table — that printout is the README
 ///   parity section. N moves when a row is written or re-checked, and when the
@@ -895,6 +992,7 @@ pub const VERIFIED: &[Verified] = &[
             VERSION_RESUME_DATA_DIVERGENCE,
             USER_DATA_RETIRED_KEYS_DIVERGENCE,
         ],
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -906,6 +1004,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -916,6 +1015,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -927,6 +1027,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -937,6 +1038,7 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -947,6 +1049,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_studios (item_values_with_counts)",
         date: "2026-10-19",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -958,6 +1061,89 @@ pub const VERIFIED: &[Verified] = &[
                push_order_expression DatePlayed)",
         date: "2026-10-19",
         divergences: RESUME_DIVERGENCES,
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Audio/{itemId}/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "GetLyrics",
+        ferrofin: "handlers/lyrics.rs get_lyrics → ferrofin-core lyric_manager.rs \
+               get_lyrics (the item's Lyric streams, LrcLyricParser then TxtLyricParser)",
+        date: "2026-10-19",
+        divergences: &[
+            "A Lyric stream whose file is gone (removed outside the server, before the next \
+         refresh) is skipped and the next stream read; upstream's File.ReadAllTextAsync \
+         throws and the request is a 500. Jellyfin bug not ported. The sidecar read is a \
+         blocking std::fs read on the runtime (gl-144).",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Audio/{itemId}/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "UploadLyrics",
+        ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
+               → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
+               try_save_to_files)",
+        date: "2026-10-19",
+        divergences: &[
+            "An upload with no Content-Length (a chunked body) is read and saved; upstream \
+         tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
+         uploaded\". Jellyfin bug not ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Audio/{itemId}/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "DeleteLyrics",
+        ferrofin: "handlers/lyrics.rs delete_lyrics (run_item_refresh) → ferrofin-core \
+               lyric_manager.rs delete_lyrics",
+        date: "2026-10-19",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Audio/{itemId}/RemoteSearch/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "SearchRemoteLyrics",
+        ferrofin: "handlers/lyrics.rs search_remote_lyrics → ferrofin-core lyric_manager.rs \
+               search_lyrics (search_request_for, search_request, search_provider)",
+        date: "2026-10-19",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "DownloadRemoteLyrics",
+        ferrofin: "handlers/lyrics.rs download_remote_lyrics (queue_high_priority_refresh) → \
+               ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
+               try_save_to_files)",
+        date: "2026-10-19",
+        divergences: &[
+            "A lyricId of only whitespace is a 404 (no provider owns it); upstream's \
+         ArgumentException.ThrowIfNullOrWhiteSpace makes it a 500. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Providers/Lyrics/{lyricId}",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "GetRemoteLyrics",
+        ferrofin: "handlers/lyrics.rs get_remote_lyrics → ferrofin-core lyric_manager.rs \
+               get_remote_lyrics (fetch_remote, parse_by_format)",
+        date: "2026-10-19",
+        divergences: &[],
+        refs: &[],
     },
 ];
 

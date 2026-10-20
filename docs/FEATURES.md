@@ -1,54 +1,45 @@
 # Feature status
 
+**Parity: 7 / 412 operations deep-verified against Jellyfin v12.2** (`ca0f16eb7c`), none
+owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
+`contract_superset` test prints the current line).
+**Latest live parity run: none yet.** The replay that sends the same jellyfin-web requests
+to Jellyfin and to Ferrofin and diffs the answers is still being built; its verdict appears
+here once a release branch has run it.
+
 Ferrofin implements the Jellyfin server API surface, not a subset of it. Every one of the
 **412 operations** in the vendored OpenAPI contract is wired to a real handler — there are
 **no `501` stubs**. What varies is verification depth and, for a handful of operations, how
 faithfully an edge case matches Jellyfin.
 
-These tiers were last derived from the v2 parity ledger, retired with the v2 suite on
-2026-09-02 (recoverable from git history). Verification tracking now lives in the source:
-`handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
-`crates/ferrofin-api/tests/contract_superset.rs`, where **"deep verified" means the
-Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
-equivalence** — the Jellyfin release each row was compared against is `UPSTREAM_TAG` /
-`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs` (the latest Jellyfin release,
-`v12.2`), except rows listed in `VERIFIED_AGAINST_EARLIER_PIN`. That record is early:
-**7 of 412 operations** carry a row today, all 7 compared against the earlier pin `v12.0-rc7`
-and owed a re-check against `v12.2`, so the tiers below remain the honest picture and
-the `VERIFIED` count is the one that will replace them as it fills in.
+**"Deep verified" means the Ferrofin implementation was compared against the upstream
+Jellyfin C# for behavioral equivalence.** The record lives in the source:
+`handlers::VERIFIED` (one row per operation) and `handlers::VERIFIED_SUBSYSTEMS` (one row per
+shared subsystem, which operation rows reference) beside `REAL_ROUTES`, validated by
+`crates/ferrofin-api/tests/contract_superset.rs`, which prints the line above
+(`cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`). The
+release compared against is `UPSTREAM_TAG` / `UPSTREAM_COMMIT` in
+`crates/ferrofin-api/src/handlers/mod.rs`, always the latest Jellyfin release; rows compared
+against an earlier pin are listed in `VERIFIED_AGAINST_EARLIER_PIN` until re-checked.
+
+That record is early, so the tiers below remain the broader picture until its count
+replaces them. They were last derived from the v2 parity ledger, retired with the v2 suite
+on 2026-09-02 (recoverable from git history), which diffed responses at runtime against
+Jellyfin 10.11.8: a weaker bar than the C# comparison above.
+
+Transliterated upstream unit tests are a second measure: `scripts/transliteration-coverage.py`,
+with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at `UPSTREAM_COMMIT`, prints per
+upstream test project the Ferrofin rstest cases that cite an upstream test next to that
+project's `[InlineData]` count (1,833 cases against 2,677 at v12.2, as of 2026-10-19).
 
 Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin
 12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
 evidence, not the parity number — it covers 28 requests and only the fields those requests
 happen to exercise.
 
-Headline as of the last v2 run — note this table uses the **retired v2** definition of
-"deep-verified" (response + read-back diffed clean at runtime), which is a different and
-weaker bar than the C#-comparison definition above, and is why its count is so much larger
-than the 7 rows `VERIFIED` holds:
-
-| | ops | |
-|---|---:|---|
-| Wired to a real handler (`REAL`) | **412 / 412** | 100% |
-| `501` / hollow stubs | **0** | none |
-| Deep-verified vs Jellyfin 10.11.8 | **241** | response + read-back diffed clean |
-| Classified divergence | **146** | intentional, Jellyfin-bug-avoiding, or open work |
-| Untested | **25** | awaiting a parity leg on the current tree |
-
-Deep-verified means the response body **and** the persisted read-back were diffed against a
-real `jellyfin/jellyfin:10.11.8` server on identical inputs and matched (for binary/asset
-routes, the bytes were compared). Most of the rest are classified: a difference exists and
-has been reviewed — usually because Ferrofin is correct where Jellyfin has a known bug
-(see the "don't port Jellyfin bugs" policy), because the difference is a documented,
-bounded simplification, or because it is named open work still to be ported.
-
-The untested count is ops the harness had no measurement for. It is not a claim that
-they are broken, and not a claim that they are fine — it is the ledger refusing to carry a
-result forward from a tree that is no longer this one.
-
 ## Implemented & verified
 
-Deep-verified against a real Jellyfin server:
+Checked against a real Jellyfin server by the retired v2 runtime diff:
 
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.

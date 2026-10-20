@@ -44,8 +44,8 @@ from.
 
 1. **Ensure the branch is green** — the `CI` workflow (lint, tests, per-crate coverage gate)
    must have succeeded on the commit you are releasing; the workflow refuses otherwise. `main`
-   gets CI on every push. A `release/vX.Y.Z` head gets it through the release PR
-   (release branch → `main`), so keep that PR open.
+   and `release/vX.Y.Z` get CI on every push, and the workflow reads that push run. The
+   release PR (release branch → `main`) shows the same run's checks and runs no CI of its own.
 2. **Freeze and measure the release branch.** PRs are not benchmarked individually, so this
    is the only performance gate.
 

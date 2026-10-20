@@ -31,6 +31,13 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
+use lofty::TextEncoding;
+use lofty::config::WriteOptions;
+use lofty::id3::v2::{
+    BinaryFrame, ExtendedTextFrame, Frame, FrameId, Id3v2Tag, SyncTextContentType,
+    SynchronizedTextFrame, TimestampFormat, UnsynchronizedTextFrame,
+};
+use lofty::tag::TagExt;
 use uuid::Uuid;
 
 /// `MediaStreamType.Lyric` as `MediaStreamInfos.StreamType` stores it.
@@ -154,11 +161,21 @@ async fn harness(tmp: &Path) -> Harness {
 }
 
 async fn harness_with(tmp: &Path, options: LibraryOptions) -> Harness {
+    // Not a readable FLAC: the lyric pick falls back to the probe's tags.
+    harness_track(tmp, options, "01 - Song.flac", b"fLaC").await
+}
+
+async fn harness_track(
+    tmp: &Path,
+    options: LibraryOptions,
+    file_name: &str,
+    bytes: &[u8],
+) -> Harness {
     let media = tmp.join("music");
     let album = media.join("Artist").join("Album");
     std::fs::create_dir_all(&album).expect("album dir");
-    let track = album.join("01 - Song.flac");
-    std::fs::write(&track, b"fLaC").expect("track");
+    let track = album.join(file_name);
+    std::fs::write(&track, bytes).expect("track");
     let meta_root = tmp.join("metadata").join("library");
 
     let db = Database::connect_in_memory().await.expect("connect");
@@ -327,6 +344,47 @@ async fn lyric_sidecars_become_the_tracks_lyric_stream_and_changes_reprobe_it() 
     assert!(h.lyric_files().await.is_empty());
 }
 
+/// The refresh `LyricsController.UploadLyrics` queues after saving a lyric
+/// (`QueueRefresh` with default options): the track's own refresh sees the
+/// new sidecar (`ProbeProvider.HasChanged`'s lyric arm) and records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_records_a_lyric_saved_beside_the_track() {
+    use ferrofin_core::{ScanCancel, ScanPasses, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert!(h.lyric_streams().await.is_empty());
+
+    let album = h.track.parent().expect("album");
+    std::fs::write(album.join("01 - Song.lrc"), "[00:01.00]hello").expect("upload");
+    // As the library manager queues it (`ScanRequest::item_refresh`).
+    let target = ScanTarget::Items(vec![h.track.to_string_lossy().into_owned()]);
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    h.scanner
+        .scan_target(
+            &target,
+            ScanRun::new(
+                &MetadataRefreshOptions::default(),
+                &none,
+                &ScanCancel::new(),
+            )
+            .with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("item refresh");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+    assert_eq!(h.lyric_streams().await.len(), 1);
+}
+
 /// An ID3 `USLT` frame, as ffprobe reports it.
 const USLT: (&str, &str) = ("lyrics-eng", "[00:01.00]Hello\r\n[00:02.5]World");
 /// What `FetchDataFromTags` saves for [`USLT`]: ATL's LRC rendering.
@@ -493,4 +551,154 @@ async fn a_lyric_that_cannot_be_written_fails_the_probe_and_is_retried() {
     h.scanner.scan_all().await.expect("rescan");
     assert_eq!(h.probe.take(), ["01 - Song.flac"]);
     assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+}
+
+/// A real MP3: an ID3v2 tag holding `frames` in this order, then three silent
+/// MPEG-1 Layer III frames, so the file's own tags can be read.
+fn mp3(frames: Vec<Frame<'static>>) -> Vec<u8> {
+    let mut tag = Id3v2Tag::new();
+    for frame in frames {
+        let _ = tag.insert(frame);
+    }
+    let mut bytes = Vec::new();
+    tag.dump_to(&mut bytes, WriteOptions::default())
+        .expect("dump tag");
+    for _ in 0..3 {
+        // 128 kbit/s at 44.1 kHz: a 417-byte frame, header included.
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        bytes.extend(std::iter::repeat_n(0u8, 413));
+    }
+    bytes
+}
+
+fn uslt(language: [u8; 3], text: &str) -> Frame<'static> {
+    Frame::UnsynchronizedText(UnsynchronizedTextFrame::new(
+        TextEncoding::UTF8,
+        language,
+        "",
+        text.to_owned(),
+    ))
+}
+
+/// A `SYLT` frame (millisecond timestamps), stored as lofty reads it.
+fn sylt(lines: &[(u32, &str)]) -> Frame<'static> {
+    let frame = SynchronizedTextFrame::new(
+        TextEncoding::UTF8,
+        *b"eng",
+        TimestampFormat::MS,
+        SyncTextContentType::Lyrics,
+        None,
+        lines.iter().map(|(t, s)| (*t, (*s).to_owned())).collect(),
+    );
+    Frame::Binary(BinaryFrame::new(
+        FrameId::new("SYLT").expect("id"),
+        frame.as_bytes(WriteOptions::default()).expect("sylt"),
+    ))
+}
+
+/// The `TXXX` frame ffmpeg writes for a `lyrics` key (described `USLT`),
+/// which ffprobe reports as `lyrics`.
+fn txxx_lyrics(text: &str) -> Frame<'static> {
+    Frame::UserText(ExtendedTextFrame::new(
+        TextEncoding::UTF8,
+        "USLT".to_owned(),
+        text.to_owned(),
+    ))
+}
+
+/// Scans a library holding one MP3 with these ID3v2 frames (ffprobe
+/// reporting `probe_tags`) and returns the `.lrc` saved for it, if any.
+async fn saved_lyrics_for(
+    frames: Vec<Frame<'static>>,
+    probe_tags: &[(&str, &str)],
+) -> Option<String> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness_track(
+        tmp.path(),
+        LibraryOptions::default(),
+        "01 - Song.mp3",
+        &mp3(frames),
+    )
+    .await;
+    h.probe.set_tags(probe_tags);
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.mp3"]);
+    let saved = std::fs::read_to_string(h.metadata_folder().await.join("01 - Song.lrc")).ok();
+    if saved.is_some() {
+        assert_eq!(
+            h.lyric_streams().await,
+            [(1, "01 - Song.lrc".to_owned(), None)]
+        );
+    }
+    saved
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sylt_only_track_saves_its_synchronised_lyrics_as_lrc() {
+    // ffprobe reports no tag for a `SYLT` frame; the file's own tag has it.
+    let saved = saved_lyrics_for(
+        vec![sylt(&[(1_000, "Hello"), (65_250, "\nWorld")])],
+        &[("title", "Song")],
+    )
+    .await;
+    // ATL skips the newline a SYLT editor puts before a line.
+    assert_eq!(
+        saved.as_deref(),
+        Some("\n[00:01.00]Hello\n[01:05.25]World\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_uslt_languages_save_the_first_in_file_order() {
+    // ffprobe's tag map sorts `lyrics-deu` first; the file has `eng` first.
+    let saved = saved_lyrics_for(
+        vec![
+            uslt(*b"eng", "English words"),
+            uslt(*b"deu", "Deutsche Worte"),
+        ],
+        &[
+            ("lyrics-eng", "English words"),
+            ("lyrics-deu", "Deutsche Worte"),
+        ],
+    )
+    .await;
+    assert_eq!(saved.as_deref(), Some("English words"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn txxx_lyrics_are_still_saved_an_accepted_divergence() {
+    // Jellyfin's ATL reads a `TXXX` lyric frame as a custom field and saves nothing;
+    // Ferrofin keeps the lyrics the user has (owner decision D3).
+    let saved = saved_lyrics_for(
+        vec![txxx_lyrics("Custom field words")],
+        &[("lyrics", "Custom field words")],
+    )
+    .await;
+    assert_eq!(saved.as_deref(), Some("Custom field words"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn txxx_lyrics_never_win_over_a_uslt_frame() {
+    let saved = saved_lyrics_for(
+        vec![txxx_lyrics("[00:01.00]Custom"), uslt(*b"eng", "Real words")],
+        &[("lyrics", "[00:01.00]Custom"), ("lyrics-eng", "Real words")],
+    )
+    .await;
+    assert_eq!(saved.as_deref(), Some("Real words"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_file_falls_back_to_the_probes_tags() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness_track(
+        tmp.path(),
+        LibraryOptions::default(),
+        "01 - Song.mp3",
+        b"ID3\x04\x00\x00\x7f\x7f\x7f\x7fnot a tag",
+    )
+    .await;
+    h.probe.set_tags(&[USLT]);
+    h.scanner.scan_all().await.expect("scan");
+    let saved = h.metadata_folder().await.join("01 - Song.lrc");
+    assert_eq!(std::fs::read_to_string(&saved).expect("saved lrc"), SAVED);
 }

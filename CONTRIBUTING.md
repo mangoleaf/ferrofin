@@ -33,6 +33,16 @@ errors in CI). New code needs tests: Ferrofin ports Jellyfin behavior faithfully
 so where upstream ships xUnit `[Theory]/[InlineData]` cases, transliterate them
 into `rstest` `#[case]` tests — the C# expected values are the oracle.
 
+**The parity record is part of done.** A change to a handler or a core path either
+adds or updates the parity row it touches, after comparing that code against the
+upstream Jellyfin C# at `UPSTREAM_TAG`, or says in the PR why the behaviour it touches
+is unchanged. The row is the operation's `handlers::VERIFIED` row, or the
+`handlers::VERIFIED_SUBSYSTEMS` row of a shared subsystem the change sits in (query
+translation, DTO fields, user data, access filtering, images, paging and sort), which
+operation rows reference through `refs`. A re-checked row leaves
+`VERIFIED_AGAINST_EARLIER_PIN` (or `VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`). Live
+parity runs and benchmark shape checks are supporting evidence; they never add a row.
+
 **Coverage gate — ≥80% line coverage, per crate:**
 
 ```bash

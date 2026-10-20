@@ -42,6 +42,8 @@ reqwest.workspace = true
 sha2.workspace = true
 # The photo embedded-information provider (EXIF) runs during the scan.
 ferrofin-drawing.workspace = true
+# Embedded lyrics (SYLT, file order) for the scan's lyric pick.
+lofty.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

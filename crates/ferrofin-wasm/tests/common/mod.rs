@@ -769,7 +769,7 @@ impl ferrofin_traits::stubs::LyricManager for StubLyrics {
         &self,
         item_id: Uuid,
         format: &str,
-        lyrics: &str,
+        lyrics: &[u8],
     ) -> Result<Option<LyricDto>, ServiceError> {
         self.writes.lock().unwrap().push((
             "lyric".into(),
