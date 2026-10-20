@@ -290,8 +290,8 @@ EOS
   # so the fresh oracle really is a 12.2 image's answers (not the non-existent :12.2-fresh tag).
   # The full build_oracle path needs a live Jellyfin (readiness probe + smoke.sh), so it is
   # exercised by the live build-fixtures.sh run in the Adoption workflow, not offline here.
-  grep -qE 'local version=\$1 source=\$FIXTURES/\$2 port=\$3 image=\$4' "$ADOPTION/build-fixtures.sh"
-  grep -qE 'docker run .*"\$image"' "$ADOPTION/build-fixtures.sh"
+  grep -qF "local version=\$1 source=\$FIXTURES/\$2 port=\$3 image=\$4" "$ADOPTION/build-fixtures.sh"
+  grep -qF "\"\$image\"" "$ADOPTION/build-fixtures.sh"
 }
 
 @test "run.sh: the fresh-install row is skipped, named, when its own oracle is missing" {
@@ -452,7 +452,11 @@ EOS
       INSERT INTO t VALUES (1); ANALYZE; CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO s DEFAULT VALUES;'
   done
   sqlite3 fixtures/jellyfin-12.2-from-12/data/jellyfin.db 'CREATE INDEX extra ON t(a);'
+  # Every oracle present (the fresh-install one included) so build_oracle early-returns and the
+  # run touches no docker; the fresh fixture is left out of the schema diff, so it needs none of
+  # the t/s tables above.
   smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  smoke fixtures/oracle/smoke-jellyfin-12.2-fresh.txt 120
   run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
   [ "$status" -eq 0 ]
   [[ "$output" == *"jellyfin-12.2-schema.sql: 4 CREATE statements"* ]]
@@ -460,7 +464,8 @@ EOS
   [[ "$output" == *"jellyfin-12.2-from-12: schema DIFFERS"* ]]
   [[ "$output" != *"unexpected docker"* ]]
   grep -q 'WHERE a IS NOT NULL' fixtures/jellyfin-12.2-schema.sql
-  run grep -cE 'sqlite_stat1|sqlite_sequence' fixtures/jellyfin-12.2-schema.sql
+  # dump_schema strips every sqlite_stat* (stat1, and stat4 on a STAT4 build) and sqlite_sequence.
+  run grep -cE 'sqlite_stat[0-9]+|sqlite_sequence' fixtures/jellyfin-12.2-schema.sql
   [ "$output" = 0 ]
 }
 

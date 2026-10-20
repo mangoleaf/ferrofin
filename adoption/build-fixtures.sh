@@ -13,7 +13,7 @@
 #   oracle/smoke-jellyfin-12.2.txt smoke.sh against Jellyfin 12.2 on a throwaway copy of 12.2-from-121
 #   oracle/smoke-jellyfin-12.2-fresh.txt  smoke.sh against Jellyfin 12.2 on a copy of 12.2-fresh
 #   oracle/user.txt                the account both oracles (and run.sh) probe as
-#   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat1/sqlite_sequence,
+#   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat*/sqlite_sequence,
 #                                  rewritten every run; the other 12.2 routes are diffed against it
 # Existing fixtures and oracles are kept; synthetic.py refuses fixtures from an older recipe, so
 # build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
@@ -93,7 +93,10 @@ build_oracle() { # build_oracle <label> <fixture> <port> <image> — that image'
 }
 
 dump_schema() { # dump_schema <fixture dir> — the schema without SQLite's own bookkeeping tables
-  sqlite3 -readonly "$1/data/jellyfin.db" .schema | grep -v -E '^CREATE TABLE (sqlite_stat1|sqlite_sequence)'
+  # ANALYZE writes sqlite_stat1 and, on a build with SQLITE_ENABLE_STAT4 (Arch, Fedora, …),
+  # sqlite_stat4 too; strip every sqlite_stat* and sqlite_sequence. Real fixtures never ANALYZE,
+  # so this changes nothing there; it keeps the schema pin stable across host sqlite builds.
+  sqlite3 -readonly "$1/data/jellyfin.db" .schema | grep -v -E '^CREATE TABLE (sqlite_stat[0-9]+|sqlite_sequence)'
 }
 
 build_oracle 12.1 jellyfin-12.1-from-12 18095 jellyfin/jellyfin:12.1
