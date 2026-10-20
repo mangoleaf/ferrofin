@@ -1274,6 +1274,12 @@ pub async fn build_app_state(
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().dummy_chapter_duration
     })
+    // "Display specials within seasons" decides a season's episodes when its
+    // premiere date is derived from them. Read live, once per season refresh.
+    .with_display_specials_within_seasons({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().display_specials_within_seasons
+    })
     // The saved `xbmcmetadata` options (ReleaseDateFormat, UserId) every NFO
     // sidecar is parsed with, re-read when the dashboard changes the file.
     .with_nfo_configuration({

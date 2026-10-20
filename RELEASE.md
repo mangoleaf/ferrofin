@@ -69,6 +69,11 @@ from.
      `ferrofin:bench` before each run, checks that the run measured the intended image, and
      restores the tag at the end. A failed run stops the session. It is never retried: start
      a new session.
+   - **Oracle pin.** Before the first run, the session checks that `UPSTREAM_TAG` (the
+     Jellyfin oracle, pinned by digest in `bench/testdata/jellyfin-image.txt`) is the latest
+     Jellyfin release. It refuses to start when a newer release exists or the lookup fails
+     (it needs network access to GitHub). Moving the pin is then a work item: move
+     `UPSTREAM_TAG`, pin that release's image and prepare the corpus again.
    - **Wall time.** Not yet measured on the shared host. The fixed waits alone add up to
      8 minutes per run: four 30 s settles (after startup and before each window and the
      steady phase), two 30 s warm-ups with 120 s windows, and the 60 s steady window. Six
@@ -112,8 +117,9 @@ from.
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
    that commit and runs the full adoption validation in
-   [`adoption/README.md`](adoption/README.md): `adoption/run.sh` **and** the synthetic
-   preservation matrix, all ten paths. Every push to `release/**` starts it; for a patch
+   [`adoption/README.md`](adoption/README.md): `adoption/run.sh` (eleven paths, including the
+   fresh-install 12.2 row) **and** the synthetic preservation matrix (ten paths; the seedless
+   fresh-install row is validated by `run.sh` alone). Every push to `release/**` starts it; for a patch
    release from `main`, start it with **Actions → Adoption → Run workflow** on `main`. Keep
    the run's link for step 5. A manual run of the same commands is for debugging only and
    does not replace the CI run. An adoption failure is never waived; fix it, which means

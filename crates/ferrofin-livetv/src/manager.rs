@@ -8787,6 +8787,44 @@ mod tests {
         );
     }
 
+    /// The default channel order follows Jellyfin 12's `CreateSortName`
+    /// (`{0:0000000000.00000}`): six-digit numbers sort numerically, and
+    /// subchannels that agree to one decimal still sort by number.
+    #[tokio::test]
+    async fn channels_sort_by_number_like_jellyfin_12() {
+        let m3u = "#EXTM3U\n\
+            #EXTINF:-1 tvg-id=\"a\" tvg-chno=\"100010\",Hundred Ten\nhttp://tuner/a\n\
+            #EXTINF:-1 tvg-id=\"b\" tvg-chno=\"10002\",Ten Two\nhttp://tuner/b\n\
+            #EXTINF:-1 tvg-id=\"c\" tvg-chno=\"10001\",Ten One\nhttp://tuner/c\n\
+            #EXTINF:-1 tvg-id=\"d\" tvg-chno=\"4.12\",Alpha\nhttp://tuner/d\n\
+            #EXTINF:-1 tvg-id=\"e\" tvg-chno=\"4.11\",Zulu\nhttp://tuner/e\n";
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u.to_owned());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let names: Vec<String> = mgr
+            .get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
+            .await
+            .expect("channels")
+            .items
+            .into_iter()
+            .filter_map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["Zulu", "Alpha", "Ten One", "Ten Two", "Hundred Ten"],
+            "4.11 < 4.12 < 10001 < 10002 < 100010"
+        );
+    }
+
     /// The single-channel path keeps every requested field (no `RemoveFields`)
     /// and carries the `ExternalServiceId` provider id.
     #[tokio::test]

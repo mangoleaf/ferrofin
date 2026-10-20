@@ -34,19 +34,27 @@ TABLES = (
 # Columns dropped before hashing, with the reason.
 IGNORED = {
     "ItemValues": ("CleanValue",),  # 0031 re-derives keys that matched the previous derivation
-    # A client that authenticates again from the same device replaces its row: a new Id, token,
-    # creation date and IsActive (as Jellyfin does), and every request re-announces the client.
-    # What stays is whose device it is (KEYS), so a lost device still fails.
-    "Devices": ("Id", "AccessToken", "IsActive", "DateCreated", "AppName", "AppVersion", "DeviceName",
-                "DateModified", "DateLastActivity"),
+    # Every authenticated request re-announces these, so they move on any device the harness
+    # touches. The device's own identity (Id, token, activation, creation date) is kept and
+    # compared below, so a reset token or a deactivated device fails.
+    "Devices": ("AppName", "AppVersion", "DeviceName", "DateModified", "DateLastActivity"),
     "ApiKeys": ("DateLastActivity",),
 }
+# Dropped only for the DeviceIds the harness itself logs in from (reauthenticated_devices):
+# authenticating again from one replaces its row with a new Id, token, IsActive and creation
+# date, as Jellyfin does. On every other device these are compared, so an adoption bug that
+# reset a token or deactivated a device — logging that client out — fails the check.
+REAUTH_VOLATILE = ("Id", "AccessToken", "IsActive", "DateCreated")
 # 0007 rewrites ISO 'T' timestamps to the space form; both spell one instant.
 TIMESTAMPS = {
     "ActivityLogs": ("DateCreated",),
     "ApiKeys": ("DateCreated",),
     "Chapters": ("ImageDateModified",),
+    "Devices": ("DateCreated",),  # compared on devices the harness did not re-authenticate
 }
+# Bumped when the baseline's shape changes so a stale file is rejected, not mis-read. 2: rows
+# sharing a key became a list (multiset).
+SNAPSHOT_VERSION = 2
 KEYS = {"Devices": ("UserId", "DeviceId")}
 # Tables whose ItemId names a library item. The rehome repair re-keys a local alternate version
 # to the id its primary's type derives, as Jellyfin 12.2 does, so an item is identified by its
@@ -75,6 +83,17 @@ def digest(row):
     return hashlib.sha256(json.dumps(row, sort_keys=True, default=repr).encode()).hexdigest()
 
 
+def reauthenticated_devices(users, passwordless):
+    """The DeviceIds the synthetic runner authenticates from after taking the baseline, whose
+    device rows it legitimately replaces: ``synthetic_fixture.Api.login`` logs in from
+    ``synthetic-login-<user>`` and ``user_accounts.snapshot`` from ``account-login-<user>`` for
+    every user and the passwordless account. ``run.sh`` authenticates from none of these (it
+    replays a stored token), so it compares every device's full row."""
+    return {"synthetic-login-" + name for name in users} | {
+        "account-login-" + name for name in (*users, passwordless)
+    }
+
+
 def identities(conn):
     """{item id: 'path:<Path>'} for every owned item whose path no other item shares."""
     items = [(normalize(item), path, normalize(owner))
@@ -84,8 +103,9 @@ def identities(conn):
             if path and counts[path] == 1 and owner and owner not in NO_OWNER}
 
 
-def table_rows(conn, table, only=None, identity=None, users=None):
-    """(columns, {key: row hash}) of one table, normalised; `only` limits the hashed columns."""
+def table_rows(conn, table, only=None, identity=None, users=None, reauthenticated=frozenset()):
+    """(columns, {key: sorted row hashes}) of one table, normalised; `only` limits the hashed
+    columns. Rows that share a key are kept as a multiset so losing one of them still fails."""
     info = list(conn.execute(f'PRAGMA table_info("{table}")'))
     if not info:
         raise CheckError(f"table {table} is missing")
@@ -98,6 +118,9 @@ def table_rows(conn, table, only=None, identity=None, users=None):
         if table in USER_OWNED and record["UserId"] is not None and normalize(record["UserId"]) not in users:
             continue
         row = {name: normalize(record[name]) for name in columns}
+        if table == "Devices" and record["DeviceId"] in reauthenticated:
+            for name in REAUTH_VOLATILE:
+                row.pop(name, None)
         if table in ITEM_KEYED and identity and "ItemId" in row:
             row["ItemId"] = identity.get(row["ItemId"], row["ItemId"])
         for name in TIMESTAMPS.get(table, ()):
@@ -108,20 +131,24 @@ def table_rows(conn, table, only=None, identity=None, users=None):
             except ValueError:
                 pass  # not a date: hashed as stored, so any change to it still shows
         key = "/".join(str(row[name]) for name in keys)
-        rows[key] = digest(row)
-    return columns, rows
+        rows.setdefault(key, []).append(digest(row))
+    return columns, {key: sorted(digests) for key, digests in rows.items()}
 
 
-def snapshot(db, baseline=None):
-    """Every table's rows. With a baseline, only the columns it holds (0032 adds some)."""
+def snapshot(db, baseline=None, reauthenticated=frozenset()):
+    """Every table's rows. With a baseline, only the columns it holds (0032 adds some).
+    `reauthenticated` names the DeviceIds the harness logs in from (reauthenticated_devices);
+    on a path that re-authenticates, baseline and comparison snapshots must pass the same set."""
+    reauthenticated = frozenset(reauthenticated)
     with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         identity = identities(conn)
         users = {normalize(user) for (user,) in conn.execute('SELECT "Id" FROM "Users"')}
-        return {"version": 1, "tables": {
+        return {"version": SNAPSHOT_VERSION, "tables": {
             table: dict(zip(("columns", "rows"), table_rows(
-                conn, table, baseline and baseline["tables"][table]["columns"], identity, users))) for table in TABLES}}
+                conn, table, baseline and baseline["tables"][table]["columns"], identity, users,
+                reauthenticated))) for table in TABLES}}
 
 
 def compare(before, after):
@@ -133,11 +160,20 @@ def compare(before, after):
         if gone:
             failures.append(f"{table} lost column {', '.join(gone)}")
             continue
-        for key, value in was["rows"].items():
-            if key not in now["rows"]:
+        for key, before_digests in was["rows"].items():
+            after_digests = now["rows"].get(key)
+            if after_digests is None:
                 failures.append(f"{table} row {key} is gone")
-            elif now["rows"][key] != value:
-                failures.append(f"{table} row {key} changed")
+            elif len(before_digests) == 1 and len(after_digests) == 1:
+                if before_digests[0] != after_digests[0]:
+                    failures.append(f"{table} row {key} changed")
+            else:
+                # Rows sharing a key are a multiset: a lost or changed one leaves a digest
+                # the after side can no longer account for.
+                lost = Counter(before_digests) - Counter(after_digests)
+                if lost:
+                    failures.append(
+                        f"{table} row {key}: {sum(lost.values())} of {len(before_digests)} rows sharing its key gone or changed")
     return failures
 
 
@@ -154,6 +190,8 @@ def main(argv=None):
                 json.dump(snapshot(args.db), output, sort_keys=True)
             return 0
         before = json.loads(Path(args.baseline).read_text())
+        if before.get("version") != SNAPSHOT_VERSION:
+            raise CheckError("table baseline was written by an incompatible version; regenerate it")
         failures = compare(before, snapshot(args.db, before))
         for line in failures:
             print(line)
