@@ -37,7 +37,7 @@ The benchmark reference is the Jellyfin release named by the C# source-parity pi
 (`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
 in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
 Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab`) refuses to start and `run.sh` warns and
+fails, a release-gate session (`gate.py aa|ab|ramp`) refuses to start and `run.sh` warns and
 continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
 and digest. A run that boots Jellyfin also stops unless the pinned image reports the
 `UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.

@@ -101,21 +101,25 @@ from.
    A `[cells."…"]` entry in `gate.toml` overrides its row for a single cell. Change the table
    only by a reviewed commit, after re-measuring the noise floor with
    `python3 bench/gate.py aa <image>` (six runs of one image), and keep this table in step
-   with it.
+   with it. The `ramp` row has no A/A: its values are re-derived after the first two ramps
+   (see *Throughput ceiling*).
 
    **What blocks.** A gated cell that *regressed*, or one that is *not comparable* because a
    side's evidence is flagged, a side has missing values, or the candidate's responses
    differ from the previous release's. Either blocks the release until it is fixed or the
    maintainer accepts it. Gated cells are the screen and endpoint p50s at the unloaded and
-   loaded levels, plus peak and steady memory, and the throughput ceiling when the ramp was
-   run. The stress level and endpoint cells whose medians are both under 1 ms are reported
+   loaded levels, plus peak and steady memory, and the throughput ceiling of the ramp
+   session below, which blocks whenever it is run. The stress level and endpoint cells whose medians are both under 1 ms are reported
    but never block.
 
-   **Throughput ceiling.** Measure it in the same window as the gate:
+   **Throughput ceiling.** Measure it in the same window as the gate. It is a separate
+   session (output in `bench/runs/gate-ramp-<date>-<time>/`, with the same oracle-pin
+   refusal and the same rule that a failed run stops the session):
    `python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`
    ([`bench/README.md`](bench/README.md#throughput-ceiling-the-saturation-ramp)). Each run is
    `bench/run.sh --servers ferrofin --only ramp`, which steps the loaded mix up from 25
-   screens/s and reports the last rate whose worst-screen p95 stayed within 100 ms. The
+   screens/s and reports the last rate whose worst-screen p95 stayed within 100 ms with no
+   failed request and no dropped load-client iteration. The
    ceiling is judged by the `ramp` row on the same rule as the other cells, with higher
    being better: it regressed when the candidate's median ceiling is below the previous
    release's by more than 15 % **and** 5 screens/s, in at least 2 of the 3 pairs. A ramp
@@ -148,7 +152,7 @@ from.
 4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
    Watch it finish, then verify (below).
 5. **Record the results** after the tag, so the record never moves the frozen head: attach
-   the benchmark gate's `report.md` to the release PR (release branch → `main`), or to the
+   the benchmark gate's `report.md` (and the ramp session's, when it was run) to the release PR (release branch → `main`), or to the
    GitHub Release for a patch release from `main`, and update the adoption test record in
    `adoption/README.md` with the link to the green `Adoption` run from step 2.
    After a patch release from `main`, merge `main` into the open release branch so the fix
