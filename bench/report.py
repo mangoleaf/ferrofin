@@ -1342,7 +1342,7 @@ sup.fn{margin-left:3px}sup.fn a{color:var(--flag);font-weight:600;text-decoratio
 ol.notes{font-size:13px;color:var(--muted);max-width:90ch;padding-left:22px}
 ol.notes li{margin:8px 0;overflow-wrap:anywhere}ol.notes li:target{color:var(--ink);font-weight:500}
 ol.notes .src{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);opacity:.85;margin-top:2px}
-td.verdict{font-weight:600;white-space:nowrap}td.verdict.regressed{color:var(--bad)}td.verdict.improved{color:var(--good)}td.verdict.within-noise{color:var(--muted);font-weight:400}
+td.verdict{font-weight:600;white-space:nowrap}td.verdict.regressed{color:var(--bad)}td.verdict.improved{color:var(--good)}td.verdict.within-noise{color:var(--muted);font-weight:400}td.verdict.not-comparable{color:var(--flag);white-space:normal}
 """
 
 
@@ -1557,15 +1557,17 @@ def run_list(runs, noun):
     return html.escape(f"{len(runs)} {noun}{'s' if len(runs) != 1 else ''}: {names}")
 
 
-VERDICTS = ("regressed", "within noise", "improved")
+#: The A/B gate's verdicts, in the order the viewer lists them: the two that block first.
+VERDICTS = ("regressed", "not comparable", "within noise", "improved")
 
 
 def load_verdicts(runs):
     """The A/B gate's verdicts, from the first of `runs` holding an `ab-verdicts.json`, else
     None. The file is `{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
-    "delta_pct"}]}` with `verdict` one of `VERDICTS` (the A/B driver writes it; the
-    cell's `unit` (a string) and numbers are optional). A file that does not say so is an error:
-    a gate verdict that silently vanished from the report would read as a pass."""
+    "delta_pct", "reason"}]}` with `verdict` one of `VERDICTS` (`gate.py` writes it into each
+    candidate run of an A/B; the cell's `unit` and `reason` (strings) and numbers are optional).
+    A file that does not say so is an error: a gate verdict that silently vanished from the
+    report would read as a pass."""
     for run in runs:
         path = os.path.join(run, "ab-verdicts.json")
         if not os.path.isfile(path):
@@ -1574,25 +1576,28 @@ def load_verdicts(runs):
         cells = doc.get("cells") if isinstance(doc, dict) else None
         if not isinstance(cells, list) or not all(
                 isinstance(c, dict) and isinstance(c.get("cell"), str) and c.get("verdict") in VERDICTS
-                and isinstance(c.get("unit", ""), str) for c in cells):
+                and isinstance(c.get("unit", ""), str) and isinstance(c.get("reason", ""), str) for c in cells):
             raise ValueError(f"{path}: expected {{\"cells\": [{{\"cell\": name, \"verdict\": one of {', '.join(VERDICTS)}}}]}}")
         return cells
     return None
 
 
 def verdict_html(cells):
-    """The A/B gate section: the tally, then one row per cell, regressions first."""
+    """The A/B gate section: the tally, then one row per cell, the blocking ones first."""
     e = html.escape
     tally = Counter(c["verdict"] for c in cells)
     head = ", ".join(f"{tally[v]} {v}" for v in VERDICTS) if cells else ""
     finite = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
     num = lambda v, unit: f"{sig3(v)} {e(unit or '')}".strip() if finite(v) else "—"
     rows = "".join(
-        f"<tr><th>{e(c['cell'])}</th><td class='verdict {c['verdict'].replace(' ', '-')}'>{c['verdict']}</td>"
+        f"<tr><th>{e(c['cell'])}</th><td class='verdict {c['verdict'].replace(' ', '-')}'>{c['verdict']}"
+        f"{': ' + e(c['reason']) if c.get('reason') else ''}</td>"
         f"<td class='num'>{num(c.get('baseline'), c.get('unit'))}</td><td class='num'>{num(c.get('candidate'), c.get('unit'))}</td>"
         f"<td class='num'>{format(c['delta_pct'], '+.1f') + '%' if finite(c.get('delta_pct')) else '—'}</td></tr>"
         for c in sorted(cells, key=lambda c: (VERDICTS.index(c["verdict"]), c["cell"])))
-    return (f"<h2>A/B gate — {head or 'no cells'}</h2><p class='lede'>The verdict of each gated cell, regressions first; "
+    return (f"<h2>A/B gate — {head or 'no cells'}</h2><p class='lede'>The verdict of each gated cell, the blocking ones first: "
+            "a regressed or not comparable cell blocks the release. Baseline and candidate are medians over all of "
+            "the gate session's runs of each image, so they can differ from the numbers above; "
             "<code>bench/gate.toml</code> holds the thresholds the verdicts were judged by.</p>"
             "<div class='scroll'><table><thead><tr><th>Cell</th><th>Verdict</th><th>Baseline</th><th>Candidate</th><th>Change</th></tr></thead>"
             f"<tbody>{rows}</tbody></table></div>")
@@ -1705,14 +1710,19 @@ PICKER_CSS = """
 
 
 def list_runs(runs_dir):
-    """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date."""
+    """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date.
+    The runs of a `gate.py` session (a directory holding `gate.json`) are one level down and
+    are named `<session>/<run>`."""
     out = []
-    for name in os.listdir(runs_dir):
-        d = os.path.join(runs_dir, name)
-        meta = load(os.path.join(d, "run.json"))
-        if isinstance(meta, dict):
-            srv = [k for k, _ in SERVERS if os.path.isdir(os.path.join(d, k))]
-            out.append((meta.get("date", ""), name, f"{name}  ·  {meta.get('date', '')[:16].replace('T', ' ')}  ·  {meta.get('sha', '?')}  ·  {', '.join(srv)}"))
+    for session in os.listdir(runs_dir):
+        top = os.path.join(runs_dir, session)
+        nested = os.path.isfile(os.path.join(top, "gate.json"))
+        for name in ([f"{session}/{sub}" for sub in os.listdir(top)] if nested else [session]):
+            d = os.path.join(runs_dir, name)
+            meta = load(os.path.join(d, "run.json"))
+            if isinstance(meta, dict):
+                srv = [k for k, _ in SERVERS if os.path.isdir(os.path.join(d, k))]
+                out.append((meta.get("date", ""), name, f"{name}  ·  {meta.get('date', '')[:16].replace('T', ' ')}  ·  {meta.get('sha', '?')}  ·  {', '.join(srv)}"))
     return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
 
 
@@ -1852,8 +1862,8 @@ def handle(target, roots):
         return status, HTML, text.encode("utf-8")
 
     keys = [h[0] for h in HARNESSES]
-    if parts[0] == "report" and len(parts) == 3 and parts[1] in keys:
-        harness, name = parts[1], parts[2]
+    if parts[0] == "report" and len(parts) >= 3 and parts[1] in keys:
+        harness, name = parts[1], "/".join(parts[2:])  # a gate session's run is `<session>/<run>`
         if name not in {n for n, _ in discover(harness, roots.get(harness))}:
             return reply(404, page_html("Not found", "<h1>No such run</h1>"))
         if harness == "benchmark":
