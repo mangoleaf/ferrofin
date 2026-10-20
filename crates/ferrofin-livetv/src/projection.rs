@@ -250,16 +250,26 @@ pub fn channel_media_type(channel_type: &str) -> &'static str {
     }
 }
 
-/// Port of `LiveTvChannel.CreateSortName`: a parseable number pads to
-/// `00000.0` form (`"1"` → `"00001.0-Name"`), an unparseable one is used
-/// verbatim (`"A1"` → `"A1-Name"`).
+/// Port of Jellyfin 12's `LiveTvChannel.CreateSortName`: a parseable number
+/// pads to `0000000000.00000` form (`"1"` → `"0000000001.00000-Name"`), so
+/// six-digit numbers and two-decimal subchannels sort numerically; an
+/// unparseable one is used verbatim (`"A1"` → `"A1-Name"`).
 #[must_use]
 pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
     let number = number.unwrap_or("");
     // C# `double.TryParse(Number, InvariantCulture, …)` trims whitespace.
     match number.trim().parse::<f64>() {
-        Ok(n) => format!("{n:07.1}-{name}"),
-        Err(_) => format!("{number}-{name}"),
+        // .NET's custom format keeps the sign outside the zero padding
+        // (`-1` → `-0000000001.00000`), where Rust's width counts it; a number
+        // wider than the pattern keeps all its digits in both.
+        Ok(n) if n.is_finite() => {
+            let sign = if n < 0.0 { "-" } else { "" };
+            format!("{sign}{:016.5}-{name}", n.abs())
+        }
+        // Rust also parses `inf`/`nan`, which have no padded form; keep the
+        // text (.NET rejects `inf`, and formats a parsed `NaN`/`Infinity` as
+        // that word).
+        _ => format!("{number}-{name}"),
     }
 }
 
@@ -707,16 +717,40 @@ mod tests {
 
     #[test]
     fn sort_name_pads_numeric_channel_numbers_like_upstream() {
-        // C# string.Format("{0:00000.0}", n) + "-" + name.
+        // v12.2 C# string.Format("{0:0000000000.00000}", n) + "-" + name.
         assert_eq!(
             channel_sort_name(Some("1"), "Parity One"),
-            "00001.0-Parity One"
+            "0000000001.00000-Parity One"
         );
-        assert_eq!(channel_sort_name(Some("8.5"), "Eight"), "00008.5-Eight");
-        assert_eq!(channel_sort_name(Some("123456"), "Big"), "123456.0-Big");
+        assert_eq!(
+            channel_sort_name(Some("8.5"), "Eight"),
+            "0000000008.50000-Eight"
+        );
+        assert_eq!(
+            channel_sort_name(Some("123456"), "Big"),
+            "0000123456.00000-Big"
+        );
+        assert_eq!(
+            channel_sort_name(Some("4.11"), "Sub"),
+            "0000000004.11000-Sub"
+        );
+        // .NET keeps the sign outside the zero padding, and a number wider
+        // than the pattern keeps all its digits.
+        assert_eq!(
+            channel_sort_name(Some("-1"), "Neg"),
+            "-0000000001.00000-Neg"
+        );
+        assert_eq!(
+            channel_sort_name(Some("12345678901"), "Wide"),
+            "12345678901.00000-Wide"
+        );
         // An unparseable number is used verbatim.
         assert_eq!(channel_sort_name(Some("A1"), "Alpha"), "A1-Alpha");
+        assert_eq!(channel_sort_name(Some("inf"), "X"), "inf-X");
         assert_eq!(channel_sort_name(None, "Bare"), "-Bare");
+        // The keys order numerically (jellyfin/jellyfin#15399).
+        assert!(channel_sort_name(Some("10002"), "") < channel_sort_name(Some("100010"), ""));
+        assert!(channel_sort_name(Some("4.11"), "Z") < channel_sort_name(Some("4.12"), "A"));
     }
 
     #[test]
@@ -867,7 +901,10 @@ mod tests {
         assert_eq!(entity.type_, CHANNEL_TYPE_NAME);
         assert_eq!(entity.path, None); // upstream channel items carry no path
         assert_eq!(entity.media_type.as_deref(), Some("Video"));
-        assert_eq!(entity.sort_name.as_deref(), Some("00001.0-Parity One"));
+        assert_eq!(
+            entity.sort_name.as_deref(),
+            Some("0000000001.00000-Parity One")
+        );
         assert_eq!(entity.external_service_id.as_deref(), Some("Emby"));
         assert_eq!(entity.unrated_type.as_deref(), Some("LiveTvChannel"));
         // `ExternalId` is the TUNER's id, which is what the GUID was hashed
