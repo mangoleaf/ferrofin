@@ -8895,8 +8895,7 @@ impl LibraryScanner {
     /// collection folder first, [`Self::library_top_parents`]) the pruning
     /// weighs: those at or under `roots` and their path-less children on a
     /// path-scoped scan (`roots` given), every row of the library on a
-    /// library scan — both less the owned non-extras and the alternate
-    /// versions a library read never lists
+    /// library scan — both less the owned non-extras
     /// ([`ItemPersistenceService::library_items`]). `None` when they could
     /// not be read (logged): nothing of the library is pruned then.
     async fn prune_candidates(
@@ -8921,7 +8920,8 @@ impl LibraryScanner {
         let rows = match self.persistence.library_items(top_parents).await {
             Ok(Some(rows)) => rows,
             // A store that cannot answer: the item repository's library
-            // read, which applies the same candidate terms.
+            // read. It also hides an unowned alternate version, so such a
+            // store never weighs one.
             Ok(None) => match items
                 .get_item_list(&InternalItemsQuery {
                     top_parent_ids: top_parents.to_vec(),
