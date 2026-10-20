@@ -58,6 +58,13 @@ pub async fn run_all(db: &Database, paths: &VirtualPathExpander) -> Result<(), S
             "imported playlist/collection/version membership from Data JSON"
         );
     }
+    let reunited = reunite_split_versions(db).await?;
+    if reunited > 0 {
+        tracing::info!(
+            versions = reunited,
+            "reunited local versions a Ferrofin 1.0 scan split off"
+        );
+    }
     let removed = cleanup_orphaned_extras(db).await?;
     if removed > 0 {
         tracing::info!(
@@ -561,40 +568,146 @@ async fn dedupe_paths(
         // Highest flags win; equal flags → lowest index (newest DateCreated).
         ranked.sort_by(|a, b| (b.0, b.1, b.2, a.3).cmp(&(a.0, a.1, a.2, b.3)));
         for (_, _, _, _, id) in ranked.iter().skip(1) {
-            move_user_data(tx, id, &ranked[0].4).await?;
-            // ParentId cascades may reach children even though the repair
-            // keeps owned extras by clearing OwnerId below.
-            let descendants: Vec<String> = sqlx::query_scalar(
-                r#"WITH RECURSIVE gone("Id") AS (
-                    SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1
-                    UNION SELECT b."Id" FROM "BaseItems" b JOIN gone g ON b."ParentId" = g."Id"
-                ) SELECT "Id" FROM gone"#,
-            )
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            detach_user_data(tx, &descendants).await?;
-
-            sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = NULL WHERE "OwnerId" = ?1"#)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+            fold_into(tx, id, &ranked[0].4).await?;
             deleted += 1;
         }
     }
     Ok(deleted)
+}
+
+/// Deletes the row `id` in favour of `keeper`, the way upstream's step 1
+/// drops a duplicate: its user data moves to `keeper`, its descendants'
+/// user data is detached, its version links go and the extras it owns are
+/// left unowned.
+async fn fold_into(
+    tx: &mut sqlx::SqliteConnection,
+    id: &str,
+    keeper: &str,
+) -> Result<(), ServiceError> {
+    move_user_data(tx, id, keeper).await?;
+    // ParentId cascades may reach children even though the repair keeps
+    // owned extras by clearing OwnerId below.
+    let descendants: Vec<String> = sqlx::query_scalar(
+        r#"WITH RECURSIVE gone("Id") AS (
+            SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1
+            UNION SELECT b."Id" FROM "BaseItems" b JOIN gone g ON b."ParentId" = g."Id"
+        ) SELECT "Id" FROM gone"#,
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    detach_user_data(tx, &descendants).await?;
+
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = NULL WHERE "OwnerId" = ?1"#)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Reunites the local alternate versions a Ferrofin v1.0.0 scan split off
+/// (a Ferrofin-only repair: no Jellyfin release writes this shape). v1.0.0
+/// stored an adopted 10.11 version again as a standalone row of its
+/// primary's type (the `Movie` id, no owner) beside the 10.11 `Video` row
+/// the primary still owns, and emptied the primary's
+/// `LocalAlternateVersions`. Left alone, step 1 of
+/// [`fix_owner_id_relationships`] keeps whichever row is newer and step 2
+/// detaches the survivor, so the version vanishes from its movie until the
+/// next scan rebuilds it. Instead the standalone row is kept, the `Video`
+/// row folds into it ([`fold_into`]: both rows' user data survive) and the
+/// primary lists the path again, which is the group
+/// [`rehome_local_versions`] then completes at boot (owner, pointer, link)
+/// and the shape a 12.x scan ends at (`LibraryManager.ResolveAlternateVersion`,
+/// `LibraryManager.cs:865-922`). Runs before [`fix_owner_id_relationships`].
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError> {
+    const KEY: &str = "split_versions_v1";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // (stale video, standalone row, primary, path, primary's path, primary's Data)
+    let splits: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT v."Id", m."Id", p."Id", v."Path", p."Path", p."Data"
+           FROM "BaseItems" v
+           JOIN "BaseItems" p ON p."Id" = v."OwnerId"
+           JOIN "BaseItems" m ON m."Path" = v."Path" AND m."Id" <> v."Id"
+           WHERE v."Type" = ?1 AND (v."ExtraType" IS NULL OR v."ExtraType" = 0)
+             AND p."Type" <> ?1 AND p."Path" IS NOT NULL AND p."Path" <> v."Path"
+             AND (p."ExtraType" IS NULL OR p."ExtraType" = 0)
+             AND m."Type" = p."Type" AND m."OwnerId" IS NULL
+             AND (m."ExtraType" IS NULL OR m."ExtraType" = 0)
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(CASE WHEN json_valid(p."Data") THEN p."Data" ELSE '{}' END,
+                                       '$.AdditionalParts') part
+               WHERE part."value" = v."Path")
+           ORDER BY p."Id", v."Path", m."Id""#,
+    )
+    .bind(video)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let mut folded: BTreeSet<String> = BTreeSet::new();
+    let mut lists: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
+    for (stale, standalone, primary, path, primary_path, data) in splits {
+        // Two rows of the primary's type at one path: the first (by id) is
+        // kept; step 1 of [`fix_owner_id_relationships`] drops the other.
+        if !same_folder(&primary_path, &path) || !folded.insert(stale.clone()) {
+            continue;
+        }
+        fold_into(&mut tx, &stale, &standalone).await?;
+        lists
+            .entry(primary)
+            .or_insert_with(|| (data, Vec::new()))
+            .1
+            .push(path);
+    }
+    for (primary, (data, paths)) in lists {
+        // A primary whose Data is not a JSON object is left as it is: the
+        // version is still kept and its history merged, and the scan lists it.
+        let mut data: serde_json::Value = match data.as_deref() {
+            None => serde_json::json!({}),
+            Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(value) if value.is_object() => value,
+                _ => continue,
+            },
+        };
+        let mut versions = data
+            .get("LocalAlternateVersions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for path in paths {
+            if !versions.iter().any(|v| v.as_str() == Some(path.as_str())) {
+                versions.push(serde_json::Value::String(path));
+            }
+        }
+        data["LocalAlternateVersions"] = serde_json::Value::Array(versions);
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(&primary)
+            .bind(data.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    done(db, KEY).await?;
+    Ok(folded.len())
 }
 
 /// Ferrofin modelled a version group by `PrimaryVersionId` alone; 12.0 reads
