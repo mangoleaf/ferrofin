@@ -66,6 +66,13 @@ from.
        `ferrofin:bench` before each run.
    - In `python3 bench/report.py --serve`, tick the three release runs and tick the
      baseline directories as the baseline (compared by their median).
+   - Measure the throughput ceiling A/B in the same window:
+     `python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV <release image>`
+     ([`bench/README.md`](bench/README.md#throughput-ceiling-the-saturation-ramp)). A ceiling
+     more than 15 % (and 5 screens/s) below the previous release's, or one that could not be
+     judged, blocks the release like a latency regression. The thresholds are the `[ramp]`
+     row of [`bench/gate.toml`](bench/gate.toml), starting values to be re-derived after
+     the first two ramps.
 
    A latency or memory regression against the baseline, or a `⚠` response-shape note that
    the baseline does not have, blocks the release until it is fixed or the maintainer

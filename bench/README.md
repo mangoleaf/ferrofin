@@ -60,10 +60,11 @@ recorded and checked; differing selections flag the affected screen.
 Three levels are published: **unloaded** (1 screen/s), **loaded** (5 screens/s — about
 24 API requests/s plus up to ~55 poster requests/s) and **stress** (25 screens/s, five
 times that), which exists to push both servers past a comfortable browse. All three are
-fixed arrival rates rather than a ramp: finding one server's knee is a different question
-from comparing two servers doing the same work, and `RATE_STRESS` is the knob if neither
-bends. Each window is 120 s after a 30 s warm-up at the same rate (different picks) that
-is discarded, and a window in which k6 could not hold its rate is flagged, not published.
+fixed arrival rates, because comparing two servers doing the same work is a different
+question from finding one server's knee; the knee has its own opt-in, Ferrofin-only phase,
+the [saturation ramp](#throughput-ceiling-the-saturation-ramp), and `RATE_STRESS` is the
+knob if neither server bends at the stress rate. Each window is 120 s after a 30 s
+warm-up at the same rate (different picks) that is discarded, and a window in which k6 could not hold its rate is flagged, not published.
 
 ## Definitions (one sentence each)
 
@@ -100,6 +101,9 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
 - **CPU seconds** — change in the raw cgroup `usage_usec` counter between the
   bracketing samples, divided by one million, for the server and its children; load
   windows include k6 setup/teardown and harness overhead, and steady is post-load idle.
+- **Throughput ceiling** — the highest loaded-mix arrival rate, in screens per second,
+  whose worst screen p95 stayed within 100 ms with no failed request and no dropped k6
+  iteration, found by the `ramp` phase.
 - **Parity** — `N / 412 operations deep-verified against <UPSTREAM_TAG>, plus M compared
   against an earlier release`: the number of contract operations whose Ferrofin
   implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the latest
@@ -265,12 +269,50 @@ validation, not full decoding or sustained playback evidence.
 | cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 
+## Throughput ceiling: the saturation ramp
+
+`run.sh --servers ferrofin --only ramp` (opt-in: no default run includes it, and it
+refuses Jellyfin) steps the loaded mix upward and reports where Ferrofin stops keeping up.
+It drains the server, discards one `WARMUP_S` warm-up at the start rate, then measures
+`RAMP_STEP_S` (30 s) at each rate from `RAMP_START` (25 screens/s, the stress rate Ferrofin
+is known to pass) in steps of `RAMP_STEP_RATE` (10), the last step being the highest
+start-plus-a-multiple-of-the-step not above `RAMP_CAP` (400; so 395). Each step is
+the `screens.js` workload at that rate, with the same picks as every other window.
+
+A step ends the ramp when, in this order of precedence, a screen's request failed
+(`errors`), k6 dropped an iteration so the client rather than the server was the limit
+(`client`), or the **worst screen's p95** went over `RAMP_BOUND_MS` (100 ms; `p95`). The
+ceiling is the last rate before that step. The mix has no single p95 in k6's per-screen
+summary, and the slowest screen is the one a client notices first, so that is the number
+bounded. If no step fails before the cap the ceiling is a lower bound (`cap`); if the first
+step fails there is no ceiling and the phase fails. The phase writes `ramp-params.json`,
+one `k6-ramp-<rate>.json` per step and `ramp.json` (the ceiling, what ended the ramp and
+every step), and the run's `report.html` gets a "Throughput ramp" section with the step
+table. The decisions live in `ramp.py` and are unit-tested in `test_ramp.py`.
+
+The release gate compares the candidate with the previous release in one window,
+interleaved, exactly as the latency gate does:
+
+```bash
+python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:rc --pairs 3
+```
+
+The ceiling is a higher-is-better cell, `ramp/ceiling`, judged by the `[ramp]` row of
+[`gate.toml`](gate.toml) (15 % and 5 screens/s) and the same rule: the median of the
+candidate's ceilings is below the previous release's by more than both thresholds, in at
+least two of three pairs. A ramp that ended on the client or has no passing step cannot be
+judged, and an unjudgeable gated cell blocks like a regression. These are starting values,
+to be re-derived after the first two ramps. The ramp pushes the shared host harder than any
+other phase: `run.sh` still refuses to start unless the server and client cores are idle,
+and a run that fails stops the session.
+
 ## Running it
 
 The reporter has a fast correctness check, also run in CI:
 
 ```sh
 python3 -m unittest discover -s bench -p test_report.py
+python3 -m unittest discover -s bench -p test_ramp.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.
@@ -366,7 +408,7 @@ stdlib only, no JavaScript.
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
 `--only loaded` for a before/after on two builds, or a comma list such as
 `--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
-The default still selects all phases and both servers. A shared host must be quiet: stop
+The default still selects all phases (except the opt-in `ramp`) and both servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.
 
 For repeated comparisons, rotate order explicitly, for example

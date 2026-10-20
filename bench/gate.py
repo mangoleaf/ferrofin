@@ -8,10 +8,14 @@
         PREVIOUS CANDIDATE PREVIOUS CANDIDATE … (default 3 pairs), Ferrofin only: per cell,
         regressed / within noise / improved; exits 1 when a gated cell regressed or could
         not be judged
+    gate.py ramp PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
+        the saturation ramp (`run.sh --only ramp`, Ferrofin only) interleaved the same way: the
+        throughput ceiling in screens/s per run, regressed / within noise / improved on the
+        same rule with the ceiling as a higher-is-better cell (gate.toml `[ramp]`)
     gate.py render SESSION_DIR
         rewrite a finished session's report.md and report.html from its run dirs
 
-Each run is `run.sh --servers ferrofin --only shape,unloaded,loaded` into SESSION_DIR/NN-a or
+Each run is `run.sh --servers ferrofin --only PHASES` (below) into SESSION_DIR/NN-a or
 NN-b. The shape pass is what makes a cell comparable: without it every cell is caveated
 for a missing phase and the change in the responses behind a cell cannot be seen.
 `ferrofin:bench` is only ever inspected by run.sh, so the driver retags it before every run,
@@ -36,11 +40,12 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+import ramp
 import report
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 TAG = "ferrofin:bench"
-PHASES = "shape,unloaded,loaded"
+PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": "ramp"}
 #: The levels whose cells can block a release; `stress` is reported, never gated (B5).
 GATED_LEVELS = ("unloaded", "loaded")
 #: An endpoint cell whose medians are both under this many ms is reported, never gated (B5).
@@ -125,22 +130,43 @@ def is_gated(key, a_median, b_median):
     return level in GATED_LEVELS or level == "memory"
 
 
-def verdict(a, b, thresholds):
+def verdict(a, b, thresholds, higher_is_better=False):
     """The D4 rule over per-run values in schedule order (`a[i]` ran just before `b[i]`).
-    Lower is better for every gated number. Returns (verdict, median delta, % delta, pairs
-    in which b was slower)."""
+    Lower is better unless `higher_is_better` (the throughput ceiling). Returns (verdict,
+    median delta, % delta, pairs in which b was worse)."""
     ma, mb = statistics.median(a), statistics.median(b)
     diff = mb - ma
     pct = diff / ma * 100 if ma else None
-    slower = sum(y > x for x, y in zip(a, b))
-    faster = sum(y < x for x, y in zip(a, b))
+    sign = -1 if higher_is_better else 1  # sign * change > 0 is a change for the worse
+    worse = sum(sign * (y - x) > 0 for x, y in zip(a, b))
+    better = sum(sign * (y - x) < 0 for x, y in zip(a, b))
     need = len(a) // 2 + 1  # a majority of the pairs: 2 of 3
     beyond = thresholds and pct is not None and abs(pct) > thresholds["relative_pct"] and abs(diff) > thresholds["absolute"]
-    if beyond and diff > 0 and slower >= need:
-        return "regressed", diff, pct, slower
-    if beyond and diff < 0 and faster >= need:
-        return "improved", diff, pct, slower
-    return "within noise", diff, pct, slower
+    if beyond and sign * diff > 0 and worse >= need:
+        return "regressed", diff, pct, worse
+    if beyond and sign * diff < 0 and better >= need:
+        return "improved", diff, pct, worse
+    return "within noise", diff, pct, worse
+
+
+def ramp_verdicts(docs_a, docs_b, gate):
+    """The one ramp cell, `ramp/ceiling`: per-run ceilings (screens/s, higher is better) of
+    the previous release and the candidate, from their `ramp.json` documents (None when a
+    run left none). A ramp that ended on the client or has no passing step cannot be
+    judged, and an unjudgeable gated cell blocks like a regression."""
+    key = "ramp/ceiling"
+    band = (gate.get("cells") or {}).get(key) or gate.get("ramp")
+    row = {"kind": "ramp", "unit": "screens/s", "band": band, "gated": True,
+           "a": [(d or {}).get("ceiling") for d in docs_a], "b": [(d or {}).get("ceiling") for d in docs_b]}
+    problems = sorted({f"{side} run {i}: {why}" for side, docs in (("previous", docs_a), ("candidate", docs_b))
+                       for i, d in enumerate(docs, 1) for ok, why in [ramp.comparable(d or {})] if not ok})
+    if problems or not row["a"] or len(row["a"]) != len(row["b"]):
+        row.update(verdict="not comparable", reason="; ".join(problems) or "missing ramps")
+    else:
+        v, diff, pct, worse = verdict(row["a"], row["b"], band, higher_is_better=True)
+        row.update(verdict=v, diff=diff, pct=pct, slower=worse, a_median=statistics.median(row["a"]),
+                   b_median=statistics.median(row["b"]))
+    return {key: row}
 
 
 def verdicts(model_a, model_b, gate):
@@ -209,7 +235,7 @@ def run_session(session, plan, testdata):
             out = os.path.join(session, name)
             print(f"== {name}: {role} = {image}", flush=True)
             docker("tag", plan["images"][role]["id"], TAG)
-            cmd = ["bash", os.path.join(BENCH, "run.sh"), "--servers", "ferrofin", "--only", PHASES, "--out", out]
+            cmd = ["bash", os.path.join(BENCH, "run.sh"), "--servers", "ferrofin", "--only", PHASES[plan["mode"]], "--out", out]
             if testdata:
                 cmd += ["--testdata", testdata]
             rc = run_sh(cmd)
@@ -232,10 +258,15 @@ def run_session(session, plan, testdata):
             print(f"gate: {TAG} did not exist before the session; it now names the last image run", file=sys.stderr)
 
 
-def models(session, plan):
+def run_dirs(session, plan):
     by_role = {}
     for name, role, _ in plan["schedule"]:
         by_role.setdefault(role, []).append(os.path.join(session, name))
+    return by_role
+
+
+def models(session, plan):
+    by_role = run_dirs(session, plan)
     return {role: report.build(runs) for role, runs in by_role.items()}, by_role
 
 
@@ -246,8 +277,13 @@ def render(session):
     if not plan:
         raise ValueError(f"{session} has no gate.json")
     gate = report.load_gate()
-    built, by_role = models(session, plan)
-    if plan["mode"] == "aa":
+    if plan["mode"] == "ramp":
+        docs = {role: [report.load(os.path.join(d, "ferrofin", "ramp.json")) for d in dirs]
+                for role, dirs in run_dirs(session, plan).items()}
+        result = {"verdicts": ramp_verdicts(docs["a"], docs["b"], gate), "ramps": docs}
+        name, block = "verdict.json", blocking(result["verdicts"])
+    elif plan["mode"] == "aa":
+        built, by_role = models(session, plan)
         runs = by_role["a"]
         # The A/A runs split into the interleaved halves an A/B would compare: any verdict
         # but "within noise" there is a false alarm the thresholds would raise.
@@ -257,6 +293,7 @@ def render(session):
         result["kinds"] = kind_summary(result["noise"], gate)
         name, block = "noise.json", []
     else:
+        built, _ = models(session, plan)
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
@@ -310,6 +347,17 @@ def kind_rows(kinds):
 KIND_HEAD = ("gate.toml row", "cells", "cells past the row", "widest range", "widest absolute range", "row now")
 NOISE_HEAD = ("cell", "min", "median", "max", "range", "CV", "p95 range", "band", "", "flag")
 VERDICT_HEAD = ("cell", "previous", "candidate", "change", "slower pairs", "band", "gates", "verdict")
+RAMP_HEAD = ("cell", "previous", "candidate", "change", "worse pairs", "band", "gates", "verdict")
+RAMP_RUN_HEAD = ("run", "ceiling", "limit", "stopped at", "why")
+
+
+def ramp_run_rows(ramps):
+    """Per run of each role: its ceiling, what ended the ramp and at which rate."""
+    for role, docs in ramps.items():
+        for i, d in enumerate(docs, 1):
+            d = d or {}
+            yield (f"{role} {i}", fmt(d.get("ceiling"), "screens/s"), d.get("limit", "no ramp.json"),
+                   d.get("stopped_at") or "—", d.get("reason", "—"))
 
 
 def md_table(head, rows):
@@ -335,6 +383,10 @@ def render_md(plan, result):
             parts.append("\n## Proposed per-cell bands for gate.toml (owner decision, D8)\n\n```toml\n" + "".join(
                 f'[cells."{k}"]\nrelative_pct = {v["relative_pct"]}\nabsolute = {v["absolute"]}\n\n'
                 for k, v in result["proposed_cells"].items()).rstrip() + "\n```\n")
+    elif plan["mode"] == "ramp":
+        parts += ["\n## Throughput ceiling\n\n", md_table(RAMP_HEAD, verdict_rows(result["verdicts"])),
+                  "\n## Per run\n\n", md_table(RAMP_RUN_HEAD, ramp_run_rows(result["ramps"])),
+                  "\n" + (f"**BLOCKED**: {', '.join(result['blocking'])}\n" if result["blocking"] else "**PASS**: the ceiling did not regress.\n")]
     else:
         parts += ["\n## Verdict per cell\n\n", md_table(VERDICT_HEAD, verdict_rows(result["verdicts"])),
                   "\n" + (f"**BLOCKED**: {', '.join(result['blocking'])}\n" if result["blocking"] else "**PASS**: no gated cell regressed.\n")]
@@ -376,6 +428,13 @@ def render_html(plan, result):
                   "<h2>Interleaved halves</h2><p class='lede'>The A/A runs compared as an A/B would compare them; any "
                   "verdict but within noise is a false alarm.</p>",
                   html_table(VERDICT_HEAD, verdict_rows(result["false_alarms"]), verdict_col=7)]
+    elif plan["mode"] == "ramp":
+        verdict_text = (f"<b>Blocked</b> by {e(', '.join(result['blocking']))}" if result["blocking"]
+                        else "<b>Pass</b>: the ceiling did not regress.")
+        parts += [f"<h2>Throughput ceiling</h2><p class='lede'>{verdict_text} The ceiling is the last loaded-mix rate "
+                  "(screens/s) whose worst-screen p95 stayed within the bound; higher is better.</p>",
+                  html_table(RAMP_HEAD, verdict_rows(result["verdicts"]), verdict_col=7),
+                  "<h2>Per run</h2>", html_table(RAMP_RUN_HEAD, ramp_run_rows(result["ramps"]))]
     else:
         verdict_text = (f"<b>Blocked</b> by {e(', '.join(result['blocking']))}" if result["blocking"]
                         else "<b>Pass</b>: no gated cell regressed.")
@@ -385,7 +444,7 @@ def render_html(plan, result):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("aa", "ab", "render"):
+    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "render"):
         sys.exit(__doc__)
     mode, args = argv[0], argv[1:]
     if mode == "render":
@@ -419,7 +478,7 @@ def main(argv):
             "schedule": schedule(mode, images, count)}
     print(f"{mode} session {session}:")
     for name, role, image in plan["schedule"]:
-        print(f"  {name}  {role}  {image}  run.sh --servers ferrofin --only {PHASES}")
+        print(f"  {name}  {role}  {image}  run.sh --servers ferrofin --only {PHASES[mode]}")
     if flags:
         return 0
     if os.path.exists(session):

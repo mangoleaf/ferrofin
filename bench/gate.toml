@@ -20,8 +20,13 @@ absolute = 0.5
 relative_pct = 25
 absolute = 40
 
+[ramp]          # throughput ceiling (highest rate with worst-screen p95 <= the bound), screens/s
+relative_pct = 15
+absolute = 5
+
 # A per-cell band from the A/A noise table replaces its row for that one cell, keyed
-# `<level>/screens/<screen>`, `<level>/endpoints/<endpoint>` or `memory/<row>`:
+# `<level>/screens/<screen>`, `<level>/endpoints/<endpoint>` or `memory/<row>` (and `ramp/ceiling`, which
+# only an owner can set: there is no A/A for the ramp):
 #
 # [cells."loaded/screens/detail"]
 # relative_pct = 40
