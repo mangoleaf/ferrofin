@@ -52,10 +52,12 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0001);
+/// A non-video item: the subtitle routes upstream binds to `Video` 404 on it.
+const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
 
 // ---- Fakes -----------------------------------------------------------------
 
-/// A library where only [`ITEM_ID`] exists.
+/// A library where only [`ITEM_ID`] (a Movie) and [`SERIES_ID`] exist.
 struct OneItemLibrary;
 
 #[async_trait]
@@ -76,7 +78,11 @@ impl LibraryManager for OneItemLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| minimal_base_item(id, "The Item", "Movie")))
+        Ok(match id {
+            ITEM_ID => Some(minimal_base_item(id, "The Item", "Movie")),
+            SERIES_ID => Some(minimal_base_item(id, "The Show", "Series")),
+            _ => None,
+        })
     }
     async fn query_items(
         &self,
@@ -969,5 +975,51 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
             );
         }
         assert_eq!(deleted.lock().unwrap().len(), usize::from(admin || api_key));
+    }
+}
+
+// ---- Item kind --------------------------------------------------------------
+
+/// `SubtitleController` resolves `GetItemById<Video>` for search, download,
+/// upload and the subtitle playlist, so a non-video item is a `404` there and
+/// no sidecar is ever written beside a series, season or audio path.
+#[tokio::test]
+async fn video_only_subtitle_routes_refuse_a_non_video_item() {
+    let app = remote_search_state(Arc::new(CannedSubtitles::default()));
+    for (method, uri, body) in [
+        (
+            "GET",
+            format!("/Items/{SERIES_ID}/RemoteSearch/Subtitles/eng"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/Items/{SERIES_ID}/RemoteSearch/Subtitles/sub1"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/Videos/{SERIES_ID}/Subtitles"),
+            r#"{"Language":"eng","Format":"srt","IsForced":false,"IsHearingImpaired":false,"Data":"aGk="}"#,
+        ),
+        (
+            "GET",
+            format!("/Videos/{SERIES_ID}/msrc/Subtitles/0/subtitles.m3u8?segmentLength=10"),
+            "",
+        ),
+    ] {
+        let response = create_router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("X-Emby-Token", "tok")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
 }
