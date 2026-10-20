@@ -20,6 +20,59 @@ use crate::omdb::{OmdbItem, OmdbPersonKind};
 use crate::tmdb::{EpisodeDetails, EpisodeExtras};
 use crate::tvdb::{TvdbEpisodeDetails, TvdbPerson};
 
+/// Port of `EpisodeMetadataService.BeforeSaveInternal`'s range guard (v12.2,
+/// PR 17805): an episode cannot end before it starts. An `IndexNumberEnd`
+/// below the row's `IndexNumber`, or one with no `IndexNumber` at all (which
+/// describes no range, and promoting it would invent an episode number), is
+/// dropped from the row's `Data` with a warning. Returns whether it was, so
+/// the caller treats the row as changed (`ItemUpdateType.MetadataImport`).
+///
+/// Rows that are not episodes, or carry no end, are left alone. The warning is
+/// upstream's, and stays at warn because it names a bad source someone can
+/// fix: a stored value warns once (the save that follows clears it), an NFO
+/// that keeps supplying one warns on each refresh of that one file.
+pub fn discard_invalid_episode_range(item: &mut BaseItemEntity) -> bool {
+    // The stored type name's last segment (`…Entities.TV.Episode`): the core's
+    // type lookup is out of reach from this crate.
+    if item.type_.rsplit('.').next() != Some("Episode") {
+        return false;
+    }
+    let Some(data) = item.data.as_deref() else {
+        return false;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(data)
+    else {
+        return false;
+    };
+    let Some(end) = map
+        .get("IndexNumberEnd")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return false;
+    };
+    let item_id = item.id.as_str();
+    let path = item.path.as_deref().unwrap_or_default();
+    match item.index_number {
+        Some(start) if end < start => tracing::warn!(
+            item_id,
+            path,
+            end,
+            start,
+            "discarding episode range end preceding episode number"
+        ),
+        None => tracing::warn!(
+            item_id,
+            path,
+            end,
+            "discarding episode range end without an episode number"
+        ),
+        Some(_) => return false,
+    }
+    map.remove("IndexNumberEnd");
+    item.data = Some(serde_json::Value::Object(map).to_string());
+    true
+}
+
 /// One provider's answer for an episode, and the language it claims
 /// (`MetadataResult.ResultLanguage`): OMDb answers in English only, so its
 /// overview stands only until an answer in the preferred language supplies one.
@@ -301,6 +354,68 @@ pub fn tvdb_answer(
 mod tests {
     use super::*;
     use crate::tmdb::TmdbPerson;
+
+    /// An episode row with `IndexNumber` `start` and `Data.IndexNumberEnd` `end`.
+    fn ranged_episode(start: Option<i64>, end: i64) -> BaseItemEntity {
+        BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+            index_number: start,
+            path: Some("/tv/Show/Season 1/Show - S01E01.mkv".to_owned()),
+            data: Some(
+                serde_json::json!({ "IndexNumberEnd": end, "AirsBeforeSeasonNumber": 2 })
+                    .to_string(),
+            ),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    fn range_end(item: &BaseItemEntity) -> Option<i64> {
+        serde_json::from_str::<serde_json::Value>(item.data.as_deref()?)
+            .ok()?
+            .get("IndexNumberEnd")?
+            .as_i64()
+    }
+
+    /// v12.2 `EpisodeMetadataServiceTests`: `BeforeSave_ReversedEpisodeRange_ClearsIndexNumberEnd`
+    /// (2,1 / 22,21 / 21,2 — e.g. "S03E21 - E2", where "E2" is the title),
+    /// `BeforeSave_EpisodeRangeWithoutStart_ClearsIndexNumberEnd` and
+    /// `BeforeSave_ValidEpisodeRange_KeepsIndexNumberEnd` (1,2 / 1,1).
+    #[rstest::rstest]
+    #[case::reversed(Some(2), 1, true)]
+    #[case::reversed_double_digit(Some(22), 21, true)]
+    #[case::title_read_as_end(Some(21), 2, true)]
+    #[case::without_start(None, 2, true)]
+    #[case::valid(Some(1), 2, false)]
+    #[case::degenerate(Some(1), 1, false)]
+    fn an_episode_range_that_ends_before_it_starts_is_discarded(
+        #[case] start: Option<i64>,
+        #[case] end: i64,
+        #[case] discarded: bool,
+    ) {
+        let mut item = ranged_episode(start, end);
+
+        assert_eq!(super::discard_invalid_episode_range(&mut item), discarded);
+
+        assert_eq!(range_end(&item), (!discarded).then_some(end));
+        assert_eq!(item.index_number, start);
+        // The rest of `Data` stays.
+        assert!(
+            item.data
+                .as_deref()
+                .is_some_and(|d| d.contains("AirsBeforeSeasonNumber"))
+        );
+    }
+
+    /// Only episodes carry the guard.
+    #[test]
+    fn a_non_episode_keeps_its_data() {
+        let mut item = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Season".to_owned(),
+            ..ranged_episode(Some(2), 1)
+        };
+        assert!(!super::discard_invalid_episode_range(&mut item));
+        assert_eq!(range_end(&item), Some(1));
+    }
 
     fn omdb_record() -> OmdbItem {
         serde_json::from_str(

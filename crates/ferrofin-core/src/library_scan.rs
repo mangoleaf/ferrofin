@@ -7112,6 +7112,9 @@ impl LibraryScanner {
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
+        // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
+        // episode cannot end before it starts.
+        ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
         self.apply_parental_rating_score(&mut entity).await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
@@ -18179,6 +18182,9 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
         ("AirsBeforeSeasonNumber", n.airs_before_season_number),
         ("AirsAfterSeasonNumber", n.airs_after_season_number),
         ("AirsBeforeEpisodeNumber", n.airs_before_episode_number),
+        // The episode range end (`<episodenumberend>`, or the last of several
+        // `<episodedetails>` blocks): `IndexNumberEnd` lives in `Data`.
+        ("IndexNumberEnd", n.index_number_end),
     ] {
         fill_provider_data(entity, key, value.map(|value| serde_json::json!(value)));
     }
@@ -18754,9 +18760,6 @@ impl MergeMode {
 /// No other kind takes anything (a book's year or series never comes back
 /// from its path). The embedded MP4 episode info `Episode.BeforeMetadataRefresh`
 /// also reads is applied with the probe ([`embedded_episode_info_enabled`]).
-/// The one field upstream sets here that Ferrofin does not is an episode's
-/// `IndexNumberEnd` (open work item gl-102; see
-/// [`fill_episode_numbers_from_path`]).
 fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
@@ -18846,15 +18849,16 @@ fn names_its_own_folder(row: &BaseItemEntity) -> bool {
 
 /// `LibraryManager.FillMissingEpisodeNumbersFromPath` (`LibraryManager.cs:
 /// 3291-3413`) on a stored episode: a by-date name clears the episode
-/// number and fills an empty premiere date (UTC midnight of the date) and
-/// year; any other name fills the episode and season numbers the row lacks —
-/// or, under `ReplaceAllMetadata` (`forceRefresh`), sets them from the path
-/// even to nothing. A season number still missing then takes the season's
+/// number and range end and fills an empty premiere date (UTC midnight of
+/// the date) and year; any other name fills the episode number, range end
+/// (`IndexNumberEnd`, in `Data`) and season number the row lacks — or, under
+/// `ReplaceAllMetadata` (`forceRefresh`), sets them from the path even to
+/// nothing. A season number still missing then takes the season's
 /// (`season_index`).
 ///
-/// Resolved as the planner resolves episodes: the path alone, and no
-/// plain-folder parent (the planner creates none). `IndexNumberEnd` is not
-/// in the schema, so it is neither filled nor cleared.
+/// Resolved as the planner resolves episodes: the path below its library
+/// ([`below_library`]), and no plain-folder parent (the planner creates
+/// none).
 ///
 /// A series whose `DisplayOrder` is `absolute` resolves with
 /// `isAbsoluteNaming` (`LibraryManager.cs:3292-3298`): only the expressions
@@ -18868,19 +18872,12 @@ fn fill_episode_numbers_from_path(
     naming: EpisodeNaming<'_>,
 ) {
     use chrono::TimeZone as _;
-    // `isAbsoluteNaming`: `null` (no filter) unless the series is absolute.
-    let Some(info) = EpisodeResolver::new(&PATH_NAMING).resolve(
-        below_library(path, naming.library),
-        false,
-        None,
-        None,
-        naming.absolute.then_some(true),
-        true,
-    ) else {
+    let Some(info) = resolve_episode_path(path, naming) else {
         return;
     };
     if info.is_by_date {
         row.index_number = None;
+        set_index_number_end(row, None);
         if row.premiere_date.is_none()
             && let (Some(y), Some(m), Some(d)) = (info.year, info.month, info.day)
             && let (Ok(m), Ok(d)) = (u32::try_from(m), u32::try_from(d))
@@ -18894,6 +18891,9 @@ fn fill_episode_numbers_from_path(
         if row.index_number.is_none() || replace_all {
             row.index_number = info.episode_number.map(i64::from);
         }
+        if index_number_end(row).is_none() || replace_all {
+            set_index_number_end(row, info.ending_episode_number);
+        }
         if row.parent_index_number.is_none() || replace_all {
             row.parent_index_number = info.season_number.map(i64::from);
         }
@@ -18901,6 +18901,73 @@ fn fill_episode_numbers_from_path(
     if row.parent_index_number.is_none() {
         row.parent_index_number = season_index;
     }
+}
+
+/// `FillMissingEpisodeNumbersFromPath`'s resolve: the path below its library
+/// ([`below_library`]), with `isAbsoluteNaming` `null` (no filter) unless
+/// the series is absolute.
+fn resolve_episode_path(
+    path: &str,
+    naming: EpisodeNaming<'_>,
+) -> Option<ferrofin_naming::tv::EpisodeInfo> {
+    EpisodeResolver::new(&PATH_NAMING).resolve(
+        below_library(path, naming.library),
+        false,
+        None,
+        None,
+        naming.absolute.then_some(true),
+        true,
+    )
+}
+
+/// A NEW episode's range end from its path, where its providers (an NFO)
+/// gave none, on a pass that runs `BeforeMetadataRefresh` (as the stored
+/// row's [`before_metadata_refresh`]). Upstream's first refresh runs
+/// `FillMissingEpisodeNumbersFromPath` before the providers, whose answer
+/// then replaces the item's and is filled from it only where it has nothing
+/// (`MetadataService.cs:850, 905-917`), so an NFO's range wins and the
+/// path's fills in. The planned row cannot carry it: the providers start
+/// from that row, and `apply_nfo` only fills.
+fn fill_new_episode_range(row: &mut BaseItemEntity, naming: EpisodeNaming<'_>) {
+    if item_type_lookup::kind_from_type_name(&row.type_) != Some(BaseItemKind::Episode)
+        || index_number_end(row).is_some()
+    {
+        return;
+    }
+    let Some(info) = row
+        .path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|path| resolve_episode_path(path, naming))
+    else {
+        return;
+    };
+    if !info.is_by_date {
+        set_index_number_end(row, info.ending_episode_number);
+    }
+}
+
+/// The episode's range end, `IndexNumberEnd`, which lives in the `Data` blob.
+fn index_number_end(row: &BaseItemEntity) -> Option<i32> {
+    crate::item_data::read_data_i32(
+        &crate::item_data::parse_data(row.data.as_deref()),
+        "IndexNumberEnd",
+    )
+}
+
+/// Sets (`Some`) or removes (`None`) `Data.IndexNumberEnd`, leaving the row
+/// untouched when it already says so.
+fn set_index_number_end(row: &mut BaseItemEntity, end: Option<i32>) {
+    let mut data = crate::item_data::parse_data(row.data.as_deref());
+    let current = crate::item_data::read_data_i32(&data, "IndexNumberEnd");
+    if current == end && (end.is_some() || !data.contains_key("IndexNumberEnd")) {
+        return;
+    }
+    match end {
+        Some(end) => data.insert("IndexNumberEnd".to_owned(), serde_json::json!(end)),
+        None => data.remove("IndexNumberEnd"),
+    };
+    row.data = Some(serde_json::Value::Object(data).to_string());
 }
 
 /// `Episode.BeforeMetadataRefresh` checks the stored container for exactly mp4.
@@ -19034,6 +19101,9 @@ fn saved_row(
     } else {
         let mut row = scanned.clone();
         guesses.fill(&mut row);
+        if facts.before_refresh {
+            fill_new_episode_range(&mut row, facts.naming);
+        }
         // `Folder.AddChild` stamps a new child's unset `DateModified` with
         // the `UtcNow` of its `DateCreated`. A path-less one (a season with
         // no folder) keeps it — no save restats it, where a file's or a
@@ -22375,6 +22445,26 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// An NFO episode range (`<episodenumberend>`, or the last of several
+    /// `<episodedetails>` blocks) is stored where `IndexNumberEnd` lives, the
+    /// `Data` blob the DTO reads it from (PR 17805). `apply_nfo` used to drop
+    /// it, so no NFO range ever reached a client.
+    #[test]
+    fn apply_nfo_stores_the_episode_range_in_the_data_blob() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Episode);
+        n.index_number = Some(1);
+        n.index_number_end = Some(2);
+
+        let mut e = BaseItemEntity::default();
+        super::apply_nfo(&mut e, &n);
+
+        let data = crate::item_data::parse_data(e.data.as_deref());
+        assert_eq!(e.index_number, Some(1));
+        assert_eq!(data.get("IndexNumberEnd"), Some(&serde_json::json!(2)));
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
@@ -28036,6 +28126,60 @@ mod tests {
             Some("2024-03-01")
         );
         assert_eq!(by_date.parent_index_number, Some(4), "the season's number");
+    }
+
+    /// `FillMissingEpisodeNumbersFromPath`'s range end (v12.2
+    /// `LibraryManager.cs:3350-3356, 3391-3399`), kept in `Data` as
+    /// `IndexNumberEnd`: a multi-episode name fills one the row lacks; a
+    /// stored one (an NFO's) stays unless `ReplaceAllMetadata` re-sets it
+    /// from the path, even to nothing; a by-date name clears it. The rest of
+    /// `Data` stays.
+    #[rstest::rstest]
+    #[case::filled(
+        "Season 2/Elementary - 02x03 - 02x04 - 02x15 - Ep Name.mp4",
+        None,
+        false,
+        Some(15)
+    )]
+    #[case::filled_dash("Season 1/Show S01E01-E02.mkv", None, false, Some(2))]
+    #[case::single_episode("Season 1/Show S01E02 blah.avi", None, false, None)]
+    #[case::stored_kept("Season 1/Show S01E01-E02.mkv", Some(5), false, Some(5))]
+    #[case::stored_kept_without_range("Season 1/Show S01E03.mkv", Some(5), false, Some(5))]
+    #[case::replaced("Season 1/Show S01E01-E02.mkv", Some(5), true, Some(2))]
+    #[case::replaced_by_nothing("Season 1/Show S01E03.mkv", Some(5), true, None)]
+    #[case::by_date_clears("News 2024-03-01.mkv", Some(5), false, None)]
+    fn the_refill_takes_an_episode_range_from_its_path(
+        #[case] name: &str,
+        #[case] stored_end: Option<i64>,
+        #[case] replace_all: bool,
+        #[case] expected: Option<i64>,
+    ) {
+        let mut row = stored_row(
+            "TV.Episode",
+            &format!("/tv/Show/{name}"),
+            Some("Title"),
+            None,
+        );
+        let mut data = serde_json::json!({ "Container": "mkv" });
+        if let Some(end) = stored_end {
+            data["IndexNumberEnd"] = serde_json::json!(end);
+        }
+        row.data = Some(data.to_string());
+
+        super::before_metadata_refresh(
+            &mut row,
+            replace_all,
+            None,
+            super::EpisodeNaming::default(),
+        );
+
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        assert_eq!(
+            data.get("IndexNumberEnd")
+                .and_then(serde_json::Value::as_i64),
+            expected
+        );
+        assert_eq!(data.get("Container"), Some(&serde_json::json!("mkv")));
     }
 
     /// The refill runs only on a pass that runs `BeforeMetadataRefresh`: a
