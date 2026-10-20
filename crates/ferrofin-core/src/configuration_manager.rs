@@ -217,6 +217,10 @@ pub struct FerrofinServerConfigurationManager {
     /// The `metadata.json` the last "unusable" warning was logged for, so a
     /// broken document warns once per change, not on every read.
     metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// The same for `branding.json`.
+    branding_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// The same for `encoding.json`.
+    encoding_warned: std::sync::Mutex<Option<WarnedFile>>,
     configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
@@ -226,6 +230,24 @@ pub struct FerrofinServerConfigurationManager {
 /// it has none to read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WarnedFile(Option<std::time::SystemTime>);
+
+/// Whether the unusable `path` as it stands now has not been warned about
+/// yet, by `warned`; records that it now has.
+fn first_warning(warned: &std::sync::Mutex<Option<WarnedFile>>, path: &std::path::Path) -> bool {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    warned.replace(WarnedFile(mtime)) != Some(WarnedFile(mtime))
+}
+
+/// Forgets the last warning in `warned`, so a file that breaks again warns anew.
+fn forget_warning(warned: &std::sync::Mutex<Option<WarnedFile>>) {
+    warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+}
 
 /// Hands the two settings that shape item ids to id derivation.
 fn publish_item_id_policy(configuration: &ServerConfiguration) {
@@ -433,6 +455,8 @@ impl FerrofinServerConfigurationManager {
             encoding_file,
             metadata_file,
             metadata_warned: std::sync::Mutex::new(None),
+            branding_warned: std::sync::Mutex::new(None),
+            encoding_warned: std::sync::Mutex::new(None),
             configuration: Arc::new(RwLock::new(Arc::new(configuration))),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             listeners: Arc::new(RwLock::new(Vec::new())),
@@ -552,23 +576,51 @@ impl FerrofinServerConfigurationManager {
     /// Whether the unusable `metadata.json` as it stands now has not been
     /// warned about yet; records that it now has.
     fn first_metadata_warning(&self) -> bool {
-        let mtime = std::fs::metadata(&self.metadata_file)
-            .and_then(|m| m.modified())
-            .ok();
-        let mut warned = self
-            .metadata_warned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        warned.replace(WarnedFile(mtime)) != Some(WarnedFile(mtime))
+        first_warning(&self.metadata_warned, &self.metadata_file)
     }
 
     /// Forgets the last warning once the document reads again, so breaking
     /// it later warns anew whatever its modification time.
     fn metadata_usable(&self) {
-        self.metadata_warned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        forget_warning(&self.metadata_warned);
+    }
+
+    /// Reads a named configuration document (`branding`, `encoding`) as C#
+    /// `BaseConfigurationManager.LoadConfiguration` does: a document never
+    /// saved is the default, and one that does not parse is the default too,
+    /// logged with its path. Upstream logs that once, because it caches the
+    /// default; Ferrofin rereads the file on every call, so it warns once per
+    /// change of the file. A read failure other than not-found is still an
+    /// error, as upstream lets an `IOException` through.
+    async fn read_named<T: serde::de::DeserializeOwned + Default>(
+        what: &'static str,
+        path: &std::path::Path,
+        warned: &std::sync::Mutex<Option<WarnedFile>>,
+    ) -> Result<T, ServiceError> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                forget_warning(warned);
+                return Ok(T::default());
+            }
+            Err(e) => return Err(io_err(what, path, &e)),
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(document) => {
+                forget_warning(warned);
+                Ok(document)
+            }
+            Err(e) => {
+                if first_warning(warned, path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "a saved configuration file is not valid; using its defaults until it is fixed"
+                    );
+                }
+                Ok(T::default())
+            }
+        }
     }
 
     /// A shared handle to the current configuration.
@@ -712,14 +764,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
-        if !self.branding_file.exists() {
-            return Ok(BrandingOptions::default());
-        }
-        let bytes = tokio::fs::read(&self.branding_file)
-            .await
-            .map_err(|e| io_err("read branding", &self.branding_file, &e))?;
-        serde_json::from_slice::<BrandingOptions>(&bytes)
-            .map_err(|e| json_err("invalid branding JSON", &self.branding_file, &e))
+        Self::read_named("read branding", &self.branding_file, &self.branding_warned).await
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
@@ -747,14 +792,12 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     }
 
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
-        if !self.encoding_file.exists() {
-            return Ok(EncodingOptions::default());
-        }
-        let bytes = tokio::fs::read(&self.encoding_file)
-            .await
-            .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
-        serde_json::from_slice::<EncodingOptions>(&bytes)
-            .map_err(|e| json_err("invalid encoding options JSON", &self.encoding_file, &e))
+        Self::read_named(
+            "read encoding options",
+            &self.encoding_file,
+            &self.encoding_warned,
+        )
+        .await
     }
 }
 
@@ -1578,38 +1621,13 @@ mod tests {
         );
     }
 
+    /// C# `BaseConfigurationManager.LoadConfiguration`: a named document that
+    /// does not parse is logged with its path and read as the defaults, so
+    /// every reader (the branding routes, the transcode throttle, the segment
+    /// cleaner, trickplay) carries on. The warning comes once per change of the
+    /// file, not on every read.
     #[tokio::test]
-    async fn encoding_options_rejects_invalid_json() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = test_paths(tmp.path());
-        let mgr = FerrofinServerConfigurationManager::load(paths)
-            .await
-            .expect("load");
-
-        tokio::fs::create_dir_all(mgr.encoding_file.parent().expect("named dir"))
-            .await
-            .expect("create named dir");
-        tokio::fs::write(&mgr.encoding_file, b"not json")
-            .await
-            .expect("write bad encoding");
-        let error = mgr
-            .get_encoding_options()
-            .await
-            .expect_err("invalid encoding JSON");
-        // Every reader logs this error as it is (the throttle, the segment
-        // cleaner, trickplay, the planner), so it has to say which file it is.
-        assert!(
-            error
-                .to_string()
-                .contains(&mgr.encoding_file.display().to_string()),
-            "{error}"
-        );
-    }
-
-    /// Upstream's `MyXmlSerializer.DeserializeFromFile` attaches the file name
-    /// to any deserialization failure; a broken `branding.json` names itself.
-    #[tokio::test]
-    async fn invalid_branding_json_names_the_file() {
+    async fn an_invalid_named_document_reads_as_its_defaults_and_warns_once() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
             .await
@@ -1618,14 +1636,45 @@ mod tests {
             .expect("create named dir");
         std::fs::write(&mgr.branding_file, b"{ \"LoginDisclaimer\": \"hi\", }")
             .expect("write bad branding");
+        std::fs::write(&mgr.encoding_file, b"not json").expect("write bad encoding");
 
-        let error = mgr.get_branding().await.expect_err("invalid branding JSON");
-        assert!(
-            error
-                .to_string()
-                .contains(&mgr.branding_file.display().to_string()),
-            "{error}"
-        );
+        let logs = CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                assert_eq!(
+                    mgr.get_branding().await.expect("branding"),
+                    BrandingOptions::default()
+                );
+                assert_eq!(
+                    mgr.get_encoding_options().await.expect("encoding"),
+                    EncodingOptions::default()
+                );
+            }
+        }
+        let text = logs.text();
+        for file in [&mgr.branding_file, &mgr.encoding_file] {
+            let warnings: Vec<&str> = text
+                .lines()
+                .filter(|line| {
+                    line.contains(" WARN ") && line.contains(&file.display().to_string())
+                })
+                .collect();
+            assert_eq!(warnings.len(), 1, "one warning per broken file:\n{text}");
+        }
+
+        // A save overwrites the broken file, as the dashboard's would.
+        let branding = BrandingOptions {
+            login_disclaimer: Some("fixed".to_owned()),
+            ..BrandingOptions::default()
+        };
+        mgr.update_branding(&branding).await.expect("save branding");
+        assert_eq!(mgr.get_branding().await.expect("branding"), branding);
     }
 
     /// A hand-edited `system.json` that no longer parses stops the boot with

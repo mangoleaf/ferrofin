@@ -41,6 +41,33 @@ fn person_kind(person: &PeopleEntity) -> ferrofin_model::data::PersonKind {
 
 type SaveLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
 
+/// Whether the Nfo saver is enabled for `row` at `MetadataEdit`: upstream's
+/// `isSavingMetadata` (`ProviderManager.GetMetadataSavers(item,
+/// libraryOptions).Any()`, `MetadataService.cs:184`), under which "Replace
+/// all metadata" skips the local readers (`:803`). An existing sidecar counts
+/// even with local saving off (`IsSaverEnabledForItem`, `:880-889`).
+///
+/// `library` is the item's library options and `global` the server-wide
+/// options for its kind, as [`NfoSaver`] resolves them.
+#[must_use]
+pub fn saves_metadata(
+    row: &BaseItemEntity,
+    library: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+) -> bool {
+    let (Some(kind), Some(path)) = (policy::kind(row), policy::save_path(row)) else {
+        return false;
+    };
+    policy::enabled(
+        library,
+        global,
+        kind,
+        ItemUpdateType::MetadataEdit,
+        false,
+        &path,
+    )
+}
+
 /// The registered Nfo saver, using repository interfaces rather than SQL.
 /// A per-path lock keeps concurrent edits from interleaving file replacement.
 pub struct NfoSaver {

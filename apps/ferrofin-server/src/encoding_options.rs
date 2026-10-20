@@ -1,12 +1,14 @@
 //! Per-job reads of the persisted `encoding` named configuration.
 //!
 //! The transcode planner and subtitle extraction read the live document once
-//! per job, so a dashboard change applies to the next one. When it does not
-//! parse they carry on with [`EncodingOptions::default`], as upstream's
-//! `BaseConfigurationManager.LoadConfiguration` does. They also carry on when
-//! it cannot be read at all, where upstream lets the `IOException` through; a
-//! transcode is not failed over its settings file. [`EncodingOptionsReader`]
-//! keeps either failure visible without repeating it for every job.
+//! per job, so a dashboard change applies to the next one. A document that does
+//! not parse already reads as [`EncodingOptions::default`] in the
+//! configuration manager, as upstream's `BaseConfigurationManager.
+//! LoadConfiguration` does. This module covers the remaining failure, a file
+//! that cannot be read at all, where upstream lets the `IOException` through:
+//! a transcode is not failed over its settings file, so they carry on with the
+//! defaults, and [`EncodingOptionsReader`] keeps that failure visible without
+//! repeating it for every job.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -14,16 +16,13 @@ use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 
 /// Reads the `encoding` named configuration for a caller that runs once per
-/// job, falling back to the defaults when the document is unusable.
+/// job, falling back to the defaults when the document cannot be read.
 ///
-/// For a document that does not parse, upstream logs `Error loading
-/// configuration file: {Path}` and caches the default instance it falls back
-/// to, so a broken file is reported once per process. Ferrofin rereads the
-/// file for every job; a `warn` on each failed read would follow the request
-/// rate, which LOGGING.md §1 rules out. So a failure is logged at `warn` the
-/// first time it is seen and at `debug` while the same failure repeats. A
-/// successful read re-arms the warning, so a file that breaks again later is
-/// reported again.
+/// Ferrofin rereads the file for every job; a `warn` on each failed read would
+/// follow the request rate, which LOGGING.md §1 rules out. So a failure is
+/// logged at `warn` the first time it is seen and at `debug` while the same
+/// failure repeats. A successful read re-arms the warning, so a file that
+/// breaks again later is reported again.
 pub(crate) struct EncodingOptionsReader {
     /// What reads the options, named in the log line.
     reader: &'static str,
@@ -106,10 +105,14 @@ mod tests {
         (manager, file)
     }
 
-    /// One `warn` per distinct failure, `debug` while it repeats, and a fresh
-    /// `warn` once the file has read again and then breaks.
+    /// One `warn` per distinct read failure, `debug` while it repeats, and a
+    /// fresh `warn` once the file has read again and then breaks. (A document
+    /// that does not parse never reaches the reader: the manager serves the
+    /// defaults for it.)
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failure_is_warned_about_once_until_the_file_reads_again() {
+        use std::os::unix::fs::PermissionsExt as _;
         let root = tempfile::tempdir().expect("root");
         let (config, file) = manager(root.path()).await;
         let reader = EncodingOptionsReader::new("test");
@@ -120,27 +123,39 @@ mod tests {
 
         let logs = CapturedLogs::default();
         let guard = logs.install();
-        std::fs::write(&file, b"{ not json").expect("broken");
+        // A directory where the file should be cannot be read.
+        std::fs::create_dir(&file).expect("unreadable");
         assert_eq!(reader.read(&config).await, EncodingOptions::default());
         assert_eq!(reader.read(&config).await, EncodingOptions::default());
         assert_eq!(logs.lines_at("WARN").len(), 1);
         assert_eq!(logs.lines_at("DEBUG").len(), 1);
 
-        // A different failure is news.
-        std::fs::write(&file, b"\"text\"").expect("wrong shape");
+        // A different failure is news: a file the server may not read.
+        std::fs::remove_dir(&file).expect("remove dir");
+        std::fs::write(&file, serde_json::to_vec(&saved).expect("json")).expect("file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let readable_anyway = std::fs::read(&file).is_ok();
         reader.read(&config).await;
-        assert_eq!(logs.lines_at("WARN").len(), 2);
+        if !readable_anyway {
+            assert_eq!(logs.lines_at("WARN").len(), 2);
+        }
 
-        std::fs::write(&file, serde_json::to_vec(&saved).expect("json")).expect("fixed");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert_eq!(reader.read(&config).await, saved);
 
         // Broken the same way again after a good read: warned again.
-        std::fs::write(&file, b"{ not json").expect("broken again");
+        std::fs::remove_file(&file).expect("remove file");
+        std::fs::create_dir(&file).expect("unreadable again");
         reader.read(&config).await;
         drop(guard);
 
         let warnings = logs.lines_at("WARN");
-        assert_eq!(warnings.len(), 3, "{warnings:#?}");
+        // A root test run reads a mode-000 file, so that step warns nothing.
+        assert_eq!(
+            warnings.len(),
+            if readable_anyway { 2 } else { 3 },
+            "{warnings:#?}"
+        );
         let path = file.display().to_string();
         assert!(
             warnings.iter().all(|line| line.contains(&path)),

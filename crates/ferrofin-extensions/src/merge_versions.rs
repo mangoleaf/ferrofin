@@ -47,8 +47,6 @@
 //!   with no Ferrofin equivalent.
 //! - No `VideoType`/`Video3DFormat` columns exist, so primary selection cannot
 //!   demote 3D/non-file videos — the widest wins.
-//! - No `IndexNumberEnd` column exists, so that merge-key component is always
-//!   empty (only multi-episode files could tell the difference).
 //! - The upstream movie loops run their async merges inside `Parallel.ForEach`
 //!   fire-and-forget lambdas (dropping errors); Ferrofin awaits sequentially.
 
@@ -830,9 +828,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         }
     }
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
-        // No `IndexNumberEnd` column exists in Ferrofin's schema; the trailing
-        // component is empty, exactly as the C# renders a null.
-        return format!("{series}|number:{parent}:{index}:");
+        // `IndexNumberEnd` lives in the `Data` blob; a null renders as
+        // nothing, as in the C# interpolation.
+        let end = ferrofin_core::item_data::read_data_i32(
+            &ferrofin_core::item_data::parse_data(ep.data.as_deref()),
+            "IndexNumberEnd",
+        )
+        .map(|end| end.to_string())
+        .unwrap_or_default();
+        return format!("{series}|number:{parent}:{index}:{end}");
     }
     format!(
         "{series}|title:{}:{}:{}",
@@ -1226,6 +1230,14 @@ mod tests {
     fn episode_merge_key_falls_back_to_numbers_then_title() {
         let ep = episode("Show", "Season 1", "Pilot", Some((1, 2)));
         assert_eq!(episode_merge_key(&ep, |_| None), "Show|number:1:2:");
+        // A multi-episode file's range end is the last component, as the C#
+        // renders `IndexNumberEnd`: a double episode is not a version of
+        // its first half.
+        let double = BaseItemEntity {
+            data: Some(r#"{"IndexNumberEnd":3,"Container":"mkv"}"#.to_owned()),
+            ..ep.clone()
+        };
+        assert_eq!(episode_merge_key(&double, |_| None), "Show|number:1:2:3");
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
