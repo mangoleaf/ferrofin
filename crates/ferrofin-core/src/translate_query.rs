@@ -2565,6 +2565,8 @@ fn push_search_relevance(qb: &mut QueryBuilder<Sqlite>, term: &str) {
 ///   alone is not a total order here (7,093 of 9,862 rows are people/studios/
 ///   genres with a NULL `SortName`), and the index reorders 7,189 positions.
 ///
+/// `Name` (`CleanName`) is pinned for a different index: see [`pins_sort_plan`].
+///
 /// The ascending `(SortName, Name)` ordering is the one case proven identical:
 /// all 9,679 rows come back in the same order with and without the index,
 /// because SQLite's sorter and the index agree on rowid order within a tie.
@@ -2577,11 +2579,16 @@ const SORT_PLAN_PIN: &str = "+";
 /// A key that renders as anything else (`DateCreated`, a correlated user-data
 /// sub-select, `ferrofin_random()`, …) can never be served by
 /// `FerrofinIX_BaseItems_SortName_Name`, so it is left alone.
+///
+/// `Name` (`CleanName`) is pinned too, keeping the sort it had while it fell
+/// back to `SortName`: unpinned, `IX_BaseItems_Type_CleanName` turns a typed
+/// browse into an index walk that reads every row of that type, in every
+/// library, to fill a page of one.
 fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery) -> bool {
     if by == ItemSortBy::SortName && order == SortOrder::Ascending {
         return false;
     }
-    orders_by_sort_name_column(by, filter)
+    by == ItemSortBy::Name || orders_by_sort_name_column(by, filter)
 }
 
 /// Whether [`push_order_expression`] renders `by` as the bare
@@ -2911,8 +2918,11 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,
-        // Name/SortName fall back to SortName (the join-backed keys `Artist`,
-        // `AlbumArtist` and `Studio` are expressions of their own).
+        // `(ItemSortBy.Name, _) => e => e.CleanName`: a track's or episode's
+        // `SortName` leads with its numbers, so "Track name" must not use it.
+        ItemSortBy::Name => r#"bi."CleanName""#,
+        // Everything else falls back to SortName (the join-backed keys
+        // `Artist`, `AlbumArtist` and `Studio` are expressions of their own).
         _ => r#"bi."SortName""#,
     }
 }
@@ -3563,12 +3573,18 @@ mod tests {
             order_by(&InternalItemsQuery::default()),
             r#"ORDER BY +bi."SortName""#
         );
-        // A key that falls back to the SortName column without being SortName
-        // (upstream maps `Name` to `CleanName`, so it gets no Name tiebreaker)
-        // is pinned for the same reason as the bare default.
+        // `Name` orders by `CleanName` (upstream `OrderMapper`), takes no Name
+        // or SortName tiebreaker, and keeps its pinned sort.
         assert_eq!(
             order_by(&sorted_by(&[(ItemSortBy::Name, SortOrder::Ascending)])),
-            r#"ORDER BY +bi."SortName" ASC"#
+            r#"ORDER BY +bi."CleanName" ASC"#
+        );
+        // A key that falls back to the SortName column without being SortName
+        // is pinned for the same reason as the bare default, and takes
+        // upstream's final SortName tiebreaker.
+        assert_eq!(
+            order_by(&sorted_by(&[(ItemSortBy::AirTime, SortOrder::Ascending)])),
+            r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
         );
         // A leading key on another column can never be served by the index, so
         // it is left unpinned — and takes no Name tiebreaker.
