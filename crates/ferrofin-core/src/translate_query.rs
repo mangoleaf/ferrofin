@@ -2601,14 +2601,17 @@ fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bo
 
 /// Appends the `ORDER BY` clause from `filter.order_by`, mapping each
 /// [`ItemSortBy`] to its column (subset of C# `OrderMapper.MapOrderByField`),
-/// with `SortName` as the default / tiebreaker.
+/// with `SortName` as the default / tiebreaker when there is no search.
 ///
-/// A non-blank `filter.search_term` takes the C# `ApplyOrder` search branch:
-/// the relevance rank leads, and `order_by` is evaluated as
-/// `[(SortName, Ascending), ..order_by]` — that leading key being `SortName` is
-/// also what earns C#'s `ThenBy(e.Name)` tiebreaker. Ranking in SQL rather than
-/// after the fact is what makes the `LIMIT` keep the *best* matches instead of
-/// the alphabetically first ones.
+/// A non-blank `filter.search_term` takes the v12.2 `ApplyOrder` search
+/// branch: the relevance rank leads, then the caller's keys exactly as without
+/// a search (`ThenBy(e.Name)` after a leading `SortName` included), and no
+/// final `SortName` tiebreaker — upstream guards it with `!hasSearch`, so with
+/// no `sortBy` the relevance rank is the whole ordering. (10.11.8 evaluated
+/// `[(SortName, Ascending), ..order_by]` here; upstream dropped that prepend,
+/// which had made an explicit `sortBy` inert among equal-relevance hits.)
+/// Ranking in SQL rather than after the fact is what makes the `LIMIT` keep
+/// the *best* matches instead of the alphabetically first ones.
 pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let ordered: Vec<&(ItemSortBy, SortOrder)> = filter
         .order_by
@@ -2656,14 +2659,11 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
 
     if let Some(term) = search_term {
         push_search_relevance(qb, term);
-        qb.push(r#", bi."SortName" ASC, bi."Name" ASC"#);
-        for (by, order) in ordered {
+        // The relevance rank leads, so no index can serve what follows and
+        // nothing is pinned.
+        if !ordered.is_empty() {
             qb.push(", ");
-            push_order_expression(qb, *by, filter);
-            qb.push(match order {
-                SortOrder::Ascending => " ASC",
-                SortOrder::Descending | SortOrder::Unrecognized(_) => " DESC",
-            });
+            push_caller_keys(qb, &ordered, filter, false);
         }
         return;
     }
@@ -2678,13 +2678,31 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         return;
     }
 
-    let mut has_name_sort = false;
-    // C# `ApplyOrder` appends `ThenBy(e => e.Name)` when the FIRST ordering key
-    // is `SortName` — see below.
-    let leads_with_sort_name = matches!(ordered.first(), Some((ItemSortBy::SortName, _)));
     // Only the leading term can be satisfied by an index, so it is the only one
     // that ever carries the plan pin.
     let pin_leading_term = pins_sort_plan(ordered[0].0, ordered[0].1, filter);
+    push_caller_keys(qb, &ordered, filter, pin_leading_term);
+    // C# "Add SortName as final tiebreaker" — only without a search, and only
+    // when no key is already `SortName` or `Name`.
+    if ordered
+        .iter()
+        .all(|(by, _)| !matches!(by, ItemSortBy::SortName | ItemSortBy::Name))
+    {
+        qb.push(r#", bi."SortName" ASC"#);
+    }
+}
+
+/// Pushes the caller's (non-`Default`) sort keys — the body of C#
+/// `ApplyOrder`'s `if (orderBy.Length > 0)` block, shared by the search and
+/// the plain branch. `ordered` must not be empty, and the caller has already
+/// pushed any separator the first key needs. `pin_leading_term` prefixes the
+/// first key with [`SORT_PLAN_PIN`].
+fn push_caller_keys(
+    qb: &mut QueryBuilder<Sqlite>,
+    ordered: &[&(ItemSortBy, SortOrder)],
+    filter: &InternalItemsQuery,
+    pin_leading_term: bool,
+) {
     for (index, (by, order)) in ordered.iter().enumerate() {
         if index > 0 {
             qb.push(", ");
@@ -2696,9 +2714,6 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
             SortOrder::Ascending => " ASC",
             SortOrder::Descending | SortOrder::Unrecognized(_) => " DESC",
         });
-        if matches!(by, ItemSortBy::SortName | ItemSortBy::Name) {
-            has_name_sort = true;
-        }
         // C# `ApplyOrder`:
         //     if (firstOrdering.OrderBy is ItemSortBy.Default or ItemSortBy.SortName)
         //         orderedQuery = ascending ? ThenBy(e => e.Name)
@@ -2713,18 +2728,15 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         // `SortName, Name, ProductionYear`. Because `Name` is near-unique,
         // upstream's third term is effectively inert and ours is not.
         //
-        // It fires only for a leading `SortName` (`Default` is filtered out
-        // above), never for a leading `Name` — which upstream maps to
-        // `CleanName`, not `SortName`.
-        if index == 0 && leads_with_sort_name {
+        // It fires only for a leading `SortName` (`append_order_by` has
+        // already dropped `Default`), never for a leading `Name` — which
+        // upstream maps to `CleanName`, not `SortName`.
+        if index == 0 && *by == ItemSortBy::SortName {
             qb.push(match order {
                 SortOrder::Ascending => r#", bi."Name" ASC"#,
                 SortOrder::Descending | SortOrder::Unrecognized(_) => r#", bi."Name" DESC"#,
             });
         }
-    }
-    if !leads_with_sort_name && !has_name_sort {
-        qb.push(r#", bi."SortName" ASC"#);
     }
 }
 
@@ -3474,23 +3486,53 @@ mod tests {
         );
     }
 
-    /// The search branch already carried upstream's `(SortName, Name)` pair;
-    /// its relevance rank leads, so no index can serve the ordering and the
-    /// leading term must stay unpinned.
+    /// The search branch is v12.2 `ApplyOrder`'s: the relevance rank leads,
+    /// then the caller's keys in order — with `ThenBy(Name)` only after a
+    /// leading `SortName` — and no final `SortName` tiebreaker (it is guarded by
+    /// `!hasSearch`). 10.11.8 prepended `(SortName, Ascending)` to the caller's
+    /// keys, which upstream dropped, so an explicit `sortBy` decided nothing
+    /// among equal-relevance hits. The relevance rank leads, so no index can
+    /// serve any of these orderings and nothing is pinned.
     #[test]
-    fn search_ordering_is_unchanged() {
-        let filter = InternalItemsQuery {
-            search_term: Some("blade".to_owned()),
-            ..InternalItemsQuery::default()
+    fn search_ordering_follows_v12_apply_order() {
+        const RELEVANCE: &str = r#"ORDER BY CASE WHEN bi."CleanName" = ? THEN 0 WHEN substr(bi."CleanName", 1, ?) = ? THEN 1 WHEN substr(bi."CleanName", 1, ?) = ? THEN 2 ELSE 3 END ASC"#;
+        let searched = |keys: &[(ItemSortBy, SortOrder)]| {
+            order_by(&InternalItemsQuery {
+                search_term: Some("blade".to_owned()),
+                ..sorted_by(keys)
+            })
         };
-        let sql = order_by(&filter);
-        assert!(
-            sql.contains(r#", bi."SortName" ASC, bi."Name" ASC"#),
-            "search keeps the SortName/Name pair: {sql}"
+        // No sortBy: relevance alone. `orderedQuery` is already the relevance
+        // ordering, so neither the bare `OrderBy(SortName)` fallback nor the
+        // `!hasSearch` tiebreaker applies.
+        assert_eq!(searched(&[]), RELEVANCE);
+        // An explicit key follows the relevance rank directly.
+        assert_eq!(
+            searched(&[(ItemSortBy::DateCreated, SortOrder::Descending)]),
+            format!(r#"{RELEVANCE}, bi."DateCreated" DESC"#)
         );
-        assert!(
-            !sql.contains('+'),
-            "the relevance rank leads, so nothing is pinned: {sql}"
+        // A leading SortName earns `ThenBy(Name)` in its own direction (the
+        // `/Search/Hints` shape)…
+        assert_eq!(
+            searched(&[(ItemSortBy::SortName, SortOrder::Ascending)]),
+            format!(r#"{RELEVANCE}, bi."SortName" ASC, bi."Name" ASC"#)
+        );
+        assert_eq!(
+            searched(&[(ItemSortBy::SortName, SortOrder::Descending)]),
+            format!(r#"{RELEVANCE}, bi."SortName" DESC, bi."Name" DESC"#)
+        );
+        // …a secondary one does not, and nothing is appended after the keys.
+        assert_eq!(
+            searched(&[
+                (ItemSortBy::ProductionYear, SortOrder::Ascending),
+                (ItemSortBy::SortName, SortOrder::Ascending),
+            ]),
+            format!(r#"{RELEVANCE}, bi."ProductionYear" ASC, bi."SortName" ASC"#)
+        );
+        // `Default` keys are dropped before anything is emitted.
+        assert_eq!(
+            searched(&[(ItemSortBy::Default, SortOrder::Ascending)]),
+            RELEVANCE
         );
     }
 }

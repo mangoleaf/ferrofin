@@ -1539,6 +1539,63 @@ async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes
     }
 }
 
+/// v12.2 `ItemsController.GetItems` re-sorts a searched page by the search
+/// providers' score, then `SortName` (ItemsController.cs:596-600), a stable
+/// sort over what `folder.GetItems` returned in the caller's order. The
+/// handler reproduces it by leading the caller's keys with `SortName`, which
+/// `ApplyOrder`'s search branch puts right after the relevance rank. Without
+/// a (non-blank) search the caller's keys pass through untouched.
+#[tokio::test]
+async fn get_items_orders_a_search_by_sort_name_before_the_callers_keys() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let order_by_for = |params: &'static str| async move {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5B),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?recursive=true&userId={USER_ID}&{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock()
+            .unwrap()
+            .take()
+            .expect("query_items ran")
+            .order_by
+    };
+    assert_eq!(
+        order_by_for("searchTerm=blade&sortBy=DateCreated&sortOrder=Descending").await,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::DateCreated, SortOrder::Descending)
+        ]
+    );
+    assert_eq!(
+        order_by_for("searchTerm=blade").await,
+        [(ItemSortBy::SortName, SortOrder::Ascending)]
+    );
+    assert_eq!(
+        order_by_for("sortBy=DateCreated&sortOrder=Descending").await,
+        [(ItemSortBy::DateCreated, SortOrder::Descending)]
+    );
+    assert_eq!(
+        order_by_for("searchTerm=%20&sortBy=DateCreated").await,
+        [(ItemSortBy::DateCreated, SortOrder::Ascending)]
+    );
+}
+
 /// Wholphin's genre grid asks each genre for one random item that has a
 /// backdrop (`imageTypes=Backdrop`) and builds the card's image URL from it;
 /// an item without a backdrop yields a null URL that crashes the whole grid
