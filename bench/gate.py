@@ -8,9 +8,15 @@
         PREVIOUS CANDIDATE PREVIOUS CANDIDATE … (default 3 pairs), Ferrofin only: per cell,
         regressed / within noise / improved; exits 1 when a gated cell regressed or could
         not be judged
+    gate.py scan PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
+        the same interleaved pairs, each run `scan.py` (library-scan and adoption-migration
+        wall time and peak anon memory, B7/B8) instead of run.sh; every cell gates (D6)
     gate.py render SESSION_DIR
         rewrite a finished session's report.md and report.html from its run dirs (an A/B
         also rewrites each candidate run's ab-verdicts.json and report.html)
+
+Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
+latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
 
 Each run is `run.sh --servers ferrofin --only shape,unloaded,loaded` into SESSION_DIR/NN-a or
 NN-b. The shape pass is what makes a cell comparable: without it every cell is caveated
@@ -37,6 +43,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+import oracle
 import report
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +53,11 @@ PHASES = "shape,unloaded,loaded"
 GATED_LEVELS = ("unloaded", "loaded")
 #: An endpoint cell whose medians are both under this many ms is reported, never gated (B5).
 SUB_MS = 1.0
+#: A scan session's cells: (cell, scan.json part, field, unit, gate.toml row).
+SCAN_CELLS = (("scan/wall time", "scan", "wall_s", "s", "scan"),
+              ("scan/peak anon", "scan", "peak_anon_mib", "MiB", "memory"),
+              ("migration/wall time", "migration", "wall_s", "s", "scan"),
+              ("migration/peak anon", "migration", "peak_anon_mib", "MiB", "memory"))
 
 
 # ── the pure part: cells, noise, verdicts ───────────────────────────────────
@@ -164,6 +176,19 @@ def verdicts(model_a, model_b, gate):
     return out
 
 
+def scan_verdicts(results, gate):
+    """Per SCAN_CELLS cell: the D4 verdict over each role's scan.json values in schedule
+    order (`results[role]`), judged by the cell's own band or its gate.toml row."""
+    out = {}
+    for key, part, field, unit, kind in SCAN_CELLS:
+        a, b = ([r[part][field] for r in results[role]] for role in ("a", "b"))
+        band = (gate.get("cells") or {}).get(key) or gate.get(kind)
+        v, diff, pct, slower = verdict(a, b, band)
+        out[key] = {"kind": kind, "unit": unit, "a": a, "b": b, "band": band, "verdict": v, "diff": diff, "pct": pct,
+                    "slower": slower, "a_median": statistics.median(a), "b_median": statistics.median(b), "gated": True}
+    return out
+
+
 def blocking(rows):
     """The gated cells that stop the release: regressed, or not judgeable."""
     return sorted(k for k, r in rows.items() if r["gated"] and r["verdict"] in ("regressed", "not comparable"))
@@ -204,9 +229,9 @@ def image_ref(image):
 
 
 def run_sh(cmd):
-    """run.sh to completion. On Ctrl-C it gets SIGTERM and time to run its own cleanup
-    (stop its container, finish phases.json): a killed run.sh would leave a bench-*
-    container behind that refuses the next run."""
+    """A run (run.sh or scan.py) to completion. On Ctrl-C it gets SIGTERM and time to run
+    its own cleanup (stop its container, finish phases.json): a killed run would leave a
+    bench-* container behind that refuses the next run."""
     proc = subprocess.Popen(cmd)
     try:
         return proc.wait()
@@ -218,6 +243,8 @@ def run_sh(cmd):
 
 def run_session(session, plan, testdata):
     """Run the schedule; stop at the first run that fails or measured the wrong image."""
+    if plan.get("mode") == "scan":
+        return scan_session(session, plan, testdata)
     original = image_ref(TAG)
     try:
         for name, role, image in plan["schedule"]:
@@ -247,6 +274,21 @@ def run_session(session, plan, testdata):
             print(f"gate: {TAG} did not exist before the session; it now names the last image run", file=sys.stderr)
 
 
+def scan_session(session, plan, testdata):
+    """scan.py per run, given the image ID itself, so nothing is retagged; the ID its
+    containers ran is checked all the same."""
+    for name, role, image in plan["schedule"]:
+        out = os.path.join(session, name)
+        print(f"== {name}: {role} = {image}", flush=True)
+        rc = run_sh([sys.executable, os.path.join(BENCH, "scan.py"), plan["images"][role]["id"],
+                     testdata or os.path.join(BENCH, "testdata"), out])
+        if rc:
+            sys.exit(f"gate: {name} failed (scan.py exit {rc}); the session stops here, see {out}")
+        measured = (report.load(os.path.join(out, "scan.json")) or {}).get("image_id")
+        if measured != plan["images"][role]["id"]:
+            sys.exit(f"gate: {name} measured {measured or 'no image'}, not {image}. The session stops here.")
+
+
 def models(session, plan):
     by_role = {}
     for name, role, _ in plan["schedule"]:
@@ -263,8 +305,17 @@ def render(session):
     if not plan:
         raise ValueError(f"{session} has no gate.json")
     gate = report.load_gate()
-    built, by_role = models(session, plan)
-    if plan["mode"] == "aa":
+    if plan["mode"] == "scan":
+        results = {}
+        for run, role, _ in plan["schedule"]:
+            measured = report.load(os.path.join(session, run, "scan.json"))
+            if not measured:
+                raise ValueError(f"{session}/{run} has no scan.json")
+            results.setdefault(role, []).append(measured)
+        result = {"verdicts": scan_verdicts(results, gate)}
+        name, block = "verdict.json", blocking(result["verdicts"])
+    elif plan["mode"] == "aa":
+        built, by_role = models(session, plan)
         runs = by_role["a"]
         # The A/A runs split into the interleaved halves an A/B would compare: any verdict
         # but "within noise" there is a false alarm the thresholds would raise.
@@ -274,6 +325,7 @@ def render(session):
         result["kinds"] = kind_summary(result["noise"], gate)
         name, block = "noise.json", []
     else:
+        built, by_role = models(session, plan)
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
@@ -343,7 +395,9 @@ def md_table(head, rows):
 
 def header(plan):
     imgs = "; ".join(f"{role} = {i['ref']} ({i['id'][:19]})" for role, i in plan["images"].items())
-    return f"{plan['mode'].upper()} session {plan['name']}, {len(plan['schedule'])} runs, {plan['date']}: {imgs}"
+    o = plan.get("oracle")
+    pin = f"; Jellyfin oracle {o['tag']} ({o['image']})" if o else ""
+    return f"{plan['mode'].upper()} session {plan['name']}, {len(plan['schedule'])} runs, {plan['date']}: {imgs}{pin}"
 
 
 def render_md(plan, result):
@@ -408,7 +462,7 @@ def render_html(plan, result):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("aa", "ab", "render"):
+    if len(argv) < 2 or argv[0] not in ("aa", "ab", "scan", "render"):
         sys.exit(__doc__)
     mode, args = argv[0], argv[1:]
     if mode == "render":
@@ -441,12 +495,20 @@ def main(argv):
     plan = {"mode": mode, "name": os.path.basename(session), "date": stamp.isoformat(timespec="seconds"),
             "schedule": schedule(mode, images, count)}
     print(f"{mode} session {session}:")
+    what = "scan.py" if mode == "scan" else f"run.sh --servers ferrofin --only {PHASES}"
     for name, role, image in plan["schedule"]:
-        print(f"  {name}  {role}  {image}  run.sh --servers ferrofin --only {PHASES}")
+        print(f"  {name}  {role}  {image}  {what}")
     if flags:
         return 0
     if os.path.exists(session):
         sys.exit(f"gate: {session} exists — a session directory is never reused")
+    # A release gate never runs against a Jellyfin pin behind the latest release (DO).
+    try:
+        plan["oracle"], problem = oracle.check()
+    except (OSError, ValueError) as err:
+        problem = f"cannot read the Jellyfin oracle pin ({err})"
+    if problem:
+        sys.exit(f"gate: refusing: {problem}")
     plan["images"] = {}
     for role, image in images.items():
         ref = image_ref(image)

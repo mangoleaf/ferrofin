@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
 #
-# Adopts every Jellyfin release Ferrofin claims to support, 10 paths: 10.11.8, 10.11.9, 10.11.10,
-# 10.11.11, 12.0, 12.1 via both upgrade routes and 12.2 via all three (from 10.11, 12.0, 12.1),
-# through one image, on a FRESH copy of each pristine fixture under DIR, and checks each one
+# Adopts every Jellyfin release Ferrofin claims to support, 11 paths: 10.11.8, 10.11.9, 10.11.10,
+# 10.11.11, 12.0, 12.1 via both upgrade routes, 12.2 via all three (from 10.11, 12.0, 12.1), and a
+# 12.2 fresh install (not upgraded from 10.11), through one image, on a FRESH copy of each pristine
+# fixture under DIR, and checks each one
 # the same way:
 #   1. the boot log names the expected generation, applies every migration, logs no ERROR;
 #   2. smoke.sh answers match the oracle release's own answers on the same library
@@ -37,6 +38,7 @@ FIXTURES=$(cd "$FIXTURES" && pwd)
 WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work/run}  # synthetic.py run owns work/<fixture>
 for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
 python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is required for artwork checks" >&2; exit 2; }
+python3 -c 'import icu' 2>/dev/null || { echo "run: Python PyICU (python3-icu) is required for the CleanValue check" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
 ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
@@ -47,9 +49,12 @@ adoption_require_local "$FIXTURES" && adoption_require_local "$WORK" || exit 2; 
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 # name|fixture directory|host port
 # The generation is the id SET the gate matches, so 10.11.9 adopts as "10.11.8" (it adds no
-# migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids). Every row
-# is an upgraded database; fresh-install 12.x databases adopt too, covered by the Rust gate
-# tests only.
+# migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids). Every
+# jellyfin-*-from-* row is an upgraded database; jellyfin-12.2-fresh is a database created by a
+# Jellyfin 12.2 first run (not upgraded from 10.11), so it carries the fresh-install EF history
+# id set (105 ids, without the retired 10.11-era routines) and the fresh-install schema, yet
+# still adopts as generation 12.2.0 and answers Jellyfin 12.2's own smoke on that first-run
+# library (its own oracle, since a clean install is a distinct library from the seeded routes).
 FIXTURE_TABLE=(
   "10.11.8|jellyfin-10.11.8|18099"
   "10.11.8|jellyfin-10.11.9|18089"
@@ -61,6 +66,7 @@ FIXTURE_TABLE=(
   "12.2.0|jellyfin-12.2-from-10|18091"
   "12.2.0|jellyfin-12.2-from-12|18090"
   "12.2.0|jellyfin-12.2-from-121|18083"
+  "12.2.0|jellyfin-12.2-fresh|18082"
 )
 wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
 settle() { local port=$1 auth=$2 busy; for _ in $(seq 1 60); do busy=$(curl -sf "http://127.0.0.1:$port/ScheduledTasks" -H "$auth" 2>/dev/null | jq -r '[.[]|select(.State!="Idle")]|length' 2>/dev/null); [ "${busy:-1}" = 0 ] && break; sleep 2; done; sleep 5; }
@@ -96,6 +102,12 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   IFS='|' read -r expected src port <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$src" ] || [ "$ONLY" = "$expected" ] || continue
   [ -d "$FIXTURES/$src" ] || { printf '%-5s %-9s %-28s %s\n' SKIP "$expected" "$src" "fixture missing"; continue; }
+  # A first-run install is a distinct, clean library (no aged seeds), so it always answers its
+  # own Jellyfin 12.2 oracle (it is a 12.2 database; --oracle does not apply to it). Every other
+  # row answers the shared ORACLE_VERSION oracle. Either way it is Jellyfin's own answers on the
+  # row's library, compared against Ferrofin's after adoption.
+  case $src in jellyfin-12.2-fresh) oracle=$FIXTURES/oracle/smoke-jellyfin-12.2-fresh.txt;; *) oracle=$ORACLE;; esac
+  [ -f "$oracle" ] || { printf '%-5s %-9s %-28s %s\n' SKIP "$expected" "$src" "oracle ${oracle##*/} missing — run build-fixtures.sh"; continue; }
   name=adopt-$src; dst=$WORK/$src
   # A 10.11 source has no music-artist credits until its first 12.x or Ferrofin scan: 10.11
   # never made them, and 12.x makes them only on a metadata refresh (AudioFileProber,
@@ -136,7 +148,7 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   docker logs "$name" > "$dst.boot.log" 2>&1
   mapfile -t -O "${#why[@]}" why < <(adoption_check_boot_log "$dst.boot.log" "$expected")
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke.txt" 2>&1
-  mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$ORACLE" "$dst.smoke.txt" "$after_scan")
+  mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$oracle" "$dst.smoke.txt" "$after_scan")
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
   metadata_check "after adoption" check
   docker restart "$name" >/dev/null; wait_ready "$port" || why+=("second boot never ready")
@@ -154,7 +166,7 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   if [ -n "$after_scan" ]; then
     settle "$port" "$AUTH"
     "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke-scan.txt" 2>&1
-    mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$ORACLE" "$dst.smoke-scan.txt" | sed 's/^/after scan: /')
+    mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$oracle" "$dst.smoke-scan.txt" | sed 's/^/after scan: /')
   fi
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
   verdict=PASS; [ "${#why[@]}" = 0 ] || verdict=FAIL

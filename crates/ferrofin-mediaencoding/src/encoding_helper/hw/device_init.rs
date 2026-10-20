@@ -12,7 +12,7 @@
 //! how the C# builds it, and keeping the shape means a golden string can be
 //! compared against upstream output by eye.
 
-use crate::encoder::FfmpegVersion;
+use crate::encoder::{FfmpegVersion, quote_if_needed};
 
 use super::capabilities::Platform;
 use super::versions::MIN_FFMPEG_VAAPI_DEVICE_VENDOR_ID;
@@ -255,6 +255,11 @@ impl<'a> VaapiDeviceSpec<'a> {
 ///
 /// The vendor-id form only appears on ffmpeg 7.0.1 and newer, which is where
 /// `,vendor_id=` was added; older builds fall through to the kernel driver.
+///
+/// **Accepted divergence.** A configured render-node path that needs it is
+/// quoted for the argv split ([`quote_if_needed`]); upstream interpolates it
+/// bare, so a space or quote in the path breaks the command line. Jellyfin
+/// bug, not ported.
 #[must_use]
 pub fn vaapi_device_args(
     spec: &VaapiDeviceSpec<'_>,
@@ -265,7 +270,7 @@ pub fn vaapi_device_args(
         && ffmpeg_version.is_some_and(|v| v >= MIN_FFMPEG_VAAPI_DEVICE_VENDOR_ID);
 
     let selector = if spec.render_node.usable() {
-        spec.render_node.path().unwrap_or_default().to_owned()
+        quote_if_needed(spec.render_node.path().unwrap_or_default()).into_owned()
     } else if have_vendor_id {
         format!(",vendor_id={}", spec.vendor_id.unwrap_or_default())
     } else {
@@ -304,13 +309,15 @@ pub fn vaapi_device_args(
 /// start. Every other device builder in this file uses `IsNullOrEmpty`; this one
 /// is upstream's odd one out. Ferrofin treats empty as unset here too, so a
 /// cleared field degrades to the default node instead of to a broken command
-/// line. Recorded per the project rule on not porting Jellyfin's bugs.
+/// line. Recorded per the project rule on not porting Jellyfin's bugs. The
+/// node is also quoted for the argv split when it needs it, as in
+/// [`vaapi_device_args`].
 #[must_use]
 pub fn drm_device_args(render_node_path: Option<&str>, alias: &str) -> String {
     let node = render_node_path
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_RENDER_NODE);
-    format!(" -init_hw_device drm={alias}:{node}")
+    format!(" -init_hw_device drm={alias}:{}", quote_if_needed(node))
 }
 
 /// The QSV device graph for this platform. Port of `GetQsvDeviceArgs`.
@@ -388,6 +395,7 @@ pub fn qsv_device_is_adapter_index(render_node_path: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::split_args;
 
     /// ffmpeg 7.0.1 — new enough for the `,vendor_id=` VAAPI option.
     const V701: FfmpegVersion = FfmpegVersion::with_build(7, 0, 1);
@@ -589,6 +597,26 @@ mod tests {
         assert_eq!(
             vaapi_device_args(&VaapiDeviceSpec::default(), VAAPI_ALIAS, Some(V701)),
             " -init_hw_device vaapi=va"
+        );
+    }
+
+    // The device string is split into argv by `split_args`, so a configured
+    // render node with a space must come back as one `-init_hw_device` value.
+    #[test]
+    fn a_configured_render_node_with_a_space_stays_one_argument() {
+        let node = "/dev/dri/by-path/my gpu-render";
+        assert_eq!(
+            split_args(&drm_device_args(Some(node), DRM_ALIAS)).unwrap(),
+            ["-init_hw_device", "drm=dr:/dev/dri/by-path/my gpu-render"]
+        );
+        let spec = VaapiDeviceSpec::for_render_node(RenderNode::new(Some(node), true))
+            .with_driver(Some("iHD"));
+        assert_eq!(
+            split_args(&vaapi_device_args(&spec, VAAPI_ALIAS, Some(V701))).unwrap(),
+            [
+                "-init_hw_device",
+                "vaapi=va:/dev/dri/by-path/my gpu-render,driver=iHD"
+            ]
         );
     }
 

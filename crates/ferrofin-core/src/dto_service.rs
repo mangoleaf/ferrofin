@@ -98,7 +98,7 @@ struct Prefetched {
     user_data: HashMap<Uuid, UserItemDataDto>,
     /// Media streams per item id (populated when EITHER the `MediaStreams` or
     /// the `MediaSources` field is requested), so a page builds them in one
-    /// query instead of N. Read three times — see [`take_or_clone`].
+    /// query instead of N. Read up to three times — see [`take_or_clone`].
     media_streams: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaStream>>,
     /// Media attachments per item id (when `MediaSources` is requested).
     media_attachments: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaAttachment>>,
@@ -175,6 +175,20 @@ struct Prefetched {
     /// user, with `MediaSources`, on a page holding versions), which puts the
     /// version being resumed first.
     version_user_data: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto>,
+    /// The `(AudioStreamIndex, SubtitleStreamIndex)` the user remembers for
+    /// each page video (populated only for a user, with `MediaSources`; an
+    /// item remembering neither is absent) — `SetDefaultAudioAndSubtitle
+    /// StreamIndices`' `GetUserData(user, item)`, read once for the page.
+    remembered_streams: HashMap<Uuid, (Option<i32>, Option<i32>)>,
+    /// `OriginalLanguage` per *series* id, for the page's episodes that have
+    /// none of their own (populated only for a user, with
+    /// `MediaSources`): their inherited original language, which the default
+    /// audio stream follows.
+    series_original_languages: HashMap<Uuid, String>,
+    /// The user's playback permissions (populated only for a user, with
+    /// `MediaSources`), which overwrite each source's `SupportsTranscoding`/
+    /// `SupportsDirectStream` (`MediaSourceManager.cs:409-417`).
+    playback_permissions: Option<ferrofin_traits::library::PlaybackPermissions>,
     /// How many alternate versions each primary has (populated when either
     /// the `MediaSources` or the `MediaSourceCount` field is requested; a
     /// primary with none is absent). Keyed by the PRIMARY, which for a page
@@ -230,9 +244,11 @@ struct Prefetched {
 /// **Only safe where no reader of that id remains after this point.** For most
 /// maps that is trivially true — they have exactly one read site, keyed by the
 /// item's own id. `media_streams` is the exception and needs care: it is read
-/// three times (the `MediaSources` block, once more there per merged alternate
-/// keyed by the *alternate's* id, and the `MediaStreams` field). It may be
-/// drained ONLY at the last of those, the `MediaStreams` field, and only when
+/// up to three times (the `MediaSources` block, once more there per merged
+/// alternate keyed by the *alternate's* id, and the `MediaStreams` field — which
+/// reads the item's own source instead when the DTO has one, and the map only
+/// otherwise). It may be drained ONLY at the last of those, the `MediaStreams`
+/// field, and only when
 /// `repeated` also folds in `Prefetched::alt_referenced` — otherwise a page item
 /// that lists this id as its alternate is projected later and finds the entry
 /// gone. Do not drain it at the `MediaSources` block: that read comes first, and
@@ -609,6 +625,17 @@ pub(crate) fn runtime_is_folder(item: &BaseItemEntity) -> bool {
             .and_then(|p| Uuid::parse_str(p).ok())
             .is_some_and(|p| !p.is_nil()),
         _ => true,
+    }
+}
+
+/// A leaf's played numbers — `BaseItem.FillUserDataDtoValues` (v12.2
+/// BaseItem.cs:2746-2767): a positive resume position over a known runtime
+/// becomes `PlayedPercentage`.
+pub(crate) fn fill_leaf_played_percentage(ud: &mut UserItemDataDto, run_time_ticks: Option<i64>) {
+    if ud.playback_position_ticks > 0
+        && let Some(runtime) = run_time_ticks.filter(|rt| *rt > 0)
+    {
+        ud.played_percentage = Some(percent_of_ticks(ud.playback_position_ticks, runtime));
     }
 }
 
@@ -1240,6 +1267,11 @@ pub struct FerrofinDtoService {
     /// is `Clone` and the composition root wires the seam after the clones
     /// exist — every copy must see the value once it lands.
     live_tv: Arc<OnceLock<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>>,
+    /// The localization the per-user default-stream selection normalizes
+    /// languages through (`MediaSourceManager.NormalizeLanguage`) — the same
+    /// one the media-source manager holds, so the item DTO and `PlaybackInfo`
+    /// select alike. `None` (unit tests) compares languages as given.
+    localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinDtoService {
@@ -1281,7 +1313,20 @@ impl FerrofinDtoService {
             virtual_paths: VirtualPathExpander::identity(),
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
+            localization: None,
         }
+    }
+
+    /// Installs the localization the `MediaSources`' default-stream selection
+    /// normalizes languages through. Called once by the composition root,
+    /// with the media-source manager's.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
+        self
     }
 
     /// Attaches the Live TV manager whose `AddChannelInfo` finishes a channel
@@ -2246,11 +2291,8 @@ impl FerrofinDtoService {
                 // (Folder.cs:2024), so a by-name artist never gets one.
                 if !kinds::is_folder(kind)
                     && let Some(ud) = dto.user_data.as_mut()
-                    && ud.playback_position_ticks > 0
-                    && let Some(runtime) = item.run_time_ticks.filter(|rt| *rt > 0)
                 {
-                    ud.played_percentage =
-                        Some(percent_of_ticks(ud.playback_position_ticks, runtime));
+                    fill_leaf_played_percentage(ud, item.run_time_ticks);
                 }
                 // Folder UserData carries UnplayedItemCount = unplayed leaf
                 // descendants; leaf items leave it unset. The branch keys on the
@@ -2423,6 +2465,38 @@ impl FerrofinDtoService {
                         .and_then(|id| Uuid::parse_str(id).ok())
                         .is_none_or(|id| id == item_id || visible.contains(&id))
                 });
+            }
+            // The rest of `GetStaticMediaSources`' per-user tail
+            // (`MediaSourceManager.cs:405-418`), as `PlaybackInfo` runs it:
+            // each source gets the user's default audio and subtitle streams
+            // and subtitle scores, then the policy's `Supports*` flags.
+            if let Some(user) = user {
+                let defaults = crate::media_source_manager::StreamDefaults {
+                    localization: self.localization.as_deref(),
+                };
+                let remembered = prefetched
+                    .remembered_streams
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or_default();
+                // `GetInheritedOriginalLanguage()`: an episode without its
+                // own falls back to its series' (`Episode.cs:157-160`; a
+                // season has no sources, so it never gets here).
+                let original_language = item.original_language.as_deref().or_else(|| {
+                    (kind == BaseItemKind::Episode)
+                        .then_some(item.series_id.as_deref())
+                        .flatten()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .and_then(|id| prefetched.series_original_languages.get(&id))
+                        .map(String::as_str)
+                });
+                let media_type = item.media_type.as_deref();
+                for source in &mut sources {
+                    defaults.apply(media_type, source, user, remembered, original_language);
+                    if let Some(permissions) = prefetched.playback_permissions {
+                        permissions.apply(media_type, source);
+                    }
+                }
             }
             let resume = &prefetched.version_user_data;
             crate::video_versions::put_resumed_version_first(item, &mut sources, |id| {
@@ -2909,8 +2983,9 @@ impl FerrofinDtoService {
             dto.chapters = Some(chapters);
         }
 
-        // Media streams. This is the LAST read of this id's stream rows, so
-        // no reader remains and the entry can be moved out rather than cloned —
+        // Media streams. When the map is read here (no source on the DTO to
+        // read instead, below), this is the LAST read of this id's stream rows,
+        // so no reader remains and the entry can be moved out rather than cloned —
         // unless one does: a repeated id is projected again, and an id some
         // other page item lists as a merged alternate is read while projecting
         // THAT item, both after this point. (The earlier `MediaSources` read,
@@ -2925,9 +3000,28 @@ impl FerrofinDtoService {
             } else if is_live_tv_program(kind) {
                 // A programme is not `IHasMediaSources`; C# never assigns.
             } else {
-                let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
-                let streams = take_or_clone(&mut prefetched.media_streams, &item_id, pinned)
-                    .unwrap_or_default();
+                // With the item's sources on the DTO, C# reads the streams
+                // off the item's own source (`DtoService.cs:1473-1485`) — the
+                // very objects the per-user tail scored — so a detail page
+                // asking for both fields sees the same subtitle `Score`s in
+                // both. That source was built from these same rows, so they
+                // are read only when there is no source to read instead.
+                let own_id = item_id.simple().to_string();
+                let streams = match dto.media_sources.as_deref() {
+                    Some(sources) if !sources.is_empty() => sources
+                        .iter()
+                        .filter(|s| {
+                            s.id.as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(&own_id))
+                        })
+                        .flat_map(|s| s.media_streams.iter().cloned())
+                        .collect(),
+                    _ => {
+                        let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
+                        take_or_clone(&mut prefetched.media_streams, &item_id, pinned)
+                            .unwrap_or_default()
+                    }
+                };
                 if !streams.is_empty() {
                     dto.media_streams = Some(streams);
                 }
@@ -3225,6 +3319,30 @@ impl FerrofinDtoService {
             }
         }
         Ok(map)
+    }
+
+    /// The `OriginalLanguage` of the given series rows, which their episodes
+    /// inherit when they have none (`Episode.GetInheritedOriginalLanguage`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn load_series_original_languages(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ServiceError> {
+        if series_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
+        Ok(self
+            .db
+            .item_original_languages(&stored)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .into_iter()
+            .filter_map(|(id, language)| Uuid::parse_str(&id).ok().map(|id| (id, language)))
+            .collect())
     }
 
     /// Names the given PhotoAlbum rows, for the `Album`/`AlbumId` a photo's DTO
@@ -3994,6 +4112,49 @@ impl FerrofinDtoService {
             }
             _ => HashMap::new(),
         };
+        // `GetStaticMediaSources(item, true, user)`'s per-user tail
+        // (`MediaSourceManager.cs:397-421`, reached from `DtoService.cs:410`)
+        // reads, per item, the user's remembered streams and the item's
+        // inherited original language, and the user's permissions: here one
+        // read each for the whole page, and none without a user or the field.
+        let sourced = items
+            .iter()
+            .filter(|i| kinds::is_video(row_kind(i)) || kinds::is_audio(row_kind(i)));
+        let (remembered_streams, series_original_languages, playback_permissions) = match user {
+            Some(user) if want_sources && sourced.clone().next().is_some() => {
+                let user_id = parse_user_id(&user.id)?;
+                let videos: Vec<&BaseItemEntity> = sourced
+                    .filter(|i| i.media_type.as_deref().unwrap_or("Video") == "Video")
+                    .collect();
+                let mut video_ids: Vec<Uuid> = videos.iter().map(|i| row_id(i)).collect();
+                video_ids.sort_unstable();
+                video_ids.dedup();
+                let mut series_ids: Vec<Uuid> = videos
+                    .iter()
+                    .filter(|i| i.original_language.is_none())
+                    .filter(|i| row_kind(i) == BaseItemKind::Episode)
+                    .filter_map(|i| i.series_id.as_deref())
+                    .filter_map(|id| Uuid::parse_str(id).ok())
+                    .collect();
+                series_ids.sort_unstable();
+                series_ids.dedup();
+                let remembered = async {
+                    if video_ids.is_empty() {
+                        Ok(HashMap::new())
+                    } else {
+                        self.user_data
+                            .get_stream_default_data_batch(&video_ids, user_id)
+                            .await
+                    }
+                };
+                tokio::try_join!(
+                    remembered,
+                    self.load_series_original_languages(&series_ids),
+                    self.user_data.get_playback_permissions(user_id),
+                )?
+            }
+            _ => (HashMap::new(), HashMap::new(), None),
+        };
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
@@ -4480,6 +4641,9 @@ impl FerrofinDtoService {
             versions,
             version_visible,
             version_user_data,
+            remembered_streams,
+            series_original_languages,
+            playback_permissions,
             alternate_counts,
             has_subtitles,
             has_lyrics,
@@ -6463,6 +6627,8 @@ mod tests {
         /// When set, the alternate versions are the rows stored here (the
         /// real repository's read), not the canned one.
         stored_alternates: Option<Database>,
+        /// When set, every item's streams are these instead of the canned ones.
+        streams: Option<Vec<MediaStream>>,
     }
 
     #[async_trait]
@@ -6500,6 +6666,9 @@ mod tests {
             // (MediaSources, then the MediaStreams field) plus once per merged
             // alternate keyed by the alternate's id, which is why it may only
             // be drained at its last read. An empty map would hide a regression there.
+            if let Some(streams) = &self.streams {
+                return Ok(item_ids.iter().map(|id| (*id, streams.clone())).collect());
+            }
             Ok(item_ids
                 .iter()
                 .map(|id| {
@@ -8626,6 +8795,112 @@ mod tests {
         );
     }
 
+    /// The item DTO's sources run `GetStaticMediaSources(item, true, user)`'s
+    /// per-user tail (v12.2 `DtoService.cs:410` → `MediaSourceManager.cs:
+    /// 397-421`), from page-wide reads: an episode with no original language
+    /// of its own takes its series' for an `OriginalLanguage` audio
+    /// preference, the subtitle the user remembers wins, and the user's
+    /// policy sets the `Supports*` flags. Without a user the sources stay as
+    /// built.
+    #[tokio::test]
+    async fn media_sources_carry_the_users_default_streams_and_permissions() {
+        use ferrofin_db::enums::PermissionKind;
+        use ferrofin_model::entities::MediaStreamType::{Audio, Subtitle, Video};
+
+        let db = test_db().await;
+        let series = Uuid::new_v4();
+        let episode = Uuid::new_v4();
+        seed_folder_item(&db, series, BaseItemKind::Series, "Show", None).await;
+        let mut row = fetch_item(&db, series).await;
+        row.original_language = Some("fra".to_owned());
+        save_item(&db, &row).await;
+        seed_item_of_series(&db, episode, BaseItemKind::Episode, "Pilot", series).await;
+        let mut row = fetch_item(&db, episode).await;
+        row.media_type = Some("Video".to_owned());
+        save_item(&db, &row).await;
+        let item = fetch_item(&db, episode).await;
+
+        let user_id = Uuid::new_v4();
+        let mut user = seed_user(&db, user_id).await;
+        user.audio_language_preference = Some("OriginalLanguage".to_owned());
+        user.play_default_audio_track = false;
+        user.remember_subtitle_selections = true;
+        crate::user_data_manager::seed_content_permissions(
+            &db,
+            user_id,
+            &[
+                PermissionKind::EnableAudioPlaybackTranscoding,
+                PermissionKind::EnablePlaybackRemuxing,
+            ],
+            &[],
+        )
+        .await;
+        crate::test_support::seed_user_data(&db, user_id, episode, false, None).await;
+        crate::user_data_manager::remember_streams(&db, user_id, episode, None, Some(4)).await;
+
+        let stream = |index, stream_type, language: &str, is_default| MediaStream {
+            index,
+            stream_type,
+            language: Some(language.to_owned()),
+            is_default,
+            ..MediaStream::default()
+        };
+        let (mut svc, _tmp) = service_with_real_permissions(&db).await;
+        svc.media_sources = Arc::new(FakeSources {
+            no_alternates: true,
+            streams: Some(vec![
+                stream(0, Video, "und", true),
+                stream(1, Audio, "eng", true),
+                stream(2, Audio, "fra", false),
+                stream(3, Subtitle, "eng", true),
+                stream(4, Subtitle, "fra", false),
+            ]),
+            ..FakeSources::default()
+        });
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let single = svc
+            .get_base_item_dto(&item, &options, Some(&user), None)
+            .await
+            .expect("dto");
+        let page = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&item),
+                &options,
+                Some(&user),
+                None,
+                false,
+            )
+            .await
+            .expect("page");
+        for dto in [&single, &page[0]] {
+            let source = &dto.media_sources.as_ref().expect("sources")[0];
+            assert_eq!(source.default_audio_stream_index, Some(2), "series' French");
+            assert_eq!(source.default_subtitle_stream_index, Some(4), "remembered");
+            assert!(
+                !source.supports_transcoding,
+                "no video transcoding permission"
+            );
+            assert!(source.supports_direct_stream, "remuxing permitted");
+            assert_eq!(
+                dto.media_streams.as_ref(),
+                Some(&source.media_streams),
+                "MediaStreams are the item's own source's, scores included"
+            );
+        }
+
+        let anonymous = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .expect("dto");
+        let source = &anonymous.media_sources.as_ref().expect("sources")[0];
+        assert_eq!(source.default_subtitle_stream_index, None);
+        assert!(source.supports_transcoding, "as built");
+    }
+
     #[tokio::test]
     async fn an_items_alternate_version_keeps_its_streams_when_also_on_the_page() {
         // The other half of the `media_streams` exclusion: the map is read once
@@ -10259,7 +10534,7 @@ mod tests {
             type_: "MediaBrowser.Controller.LiveTv.LiveTvChannel".to_owned(),
             name: Some("Parity One".to_owned()),
             media_type: Some("Video".to_owned()),
-            sort_name: Some("00001.0-Parity One".to_owned()),
+            sort_name: Some("0000000001.00000-Parity One".to_owned()),
             date_created: Some(Utc.with_ymd_and_hms(2026, 8, 23, 18, 0, 0).unwrap()),
             is_folder: false,
             ..BaseItemEntity::default()
@@ -10291,7 +10566,10 @@ mod tests {
         assert_eq!(dto.can_delete, Some(false));
         assert_eq!(dto.can_download, Some(false));
         assert_eq!(dto.media_type, MediaType::Video);
-        assert_eq!(dto.sort_name.as_deref(), Some("00001.0-Parity One"));
+        assert_eq!(
+            dto.sort_name.as_deref(),
+            Some("0000000001.00000-Parity One")
+        );
         assert!(dto.date_created.is_some());
         // The all-fields channel detail carries a present-and-empty stream list
         // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).

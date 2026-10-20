@@ -1,7 +1,8 @@
 name: Adoption
 
-# The full synthetic adoption validation (adoption/README.md): adoption/run.sh and the
-# synthetic preservation matrix, all ten Jellyfin paths, against an image built from this
+# The full synthetic adoption validation (adoption/README.md): adoption/run.sh (eleven Jellyfin
+# paths, including the fresh-install 12.2 row) and the synthetic preservation matrix (ten paths;
+# the seedless fresh-install row is validated by run.sh alone), against an image built from this
 # commit. A green run on the frozen release commit is the release's adoption evidence
 # (RELEASE.md, "Validate adoption"). Every push to a release branch runs it; a patch
 # release from main runs it by hand (workflow_dispatch). Not on PRs: it is long, and the
@@ -22,7 +23,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3 jq curl python3-pil
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3 jq curl python3-pil python3-icu
       # A cache miss needs all seven Jellyfin images (~17 GB) beside the Ferrofin build;
       # the runner has ~14 GB free without this.
       - name: free runner disk (~25 GB of preinstalled toolchains)

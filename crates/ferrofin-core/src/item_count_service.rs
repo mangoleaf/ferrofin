@@ -133,6 +133,34 @@ impl FerrofinItemCountService {
         Ok(i32::try_from(count).unwrap_or(i32::MAX))
     }
 
+    /// The countable leaves (`IsCountableLeaf`: neither a folder nor virtual)
+    /// below `parent_id`'s closure and links, with `filter`'s preferences and
+    /// the `DescendantOfId` roots resolved — the statement
+    /// [`ItemCountService::get_played_and_total_count_from_linked_children`]
+    /// counts twice (total, then played).
+    async fn countable_leaves_query(
+        &self,
+        filter: &InternalItemsQuery,
+        parent_id: Uuid,
+    ) -> Result<InternalItemsQuery, ServiceError> {
+        let leaves = InternalItemsQuery {
+            descendant_of_id: Some(parent_id),
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            ..filter.clone()
+        };
+        let leaves = match crate::query_restrictions::resolve(&self.db, &leaves).await? {
+            Some(resolved) => resolved,
+            None => leaves,
+        };
+        Ok(
+            match crate::item_repository::resolve_descendant_query(&self.db, &leaves).await? {
+                Some(resolved) => resolved,
+                None => leaves,
+            },
+        )
+    }
+
     /// The folders sharing `folder_id`'s `PresentationUniqueKey`: a merged
     /// series or season is one row per library (v12.2
     /// `GetPresentationKeyGroups`, `ItemCountService.cs:693-733`). A folder
@@ -599,22 +627,8 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        let leaves = InternalItemsQuery {
-            descendant_of_id: Some(parent_id),
-            is_folder: Some(false),
-            is_virtual_item: Some(false),
-            ..filter.clone()
-        };
         // Resolved once for both counts.
-        let leaves = match crate::query_restrictions::resolve(&self.db, &leaves).await? {
-            Some(resolved) => resolved,
-            None => leaves,
-        };
-        let leaves =
-            match crate::item_repository::resolve_descendant_query(&self.db, &leaves).await? {
-                Some(resolved) => resolved,
-                None => leaves,
-            };
+        let leaves = self.countable_leaves_query(filter, parent_id).await?;
         let total = self.count_rows(&leaves).await?;
         if leaves.user.is_none() || total == 0 {
             return Ok(PlayedAndTotal { played: 0, total });
@@ -3099,6 +3113,91 @@ mod tests {
                     "played count must scan the branches first and probe UserData by ItemId, got: {plan:?}"
                 );
             }
+        }
+    }
+
+    /// A folder read by id (no page to batch) counts its leaves through
+    /// [`ItemCountService::get_played_and_total_count_from_linked_children`]:
+    /// two `build_query` counts over the `DescendantOfId` set with
+    /// `IsFolder = 0`. Both must be driven by that descendant set, reaching
+    /// `BaseItems` by id. Left to itself SQLite drives them from
+    /// `IX_BaseItems_IsFolder_…` (`IsFolder=?`) — every non-folder row in the
+    /// library, each probed against the set: ~10 ms per count for one series
+    /// on the bench library, ~0.05 ms driven by the set. The linked
+    /// BoxSet/Playlist browse shares the shape; unpinned, its row set seeded
+    /// from `(TopParentId, IsFolder)`, every non-folder row in the user's
+    /// libraries.
+    #[tokio::test]
+    async fn descendant_leaf_counts_drive_from_the_descendant_set() {
+        use sqlx::Row;
+        let db = test_db().await;
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(seed_user(&db, Uuid::from_u128(0xD0F0)).await);
+        let leaves = svc(&db)
+            .countable_leaves_query(&filter, Uuid::from_u128(0xD0F1))
+            .await
+            .unwrap();
+        let played = InternalItemsQuery {
+            is_played: Some(true),
+            ..leaves.clone()
+        };
+        // The other `DescendantOfId` producer, a recursive linked
+        // BoxSet/Playlist browse filtered on `IsFolder`: scoped to the user's
+        // libraries (`TopParentId IN …`), sorted and paged. The `TopParentId`
+        // indexes must not take over from the descendant set either.
+        let browse = InternalItemsQuery {
+            is_virtual_item: None,
+            top_parent_ids: vec![Uuid::from_u128(0xD0F2), Uuid::from_u128(0xD0F3)],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Ascending,
+            )],
+            limit: Some(100),
+            ..leaves.clone()
+        };
+        for (label, query, shape) in [
+            ("total", &leaves, QueryShape::Count),
+            ("played", &played, QueryShape::Count),
+            ("browse", &browse, QueryShape::FullRows),
+            ("browse count", &browse, QueryShape::GroupedCount),
+        ] {
+            let mut builder = build_query(query, shape);
+            let mut built = builder.build();
+            let args = built.take_arguments().unwrap().unwrap();
+            let sql = format!("EXPLAIN QUERY PLAN {}", built.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                !plan.iter().any(|s| s.contains("IsFolder=?")),
+                "{label} must not walk the IsFolder index: {plan:#?}"
+            );
+            // Every `BaseItems` step seeks an id: the outer statement by the
+            // primary key, a sorted page's inner row set by
+            // `(TopParentId, Id)` per descendant.
+            let steps: Vec<&String> = plan
+                .iter()
+                .filter(|s| s.starts_with("SEARCH bi ") || s.starts_with("SCAN bi"))
+                .collect();
+            assert!(
+                !steps.is_empty()
+                    && steps.iter().all(|s| s.starts_with("SEARCH bi ")
+                        && (s.ends_with("(Id=?)") || s.ends_with(" AND Id=?)"))),
+                "{label} must reach BaseItems by id from the descendant set: {plan:#?}"
+            );
+            assert_eq!(
+                steps[0].as_str(),
+                if label == "browse count" {
+                    "SEARCH bi USING COVERING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"
+                } else {
+                    "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"
+                },
+                "{label} must be driven through the primary key: {plan:#?}"
+            );
         }
     }
 
