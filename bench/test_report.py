@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import urllib.error
 
+import gate
 import report
 import coldstart
 import mem_sample
@@ -1076,6 +1078,179 @@ class InstrumentTests(unittest.TestCase):
             result=coldstart.restart('owned','http://localhost',{},.01)
         self.assertEqual(events,['stop','poll','start'])
         self.assertAlmostEqual(result['home_ms'],3200)
+
+
+class GateTests(unittest.TestCase):
+    """The A/A noise table and the A/B verdict (gate.py) over synthetic run dirs."""
+    write, edit, make_run, shapes, ferrofin_only = (ReportTests.write, ReportTests.edit, ReportTests.make_run,
+                                                    ReportTests.shapes, ReportTests.ferrofin_only)
+    SCREEN = {'relative_pct': 15, 'absolute': 2}
+    ENDPOINT = {'relative_pct': 15, 'absolute': 0.5}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def runs(self, prefix, p50s):
+        return [str(self.ferrofin_only(f'{prefix}{i}', p50=p)) for i, p in enumerate(p50s)]
+
+    def test_untouched_path_moving_ten_percent_is_within_noise(self):
+        # search:persons in the October b5 runs: main vs branch, median-of-3 +10.2%, slower in
+        # 2 of 3 pairs, on a path the branch did not touch.
+        v, diff, pct, slower = gate.verdict([1.8335, 1.8888, 1.8470], [1.7971, 2.0506, 2.0359], self.ENDPOINT)
+        self.assertEqual(v, 'within noise')
+        self.assertAlmostEqual(pct, 10.2, places=1)
+        self.assertEqual(slower, 2)
+
+    def test_verdict_needs_both_thresholds_and_two_of_three_pairs(self):
+        for name, a, b, expected in [
+                ('regressed', [10, 10, 10], [13, 12.5, 13], 'regressed'),
+                ('improved', [13, 12.5, 13], [10, 10, 10], 'improved'),
+                ('relative but not absolute', [1, 1, 1], [1.9, 1.9, 1.9], 'within noise'),
+                ('absolute but not relative', [100, 100, 100], [110, 110, 110], 'within noise'),
+                ('median moved, one pair slower', [10, 10, 30], [14, 9, 14], 'within noise'),
+                ('no threshold row', [10, 10, 10], [20, 20, 20], None)]:
+            with self.subTest(name):
+                band = None if expected is None else self.SCREEN
+                self.assertEqual(gate.verdict(a, b, band)[0], expected or 'within noise')
+
+    def test_stress_and_sub_millisecond_endpoints_never_gate(self):
+        self.assertFalse(gate.is_gated('stress/screens/home', 10, 20))
+        self.assertFalse(gate.is_gated('loaded/endpoints/home:items', 0.4, 0.9))
+        self.assertTrue(gate.is_gated('loaded/endpoints/home:items', 0.8, 2))
+        self.assertTrue(gate.is_gated('unloaded/screens/home', 0.4, 0.5))
+        self.assertTrue(gate.is_gated('memory/steady idle', 1, 1))
+
+    def test_ab_verdict_blocks_on_a_gated_regression_only(self):
+        a, b = report.build(self.runs('a', [10, 10, 10])), report.build(self.runs('b', [20, 19, 21]))
+        rows = gate.verdicts(a, b, report.load_gate())
+        self.assertEqual(rows['loaded/screens/home']['verdict'], 'regressed')
+        self.assertEqual(rows['memory/steady idle']['verdict'], 'within noise')
+        self.assertIn('loaded/screens/home', gate.blocking(rows))
+        same = gate.verdicts(a, report.build(self.runs('c', [10, 10, 10])), report.load_gate())
+        self.assertEqual(gate.blocking(same), [])
+        self.assertEqual({r['verdict'] for r in same.values()}, {'within noise'})
+
+    def test_stress_regression_is_reported_not_blocking(self):
+        def stress(prefix, p50s):
+            out = self.runs(prefix, p50s)
+            for run in out:
+                d = Path(run) / 'ferrofin'
+                (d / 'k6-loaded.json').rename(d / 'k6-stress.json')
+                self.write(d / 'windows.json', {'stress': {'start': 1, 'end': 2}, 'steady': {'start': 3, 'end': 4}})
+            return report.build(out)
+        rows = gate.verdicts(stress('a', [10, 10, 10]), stress('b', [20, 20, 20]), report.load_gate())
+        self.assertEqual(rows['stress/screens/home']['verdict'], 'regressed')
+        self.assertFalse(rows['stress/screens/home']['gated'])
+        self.assertNotIn('stress/screens/home', gate.blocking(rows))
+
+    def test_flagged_cell_cannot_be_judged_and_blocks(self):
+        runs = self.runs('b', [20, 20, 20])
+        self.edit(Path(runs[1]) / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
+        rows = gate.verdicts(report.build(self.runs('a', [10, 10, 10])), report.build(runs), report.load_gate())
+        self.assertEqual(rows['loaded/screens/home']['verdict'], 'not comparable')
+        self.assertIn('measured requests failed', rows['loaded/screens/home']['reason'])
+        self.assertIn('loaded/screens/home', gate.blocking(rows))
+
+    def test_noise_table_spans_the_runs_and_proposes_bands_beyond_the_row(self):
+        runs = self.runs('aa', [10, 10, 10, 10, 10, 14])
+        noise = gate.noise_table(report.build(runs), report.load_gate())
+        home = noise['loaded/screens/home']
+        self.assertEqual((home['p50']['min'], home['p50']['max'], home['p50']['median']), (10, 14, 10))
+        self.assertAlmostEqual(home['p50']['range_pct'], 40)
+        self.assertGreater(home['p50']['cv_pct'], 0)
+        self.assertIn('p95', home)
+        self.assertTrue(home['exceeds_band'])
+        self.assertIn('value', noise['memory/peak under load'])
+        self.assertEqual(gate.proposed_cells(noise)['loaded/screens/home'], {'relative_pct': 40, 'absolute': 4.0})
+        self.assertNotIn('memory/steady idle', gate.proposed_cells(noise))  # every run agreed
+        kinds = gate.kind_summary(noise, report.load_gate())
+        self.assertEqual((kinds['screens']['cells'], kinds['screens']['exceeding']), (6, 6))
+        self.assertAlmostEqual(kinds['screens']['max_range_pct'], 40)
+        self.assertEqual(kinds['memory']['exceeding'], 0)
+        self.assertEqual(kinds['screens']['row'], {'relative_pct': 15, 'absolute': 2})
+
+    def test_schedule_interleaves_and_dry_run_starts_nothing(self):
+        self.assertEqual([(n, r) for n, r, _ in gate.schedule('ab', {'a': 'old', 'b': 'new'}, 3)],
+                         [('01-a', 'a'), ('02-b', 'b'), ('03-a', 'a'), ('04-b', 'b'), ('05-a', 'a'), ('06-b', 'b')])
+        self.assertEqual(len(gate.schedule('aa', {'a': 'x'}, 6)), 6)
+        out = self.root / 'session'
+        result = subprocess.run([sys.executable, str(Path(__file__).parent / 'gate.py'), 'ab', 'old', 'new',
+                                 '--dry-run', '--out', str(out)], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=''))  # no docker reachable
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count('--only shape,unloaded,loaded'), 6)
+        self.assertIn('06-b  b  new', result.stdout)
+        self.assertFalse(out.exists())
+
+    def test_driver_retags_each_run_stops_on_a_wrong_image_and_restores_the_tag(self):
+        plan = {'schedule': gate.schedule('ab', {'a': 'old', 'b': 'new'}, 3),
+                'images': {'a': {'id': 'sha256:old'}, 'b': {'id': 'sha256:new'}}}
+        calls = []
+
+        def docker(*args):
+            calls.append(args)
+            return 'sha256:orig' if args[:2] == ('image', 'inspect') else ''
+
+        def run(cmd):
+            out = Path(cmd[cmd.index('--out') + 1]) / 'ferrofin'
+            out.mkdir(parents=True)
+            tagged = calls[-1][1]  # the image the driver just tagged ferrofin:bench to
+            # the second run finds ferrofin:bench retagged under it by someone else
+            (out / 'image.txt').write_text('ferrofin:bench ' + ('sha256:old' if out.parent.name == '02-b' else tagged))
+            return 0
+
+        with patch.object(gate, 'docker', docker), patch.object(gate, 'run_sh', run):
+            with self.assertRaisesRegex(SystemExit, '02-b measured'):
+                gate.run_session(str(self.root), plan, None)
+        self.assertEqual([c for c in calls if c[0] == 'tag'],
+                         [('tag', 'sha256:old', 'ferrofin:bench'), ('tag', 'sha256:new', 'ferrofin:bench'),
+                          ('tag', 'sha256:orig', 'ferrofin:bench')])
+        self.assertFalse((self.root / '03-a').exists())
+
+    def test_a_run_that_cannot_start_stops_the_session_with_its_own_exit(self):
+        plan = {'schedule': gate.schedule('aa', {'a': 'x'}, 2), 'images': {'a': {'id': 'sha256:x'}}}
+        with patch.object(gate, 'docker', lambda *a: ''), patch.object(gate, 'run_sh', lambda cmd: 1):
+            with self.assertRaisesRegex(SystemExit, r'01-a failed \(run.sh exit 1\)'):
+                gate.run_session(str(self.root), plan, None)
+
+    def test_run_counts_are_checked_before_anything_starts(self):
+        script = str(Path(__file__).parent / 'gate.py')
+        for args in (['aa', 'x', '--runs', '3'], ['aa', 'x', '--runs', '0'], ['ab', 'x', 'y', '--pairs', '0'],
+                     ['ab', 'x', 'y', '--pairs', 'two'], ['render']):
+            with self.subTest(args):
+                result = subprocess.run([sys.executable, script, *args, '--dry-run'] if args != ['render'] else
+                                        [sys.executable, script, *args], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('Traceback', result.stderr)
+
+    def session(self, mode, p50s):
+        out = self.root / f'gate-{mode}'
+        plan = {'mode': mode, 'name': out.name, 'date': '2026-10-19T00:00:00+00:00',
+                'schedule': gate.schedule(mode, {'a': 'old', 'b': 'new'}, len(p50s) // (2 if mode == 'ab' else 1)),
+                'images': {'a': {'ref': 'old', 'id': 'sha256:old'}, 'b': {'ref': 'new', 'id': 'sha256:new'}}}
+        out.mkdir()
+        for (name, _, _), p in zip(plan['schedule'], p50s):
+            shutil.move(str(self.ferrofin_only(name, p50=p)), out / name)
+        self.write(out / 'gate.json', plan)
+        return out
+
+    def test_render_writes_the_session_report_and_its_machine_readable_file(self):
+        out = self.session('ab', [10, 20, 10, 20, 10, 20])
+        md, block = gate.render(str(out))
+        self.assertIn('loaded/screens/home', block)
+        self.assertIn('**BLOCKED**', md)
+        page = (out / 'report.html').read_text()
+        self.assertIn("class='delta bad'>regressed", page)
+        self.assertEqual(json.loads((out / 'verdict.json').read_text())['blocking'], block)
+        aa = self.session('aa', [10, 10, 10, 10, 10, 10])
+        md, block = gate.render(str(aa))
+        self.assertEqual(block, [])
+        noise = json.loads((aa / 'noise.json').read_text())
+        self.assertEqual(noise['proposed_cells'], {})
+        self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
+        self.assertIn('Noise per cell', (aa / 'report.html').read_text())
 
 
 if __name__ == '__main__':
