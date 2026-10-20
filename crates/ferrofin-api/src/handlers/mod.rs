@@ -1070,8 +1070,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "PostUserImage",
         ferrofin: "handlers/images.rs post_user_image → handlers/items.rs resolve_user, \
                handlers/users.rs assert_can_update_user, handlers/image_upload.rs \
-               (image_mime_from_content_type, decode_base64) → ferrofin-core \
-               user_manager.rs save_profile_image",
+               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
+               to_extension, decode_base64) → ferrofin-core user_manager.rs \
+               save_profile_image",
         date: "2026-10-20",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
@@ -1083,10 +1084,6 @@ pub const VERIFIED: &[Verified] = &[
          third `=` or a partial group after the padding is ignored. Ferrofin decodes the \
          final group in full and refuses the other two with a 400. Jellyfin bugs not \
          ported.",
-            "Any image/* Content-Type is accepted, and one MimeTypes.ToExtension knows no \
-         extension for (image/jpg, image/x-unknown) is saved as `profile.` with no \
-         extension, where TryGetImageExtensionFromContentType answers 400 Incorrect \
-         ContentType. Fix path: gl-453.",
             "The body is read as UTF-8 text before the user and the Content-Type are \
          checked, so a body that is not UTF-8 is the extractor's 400 whatever the user or \
          type; upstream resolves the user and checks the type first, and fails such a body \
@@ -1199,6 +1196,35 @@ pub const VERIFIED: &[Verified] = &[
                get_countries (COUNTRIES, data/countries.json byte-equal to v12.2)",
         date: "2026-10-20",
         divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Branding/Splashscreen",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "UploadCustomSplashscreen",
+        ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
+               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
+               to_extension, decode_base64)",
+        date: "2026-10-20",
+        divergences: &[
+            "The body is decoded in full before anything is written, and the location is \
+         recorded only after the file is: a body the decoder rejects is a 400 that changes \
+         nothing. Upstream records the new SplashscreenLocation first and decodes while \
+         copying, so invalid base64 fails mid-copy with a 500 (FormatException), and any \
+         write failure leaves the recorded location pointing at a missing or truncated \
+         file. FromBase64Transform also silently drops a trailing partial group (fewer \
+         than four characters): an unpadded or short padded final group (`aGk`, `aG=`) \
+         loses its last bytes, and a third `=` or a partial group after the padding is \
+         ignored. Ferrofin decodes the final group in full and refuses the other two with \
+         a 400. Jellyfin bugs not ported.",
+            "The body is read as UTF-8 text before the Content-Type is checked, so a body \
+         that is not UTF-8 is the extractor's 400 whatever its type; upstream checks the \
+         type first and fails such a body with a 500 while decoding. Jellyfin bug not \
+         ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
         refs: &[],
     },
     Verified {

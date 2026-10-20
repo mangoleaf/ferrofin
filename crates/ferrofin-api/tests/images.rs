@@ -516,11 +516,14 @@ impl LibraryManager for StubLibrary {
     }
 }
 
+/// One recorded `save_profile_image` call: user id, MIME type, extension.
+type SavedProfileImage = (String, String, String);
+
 /// A [`UserManager`] resolving the fixed user, its profile image, and recording
 /// `save_profile_image`.
 struct StubUsers {
     profile_path: String,
-    saved: Arc<Mutex<Vec<(String, String)>>>,
+    saved: Arc<Mutex<Vec<SavedProfileImage>>>,
 }
 
 #[async_trait]
@@ -549,12 +552,13 @@ impl UserManager for StubUsers {
         user: &UserEntity,
         _content: &[u8],
         mime_type: &str,
-        _extension: &str,
+        extension: &str,
     ) -> Result<(), ServiceError> {
-        self.saved
-            .lock()
-            .expect("lock")
-            .push((user.id.clone(), mime_type.to_owned()));
+        self.saved.lock().expect("lock").push((
+            user.id.clone(),
+            mime_type.to_owned(),
+            extension.to_owned(),
+        ));
         Ok(())
     }
 
@@ -1468,7 +1472,11 @@ async fn post_user_image_saves_and_returns_204() {
     let saved = s.users.saved.lock().expect("lock");
     assert_eq!(
         saved.as_slice(),
-        [(USER_ID.to_string(), "image/png".to_owned())]
+        [(
+            USER_ID.to_string(),
+            "image/png".to_owned(),
+            ".png".to_owned()
+        )]
     );
 }
 
@@ -1492,6 +1500,89 @@ async fn post_user_image_bad_content_type_is_400() {
     let s = stubs(String::new(), String::new());
     let (status, _) = send(&s, "POST", "/UserImage", Some(("text/plain", "aGk="))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Jellyfin 12 maps the non-standard `image/jpg` to `.jpg`
+/// (`MimeTypes._extensionLookup`), so the avatar is `profile.jpg`, never an
+/// extension-less `profile.`.
+#[tokio::test]
+async fn post_user_image_maps_image_jpg_to_jpg() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "POST", "/UserImage", Some(("image/jpg", "aGk="))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.users.saved.lock().expect("lock").as_slice(),
+        [(
+            USER_ID.to_string(),
+            "image/jpg".to_owned(),
+            ".jpg".to_owned()
+        )]
+    );
+}
+
+/// `MimeTypes.ToExtension` falls back to the `MimeTypes` package's base table,
+/// so image types outside the override table upload on the user and item
+/// routes, stored under their own extension (upstream `ImageControllerTests`
+/// expects `image/apng` and `image/avif` to be accepted).
+#[rstest::rstest]
+#[case("image/avif", ".avif")]
+#[case("image/apng", ".apng")]
+#[case("image/heic", ".heic")]
+#[tokio::test]
+async fn image_uploads_accept_base_table_image_types(
+    #[case] content_type: &str,
+    #[case] extension: &str,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    let (status, _) = send(&s, "POST", "/UserImage", Some((content_type, "aGk="))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.users.saved.lock().expect("lock").as_slice(),
+        [(
+            USER_ID.to_string(),
+            content_type.to_owned(),
+            extension.to_owned()
+        )]
+    );
+
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Primary"),
+        Some((content_type, "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.providers.saved.lock().expect("lock").as_slice(),
+        [(ITEM_ID, content_type.to_owned(), ImageType::Primary, None)]
+    );
+}
+
+/// Upstream `TryGetImageExtensionFromContentType` fails when `ToExtension`
+/// knows no extension for the type, so an unknown image subtype is
+/// `400 Incorrect ContentType.` on every user and item upload route, and
+/// nothing is saved.
+#[rstest::rstest]
+#[case::user_image("/UserImage")]
+#[case::legacy_user_image("/Users/{user}/Images/Primary")]
+#[case::indexed_legacy_user_image("/Users/{user}/Images/Primary/0")]
+#[case::item_image("/Items/{item}/Images/Primary")]
+#[case::item_image_by_index("/Items/{item}/Images/Primary/0")]
+#[tokio::test]
+async fn image_uploads_reject_unknown_image_subtypes(#[case] route: &str) {
+    let s = elevated_stubs(String::new(), String::new());
+    let uri = route
+        .replace("{user}", &USER_ID.to_string())
+        .replace("{item}", &ITEM_ID.to_string());
+    let (status, body) = send(&s, "POST", &uri, Some(("image/x-unknown", "aGk="))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Incorrect ContentType."),
+        "{uri}"
+    );
+    assert!(s.users.saved.lock().expect("lock").is_empty(), "{uri}");
+    assert!(s.providers.saved.lock().expect("lock").is_empty(), "{uri}");
 }
 
 /// `=` before the end of the body is invalid data to `FromBase64Transform`, so
@@ -1547,7 +1638,11 @@ async fn post_user_image_with_an_empty_user_id_targets_the_caller() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
         s.users.saved.lock().expect("lock").as_slice(),
-        [(USER_ID.to_string(), "image/png".to_owned())]
+        [(
+            USER_ID.to_string(),
+            "image/png".to_owned(),
+            ".png".to_owned()
+        )]
     );
 }
 
@@ -1746,7 +1841,11 @@ async fn legacy_user_image_upload_and_delete_forward() {
     // Recorded exactly as the modern /UserImage POST would record it.
     assert_eq!(
         s.users.saved.lock().expect("lock").as_slice(),
-        [(USER_ID.to_string(), "image/png".to_owned())]
+        [(
+            USER_ID.to_string(),
+            "image/png".to_owned(),
+            ".png".to_owned()
+        )]
     );
 
     let (status, _) = send(
@@ -1775,7 +1874,11 @@ async fn indexed_legacy_user_image_upload_and_delete_forward() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
         s.users.saved.lock().expect("lock").as_slice(),
-        [(USER_ID.to_string(), "image/png".to_owned())]
+        [(
+            USER_ID.to_string(),
+            "image/png".to_owned(),
+            ".png".to_owned()
+        )]
     );
 
     let (status, _) = send(
