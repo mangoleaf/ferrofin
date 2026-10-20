@@ -27,6 +27,7 @@ use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
@@ -427,16 +428,26 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
+    library: Arc<dyn LibraryManager>,
 }
 
 impl OptimizeDatabaseTask {
-    /// Builds the task over the database handle and the session manager (the
+    /// Builds the task over the database handle, the session manager (the
     /// vacuum is skipped while anything is playing — `VACUUM` and the
     /// truncating checkpoint take exclusive locks that fail live requests; a
-    /// real mid-playback black-screen traced to exactly this window).
+    /// real mid-playback black-screen traced to exactly this window) and the
+    /// library manager (skipped, as upstream, while a library scan runs).
     #[must_use]
-    pub fn new(db: Database, sessions: Arc<dyn SessionManager>) -> Self {
-        Self { db, sessions }
+    pub fn new(
+        db: Database,
+        sessions: Arc<dyn SessionManager>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            db,
+            sessions,
+            library,
+        }
     }
 }
 
@@ -467,6 +478,13 @@ impl ScheduledTask for OptimizeDatabaseTask {
         vec![interval_hours(6)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `OptimizeDatabaseTask.ExecuteAsync`: the vacuum and the truncating
+        // checkpoint hold the only writer a library scan writes through, and
+        // can stall it, so the run waits for the next trigger.
+        if self.library.is_scan_running() {
+            tracing::info!("skipping database optimization: a library scan is running");
+            return Ok(());
+        }
         // Playback guard: VACUUM + wal_checkpoint(TRUNCATE) take exclusive
         // locks; concurrent requests (HLS auth, playstate) hard-fail once the
         // reader busy-timeout elapses. Skip while anything is playing — the
@@ -1085,7 +1103,11 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_runs_pragmas_and_vacuum() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db, idle_sessions());
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db),
+        );
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
             task.default_triggers()[0].interval_ticks,
@@ -1099,12 +1121,36 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_skips_while_playback_is_active() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db, playing_sessions());
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            playing_sessions(),
+            crate::test_support::library_manager_over(db),
+        );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
         assert!(
             progress.current().abs() < f64::EPSILON,
             "guarded run must not have executed the vacuum steps"
+        );
+    }
+
+    /// `OptimizeDatabaseTask.ExecuteAsync` returns at once while a library
+    /// scan runs (`IsScanRunning`): the vacuum and the truncating checkpoint
+    /// would hold the only writer the scan writes through. The skipped run
+    /// still succeeds, so the task records `Completed`.
+    #[tokio::test]
+    async fn optimize_database_skips_while_a_library_scan_runs() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_mid_scan(db).await,
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "a run during a library scan must not have executed the vacuum steps"
         );
     }
 

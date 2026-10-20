@@ -229,14 +229,25 @@ pub fn authed_fake_state_with_policy(policy: UserPolicy) -> AppState {
 /// real non-administrator token.
 #[must_use]
 pub fn elevated_fake_state() -> AppState {
+    elevated_state_with(Arc::new(FakeLibrary), Arc::new(FakeSystem))
+}
+
+/// [`elevated_fake_state`] over the given library and system managers, for an
+/// admin-only handler whose behaviour depends on them (the backup create's
+/// scan and free-space guards).
+#[must_use]
+pub fn elevated_state_with(
+    library: Arc<dyn LibraryManager>,
+    system: Arc<dyn SystemManager>,
+) -> AppState {
     AppState::new(
-        Arc::new(FakeLibrary),
+        library,
         Arc::new(FakeUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
         Arc::new(FakeSessions),
-        Arc::new(FakeSystem),
+        system,
         Arc::new(FakeAppHost),
         Arc::new(FakeConfig),
         Arc::new(FakeProviders),
@@ -439,11 +450,141 @@ impl AuthService for ApiKeyAuthService {
     }
 }
 
+/// Implements [`LibraryManager`] for a library fake: the methods given, then
+/// every other required one, which INFRA-level tests never reach.
+macro_rules! fake_library_manager {
+    ($fake:ty { $($given:tt)* }) => {
+        #[async_trait]
+        impl LibraryManager for $fake {
+            $($given)*
+
+            async fn get_item_by_id(
+                &self,
+                _id: Uuid,
+            ) -> Result<Option<BaseItemEntity>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn query_items(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_item_ids(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<Vec<Uuid>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_item_list(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_latest_item_list(
+                &self,
+                _query: &InternalItemsQuery,
+                _collection_type: CollectionType,
+            ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn create_items(
+                &self,
+                _items: &[BaseItemEntity],
+                _parent_id: Option<Uuid>,
+            ) -> Result<(), ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn update_items(
+                &self,
+                _items: &[BaseItemEntity],
+                _parent_id: Option<Uuid>,
+            ) -> Result<(), ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn delete_item(
+                &self,
+                _id: Uuid,
+                _options: &DeleteOptions,
+            ) -> Result<(), ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_people(
+                &self,
+                _query: &InternalPeopleQuery,
+            ) -> Result<Vec<PeopleEntity>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_people_names(
+                &self,
+                _query: &InternalPeopleQuery,
+            ) -> Result<Vec<String>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_count(&self, _query: &InternalItemsQuery) -> Result<i32, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_item_counts(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<ItemCounts, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_genres(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_studios(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_artists(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_music_genres(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_album_artists(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_query_filters_legacy(
+                &self,
+                _query: &InternalItemsQuery,
+            ) -> Result<QueryFiltersLegacy, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn get_media_stream_languages(
+                &self,
+                _stream_type: ferrofin_model::entities::MediaStreamType,
+                _query: &InternalItemsQuery,
+            ) -> Result<Vec<String>, ServiceError> {
+                unimplemented!("fake")
+            }
+            async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+                unimplemented!("fake")
+            }
+        }
+    };
+}
+
 /// A fake [`LibraryManager`]; every method is unused by INFRA-level tests.
 pub struct FakeLibrary;
 
-#[async_trait]
-impl LibraryManager for FakeLibrary {
+fake_library_manager!(FakeLibrary {
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -458,117 +599,18 @@ impl LibraryManager for FakeLibrary {
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
         Ok(true)
     }
+});
 
-    async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
+/// [`FakeLibrary`] in the middle of a full library validation
+/// ([`LibraryManager::is_scan_running`]), for the work that refuses or stands
+/// down while a library scan runs.
+pub struct ScanningLibrary;
+
+fake_library_manager!(ScanningLibrary {
+    fn is_scan_running(&self) -> bool {
+        true
     }
-    async fn query_items(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_item_ids(&self, _query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_item_list(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_latest_item_list(
-        &self,
-        _query: &InternalItemsQuery,
-        _collection_type: CollectionType,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn update_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn delete_item(&self, _id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_people(
-        &self,
-        _query: &InternalPeopleQuery,
-    ) -> Result<Vec<PeopleEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_people_names(
-        &self,
-        _query: &InternalPeopleQuery,
-    ) -> Result<Vec<String>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_count(&self, _query: &InternalItemsQuery) -> Result<i32, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_item_counts(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<ItemCounts, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_genres(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_studios(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_artists(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_music_genres(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_album_artists(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_query_filters_legacy(
-        &self,
-        _query: &InternalItemsQuery,
-    ) -> Result<QueryFiltersLegacy, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_media_stream_languages(
-        &self,
-        _stream_type: ferrofin_model::entities::MediaStreamType,
-        _query: &InternalItemsQuery,
-    ) -> Result<Vec<String>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-}
+});
 
 /// A plain, non-administrator [`UserEntity`] for tests that need the
 /// authenticated caller to *be* somebody — every permission extractor resolves
@@ -1329,7 +1371,8 @@ impl SessionManager for FakeSessions {
 /// contract probe expects them to route, not `404`); `restart` accepts the
 /// request (the backup-restore handler schedules a restart, and its test
 /// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
-/// `snapshot_database` keeps the trait default (writes nothing — no database).
+/// `snapshot_database` keeps the trait default (writes nothing — no database),
+/// and `free_space_of` reports a disk that never fills.
 pub struct FakeSystem;
 
 #[async_trait]
@@ -1351,6 +1394,9 @@ impl SystemManager for FakeSystem {
     }
     async fn get_system_storage_info(&self) -> Result<SystemStorageInfo, ServiceError> {
         unimplemented!("fake")
+    }
+    async fn free_space_of(&self, _path: &std::path::Path) -> i64 {
+        i64::MAX
     }
 }
 
