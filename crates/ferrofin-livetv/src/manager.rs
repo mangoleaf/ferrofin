@@ -2188,9 +2188,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             };
             match self.xmltv.get_xml(&provider).await {
                 // Jellyfin 12.1's `hasErrors` (`cleanDatabase &= !hasErrors`): an
-                // empty or unreadable document is a listings error like a failed
-                // fetch. The provider writes nothing, so `clean_programs` cannot
-                // replace its channels' airings with a partial read either.
+                // unreadable document is a listings error like a failed fetch. The
+                // provider writes nothing, so `clean_programs` cannot replace its
+                // channels' airings with a partial read either. For a saved provider
+                // an empty download never gets here: `get_xml` treats it as a failed
+                // download and answers with the cached copy, if there is one, or the
+                // `Err` below.
                 Ok(body) => {
                     let guide = parse_xmltv(&body);
                     if let Some(e) = &guide.error {
@@ -9937,7 +9940,8 @@ mod tests {
     /// `cleanDatabase &= !hasErrors`): a guide body that is empty or not a
     /// readable XMLTV document is a listings error, so the stored airings stay
     /// and the provider writes nothing. A well-formed guide with no programmes
-    /// is not an error and still prunes.
+    /// is not an error and still prunes. With no cached copy left, an empty
+    /// body fails as a download (`UnzipIfNeededAndCopy`) before it is parsed.
     #[rstest::rstest]
     #[case::empty("", 1)]
     #[case::whitespace("  \n", 1)]
