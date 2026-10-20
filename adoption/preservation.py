@@ -449,6 +449,7 @@ def run_matrix(root, image, only, port):
     from synthetic import VERSIONS, server, recipe
     import metadata
     import watch_history
+    import table_digests
     import user_accounts
     failures = []
     oracle_dir = root / ORACLE
@@ -485,6 +486,7 @@ def run_matrix(root, image, only, port):
             orphans = watch_history.orphaned_items(conn) | set(seeds["orphans"])
         history = watch_history.snapshot(db, expected=True)
         accounts_before = user_accounts.database_snapshot(db)
+        tables_before = table_digests.snapshot(db)
         metadata_before = metadata.snapshot(db, expected=True)
         with server(image, work, root / "media", "synthetic-adoption", port, ferrofin=True) as api:
             api = api.login(USERS[0])
@@ -514,6 +516,7 @@ def run_matrix(root, image, only, port):
                         closing(metadata.connect(oracle_dir / "data/jellyfin.db")) as oracle_conn:
                     changed += seed_failures(conn, actual, seeds, state, oracle_conn, oracle)
                 changed += user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db))
+                changed += table_digests.compare(tables_before, table_digests.snapshot(db, tables_before))
                 changed += list(watch_history.compare_db(history, watch_history.snapshot(db)))
                 changed += list(watch_history.compare_api(history, metadata.Api(api.base, db)))
                 changed += list(metadata.compare(metadata_before, metadata.snapshot(db), "database"))

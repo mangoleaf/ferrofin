@@ -467,6 +467,21 @@ EOS
   [ "$status" -eq 0 ]
 }
 
+@test "table digests: a lost row or changed column in any listed table fails; documented rewrites pass" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_table_digests.py
+  [ "$status" -eq 0 ]
+}
+
+@test "run.sh and synthetic.py run: the table baseline is taken before the container starts and checked at every stage" {
+  snapshot=$(grep -nF 'table_digests.py" snapshot' "$ADOPTION/run.sh" | cut -d: -f1)
+  start=$(grep -nF 'docker run -d' "$ADOPTION/run.sh" | cut -d: -f1)
+  [ -n "$snapshot" ] && [ "$snapshot" -lt "$start" ]
+  grep -qF 'table_digests.py" check' "$ADOPTION/run.sh"
+  # metadata_check runs after adoption, after restart and after scan
+  [ "$(grep -c '^  metadata_check "after' "$ADOPTION/run.sh")" -eq 3 ]
+  grep -qF 'table_digests.compare(tables_before, table_digests.snapshot(db, tables_before))' "$ADOPTION/preservation.py"
+}
+
 @test "populated upgrade: user state, boot checks and the runner's refusals" {
   run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_upgrade.py
   [ "$status" -eq 0 ]
