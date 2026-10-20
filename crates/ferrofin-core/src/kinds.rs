@@ -1,8 +1,8 @@
 //! `BaseItem` domain behavior, ported as free functions over [`BaseItemKind`].
 //!
 //! In Jellyfin the `BaseItem` → `Folder` → `Video` (etc.) class hierarchy carries
-//! virtual boolean properties — `IsFolder`, `SupportsPeople`,
-//! `SupportsThemeMedia`, … — that each concrete subclass overrides. Ferrofin has no
+//! virtual boolean properties — `IsFolder`, `SupportsThemeMedia`,
+//! `SupportsPlayedStatus`, … — that each concrete subclass overrides. Ferrofin has no
 //! `BaseItem` object graph: item rows are [`ferrofin_db::entities::base_items::BaseItemEntity`]
 //! and their *kind* is a [`BaseItemKind`]. The OOP behavior therefore lives here
 //! as pure functions keyed on the kind.
@@ -12,17 +12,18 @@
 //!   (`Folder`/`AggregateFolder`/`BoxSet`/`Series`/`Season`/`MusicAlbum`/… plus the
 //!   `BasePluginFolder` line);
 //! - `Video` and its subclasses (`Movie`/`Episode`/`MusicVideo`/`Trailer`/`Video`)
-//!   override `SupportsPeople`, `SupportsThemeMedia`, and
-//!   `SupportsInheritedParentImages` to `true`;
+//!   override `SupportsThemeMedia` and `SupportsInheritedParentImages` to
+//!   `true`;
 //! - the `IItemByName` kinds (`Genre`/`MusicGenre`/`Studio`/`Year`/`Person`/
 //!   `MusicArtist`) are the by-name items.
 //!
-//! These are the queries the library/DTO layers make against an item's kind; the
-//! richer per-instance behavior (which depends on runtime fields, not just the
-//! kind) is not part of this seam.
+//! These are the queries the library/DTO layers make against an item's kind.
+//! Where an override reads a field of the instance, the function takes that
+//! field too: [`supports_played_status`] the row's `MediaType` (a playlist),
+//! [`supports_position_ticks_resume`] its `ExtraType` (a video extra).
 
-use ferrofin_model::data::{BaseItemKind, CollectionType, UnratedItem};
-use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType, UnratedItem};
+use ferrofin_model::entities::{CollectionTypeOptions, ExtraType};
 use uuid::Uuid;
 
 /// The class-specific `GetBlockUnratedType` overrides. Audio depends on its source.
@@ -86,17 +87,6 @@ pub fn is_folder(kind: BaseItemKind) -> bool {
             | BaseItemKind::UserRootFolder
             | BaseItemKind::UserView
     )
-}
-
-/// Whether items of this kind are displayed as folders in the UI
-/// (C# `BaseItem.IsDisplayedAsFolder`).
-///
-/// Identical to [`is_folder`] in the base hierarchy — every `Folder` overrides
-/// both together — but kept as its own function so the two concepts can diverge
-/// as more per-kind behavior is ported.
-#[must_use]
-pub fn is_displayed_as_folder(kind: BaseItemKind) -> bool {
-    is_folder(kind)
 }
 
 /// Whether this kind is a video (`Video` or one of its subclasses).
@@ -355,13 +345,6 @@ pub fn has_media_sources(kind: BaseItemKind) -> bool {
     !is_folder(kind) && !is_item_by_name(kind)
 }
 
-/// Whether items of this kind carry cast/crew people
-/// (C# `BaseItem.SupportsPeople`, `false` by default, `true` for `Video`).
-#[must_use]
-pub fn supports_people(kind: BaseItemKind) -> bool {
-    is_video(kind)
-}
-
 /// Whether items of this kind can have theme songs/videos
 /// (C# `BaseItem.SupportsThemeMedia`, `true` for `Folder` and `Video`).
 #[must_use]
@@ -580,44 +563,63 @@ pub fn supports_user_data_from_children(kind: BaseItemKind) -> bool {
     )
 }
 
-/// `BaseItem` defaults to `false` and `Folder` overrides it to `true`
-/// (`Folder.cs:84`), so ordinary media and the folders that aggregate it
-/// support it — but seven container kinds override it back to `false`:
-/// `CollectionFolder.cs:74`, `AggregateFolder.cs:50`, `UserRootFolder.cs:39`,
-/// `UserView.cs:66`, `PhotoAlbum.cs:14`, `MusicAlbum.cs:51` and
-/// `MusicArtist.cs:48`. The by-name grouping kinds are plain `BaseItem`s and
-/// keep the `false` default.
+/// `BaseItem` defaults to `false` (`BaseItem.cs:187`); `Video`
+/// (`Video.cs:54`), `Audio` (`Audio.cs:43`), `AudioBook`, `Book` and `Folder`
+/// (`Folder.cs:100`) override it to `true`, so ordinary media and the folders
+/// that aggregate it support it. Seven container kinds override it back to
+/// `false`: `CollectionFolder.cs:74`, `AggregateFolder.cs:50`,
+/// `UserRootFolder.cs:39`, `UserView.cs:66`, `PhotoAlbum.cs:14`,
+/// `MusicAlbum.cs:51` and `MusicArtist.cs:48`. `Photo`, the Live TV kinds and
+/// the by-name grouping kinds are plain `BaseItem`s and keep the `false`
+/// default, and a `Playlist` supports it only when its media type is video
+/// (`Playlist.cs:73`), hence `media_type` (the row's stored `MediaType`).
 ///
 /// This is the guard `Folder.FillUserDataDtoValues` (`Folder.cs:1973`) puts on
 /// `UserData.UnplayedItemCount`, so a kind listed here as `false` must not
 /// carry that count.
 #[must_use]
-pub fn supports_played_status(kind: BaseItemKind) -> bool {
+pub fn supports_played_status(kind: BaseItemKind, media_type: MediaType) -> bool {
+    // `Playlist.cs:73`: only a video playlist tracks played state.
+    if kind == BaseItemKind::Playlist {
+        return media_type == MediaType::Video;
+    }
     !matches!(
         kind,
+        // The seven container overrides back to `false`.
         BaseItemKind::CollectionFolder
             | BaseItemKind::AggregateFolder
             | BaseItemKind::UserRootFolder
             | BaseItemKind::UserView
             | BaseItemKind::PhotoAlbum
             | BaseItemKind::MusicAlbum
+            // Plain `BaseItem`s keep its `false` (`BaseItem.cs:187`): `Photo`,
+            // and the Live TV classes `TvChannel`/`TvProgram` map to
+            // (`ItemTypeLookup.cs:57-58`).
+            | BaseItemKind::Photo
+            | BaseItemKind::LiveTvChannel
+            | BaseItemKind::LiveTvProgram
+            | BaseItemKind::TvChannel
+            | BaseItemKind::TvProgram
     ) && !is_item_by_name(kind)
 }
 
-/// Whether items of this kind can resume from a saved position tick
-/// (C# `BaseItem.SupportsPositionTicksResume`, `false` by default, overridden to
-/// `true` for `Video` and its subclasses plus `Audio`, `AudioBook`, and `Book`).
+/// Whether an item can resume from a saved position tick (C#
+/// `BaseItem.SupportsPositionTicksResume`, `false` by default,
+/// `BaseItem.cs:190`).
 ///
-/// The C# `Video` override additionally returns `false` for `ExtraType.Sample`
-/// clips; that sub-case is deferred here because the stored item row does not
-/// surface `ExtraType` at this layer.
+/// `Video` and its subclasses override it to `true` except for `Sample`,
+/// `ThemeVideo` and `Trailer` extras (`Video.cs:63-88`); `AudioBook`
+/// (`AudioBook.cs:16`) and `Book` (`Book.cs:21`) to `true`. `Audio` does not
+/// override it, so a song never keeps a resume point.
 #[must_use]
-pub fn supports_position_ticks_resume(kind: BaseItemKind) -> bool {
-    is_video(kind)
-        || matches!(
-            kind,
-            BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::Book
-        )
+pub fn supports_position_ticks_resume(kind: BaseItemKind, extra_type: Option<ExtraType>) -> bool {
+    if is_video(kind) {
+        return !matches!(
+            extra_type,
+            Some(ExtraType::Sample | ExtraType::ThemeVideo | ExtraType::Trailer)
+        );
+    }
+    matches!(kind, BaseItemKind::AudioBook | BaseItemKind::Book)
 }
 
 /// Whether this kind is an audio item (`Audio` or `AudioBook`).
@@ -723,14 +725,16 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
+        collection_type_of, is_folder, is_item_by_name, is_video,
         latest_items_index_container_kind, presentation_unique_key, saved_sort_name,
         series_presentation_unique_key, series_user_data_keys, supports_adding_to_playlist,
-        supports_ancestors, supports_inherited_parent_images, supports_people,
-        supports_played_status, supports_similarity, supports_theme_media,
+        supports_ancestors, supports_inherited_parent_images, supports_played_status,
+        supports_position_ticks_resume, supports_similarity, supports_theme_media,
     };
+    use ferrofin_model::data::MediaType;
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
+    use ferrofin_model::entities::ExtraType;
     use rstest::rstest;
 
     /// The series key a `Season` case carries.
@@ -1064,18 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn displayed_as_folder_tracks_is_folder() {
-        for kind in [
-            BaseItemKind::Series,
-            BaseItemKind::Movie,
-            BaseItemKind::Genre,
-        ] {
-            assert_eq!(is_displayed_as_folder(kind), is_folder(kind));
-        }
-    }
-
-    #[test]
-    fn videos_support_people_and_theme_media() {
+    fn videos_support_theme_media() {
         for kind in [
             BaseItemKind::Movie,
             BaseItemKind::Episode,
@@ -1084,18 +1077,14 @@ mod tests {
             BaseItemKind::Trailer,
         ] {
             assert!(is_video(kind));
-            assert!(supports_people(kind));
             assert!(supports_theme_media(kind));
             assert!(supports_inherited_parent_images(kind));
         }
-        // Audio is not a video and does not support people.
-        assert!(!supports_people(BaseItemKind::Audio));
     }
 
     #[test]
-    fn folders_support_theme_media_but_not_people() {
+    fn folders_support_theme_media() {
         assert!(supports_theme_media(BaseItemKind::Series));
-        assert!(!supports_people(BaseItemKind::Series));
     }
 
     /// The v12 `SupportsInheritedParentImages` override table, one case per
@@ -1284,10 +1273,13 @@ mod tests {
         ] {
             assert!(is_item_by_name(kind));
             assert!(!supports_ancestors(kind));
-            assert!(!supports_played_status(kind));
+            assert!(!supports_played_status(kind, MediaType::Unknown));
         }
         assert!(supports_ancestors(BaseItemKind::Movie));
-        assert!(supports_played_status(BaseItemKind::Movie));
+        assert!(supports_played_status(
+            BaseItemKind::Movie,
+            MediaType::Unknown
+        ));
     }
 
     /// The seven container kinds that override `SupportsPlayedStatus` back to
@@ -1306,7 +1298,10 @@ mod tests {
             BaseItemKind::MusicAlbum,
             BaseItemKind::MusicArtist,
         ] {
-            assert!(!supports_played_status(kind), "{kind:?}");
+            assert!(
+                !supports_played_status(kind, MediaType::Unknown),
+                "{kind:?}"
+            );
         }
         // `Folder.SupportsPlayedStatus => true` still holds for the aggregating
         // kinds that do not override it.
@@ -1321,7 +1316,107 @@ mod tests {
             BaseItemKind::PlaylistsFolder,
             BaseItemKind::ManualPlaylistsFolder,
         ] {
-            assert!(supports_played_status(kind), "{kind:?}");
+            assert!(supports_played_status(kind, MediaType::Unknown), "{kind:?}");
+        }
+    }
+
+    /// Upstream's `SupportsPlayedStatus` table: `BaseItem` (`BaseItem.cs:187`)
+    /// is `false`, which `Photo` and the Live TV classes inherit (`TvChannel` and
+    /// `TvProgram` are `LiveTvChannel` and `LiveTvProgram`,
+    /// `ItemTypeLookup.cs:57-58`); `Video` (`Video.cs:54`), `Audio`
+    /// (`Audio.cs:43`), `AudioBook` (`AudioBook.cs:19`), `Book` (`Book.cs:19`)
+    /// and `Folder` (`Folder.cs:100`) are `true`.
+    #[rstest]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::LiveTvChannel, false)]
+    #[case(BaseItemKind::LiveTvProgram, false)]
+    #[case(BaseItemKind::TvChannel, false)]
+    #[case(BaseItemKind::TvProgram, false)]
+    #[case(BaseItemKind::Video, true)]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::Audio, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::Book, true)]
+    #[case(BaseItemKind::Folder, true)]
+    fn played_status_follows_the_upstream_overrides(
+        #[case] kind: BaseItemKind,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            supports_played_status(kind, MediaType::Unknown),
+            expected,
+            "{kind:?}"
+        );
+    }
+
+    /// Upstream's `SupportsPositionTicksResume` table: `BaseItem` is `false`
+    /// (`BaseItem.cs:190`), and `Audio` does not override it, so a song never
+    /// keeps a resume point; `Video` (`Video.cs:63`), `AudioBook`
+    /// (`AudioBook.cs:16`) and `Book` (`Book.cs:21`) resume; `LiveTvChannel`
+    /// overrides it to `false` (`LiveTvChannel.cs:24`).
+    #[rstest]
+    #[case(BaseItemKind::Audio, false)]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::LiveTvChannel, false)]
+    #[case(BaseItemKind::Folder, false)]
+    #[case(BaseItemKind::Video, true)]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::MusicVideo, true)]
+    #[case(BaseItemKind::Trailer, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::Book, true)]
+    fn position_resume_follows_the_upstream_overrides(
+        #[case] kind: BaseItemKind,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            supports_position_ticks_resume(kind, None),
+            expected,
+            "{kind:?}"
+        );
+    }
+
+    /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`).
+    #[rstest]
+    #[case(MediaType::Video, true)]
+    #[case(MediaType::Audio, false)]
+    #[case(MediaType::Unknown, false)]
+    fn playlist_played_status_follows_its_media_type(
+        #[case] media_type: MediaType,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            supports_played_status(BaseItemKind::Playlist, media_type),
+            expected
+        );
+    }
+
+    /// `Video.SupportsPositionTicksResume` (`Video.cs:63-88`) is `false` for
+    /// `Sample`, `ThemeVideo` and `Trailer` extras and `true` for every other
+    /// extra type and for a main video.
+    #[rstest]
+    #[case(Some(ExtraType::Sample), false)]
+    #[case(Some(ExtraType::ThemeVideo), false)]
+    #[case(Some(ExtraType::Trailer), false)]
+    #[case(Some(ExtraType::Clip), true)]
+    #[case(Some(ExtraType::BehindTheScenes), true)]
+    #[case(None, true)]
+    fn video_extras_resume_unless_sample_theme_or_trailer(
+        #[case] extra_type: Option<ExtraType>,
+        #[case] expected: bool,
+    ) {
+        for kind in [
+            BaseItemKind::Video,
+            BaseItemKind::Trailer,
+            BaseItemKind::Movie,
+        ] {
+            assert_eq!(
+                supports_position_ticks_resume(kind, extra_type),
+                expected,
+                "{kind:?} {extra_type:?}"
+            );
         }
     }
 

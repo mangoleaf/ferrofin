@@ -303,10 +303,9 @@ async fn update_display_preferences(
     let home_section_keys: Vec<String> = dto
         .custom_prefs
         .keys()
-        .filter(|k| {
-            k.len() > "homesection".len()
-                && k[.."homesection".len()].eq_ignore_ascii_case("homesection")
-        })
+        // A bare `homesection` is left alone: C# matches it too and then
+        // throws on `int.Parse("")`, a 500 not worth porting.
+        .filter(|k| k.len() > "homesection".len() && has_prefix_ignore_case(k, "homesection"))
         .cloned()
         .collect();
     for key in home_section_keys {
@@ -329,17 +328,21 @@ async fn update_display_preferences(
         home_sections.push((order, type_));
     }
 
-    // `landing-*` keys naming something that is not a `ViewType` are dropped
-    // rather than persisted (C# logs and removes them).
+    // `landing-*` keys: an empty value (jellyfin-web's "default screen") is
+    // dropped silently, one naming something that is not a `ViewType` is
+    // logged and dropped (C#).
     dto.custom_prefs.retain(|key, value| {
-        if key.len() <= "landing-".len()
-            || !key[.."landing-".len()].eq_ignore_ascii_case("landing-")
-        {
+        if !has_prefix_ignore_case(key, "landing-") {
             return true;
         }
-        let valid = value.as_deref().is_some_and(is_view_type_name);
+        let Some(value) = value.as_deref().filter(|v| !v.is_empty()) else {
+            return false;
+        };
+        let valid = is_view_type_name(value);
         if !valid {
-            tracing::error!(landing_screen_option = ?value, "Invalid ViewType");
+            // C# logs this at error; it is bad client input, a warning by
+            // docs/conventions/LOGGING.md.
+            tracing::warn!(landing_screen_option = value, "Invalid ViewType");
         }
         valid
     });
@@ -429,64 +432,35 @@ fn home_section_name(value: i32) -> String {
 /// Parses a `HomeSectionType` name back to its stored discriminant, case
 /// insensitively (C# `Enum.TryParse<HomeSectionType>(value, true, out _)`).
 fn home_section_from_name(name: &str) -> Option<i32> {
-    HOME_SECTION_TYPES
+    HomeSectionType::ALL
         .iter()
         .find(|t| format!("{t:?}").eq_ignore_ascii_case(name))
         .map(|t| i32::from(*t))
 }
 
-/// Every `HomeSectionType` variant, so a name lookup can enumerate them (the
-/// `db_enum!` macro generates only the numeric conversions).
-const HOME_SECTION_TYPES: [HomeSectionType; 10] = [
-    HomeSectionType::None,
-    HomeSectionType::SmallLibraryTiles,
-    HomeSectionType::LibraryButtons,
-    HomeSectionType::ActiveRecordings,
-    HomeSectionType::Resume,
-    HomeSectionType::ResumeAudio,
-    HomeSectionType::LatestMedia,
-    HomeSectionType::NextUp,
-    HomeSectionType::LiveTv,
-    HomeSectionType::ResumeBook,
-];
-
-/// Whether `name` parses as a `ViewType`, case insensitively (C#
-/// `Enum.TryParse<ViewType>(value, true, out _)`).
-fn is_view_type_name(name: &str) -> bool {
-    VIEW_TYPES
-        .iter()
-        .any(|v| format!("{v:?}").eq_ignore_ascii_case(name))
+/// Whether `value` parses as a `ViewType`, case insensitively: C#
+/// `Enum.TryParse<ViewType>(value, true, out _)`, which takes any integer of the
+/// enum's underlying type (named or not) or a comma-separated list of names.
+fn is_view_type_name(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+') {
+        return value.parse::<i32>().is_ok();
+    }
+    !value.is_empty()
+        && value.split(',').all(|name| {
+            ViewType::ALL
+                .iter()
+                .any(|v| format!("{v:?}").eq_ignore_ascii_case(name.trim()))
+        })
 }
 
-/// Every `ViewType` variant, for the `landing-*` validity check.
-const VIEW_TYPES: [ViewType; 26] = [
-    ViewType::Albums,
-    ViewType::AlbumArtists,
-    ViewType::Artists,
-    ViewType::Channels,
-    ViewType::Collections,
-    ViewType::Episodes,
-    ViewType::Favorites,
-    ViewType::Genres,
-    ViewType::Guide,
-    ViewType::Movies,
-    ViewType::Networks,
-    ViewType::Playlists,
-    ViewType::Programs,
-    ViewType::Recordings,
-    ViewType::Schedule,
-    ViewType::Series,
-    ViewType::Shows,
-    ViewType::Songs,
-    ViewType::Suggestions,
-    ViewType::Trailers,
-    ViewType::Upcoming,
-    ViewType::Authors,
-    ViewType::Books,
-    ViewType::Folders,
-    ViewType::Mixed,
-    ViewType::Photos,
-];
+/// Whether `key` starts with the ASCII `prefix`, ignoring case (C#
+/// `StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`). Never slices
+/// inside a multi-byte character.
+fn has_prefix_ignore_case(key: &str, prefix: &str) -> bool {
+    key.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
 
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
