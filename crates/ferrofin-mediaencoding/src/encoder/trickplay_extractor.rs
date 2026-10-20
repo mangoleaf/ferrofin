@@ -25,14 +25,15 @@
 //!   interval through `GetFramerateParam`, which returns nothing unless the
 //!   stream carries a `ReferenceFrameRate` *greater* than the requested rate,
 //!   so a stream ffprobe could not read a frame rate for gets no `fps=` filter
-//!   at all and upstream extracts a thumbnail from **every frame**, filling a
-//!   disk with JPEGs. Ferrofin keeps the sampling filter (the "do not port
-//!   Jellyfin bugs" rule); the two agree on every stream that has a frame
-//!   rate, which is all of them in practice.
-//! - The `setpts=N/frame_rate/TB` PTS normalisation the C# splices in front of
-//!   the `fps` filter guards against containers with broken timestamps and
-//!   needs the probed input frame rate, which this seam does not carry; ffmpeg's
-//!   `fps` filter handles well-formed inputs without it.
+//!   at all. Upstream then extracts a thumbnail from **every keyframe** in
+//!   keyframe-only mode, filling a disk with JPEGs, and with keyframe-only off
+//!   it throws "EncodingHelper returned invalid filter parameters" (12.0-rc3,
+//!   PR 17304), so the item gets no trickplay. Ferrofin keeps the sampling
+//!   filter in both modes (the "do not port Jellyfin bugs" rule). Without a
+//!   frame rate there is nothing to rebuild timestamps at, so such a stream is
+//!   sampled on its container timestamps with no `setpts` in front: upstream's
+//!   `30` fallback for that rebuild is never reached there. The two agree on
+//!   every stream that has a frame rate, which is all of them in practice.
 //! - The C# creates the temp output directory itself; here the caller owns the
 //!   output directory (the trickplay manager passes a temp dir and cleans it
 //!   up), so the extractor only creates and fills it.
@@ -53,6 +54,36 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 
 use super::Transcoder;
+
+/// The input frame rate `setpts` rebuilds a full decode's timestamps at: the
+/// stream's `ReferenceFrameRate` when it is positive (`MediaEncoder.cs:945`).
+///
+/// `None` without one. Upstream falls back to `30` there, but only after
+/// `GetFramerateParam` has already left such a stream without the `fps=`
+/// sampler the rebuild is spliced in front of, so upstream throws first and
+/// the fallback never runs (see the module doc).
+fn pts_frame_rate(stream: Option<&MediaStream>) -> Option<f32> {
+    stream
+        .and_then(MediaStream::reference_frame_rate)
+        .filter(|rate| *rate > 0.0)
+}
+
+/// `setpts=N/{rate:F3}/TB,`, the filter upstream splices in front of the
+/// `fps=` sampler (`MediaEncoder.cs:948`). Numbering frames from the decode
+/// counter stops a container with corrupt timestamps or duration from making
+/// the sampler emit frames without bound.
+fn pts_normalizer(rate: f32) -> String {
+    format!("setpts=N/{rate:.3}/TB,")
+}
+
+/// ` -map 0:{index}`, which upstream appends to the trickplay input argument
+/// (`MediaEncoder.cs:925-932`): "Force the video stream, otherwise ffmpeg may
+/// pick a cover image." Empty when no video stream was handed over.
+fn map_argument(map_index: Option<i32>) -> String {
+    map_index
+        .map(|index| format!(" -map 0:{index}"))
+        .unwrap_or_default()
+}
 
 /// The concrete trickplay frame extractor: builds the ffmpeg argument line and
 /// runs it through the [`Transcoder`] seam (a real spawn in production, a fake
@@ -167,6 +198,11 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// width-bounded software scaler (`trunc(min(max(iw,ih*dar),W)/2)*2` by
 /// `trunc(ow/dar/2)*2`), which keeps both dimensions even and honours
 /// anamorphic sources.
+///
+/// `pts_frame_rate` is `Some` when the timestamps are rebuilt in front of the
+/// sampler (keyframe-only extraction configured off; see [`pts_normalizer`]).
+/// `map_index` is the video stream's ffmpeg index, mapped right after the
+/// input (` -map 0:N`, [`map_argument`]).
 #[must_use]
 #[allow(
     clippy::too_many_arguments,
@@ -182,6 +218,8 @@ pub fn build_trickplay_args(
     output_pattern: &str,
     ffmpeg_version: Option<FfmpegVersion>,
     keyframe_only: bool,
+    pts_frame_rate: Option<f32>,
+    map_index: Option<i32>,
 ) -> String {
     // ffmpeg qscale is 1 (best) – 31 (worst); C# clamps the configured value.
     let qscale = qscale.clamp(1, 31);
@@ -198,9 +236,11 @@ pub fn build_trickplay_args(
     } else {
         ""
     };
+    let setpts = pts_frame_rate.map(pts_normalizer).unwrap_or_default();
+    let map = map_argument(map_index);
     format!(
-        "-loglevel error {skip_frame}-threads {threads} -i file:{input} -an -sn \
-         -vf \"fps=1000/{interval_ms},scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2\" \
+        "-loglevel error {skip_frame}-threads {threads} -i file:{input}{map} -an -sn \
+         -vf \"{setpts}fps=1000/{interval_ms},scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2\" \
          -threads {threads} -c:v mjpeg -qscale:v {qscale}{sync} -f image2 {output}",
         input = quote(input_path),
         output = quote(output_pattern),
@@ -239,6 +279,13 @@ pub struct TrickplayJob<'a> {
     /// caller that gets an ffmpeg failure should rebuild the job with this
     /// `false` and retry, as upstream does.
     pub keyframe_only: bool,
+    /// `Some(rate)` when the timestamps are rebuilt in front of the `fps=`
+    /// sampler ([`pts_normalizer`]). Decided by the CONFIGURED keyframe-only
+    /// flag, not by `keyframe_only`: upstream builds the filter once, so the
+    /// standard-way retry of a keyframe-only job carries none.
+    pub pts_frame_rate: Option<f32>,
+    /// The video stream's ffmpeg input index ([`map_argument`]).
+    pub map_index: Option<i32>,
 }
 
 /// Builds the ffmpeg argument line and process environment for a **hardware**
@@ -286,6 +333,8 @@ pub fn build_accelerated_trickplay_args(
         allow_hw_accel,
         enable_hw_encoding,
         keyframe_only,
+        pts_frame_rate,
+        map_index,
     } = job;
 
     if !allow_hw_accel || options.hardware_acceleration_type == HardwareAccelerationType::none {
@@ -414,7 +463,7 @@ pub fn build_accelerated_trickplay_args(
                   emitted string is that float widened to double"
     )]
     let fps = f64::from(1000.0_f32 / interval_ms as f32);
-    let (flag, graph) = hw::sw_chain::video_processing_filter_args(
+    let (flag, mut graph) = hw::sw_chain::video_processing_filter_args(
         chain,
         Some(fps),
         hw::sw_chain::StreamPads {
@@ -425,6 +474,16 @@ pub fn build_accelerated_trickplay_args(
         false,
         false,
     )?;
+
+    // Upstream inserts `setpts` at the first `fps=` of the filter and throws
+    // when there is none. The chain always opens with the `fps=` built from
+    // `Some(fps)` above, so a miss cannot happen; were it to, the software
+    // path (whose filter always has one) runs instead of failing the job.
+    if let Some(rate) = pts_frame_rate {
+        let at = graph.find("fps=");
+        debug_assert!(at.is_some(), "the trickplay chain opens with fps=: {graph}");
+        graph.insert_str(at?, &pts_normalizer(rate));
+    }
 
     let (quality_option, quality) = mjpeg_quality(&video_encoder, qscale);
     let hwaccel_args = hwaccel.args.trim();
@@ -446,9 +505,12 @@ pub fn build_accelerated_trickplay_args(
         " -noautoscale"
     };
     let sync = crate::encoding_helper::helper::video_sync_option("0", caps.ffmpeg_version());
+    // `-noautoscale` belongs to `GetInputArgument`, and upstream appends the
+    // map after the whole input argument.
+    let map = map_argument(map_index);
     let args = format!(
         "-loglevel error{skip_frame}{separator}{hwaccel_args} -i file:{input}\
-         {noautoscale} -an -sn {flag} \"{graph}\" -threads {threads} \
+         {noautoscale}{map} -an -sn {flag} \"{graph}\" -threads {threads} \
          -c:v {video_encoder} {quality_option} {quality}{sync} -f image2 {output}",
         input = quote(input_path),
         output = quote(output_pattern),
@@ -590,7 +652,33 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
         let output_pattern = dir.join("%08d.jpg");
         let output_pattern = output_pattern.to_string_lossy();
 
-        let plan = self.plan(request, &output_pattern).await;
+        // `MediaEncoder.cs:937-955`: decided once, from the configured flag, so
+        // the standard-way retry below reuses the keyframe-only filter as-is.
+        let pts_frame_rate = if request.keyframe_only {
+            None
+        } else {
+            pts_frame_rate(request.video_stream)
+        };
+        // `MediaEncoder.cs:925-932`: upstream throws when the stream it was
+        // asked to thumbnail is not among the source's streams, rather than
+        // let ffmpeg choose one.
+        let map_index = match request.video_stream {
+            Some(stream) => {
+                let index =
+                    crate::encoding_helper::helper::find_index(request.media_streams, stream);
+                if index < 0 {
+                    return Err(ServiceError::backend(format!(
+                        "unable to locate the requested video stream {} of {}",
+                        stream.index, request.input_path
+                    )));
+                }
+                Some(index)
+            }
+            None => None,
+        };
+        let plan = self
+            .plan(request, &output_pattern, pts_frame_rate, map_index)
+            .await;
         let first = self.run(&plan).await?;
         if let Some(frames) = Self::frames_of(dir, &first)? {
             return Ok(frames);
@@ -618,6 +706,8 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
                         ..*request
                     },
                     &output_pattern,
+                    pts_frame_rate,
+                    map_index,
                 )
                 .await;
             let second = self.run(&retry).await?;
@@ -653,6 +743,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
         &self,
         request: &TrickplayExtraction<'_>,
         output_pattern: &str,
+        pts_frame_rate: Option<f32>,
+        map_index: Option<i32>,
     ) -> ExtractionPlan {
         if request.allow_hw_accel
             && let Some(stream) = request.video_stream
@@ -671,6 +763,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                     allow_hw_accel: request.allow_hw_accel,
                     enable_hw_encoding: request.enable_hw_encoding,
                     keyframe_only: request.keyframe_only,
+                    pts_frame_rate,
+                    map_index,
                 },
             )
         {
@@ -680,7 +774,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 hardware: true,
             };
         }
-        self.software_plan(request, output_pattern)
+        self.software_plan(request, output_pattern, pts_frame_rate, map_index)
     }
 
     /// The software plan, which needs nothing probed.
@@ -688,6 +782,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
         &self,
         request: &TrickplayExtraction<'_>,
         output_pattern: &str,
+        pts_frame_rate: Option<f32>,
+        map_index: Option<i32>,
     ) -> ExtractionPlan {
         ExtractionPlan {
             args: build_trickplay_args(
@@ -699,6 +795,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 output_pattern,
                 self.ffmpeg_version,
                 request.keyframe_only,
+                pts_frame_rate,
+                map_index,
             ),
             env: Vec::new(),
             hardware: false,
@@ -882,6 +980,8 @@ mod tests {
             "/tmp/out/%08d.jpg",
             Some(FfmpegVersion::with_build(7, 0, 1)),
             false,
+            None,
+            None,
         );
         assert_eq!(
             args,
@@ -898,7 +998,18 @@ mod tests {
     #[case::quote(r#"/m/a" -y -i /etc/passwd ".mkv"#)]
     #[case::backslash_quote(r#"/m/a\" -y -i /etc/passwd \".mkv"#)]
     fn a_hostile_path_stays_one_input(#[case] path: &str) {
-        let args = build_trickplay_args(path, 10_000, 320, 4, 1, "/tmp/o/%08d.jpg", None, false);
+        let args = build_trickplay_args(
+            path,
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/o/%08d.jpg",
+            None,
+            false,
+            None,
+            None,
+        );
         let tokens = crate::encoder::split_args(&args).unwrap();
         let i = tokens.iter().position(|a| a == "-i").unwrap();
         assert_eq!(tokens[i + 1], format!("file:{path}"));
@@ -911,20 +1022,23 @@ mod tests {
         // Upstream prepends `-skip_frame nokey` to the input fragment whether
         // or not hardware is in play, so a job that dropped to software
         // because its accelerator cannot skip keyframes still skips them here.
-        let args = build_trickplay_args("/m/v.mkv", 10_000, 320, 4, 1, "o", None, true);
+        let args = build_trickplay_args("/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None);
         assert!(
             args.starts_with("-loglevel error -skip_frame nokey -threads 1 -i "),
             "{args}"
         );
-        let args = build_trickplay_args("/m/v.mkv", 10_000, 320, 4, 1, "o", None, false);
+        let args =
+            build_trickplay_args("/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None);
         assert!(!args.contains("-skip_frame"), "{args}");
     }
 
     #[test]
     fn qscale_is_clamped_to_ffmpeg_range() {
-        let args = build_trickplay_args("/m/v.mkv", 10_000, 320, 0, 0, "o", None, false);
+        let args =
+            build_trickplay_args("/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None);
         assert!(args.contains("-qscale:v 1 "), "low clamp in {args}");
-        let args = build_trickplay_args("/m/v.mkv", 10_000, 320, 99, 0, "o", None, false);
+        let args =
+            build_trickplay_args("/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None);
         assert!(args.contains("-qscale:v 31 "), "high clamp in {args}");
     }
 
@@ -933,6 +1047,7 @@ mod tests {
         TrickplayExtraction {
             input_path,
             video_stream: None,
+            media_streams: &[],
             interval_ms: 10_000,
             max_width: 320,
             qscale: 4,
@@ -1057,6 +1172,7 @@ mod tests {
     ) -> TrickplayExtraction<'a> {
         TrickplayExtraction {
             video_stream: Some(stream),
+            media_streams: std::slice::from_ref(stream),
             allow_hw_accel: true,
             enable_hw_encoding: true,
             keyframe_only: true,
@@ -1074,6 +1190,219 @@ mod tests {
             height: Some(1080),
             ..MediaStream::default()
         }
+    }
+
+    /// A video stream whose probed frame rate is `fps` (`None`: ffprobe read
+    /// none).
+    fn stream_at(fps: Option<f32>) -> MediaStream {
+        MediaStream {
+            average_frame_rate: fps,
+            real_frame_rate: fps,
+            ..h264_stream()
+        }
+    }
+
+    /// v12.2 `ExtractVideoImagesOnIntervalAccelerated` (:937-955, PR 17304):
+    /// with keyframe-only extraction off, `setpts=N/{rate:F3}/TB,` goes in
+    /// front of the `fps=` sampler, so broken container timestamps cannot make
+    /// it emit frames without bound. The rate is the stream's
+    /// `ReferenceFrameRate`. A stream without one has no `fps=` upstream (and
+    /// fails there); Ferrofin samples it on its container timestamps.
+    #[rstest::rstest]
+    #[case::film(Some(23.976), "setpts=N/23.976/TB,fps=")]
+    #[case::ntsc(Some(29.97), "setpts=N/29.970/TB,fps=")]
+    #[case::no_frame_rate(None, "fps=")]
+    #[tokio::test]
+    async fn a_full_decode_rebuilds_timestamps_before_sampling(
+        #[case] fps: Option<f32>,
+        #[case] expected: &str,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let stream = stream_at(fps);
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                video_stream: Some(&stream),
+                media_streams: std::slice::from_ref(&stream),
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let recorded = transcoder.recorded();
+        assert!(
+            recorded[0].contains(&format!("-vf \"{expected}")),
+            "{}",
+            recorded[0]
+        );
+    }
+
+    /// Upstream builds the filter once from the CONFIGURED keyframe-only flag
+    /// and reuses it for the standard-way retry (`MediaEncoder.cs:980`), so
+    /// with keyframe-only on neither the first run nor its retry gets setpts.
+    #[tokio::test]
+    async fn keyframe_only_runs_and_their_retry_keep_the_plain_sampler() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(0, "no keyframes").failing());
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let stream = stream_at(Some(25.0));
+
+        let _ = extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                video_stream: Some(&stream),
+                media_streams: std::slice::from_ref(&stream),
+                keyframe_only: true,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await;
+
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 2, "the keyframe-only run and its retry");
+        for args in &recorded {
+            assert!(!args.contains("setpts=N/"), "{args}");
+            assert!(args.contains("-vf \"fps="), "{args}");
+        }
+        assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
+    }
+
+    /// A cover image stored ahead of the main video, then the audio: the
+    /// layout that made ffmpeg pick the wrong stream upstream.
+    fn covered_streams() -> Vec<MediaStream> {
+        vec![
+            MediaStream {
+                codec: Some("mjpeg".to_owned()),
+                index: 0,
+                stream_type: ferrofin_model::entities::MediaStreamType::EmbeddedImage,
+                width: Some(3840),
+                height: Some(2160),
+                ..MediaStream::default()
+            },
+            MediaStream {
+                index: 1,
+                ..stream_at(Some(25.0))
+            },
+            MediaStream {
+                codec: Some("aac".to_owned()),
+                index: 2,
+                stream_type: ferrofin_model::entities::MediaStreamType::Audio,
+                ..MediaStream::default()
+            },
+        ]
+    }
+
+    /// v12.2 `ExtractVideoImagesOnIntervalAccelerated` (:925-932, PR 17883):
+    /// "Force the video stream, otherwise ffmpeg may pick a cover image." The
+    /// input argument ends with ` -map 0:{FindIndex}`, so ffmpeg decodes the
+    /// stream the job was sized for, not the higher-resolution cover.
+    #[tokio::test]
+    async fn a_full_decode_maps_the_video_stream_it_was_sized_for() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let streams = covered_streams();
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                video_stream: Some(&streams[1]),
+                media_streams: &streams,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let recorded = transcoder.recorded();
+        assert!(
+            recorded[0].contains("-i file:\"/m/v.mkv\" -map 0:1 -an -sn"),
+            "{}",
+            recorded[0]
+        );
+    }
+
+    /// Upstream throws "Unable to locate requested stream" rather than let
+    /// ffmpeg pick a stream when the one it was asked to thumbnail is not
+    /// among the source's streams; nothing is spawned.
+    #[tokio::test]
+    async fn a_video_stream_missing_from_the_source_fails_the_job() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let streams = covered_streams();
+        let elsewhere = MediaStream {
+            index: 7,
+            ..stream_at(Some(25.0))
+        };
+
+        let err = extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                video_stream: Some(&elsewhere),
+                media_streams: &streams,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await
+            .expect_err("an unknown stream is not guessed at");
+
+        assert!(err.to_string().contains("unable to locate"), "{err}");
+        assert!(transcoder.recorded().is_empty(), "ffmpeg never ran");
+    }
+
+    /// On the GPU the map follows the whole input argument, `-noautoscale`
+    /// included, as upstream appends it to `GetInputArgument`'s result.
+    #[tokio::test]
+    async fn a_gpu_decode_maps_the_video_stream_after_the_input() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect("frames");
+
+        let recorded = transcoder.recorded();
+        assert!(
+            recorded[0].contains(" -noautoscale -map 0:0 -an -sn"),
+            "{}",
+            recorded[0]
+        );
+    }
+
+    /// The hardware chain gets the same splice: `setpts` lands in front of the
+    /// `fps=` at the head of the chain.
+    #[tokio::test]
+    async fn a_full_decode_on_the_gpu_rebuilds_timestamps_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = stream_at(Some(23.976));
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                keyframe_only: false,
+                ..hardware_request(&stream, &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let recorded = transcoder.recorded();
+        assert!(
+            recorded[0].contains("-init_hw_device vaapi=va:"),
+            "{}",
+            recorded[0]
+        );
+        assert!(
+            recorded[0].contains("\"setpts=N/23.976/TB,fps="),
+            "{}",
+            recorded[0]
+        );
     }
 
     #[tokio::test]
@@ -1490,6 +1819,8 @@ mod accelerated_tests {
             allow_hw_accel: true,
             enable_hw_encoding: true,
             keyframe_only: true,
+            pts_frame_rate: None,
+            map_index: None,
         }
     }
 

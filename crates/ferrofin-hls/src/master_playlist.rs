@@ -1175,6 +1175,7 @@ mod tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: vec!["h264".to_owned()],
             supported_audio_codecs: vec!["aac".to_owned()],
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 3,
             wait_for_path: None,
             segment_container: Some("ts".to_owned()),

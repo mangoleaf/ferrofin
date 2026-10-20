@@ -1507,6 +1507,7 @@ mod tests {
                 .extract_trickplay_frames(&TrickplayExtraction {
                     input_path: "/movie.mkv",
                     video_stream: None,
+                    media_streams: &[],
                     interval_ms: 10_000,
                     max_width: 320,
                     qscale: 4,

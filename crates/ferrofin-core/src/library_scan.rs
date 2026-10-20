@@ -719,6 +719,16 @@ impl<'a> FetcherPolicy<'a> {
         ferrofin_providers::library_options::global_metadata_options(self.global?, kind)
     }
 
+    /// Whether a metadata saver will rewrite `row`'s metadata
+    /// ([`ferrofin_providers::nfo_save::saves_metadata`]), with this policy's
+    /// library and server-wide options. It reads the configuration only, not
+    /// whether this scanner was given savers: the composition root always
+    /// wires the Nfo saver, as upstream always registers it.
+    fn saves_metadata(self, row: &BaseItemEntity) -> bool {
+        let kind = row.type_.rsplit('.').next().unwrap_or_default();
+        ferrofin_providers::nfo_save::saves_metadata(row, self.options, self.global_for(kind))
+    }
+
     /// Whether the library enabled metadata fetcher `name` for `kind`.
     ///
     /// Delegates to the shared gate so the scan and the on-demand refresh in
@@ -3643,6 +3653,13 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
+    /// The persistence's [`user_data_detach_epoch`] when the last full
+    /// user-data recovery sweep began; `None` until one has run, so the first
+    /// scan after a start always sweeps ([`recover_user_data`]).
+    ///
+    /// [`user_data_detach_epoch`]: ferrofin_traits::persistence::ItemPersistenceService::user_data_detach_epoch
+    /// [`recover_user_data`]: Self::recover_user_data
+    swept_at_epoch: std::sync::Mutex<Option<i64>>,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -3830,6 +3847,7 @@ impl LibraryScanner {
             display_specials_within_seasons: None,
             nfo_configuration: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
+            swept_at_epoch: std::sync::Mutex::new(None),
         }
     }
 
@@ -5579,6 +5597,43 @@ impl LibraryScanner {
             .collect())
     }
 
+    /// The full user-data recovery sweep after a scan
+    /// ([`reattach_all_user_data`]), when it can find something: history
+    /// whose destination no save of this scan reattached.
+    ///
+    /// Every item a scan saves reattaches its own history on the spot. What
+    /// that misses is a pair matched across time: history detached after its
+    /// destination was saved (later in this scan, or by an earlier watcher
+    /// event outside this one's scope), and a destination whose keys changed
+    /// after its save or outside a scan (music's closing pass, a series'
+    /// re-pointed children, an edit). A `ScanPasses::Library` scan (the
+    /// scheduled scan, `POST /Library/Refresh`, one library's scan) always
+    /// sweeps for them. A `ScanPasses::Touched` scan (watcher and webhook
+    /// batches, item and folder refreshes) sweeps only when history was
+    /// detached since the last sweep: otherwise it has no new history to
+    /// place, and the next library scan catches a late key change.
+    ///
+    /// [`reattach_all_user_data`]: ItemPersistenceService::reattach_all_user_data
+    async fn recover_user_data(&self, passes: ScanPasses) -> Result<(), ServiceError> {
+        let epoch = self.persistence.user_data_detach_epoch().await?;
+        let swept = *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if passes == ScanPasses::Touched && epoch.is_some() && epoch == swept {
+            tracing::debug!(
+                "user-data recovery sweep skipped: nothing detached since the last one"
+            );
+            return Ok(());
+        }
+        self.persistence.reattach_all_user_data().await?;
+        *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+        Ok(())
+    }
+
     /// The shared scan pipeline over an already-planned item set: probe +
     /// metadata + persistence per item, deleted-item pruning (restricted to
     /// `scope`'s roots when given), the `LibraryChanged` push, and the music
@@ -6137,10 +6192,7 @@ impl LibraryScanner {
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
         if !outcome.stopped {
-            // New destinations may have been saved before old paths were
-            // pruned, or by an earlier watcher event outside this scope.
-            // Music's closing pass must also have persisted its final keys.
-            self.persistence.reattach_all_user_data().await?;
+            self.recover_user_data(run.passes).await?;
             run.report(100.0);
         }
         // Announce what the scan changed (`LibraryChanged`) so open clients
@@ -6628,9 +6680,17 @@ impl LibraryScanner {
             });
         }
         let stored_row = stored.row();
-        let absolute_naming = self
-            .remember_display_order(state.art_cache, stored_row.unwrap_or(&item.entity))
-            .await;
+        let folders = state.folders;
+        let naming = EpisodeNaming {
+            absolute: self
+                .remember_display_order(state.art_cache, stored_row.unwrap_or(&item.entity))
+                .await,
+            library: item
+                .entity
+                .path
+                .as_deref()
+                .and_then(|path| library_holding(path, library_locations(folders))),
+        };
         // The options this item refreshes with (the scan's, or the defaults
         // for an ancestor a path-scoped scan carries along).
         let request = *state
@@ -6682,15 +6742,7 @@ impl LibraryScanner {
         let mut video_base = stored_row.filter(|_| video_info.is_some()).cloned();
         let embedded_title = if let Some(info) = video_info {
             let base = video_base.as_mut().unwrap_or(&mut entity);
-            apply_video_metadata(
-                base,
-                info,
-                policy,
-                locked,
-                locked_fields,
-                options,
-                absolute_naming,
-            );
+            apply_video_metadata(base, info, policy, locked, locked_fields, options, naming);
             embedded_video_title(info, base, policy, locked, locked_fields).map(str::to_owned)
         } else {
             None
@@ -6765,9 +6817,14 @@ impl LibraryScanner {
         // plus the external ids the file pins. It runs only when the plan
         // runs the local readers (`BaseNfoProvider.HasChanged`: the NFO is
         // newer than the last save by over a minute, or every provider runs).
-        // Identifying skips the local readers ("Do not execute local
-        // providers if we are identifying", `MetadataService.cs:802-803`).
-        let run_local = plan.local_metadata && !locked && search.is_none();
+        // Identifying skips the local readers, and so does "Replace all
+        // metadata" for an item a saver will rewrite ("Do not execute local
+        // providers if we are identifying or replacing with local metadata
+        // saving enabled", `MetadataService.cs:802-803`).
+        let run_local = plan.local_metadata
+            && !locked
+            && search.is_none()
+            && !(options.replace_all_metadata && policy.saves_metadata(&entity));
         let local = if run_local {
             self.fetch_local_nfo(&mut entity, policy).await
         } else {
@@ -6998,7 +7055,7 @@ impl LibraryScanner {
                     || plan.is_first_refresh
                     || plan.requires_refresh),
             replace_all: options.replace_all_metadata,
-            absolute_naming,
+            naming,
             remote_answered: has_remote_metadata,
         };
         // The season date fields this pass's readers and providers answered
@@ -14875,7 +14932,7 @@ impl LibraryScanner {
             .filter(|p| episode_group(p, ctx).is_none_or(|(_, first)| first))
             .map(|p| {
                 let num = EpisodeResolver::new(naming)
-                    .resolve_simple(p, false)
+                    .resolve_simple(below_library(p, library_locations(ctx.key_folders)), false)
                     .and_then(|i| i.season_number);
                 (p, num)
             })
@@ -15165,7 +15222,10 @@ impl LibraryScanner {
     /// when there is no season folder), carrying `IndexNumber` /
     /// `ParentIndexNumber` from the filename's episode/season numbers.
     fn episode_row(&self, path: &str, home: EpisodeHome<'_>, ctx: &PlanCtx<'_>) -> Option<Planned> {
-        let info = EpisodeResolver::new(ctx.naming).resolve_simple(path, false);
+        let info = EpisodeResolver::new(ctx.naming).resolve_simple(
+            below_library(path, library_locations(ctx.key_folders)),
+            false,
+        );
         let (parent, ancestors) = home.parent();
         let (id, mut entity) = self.base_item(
             ctx,
@@ -17721,6 +17781,54 @@ pub(crate) fn path_is_under(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// What an episode's numbers are read from: `path` below the deepest of
+/// `libraries` holding it, from the separator on (`/Show/Season 1/e.mkv`), or
+/// the whole path when none does.
+///
+/// ACCEPTED DIVERGENCE (Ferrofin is the more-correct side): upstream hands
+/// `EpisodeResolver` the whole path (`FillMissingEpisodeNumbersFromPath`,
+/// `LibraryManager.cs:3321`), so an unanchored expression such as "1-12
+/// episode title" (`([0-9]+)-([0-9]+)`) also matches a folder above the
+/// library: an episode under `/srv/media-v12-2/tv/Show/Bonus/` lands in
+/// season 12. The folders that hold a library name none of its episodes.
+fn below_library<'p, 'l>(path: &'p str, libraries: impl IntoIterator<Item = &'l str>) -> &'p str {
+    library_holding(path, libraries).map_or(path, |root| &path[root.len()..])
+}
+
+/// Every location of `folders`, the libraries an episode's numbers are read
+/// below ([`below_library`]). The planner and the refresh pass every
+/// configured library, so nested libraries cut a path at the same root.
+fn library_locations(folders: &[VirtualFolderInfo]) -> impl Iterator<Item = &str> {
+    folders
+        .iter()
+        .flat_map(|folder| folder.locations.iter().map(String::as_str))
+}
+
+/// The deepest of `libraries` that holds `path` below it, without a
+/// trailing slash.
+fn library_holding<'l>(
+    path: &str,
+    libraries: impl IntoIterator<Item = &'l str>,
+) -> Option<&'l str> {
+    libraries
+        .into_iter()
+        .map(|root| root.trim_end_matches('/'))
+        .filter(|root| !root.is_empty() && path_is_under(path, root) && path != *root)
+        .max_by_key(|root| root.len())
+}
+
+/// How an episode's path is read for its numbers
+/// ([`fill_episode_numbers_from_path`]).
+#[derive(Clone, Copy, Default)]
+struct EpisodeNaming<'a> {
+    /// The episode's series uses `absolute` display order, so its bare file
+    /// numbers are absolute episode numbers.
+    absolute: bool,
+    /// The library location holding the episode: only the path below it is
+    /// read ([`below_library`]).
+    library: Option<&'a str>,
+}
+
 /// MovieResolver.FindMovie accepts one resolved movie (including versions)
 /// and no ordinary subdirectories. Only such a movie searches its containing
 /// folder for extras (BaseItem.SearchesContainingFolderForExtras).
@@ -18437,9 +18545,9 @@ struct SaveFacts<'a> {
     before_refresh: bool,
     /// The pass replaces all metadata (`ReplaceAllMetadata`).
     replace_all: bool,
-    /// The episode's series uses `absolute` display order, so its bare
-    /// file numbers are absolute episode numbers.
-    absolute_naming: bool,
+    /// How an episode's path is read for its numbers: its series' display
+    /// order and the library holding it.
+    naming: EpisodeNaming<'a>,
     /// A remote provider answered with metadata. A season's or an
     /// episode's put the number it was looked up by on its result (TMDB's
     /// `IndexNumber = info.IndexNumber`); Ferrofin's fetchers leave that to
@@ -18653,7 +18761,7 @@ fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
     season_index: Option<i64>,
-    absolute_naming: bool,
+    naming: EpisodeNaming<'_>,
 ) {
     let path = row.path.clone().filter(|p| !p.is_empty());
     // ACCEPTED DIVERGENCE (Ferrofin is the more-correct side: upstream
@@ -18718,13 +18826,7 @@ fn before_metadata_refresh(
             // Embedded episode info is applied by `apply_video_metadata`
             // before this path fallback; the probe and lookup share that row.
             if let Some(path) = path.as_deref() {
-                fill_episode_numbers_from_path(
-                    row,
-                    path,
-                    replace_all,
-                    season_index,
-                    absolute_naming,
-                );
+                fill_episode_numbers_from_path(row, path, replace_all, season_index, naming);
             }
         }
         _ => {}
@@ -18763,16 +18865,16 @@ fn fill_episode_numbers_from_path(
     path: &str,
     replace_all: bool,
     season_index: Option<i64>,
-    absolute_naming: bool,
+    naming: EpisodeNaming<'_>,
 ) {
     use chrono::TimeZone as _;
     // `isAbsoluteNaming`: `null` (no filter) unless the series is absolute.
     let Some(info) = EpisodeResolver::new(&PATH_NAMING).resolve(
-        path,
+        below_library(path, naming.library),
         false,
         None,
         None,
-        absolute_naming.then_some(true),
+        naming.absolute.then_some(true),
         true,
     ) else {
         return;
@@ -18848,7 +18950,7 @@ fn apply_video_metadata(
     locked: bool,
     fields: &[MetadataField],
     options: &MetadataRefreshOptions,
-    absolute_naming: bool,
+    naming: EpisodeNaming<'_>,
 ) {
     if options.metadata_refresh_mode != MetadataRefreshMode::None {
         if !locked && embedded_episode_info_enabled(row, policy) {
@@ -18866,7 +18968,7 @@ fn apply_video_metadata(
             row,
             options.replace_all_metadata,
             row.parent_index_number,
-            absolute_naming,
+            naming,
         );
     }
     if let Some(title) = embedded_video_title(info, row, policy, locked, fields) {
@@ -18911,7 +19013,7 @@ fn saved_row(
                 &mut base,
                 facts.replace_all,
                 guesses.parent_index_number,
-                facts.absolute_naming,
+                facts.naming,
             );
         }
         let mut row = merge_onto_stored(&base, scanned, facts, base.parent_index_number);
@@ -19347,12 +19449,14 @@ fn settle_extra_name(
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
 /// to a persistable [`PeopleEntity`]. NFO people carry no remote id/image, so those
-/// are left empty; the person-type key is the Jellyfin `PersonType` name.
+/// are left empty; the person-type key is the Jellyfin `PersonType` name
+/// (`PersonInfo.Type.ToString()`, `PeopleRepository.cs:122`): the member name,
+/// or the C# integer of an undeclared value.
 fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> PeopleEntity {
     PeopleEntity {
         id: guid_to_db(Uuid::new_v4()),
         name: p.name,
-        person_type: Some(format!("{:?}", p.type_)),
+        person_type: Some(p.type_.json_name().into_owned()),
         role: p.role,
         primary_image_url: None,
         provider_id: None,
@@ -20754,7 +20858,7 @@ mod tests {
             locked,
             &[],
             &refresh,
-            false,
+            super::EpisodeNaming::default(),
         );
         assert_eq!(
             (row.index_number, row.parent_index_number),
@@ -26432,7 +26536,7 @@ mod tests {
                 merge: super::MergeMode::DEFAULT,
                 before_refresh: true,
                 replace_all: false,
-                absolute_naming: false,
+                naming: crate::library_scan::EpisodeNaming::default(),
                 remote_answered: false,
                 redated: None,
             },
@@ -26686,7 +26790,7 @@ mod tests {
                 merge,
                 before_refresh: true,
                 replace_all: options.replace_all_metadata,
-                absolute_naming: false,
+                naming: crate::library_scan::EpisodeNaming::default(),
                 remote_answered: answered,
                 redated: None,
             },
@@ -27761,12 +27865,12 @@ mod tests {
     ) {
         let mut row = stored_row(kind, path, name, None);
         row.is_in_mixed_folder = mixed;
-        super::before_metadata_refresh(&mut row, false, None, false);
+        super::before_metadata_refresh(&mut row, false, None, super::EpisodeNaming::default());
         assert_eq!(row.name.as_deref(), expected_name, "{kind}");
         assert_eq!(row.production_year, expected_year, "{kind}");
         // A value the row holds is never replaced.
         let mut kept = stored_row(kind, path, name.or(Some("Kept")), Some(1900));
-        super::before_metadata_refresh(&mut kept, true, None, false);
+        super::before_metadata_refresh(&mut kept, true, None, super::EpisodeNaming::default());
         assert_eq!(kept.production_year, Some(1900), "{kind}");
     }
 
@@ -27777,12 +27881,12 @@ mod tests {
     fn the_refill_reads_a_disc_rips_own_folder() {
         let mut rip = stored_row("Movies.Movie", "/m/Dune (2021)", None, None);
         rip.data = Some(r#"{"VideoType":"BluRay"}"#.to_owned());
-        super::before_metadata_refresh(&mut rip, false, None, false);
+        super::before_metadata_refresh(&mut rip, false, None, super::EpisodeNaming::default());
         assert_eq!(rip.name.as_deref(), Some("Dune (2021)"));
         assert_eq!(rip.production_year, Some(2021));
         let mut named = stored_row("Movies.Movie", "/m (1999)/Dune (2021)", Some("Dune"), None);
         named.data = Some(r#"{"VideoType":"Dvd"}"#.to_owned());
-        super::before_metadata_refresh(&mut named, false, None, false);
+        super::before_metadata_refresh(&mut named, false, None, super::EpisodeNaming::default());
         assert_eq!(
             named.production_year,
             Some(2021),
@@ -27795,10 +27899,10 @@ mod tests {
     #[test]
     fn the_refill_numbers_a_season_from_its_folder() {
         let mut season = stored_row("TV.Season", "/tv/Show/Season 03", Some("Season 3"), None);
-        super::before_metadata_refresh(&mut season, false, None, false);
+        super::before_metadata_refresh(&mut season, false, None, super::EpisodeNaming::default());
         assert_eq!(season.index_number, Some(3));
         season.index_number = Some(9);
-        super::before_metadata_refresh(&mut season, true, None, false);
+        super::before_metadata_refresh(&mut season, true, None, super::EpisodeNaming::default());
         assert_eq!(season.index_number, Some(9));
     }
 
@@ -27820,28 +27924,67 @@ mod tests {
         // tries the absolute-number expressions, which do not match it, so
         // nothing is taken from the path.
         let mut aired = episode("Show.102.mkv");
-        super::before_metadata_refresh(&mut aired, false, None, false);
+        super::before_metadata_refresh(&mut aired, false, None, super::EpisodeNaming::default());
         assert_eq!(
             (aired.parent_index_number, aired.index_number),
             (Some(1), Some(2))
         );
         let mut absolute = episode("Show.102.mkv");
-        super::before_metadata_refresh(&mut absolute, false, None, true);
+        super::before_metadata_refresh(
+            &mut absolute,
+            false,
+            None,
+            super::EpisodeNaming {
+                absolute: true,
+                library: None,
+            },
+        );
         assert_eq!(
             (absolute.parent_index_number, absolute.index_number),
             (None, None)
         );
         // A bare number both read the same way is an absolute number.
         let mut bare = episode("Show 101.mkv");
-        super::before_metadata_refresh(&mut bare, false, None, true);
+        super::before_metadata_refresh(
+            &mut bare,
+            false,
+            None,
+            super::EpisodeNaming {
+                absolute: true,
+                library: None,
+            },
+        );
         assert_eq!(bare.index_number, Some(101));
+    }
+
+    /// The refill reads only the path below the library: a folder above it
+    /// named like "1-12" is no season and episode. The whole path, as
+    /// upstream reads it, makes this bonus video season 12, episode 2.
+    #[test]
+    fn the_refill_reads_numbers_below_the_library() {
+        let path = "/srv/media-v12-2/tv/Show/Bonus/Making of.mkv";
+        let refill = |library| {
+            let mut row = stored_row("TV.Episode", path, Some("Making of"), None);
+            super::before_metadata_refresh(
+                &mut row,
+                false,
+                None,
+                super::EpisodeNaming {
+                    absolute: false,
+                    library,
+                },
+            );
+            (row.parent_index_number, row.index_number)
+        };
+        assert_eq!(refill(Some("/srv/media-v12-2/tv")), (None, None));
+        assert_eq!(refill(None), (Some(12), Some(2)));
     }
 
     #[test]
     fn the_refill_numbers_an_episode_from_its_path() {
         let path = "/tv/Show/Season 01/Show S01E03.mkv";
         let mut missing = stored_row("TV.Episode", path, Some("Title"), None);
-        super::before_metadata_refresh(&mut missing, false, None, false);
+        super::before_metadata_refresh(&mut missing, false, None, super::EpisodeNaming::default());
         assert_eq!(
             (missing.parent_index_number, missing.index_number),
             (Some(1), Some(3))
@@ -27850,12 +27993,12 @@ mod tests {
         let mut edited = stored_row("TV.Episode", path, Some("Title"), None);
         edited.parent_index_number = Some(2);
         edited.index_number = Some(1);
-        super::before_metadata_refresh(&mut edited, false, None, false);
+        super::before_metadata_refresh(&mut edited, false, None, super::EpisodeNaming::default());
         assert_eq!(
             (edited.parent_index_number, edited.index_number),
             (Some(2), Some(1))
         );
-        super::before_metadata_refresh(&mut edited, true, None, false);
+        super::before_metadata_refresh(&mut edited, true, None, super::EpisodeNaming::default());
         assert_eq!(
             (edited.parent_index_number, edited.index_number),
             (Some(1), Some(3)),
@@ -27864,7 +28007,7 @@ mod tests {
 
         let mut locked = stored_row("TV.Episode", path, Some("Title"), None);
         locked.is_locked = true;
-        super::before_metadata_refresh(&mut locked, true, None, false);
+        super::before_metadata_refresh(&mut locked, true, None, super::EpisodeNaming::default());
         assert_eq!(
             (locked.parent_index_number, locked.index_number),
             (None, None)
@@ -27877,7 +28020,12 @@ mod tests {
             None,
         );
         by_date.index_number = Some(7);
-        super::before_metadata_refresh(&mut by_date, false, Some(4), false);
+        super::before_metadata_refresh(
+            &mut by_date,
+            false,
+            Some(4),
+            super::EpisodeNaming::default(),
+        );
         assert_eq!(by_date.index_number, None, "a by-date name has no number");
         assert_eq!(by_date.production_year, Some(2024));
         assert_eq!(
@@ -27914,7 +28062,7 @@ mod tests {
                     merge: super::MergeMode::DEFAULT,
                     before_refresh,
                     replace_all: false,
-                    absolute_naming: false,
+                    naming: crate::library_scan::EpisodeNaming::default(),
                     remote_answered: false,
                     redated: None,
                 },
@@ -28226,7 +28374,7 @@ mod tests {
                     },
                     before_refresh: true,
                     replace_all: false,
-                    absolute_naming: false,
+                    naming: crate::library_scan::EpisodeNaming::default(),
                     remote_answered: false,
                     redated: None,
                 },
@@ -28625,7 +28773,7 @@ mod tests {
                 merge: super::MergeMode::DEFAULT,
                 before_refresh: true,
                 replace_all: false,
-                absolute_naming: false,
+                naming: crate::library_scan::EpisodeNaming::default(),
                 remote_answered: true,
                 redated: None,
             },
@@ -29004,7 +29152,7 @@ mod tests {
                 merge: super::MergeMode::DEFAULT,
                 before_refresh: true,
                 replace_all: false,
-                absolute_naming: false,
+                naming: crate::library_scan::EpisodeNaming::default(),
                 remote_answered: true,
                 redated: None,
             },
@@ -31463,19 +31611,29 @@ mod tests {
     /// returns a list, `BaseNfoParser` → `ResetPeople`) clears the stored cast
     /// only under "Replace all metadata", where `RemoveOldMetadata` skips
     /// "add existing metadata to provider result" (`:905`); every other mode
-    /// turns the empty list into null there and keeps the cast.
+    /// turns the empty list into null there and keeps the cast. That needs a
+    /// library that saves no metadata: where the Nfo saver is on (the existing
+    /// NFO turns it on), "Replace all metadata" reads no NFO at all
+    /// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`),
+    /// and with no provider answering the cast stands.
     #[rstest::rstest]
-    #[case::scan("scan", 2)]
-    #[case::missing("missing", 2)]
-    #[case::replace_all("replace", 0)]
+    #[case::scan("scan", false, 2)]
+    #[case::missing("missing", false, 2)]
+    #[case::replace_all("replace", false, 0)]
+    #[case::replace_all_with_a_saver("replace", true, 2)]
     #[tokio::test]
     async fn an_nfo_naming_no_actors_clears_the_cast_only_under_replace_all(
         #[case] choice: &str,
+        #[case] saving: bool,
         #[case] expected: usize,
     ) {
         let tmp = tempfile::tempdir().unwrap();
+        let options = LibraryOptions {
+            metadata_savers: (!saving).then(Vec::new),
+            ..LibraryOptions::default()
+        };
         let (vf, persistence, people, episode_id, items) =
-            library_with_a_stale_episode_cast(tmp.path()).await;
+            library_with_a_stale_episode_cast_in(tmp.path(), options).await;
         let nfo = tmp.path().join("tv/GoT/Season 01/GoT S01E01.nfo");
         std::fs::write(
             &nfo,
@@ -31686,6 +31844,15 @@ mod tests {
         assert_eq!(e.role.as_deref(), Some("Self"));
         assert!(e.provider_id.is_none());
         assert!(e.primary_image_url.is_none());
+
+        // An NFO `<type>27</type>` (or `Director,Narrator`) parses to an
+        // undeclared value, which C#'s `ToString()` stores as its integer.
+        let undeclared = super::person_to_entity(PersonInfo {
+            type_: PersonKind::Unrecognized(27),
+            ..PersonInfo::new("Jane Doe")
+        });
+        assert_eq!(undeclared.person_type.as_deref(), Some("27"));
+        assert_eq!(PersonKind::from_stored("27"), PersonKind::Unrecognized(27));
     }
 
     // A track's embedded cover becomes its Primary image, stored in the
@@ -34672,6 +34839,20 @@ mod tests {
         assert!(!super::path_is_under("/media", "/media/tv"));
     }
 
+    #[rstest::rstest]
+    #[case("/srv/v12-2/tv/Show/Bonus/e.mkv", &["/srv/v12-2/tv"], "/Show/Bonus/e.mkv")]
+    #[case("/srv/tv/Show/e.mkv", &["/srv", "/srv/tv/"], "/Show/e.mkv")]
+    #[case("/srv/tv2/Show/e.mkv", &["/srv/tv"], "/srv/tv2/Show/e.mkv")]
+    #[case("/srv/tv", &["/srv/tv"], "/srv/tv")]
+    #[case("/e.mkv", &["/"], "/e.mkv")]
+    fn episode_numbers_are_read_below_the_library(
+        #[case] path: &str,
+        #[case] libraries: &[&str],
+        #[case] read: &str,
+    ) {
+        assert_eq!(super::below_library(path, libraries.iter().copied()), read);
+    }
+
     /// Counts `BaseItems` whose stored `Type` matches a `LIKE` pattern. Routes
     /// the repeated row-count assertions through one query so the SQL-boundary
     /// ratchet (`ferrofin-db` `sql_boundary`) stays honest as tests are added.
@@ -34807,6 +34988,9 @@ mod tests {
                         path_infos: vec![MediaPathInfo {
                             path: media.to_string_lossy().into_owned(),
                         }],
+                        // No saver, so "Replace all metadata" still reads
+                        // the NFO (`isSavingMetadata`, `MetadataService.cs:803`).
+                        metadata_savers: Some(Vec::new()),
                         ..Default::default()
                     },
                 )
@@ -38253,7 +38437,7 @@ mod chapter_image_refresh_tests {
                             },
                             before_refresh: false,
                             replace_all: replace,
-                            absolute_naming: false,
+                            naming: crate::library_scan::EpisodeNaming::default(),
                             remote_answered: false,
                             redated: None,
                         },
