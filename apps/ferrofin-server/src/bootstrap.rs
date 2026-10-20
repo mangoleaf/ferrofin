@@ -527,8 +527,10 @@ fn spawn_pool_sampler(db: &Database) {
 ///   phase 6, alongside reading the macOS release in [`read_os_version`].
 ///
 /// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
-/// key) and `CheckSupportedProberOption` calls are outside the hardware matrix
-/// and are recorded as numbered work items in the hardware-transcoding roadmap.
+/// key) is [`probe_pause_keys`], run in the background after boot because the
+/// upstream probe is a real-time job. Its `CheckSupportedProberOption` call is
+/// outside the hardware matrix and is recorded as a numbered work item in the
+/// hardware-transcoding roadmap.
 ///
 /// # Errors
 ///
@@ -577,7 +579,6 @@ pub async fn discover_ffmpeg(
             path: ffmpeg.clone(),
         })?;
 
-    let pkey_pause_supported = probe_runtime_pause(&ffmpeg, ffmpeg_version).await;
     let mut builder = FfmpegCapabilities::builder()
         .filters(filters)
         .encoders(encoders)
@@ -588,7 +589,7 @@ pub async fn discover_ffmpeg(
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
         .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
-        .pkey_pause_supported(pkey_pause_supported);
+        .validated(true);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
     }
@@ -611,7 +612,6 @@ pub async fn discover_ffmpeg(
         platform = ?capabilities.platform(),
         tonemapx = capabilities.supports_filter("tonemapx"),
         libfdk_aac = capabilities.supports_encoder("libfdk_aac"),
-        pkey_pause_supported,
         chromaprint_muxer,
         "media encoder ready"
     );
@@ -628,38 +628,59 @@ pub async fn discover_ffmpeg(
     })
 }
 
+/// The arguments of `EncoderValidator.CheckSupportedRuntimeKey`'s dummy encode
+/// (Jellyfin 12.1, unchanged in 12.2): a 1x1 source at 1 fps, paced in real time
+/// and capped at 5 s, so it cannot finish before ffmpeg first polls stdin. The
+/// earlier form (`nullsrc=s=1x1:d=10000`, no `-re`) finished in about 0.3 s on a
+/// fast CPU, before the `?` was read, and never printed the help.
+const PAUSE_PROBE_ARGS: [&str; 9] = [
+    "-hide_banner",
+    "-re",
+    "-f",
+    "lavfi",
+    "-i",
+    "nullsrc=s=1x1:r=1:d=5",
+    "-f",
+    "null",
+    "-",
+];
+
+/// Probes the ffmpeg at `ffmpeg` for its keyboard pause controls and publishes
+/// them to `slot`, which the transcode manager reads on every throttle tick.
+///
+/// The probe is a real-time ffmpeg job (about a second or more), so it runs in
+/// the background after boot, never on the path to the listening socket.
+pub async fn probe_pause_keys(
+    ffmpeg: PathBuf,
+    version: Option<FfmpegVersion>,
+    slot: ferrofin_mediaencoding::transcoding::throttler::PauseKeySlot,
+) {
+    use ferrofin_mediaencoding::transcoding::throttler::PauseKeys;
+    let pkey_pause_supported = probe_runtime_pause(&ffmpeg).await;
+    let keys = PauseKeys::select(pkey_pause_supported, version);
+    slot.set(keys);
+    tracing::info!(pkey_pause_supported, ?keys, "ffmpeg pause key probed");
+}
+
 /// Detects Jellyfin-ffmpeg's explicit pause key from its interactive help.
 ///
-/// Matches EncoderValidator.CheckSupportedRuntimeKey's input/duration and
-/// exact, case-sensitive help description. An absent key or failed probe does
-/// not grant keyboard support; the manager separately checks the legacy gate.
-async fn probe_runtime_pause(ffmpeg: &Path, version: Option<FfmpegVersion>) -> bool {
+/// Matches EncoderValidator.CheckSupportedRuntimeKey's arguments, stdin (`?q`)
+/// and exact, case-sensitive help description. An absent key or failed probe
+/// does not grant keyboard support; [`probe_pause_keys`] applies the legacy
+/// version gate through `PauseKeys::select`.
+async fn probe_runtime_pause(ffmpeg: &Path) -> bool {
     use tokio::io::AsyncWriteExt as _;
-    let duration = if version.is_some_and(|version| version >= FfmpegVersion::new(7, 0)) {
-        "10000"
-    } else {
-        "1000"
-    };
-    let input = format!("nullsrc=s=1x1:d={duration}");
     let probe = async {
         let mut child = tokio::process::Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-f",
-                "lavfi",
-                "-i",
-                &input,
-                "-f",
-                "null",
-                "-",
-            ])
+            .args(PAUSE_PROBE_ARGS)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(b"?").await?;
+            // `?` prints the key help; `q` then stops the job at once.
+            stdin.write_all(b"?q").await?;
             // Closing stdin matches disposing EncoderValidator's test writer.
             stdin.shutdown().await?;
         }
@@ -1706,6 +1727,79 @@ mod tests {
             .await
             .expect("discovery succeeds");
         assert_eq!(paths.ffprobe, ffprobe);
+    }
+
+    /// A fake ffmpeg that records its arguments and, like Jellyfin's build, prints
+    /// the pause key's help only after reading `?` and then `q` on stdin.
+    #[cfg(unix)]
+    fn write_fake_pause_ffmpeg(dir: &Path, prints_help: bool) -> PathBuf {
+        let path = dir.join("ffmpeg");
+        let help = if prints_help {
+            "p      pause transcoding"
+        } else {
+            "Press [q] to stop"
+        };
+        crate::test_exec::stub_script(
+            &path,
+            &format!(
+                "echo \"$*\" > '{}/args'\nkeys=$(dd bs=1 count=2 2>/dev/null)\n\
+                 if [ \"$keys\" = '?q' ]; then echo '{help}' >&2; fi\n",
+                dir.display()
+            ),
+        );
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_probe_runs_upstreams_realtime_form_and_reads_the_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = write_fake_pause_ffmpeg(tmp.path(), true);
+        assert!(probe_runtime_pause(&ffmpeg).await);
+        // EncoderValidator.CheckSupportedRuntimeKey at v12.2: real-time and 5 s at most,
+        // so it cannot finish before ffmpeg first polls stdin; `q` stops it at once.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("args"))
+                .unwrap()
+                .trim(),
+            "-hide_banner -re -f lavfi -i nullsrc=s=1x1:r=1:d=5 -f null -"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_probe_is_false_without_the_exact_help_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = write_fake_pause_ffmpeg(tmp.path(), false);
+        assert!(!probe_runtime_pause(&ffmpeg).await);
+        assert!(!probe_runtime_pause(&tmp.path().join("missing")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probed_pause_keys_follow_upstreams_version_gate() {
+        use ferrofin_mediaencoding::transcoding::throttler::{PauseKeySlot, PauseKeys};
+        let with_dir = tempfile::tempdir().unwrap();
+        let without_dir = tempfile::tempdir().unwrap();
+        let with_key = write_fake_pause_ffmpeg(with_dir.path(), true);
+        let without_key = write_fake_pause_ffmpeg(without_dir.path(), false);
+        for (ffmpeg, version, expected) in [
+            (
+                &with_key,
+                FfmpegVersion::new(8, 0),
+                Some(PauseKeys::Patched),
+            ),
+            (
+                &without_key,
+                FfmpegVersion::new(6, 1),
+                Some(PauseKeys::Legacy),
+            ),
+            (&without_key, FfmpegVersion::new(7, 0), None),
+        ] {
+            let slot = PauseKeySlot::default();
+            probe_pause_keys(ffmpeg.clone(), Some(version), slot.clone()).await;
+            assert_eq!(slot.get(), expected, "{version:?} via {ffmpeg:?}");
+        }
     }
 
     #[test]
