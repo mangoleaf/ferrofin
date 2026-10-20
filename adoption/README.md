@@ -447,8 +447,8 @@ the scan, and the builder runs the keyframe-extraction task, saves display
 preferences and a device name, and writes two media segments under the Intro
 Skipper plugin's provider id (no API creates one). So every table the
 [table digests](#2026-10-19-table-digests-check-7) compare holds rows on every
-fixture, and the builder fails when one of them is empty. The fresh-install fixture skips
-`seed_database`, so it is allowed no media segments. Measured on 2026-10-20 on an idle host,
+fixture (bar media segments on the fresh install, which skips `seed_database`), and the
+builder fails when one of them is empty. Measured on 2026-10-20 on an idle host,
 before the fresh-install row existed, this made a full `build-fixtures.sh` take 420 s instead
 of 396 s (+6 %), and the fixture directory 29 MB instead of 18 MB.
 
