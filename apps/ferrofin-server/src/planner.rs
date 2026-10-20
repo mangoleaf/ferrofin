@@ -686,6 +686,35 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // it must not read as `Hls` when nothing was selected.
             requested_subtitle_method.unwrap_or(SubtitleDeliveryMethod::External)
         };
+        // `AttachMediaSourceInfo`'s `NormalizeSubtitleEmbed`, in its video-request
+        // branch: a DVB subtitle is burned in rather than embedded, before the
+        // copy decision reads the method.
+        let subtitle_delivery_method = if is_audio {
+            subtitle_delivery_method
+        } else {
+            ferrofin_mediaencoding::encoding_helper::helper::normalize_subtitle_embed(
+                subtitle_stream.as_ref(),
+                subtitle_delivery_method,
+            )
+        };
+
+        // `StreamingHelpers.GetStreamingState`: a non-blank `subtitleCodec`
+        // becomes `SupportedSubtitleCodecs`, split on commas with empty entries
+        // dropped (`Split(',', RemoveEmptyEntries)`, which trims nothing). The
+        // ordinary stream routes validate it (`validate_stream_request`), and
+        // the embed arguments check it again before writing it.
+        let supported_subtitle_codecs: Vec<String> = request
+            .subtitle_codec
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|codec| !codec.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let progressive = kind == PlaylistKind::Progressive;
         let options = self.encoding_options().await;
@@ -883,6 +912,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             },
             supported_video_codecs: supported_video_codecs.clone(),
             supported_audio_codecs: supported_audio_codecs.clone(),
+            supported_subtitle_codecs,
             segment_length_secs,
             wait_for_path: None,
             segment_container: Some(segment_container.clone()),
@@ -1442,6 +1472,15 @@ impl FerrofinStreamStatePlanner {
         args.push("200M".to_owned());
         push_split(&mut args, "-probesize");
         args.push("1G".to_owned());
+        // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
+        // source (a tuner, a playlist channel) requires, as the probe sends
+        // them. Each value is one argv element, never parsed as options.
+        for (header, flag) in [("User-Agent", "-user_agent"), ("Referer", "-referer")] {
+            if let Some(value) = state.media_source.required_http_headers.get(header) {
+                args.push(flag.to_owned());
+                args.push(value.clone());
+            }
+        }
         // `GetInputModifier`: timestamp sync, then pacing, then the options
         // the live-TV source settings drive (ignore DTS, stream looping).
         args.extend(
@@ -1716,9 +1755,12 @@ impl FerrofinStreamStatePlanner {
                 &mut args,
                 &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
             );
+            // The probed capabilities, not the helper's boot ones: only the
+            // probe knows whether the VAAPI driver is iHD.
             push_split(
                 &mut args,
-                &self.encoding_helper.video_quality_param(
+                &self.encoding_helper.video_quality_param_with(
+                    caps,
                     state,
                     &video_encoder,
                     options,
@@ -1946,15 +1988,26 @@ impl FerrofinStreamStatePlanner {
                 {
                     push_split(&mut args, "-movflags empty_moov+delay_moov");
                 }
-            } else if playlist_path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
-                && state.base_request.context == ferrofin_model::dlna::EncodingContext::Streaming
-            {
+            } else {
+                // `GetProgressiveVideoFullCommandLine`: the subtitle embed
+                // arguments follow the audio's, ahead of the output format.
                 push_split(
                     &mut args,
-                    "-f mp4 -movflags frag_keyframe+empty_moov+delay_moov",
+                    &ferrofin_mediaencoding::encoding_helper::helper::subtitle_embed_arguments(
+                        state,
+                    ),
                 );
+                if playlist_path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+                    && state.base_request.context
+                        == ferrofin_model::dlna::EncodingContext::Streaming
+                {
+                    push_split(
+                        &mut args,
+                        "-f mp4 -movflags frag_keyframe+empty_moov+delay_moov",
+                    );
+                }
             }
             push_split(&mut args, "-y");
             args.push(playlist_path.to_string_lossy().into_owned());
@@ -3556,6 +3609,54 @@ mod tests {
         }
     }
 
+    /// `GetInputModifier`'s `GetUserAgentParam` and `GetRefererParam`: the
+    /// source's `RequiredHttpHeaders` reach ffmpeg after `-probesize`, each
+    /// value one argv element however it is spelled (a tuner or playlist sets
+    /// them).
+    #[tokio::test]
+    async fn plan_sends_the_sources_user_agent_and_referer_to_ffmpeg() {
+        let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        src.required_http_headers = [
+            ("User-Agent", r#"TunerBox/1.0 (Linux; "x")"#),
+            ("Referer", "http://portal.example/tv"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let p = planner(vec![src]);
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let at = |flag: &str| args.iter().position(|a| a == flag).expect(flag);
+        assert_eq!(args[at("-user_agent") + 1], r#"TunerBox/1.0 (Linux; "x")"#);
+        assert_eq!(args[at("-referer") + 1], "http://portal.example/tv");
+        assert!(at("-probesize") < at("-user_agent"), "{args:?}");
+        assert!(at("-user_agent") < at("-referer"), "{args:?}");
+        assert!(at("-referer") < at("-i"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn plan_without_http_headers_sends_none() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            !plan
+                .arguments
+                .iter()
+                .any(|a| a == "-user_agent" || a == "-referer"),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
     #[tokio::test]
     async fn plan_falls_back_to_the_first_source_when_the_id_is_the_item_id() {
         // `StreamingHelpers`: a MediaSourceId equal to the item id selects the first source.
@@ -3740,6 +3841,172 @@ mod tests {
         assert!(
             args.contains("subtitles=f='/media/movie.mkv':si=0"),
             "explicit Encode must burn: {args}"
+        );
+    }
+
+    /// A progressive transcode that embeds the subtitle (`SubtitleMethod=Embed`)
+    /// names the track's codec and marks it default, as
+    /// `GetProgressiveVideoFullCommandLine` appends `GetSubtitleEmbedArguments`
+    /// after the audio arguments: `copy` when `subtitleCodec` is empty or names
+    /// the source codec (ignoring case), else its first entry.
+    #[rstest::rstest]
+    #[case::bitmap_without_a_codec("PGSSUB", None, "copy")]
+    #[case::text_into_another_codec("subrip", Some("ass,srt"), "ass")]
+    #[case::the_source_codec_is_copied("subrip", Some("SUBRIP,ass"), "copy")]
+    #[case::empty_entries_are_dropped("subrip", Some(",ass"), "ass")]
+    #[case::a_blank_list_is_none("subrip", Some(" "), "copy")]
+    #[tokio::test]
+    async fn progressive_embed_names_the_subtitle_codec_and_default(
+        #[case] source_codec: &str,
+        #[case] subtitle_codec: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream(source_codec, 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        req.subtitle_codec = subtitle_codec.map(str::to_owned);
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let position = |pair: [&str; 2]| {
+            args.windows(2)
+                .position(|window| window == pair)
+                .unwrap_or_else(|| panic!("{pair:?} missing: {args:?}"))
+        };
+        let map = position(["-map", "0:2"]);
+        let codec = position(["-codec:s:0", expected]);
+        let disposition = position(["-disposition:s:0", "default"]);
+        let audio = args
+            .iter()
+            .position(|arg| arg == "-c:a")
+            .unwrap_or_else(|| panic!("audio args: {args:?}"));
+        let output = args.len() - 1;
+        assert!(
+            map < audio && audio < codec && codec < disposition && disposition < output,
+            "map, audio, codec, disposition, output in order: {args:?}"
+        );
+    }
+
+    /// In an MP4 stream the embed arguments come before the format flags, as
+    /// `GetProgressiveVideoFullCommandLine` orders them.
+    #[tokio::test]
+    async fn progressive_mp4_embed_arguments_precede_the_format() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("mov_text", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mp4".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.context = Some(ferrofin_model::dlna::EncodingContext::Streaming);
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let position = |pair: [&str; 2]| {
+            args.windows(2)
+                .position(|window| window == pair)
+                .unwrap_or_else(|| panic!("{pair:?} missing: {args:?}"))
+        };
+        let disposition = position(["-disposition:s:0", "default"]);
+        let format = position(["-f", "mp4"]);
+        assert!(
+            position(["-codec:s:0", "copy"]) < disposition && disposition < format,
+            "{args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), plan.playlist_path.to_str());
+    }
+
+    /// `NormalizeSubtitleEmbed`: a remuxed DVB subtitle is mispositioned, so an
+    /// `Embed` of one is burned in (`Encode`) before anything reads the method.
+    #[tokio::test]
+    async fn an_embedded_dvb_subtitle_is_burned_in() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("DVBSUB", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.state.subtitle_delivery_method,
+            SubtitleDeliveryMethod::Encode
+        );
+        assert!(
+            plan.arguments.iter().any(|arg| arg.contains("overlay")),
+            "burned in: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|arg| arg.starts_with("-codec:s")),
+            "not embedded: {:?}",
+            plan.arguments
+        );
+    }
+
+    /// Upstream appends the embed arguments to the progressive command only.
+    #[tokio::test]
+    async fn hls_never_gets_subtitle_embed_arguments() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=Embed".to_owned();
+        req.subtitle_codec = Some("ass".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.state.subtitle_delivery_method,
+            SubtitleDeliveryMethod::Embed
+        );
+        assert_eq!(plan.state.supported_subtitle_codecs, ["ass"]);
+        assert!(
+            !plan
+                .arguments
+                .iter()
+                .any(|arg| arg.starts_with("-codec:s") || arg.starts_with("-disposition")),
+            "{:?}",
+            plan.arguments
         );
     }
 
@@ -5053,6 +5320,40 @@ mod tests {
                 "{codecs} with AllowAv1Encoding={allow_av1}, AllowHevcEncoding={allow_hevc}"
             );
         }
+    }
+
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, which
+    /// only the per-job probe learns: an explicit preset on a probed iHD device
+    /// becomes `-compression_level`. The boot capabilities the encoding helper
+    /// was built with never carry the driver, so reading those would leave the
+    /// arm dead on every Intel server.
+    #[tokio::test]
+    async fn a_probed_ihd_device_maps_the_preset_to_compression_level() {
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                encoder_preset: EncoderPreset::slow,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+
+        assert!(args.contains("-c:v h264_vaapi"), "{args}");
+        assert!(args.contains(" -compression_level 3"), "{args}");
     }
 
     #[tokio::test]

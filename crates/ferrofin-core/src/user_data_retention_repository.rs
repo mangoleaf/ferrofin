@@ -192,6 +192,48 @@ mod tests {
     use ferrofin_traits::persistence::ItemPersistenceService;
     use uuid::Uuid;
 
+    /// `user_data_detach_epoch` moves with a detach that retains history, not
+    /// with a delete that retains none, and never goes back when expired
+    /// snapshots are purged: equal readings mean nothing was detached.
+    #[tokio::test]
+    async fn the_detach_epoch_moves_only_forward_and_only_with_history() {
+        let db = test_db().await;
+        let store = crate::FerrofinItemPersistenceService::new(db.clone());
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let start = store.user_data_detach_epoch().await.unwrap();
+        assert!(start.is_some());
+
+        let unplayed = Uuid::new_v4();
+        seed_item(&db, unplayed, BaseItemKind::Movie).await;
+        store.delete_items(&[unplayed]).await.unwrap();
+        assert_eq!(
+            store.user_data_detach_epoch().await.unwrap(),
+            start,
+            "no history, nothing detached"
+        );
+
+        let played = Uuid::new_v4();
+        seed_item(&db, played, BaseItemKind::Movie).await;
+        seed_user_data(&db, user, played, true, None).await;
+        store.delete_items(&[played]).await.unwrap();
+        let moved = store.user_data_detach_epoch().await.unwrap();
+        assert!(moved > start, "{moved:?} after {start:?}");
+
+        // Every snapshot expires and is purged; the epoch stays where it was.
+        sqlx::query(
+            r#"UPDATE "FerrofinUserDataRetentionSnapshots"
+            SET "RetentionDate" = '2000-01-01 00:00:00.0000000'"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        purge_expired(&db, "2001-01-01 00:00:00.0000000")
+            .await
+            .unwrap();
+        assert_eq!(store.user_data_detach_epoch().await.unwrap(), moved);
+    }
+
     #[tokio::test]
     async fn retention_snapshots_expire_and_user_deletion_removes_the_remainder() {
         let db = test_db().await;
