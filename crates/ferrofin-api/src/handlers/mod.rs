@@ -51,6 +51,46 @@ pub(crate) async fn queue_high_priority_refresh(
     Ok(())
 }
 
+/// Runs an item's default metadata refresh and returns once it has run —
+/// `item.RefreshMetadata(CancellationToken.None)`, which a handler awaits
+/// rather than queues. A file item refreshes through the scan queue's
+/// priority lane ([`LibraryManager::run_refresh_scan`]), on a task of its own
+/// so a client that hangs up does not withdraw it; an item with no file of
+/// its own is queued as [`queue_high_priority_refresh`] does.
+///
+/// [`LibraryManager::run_refresh_scan`]: ferrofin_traits::library::LibraryManager::run_refresh_scan
+pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+    use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::MetadataRefreshOptions;
+    let item = state.library.get_item_by_id(item_id).await?;
+    let Some(path) = item.as_ref().and_then(refresh_scan_path) else {
+        return queue_high_priority_refresh(state, item_id).await;
+    };
+    let library = std::sync::Arc::clone(&state.library);
+    // In the request's span: the request awaits it (LOGGING.md §4).
+    let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+        library
+            .run_refresh_scan(
+                ScanTarget::Items(vec![path]),
+                &MetadataRefreshOptions::default(),
+            )
+            .await
+    }))
+    .await
+    .map_err(|err| {
+        ApiError::Service(ServiceError::backend(format!(
+            "item refresh task failed: {err}"
+        )))
+    })??;
+    if !ran {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "the refresh of item {item_id} was stopped before it finished"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether the library scan can reach `target`: every path of it lies under
 /// a location of a configured library (the scan plans nothing anywhere
 /// else). A library or the root always can.
@@ -1021,6 +1061,88 @@ pub const VERIFIED: &[Verified] = &[
                push_order_expression DatePlayed)",
         date: "2026-10-19",
         divergences: RESUME_DIVERGENCES,
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Audio/{itemId}/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "GetLyrics",
+        ferrofin: "handlers/lyrics.rs get_lyrics → ferrofin-core lyric_manager.rs \
+               get_lyrics (the item's Lyric streams, LrcLyricParser then TxtLyricParser)",
+        date: "2026-10-19",
+        divergences: &[
+            "A Lyric stream whose file is gone (removed outside the server, before the next \
+         refresh) is skipped and the next stream read; upstream's File.ReadAllTextAsync \
+         throws and the request is a 500. Jellyfin bug not ported. The sidecar read is a \
+         blocking std::fs read on the runtime (gl-144).",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Audio/{itemId}/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "UploadLyrics",
+        ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
+               → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
+               try_save_to_files)",
+        date: "2026-10-19",
+        divergences: &[
+            "An upload with no Content-Length (a chunked body) is read and saved; upstream \
+         tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
+         uploaded\". Jellyfin bug not ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Audio/{itemId}/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "DeleteLyrics",
+        ferrofin: "handlers/lyrics.rs delete_lyrics (run_item_refresh) → ferrofin-core \
+               lyric_manager.rs delete_lyrics",
+        date: "2026-10-19",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Audio/{itemId}/RemoteSearch/Lyrics",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "SearchRemoteLyrics",
+        ferrofin: "handlers/lyrics.rs search_remote_lyrics → ferrofin-core lyric_manager.rs \
+               search_lyrics (search_request_for, search_request, search_provider)",
+        date: "2026-10-19",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "DownloadRemoteLyrics",
+        ferrofin: "handlers/lyrics.rs download_remote_lyrics (queue_high_priority_refresh) → \
+               ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
+               try_save_to_files)",
+        date: "2026-10-19",
+        divergences: &[
+            "A lyricId of only whitespace is a 404 (no provider owns it); upstream's \
+         ArgumentException.ThrowIfNullOrWhiteSpace makes it a 500. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Providers/Lyrics/{lyricId}",
+        upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
+        upstream_method: "GetRemoteLyrics",
+        ferrofin: "handlers/lyrics.rs get_remote_lyrics → ferrofin-core lyric_manager.rs \
+               get_remote_lyrics (fetch_remote, parse_by_format)",
+        date: "2026-10-19",
+        divergences: &[],
         refs: &[],
     },
 ];

@@ -118,7 +118,7 @@ pub struct LyricFile {
 }
 
 /// Lyric search request.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct LyricSearchRequest {
     /// Gets or sets the media path.
@@ -160,6 +160,26 @@ pub struct LyricSearchRequest {
 
     /// Gets or sets a value indicating whether this request is automated.
     pub is_automated: bool,
+}
+
+/// Upstream's initialisers: `SearchAllProviders` starts `true`, everything
+/// else empty.
+impl Default for LyricSearchRequest {
+    fn default() -> Self {
+        Self {
+            media_path: None,
+            album_artists_names: None,
+            artist_names: None,
+            album_name: None,
+            song_name: None,
+            duration: None,
+            provider_ids: HashMap::new(),
+            search_all_providers: true,
+            disabled_lyric_fetchers: Vec::new(),
+            lyric_fetcher_order: Vec::new(),
+            is_automated: false,
+        }
+    }
 }
 
 /// The remote lyric info DTO.

@@ -344,6 +344,47 @@ async fn lyric_sidecars_become_the_tracks_lyric_stream_and_changes_reprobe_it() 
     assert!(h.lyric_files().await.is_empty());
 }
 
+/// The refresh `LyricsController.UploadLyrics` queues after saving a lyric
+/// (`QueueRefresh` with default options): the track's own refresh sees the
+/// new sidecar (`ProbeProvider.HasChanged`'s lyric arm) and records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_records_a_lyric_saved_beside_the_track() {
+    use ferrofin_core::{ScanCancel, ScanPasses, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert!(h.lyric_streams().await.is_empty());
+
+    let album = h.track.parent().expect("album");
+    std::fs::write(album.join("01 - Song.lrc"), "[00:01.00]hello").expect("upload");
+    // As the library manager queues it (`ScanRequest::item_refresh`).
+    let target = ScanTarget::Items(vec![h.track.to_string_lossy().into_owned()]);
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    h.scanner
+        .scan_target(
+            &target,
+            ScanRun::new(
+                &MetadataRefreshOptions::default(),
+                &none,
+                &ScanCancel::new(),
+            )
+            .with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("item refresh");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+    assert_eq!(h.lyric_streams().await.len(), 1);
+}
+
 /// An ID3 `USLT` frame, as ffprobe reports it.
 const USLT: (&str, &str) = ("lyrics-eng", "[00:01.00]Hello\r\n[00:02.5]World");
 /// What `FetchDataFromTags` saves for [`USLT`]: ATL's LRC rendering.

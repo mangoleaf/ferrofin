@@ -1113,7 +1113,7 @@ pub fn write_lyrics(
     let iid = parse_uuid("item-id", item_id)?;
     let text = std::str::from_utf8(content).map_err(|_| "lyrics must be UTF-8".to_owned())?;
     cx.handle
-        .block_on(cx.lyrics.save_lyric(iid, format, text))
+        .block_on(cx.lyrics.save_lyric(iid, format, text.as_bytes()))
         .map(|_| ())
         .map_err(|e| format!("lyric write failed: {e}"))
 }
