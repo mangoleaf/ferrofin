@@ -153,11 +153,13 @@ def build(root, only, port):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("build", "run"))
+    parser.add_argument("mode", choices=("build", "run", "upgrade"))
     parser.add_argument("--fixtures", required=True, type=Path)
     parser.add_argument("--only", choices=[row[0] for row in VERSIONS])
     parser.add_argument("--port", type=int, default=18120)
     parser.add_argument("--image", default="ferrofin:bench")
+    parser.add_argument("--from", dest="starts", action="append", default=[],
+                        help="upgrade: an earlier Ferrofin release image to start from (repeatable)")
     args = parser.parse_args(argv)
     os.umask(0o077)
     root = args.fixtures.resolve()
@@ -167,6 +169,9 @@ def main(argv=None):
                         str(Path(__file__).with_name("lib.sh")), str(root)], check=True)
         if args.mode == "build":
             build(root, args.only, args.port)
+        elif args.mode == "upgrade":
+            from upgrade import run
+            run(root, args.starts, args.image, args.only, args.port)
         else:
             from preservation import run_matrix
             run_matrix(root, args.image, args.only, args.port)

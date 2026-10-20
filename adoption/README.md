@@ -500,6 +500,66 @@ the cache to the branch, so each new release branch builds once), and runs
 artifact. Its green run on the frozen release commit is the release's adoption evidence,
 linked from the test record above (`RELEASE.md`, "Validate adoption").
 
+### Populated Ferrofin upgrade
+
+`synthetic.py upgrade` checks that a release candidate keeps a populated install of an
+earlier Ferrofin release: the previous release and v1.0.0, the oldest. The previous
+release moves with each release.
+
+```bash
+python3 adoption/synthetic.py build --fixtures /path/to/fixtures --only jellyfin-10.11.8
+python3 adoption/synthetic.py upgrade --fixtures /path/to/fixtures --image ferrofin:bench \
+  --from ghcr.io/mangoleaf/ferrofin:v1.3.2 --from ghcr.io/mangoleaf/ferrofin:v1.0.0
+```
+
+For each `--from` image, the check works on a copy of the `jellyfin-10.11.8` fixture,
+the one generation every release adopts:
+
+1. The earlier release boots on the copy, adopts it, and runs a scan.
+2. Through that release's API, the check adds user state: a played movie, a resume
+   position, a favourite, a user created with an avatar, and a user created then
+   deleted. It reads that state back.
+3. The candidate boots on the same data directory.
+4. The `synthetic.py run` checks compare the candidate with what the earlier release
+   stored and served, once after the upgrade and again after a scan. Those checks cover
+   the account rows, watch history, metadata, and the API snapshot of visibility, views,
+   playlists, collections and accounts.
+
+Both sides are Ferrofin, so every comparison is exact, with these exceptions:
+- **Seeds the start releases cannot boot on.** The copy loses the seeded dangling
+  parent chain and the stale LinkedChildren entries first. Releases before v1.4.0 have
+  no orphan clean-up and fail on both, on a foreign key. `synthetic.py run` covers the
+  candidate on those seeds.
+- **Changes the candidate's boot repairs make by design, following Jellyfin 12.2.**
+  These are the seeded ratings' visibility, the harmonized conflicting user data, and the
+  re-keyed id of the local alternate version, for which only the version count is
+  compared. `synthetic.py run` holds each of these against Jellyfin 12.2.
+- **Avatars.** They are fetched with the admin's token, because v1.0.0 serves them to no
+  anonymous client.
+- **A start release with a known API bug.** v1.0.0 lets a restricted user download an
+  item (`KNOWN_API_GAPS` in `upgrade.py`), so it cannot serve the API snapshot. It gets a
+  `NOTE` line, and the API snapshot comparison (visibility, denials, views, playlists,
+  collections, account answers) is skipped for it. Its stored state, and the candidate's
+  watch-history and metadata answers measured against that state, are still compared. Any
+  other snapshot failure fails the run.
+
+A failed copy keeps `start-served.json`, `<stage>-actual.json` and the server logs in
+`work/` for inspection; a passing one removes them. `--only` picks another fixture, which
+every `--from` release must be able to adopt (v1.0.0 adopts 10.11.8 only).
+
+**2026-10-19 run.** The candidate was built from `release/v1.4.0` at `d2bb9306` (image
+`sha256:6c46acb78fc140838dbc17ffe7088579a6b3efd8bc3d39d1053c608844c4f395`). The
+`jellyfin-10.11.8` fixture was freshly built.
+
+| Start release | After the upgrade | After a scan |
+|---|---|---|
+| v1.3.2 | PASS | PASS |
+| v1.0.0 (stored state only, see the `NOTE` above) | **FAIL**: database and API missing item | PASS |
+
+The v1.0.0 failure is a server bug, gl-663. v1.0.0 leaves a 10.11 local alternate version
+as a standalone movie, and the candidate's boot deletes that row. Only the next scan
+re-creates it.
+
 ### Initial synthetic matrix validation
 
 On **2026-09-29**, all seven source paths passed every preservation category,

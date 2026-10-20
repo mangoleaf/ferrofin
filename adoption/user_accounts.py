@@ -104,7 +104,8 @@ def image_state(payload):
         return {'size': list(rgb.size), 'pixels': hashlib.sha256(rgb.tobytes()).hexdigest()}
 
 
-def snapshot(admin, manifest):
+def snapshot(admin, manifest, images=None):
+    """images: the client avatars are fetched as (anonymous, as on the login screen, by default)."""
     from synthetic_fixture import Api, PASSWORD, USERS
     anonymous = Api(admin.base)
     users = {row['Name']: row for row in admin.get('/Users')}
@@ -122,7 +123,7 @@ def snapshot(admin, manifest):
         # Jellyfin now always reports true, even for passwordless accounts.
         result['users'][name] = {key: row.get(key) for key in ('Id', 'Name', 'EnableAutoLogin', 'Policy', 'Configuration')}
         result['users'][name]['HasAvatar'] = bool(row.get('PrimaryImageTag'))
-        result['avatars'][name] = image_state(anonymous.call('GET', '/UserImage', binary=True, userId=uid, format='Png'))
+        result['avatars'][name] = image_state((images or anonymous).call('GET', '/UserImage', binary=True, userId=uid, format='Png'))
     for name in (*USERS, ACCOUNT_NAMES['passwordless']):
         device = 'account-login-' + name
         response = Api(admin.base, device=device).post('/Users/AuthenticateByName',
