@@ -89,7 +89,8 @@ from.
      `bench/scan.py` in place of `run.sh`: a full library scan of the bench corpus on an
      empty data dir, and the adoption boot of a fresh copy of its Jellyfin 10.11.8 database,
      each timed with its peak anon memory (`bench/README.md`, "Scan and migration"). It
-     needs the same idle cores and the same test data (at least 10,000 items). A self-A/B
+     needs the same idle cores and the same test data (at least 10,000 items), and refuses
+     a stale oracle pin the same way, although it never boots Jellyfin. A self-A/B
      of v1.3.2 took 20 minutes from start to report on the shared host. Output goes to
      `bench/runs/gate-scan-<date>-<time>/` in the same form, and it exits `1` when it blocks.
 
