@@ -1221,15 +1221,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         if let Some(name) = &request.name {
-            // With the `CleanName` the save derives (`BaseItemMapper.cs:279`),
-            // which is what a search by name matches.
-            sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2, "CleanName" = ?3 WHERE "Id" = ?1"#)
-                .bind(guid_to_db(request.id))
-                .bind(name)
-                .bind(crate::text_util::get_clean_value(name))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+            crate::item_persistence_service::rename_named_item_in(
+                &mut tx,
+                request.id,
+                BaseItemKind::Playlist,
+                name,
+            )
+            .await?;
         }
         if let Some(public) = request.public {
             sqlx::query(
@@ -3787,6 +3785,107 @@ mod tests {
             .expect("now public");
         assert_eq!(stranger.level, PlaylistAccessLevel::Read);
         assert!(stranger.open_access);
+    }
+
+    /// The stored `SortName` of row `id` (the raw row, no read-time derivation).
+    async fn stored_sort_name(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+        crate::test_support::fetch_item(db, id).await.sort_name
+    }
+
+    /// C# `Name`'s setter nulls `_sortName`, so the rename's save re-derives
+    /// it: from `ForcedSortName` when one is set, else `CreateSortName()`.
+    #[tokio::test]
+    async fn a_playlist_rename_rederives_its_sort_name() {
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db);
+        let alice = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Mutable".to_owned()),
+                user_id: alice,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let rename = |name: &str| PlaylistUpdateRequest {
+            id: playlist_id,
+            user_id: alice,
+            name: Some(name.to_owned()),
+            ..PlaylistUpdateRequest::default()
+        };
+
+        mgr.update_playlist(&rename("The Road Trip"))
+            .await
+            .expect("rename");
+        assert_eq!(
+            stored_sort_name(&db, playlist_id).await.as_deref(),
+            Some("road trip"),
+            "the new name's key, not the old one's"
+        );
+
+        // A sort title outranks the name.
+        let mut row = crate::test_support::fetch_item(&db, playlist_id).await;
+        row.forced_sort_name = Some("Zed".to_owned());
+        ferrofin_traits::persistence::ItemPersistenceService::save_items(
+            &crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("force");
+        mgr.update_playlist(&rename("Another"))
+            .await
+            .expect("rename");
+        assert_eq!(
+            stored_sort_name(&db, playlist_id).await.as_deref(),
+            Some("zed")
+        );
+    }
+
+    /// `Folder.AddChild` dates a new child (`DateCreated`/`DateModified`, from
+    /// the new folder in `CreatePlaylist`/`CreateCollectionAsync`), and the
+    /// create's `ForceSave` refresh stamps `DateLastSaved`.
+    #[tokio::test]
+    async fn created_box_sets_and_playlists_are_dated() {
+        let db = test_db().await;
+        let before = chrono::Utc::now();
+        let collection = collection_manager_over(&db)
+            .create_collection(&CollectionCreationOptions {
+                name: "Dated Set".to_owned(),
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("collection");
+        let (mgr, _root) = playlist_manager(&db);
+        let playlist = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Dated List".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("playlist")
+            .id;
+        let after = chrono::Utc::now();
+
+        for id in [collection.id.as_str(), playlist.as_str()] {
+            let row =
+                crate::test_support::fetch_item(&db, Uuid::parse_str(id).expect("uuid")).await;
+            for (column, value) in [
+                ("DateCreated", row.date_created),
+                ("DateModified", row.date_modified),
+                ("DateLastSaved", row.date_last_saved),
+            ] {
+                let value = value.unwrap_or_else(|| panic!("{} has no {column}", row.type_));
+                assert!(
+                    (before..=after).contains(&value),
+                    "{} {column} {value} is the create time",
+                    row.type_
+                );
+            }
+        }
     }
 
     /// Seeds a one-track playlist owned by `owner`, shared read-only with
