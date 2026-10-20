@@ -155,7 +155,9 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
 | `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
-| a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |
+| a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
+| a `Devices` row's `Id`, `AccessToken`, `IsActive` and `DateCreated` (as an instant, since 0007 rewrites it) are compared, except on the `DeviceId`s the harness logs in from (`synthetic-login-*`, `account-login-*`) | authenticating again from a device replaces its row with a new id, token, activation and creation date, as Jellyfin does; the harness does this only from its own `DeviceId`s, so on every other device a reset token or a deactivated device fails. `run.sh` logs in from none and compares them all |
+| rows that share a key are a multiset, not one row | `(UserId, DeviceId)` is not unique, so losing or changing one of two devices for the same user and device must still fail |
 | rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
