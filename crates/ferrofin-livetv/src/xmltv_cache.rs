@@ -205,3 +205,64 @@ impl XmlTvCache {
         Ok(body)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use ferrofin_model::live_tv::ListingsProviderInfo;
+    use ferrofin_traits::error::ServiceError;
+
+    use super::XmlTvCache;
+    use crate::fetch::SourceFetcher;
+
+    /// A guide host that never answers, counting the downloads it was asked for.
+    #[derive(Default)]
+    struct HangingFetcher(AtomicUsize);
+
+    #[async_trait]
+    impl SourceFetcher for HangingFetcher {
+        async fn fetch(&self, _url: &str) -> Result<String, ServiceError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    /// Upstream `GetProgramsAsync_DownloadTimesOut_DoesNotSurfaceAsCancellation`:
+    /// a download that outlives `_downloadTimeout` is an ordinary listings
+    /// error (`TimeoutException`), so the guide refresh carries on with the
+    /// other providers, and the remote path is then backed off. Upstream's
+    /// cancellation-vs-timeout distinction has no Rust counterpart: the
+    /// timeout is an ordinary `ServiceError::Backend`.
+    #[tokio::test(start_paused = true)]
+    async fn a_download_timeout_is_an_ordinary_error() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let fetcher = Arc::new(HangingFetcher::default());
+        let cache = XmlTvCache::new(
+            Arc::clone(&fetcher) as Arc<dyn SourceFetcher>,
+            cache_dir.path(),
+        );
+        let info = ListingsProviderInfo {
+            id: Some(uuid::Uuid::new_v4().simple().to_string()),
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        };
+
+        // The outer bound turns a missing download timeout into a failure, not a hang.
+        let err = tokio::time::timeout(2 * super::DOWNLOAD_TIMEOUT, cache.get_xml(&info))
+            .await
+            .expect("the download timeout fired first")
+            .expect_err("timed out");
+        assert!(
+            matches!(&err, ServiceError::Backend(message) if message.starts_with("Timed out")),
+            "{err:?}"
+        );
+        assert!(matches!(
+            cache.get_xml(&info).await,
+            Err(ServiceError::Backend(message)) if message.starts_with("Skipping")
+        ));
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+    }
+}
