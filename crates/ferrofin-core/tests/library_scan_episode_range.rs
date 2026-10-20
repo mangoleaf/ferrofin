@@ -1,7 +1,9 @@
 //! An episode's range end (`IndexNumberEnd`, kept in the `Data` blob) through
-//! a scan, as v12.2 sets it (PR 17805): from a multi-episode NFO, whose
-//! `<episodedetails>` blocks are sorted by episode number first, and never
-//! ending before the episode starts (`EpisodeMetadataService.BeforeSaveInternal`).
+//! a scan, as v12.2 sets it: from a multi-episode file name
+//! (`FillMissingEpisodeNumbersFromPath`), from a multi-episode NFO, whose
+//! `<episodedetails>` blocks are sorted by episode number first (PR 17805),
+//! and never ending before the episode starts
+//! (`EpisodeMetadataService.BeforeSaveInternal`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 /// A one-episode show library holding `file`, with `nfo` beside it when
 /// given, and a scanner over it.
@@ -126,4 +129,85 @@ async fn a_rescan_clears_a_stored_range_ending_before_the_episode() {
         episode(&db).await,
         ("Show S01E02".to_owned(), Some(2), None)
     );
+}
+
+/// A double-episode file with no NFO is the range its name gives, as
+/// upstream's `FillMissingEpisodeNumbersFromPath` sets it.
+#[tokio::test]
+async fn a_multi_episode_file_name_is_stored_as_a_range() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = episode_library(tmp.path(), "Show S01E01-E02.mkv", None).await;
+    scanner.scan_all().await.expect("scan");
+
+    let (_, index, end) = episode(&db).await;
+    assert_eq!((index, end), (Some(1), Some(2)));
+}
+
+/// Upstream fills the range from the name before the providers run and
+/// lets an NFO's replace it, so an NFO range beats the file name's, and an
+/// NFO without one leaves the name's.
+#[rstest::rstest]
+#[case::nfo_range(
+    "<episodedetails><title>T</title><episode>1</episode><episodenumberend>3</episodenumberend></episodedetails>",
+    Some(3)
+)]
+#[case::nfo_without_range(
+    "<episodedetails><title>T</title><episode>1</episode></episodedetails>",
+    Some(2)
+)]
+#[tokio::test]
+async fn an_nfo_range_beats_the_file_names(#[case] nfo: &str, #[case] expected: Option<i64>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = episode_library(tmp.path(), "Show S01E01-E02.mkv", Some(nfo)).await;
+    scanner.scan_all().await.expect("scan");
+
+    assert_eq!(episode(&db).await.2, expected);
+}
+
+/// An inverted name ("S01E05-E03") is no range: the episode is 5, and the
+/// end is dropped wherever it came from.
+#[tokio::test]
+async fn an_inverted_file_name_range_is_no_range() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = episode_library(tmp.path(), "Show S01E05-E03.mkv", None).await;
+    scanner.scan_all().await.expect("scan");
+
+    let (_, index, end) = episode(&db).await;
+    assert_eq!((index, end), (Some(5), None));
+}
+
+/// "Replace all metadata" on a stored episode: the path re-sets the range
+/// (here to nothing, the name has none) before the providers run, and the
+/// NFO's range then replaces it, as upstream's merge does.
+#[tokio::test]
+async fn replace_all_takes_the_nfos_range_over_the_stored_and_the_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let nfo = "<episodedetails><title>T</title><episode>3</episode>\
+               <episodenumberend>4</episodenumberend></episodedetails>";
+    let (scanner, db) = episode_library(tmp.path(), "Show S01E03.mkv", Some(nfo)).await;
+    scanner.scan_all().await.expect("first scan");
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Data" = json_set(COALESCE("Data", '{}'), '$.IndexNumberEnd', 5)
+           WHERE "Type" LIKE '%.Episode'"#,
+    )
+    .execute(db.writer())
+    .await
+    .expect("plant a stored range");
+
+    scanner
+        .scan_with(
+            None,
+            &MetadataRefreshOptions::for_item_refresh(
+                MetadataRefreshMode::FullRefresh,
+                MetadataRefreshMode::FullRefresh,
+                true,
+                false,
+                false,
+            ),
+        )
+        .await
+        .expect("replace all");
+
+    let (_, index, end) = episode(&db).await;
+    assert_eq!((index, end), (Some(3), Some(4)));
 }
