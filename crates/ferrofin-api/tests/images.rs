@@ -1494,6 +1494,16 @@ async fn post_user_image_bad_content_type_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// `=` before the end of the body is invalid data to `FromBase64Transform`, so
+/// the upload is refused and nothing is saved (gl-689).
+#[tokio::test]
+async fn post_user_image_with_padding_inside_the_data_is_400() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "POST", "/UserImage", Some(("image/png", "aG=k"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(s.users.saved.lock().expect("lock").is_empty());
+}
+
 /// `PostUserImage`/`DeleteUserImage` (and the legacy forms forwarding to them):
 /// `GetUserById` finds no account for the id, so the action returns `NotFound()`
 /// before anything is written (gl-685).

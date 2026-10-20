@@ -1075,13 +1075,14 @@ pub const VERIFIED: &[Verified] = &[
         date: "2026-10-20",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
-         rejects is a 400 that changes nothing, and an unpadded final group is decoded. \
-         Upstream clears the old profile image row first and decodes while copying, so \
-         invalid base64 fails mid-copy with a 500 (FormatException) and leaves the user \
-         with no profile image, and FromBase64Transform drops an unpadded final group. \
-         Jellyfin bugs not ported.",
-            "decode_base64 skips `=` wherever it appears, so a body with padding inside the \
-         data is decoded and saved where FromBase64Transform refuses it. Fix path: gl-689.",
+         rejects is a 400 that changes nothing. Upstream clears the old profile image row \
+         first and decodes while copying, so invalid base64 fails mid-copy with a 500 \
+         (FormatException) and leaves the user with no profile image. FromBase64Transform \
+         also silently drops a trailing partial group (fewer than four characters): an \
+         unpadded or short padded final group (`aGk`, `aG=`) loses its last bytes, and a \
+         third `=` or a partial group after the padding is ignored. Ferrofin decodes the \
+         final group in full and refuses the other two with a 400. Jellyfin bugs not \
+         ported.",
             "Any image/* Content-Type is accepted, and one MimeTypes.ToExtension knows no \
          extension for (image/jpg, image/x-unknown) is saved as `profile.` with no \
          extension, where TryGetImageExtensionFromContentType answers 400 Incorrect \
