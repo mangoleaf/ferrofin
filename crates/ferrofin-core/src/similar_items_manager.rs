@@ -35,9 +35,8 @@
 //! seed matches every other item of its kind — as it does in C#.
 //!
 //! Accepted divergences from C#: `IsFavoriteOrLiked` is approximated as
-//! favorite-only (as elsewhere in the query layer); the person-recommendation
-//! IMDb de-dup is dropped; and the weighted path breaks equal scores
-//! **deterministically**, by (`SortName`, `Id`), where C# keeps whatever
+//! favorite-only (as elsewhere in the query layer); and the weighted path
+//! breaks equal scores **deterministically**, by (`SortName`, `Id`), where C# keeps whatever
 //! dictionary order the candidates arrived in, so a client sees a stable answer.
 //! The flat path orders by `Random`, as C# does.
 
@@ -1100,51 +1099,142 @@ impl FerrofinSimilarItemsManager {
         Ok(out)
     }
 
-    /// Builds one category per person `name`: their unplayed movies (C#
-    /// `GetPersonRecommendations` — `Person = name`, `IsMovie`, `IsPlayed = false`,
-    /// directors additionally filtered to the `Director` credit type). The category
-    /// id is `md5(name)`, reproducing C#'s `name.GetMD5()`.
-    async fn person_categories(
+    /// The next non-empty person category of `cursor`, querying only as many
+    /// names as it takes to find one.
+    ///
+    /// Port of C# `GetPersonRecommendations`, a `yield return` iterator the
+    /// round-robin pulls with `MoveNext`: a person's movies are queried only
+    /// when the round-robin needs another category of this type. A category is
+    /// the person's unplayed movies (`Person = name`, `IsMovie`,
+    /// `IsPlayed = false`, directors restricted to the `Director` credit type).
+    /// Each query over-fetches by two, drops later movies sharing an IMDb id,
+    /// then keeps `item_limit`. The category id is `md5(name)`, as C#'s
+    /// `name.GetMD5()`.
+    async fn next_person_category(
         &self,
-        names: &[String],
-        recommendation_type: RecommendationType,
-        item_limit: i32,
-        user: &UserEntity,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        cursor: &mut PersonCursor<'_>,
+        person_query: &PersonQuery<'_>,
+    ) -> Result<Option<SimilarItemsRecommendation>, ServiceError> {
+        let PersonQuery {
+            item_limit,
+            user,
+            movie_kinds,
+        } = *person_query;
         let person_types =
-            if recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed {
+            if cursor.recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed {
                 vec!["Director".to_owned()]
             } else {
                 Vec::new()
             };
-        let movie_kinds = self.movie_candidate_kinds().await;
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
+        while let Some(name) = cursor.names.get(cursor.next) {
+            cursor.next += 1;
             let mut query = InternalItemsQuery {
-                include_item_types: movie_kinds.clone(),
+                include_item_types: movie_kinds.to_vec(),
                 is_movie: Some(true),
                 recursive: true,
                 person: Some(name.clone()),
                 person_types: person_types.clone(),
                 is_played: Some(false),
-                limit: Some(item_limit),
+                limit: Some(item_limit.saturating_add(2)),
                 ..Default::default()
             };
             query.set_user(user.clone());
             let items = self.items.get_item_list(&query).await?;
-            let _ = dto_options; // DTO projection happens in the handler, as elsewhere
-            if items.is_empty() {
-                continue;
+            let ids: Vec<Uuid> = items
+                .iter()
+                .filter_map(|i| Uuid::parse_str(&i.id).ok())
+                .collect();
+            let imdb = self.repo.imdb_ids_of(&ids).await?;
+            let mut seen = std::collections::HashSet::new();
+            let items: Vec<_> = items
+                .into_iter()
+                .filter(|i| {
+                    // `?? Guid.NewGuid()`: an item with no IMDb id is never a
+                    // duplicate.
+                    Uuid::parse_str(&i.id)
+                        .ok()
+                        .and_then(|id| imdb.get(&id))
+                        .is_none_or(|key| seen.insert(key.clone()))
+                })
+                .take(usize::try_from(item_limit.max(0)).unwrap_or(0))
+                .collect();
+            if !items.is_empty() {
+                return Ok(Some(SimilarItemsRecommendation {
+                    baseline_item_name: name.clone(),
+                    category_id: ferrofin_common::extensions::get_md5(name),
+                    recommendation_type: cursor.recommendation_type,
+                    items,
+                }));
             }
-            out.push(SimilarItemsRecommendation {
-                baseline_item_name: name.clone(),
-                category_id: ferrofin_common::extensions::get_md5(name),
-                recommendation_type,
-                items,
-            });
         }
+        Ok(None)
+    }
+
+    /// Merges the four recommendation streams by round-robin — recently-played
+    /// and liked are visited twice per pass so they carry double weight (C#'s
+    /// duplicated enumerators) — up to `cat_limit`, then orders the result by
+    /// recommendation type. The director and actor streams are pulled lazily,
+    /// as C#'s `MoveNext` does.
+    async fn round_robin_categories(
+        &self,
+        similar: [Vec<SimilarItemsRecommendation>; 2],
+        people: [&mut PersonCursor<'_>; 2],
+        cat_limit: usize,
+        person_query: &PersonQuery<'_>,
+    ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        let [played, liked] = similar;
+        let mut similar = [played.into_iter(), liked.into_iter()];
+        let [directors, actors] = people;
+        let visit_order = [0usize, 0, 1, 1, 2, 3];
+        let mut out: Vec<SimilarItemsRecommendation> = Vec::with_capacity(cat_limit);
+        'fill: loop {
+            let mut advanced = false;
+            for &stream in &visit_order {
+                if out.len() >= cat_limit {
+                    break 'fill;
+                }
+                let next = match stream {
+                    0 | 1 => similar[stream].next(),
+                    2 => self.next_person_category(directors, person_query).await?,
+                    _ => self.next_person_category(actors, person_query).await?,
+                };
+                if let Some(category) = next {
+                    out.push(category);
+                    advanced = true;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+        out.sort_by_key(|c| c.recommendation_type as i32);
         Ok(out)
+    }
+}
+
+/// A position in the names a person category stream draws from: the names
+/// before `next` have been queried.
+struct PersonCursor<'a> {
+    names: &'a [String],
+    next: usize,
+    recommendation_type: RecommendationType,
+}
+
+/// What every person-category query of one recommendations request shares.
+#[derive(Clone, Copy)]
+struct PersonQuery<'a> {
+    item_limit: i32,
+    user: &'a UserEntity,
+    movie_kinds: &'a [BaseItemKind],
+}
+
+impl<'a> PersonCursor<'a> {
+    fn new(names: &'a [String], recommendation_type: RecommendationType) -> Self {
+        Self {
+            names,
+            next: 0,
+            recommendation_type,
+        }
     }
 }
 
@@ -1291,9 +1381,10 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             .iter()
             .filter_map(|m| Uuid::parse_str(&m.id).ok())
             .collect();
+        let movie_kinds = self.movie_candidate_kinds().await;
         let mut liked_q = InternalItemsQuery {
             parent_id,
-            include_item_types: self.movie_candidate_kinds().await,
+            include_item_types: movie_kinds.clone(),
             is_movie: Some(true),
             recursive: true,
             is_favorite_or_liked: Some(true),
@@ -1339,60 +1430,23 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 dto_options,
             )
             .await?;
-        let has_director = self
-            .person_categories(
-                &directors,
-                RecommendationType::HasDirectorFromRecentlyPlayed,
-                item_limit,
-                &user,
-                dto_options,
-            )
-            .await?;
-        let has_actor = self
-            .person_categories(
-                &actors,
-                RecommendationType::HasActorFromRecentlyPlayed,
-                item_limit,
-                &user,
-                dto_options,
-            )
-            .await?;
-
-        Ok(round_robin_categories(
-            &[similar_to_played, similar_to_liked, has_director, has_actor],
+        let mut directors = PersonCursor::new(
+            &directors,
+            RecommendationType::HasDirectorFromRecentlyPlayed,
+        );
+        let mut actors = PersonCursor::new(&actors, RecommendationType::HasActorFromRecentlyPlayed);
+        self.round_robin_categories(
+            [similar_to_played, similar_to_liked],
+            [&mut directors, &mut actors],
             cat_limit,
-        ))
+            &PersonQuery {
+                item_limit,
+                user: &user,
+                movie_kinds: &movie_kinds,
+            },
+        )
+        .await
     }
-}
-
-/// Merges the four recommendation streams by round-robin — recently-played and
-/// liked are visited twice per pass so they carry double weight (C#'s duplicated
-/// enumerators) — up to `cat_limit`, then orders the result by recommendation type.
-fn round_robin_categories(
-    streams: &[Vec<SimilarItemsRecommendation>; 4],
-    cat_limit: usize,
-) -> Vec<SimilarItemsRecommendation> {
-    let visit_order = [0usize, 0, 1, 1, 2, 3];
-    let mut cursors = [0usize; 4];
-    let mut out: Vec<SimilarItemsRecommendation> = Vec::with_capacity(cat_limit);
-    'fill: loop {
-        let mut advanced = false;
-        for &stream in &visit_order {
-            if out.len() >= cat_limit {
-                break 'fill;
-            }
-            if cursors[stream] < streams[stream].len() {
-                out.push(streams[stream][cursors[stream]].clone());
-                cursors[stream] += 1;
-                advanced = true;
-            }
-        }
-        if !advanced {
-            break;
-        }
-    }
-    out.sort_by_key(|c| c.recommendation_type as i32);
-    out
 }
 
 #[cfg(test)]
@@ -3475,5 +3529,159 @@ mod tests {
                 category.baseline_item_name
             );
         }
+    }
+
+    /// Credits `people` on `item` in billing order (`ListOrder` 0, 1, …).
+    async fn credit_people(db: &Database, item: Uuid, people: &[(&str, &str)]) {
+        let credits: Vec<PeopleEntity> = people
+            .iter()
+            .map(|(name, person_type)| PeopleEntity {
+                id: String::new(),
+                name: (*name).to_owned(),
+                person_type: Some((*person_type).to_owned()),
+                ..PeopleEntity::default()
+            })
+            .collect();
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(item, &credits)
+            .await
+            .expect("credit people");
+    }
+
+    #[tokio::test]
+    async fn recommendation_people_come_in_billing_order() {
+        // C# `GetPeopleNamesByItems` orders credits by `ListOrder` and groups
+        // them per item; `GetPeopleNames` flattens with a stable `Distinct`. So
+        // the lead of each film comes before its supporting cast, whatever
+        // order the names or person ids sort in.
+        let db = test_db().await;
+        let first = Uuid::from_u128(0x701);
+        let second = Uuid::from_u128(0x702);
+        seed_movie(&db, first, "First", "SciFi").await;
+        seed_movie(&db, second, "Second", "SciFi").await;
+        credit_people(
+            &db,
+            first,
+            &[
+                ("Zed Lead", "Actor"),
+                ("Amy Support", "Actor"),
+                ("Dee Director", "Director"),
+            ],
+        )
+        .await;
+        credit_people(
+            &db,
+            second,
+            &[
+                ("Yan Lead", "Actor"),
+                ("Bob Guest", "GuestStar"),
+                ("Zed Lead", "Actor"),
+            ],
+        )
+        .await;
+
+        // `second` was played most recently, so its cast leads; `Zed Lead`
+        // keeps the place of his first credit.
+        let names = manager(&db)
+            .repo
+            .people_names_of(&[second, first], &["Actor", "GuestStar"])
+            .await
+            .expect("names");
+        assert_eq!(
+            names,
+            vec!["Yan Lead", "Bob Guest", "Zed Lead", "Amy Support"],
+            "billing order per film, the most recent film first, each name once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_director_category_lists_only_films_the_person_directed() {
+        // C# `GetPersonRecommendations` sets `PersonTypes = [Director]`, and
+        // TranslateQuery restricts the credit to it; it also over-fetches by two
+        // and drops a second film with the same IMDb id.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x711)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let played = Uuid::from_u128(0x712);
+        let acted = Uuid::from_u128(0x713);
+        let directed = Uuid::from_u128(0x714);
+        let same_film = Uuid::from_u128(0x715);
+        seed_movie(&db, played, "Played", "Drama").await;
+        seed_movie(&db, acted, "Acted", "Western").await;
+        seed_movie(&db, directed, "Directed", "Western").await;
+        seed_movie(&db, same_film, "Directed (Extended)", "Western").await;
+        let another = Uuid::from_u128(0x716);
+        seed_movie(&db, another, "Zulu Directed", "Western").await;
+        crate::test_support::seed_library_over(&db, &[played, acted, directed, same_film, another])
+            .await;
+        credit_person(&db, played, "Chris Maker", "Director").await;
+        credit_person(&db, acted, "Chris Maker", "Actor").await;
+        credit_person(&db, directed, "Chris Maker", "Director").await;
+        credit_person(&db, same_film, "Chris Maker", "Director").await;
+        credit_person(&db, another, "Chris Maker", "Director").await;
+        crate::test_support::seed_provider_id(&db, directed, "Imdb", "tt0000001").await;
+        crate::test_support::seed_provider_id(&db, same_film, "Imdb", "tt0000001").await;
+        seed_user_data(&db, user_id, played, true, None).await;
+
+        // `itemLimit` 2: the two editions of one film take the first two rows,
+        // so only the `+ 2` over-fetch leaves room for the second film.
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 2, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let directed_by = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed)
+            .expect("a directed-by category");
+        assert_eq!(directed_by.baseline_item_name, "Chris Maker");
+        let films = names(&directed_by.items);
+        assert!(
+            !films.contains(&"Acted".to_owned()),
+            "an acting credit is not directing: {films:?}"
+        );
+        assert_eq!(
+            films.len(),
+            2,
+            "one edition per IMDb id, then the next film: {films:?}"
+        );
+        assert!(films.contains(&"Zulu Directed".to_owned()), "{films:?}");
+    }
+
+    #[tokio::test]
+    async fn person_categories_are_queried_only_as_the_round_robin_needs_them() {
+        // C# `GetPersonRecommendations` is a `yield return` iterator pulled by
+        // `MoveNext`: with one category wanted, one actor is looked up, not ten.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x721)).await;
+        grant_all_folders(&db, &user).await;
+        let film = Uuid::from_u128(0x722);
+        seed_movie(&db, film, "Film", "Drama").await;
+        crate::test_support::seed_library_over(&db, &[film]).await;
+        credit_person(&db, film, "Actor 0", "Actor").await;
+        let actors: Vec<String> = (0..10).map(|i| format!("Actor {i}")).collect();
+        let mut directors =
+            PersonCursor::new(&[], RecommendationType::HasDirectorFromRecentlyPlayed);
+        let mut actor_cursor =
+            PersonCursor::new(&actors, RecommendationType::HasActorFromRecentlyPlayed);
+
+        let mgr = manager(&db);
+        let kinds = mgr.movie_candidate_kinds().await;
+        let out = mgr
+            .round_robin_categories(
+                [Vec::new(), Vec::new()],
+                [&mut directors, &mut actor_cursor],
+                1,
+                &PersonQuery {
+                    item_limit: 5,
+                    user: &user,
+                    movie_kinds: &kinds,
+                },
+            )
+            .await
+            .expect("round robin");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].baseline_item_name, "Actor 0");
+        assert_eq!(actor_cursor.next, 1, "only the first actor was queried");
     }
 }
