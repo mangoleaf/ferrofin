@@ -289,6 +289,11 @@ pub struct EncodingJobInfo {
     pub supported_video_codecs: Vec<String>,
     /// The audio codecs the target supports (`SupportedAudioCodecs`).
     pub supported_audio_codecs: Vec<String>,
+    /// The subtitle codecs an `Embed` delivery may write
+    /// (`SupportedSubtitleCodecs`): the request's `subtitleCodec`, split on
+    /// commas with empty entries dropped. The first names the embedded
+    /// track's codec ([`crate::encoding_helper::helper::subtitle_embed_arguments`]).
+    pub supported_subtitle_codecs: Vec<String>,
     /// The segment cut length, in seconds (`StreamState.SegmentLength`).
     ///
     /// Drives the segment cache filenames and the forward-gap heuristic. `0`
@@ -636,6 +641,7 @@ mod derived_state_tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 3,
             wait_for_path: None,
             segment_container: None,

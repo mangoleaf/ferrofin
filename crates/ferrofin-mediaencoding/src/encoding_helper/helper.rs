@@ -1068,6 +1068,69 @@ pub fn normalize_transcoding_level(state: &EncodingJobInfo, level: Option<&str>)
     level.map(str::to_owned)
 }
 
+/// Port of `NormalizeSubtitleEmbed`: an `Embed` of a `DVBSUB` stream becomes
+/// `Encode` (burn-in), because a remuxed DVB subtitle is mispositioned after
+/// conversion. Every other stream and method is returned unchanged.
+///
+/// Upstream runs it in `AttachMediaSourceInfo`, once the subtitle stream and
+/// its delivery method are known and before anything reads the method.
+#[must_use]
+pub fn normalize_subtitle_embed(
+    subtitle_stream: Option<&MediaStream>,
+    method: SubtitleDeliveryMethod,
+) -> SubtitleDeliveryMethod {
+    let is_dvb = subtitle_stream
+        .and_then(|sub| sub.codec.as_deref())
+        .is_some_and(|codec| codec.eq_ignore_ascii_case(super::hw::input_args::DVBSUB_CODEC));
+    if method == SubtitleDeliveryMethod::Embed && is_dvb {
+        SubtitleDeliveryMethod::Encode
+    } else {
+        method
+    }
+}
+
+/// Port of `GetSubtitleEmbedArguments`: for an `Embed` subtitle, the codec the
+/// embedded track is written as and its default flag,
+/// ` -codec:s:0 {codec} -disposition:s:0 default`; otherwise empty.
+///
+/// The codec is the first of [`EncodingJobInfo::supported_subtitle_codecs`],
+/// or `copy` when there is none or it names the source codec (ignoring case).
+/// `GetProgressiveVideoFullCommandLine` appends it after the audio arguments.
+///
+/// The stream routes reject a `subtitleCodec` outside the container pattern
+/// before a job exists (`validate_stream_request`, upstream's
+/// `[RegularExpression(ContainerValidationRegexStr)]`). Because the value is
+/// written into the command line, a name outside that pattern is also treated
+/// as no name here, so a caller that skipped the route check cannot add
+/// arguments.
+#[must_use]
+pub fn subtitle_embed_arguments(state: &EncodingJobInfo) -> String {
+    let Some(sub) = state
+        .subtitle_stream
+        .as_ref()
+        .filter(|_| state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed)
+    else {
+        return String::new();
+    };
+    let format = state
+        .supported_subtitle_codecs
+        .first()
+        .map(String::as_str)
+        .filter(|format| ferrofin_model::media_info::is_valid_stream_identifier(format))
+        .unwrap_or_default();
+    let codec = if format.is_empty()
+        || sub
+            .codec
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case(format))
+    {
+        "copy"
+    } else {
+        format
+    };
+    format!(" -codec:s:0 {codec} -disposition:s:0 default")
+}
+
 /// The subtitle portion of [`EncodingHelper::map_args`]. Port of the
 /// subtitle-delivery-method branch of `GetMapArgs`; split out so `map_args`
 /// stays within a readable length.
@@ -1837,6 +1900,7 @@ mod tests {
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 0,
             wait_for_path: None,
             segment_container: None,
@@ -3174,5 +3238,76 @@ mod tests {
     #[case("", "aac")]
     fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
         assert_eq!(infer_audio_codec(container), expected);
+    }
+
+    fn subtitle(codec: Option<&str>) -> MediaStream {
+        MediaStream {
+            codec: codec.map(str::to_owned),
+            index: 2,
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        }
+    }
+
+    /// `NormalizeSubtitleEmbed`: only an `Embed` of a `DVBSUB` stream (any
+    /// case) turns into `Encode`.
+    #[rstest]
+    #[case(
+        Some("DVBSUB"),
+        SubtitleDeliveryMethod::Embed,
+        SubtitleDeliveryMethod::Encode
+    )]
+    #[case(
+        Some("dvbsub"),
+        SubtitleDeliveryMethod::Embed,
+        SubtitleDeliveryMethod::Encode
+    )]
+    #[case(
+        Some("DVBSUB"),
+        SubtitleDeliveryMethod::External,
+        SubtitleDeliveryMethod::External
+    )]
+    #[case(
+        Some("PGSSUB"),
+        SubtitleDeliveryMethod::Embed,
+        SubtitleDeliveryMethod::Embed
+    )]
+    #[case(None, SubtitleDeliveryMethod::Embed, SubtitleDeliveryMethod::Embed)]
+    fn normalize_subtitle_embed_burns_in_only_dvb(
+        #[case] codec: Option<&str>,
+        #[case] method: SubtitleDeliveryMethod,
+        #[case] expected: SubtitleDeliveryMethod,
+    ) {
+        let stream = subtitle(codec);
+        assert_eq!(normalize_subtitle_embed(Some(&stream), method), expected);
+        assert_eq!(normalize_subtitle_embed(None, method), method);
+    }
+
+    /// `GetSubtitleEmbedArguments` is empty unless an `Embed` subtitle is
+    /// selected; a stream without a codec takes the first requested one.
+    #[test]
+    fn subtitle_embed_arguments_need_an_embedded_stream() {
+        let mut state = job(&[]);
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Embed;
+        assert_eq!(subtitle_embed_arguments(&state), "");
+        state.subtitle_stream = Some(subtitle(None));
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Encode;
+        assert_eq!(subtitle_embed_arguments(&state), "");
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Embed;
+        assert_eq!(
+            subtitle_embed_arguments(&state),
+            " -codec:s:0 copy -disposition:s:0 default"
+        );
+        state.supported_subtitle_codecs = vec!["ass".to_owned()];
+        assert_eq!(
+            subtitle_embed_arguments(&state),
+            " -codec:s:0 ass -disposition:s:0 default"
+        );
+        // A name the routes would have refused never reaches the command line.
+        state.supported_subtitle_codecs = vec!["ass -f null /tmp/x".to_owned()];
+        assert_eq!(
+            subtitle_embed_arguments(&state),
+            " -codec:s:0 copy -disposition:s:0 default"
+        );
     }
 }
