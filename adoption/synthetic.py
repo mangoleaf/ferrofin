@@ -128,7 +128,13 @@ def build(root, only, port):
                     api.scan(300, interval=1)
             else:
                 manifest = seed(api.base)
-                wait_for_live_members(config / "data/jellyfin.db", manifest)
+                # A 10.11.x database holds a linked container's entries in BaseItems.Data, where
+                # seed_database needs their ItemId (only 10.11.8 reaches this branch: the rest
+                # are copied from it). A first-run 12.x database keeps them in the
+                # LinkedChildren table, so waiting on Data would never end, and a fresh install
+                # gets no seed_database step anyway.
+                if name not in FRESH_INSTALL:
+                    wait_for_live_members(config / "data/jellyfin.db", manifest)
                 api = api.login(USERS[0])
             save(config / "synthetic.json", manifest)
             # Added by the preservation checker; a source-version baseline is

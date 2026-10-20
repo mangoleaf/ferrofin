@@ -798,7 +798,7 @@ class FreshInstallBuildTest(unittest.TestCase):
         server.return_value.__enter__.return_value = api
         with patch.object(self.synthetic, "server", server), \
                 patch.object(self.synthetic, "seed", return_value={"version": 1}) as seed, \
-                patch.object(self.synthetic, "wait_for_live_members"), \
+                patch.object(self.synthetic, "wait_for_live_members") as wait, \
                 patch.object(self.synthetic, "seed_database") as seed_database, \
                 patch("preservation.snapshot", return_value={}), \
                 patch("preservation.validate"):
@@ -806,6 +806,9 @@ class FreshInstallBuildTest(unittest.TestCase):
         config = self.root / self.fresh
         seed.assert_called_once()                       # seeded through the 12.2 API
         seed_database.assert_not_called()               # but none of the aged stopped-DB states
+        # A 12.x database keeps linked children in the LinkedChildren table, never in
+        # BaseItems.Data, which is all the wait reads: waiting would never end (gl-701).
+        wait.assert_not_called()
         self.assertFalse((config / "seeds.json").exists())
         ready = json.loads((config / "synthetic-ready.json").read_text())
         self.assertEqual(ready["fixture"], self.fresh)  # still a completed, usable fixture
