@@ -3643,6 +3643,13 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
+    /// The persistence's [`user_data_detach_epoch`] when the last full
+    /// user-data recovery sweep began; `None` until one has run, so the first
+    /// scan after a start always sweeps ([`recover_user_data`]).
+    ///
+    /// [`user_data_detach_epoch`]: ferrofin_traits::persistence::ItemPersistenceService::user_data_detach_epoch
+    /// [`recover_user_data`]: Self::recover_user_data
+    swept_at_epoch: std::sync::Mutex<Option<i64>>,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -3830,6 +3837,7 @@ impl LibraryScanner {
             display_specials_within_seasons: None,
             nfo_configuration: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
+            swept_at_epoch: std::sync::Mutex::new(None),
         }
     }
 
@@ -5579,6 +5587,43 @@ impl LibraryScanner {
             .collect())
     }
 
+    /// The full user-data recovery sweep after a scan
+    /// ([`reattach_all_user_data`]), when it can find something: history
+    /// whose destination no save of this scan reattached.
+    ///
+    /// Every item a scan saves reattaches its own history on the spot. What
+    /// that misses is a pair matched across time: history detached after its
+    /// destination was saved (later in this scan, or by an earlier watcher
+    /// event outside this one's scope), and a destination whose keys changed
+    /// after its save or outside a scan (music's closing pass, a series'
+    /// re-pointed children, an edit). A `ScanPasses::Library` scan (the
+    /// scheduled scan, `POST /Library/Refresh`, one library's scan) always
+    /// sweeps for them. A `ScanPasses::Touched` scan (watcher and webhook
+    /// batches, item and folder refreshes) sweeps only when history was
+    /// detached since the last sweep: otherwise it has no new history to
+    /// place, and the next library scan catches a late key change.
+    ///
+    /// [`reattach_all_user_data`]: ItemPersistenceService::reattach_all_user_data
+    async fn recover_user_data(&self, passes: ScanPasses) -> Result<(), ServiceError> {
+        let epoch = self.persistence.user_data_detach_epoch().await?;
+        let swept = *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if passes == ScanPasses::Touched && epoch.is_some() && epoch == swept {
+            tracing::debug!(
+                "user-data recovery sweep skipped: nothing detached since the last one"
+            );
+            return Ok(());
+        }
+        self.persistence.reattach_all_user_data().await?;
+        *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+        Ok(())
+    }
+
     /// The shared scan pipeline over an already-planned item set: probe +
     /// metadata + persistence per item, deleted-item pruning (restricted to
     /// `scope`'s roots when given), the `LibraryChanged` push, and the music
@@ -6137,10 +6182,7 @@ impl LibraryScanner {
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
         if !outcome.stopped {
-            // New destinations may have been saved before old paths were
-            // pruned, or by an earlier watcher event outside this scope.
-            // Music's closing pass must also have persisted its final keys.
-            self.persistence.reattach_all_user_data().await?;
+            self.recover_user_data(run.passes).await?;
             run.report(100.0);
         }
         // Announce what the scan changed (`LibraryChanged`) so open clients
