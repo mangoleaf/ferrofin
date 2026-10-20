@@ -640,6 +640,80 @@ async fn name_and_ordering_translate() {
     assert_eq!(hit[0].name.as_deref(), Some("Memento"));
 }
 
+/// `sortBy=Name` (jellyfin-web's Songs "Track name") orders by `CleanName`,
+/// as upstream `OrderMapper` maps it — not by the `SortName`, which for a
+/// track is `{disc} - {track} - {name}` and so would give track order.
+#[tokio::test]
+async fn name_sort_orders_by_clean_name_not_sort_name() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let track = |id: u128, number: &str, name: &str| {
+        let mut row = item(Uuid::from_u128(id), BaseItemKind::Audio, name);
+        row.sort_name = Some(format!("0001 - {number} - {name}"));
+        row
+    };
+    persist
+        .save_items(&[
+            track(0xC01, "0001", "Zebra"),
+            track(0xC02, "0002", "Apple"),
+            track(0xC03, "0003", "Mango"),
+        ])
+        .await
+        .expect("save");
+
+    for (order, expected) in [
+        (SortOrder::Ascending, ["Apple", "Mango", "Zebra"]),
+        (SortOrder::Descending, ["Zebra", "Mango", "Apple"]),
+    ] {
+        let rows = repository
+            .get_item_list(&InternalItemsQuery {
+                order_by: vec![(ItemSortBy::Name, order)],
+                ..Default::default()
+            })
+            .await
+            .expect("query");
+        let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, expected, "sortBy=Name {order:?}");
+    }
+}
+
+/// A typed `sortBy=Name` page keeps the sort it had while `Name` fell back to
+/// `SortName`: the pinned `+CleanName` stops `IX_BaseItems_Type_CleanName`
+/// from walking every row of the type, in every library, to fill one page.
+#[tokio::test]
+async fn name_sort_plan_sorts_rather_than_walking_the_clean_name_index() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    for order in [SortOrder::Ascending, SortOrder::Descending] {
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            top_parent_ids: vec![Uuid::from_u128(0xC10)],
+            limit: Some(100),
+            order_by: vec![(ItemSortBy::Name, order)],
+            ..Default::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "{order:?}: {plan}"
+        );
+    }
+}
+
 /// `ItemSortBy::Random` has to reach the database as a per-row draw.
 ///
 /// Two failure modes this pins, both of which pass every other test in this
