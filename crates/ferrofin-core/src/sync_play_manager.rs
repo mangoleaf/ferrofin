@@ -53,6 +53,13 @@ const TIME_SYNC_OFFSET_MS: i64 = 2000;
 /// corrected with a seek, in ms. Jellyfin's `Group.MaxPlaybackOffset`
 /// (Group.cs:103).
 const MAX_PLAYBACK_OFFSET_MS: i64 = 500;
+/// How far a member that reports Ready while PLAYING may lag the group before
+/// it is corrected with a seek, in ms: it may still be catching up after
+/// buffering. Jellyfin 12.1's `IGroupStateContext.MaxCatchUpOffset`
+/// (IGroupStateContext.cs:40), a hardcoded interface default. A jump of the
+/// group position during the wait takes the tolerance away
+/// ([`Group::position_jumped`]).
+const MAX_CATCH_UP_OFFSET_MS: i64 = 60_000;
 
 /// A .NET tick count as a [`Duration`]. Ticks are 100 ns, so ten to the
 /// microsecond; going through microseconds keeps the full resolution that
@@ -540,6 +547,12 @@ struct Group {
     /// `None` whenever the group is not `Waiting`: upstream builds a fresh
     /// `WaitingGroupState` per entry, so the memory dies with the state object.
     initial_state: Option<GroupStateType>,
+    /// `WaitingGroupState.PositionJumped` (12.1): whether the group position
+    /// moved during this wait — a Seek, a new queue, SetPlaylistItem,
+    /// Next/PreviousItem, or the Unpause restart from `Idle`. A member that
+    /// reports Ready while playing behind such a jump has not applied it, so it
+    /// gets no catch-up tolerance. Like `initial_state`, it dies with the wait.
+    position_jumped: bool,
     /// `PlayingGroupState.IgnoreBuffering` — armed by an Unpause that forced
     /// playback out of `Waiting`, and cleared by the next entry into `Playing`.
     ignore_buffering: bool,
@@ -560,6 +573,7 @@ impl Group {
             last_activity: now,
             resume_playing: false,
             initial_state: None,
+            position_jumped: false,
             ignore_buffering: false,
             item_runtimes: HashMap::new(),
         }
@@ -772,6 +786,9 @@ impl Group {
     /// object — and the same `InitialState` — is reused; leaving `Waiting` throws
     /// it away, which [`Group::set_state`] models by clearing the field.
     fn enter_waiting(&mut self, prev: GroupStateType) {
+        if self.state != GroupStateType::Waiting {
+            self.position_jumped = false;
+        }
         if self.state != GroupStateType::Waiting || self.initial_state.is_none() {
             self.initial_state = Some(prev);
         }
@@ -811,6 +828,7 @@ impl Group {
     fn set_state(&mut self, new_state: GroupStateType) {
         if new_state != GroupStateType::Waiting {
             self.initial_state = None;
+            self.position_jumped = false;
         }
         if new_state == GroupStateType::Playing {
             self.ignore_buffering = false;
@@ -1064,6 +1082,7 @@ impl Group {
         // when `prev` was `Waiting` (WaitingGroupState.cs:139-152).
         let out_of_range =
             usize::try_from(position).map_or(true, |p| queue.is_empty() || p >= queue.len());
+        self.position_jumped = !out_of_range;
         if out_of_range {
             self.restore_after_failed_queue_change(prev);
             return Vec::new();
@@ -1092,6 +1111,7 @@ impl Group {
         self.enter_waiting(prev);
         self.resume_playing = true;
         let found = self.queue.set_playing(playlist_item_id);
+        self.position_jumped = found;
         self.position_ticks = 0;
         self.last_activity = now;
         if !found {
@@ -1128,6 +1148,7 @@ impl Group {
         } else {
             self.queue.previous()
         };
+        self.position_jumped = moved;
         if !moved {
             self.restore_after_failed_queue_change(prev);
             return Vec::new();
@@ -1155,6 +1176,7 @@ impl Group {
                 // `Group.RestartCurrentItem` (Group.cs:601-605).
                 self.position_ticks = 0;
                 self.last_activity = now;
+                self.position_jumped = true;
                 let out = vec![Outbound::all(
                     self.play_queue_env(PlayQueueUpdateReason::NewPlaylist, now),
                 )];
@@ -1265,6 +1287,7 @@ impl Group {
         self.resume_playing_from(prev);
         self.position_ticks = self.sanitize_position_ticks(position_ticks);
         self.last_activity = now;
+        self.position_jumped = true;
         let seek = Outbound::all(self.command_env(SendCommandType::Seek, self.last_activity, now));
         self.set_all_buffering(true);
         vec![
@@ -1392,11 +1415,19 @@ impl Group {
         }
         let request_ticks = self.sanitize_position_ticks(report.position_ticks);
         let delay_ticks = self.position_ticks - (request_ticks + elapsed_ticks);
-        let max_offset_ticks = MAX_PLAYBACK_OFFSET_MS * TICKS_PER_MS;
+        let max_playback_offset_ticks = MAX_PLAYBACK_OFFSET_MS * TICKS_PER_MS;
         if self.resume_playing {
-            // :452-466 — it says ready, but it is paused and nowhere near the
-            // group's position: it has no idea where it is. Correct it.
-            if !report.is_playing && delay_ticks.abs() > max_offset_ticks {
+            // :460-481 — it says ready, but it is nowhere near the group's
+            // position: it has no idea where it is. Correct it. A member that
+            // is playing may lag while it catches up after buffering, unless
+            // the position jumped during this wait and it has not applied the
+            // jump (PR 17797, 12.1).
+            let max_offset_ticks = if report.is_playing && !self.position_jumped {
+                MAX_CATCH_UP_OFFSET_MS * TICKS_PER_MS
+            } else {
+                max_playback_offset_ticks
+            };
+            if delay_ticks.abs() > max_offset_ticks {
                 self.set_buffering(session_id, true);
                 return vec![
                     Outbound::to(
@@ -1444,7 +1475,7 @@ impl Group {
         } else {
             // :522-535 — the group is settling into Paused, so the only question
             // is whether this client seeked to the right place.
-            if (self.position_ticks - request_ticks).abs() > max_offset_ticks {
+            if (self.position_ticks - request_ticks).abs() > max_playback_offset_ticks {
                 self.set_buffering(session_id, true);
                 return vec![
                     Outbound::to(
@@ -2977,6 +3008,255 @@ mod tests {
             now,
         );
         assert_eq!(g.position_ticks, 0, "and floored at zero");
+    }
+
+    /// Ticks in `n` minutes.
+    fn minutes(n: i64) -> i64 {
+        n * 60_000 * TICKS_PER_MS
+    }
+
+    /// The `GroupHarness` of v12.2 `WaitingGroupStateTests`: two members
+    /// playing a two-hour item at 10:00, with a second item queued after it.
+    /// Returns the group and both items' `PlaylistItemId`s.
+    fn playing_pair(now: DateTime<Utc>) -> (Group, Uuid, Uuid) {
+        let mut g = Group::new(Uuid::new_v4(), "g".into(), now);
+        for (id, name) in [("s1", "first"), ("s2", "second")] {
+            g.add_member(&session(id, name));
+        }
+        let items = [Uuid::new_v4(), Uuid::new_v4()];
+        for item in items {
+            g.item_runtimes.insert(item, minutes(120));
+        }
+        g.queue.set(&items, 0);
+        let first = g.queue.playing_item_id();
+        g.queue.next();
+        let second = g.queue.playing_item_id();
+        g.queue.set_playing(first);
+        g.state = GroupStateType::Playing;
+        g.position_ticks = minutes(10);
+        g.last_activity = now;
+        (g, first, second)
+    }
+
+    fn ready_now(
+        pli: Uuid,
+        position_ticks: i64,
+        is_playing: bool,
+        now: DateTime<Utc>,
+    ) -> PlaybackRequest {
+        PlaybackRequest::Ready {
+            when: now,
+            position_ticks,
+            is_playing,
+            playlist_item_id: pli,
+        }
+    }
+
+    fn sent(out: &[Outbound], command: &str) -> bool {
+        out.iter().any(|o| is_cmd(&o.body, command))
+    }
+
+    fn bodies(out: &[Outbound]) -> Vec<&str> {
+        out.iter().map(|o| o.body.as_str()).collect()
+    }
+
+    /// v12.2 `Ready_PlayingSessionReportsPositionFromBeforeSeek_IsCorrected`
+    /// (PR 17797): after a Seek the group position JUMPED, so a member that
+    /// still reports the old position is corrected even though it says it is
+    /// playing — it is not accepted and handed a Pause half an hour out.
+    #[test]
+    fn a_playing_member_behind_a_seek_is_corrected() {
+        let now = Utc::now();
+        let (mut g, pli, _) = playing_pair(now);
+        g.handle(
+            "s2",
+            &PlaybackRequest::Seek {
+                position_ticks: minutes(40),
+            },
+            now,
+        );
+
+        let out = g.handle("s1", &ready_now(pli, minutes(10), true, now), now);
+
+        assert!(sent(&out, "Seek"), "{:?}", bodies(&out));
+        assert!(!sent(&out, "Pause"), "{:?}", bodies(&out));
+        assert!(g.is_buffering(), "the member still counts as buffering");
+    }
+
+    /// v12.2 `Ready_PlayingSessionRecoveringFromALongStall_IsNotSeeked`: with
+    /// no jump, a playing member 45 s behind is catching up after buffering
+    /// and is waited for — up to `MaxCatchUpOffset` (60 s), past which it is
+    /// seeked like any other member out of position.
+    #[rstest::rstest]
+    #[case::forty_five_seconds_behind(45, false)]
+    #[case::past_the_catch_up_offset(61, true)]
+    fn a_playing_member_recovering_from_a_stall_is_waited_for_up_to_a_minute(
+        #[case] behind_secs: i64,
+        #[case] seeked: bool,
+    ) {
+        let now = Utc::now();
+        let (mut g, pli, _) = playing_pair(now);
+        g.handle(
+            "s1",
+            &PlaybackRequest::Buffer {
+                when: now,
+                position_ticks: g.position_ticks,
+                is_playing: true,
+                playlist_item_id: pli,
+            },
+            now,
+        );
+
+        let behind = g.position_ticks - behind_secs * 1000 * TICKS_PER_MS;
+        let out = g.handle("s1", &ready_now(pli, behind, true, now), now);
+
+        assert_eq!(sent(&out, "Seek"), seeked, "{:?}", bodies(&out));
+    }
+
+    /// The jump belongs to the whole wait: upstream handles every request
+    /// while `Waiting` on the same `WaitingGroupState`, so another member's
+    /// Buffer after the Seek does not give the lagging member its catch-up
+    /// tolerance back.
+    #[test]
+    fn a_jump_lasts_for_the_rest_of_the_wait() {
+        let now = Utc::now();
+        let (mut g, pli, _) = playing_pair(now);
+        g.handle(
+            "s2",
+            &PlaybackRequest::Seek {
+                position_ticks: minutes(40),
+            },
+            now,
+        );
+        g.handle(
+            "s2",
+            &PlaybackRequest::Buffer {
+                when: now,
+                position_ticks: minutes(40),
+                is_playing: false,
+                playlist_item_id: pli,
+            },
+            now,
+        );
+        assert_eq!(g.state, GroupStateType::Waiting);
+
+        let off = minutes(40) + 30 * 1000 * TICKS_PER_MS;
+        let out = g.handle("s1", &ready_now(pli, off, true, now), now);
+
+        assert!(sent(&out, "Seek"), "{:?}", bodies(&out));
+    }
+
+    /// v12.2 `Ready_PlayingSessionSlightlyBehindGroup_IsStillTreatedAsCatchingUp`
+    /// and `Ready_PausedSessionOutOfPosition_IsStillCorrected`: in a wait with
+    /// no jump, a playing member 2 s behind gets the Pause while the other
+    /// member buffers, and a paused member out of position is still seeked
+    /// (`MaxPlaybackOffset`).
+    #[rstest::rstest]
+    #[case::playing_two_seconds_behind(minutes(30) - 2000 * TICKS_PER_MS, true, "Pause")]
+    #[case::paused_out_of_position(0, false, "Seek")]
+    fn a_wait_without_a_jump_tolerates_only_a_playing_member(
+        #[case] position_ticks: i64,
+        #[case] is_playing: bool,
+        #[case] expected: &str,
+    ) {
+        let now = Utc::now();
+        let (mut g, pli, _) = playing_pair(now);
+        g.position_ticks = minutes(30);
+        g.state = GroupStateType::Waiting;
+        g.resume_playing = true;
+        g.set_buffering("s1", true);
+        g.set_buffering("s2", true);
+
+        let out = g.handle("s1", &ready_now(pli, position_ticks, is_playing, now), now);
+
+        assert!(sent(&out, expected), "{:?}", bodies(&out));
+        assert_eq!(sent(&out, "Seek"), expected == "Seek", "{:?}", bodies(&out));
+    }
+
+    /// Every request that moves the group position marks the wait as jumped
+    /// (`PositionJumped`, WaitingGroupState.cs:144, :184, :224, :321, :598,
+    /// :645). A playing member half a minute off the new position has not
+    /// applied the jump, so it is seeked; without the jump it would be within
+    /// the catch-up tolerance. (Off by being AHEAD: a restart puts the group at
+    /// 0, and a position before 0 is clamped to it.)
+    #[rstest::rstest]
+    #[case::seek("seek")]
+    #[case::set_playlist_item("set_playlist_item")]
+    #[case::next_item("next_item")]
+    #[case::previous_item("previous_item")]
+    #[case::play("play")]
+    #[case::unpause_from_idle("unpause_from_idle")]
+    fn every_position_jump_ends_the_catch_up_tolerance(#[case] jump: &str) {
+        let now = Utc::now();
+        let (mut g, first, second) = playing_pair(now);
+        let request = match jump {
+            "seek" => PlaybackRequest::Seek {
+                position_ticks: minutes(40),
+            },
+            "set_playlist_item" => PlaybackRequest::SetPlaylistItem {
+                playlist_item_id: second,
+            },
+            "next_item" => PlaybackRequest::NextItem {
+                playlist_item_id: first,
+            },
+            "previous_item" => {
+                g.queue.set_playing(second);
+                PlaybackRequest::PreviousItem {
+                    playlist_item_id: second,
+                }
+            }
+            "play" => PlaybackRequest::Play {
+                playing_queue: g.queue.item_ids(),
+                playing_item_position: 0,
+                start_position_ticks: minutes(40),
+            },
+            _ => {
+                g.state = GroupStateType::Idle;
+                PlaybackRequest::Unpause
+            }
+        };
+        g.handle("s2", &request, now);
+        let pli = g.queue.playing_item_id();
+
+        let off = g.position_ticks + 30 * 1000 * TICKS_PER_MS;
+        let out = g.handle("s1", &ready_now(pli, off, true, now), now);
+
+        assert!(sent(&out, "Seek"), "{jump}: {:?}", bodies(&out));
+    }
+
+    /// Upstream builds a fresh `WaitingGroupState` on every entry into
+    /// `Waiting`, so a jump in one wait does not take the catch-up tolerance
+    /// away from the next wait, which only a member's buffering started.
+    #[test]
+    fn a_new_wait_starts_without_a_jump() {
+        let now = Utc::now();
+        let (mut g, pli, _) = playing_pair(now);
+        g.handle(
+            "s2",
+            &PlaybackRequest::Seek {
+                position_ticks: minutes(40),
+            },
+            now,
+        );
+        for member in ["s1", "s2"] {
+            g.handle(member, &ready_now(pli, minutes(40), true, now), now);
+        }
+        assert_eq!(g.state, GroupStateType::Playing);
+
+        g.handle(
+            "s1",
+            &PlaybackRequest::Buffer {
+                when: now,
+                position_ticks: g.position_ticks,
+                is_playing: true,
+                playlist_item_id: pli,
+            },
+            now,
+        );
+        let behind = g.position_ticks - 45 * 1000 * TICKS_PER_MS;
+        let out = g.handle("s1", &ready_now(pli, behind, true, now), now);
+
+        assert!(!sent(&out, "Seek"), "{:?}", bodies(&out));
     }
 
     /// `POST /SyncPlay/Buffering`, per state.
