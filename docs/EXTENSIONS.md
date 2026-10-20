@@ -191,8 +191,11 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item exactly once by the "Plugin media analysis" dashboard
-task. Why a host-driven pass instead of each plugin polling `query-items` with its own
+offered each new matching item once by the "Plugin media analysis" dashboard
+task. When the plugin's circuit breaker stops a pass, the items it did not reach are
+offered after the restart, and an item sharing the cut-off item's creation time (or, on
+a first pass, an undated one) can be offered again, so analysis must be idempotent.
+Why a host-driven pass instead of each plugin polling `query-items` with its own
 cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
 `host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
 could be rewound to re-burn the shared decode budget), disabled plugins are centrally
