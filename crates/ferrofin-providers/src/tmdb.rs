@@ -1261,7 +1261,7 @@ pub fn image_languages_param(language: Option<&str>, country_code: Option<&str>)
     languages.join(",")
 }
 
-/// One page of `/movie|tv/{id}/similar`.
+/// One page of `/movie|tv/{id}/recommendations`.
 #[derive(Debug, Deserialize)]
 struct SimilarResponse {
     #[serde(default)]
@@ -1870,14 +1870,21 @@ impl TmdbClient {
             .collect()
     }
 
-    /// One page of TMDB's "similar titles" for a movie or series
-    /// (`/movie|tv/{id}/similar`) — port of
-    /// `TmdbClientManager.GetMovieSimilarPageAsync`/its TV twin.
+    /// One page of TMDB's recommendations for a movie or series
+    /// (`/movie|tv/{id}/recommendations`) — port of
+    /// `TmdbClientManager.GetMovieRecommendationsPageAsync`/its TV twin, with
+    /// the `language` the similar providers hand it
+    /// (`TmdbUtils.GetImageLanguagesParam(string.Empty)`, so `null,en`).
     ///
     /// Returns the page's TMDB ids and the reported total page count, so the
     /// caller can walk the pages the way the C# provider does. Empty on any
     /// error.
-    pub async fn similar_page(&self, kind: TmdbKind, tmdb_id: i64, page: i32) -> (Vec<i64>, i32) {
+    pub async fn recommendations_page(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+        page: i32,
+    ) -> (Vec<i64>, i32) {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -1889,8 +1896,15 @@ impl TmdbClient {
         };
         let Ok(resp) = self
             .http
-            .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
-            .query(&[("api_key", key), ("page", &page.max(1).to_string())])
+            .get(format!(
+                "{}/{path}/{tmdb_id}/recommendations",
+                self.base_url
+            ))
+            .query(&[
+                ("api_key", key),
+                ("page", &page.max(1).to_string()),
+                ("language", &image_languages_param(None, None)),
+            ])
             .send_limited(&self.limiter)
             .await
         else {
@@ -3231,25 +3245,47 @@ mod tests {
         assert!(client.search_collection("  ", None).await.is_empty());
     }
 
+    /// Jellyfin 12 reads TMDB's recommendations, not its "similar" list
+    /// (`GetMovieRecommendationsPageAsync` / `GetSeriesRecommendationsPageAsync`).
     #[tokio::test]
-    async fn similar_pages_yield_their_ids_and_page_count() {
+    async fn recommendation_pages_yield_their_ids_and_page_count() {
         let body = r#"{"page":1,"total_pages":3,"results":[{"id":603},{"id":604}]}"#;
-        let server = crate::mock_http::MockServer::start(vec![("/similar", body.to_owned())]).await;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/27205/recommendations?", body.to_owned()),
+            ("/tv/1396/recommendations?", body.to_owned()),
+        ])
+        .await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
-        let (ids, total) = client.similar_page(TmdbKind::Movie, 27205, 1).await;
+        let (ids, total) = client.recommendations_page(TmdbKind::Movie, 27205, 1).await;
         assert_eq!(ids, [603, 604]);
         assert_eq!(total, 3);
         // The TV path is the same shape.
-        let (ids, _) = client.similar_page(TmdbKind::Series, 1396, 1).await;
+        let (ids, _) = client.recommendations_page(TmdbKind::Series, 1396, 1).await;
         assert_eq!(ids, [603, 604]);
     }
 
+    /// The similar providers pass `TmdbUtils.GetImageLanguagesParam(string.Empty)`
+    /// as the request's language: `null,en` (form-encoded by the client), with
+    /// the page asked for.
     #[tokio::test]
-    async fn a_failed_similar_request_yields_no_ids() {
+    async fn recommendation_pages_ask_in_the_providers_language() {
+        let body = r#"{"page":2,"total_pages":2,"results":[{"id":603}]}"#;
+        let server = crate::mock_http::MockServer::start(vec![(
+            "&page=2&language=null%2Cen",
+            body.to_owned(),
+        )])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (ids, _) = client.recommendations_page(TmdbKind::Movie, 27205, 2).await;
+        assert_eq!(ids, [603]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_recommendations_request_yields_no_ids() {
         // Nothing listening: the client must degrade, not error.
         let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
         assert_eq!(
-            client.similar_page(TmdbKind::Movie, 1, 1).await,
+            client.recommendations_page(TmdbKind::Movie, 1, 1).await,
             (vec![], 0)
         );
         assert!(client.collection(1, None).await.is_none());

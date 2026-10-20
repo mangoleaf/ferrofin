@@ -75,7 +75,7 @@ async fn provider(
         }
         return ([("content-type", "image/png")], bytes).into_response();
     }
-    if uri.path() == "/movie/603/similar" {
+    if uri.path() == "/movie/603/recommendations" {
         return Json(json!({"results":[{"id":604}],"total_pages":1})).into_response();
     }
     if uri.path() == "/movie/603/images" {
@@ -1774,7 +1774,7 @@ async fn verify_similarity_selection(
             .lock()
             .unwrap()
             .iter()
-            .filter(|uri| uri.starts_with("/movie/603/similar"))
+            .filter(|uri| uri.starts_with("/movie/603/recommendations"))
             .count()
     };
     let before = similar_calls();

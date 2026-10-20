@@ -22,7 +22,8 @@ use crate::error::DbError;
 use ferrofin_model::entities::{MetadataField, TrailerType};
 
 /// Generates a `#[repr(i32)]` enum with a `TryFrom<i32>` impl that rejects
-/// unknown discriminants with [`DbError::InvalidEnumValue`].
+/// unknown discriminants with [`DbError::InvalidEnumValue`], and an `ALL` list
+/// of its variants.
 ///
 /// Writing back to the database is done with a plain `value as i32` cast.
 macro_rules! db_enum {
@@ -43,6 +44,11 @@ macro_rules! db_enum {
                 $(#[$vmeta])*
                 $variant = $value,
             )+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
         }
 
         impl TryFrom<i32> for $name {
