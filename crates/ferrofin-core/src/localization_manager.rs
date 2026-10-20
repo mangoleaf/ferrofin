@@ -2010,9 +2010,90 @@ mod tests {
         }
     }
 
+    /// The vendored `Core/*.json` dictionaries are Jellyfin v12.2's
+    /// (`ca0f16eb7c`): 105 cultures, byte-compared against `v12.2` when
+    /// re-vendored. Each phrase below has this value only in the 12.x version
+    /// of its culture's file and differs from en-US, one per culture whose
+    /// phrases changed in the v12.2 re-vendor (en-US only reordered keys), so a
+    /// stale copy fails here instead of drifting silently.
+    #[test]
+    fn every_vendored_core_dictionary_matches_jellyfin_12_2() {
+        assert_eq!(core_dictionaries::CORE_DICTIONARIES.len(), 105);
+        let manager = LocalizationManager::default().with_ui_culture("en-US");
+        for (culture, phrase, expected) in [
+            (
+                "ar",
+                "TaskDownloadMissingLyricsDescription",
+                "تحميل كلمات الأغاني",
+            ),
+            (
+                "be",
+                "LyricDownloadFailureFromForItem",
+                "Не ўдалося загрузіць тэкст песні з {0} для {1}",
+            ),
+            ("bg-BG", "Original", "Оригинал"),
+            ("da", "TvShows", "Serier"),
+            ("de", "Artists", "Künstler"),
+            ("en-GB", "NameSeasonNumber", "Series {0}"),
+            ("eo", "Original", "Originala"),
+            (
+                "es-MX",
+                "LyricDownloadFailureFromForItem",
+                "No se pudo descargar la letra desde {0} para {1}",
+            ),
+            ("fo", "NameSeasonNumber", "Umfar {0}"),
+            (
+                "gl",
+                "LyricDownloadFailureFromForItem",
+                "Non se puideron descargar as letras desde {0} para {1}",
+            ),
+            ("hi", "Original", "असली"),
+            ("hy", "Default", "Լռելյայն"),
+            (
+                "is",
+                "TaskRefreshChannelsDescription",
+                "Endurhleður upplýsingum netrása.",
+            ),
+            (
+                "lb",
+                "LyricDownloadFailureFromForItem",
+                "Feeler beim Download vun de Songtexter vun {0} fir {1}",
+            ),
+            ("lt-LT", "ChapterNameValue", "Skyrius{0}"),
+            (
+                "ms",
+                "LyricDownloadFailureFromForItem",
+                "Lirik gagal dimuat turun dari {0} untuk {1}",
+            ),
+            ("oc", "HearingImpaired", "Amb de deficiéncias auditivas"),
+            ("pt-PT", "NameSeasonUnknown", "Temporada desconhecida"),
+            ("pt", "NameSeasonUnknown", "Temporada desconhecida"),
+            (
+                "sk",
+                "TaskKeyframeExtractorDescription",
+                "Extrahuje kľúčové snímky z videosúborov na vytvorenie presnejších HLS zoznamov. Táto úloha môže trvať dlhší čas.",
+            ),
+            ("ta", "Original", "அசல்"),
+            ("th", "Original", "ต้นฉบับ"),
+            ("tr", "AppDeviceValues", "Uygulama: {0}, Cihaz: {1}"),
+            (
+                "vi",
+                "FailedLoginAttemptWithUserName",
+                "Cố gắng đăng nhập thất bại từ {0}",
+            ),
+            ("zh-HK", "HeaderFavoriteEpisodes", "心水劇集"),
+        ] {
+            assert_eq!(
+                manager.get_localized_string_for(phrase, culture),
+                expected,
+                "{culture} {phrase}"
+            );
+        }
+    }
+
     /// Upstream `GetLocalizedString_*` (`:486-566`): en-US keys, an unknown
-    /// key, an unknown culture's en-US fallback, and BCP-47 spellings of
-    /// underscore resources (`es-419`, `he-IL`).
+    /// key, a culture's own translation, an unknown culture's en-US fallback,
+    /// and BCP-47 spellings of underscore resources (`es-419`, `he-IL`).
     #[rstest]
     #[case("Default", "", "Default")]
     #[case("HeaderLiveTV", "", "Live TV")]
@@ -2021,6 +2102,7 @@ mod tests {
         "",
         "SuperInvalidTranslationKeyThatWillNeverBeAdded"
     )]
+    #[case("Artists", "de", "Künstler")]
     #[case("Artists", "zz", "Artists")]
     #[case("Books", "he-IL", "ספרים")]
     fn get_localized_string_cases(
