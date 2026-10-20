@@ -104,17 +104,6 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
 const JELLYFIN_API_VERSION: &str = "12.2.0";
 
-/// The host a Live TV live stream's buffered file is served from.
-///
-/// Jellyfin's `GetApiUrlForLocalAccess()` is the server's own bind address and
-/// deliberately never consults `PublishedServerUrl` (only `GetSmartApiUrl`
-/// does). Loopback is the strictly-local form of that, and it is right for the
-/// readers that matter: this process's own ffmpeg — which probes and transcodes
-/// the channel — and the DVR recorder. Routing them out through a public
-/// hostname would add TLS, a reverse proxy and a dependency on external DNS
-/// resolving from inside the container, any of which breaks Live TV outright.
-const LIVE_STREAM_LOCAL_HOST: &str = "127.0.0.1";
-
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -2281,29 +2270,28 @@ pub async fn build_app_state(
                 listen_with_https: false,
                 published_server_url: config.published_url.clone(),
                 base_url: config.base_url.clone(),
-                enable_published_server_uri_by_request: false,
+                // Read live from the network manager attached below; this is
+                // only the startup fact.
+                enable_published_server_uri_by_request: network
+                    .read()
+                    .is_ok_and(|network| network.enable_published_server_uri_by_request()),
             },
             config.server_name.clone(),
         )
-        .with_network(Arc::clone(&network), config.bind_addr),
+        .with_network(
+            Arc::clone(&network),
+            config.bind_addr_explicit.then_some(config.bind_addr),
+        ),
     );
     config_mgr.add_configuration_listener(app_host.configuration_listener());
     app_host
         .refresh_server_name()
         .await
         .context("failed to refresh advertised server name")?;
-    // The URL a live stream's buffered file is served from (C#
-    // `GetApiUrlForLocalAccess()`).
-    live_tv_impl.set_local_api_url(
-        ferrofin_traits::system::ServerApplicationHost::get_local_api_url(
-            app_host.as_ref(),
-            LIVE_STREAM_LOCAL_HOST,
-            None,
-            None,
-        )
-        .await
-        .context("failed to build the Live TV local api url")?,
-    );
+    // Where a live stream's buffered file and an in-progress recording are
+    // served from (C# `GetApiUrlForLocalAccess()`), asked per stream: the
+    // bound listener and the live network settings, never the published URL.
+    live_tv_impl.set_local_api_access(Arc::clone(&app_host) as Arc<_>);
     let app_host_trait: Arc<dyn ferrofin_traits::system::ServerApplicationHost> =
         Arc::clone(&app_host) as Arc<_>;
 
@@ -2536,7 +2524,7 @@ pub async fn build_app_state(
         Arc::new(
             ferrofin_extensions::file_transformation::WebFileTransformationService::new(
                 Arc::clone(&plugins),
-                format!("http://127.0.0.1:{}", config.port),
+                Arc::clone(&app_host) as Arc<_>,
             ),
         );
     ferrofin_extensions::file_transformation::register_skip_button_transformer(

@@ -636,6 +636,7 @@ mod tests {
     use ferrofin_db::Database;
     use ferrofin_model::configuration::ServerConfiguration;
     use ferrofin_traits::net::RequestContext as HostRequestContext;
+    use ferrofin_traits::system::LocalApiAccess;
     use ferrofin_traits::system::ServerApplicationPaths;
 
     /// A minimal [`ServerConfigurationManager`] returning a fixed configuration;
@@ -697,6 +698,13 @@ mod tests {
     /// api-key branch reads; the remaining methods are unreachable in these tests.
     struct FakeHost {
         name: String,
+    }
+
+    #[async_trait]
+    impl LocalApiAccess for FakeHost {
+        async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            unreachable!()
+        }
     }
 
     #[async_trait]

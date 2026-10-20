@@ -183,6 +183,13 @@ impl NetworkManager {
         self.config.auto_discovery
     }
 
+    /// Whether smart URLs echo the request's own host
+    /// (`EnablePublishedServerUriByRequest`).
+    #[must_use]
+    pub fn enable_published_server_uri_by_request(&self) -> bool {
+        self.config.enable_published_server_uri_by_request
+    }
+
     /// Whether IPv4 is enabled (`IsIPv4Enabled`).
     #[must_use]
     pub fn is_ipv4_enabled(&self) -> bool {
