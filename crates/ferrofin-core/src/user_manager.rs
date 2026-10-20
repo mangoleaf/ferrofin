@@ -962,7 +962,10 @@ impl UserManager for FerrofinUserManager {
         }
         // The built-in provider supplies the hash while this manager owns its
         // database write. External providers own their credential store.
-        let hash = self.default_provider.format_password_hash(new_password)?;
+        let hash = self
+            .default_provider
+            .format_password_hash(new_password)
+            .await?;
         sqlx::query(
             r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
                WHERE "Id" = ?1"#,

@@ -34,12 +34,13 @@ pub const INVALID_AUTH_PROVIDER_ID: &str =
 /// `DefaultAuthenticationProvider`).
 ///
 /// Verifies a stored [`PasswordHash`] against the presented password using the
-/// shared crypto provider, supporting password-less users. Unlike upstream it
-/// does **not** re-hash (migrate) legacy hashes in-place on login: `authenticate`
-/// takes the user by shared reference, so a hash upgrade would need a write path
-/// the [`AuthenticationManager`] trait does not expose. Migration on next
-/// explicit password change still applies. (Flagged as a deliberate port
-/// simplification.)
+/// shared crypto provider, supporting password-less users. Every PBKDF2 run
+/// (verify and hash) goes to tokio's blocking pool: 210,000 rounds must not hold
+/// an async worker. Unlike upstream it does **not** re-hash (migrate) legacy
+/// hashes in-place on login: `authenticate` takes the user by shared reference,
+/// so a hash upgrade would need a write path the [`AuthenticationManager`] trait
+/// does not expose. Migration on next explicit password change still applies.
+/// (Flagged as a deliberate port simplification.)
 #[derive(Debug, Clone, Default)]
 pub struct DefaultAuthenticationProvider {
     crypto: CryptographyProvider,
@@ -75,16 +76,32 @@ impl DefaultAuthenticationProvider {
     ///
     /// # Errors
     /// Returns [`ServiceError::Backend`] if hashing fails.
-    pub fn format_password_hash(&self, new_password: &str) -> Result<Option<String>, ServiceError> {
+    pub async fn format_password_hash(
+        &self,
+        new_password: &str,
+    ) -> Result<Option<String>, ServiceError> {
         if new_password.is_empty() {
             return Ok(None);
         }
-        let hash = self
-            .crypto
-            .create_password_hash(new_password)
+        let crypto = self.crypto;
+        let new_password = new_password.to_owned();
+        let hash = blocking(move || crypto.create_password_hash(&new_password))
+            .await?
             .map_err(|e| ServiceError::Backend(format!("hashing password: {e}")))?;
         Ok(Some(hash.to_string()))
     }
+}
+
+/// Runs PBKDF2 work on tokio's blocking pool, so a login never holds an async
+/// worker for a whole hash. Dropping the caller (a client that disconnects
+/// mid-login) does not abort the work: the hash runs to completion and its
+/// result is discarded.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ServiceError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| ServiceError::Backend(format!("password hashing task failed: {e}")))
 }
 
 #[async_trait]
@@ -128,9 +145,10 @@ impl AuthenticationManager for DefaultAuthenticationProvider {
 
         let hash = PasswordHash::parse(stored)
             .map_err(|e| ServiceError::Backend(format!("parsing stored password hash: {e}")))?;
-        let ok = self
-            .crypto
-            .verify(&hash, password)
+        let crypto = self.crypto;
+        let password = password.to_owned();
+        let ok = blocking(move || crypto.verify(&hash, &password))
+            .await?
             .map_err(|e| ServiceError::Backend(format!("verifying password: {e}")))?;
         if !ok {
             return Err(ServiceError::Unauthorized(
@@ -243,6 +261,7 @@ mod tests {
         let provider = DefaultAuthenticationProvider::new();
         let hash = provider
             .format_password_hash("correct")
+            .await
             .expect("hash")
             .expect("some hash");
         let user = user_with_password(Some(hash)).await;
@@ -259,6 +278,32 @@ mod tests {
         ));
     }
 
+    /// PBKDF2 runs on the blocking pool: on a single-threaded runtime, a task
+    /// beside a login keeps running while the hash is computed. Inline, the
+    /// login's first poll would hold the thread for the whole hash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn verify_does_not_block_the_runtime() {
+        // PBKDF2-HMAC-SHA512, 20,000 iterations, of "pw": slow enough to observe.
+        const HASH: &str = "$PBKDF2-SHA512$iterations=20000$0A1B2C3D4E5F60718293A4B5C6D7E8F9$\
+            F4AFA1D71E05BE8B12BB2A758CEDFF65276341F9E06248F5813EB9800AB06F34\
+            9C6E217DFD6285C1CBD9896C42DBF0221E4EFD81330A176C0F912D7C6FC6524C";
+        let provider = DefaultAuthenticationProvider::new();
+        let user = user_with_password(Some(HASH.to_owned())).await;
+        let mut ticks = 0u32;
+        let ticker = async {
+            loop {
+                tokio::task::yield_now().await;
+                ticks += 1;
+            }
+        };
+        tokio::select! {
+            biased;
+            result = provider.authenticate("u", "pw", Some(&user)) => assert!(result.is_ok()),
+            _ = ticker => unreachable!("the ticker never ends"),
+        }
+        assert!(ticks > 0, "the runtime was blocked for the whole hash");
+    }
+
     #[tokio::test]
     async fn no_resolved_user_is_unauthorized() {
         let provider = DefaultAuthenticationProvider::new();
@@ -273,6 +318,7 @@ mod tests {
         let provider = DefaultAuthenticationProvider::new();
         let raw = provider
             .format_password_hash("pw")
+            .await
             .expect("hash")
             .expect("some");
         let parsed = PasswordHash::parse(&raw).expect("parse");
