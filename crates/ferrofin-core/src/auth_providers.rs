@@ -36,11 +36,10 @@ pub const INVALID_AUTH_PROVIDER_ID: &str =
 /// Verifies a stored [`PasswordHash`] against the presented password using the
 /// shared crypto provider, supporting password-less users. Every PBKDF2 run
 /// (verify and hash) goes to tokio's blocking pool: 210,000 rounds must not hold
-/// an async worker. Unlike upstream it does **not** re-hash (migrate) legacy
-/// hashes in-place on login: `authenticate` takes the user by shared reference,
-/// so a hash upgrade would need a write path the [`AuthenticationManager`] trait
-/// does not expose. Migration on next explicit password change still applies.
-/// (Flagged as a deliberate port simplification.)
+/// an async worker. Upstream's "migrate old hashes to the new default" step
+/// needs a write, which the [`AuthenticationManager`] trait does not expose, so
+/// the `UserManager` performs it after a successful login through
+/// [`upgraded_hash`](Self::upgraded_hash).
 #[derive(Debug, Clone, Default)]
 pub struct DefaultAuthenticationProvider {
     crypto: CryptographyProvider,
@@ -56,8 +55,7 @@ impl DefaultAuthenticationProvider {
     }
 
     /// Whether a stored hash is already at the current default method and
-    /// iteration count (C# migration check). Exposed for the `UserManager` to
-    /// decide whether to re-hash on an authenticated password touch.
+    /// iteration count (C# migration check).
     #[must_use]
     pub fn hash_is_current(&self, hash: &PasswordHash) -> bool {
         if hash.id() != self.crypto.default_hash_method() {
@@ -89,6 +87,30 @@ impl DefaultAuthenticationProvider {
             .await?
             .map_err(|e| ServiceError::Backend(format!("hashing password: {e}")))?;
         Ok(Some(hash.to_string()))
+    }
+
+    /// The hash to store after `password` verified against `stored`: a fresh
+    /// default hash when `stored` is not [current](Self::hash_is_current), else
+    /// `None`. Port of the "Migrate old hashes to the new default" step of C#
+    /// `DefaultAuthenticationProvider.Authenticate`.
+    ///
+    /// # Errors
+    /// Returns [`ServiceError::Backend`] if `stored` does not parse or hashing
+    /// fails.
+    pub async fn upgraded_hash(
+        &self,
+        stored: &str,
+        password: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        if stored.is_empty() {
+            return Ok(None);
+        }
+        let hash = PasswordHash::parse(stored)
+            .map_err(|e| ServiceError::Backend(format!("parsing stored password hash: {e}")))?;
+        if self.hash_is_current(&hash) {
+            return Ok(None);
+        }
+        self.format_password_hash(password).await
     }
 }
 
@@ -323,6 +345,12 @@ mod tests {
             .expect("some");
         let parsed = PasswordHash::parse(&raw).expect("parse");
         assert!(provider.hash_is_current(&parsed));
+        // A current hash is never re-hashed on login, nor a password-less user.
+        assert_eq!(
+            provider.upgraded_hash(&raw, "pw").await.expect("current"),
+            None
+        );
+        assert_eq!(provider.upgraded_hash("", "").await.expect("empty"), None);
     }
 
     #[tokio::test]
