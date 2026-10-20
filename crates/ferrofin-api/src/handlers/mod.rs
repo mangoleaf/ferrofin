@@ -1145,6 +1145,34 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Branding/Splashscreen",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "UploadCustomSplashscreen",
+        ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
+               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
+               to_extension, decode_base64)",
+        date: "2026-10-20",
+        divergences: &[
+            "The body is decoded in full before anything is written, and the location is \
+         recorded only after the file is: a body the decoder rejects is a 400 that changes \
+         nothing, and an unpadded final group is decoded. Upstream records the new \
+         SplashscreenLocation first and decodes while copying, so invalid base64 fails \
+         mid-copy with a 500 (FormatException), any write failure leaves the recorded \
+         location pointing at a missing or truncated file, and FromBase64Transform drops \
+         an unpadded final group. Jellyfin bugs not ported.",
+            "decode_base64 skips `=` wherever it appears, so a body with padding inside the \
+         data is decoded and saved where FromBase64Transform refuses it. Fix path: gl-689.",
+            "The body is read as UTF-8 text before the Content-Type is checked, so a body \
+         that is not UTF-8 is the extractor's 400 whatever its type; upstream checks the \
+         type first and fails such a body with a 500 while decoding. Jellyfin bug not \
+         ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
