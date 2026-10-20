@@ -6,10 +6,10 @@ use ferrofin_model::entities_media::MediaStream;
 
 /// `stream` as a video (its type forced to `Video`) whose transfer, HDR10+
 /// flag and, for Dolby Vision, (profile, compatibility id) give
-/// `range_type`. Every row also carries BT.2020 colours, as an HDR base
-/// layer would; they do not change a row's range type. The cached range
-/// fields stay unset, so a check that reads them instead of deriving the
-/// range fails its HDR cases.
+/// `range_type`. Every row also carries BT.2020 colours, which a Dolby Vision
+/// row with an HDR10 or HLG base needs to be valid; they do not change any
+/// other row's range type. The cached range fields stay unset, so a check
+/// that reads them instead of deriving the range fails its HDR cases.
 pub(crate) fn with_range(stream: MediaStream, range_type: VideoRangeType) -> MediaStream {
     let (dovi, transfer, hdr10_plus) = match range_type {
         VideoRangeType::Sdr => (None, "bt709", false),
@@ -41,4 +41,33 @@ pub(crate) fn with_range(stream: MediaStream, range_type: VideoRangeType) -> Med
     };
     assert_eq!(s.video_range_type(), range_type, "fixture");
     s
+}
+
+/// Upstream's `EncodingHelperDoviTests.CreateState` stream (v12.2): an
+/// out-of-spec Dolby Vision 10-bit video (HEVC profile 7, AV1 profile 10.1)
+/// whose base layer is tagged BT.709 with `transfer`, so `DOVIInvalid`
+/// whatever the transfer.
+pub(crate) fn invalid_dovi(codec: &str, transfer: Option<&str>) -> MediaStream {
+    let hevc = codec == "hevc";
+    let stream = MediaStream {
+        stream_type: MediaStreamType::Video,
+        codec: Some(codec.to_owned()),
+        width: Some(1920),
+        height: Some(1080),
+        bit_depth: Some(10),
+        dv_profile: Some(if hevc { 7 } else { 10 }),
+        dv_bl_signal_compatibility_id: Some(if hevc { 6 } else { 1 }),
+        rpu_present_flag: Some(1),
+        bl_present_flag: Some(1),
+        color_space: Some("bt709".to_owned()),
+        color_primaries: Some("bt709".to_owned()),
+        color_transfer: transfer.map(str::to_owned),
+        ..MediaStream::default()
+    };
+    assert_eq!(
+        stream.video_range_type(),
+        VideoRangeType::DoviInvalid,
+        "fixture"
+    );
+    stream
 }

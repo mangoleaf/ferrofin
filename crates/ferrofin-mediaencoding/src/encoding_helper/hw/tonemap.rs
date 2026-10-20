@@ -54,17 +54,21 @@ pub const DEFAULT_TONEMAP_FORMAT: &str = "nv12";
 /// Like every range check here it reads the range the stream's metadata
 /// gives ([`MediaStream::video_range_type`]), as upstream's computed
 /// `VideoRangeType` does, not the field the DTO caches.
+///
+/// An out-of-spec stream (`DoviInvalid`) counts only on a PQ base layer: its
+/// base may be HLG or SDR (jellyfin#17806).
 #[must_use]
 pub fn is_dovi_with_hdr10_bl(stream: Option<&MediaStream>) -> bool {
-    stream.is_some_and(|s| {
-        matches!(
-            s.video_range_type(),
-            VideoRangeType::DoviWithHdr10
-                | VideoRangeType::DoviWithEl
-                | VideoRangeType::DoviWithHdr10Plus
-                | VideoRangeType::DoviWithElhdr10Plus
-                | VideoRangeType::DoviInvalid
-        )
+    stream.is_some_and(|s| match s.video_range_type() {
+        VideoRangeType::DoviWithHdr10
+        | VideoRangeType::DoviWithEl
+        | VideoRangeType::DoviWithHdr10Plus
+        | VideoRangeType::DoviWithElhdr10Plus => true,
+        VideoRangeType::DoviInvalid => s
+            .color_transfer
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("smpte2084")),
+        _ => false,
     })
 }
 
@@ -75,7 +79,10 @@ pub fn is_dovi(stream: Option<&MediaStream>) -> bool {
         || stream.is_some_and(|s| {
             matches!(
                 s.video_range_type(),
-                VideoRangeType::Dovi | VideoRangeType::DoviWithHlg | VideoRangeType::DoviWithSdr
+                VideoRangeType::Dovi
+                    | VideoRangeType::DoviWithHlg
+                    | VideoRangeType::DoviWithSdr
+                    | VideoRangeType::DoviInvalid
             )
         })
 }
@@ -164,7 +171,8 @@ pub fn is_intel_vpp_tonemap_available(
 /// HLG is accepted here where the Intel VPP predicate rejects it, and Dolby
 /// Vision profile 5 (`Dovi` with no HDR10 base layer) is excluded: it plays
 /// correctly in Safari by direct play, but VideoToolbox maps it wrongly when
-/// transcoding.
+/// transcoding. An out-of-spec Dolby Vision stream is accepted on any HDR
+/// base, PQ or HLG (jellyfin#17806).
 #[must_use]
 pub fn is_videotoolbox_tonemap_available(
     options: &EncodingOptions,
@@ -180,7 +188,8 @@ pub fn is_videotoolbox_tonemap_available(
         && (stream.video_range_type() == VideoRangeType::Hdr10
             || is_hdr10_plus(Some(stream))
             || is_dovi_with_hdr10_bl(Some(stream))
-            || stream.video_range_type() == VideoRangeType::Hlg)
+            || stream.video_range_type() == VideoRangeType::Hlg
+            || stream.video_range_type() == VideoRangeType::DoviInvalid)
 }
 
 /// The hardware tonemap filter for a backend suffix. Port of
@@ -447,6 +456,50 @@ mod tests {
         assert!(is_dovi(Some(&stream)));
     }
 
+    /// Upstream's `EncodingHelperDoviTests.CreateState` stream, in HEVC.
+    fn invalid_dovi(transfer: Option<&str>) -> MediaStream {
+        crate::encoding_helper::test_streams::invalid_dovi("hevc", transfer)
+    }
+
+    /// Upstream's `IsDoviWithHdr10Bl_InvalidDovi_RequiresPq` (v12.2).
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some("bt709"), false)]
+    #[case(Some("arib-std-b67"), false)]
+    #[case(Some("smpte2084"), true)]
+    #[case(Some("SMPTE2084"), true)]
+    fn is_dovi_with_hdr10_bl_invalid_dovi_requires_pq(
+        #[case] transfer: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let stream = invalid_dovi(transfer);
+        assert!(is_dovi(Some(&stream)));
+        assert_eq!(is_dovi_with_hdr10_bl(Some(&stream)), expected);
+    }
+
+    /// Upstream's `GetSwVidFilterChain_InvalidDovi_OnlyTonemapsHdrBaseLayer`
+    /// (v12.2), over the two calls the software chain is built from: the
+    /// planner's `do_sw_tonemap` and the chain's first `setparams`.
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some("bt709"), false)]
+    #[case(Some("unknown"), false)]
+    #[case(Some("bt2020-10"), false)]
+    #[case(Some("smpte2084"), true)]
+    #[case(Some("arib-std-b67"), true)]
+    fn sw_tonemap_of_invalid_dovi_only_takes_an_hdr_base_layer(
+        #[case] transfer: Option<&str>,
+        #[case] tonemap: bool,
+    ) {
+        let caps = caps(FfmpegVersion::with_build(7, 0, 1), Platform::Linux);
+        let stream = invalid_dovi(transfer);
+        let do_sw_tonemap = is_sw_tonemap_available(&caps, Some(&stream));
+        assert_eq!(do_sw_tonemap, tonemap);
+        let params = overwrite_color_properties_param(transfer, do_sw_tonemap);
+        let trc = if tonemap { transfer.unwrap() } else { "bt709" };
+        assert!(params.contains(&format!("color_trc={trc}")), "{params}");
+    }
+
     #[test]
     fn no_stream_is_no_range() {
         assert!(!is_dovi_with_hdr10_bl(None));
@@ -584,6 +637,22 @@ mod tests {
             expected,
             "{range_type:?}"
         );
+    }
+
+    /// jellyfin#17806 keeps an out-of-spec Dolby Vision stream on an HLG base
+    /// mappable by VideoToolbox, now that it has no HDR10 base layer.
+    #[test]
+    fn the_videotoolbox_tonemap_takes_invalid_dovi_on_any_hdr_base() {
+        let options = EncodingOptions {
+            enable_video_toolbox_tonemapping: true,
+            ..EncodingOptions::default()
+        };
+        let hlg = invalid_dovi(Some("arib-std-b67"));
+        assert!(!is_dovi_with_hdr10_bl(Some(&hlg)));
+        assert!(is_videotoolbox_tonemap_available(&options, Some(&hlg)));
+        // An SDR base has nothing to map.
+        let sdr = invalid_dovi(Some("bt709"));
+        assert!(!is_videotoolbox_tonemap_available(&options, Some(&sdr)));
     }
 
     // ----- the filters themselves --------------------------------------------

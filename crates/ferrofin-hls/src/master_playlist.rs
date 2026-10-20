@@ -599,6 +599,14 @@ fn append_playlist_video_range_field(builder: &mut String, state: &EncodingJobIn
                 VideoRangeType::Hlg | VideoRangeType::DoviWithHlg => {
                     builder.push_str(",VIDEO-RANGE=HLG");
                 }
+                VideoRangeType::DoviInvalid
+                    if video_stream
+                        .color_transfer
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("arib-std-b67")) =>
+                {
+                    builder.push_str(",VIDEO-RANGE=HLG");
+                }
                 _ => builder.push_str(",VIDEO-RANGE=PQ"),
             },
             VideoRange::Unknown | VideoRange::Unrecognized(_) => {}
@@ -1292,12 +1300,42 @@ mod tests {
             profile: Some("Main 10".to_owned()),
             level: Some(153.0),
             bit_depth: Some(10),
+            color_space: Some("bt2020nc".to_owned()),
             color_transfer: Some("smpte2084".to_owned()),
             color_primaries: Some("bt2020".to_owned()),
             average_frame_rate: Some(23.976),
             real_frame_rate: Some(23.976),
             ..video_stream()
         }
+    }
+
+    /// An out-of-spec Dolby Vision copy is advertised with its base layer's
+    /// range: `VIDEO-RANGE=HLG` for an HLG base, SDR for an SDR base
+    /// (jellyfin#17806).
+    #[rstest::rstest]
+    #[case("arib-std-b67", ",VIDEO-RANGE=HLG,", "VIDEO-RANGE=PQ")]
+    #[case("smpte2084", ",VIDEO-RANGE=PQ,", "VIDEO-RANGE=HLG")]
+    // An HDR copy also gets an SDR entrance, so SDR shows only by PQ's absence.
+    #[case("bt709", ",VIDEO-RANGE=SDR,", "VIDEO-RANGE=PQ")]
+    fn an_invalid_dovi_copy_takes_its_base_layers_video_range(
+        #[case] transfer: &str,
+        #[case] expected: &str,
+        #[case] absent: &str,
+    ) {
+        let video = MediaStream {
+            color_transfer: Some(transfer.to_owned()),
+            dv_profile: Some(8),
+            dv_bl_signal_compatibility_id: Some(6),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            ..hdr_hevc_stream()
+        };
+        assert_eq!(video.video_range_type(), VideoRangeType::DoviInvalid);
+        let mut s = state(vec![video, audio_stream()]);
+        s.output_video_codec = Some("copy".to_owned());
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        assert!(pl.contains(expected), "got: {pl}");
+        assert!(!pl.contains(absent), "got: {pl}");
     }
 
     /// Copying an HDR source adds the H.264 SDR entrance with
