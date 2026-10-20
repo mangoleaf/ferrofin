@@ -990,7 +990,6 @@ pub const VERIFIED: &[Verified] = &[
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
             VERSION_RESUME_DATA_DIVERGENCE,
-            USER_DATA_RETIRED_KEYS_DIVERGENCE,
         ],
         refs: &[],
     },
@@ -1312,7 +1311,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
     VERSION_RESUME_DATA_DIVERGENCE,
-    USER_DATA_RETIRED_KEYS_DIVERGENCE,
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
      count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
@@ -1325,12 +1323,6 @@ const VERSION_RESUME_DATA_DIVERGENCE: &str = "VersionResumeData.ApplyTo is not p
      is its own row, where v12 takes Played, LastPlayedDate and the resume position from \
      the most recently played version of its group. The write-side propagate_played_state \
      covers finishing a version through playback. Fix path: gl-47.";
-
-/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
-const USER_DATA_RETIRED_KEYS_DIVERGENCE: &str = "v12.2 SaveUserData also rewrites the \
-     user's rows under keys the item no longer reports; Ferrofin writes the current keys \
-     only, so a stale-key row can keep an item played or in progress here. Fix path: \
-     gl-398.";
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

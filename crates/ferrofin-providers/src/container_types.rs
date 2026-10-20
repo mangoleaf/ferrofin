@@ -106,7 +106,7 @@ impl PersonInfo {
             || self
                 .role
                 .as_deref()
-                .is_some_and(|r| r.eq_ignore_ascii_case(&format!("{type_:?}")))
+                .is_some_and(|r| r.eq_ignore_ascii_case(&type_.json_name()))
     }
 }
 

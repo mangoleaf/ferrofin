@@ -23,6 +23,21 @@ item was deleted, and logs how many it removed from each table. It snapshots the
 `jellyfin.db.pre-ferrofin` copy, as always. Nobody can reach the deleted
 rows, so nothing visible changes. A database the earlier version refused now opens.
 
+## Unreleased — items whose owner is gone are removed, once
+
+A Jellyfin 12.x database can hold an item whose owning item is gone, typically an extra
+(a trailer, a featurette). Jellyfin 12.2 starts with it and keeps the row (an extra stays
+visible in default queries); earlier Ferrofin versions refused to open such a database
+("foreign-key violation(s)"), on adoption and on every boot after.
+
+On first boot migration `0045` hands such an item to the placeholder item, as `0032` does
+for a 10.11 database, and the start-up repair then deletes it with what hangs under it
+(streams, images, links), logging how many items it removed. Play state recorded for it
+moves to the placeholder item, as in Jellyfin. An owner that exists but is spelled in
+another case keeps its item, and an item whose owner is empty or the all-zero id is kept
+without an owner. A database the earlier version refused now opens. The pre-0044
+snapshot and the adoption copy cover this boot too.
+
 ## Unreleased — playlists get their own folder and a new id, once
 
 A playlist created in Ferrofin had no folder. Jellyfin gives each playlist one,
