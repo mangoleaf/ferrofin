@@ -771,7 +771,7 @@ pub(crate) fn parse_media_type(stored: Option<&str>) -> MediaType {
 /// Maps a stored `ExtraType` discriminant onto the enum, or `None` for a value
 /// with no corresponding extra type (the `0`/`Unknown` sentinel and any
 /// out-of-range discriminant).
-fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
+pub(crate) fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
     Some(match disc {
         1 => ExtraType::Clip,
         2 => ExtraType::Trailer,
@@ -1851,7 +1851,7 @@ impl FerrofinDtoService {
                     .person_type
                     .as_deref()
                     .map_or(ferrofin_model::data::PersonKind::Unknown, |t| {
-                        person_kind_from_str(t)
+                        ferrofin_model::data::PersonKind::from_stored(t)
                     }),
                 primary_image_tag,
                 image_blur_hashes: None,
@@ -2330,7 +2330,10 @@ impl FerrofinDtoService {
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
-                    if kinds::supports_played_status(kind) {
+                    if kinds::supports_played_status(
+                        kind,
+                        parse_media_type(item.media_type.as_deref()),
+                    ) {
                         fill_folder_played(
                             dto.user_data
                                 .get_or_insert_with(|| empty_user_data_dto(item_id)),
@@ -3570,7 +3573,6 @@ fn f64_to_f32(value: f64) -> f32 {
     value as f32
 }
 
-/// Maps a stored `PersonType` string onto a [`PersonKind`].
 /// `AttachPeople`'s order (`DtoService.cs:900-935`) over an item's credits
 /// as `GetPeople` returns them (`ListOrder`): by `SortOrder ?? int.MaxValue`,
 /// then by kind — actors, guest stars, directors, writers, then producers
@@ -3584,7 +3586,7 @@ fn attach_order(
     let kind_rank = |person: &ferrofin_db::entities::base_items::PeopleEntity| match person
         .person_type
         .as_deref()
-        .map(person_kind_from_str)
+        .map(ferrofin_model::data::PersonKind::from_stored)
     {
         Some(PersonKind::Actor) => 0,
         Some(PersonKind::GuestStar) => 1,
@@ -3602,25 +3604,6 @@ fn attach_order(
         )
     });
     ordered
-}
-
-fn person_kind_from_str(value: &str) -> ferrofin_model::data::PersonKind {
-    use ferrofin_model::data::PersonKind;
-    match value {
-        "Actor" => PersonKind::Actor,
-        "Director" => PersonKind::Director,
-        "Composer" => PersonKind::Composer,
-        "Writer" => PersonKind::Writer,
-        "GuestStar" => PersonKind::GuestStar,
-        "Producer" => PersonKind::Producer,
-        "Conductor" => PersonKind::Conductor,
-        "Lyricist" => PersonKind::Lyricist,
-        "Artist" => PersonKind::Artist,
-        "AlbumArtist" => PersonKind::AlbumArtist,
-        "Author" => PersonKind::Author,
-        "Narrator" => PersonKind::Narrator,
-        _ => PersonKind::Unknown,
-    }
 }
 
 /// Maps the trickplay-manager manifest of stored rows onto the DTO's
@@ -4484,8 +4467,10 @@ impl FerrofinDtoService {
                     .filter(|i| {
                         let kind = row_kind(i);
                         kinds::supports_user_data_from_children(kind)
-                            && (kinds::supports_played_status(kind)
-                                || options.contains_field(ItemFields::RecursiveItemCount))
+                            && (kinds::supports_played_status(
+                                kind,
+                                parse_media_type(i.media_type.as_deref()),
+                            ) || options.contains_field(ItemFields::RecursiveItemCount))
                     })
                     .map(row_id)
                     .filter(|id| !counts.contains_key(id))
@@ -5330,6 +5315,38 @@ mod tests {
         assert_eq!(ud.played_percentage, None);
         assert!(ud.played);
         assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
+    /// only a video playlist carries the folder played numbers.
+    #[tokio::test]
+    async fn only_a_video_playlist_carries_played_counts() {
+        let db = test_db().await;
+        let playlist_id = Uuid::new_v4();
+        seed_folder_item(&db, playlist_id, BaseItemKind::Playlist, "Mix", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service_with_counts(
+            db.clone(),
+            FakeCounts {
+                played: 1,
+                ..FakeCounts::default()
+            },
+        );
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        for (media_type, counted) in [("Video", true), ("Audio", false)] {
+            let mut playlist = fetch_item(&db, playlist_id).await;
+            playlist.media_type = Some(media_type.to_owned());
+            let dto = svc
+                .get_base_item_dto(&playlist, &narrow, Some(&user), None)
+                .await
+                .unwrap();
+            let ud = dto.user_data.as_ref().unwrap();
+            assert_eq!(ud.unplayed_item_count.is_some(), counted, "{media_type}");
+            assert_eq!(ud.played_percentage.is_some(), counted, "{media_type}");
+        }
     }
 
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
@@ -10048,6 +10065,51 @@ mod tests {
             .filter_map(|p| p.name.as_deref())
             .collect();
         assert_eq!(names, expected);
+    }
+
+    /// `People[].Type` is the stored `PersonType` parsed the way upstream's
+    /// `PeopleRepository` does (`Enum.TryParse<PersonKind>(row.PersonType, out
+    /// var kind)`, `PeopleRepository.cs:346`, `:380`): every member name,
+    /// case-sensitively; anything else leaves `Unknown`.
+    #[tokio::test]
+    async fn people_carry_every_stored_person_kind() {
+        use ferrofin_model::json::enums::JsonEnum as _;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let item = fetch_item(&db, movie).await;
+        let mut stored: Vec<(&str, &str)> = ferrofin_model::data::PersonKind::members()
+            .iter()
+            .map(|(name, _)| (*name, *name))
+            .collect();
+        stored.extend([("actor", "Unknown"), ("Colorer", "Unknown")]);
+        let library = Arc::new(FakeLibrary {
+            people: (0_i64..)
+                .zip(&stored)
+                .map(|(order, (kind, _))| PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: format!("Person {order}"),
+                    person_type: Some((*kind).to_owned()),
+                    sort_order: Some(order),
+                    ..Default::default()
+                })
+                .collect(),
+            named_items: Vec::new(),
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let types: Vec<String> = dto
+            .people
+            .as_ref()
+            .expect("people")
+            .iter()
+            .map(|person| person.type_.json_name().into_owned())
+            .collect();
+        let expected: Vec<&str> = stored.iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(types, expected);
     }
 
     #[tokio::test]

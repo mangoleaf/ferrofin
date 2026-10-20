@@ -620,48 +620,19 @@ fn opf_identifier_key(scheme: &str) -> Option<&'static str> {
     }
 }
 
-/// A ComicBookInfo credit role as a `PersonKind` name — port of C#'s
-/// `Enum.TryParse<PersonKind>(role)` with its `Unknown` fallback and the
-/// explicit `"Colorer"` → `Colorist` special case.
+/// A ComicBookInfo credit role as a `PersonKind` name — port of
+/// `ComicBookInfoProvider`'s case-sensitive `Enum.TryParse(person.Role, out
+/// PersonKind)` with its `Unknown` fallback, then the `"Colorer"` → `Colorist`
+/// special case, which ignores case (`StringComparison.OrdinalIgnoreCase`).
 fn person_kind(role: &str) -> String {
-    if role.eq_ignore_ascii_case("Colorer") {
-        return "Colorist".to_owned();
-    }
-    PERSON_KINDS
-        .iter()
-        .find(|kind| kind.eq_ignore_ascii_case(role))
-        .map_or_else(|| "Unknown".to_owned(), |kind| (*kind).to_owned())
+    let kind = if role.eq_ignore_ascii_case("Colorer") {
+        ferrofin_model::data::PersonKind::Colorist
+    } else {
+        ferrofin_model::json::enums::try_parse(role, false)
+            .unwrap_or(ferrofin_model::data::PersonKind::Unknown)
+    };
+    kind.json_name().into_owned()
 }
-
-/// The `PersonKind` names `Enum.TryParse` accepts, from
-/// `Jellyfin.Data/Enums/PersonKind.cs`.
-const PERSON_KINDS: [&str; 25] = [
-    "Unknown",
-    "Actor",
-    "Director",
-    "Composer",
-    "Writer",
-    "GuestStar",
-    "Producer",
-    "Conductor",
-    "Lyricist",
-    "Arranger",
-    "Engineer",
-    "Mixer",
-    "Remixer",
-    "Creator",
-    "Artist",
-    "AlbumArtist",
-    "Author",
-    "Illustrator",
-    "Penciller",
-    "Inker",
-    "Colorist",
-    "Letterer",
-    "CoverArtist",
-    "Editor",
-    "Translator",
-];
 
 /// The person kind an OPF `opf:role` MARC relator marks — port of
 /// `OpfReader.GetRole`, including its default-to-`Author` fallthrough.
@@ -1357,6 +1328,22 @@ mod tests {
         // A real PersonKind survives, "Colorer" is normalized, and anything
         // Enum.TryParse would reject becomes Unknown rather than a raw string.
         assert_eq!(kinds, ["Penciller", "Colorist", "Unknown"]);
+    }
+
+    /// `ComicBookInfoProvider` parses the role with the case-sensitive
+    /// `Enum.TryParse(person.Role, out PersonKind)`, and only the `Colorer`
+    /// special case ignores case (`StringComparison.OrdinalIgnoreCase`).
+    #[test]
+    fn comic_book_info_roles_parse_case_sensitively() {
+        let book = parse_comic_book_info(
+            r#"{"ComicBookInfo/1.0":{"title":"T","credits":[
+                {"person":"A","role":"penciller"},
+                {"person":"B","role":"colorer"},
+                {"person":"C","role":"CoverArtist"}]}}"#,
+        )
+        .expect("metadata");
+        let kinds: Vec<&str> = book.people.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(kinds, ["Unknown", "Colorist", "CoverArtist"]);
     }
 
     #[test]
