@@ -1970,7 +1970,10 @@ pub async fn build_app_state(
         // The music "Links" row points at the configured MusicBrainz mirror, as
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url)
-        .with_virtual_paths(virtual_paths),
+        .with_virtual_paths(virtual_paths)
+        // The `MediaSources`' default-stream selection normalizes languages
+        // through the same localization the media-source manager does.
+        .with_localization(Arc::clone(&localization)),
     );
     // `DtoService` finishes a Live TV channel's DTO itself (C#
     // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV

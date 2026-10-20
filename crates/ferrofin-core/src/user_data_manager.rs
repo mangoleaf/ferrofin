@@ -998,6 +998,20 @@ impl UserDataManager for FerrofinUserDataManager {
         }))
     }
 
+    async fn get_stream_default_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, (Option<i32>, Option<i32>)>, ServiceError> {
+        Ok(self
+            .stored_preferred_rows(item_ids, user_id)
+            .await?
+            .into_iter()
+            .map(|(id, row)| (id, (row.audio_stream_index, row.subtitle_stream_index)))
+            .filter(|(_, remembered)| *remembered != (None, None))
+            .collect())
+    }
+
     async fn get_user_data_dto(
         &self,
         item_id: Uuid,
@@ -1468,6 +1482,21 @@ impl FerrofinUserDataManager {
         item_ids: &[Uuid],
         user_id: Uuid,
     ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        Ok(self
+            .stored_preferred_rows(item_ids, user_id)
+            .await?
+            .into_iter()
+            .map(|(id, row)| (id, to_dto(&row, id)))
+            .collect())
+    }
+
+    /// The row [`Self::read_row`] would pick for each of `item_ids`, in two
+    /// reads for the whole set; an item with no stored row is absent.
+    async fn stored_preferred_rows(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, UserDataEntity>, ServiceError> {
         let rows = self.stored_user_data_rows(item_ids, user_id).await?;
         if rows.is_empty() {
             return Ok(HashMap::new());
@@ -1486,10 +1515,33 @@ impl FerrofinUserDataManager {
                 let current = keys
                     .get(&guid_to_db(id))
                     .map_or(own.as_slice(), Vec::as_slice);
-                Self::preferred_row(&candidates, current).map(|row| (id, to_dto(&row, id)))
+                Self::preferred_row(&candidates, current).map(|row| (id, row))
             })
             .collect())
     }
+}
+
+/// Test-only: sets the audio and subtitle stream indices `user` remembers
+/// for `item` on its existing `UserData` rows.
+#[cfg(test)]
+pub(crate) async fn remember_streams(
+    db: &Database,
+    user: Uuid,
+    item: Uuid,
+    audio: Option<i32>,
+    subtitle: Option<i32>,
+) {
+    sqlx::query(
+        r#"UPDATE "UserData" SET "AudioStreamIndex" = ?3, "SubtitleStreamIndex" = ?4
+           WHERE "UserId" = ?1 AND "ItemId" = ?2"#,
+    )
+    .bind(guid_to_db(user))
+    .bind(guid_to_db(item))
+    .bind(audio)
+    .bind(subtitle)
+    .execute(db.writer())
+    .await
+    .expect("remember streams");
 }
 
 /// Test-only: how many `UserData` rows item `item` holds.
@@ -1594,6 +1646,61 @@ mod tests {
         Arc::new(FixedConfig {
             config: default_server_configuration(),
         })
+    }
+
+    /// The page read of remembered stream indices picks, per item, the row
+    /// the per-item read picks — the current user-data key over a stale one —
+    /// and leaves out items that remember nothing.
+    #[tokio::test]
+    async fn stream_default_batch_agrees_with_the_per_item_read() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let [remembers, rekeyed, forgets, unplayed] = [(); 4].map(|()| Uuid::new_v4());
+        for item in [remembers, rekeyed, forgets, unplayed] {
+            seed_named_item(&db, item, BaseItemKind::Movie, "Movie").await;
+        }
+        seed_provider_id(&db, rekeyed, "Tmdb", "603").await;
+        for (item, key, audio, subtitle) in [
+            (remembers, remembers.to_string(), Some(2), Some(-1)),
+            (rekeyed, "stale".to_owned(), Some(7), Some(5)),
+            (rekeyed, "603".to_owned(), None, Some(3)),
+            (forgets, forgets.to_string(), None, None),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData"
+                   ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+                    "PlaybackPositionTicks", "Played", "AudioStreamIndex",
+                    "SubtitleStreamIndex")
+                   VALUES (?1, ?2, ?3, 0, 0, 0, 0, ?4, ?5)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .bind(audio)
+            .bind(subtitle)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        let ids = [remembers, rekeyed, forgets, unplayed];
+
+        let batch = manager
+            .get_stream_default_data_batch(&ids, user)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 2, "{batch:?}");
+        for item in ids {
+            let single = manager.get_stream_default_data(item, user).await.unwrap();
+            assert_eq!(
+                batch.get(&item).copied().unwrap_or_default(),
+                single,
+                "{item}"
+            );
+        }
+        assert_eq!(batch[&rekeyed], (None, Some(3)), "the current key's row");
     }
 
     #[rstest::rstest]
