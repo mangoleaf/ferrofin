@@ -121,12 +121,12 @@ pub fn nvidia_vid_filters_prefered(input: &ChainInput<'_>) -> FilterChain {
                 .main
                 .push(sw_deinterlace_filter(options, input.reference_frame_rate));
         }
-        // Tonemapping needs the extra bits, so the CPU-side format widens.
-        let out_format = if do_cu_tonemap {
-            "yuv420p10le"
-        } else {
-            "yuv420p"
-        };
+        // Tonemapping needs the extra bits, so the CPU-side format widens — to
+        // semi-planar `p010le` (v12.2, jellyfin/jellyfin#17334): FFmpeg 8.1's
+        // CUDA hwcontext uploads a planar `yuv420p10le` unchanged, and
+        // `tonemap_cuda` rejects it. Only the CUDA chain; the OpenCL chains
+        // keep `yuv420p10le`, as upstream.
+        let out_format = if do_cu_tonemap { "p010le" } else { "yuv420p" };
         chain.main.push(super::sw_chain::sw_scale_filter(
             input.video_encoder,
             in_w,
@@ -439,13 +439,15 @@ mod tests {
             chain.main
         );
 
-        // With tonemapping the CUDA filter needs them in VRAM.
+        // With tonemapping the CUDA filter needs them in VRAM, as semi-planar
+        // `p010le`: FFmpeg 8.1's CUDA hwcontext keeps a planar `yuv420p10le`
+        // upload as is, and `tonemap_cuda` rejects that format.
         let mut inp = input(&caps, &options, "", "h264_nvenc");
         inp.do_hw_tonemap = true;
         let chain = nvidia_vid_filters_prefered(&inp);
         let joined = chain.main.join(",");
         assert!(
-            joined.contains("format=yuv420p10le,hwupload=derive_device=cuda"),
+            joined.contains("format=p010le,hwupload=derive_device=cuda"),
             "{joined}"
         );
         // The whole filter, not just its name — every byte of this reaches the

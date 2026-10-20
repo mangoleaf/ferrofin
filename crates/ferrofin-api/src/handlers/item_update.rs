@@ -253,6 +253,10 @@ pub(crate) struct UpdateItemRequest {
     /// set's member ordering — assigned as sent, a null clearing it.
     #[serde(default)]
     display_order: Option<String>,
+    /// `IHasAspectRatio.AspectRatio` — a video's display aspect ratio (the
+    /// editor's "Original aspect ratio") — assigned as sent, a null clearing it.
+    #[serde(default)]
+    aspect_ratio: Option<String>,
 }
 
 /// Deserializes `LockedFields` the way `JsonStringEnumConverter` reads an
@@ -347,7 +351,13 @@ fn apply_update(
         BaseItemKind::from_stored_type_name(&item.type_),
         Some(BaseItemKind::Series | BaseItemKind::BoxSet)
     ) {
-        set_stored_display_order(item, request.display_order.as_deref());
+        set_data_string(item, "DisplayOrder", request.display_order.as_deref());
+    }
+    // `if (item is IHasAspectRatio hasAspectRatio) hasAspectRatio.AspectRatio =
+    // request.AspectRatio` (`ItemUpdateController.cs:417-420`): `Video` and its
+    // subclasses, kept in `Data` beside the disc format.
+    if super::videos::is_video(item) {
+        set_data_string(item, "AspectRatio", request.aspect_ratio.as_deref());
     }
 
     if let Some(album) = &request.album {
@@ -381,19 +391,19 @@ fn stored_display_order(item: &BaseItemEntity) -> Option<String> {
         })
 }
 
-/// Stores `order` as the row's `DisplayOrder` in its `Data`; `None` removes it.
-fn set_stored_display_order(item: &mut BaseItemEntity, order: Option<&str>) {
+/// Stores `value` under `key` in the row's `Data`; `None` removes it.
+fn set_data_string(item: &mut BaseItemEntity, key: &str, value: Option<&str>) {
     let mut data: serde_json::Map<String, serde_json::Value> = item
         .data
         .as_deref()
         .and_then(|data| serde_json::from_str(data).ok())
         .unwrap_or_default();
-    match order {
-        Some(order) => {
-            data.insert("DisplayOrder".to_owned(), order.into());
+    match value {
+        Some(value) => {
+            data.insert(key.to_owned(), value.into());
         }
         None => {
-            data.remove("DisplayOrder");
+            data.remove(key);
         }
     }
     item.data = (!data.is_empty()).then(|| serde_json::Value::Object(data).to_string());
@@ -1191,6 +1201,53 @@ mod tests {
         UpdateItemRequest, containing_folder_path, join_distinct, non_empty, propagate_rating,
     };
     use rstest::rstest;
+
+    /// `ItemUpdateController.UpdateItem` (v12.2 :417-420): a video
+    /// (`IHasAspectRatio`) takes the request's `AspectRatio`, a null clearing
+    /// it, and keeps the rest of its `Data`; any other kind ignores it.
+    #[test]
+    fn a_video_stores_the_requested_aspect_ratio() {
+        let update = |item: &mut ferrofin_db::entities::base_items::BaseItemEntity, json: &str| {
+            let request: UpdateItemRequest =
+                crate::extract::deserialize_mvc(json).expect("request");
+            super::apply_update(item, &request, &crate::test_support::FakeLocalization);
+        };
+        // Rows carry the stored type name, which the kind gate reads.
+        let stored = |kind: ferrofin_model::data::BaseItemKind| {
+            kind.stored_type_name().expect("stored name")
+        };
+        let mut movie = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Wide",
+            stored(ferrofin_model::data::BaseItemKind::Movie),
+        );
+        movie.data = Some(r#"{"VideoType":"Dvd"}"#.to_owned());
+        update(&mut movie, r#"{"Name":"Wide","AspectRatio":"2.35:1"}"#);
+        let data: serde_json::Value =
+            serde_json::from_str(movie.data.as_deref().expect("data")).expect("json");
+        assert_eq!(data["AspectRatio"], "2.35:1");
+        assert_eq!(data["VideoType"], "Dvd", "the rest of Data stays");
+        update(&mut movie, r#"{"Name":"Wide","AspectRatio":null}"#);
+        let data: serde_json::Value =
+            serde_json::from_str(movie.data.as_deref().expect("data")).expect("json");
+        assert!(data.get("AspectRatio").is_none(), "{data}");
+
+        let mut album = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Album",
+            stored(ferrofin_model::data::BaseItemKind::MusicAlbum),
+        );
+        update(&mut album, r#"{"Name":"Album","AspectRatio":"16:9"}"#);
+        assert!(
+            !album
+                .data
+                .as_deref()
+                .unwrap_or_default()
+                .contains("AspectRatio"),
+            "{:?}",
+            album.data
+        );
+    }
 
     /// A string the number cannot be read from is a REFUSAL, not a silent
     /// `None`.

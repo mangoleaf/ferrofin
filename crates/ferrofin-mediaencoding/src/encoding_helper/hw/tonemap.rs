@@ -278,6 +278,10 @@ pub fn hw_tonemap_filter(
 ///
 /// `upscaler=none:downscaler=none` is not "do not scale" — it tells libplacebo
 /// to use its default samplers rather than an explicitly named one.
+///
+/// An RGB or BGR `video_format` forces full range, as `force_full_range`
+/// does: libplacebo only outputs full-range RGB. A tonemap then takes range
+/// `pc`; without one, `:range=pc` is appended after `:format=`.
 #[must_use]
 pub fn libplacebo_filter(
     options: &EncodingOptions,
@@ -297,10 +301,15 @@ pub fn libplacebo_filter(
         }
         _ => String::new(),
     };
-    let format_arg = match video_format.filter(|f| !f.is_empty()) {
+    let mut format_arg = match video_format.filter(|f| !f.is_empty()) {
         Some(format) => format!(":format={format}"),
         None => String::new(),
     };
+    // libplacebo only outputs full-range RGB (Jellyfin 12.1, jellyfin#18025).
+    let requested_format = video_format.unwrap_or_default();
+    let force_full_range = force_full_range
+        || super::contains(requested_format, "rgb")
+        || super::contains(requested_format, "bgr");
 
     let mut tonemap_arg = String::new();
     if do_tonemap {
@@ -322,6 +331,8 @@ pub fn libplacebo_filter(
         if matches!(range, TonemappingRange::tv | TonemappingRange::pc) {
             let _ = write!(tonemap_arg, ":range={}", lower(&format!("{range:?}")));
         }
+    } else if force_full_range {
+        format_arg.push_str(":range=pc");
     }
 
     format!("libplacebo=upscaler=none:downscaler=none{size_arg}{format_arg}{tonemap_arg}")
@@ -959,6 +970,75 @@ mod tests {
                 false
             )
             .contains("range")
+        );
+    }
+
+    /// Jellyfin 12.1 (jellyfin#18025): libplacebo only outputs full-range RGB,
+    /// so an RGB or BGR output format forces `range=pc`, on the tonemap's
+    /// range or, without a tonemap, after the format.
+    #[rstest]
+    #[case(
+        Some("bgra"),
+        false,
+        TonemappingRange::auto,
+        false,
+        ":format=bgra:range=pc"
+    )]
+    #[case(
+        Some("BGRA"),
+        false,
+        TonemappingRange::auto,
+        false,
+        ":format=BGRA:range=pc"
+    )]
+    #[case(
+        Some("rgba"),
+        false,
+        TonemappingRange::tv,
+        false,
+        ":format=rgba:range=pc"
+    )]
+    #[case(Some("nv12"), false, TonemappingRange::auto, false, ":format=nv12")]
+    #[case(None, false, TonemappingRange::auto, true, ":range=pc")]
+    #[case(Some(""), false, TonemappingRange::auto, true, ":range=pc")]
+    #[case(
+        Some("bgra"),
+        true,
+        TonemappingRange::tv,
+        false,
+        ":format=bgra:tonemapping=bt.2390:peak_detect=0:color_primaries=bt709:\
+         color_trc=bt709:colorspace=bt709:range=pc"
+    )]
+    #[case(
+        Some("nv12"),
+        true,
+        TonemappingRange::tv,
+        false,
+        ":format=nv12:tonemapping=bt.2390:peak_detect=0:color_primaries=bt709:\
+         color_trc=bt709:colorspace=bt709:range=tv"
+    )]
+    fn libplacebo_forces_full_range_for_an_rgb_output(
+        #[case] format: Option<&str>,
+        #[case] do_tonemap: bool,
+        #[case] range: TonemappingRange,
+        #[case] force_full_range: bool,
+        #[case] expected_tail: &str,
+    ) {
+        let options = EncodingOptions {
+            tonemapping_range: range,
+            ..EncodingOptions::default()
+        };
+        assert_eq!(
+            libplacebo_filter(
+                &options,
+                format,
+                do_tonemap,
+                None,
+                None,
+                RequestedSize::default(),
+                force_full_range
+            ),
+            format!("libplacebo=upscaler=none:downscaler=none{expected_tail}")
         );
     }
 

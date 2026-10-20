@@ -508,8 +508,9 @@ impl LyricManager for FerrofinLyricManager {
         // `GetLyricsAsync`: walk the item's lyric streams and return the first
         // one a parser claims.
         for file in self.lyric_files(item_id).await? {
-            // `File.ReadAllTextAsync(path, Encoding.UTF8)`: BOM-aware and lossy.
-            let Ok(bytes) = std::fs::read(&file) else {
+            // `File.ReadAllTextAsync(path, Encoding.UTF8)`: BOM-aware and lossy,
+            // and off the runtime workers.
+            let Ok(bytes) = tokio::fs::read(&file).await else {
                 continue;
             };
             let content = ferrofin_util::stream_extensions::decode_stream_text(bytes);
@@ -1641,6 +1642,50 @@ mod tests {
         );
         let seen = first.last_request.lock().expect("lock").clone();
         assert!(seen.expect("request").search_all_providers);
+    }
+
+    /// Reading an item's lyric files (`File.ReadAllTextAsync` upstream) runs
+    /// on the blocking pool, never inline on a runtime worker: with the
+    /// pool's only thread held busy, the read cannot complete.
+    #[test]
+    fn reading_lyrics_goes_through_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = test_support::test_db().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let media = dir.path().join("song.flac");
+            std::fs::write(&media, b"flac").expect("write media");
+            let lyric = dir.path().join("song.lrc");
+            std::fs::write(&lyric, "[00:17.12]I want to live").expect("write lyric");
+            let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+            record_lyric_streams(&db, item_id, &[&lyric]).await;
+            let mgr = Arc::new(manager_over(&db, Vec::new()));
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let mut read = tokio::spawn(async move { mgr.get_lyrics(item_id).await });
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut read).await;
+            assert!(
+                starved.is_err(),
+                "the lyric file was read with the blocking pool starved, so inline on the runtime"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let dto = read.await.unwrap().expect("get").expect("a lyric");
+            assert_eq!(dto.lyrics[0].text, "I want to live");
+        });
     }
 
     #[tokio::test]

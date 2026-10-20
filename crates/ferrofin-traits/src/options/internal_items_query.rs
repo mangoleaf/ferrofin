@@ -707,7 +707,6 @@ impl InternalItemsQuery {
             || self.has_imdb_id.is_some()
             || self.has_tmdb_id.is_some()
             || self.has_tvdb_id.is_some()
-            || !self.any_provider_id_equals.is_empty()
             || self.has_overview.is_some()
             || self.has_official_rating.is_some()
             || self.has_parental_rating.is_some()
@@ -910,6 +909,14 @@ mod tests {
             ..Default::default()
         };
         assert!(!q3.has_filters());
+
+        // Nor is a provider-id lookup: C# `HasFilters` leaves out
+        // `HasAnyProviderId`.
+        let q4 = InternalItemsQuery {
+            any_provider_id_equals: vec![("Tmdb".into(), "603".into())],
+            ..Default::default()
+        };
+        assert!(!q4.has_filters());
     }
 
     #[test]

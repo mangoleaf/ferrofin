@@ -1,6 +1,7 @@
 //! The HLS **master** playlist (`master.m3u8`) — port of
 //! `Jellyfin.Api/Helpers/DynamicHlsHelper.cs` (10.11.8), the
-//! `GetMasterPlaylistInternal` assembly and its `AppendPlaylist*` helpers.
+//! `GetMasterPlaylistInternal` assembly and its `AppendPlaylist*` helpers,
+//! plus Jellyfin 12's `AppendDoviPlaylist` (jellyfin#16362).
 //!
 //! A pure builder over an already-resolved [`TranscodePlan`]: no I/O, so the
 //! exact bytes a client receives are unit-testable against the upstream oracle.
@@ -255,8 +256,10 @@ fn is_copy(codec: Option<&str>) -> bool {
 ///
 /// Port of `DynamicHlsHelper.GetMasterPlaylistInternal` after
 /// `GetStreamingState` (which is the [`TranscodePlan`]): the `#EXTM3U` header,
-/// the optional subtitle `#EXT-X-MEDIA` group, the main `#EXT-X-STREAM-INF`
-/// variant, the SDR compatibility variants for an HDR stream copy, the HEVC
+/// the optional subtitle `#EXT-X-MEDIA` group, the Dolby Vision `dvh1`/`dav1`
+/// variant ahead of the main one for a copied pure-DOVI stream (Jellyfin 12),
+/// the main `#EXT-X-STREAM-INF` variant, the SDR compatibility variants for
+/// an HDR stream copy, the HEVC
 /// level-5.0 duplicate, the two adaptive-bitrate variants, and the trickplay
 /// `#EXT-X-IMAGE-STREAM-INF` entries.
 #[must_use]
@@ -370,6 +373,32 @@ pub fn build_master_playlist(
 
     if subtitle_group.is_some() {
         add_subtitles(&state, &subtitle_streams, &mut builder, request);
+    }
+
+    // For DoVi profiles without a compatible base layer (P5 HEVC, P10/bl0 AV1),
+    // a spec-compliant dvh1/dav1 variant goes before the hvc1 one (Jellyfin 12,
+    // jellyfin#16362): SUPPLEMENTAL-CODECS cannot carry them, spec-compliant
+    // clients pick the first of two variants with equal BANDWIDTH, and only
+    // clients that declared DOVI get it, so players that do not recognise
+    // dvh1/dav1 are not broken.
+    if let Some(video_stream) = state.video_stream.as_ref()
+        && is_video_request
+        && is_copy(state.output_video_codec.as_deref())
+        && video_stream.video_range_type() == VideoRangeType::Dovi
+        && video_stream.dv_profile.is_some()
+        && video_stream.dv_level.is_some()
+        && state
+            .requested_range_types(video_stream.codec.as_deref().unwrap_or_default())
+            .iter()
+            .any(|range| range.eq_ignore_ascii_case("DOVI"))
+    {
+        append_dovi_playlist(
+            &mut builder,
+            &state,
+            &playlist_url,
+            total_bitrate,
+            subtitle_group,
+        );
     }
 
     let basic_playlist = append_playlist(
@@ -580,6 +609,61 @@ fn append_playlist(
     builder.push_str(&playlist_builder);
 
     playlist_builder
+}
+
+/// Port of `AppendDoviPlaylist`: the Dolby Vision variant for a stream with no
+/// compatible base layer. It declares `VIDEO-RANGE=PQ` and
+/// `CODECS="dvh1.PP.LL[,audio]"` (`dav1.PP.LL` for AV1), then carries the same
+/// RESOLUTION, FRAME-RATE and SUBTITLES fields and URL as the basic variant.
+fn append_dovi_playlist(
+    builder: &mut String,
+    state: &EncodingJobInfo,
+    url: &str,
+    bitrate: i32,
+    subtitle_group: Option<&str>,
+) {
+    let Some((dv_profile, dv_level)) = state
+        .video_stream
+        .as_ref()
+        .and_then(|video| video.dv_profile.zip(video.dv_level))
+    else {
+        return;
+    };
+    let mut playlist_builder = String::new();
+    let _ = write!(
+        playlist_builder,
+        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},AVERAGE-BANDWIDTH={bitrate},VIDEO-RANGE=PQ"
+    );
+    let dv_codec = hls_codec_strings::dovi_string(
+        dv_profile,
+        dv_level,
+        state.actual_output_video_codec().unwrap_or_default(),
+    );
+    let audio_codecs = if state
+        .actual_output_audio_codec()
+        .is_some_and(|c| !c.is_empty())
+    {
+        playlist_audio_codecs(state)
+    } else {
+        String::new()
+    };
+    let _ = write!(playlist_builder, ",CODECS=\"{dv_codec}");
+    if !audio_codecs.is_empty() {
+        let _ = write!(playlist_builder, ",{audio_codecs}");
+    }
+    playlist_builder.push('"');
+
+    append_playlist_resolution_field(&mut playlist_builder, state);
+    append_playlist_framerate_field(&mut playlist_builder, state);
+
+    if let Some(group) = subtitle_group.filter(|g| !g.trim().is_empty()) {
+        let _ = write!(playlist_builder, ",SUBTITLES=\"{group}\"");
+    }
+
+    playlist_builder.push('\n');
+    playlist_builder.push_str(url);
+    playlist_builder.push('\n');
+    builder.push_str(&playlist_builder);
 }
 
 /// Appends a `VIDEO-RANGE` field containing the range of the output video
@@ -1147,6 +1231,7 @@ mod tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: vec!["h264".to_owned()],
             supported_audio_codecs: vec!["aac".to_owned()],
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 3,
             wait_for_path: None,
             segment_container: Some("ts".to_owned()),
@@ -1462,6 +1547,198 @@ mod tests {
         let s = state(vec![video, audio_stream()]);
         let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
         assert!(!pl.contains("SUPPLEMENTAL-CODECS"), "got: {pl}");
+    }
+
+    /// A Dolby Vision stream with no compatible base layer (HEVC P5, AV1 P10
+    /// with `bl_compat_id` 0) at `dv_profile`/`dv_level`, `rpu`/`bl` present.
+    fn dovi_without_base_layer(codec: &str, profile: i32, level: Option<i32>) -> MediaStream {
+        MediaStream {
+            codec: Some(codec.to_owned()),
+            dv_profile: Some(profile),
+            dv_level: level,
+            dv_bl_signal_compatibility_id: Some(0),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            el_present_flag: Some(0),
+            ..hdr_hevc_stream()
+        }
+    }
+
+    /// The `#EXT-X-STREAM-INF` lines of `playlist`.
+    fn stream_infs(playlist: &str) -> Vec<&str> {
+        playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXT-X-STREAM-INF"))
+            .collect()
+    }
+
+    /// Jellyfin 12 (jellyfin#16362, `AppendDoviPlaylist`): a copied DoVi
+    /// stream with no compatible base layer gets a `dvh1`/`dav1` variant at
+    /// `VIDEO-RANGE=PQ` ahead of the plain one, at the same bandwidth and URL,
+    /// for a client whose requested range types include `DOVI`.
+    #[rstest::rstest]
+    #[case::hevc_profile_5("hevc", 5, "dvh1.05.06")]
+    #[case::av1_profile_10_bl0("av1", 10, "dav1.10.06")]
+    fn a_dovi_copy_without_a_base_layer_leads_with_a_dovi_variant(
+        #[case] codec: &str,
+        #[case] profile: i32,
+        #[case] dovi_codec: &str,
+    ) {
+        let mut s = state(vec![
+            dovi_without_base_layer(codec, profile, Some(6)),
+            audio_stream(),
+        ]);
+        s.output_video_codec = Some("copy".to_owned());
+        s.base_request.video_range_type = Some("SDR,HDR10,DOVI".to_owned());
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        let infs = stream_infs(&pl);
+        let (dovi, plain) = (infs[0], infs[1]);
+        assert!(
+            dovi.contains(&format!(
+                ",VIDEO-RANGE=PQ,CODECS=\"{dovi_codec},mp4a.40.2\",RESOLUTION="
+            )),
+            "got: {pl}"
+        );
+        assert!(!dovi.contains("SUPPLEMENTAL-CODECS"), "got: {pl}");
+        // RESOLUTION and FRAME-RATE come from the same fields as the plain variant's.
+        let after_codecs = |line: &str| {
+            line.split_once(",RESOLUTION=")
+                .map(|(_, rest)| rest.to_owned())
+        };
+        assert_eq!(after_codecs(dovi), after_codecs(plain), "got: {pl}");
+        assert_eq!(
+            dovi.split(",VIDEO-RANGE").next(),
+            plain.split(",VIDEO-RANGE").next(),
+            "same bandwidth: {pl}"
+        );
+        assert!(!plain.contains(dovi_codec), "got: {pl}");
+        // Both variants point at the same playlist.
+        let urls: Vec<&str> = pl
+            .lines()
+            .skip_while(|line| !line.starts_with("#EXT-X-STREAM-INF"))
+            .filter(|line| !line.starts_with('#'))
+            .take(2)
+            .collect();
+        assert_eq!(urls[0], urls[1], "got: {pl}");
+    }
+
+    /// No DoVi variant without every one of upstream's conditions: a copy, a
+    /// pure `DOVI` range type with profile and level known, and `DOVI` among
+    /// the client's requested range types.
+    #[rstest::rstest]
+    #[case::the_client_did_not_ask_for_dovi(Some(6), true, Some("SDR,HDR10"))]
+    #[case::no_range_types_at_all(Some(6), true, None)]
+    #[case::a_re_encode(Some(6), false, Some("SDR,HDR10,DOVI"))]
+    #[case::no_level(None, true, Some("SDR,HDR10,DOVI"))]
+    fn no_dovi_variant_unless_upstream_would_emit_one(
+        #[case] level: Option<i32>,
+        #[case] copy: bool,
+        #[case] range_types: Option<&str>,
+    ) {
+        let mut s = state(vec![
+            dovi_without_base_layer("hevc", 5, level),
+            audio_stream(),
+        ]);
+        if copy {
+            s.output_video_codec = Some("copy".to_owned());
+        }
+        s.base_request.video_range_type = range_types.map(str::to_owned);
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        assert!(!pl.contains(",CODECS=\"dvh1"), "got: {pl}");
+    }
+
+    /// The DoVi variant, byte for byte (`AppendDoviPlaylist`).
+    #[test]
+    fn the_dovi_variant_line_is_upstreams() {
+        let mut s = state(vec![
+            dovi_without_base_layer("hevc", 5, Some(6)),
+            audio_stream(),
+        ]);
+        s.output_video_codec = Some("copy".to_owned());
+        s.base_request.video_range_type = Some("DOVI".to_owned());
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        assert_eq!(
+            stream_infs(&pl)[0],
+            "#EXT-X-STREAM-INF:BANDWIDTH=1128000,AVERAGE-BANDWIDTH=1128000,VIDEO-RANGE=PQ,\
+             CODECS=\"dvh1.05.06,mp4a.40.2\",RESOLUTION=320x180,FRAME-RATE=23.976"
+        );
+    }
+
+    /// Clients declare range types per codec (`hevc-rangetype=…`), and
+    /// `GetRequestedRangeTypes(VideoStream.Codec)` reads the source codec's.
+    #[rstest::rstest]
+    #[case::hevc_option_on_hevc("hevc", 5, "hevc-rangetype", true)]
+    #[case::av1_option_on_av1("av1", 10, "av1-rangetype", true)]
+    #[case::another_codecs_option("hevc", 5, "av1-rangetype", false)]
+    fn the_dovi_variant_follows_the_source_codecs_range_type_option(
+        #[case] codec: &str,
+        #[case] profile: i32,
+        #[case] option: &str,
+        #[case] expected: bool,
+    ) {
+        let mut s = state(vec![
+            dovi_without_base_layer(codec, profile, Some(6)),
+            audio_stream(),
+        ]);
+        s.output_video_codec = Some("copy".to_owned());
+        s.base_request.stream_options = vec![(option.to_owned(), "SDR,HDR10,DOVI".to_owned())];
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        assert_eq!(
+            stream_infs(&pl)[0].contains(",CODECS=\"d"),
+            expected,
+            "got: {pl}"
+        );
+    }
+
+    /// Only a video request gets the DoVi variant (`state.VideoRequest is not null`).
+    #[test]
+    fn no_dovi_variant_for_an_audio_request() {
+        let mut s = state(vec![
+            dovi_without_base_layer("hevc", 5, Some(6)),
+            audio_stream(),
+        ]);
+        s.output_video_codec = Some("copy".to_owned());
+        s.base_request.video_range_type = Some("DOVI".to_owned());
+        s.is_input_video = false;
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        assert!(!pl.contains(",CODECS=\"dvh1"), "got: {pl}");
+    }
+
+    /// The DoVi variant joins the subtitle group, and names no audio codec when
+    /// there is no audio stream.
+    #[test]
+    fn the_dovi_variant_carries_subtitles_and_omits_absent_audio() {
+        let mut s = state(vec![
+            dovi_without_base_layer("hevc", 5, Some(6)),
+            text_subtitle(2, "eng", false),
+        ]);
+        s.output_video_codec = Some("copy".to_owned());
+        s.base_request.video_range_type = Some("DOVI".to_owned());
+        let req = HlsStreamRequest {
+            enable_subtitles_in_manifest: true,
+            ..request()
+        };
+        let pl = build_master_playlist(&plan(s), &req, &MasterPlaylistContext::default());
+        let dovi = stream_infs(&pl)[0];
+        assert!(dovi.contains(",CODECS=\"dvh1.05.06\","), "got: {pl}");
+        assert!(dovi.ends_with(",SUBTITLES=\"subs\""), "got: {pl}");
+    }
+
+    /// A DoVi stream that has a compatible base layer (P8.1) is labelled
+    /// through SUPPLEMENTAL-CODECS only, never with its own variant.
+    #[test]
+    fn a_dovi_copy_with_a_base_layer_gets_no_dovi_variant() {
+        let mut video = dovi_without_base_layer("hevc", 8, Some(6));
+        video.dv_bl_signal_compatibility_id = Some(1);
+        let mut s = state(vec![video, audio_stream()]);
+        s.output_video_codec = Some("copy".to_owned());
+        s.base_request.video_range_type = Some("SDR,HDR10,DOVI".to_owned());
+        let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
+        assert!(!pl.contains(",CODECS=\"dvh1"), "got: {pl}");
+        assert!(
+            pl.contains("SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\""),
+            "got: {pl}"
+        );
     }
 
     /// `OutputAudioCodec != query AudioCodec` rewrites the whole query through

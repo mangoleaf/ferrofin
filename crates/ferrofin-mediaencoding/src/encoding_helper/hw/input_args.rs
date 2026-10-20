@@ -32,11 +32,14 @@ use super::device_init::{
 use super::support::{is_cuda_full_supported, is_opencl_full_supported, is_vulkan_full_supported};
 use super::versions::{MIN_FFMPEG_RKMPP_HEVC_DEC_DOVI_RPU, MIN_KERNEL_VERSION_AMD_VK_FMT_MODIFIER};
 
-/// The subtitle canvas ffmpeg should render graphical subtitles onto.
+/// The codec name a probed DVB subtitle stream carries (`dvb_subtitle`
+/// normalized to `DVBSUB` by the probe), which upstream special-cases by
+/// name.
 ///
-/// Port of the `DVBSUB` special case in `GetGraphicalSubCanvasSize`: DVB
-/// subtitles carry no dimensions of their own and are always 720x576, so
-/// upstream declines to emit a canvas for them rather than emitting a wrong one.
+/// `GetGraphicalSubCanvasSize` emits no canvas for it: DVB subtitles carry no
+/// dimensions of their own and are always 720x576, so upstream declines to
+/// emit a canvas rather than a wrong one. `NormalizeSubtitleEmbed` burns it in
+/// instead of embedding it.
 pub const DVBSUB_CODEC: &str = "DVBSUB";
 
 /// The hardware input arguments, with the environment the ffmpeg child needs.
