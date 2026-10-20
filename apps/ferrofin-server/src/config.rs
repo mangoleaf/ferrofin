@@ -515,7 +515,8 @@ pub struct Config {
 
     /// Per-plugin event queue depth for WASM plugins. `None` = the 256
     /// default. A full queue drops events for that plugin only (events are
-    /// hints; the DB is the truth). Resolved
+    /// hints; the DB is the truth), and web requests may hold at most half
+    /// of it. Resolved
     /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
     /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
     /// treated as unset.

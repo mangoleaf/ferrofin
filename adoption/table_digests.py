@@ -71,6 +71,10 @@ KEYS = {"Devices": ("UserId", "DeviceId")}
 ITEM_KEYED = ("MediaStreamInfos", "AttachmentStreamInfos", "Chapters", "TrickplayInfos", "MediaSegments",
               "KeyframeData", "ItemValuesMap", "PeopleBaseItemMap", "DisplayPreferences",
               "ItemDisplayPreferences", "CustomItemDisplayPreferences")
+# Paths inside a re-identified item's metadata folder (library/<2>/<id>/): the rehome repair moves
+# the folder to the new id, as Jellyfin 12.2 does, so the id in it compares as the item. Any other
+# change to the path still shows.
+FOLDER_COLUMNS = {"Chapters": ("ImagePath",)}
 # Only an owned item (a version or extra) is re-identified, so a library-wide re-key still fails.
 # These two ids mean "no owner" (0032).
 NO_OWNER = ("00000000000000000000000000000000", "00000000000000000000000000000001")
@@ -137,8 +141,13 @@ def table_rows(conn, table, only=None, identity=None, users=None, reauthenticate
         if table == "Devices" and record["DeviceId"] in reauthenticated:
             for name in REAUTH_VOLATILE:
                 row.pop(name, None)
-        if table in ITEM_KEYED and identity and "ItemId" in row:
-            row["ItemId"] = identity.get(row["ItemId"], row["ItemId"])
+        if table in ITEM_KEYED and identity and row.get("ItemId") in identity:
+            item = row["ItemId"]
+            folder = f"/{item[:2]}/{item}/"
+            for name in FOLDER_COLUMNS.get(table, ()):
+                if isinstance(row.get(name), str):
+                    row[name] = row[name].replace(folder, "/<item>/")
+            row["ItemId"] = identity[item]
         for name in TIMESTAMPS.get(table, ()):
             if not isinstance(row.get(name), str):
                 continue

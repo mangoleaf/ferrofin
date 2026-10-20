@@ -769,6 +769,40 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A plugin with no room for another web request, as the WASM host reports it.
+struct BusyRequestHandler;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::plugins::PluginRequestHandler for BusyRequestHandler {
+    async fn handle(
+        &self,
+        _plugin_id: Uuid,
+        _request: ferrofin_traits::plugins::PluginWebRequest,
+    ) -> Result<Option<ferrofin_traits::plugins::PluginWebResponse>, ServiceError> {
+        Err(ServiceError::unavailable(
+            "plugin `Hello` is busy; retry the request later",
+        ))
+    }
+}
+
+/// A busy plugin turns an anonymous request away with `503`, the retry-later
+/// status, rather than a `500` that reads as a server fault.
+#[tokio::test]
+async fn plugin_route_answers_503_when_the_plugin_is_busy() {
+    let state = authed_state_with_plugins(Arc::new(RecordingPlugins::default()))
+        .with_plugin_request_handler(Arc::new(BusyRequestHandler));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Plugins/{}/web/ping", known_id()))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 // ── GET /Packages/{name} — InstallationManager.FilterPackages semantics ─────
 //
 // The C# is `FilterPackages(packages, name, assemblyGuid ?? default)`, whose two
