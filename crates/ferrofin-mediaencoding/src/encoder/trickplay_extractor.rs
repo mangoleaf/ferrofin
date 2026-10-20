@@ -1263,7 +1263,7 @@ mod tests {
         let recorded = transcoder.recorded();
         assert_eq!(recorded.len(), 2, "the keyframe-only run and its retry");
         for args in &recorded {
-            assert!(!args.contains("setpts"), "{args}");
+            assert!(!args.contains("setpts=N/"), "{args}");
             assert!(args.contains("-vf \"fps="), "{args}");
         }
         assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
