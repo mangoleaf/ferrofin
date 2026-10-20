@@ -10259,7 +10259,7 @@ mod tests {
             type_: "MediaBrowser.Controller.LiveTv.LiveTvChannel".to_owned(),
             name: Some("Parity One".to_owned()),
             media_type: Some("Video".to_owned()),
-            sort_name: Some("00001.0-Parity One".to_owned()),
+            sort_name: Some("0000000001.00000-Parity One".to_owned()),
             date_created: Some(Utc.with_ymd_and_hms(2026, 8, 23, 18, 0, 0).unwrap()),
             is_folder: false,
             ..BaseItemEntity::default()
@@ -10291,7 +10291,10 @@ mod tests {
         assert_eq!(dto.can_delete, Some(false));
         assert_eq!(dto.can_download, Some(false));
         assert_eq!(dto.media_type, MediaType::Video);
-        assert_eq!(dto.sort_name.as_deref(), Some("00001.0-Parity One"));
+        assert_eq!(
+            dto.sort_name.as_deref(),
+            Some("0000000001.00000-Parity One")
+        );
         assert!(dto.date_created.is_some());
         // The all-fields channel detail carries a present-and-empty stream list
         // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).
