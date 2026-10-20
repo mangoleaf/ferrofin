@@ -1145,6 +1145,17 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Localization/Countries",
+        upstream_file: "Jellyfin.Api/Controllers/LocalizationController.cs",
+        upstream_method: "GetCountries",
+        ferrofin: "handlers/localization.rs get_countries → ferrofin-core localization_manager.rs \
+               get_countries (COUNTRIES, data/countries.json byte-equal to v12.2)",
+        date: "2026-10-20",
+        divergences: &[],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

@@ -92,8 +92,9 @@ pub struct FerrofinUserDataManager {
     changed: Arc<std::sync::OnceLock<Arc<dyn UserDataChangedSink>>>,
     /// Where a played mark on a container finds the items it applies to,
     /// set by the composition root once the library manager exists
-    /// ([`Self::set_container_members`]). Unset (unit tests), every mark is
-    /// the requested item's own.
+    /// ([`Self::set_container_members`]), and where a user-data read finds
+    /// the item and its counts. Unset (unit tests), every mark is the
+    /// requested item's own and a read is the stored row.
     members: Arc<OnceLock<ContainerMembers>>,
 }
 
@@ -128,7 +129,8 @@ impl FerrofinUserDataManager {
     /// Lets a played mark on a container (a series, season, album, box set,
     /// playlist or folder) reach the items under it, as `Folder.MarkPlayed`
     /// and `BoxSet.MarkPlayed` do: `library` lists them and `counts` answers
-    /// the container's rolled-up played state. The first call wins.
+    /// the container's rolled-up played state, on a mark and on every
+    /// user-data read. The first call wins.
     pub fn set_container_members(
         &self,
         library: Weak<dyn LibraryManager>,
@@ -623,7 +625,9 @@ impl FerrofinUserDataManager {
                 crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)
             })
         {
-            let counts = self.container_counts(container, &members.counts).await?;
+            let counts = self
+                .container_counts(container.id, &container.user, &members.counts)
+                .await?;
             crate::dto_service::fill_folder_played(&mut dto, counts);
         }
         Ok(dto)
@@ -636,25 +640,69 @@ impl FerrofinUserDataManager {
     /// `GetPlayedAndTotalCount`.
     async fn container_counts(
         &self,
-        container: &Container,
+        id: Uuid,
+        user: &ferrofin_db::entities::users::UserEntity,
         counts: &Arc<dyn ItemCountService>,
     ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
         // `new InternalItemsQuery(user)`: `set_user` also carries the user's
         // parental-rating cap.
         let mut query = ferrofin_traits::options::InternalItemsQuery::default();
-        query.set_user(container.user.clone());
+        query.set_user(user.clone());
         if counts
-            .get_linked_children_count_batch(&[container.id])
+            .get_linked_children_count_batch(&[id])
             .await?
-            .contains_key(&container.id)
+            .contains_key(&id)
         {
             return counts
-                .get_played_and_total_count_from_linked_children(&query, container.id)
+                .get_played_and_total_count_from_linked_children(&query, id)
                 .await;
         }
-        counts
-            .get_played_and_total_count(&query, container.id)
-            .await
+        counts.get_played_and_total_count(&query, id).await
+    }
+
+    /// `item.FillUserDataDtoValues(dto, userData, null, user, options)` as
+    /// `GetUserDataDto(item, user)` runs it (v12.2 UserDataManager.cs:411-427),
+    /// chosen by class: a `Folder` (Folder.cs:2024-2081) takes its played
+    /// numbers from its leaves, any other item (BaseItem.cs:2746-2767) turns a
+    /// positive resume position over a known runtime into `PlayedPercentage`.
+    /// Unwired (unit tests), the stored row is the whole answer.
+    async fn fill_user_data_dto_values(
+        &self,
+        dto: &mut UserItemDataDto,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        let Some(members) = self.members.get() else {
+            return Ok(());
+        };
+        let Some(library) = members.library.upgrade() else {
+            return Ok(());
+        };
+        let Some(item) = library.get_item_by_id(item_id).await? else {
+            return Ok(());
+        };
+        let Some(kind) = kind_from_type_name(&item.type_) else {
+            return Ok(());
+        };
+        // Dispatched by class, as the C# virtual is, not by the stored
+        // `IsFolder`: a by-name row (a by-name artist, a genre) never passes
+        // the folder gates below, as `supports_played_status` excludes it.
+        if !crate::kinds::is_folder(kind) {
+            crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
+            return Ok(());
+        }
+        // No item DTO, so only the `SupportsPlayedStatus` half applies.
+        if !(crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)) {
+            return Ok(());
+        }
+        let Some(user) = crate::item_repository::query_user(&self.db, user_id).await? else {
+            return Ok(());
+        };
+        let counts = self
+            .container_counts(item_id, &user, &members.counts)
+            .await?;
+        crate::dto_service::fill_folder_played(dto, counts);
+        Ok(())
     }
 
     /// Port of `BaseItem.MarkPlayed(user, datePlayed, resetPosition: true)`
@@ -1007,7 +1055,10 @@ impl UserDataManager for FerrofinUserDataManager {
             .read_row(item_id, user_id)
             .await?
             .unwrap_or_else(|| Self::empty_row(item_id, user_id));
-        Ok(Some(to_dto(&row, item_id)))
+        let mut dto = to_dto(&row, item_id);
+        self.fill_user_data_dto_values(&mut dto, item_id, user_id)
+            .await?;
+        Ok(Some(dto))
     }
 
     async fn get_user_data_dtos(
@@ -4280,6 +4331,61 @@ mod tests {
         assert!(mgr.read_row(series, user).await.unwrap().is_none());
         assert!(!dto.played);
         assert_eq!(dto.unplayed_item_count, Some(2));
+    }
+
+    /// `GetUserDataDto(item, user)` (v12.2 UserDataManager.cs:411-427) runs
+    /// `Folder.FillUserDataDtoValues` on every read: a series' or season's
+    /// user data counts its episodes, an episode's is its own row, and a
+    /// favourite on the series keeps the roll-up.
+    #[tokio::test]
+    async fn folder_user_data_counts_its_leaves() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (series, season) = (Uuid::from_u128(0x5E0), Uuid::from_u128(0x5E1));
+        let (ep1, ep2) = (Uuid::from_u128(0xE1), Uuid::from_u128(0xE2));
+        seed_show(
+            &db,
+            series,
+            season,
+            &[(ep1, false, None), (ep2, false, None)],
+        )
+        .await;
+        let (mgr, _library) = container_manager(&db);
+        mgr.mark_played(user, ep1, None).await.unwrap();
+        mgr.save_user_data(
+            user,
+            series,
+            &UpdateUserItemDataDto {
+                is_favorite: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for folder in [series, season] {
+            let dto = data(&mgr, folder, user).await;
+            assert!(!dto.played, "{folder}: one episode of two is played");
+            assert_eq!(dto.unplayed_item_count, Some(1), "{folder}");
+            assert_eq!(dto.played_percentage, Some(50.0), "{folder}");
+        }
+        assert!(data(&mgr, series, user).await.is_favorite);
+
+        let episode = data(&mgr, ep1, user).await;
+        assert!(episode.played);
+        assert_eq!(episode.unplayed_item_count, None, "a leaf has no count");
+
+        // A leaf's resume position over its runtime, and none without one.
+        resume_at(&mgr, ep2, user, 250).await;
+        assert_eq!(data(&mgr, ep2, user).await.played_percentage, None);
+        sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = 1000 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(ep2))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        resume_at(&mgr, ep2, user, 250).await;
+        assert_eq!(data(&mgr, ep2, user).await.played_percentage, Some(25.0));
     }
 
     /// `Folder.MarkPlayed` on a season, through `Season.GetItemsInternal`:

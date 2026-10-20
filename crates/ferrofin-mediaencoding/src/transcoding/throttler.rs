@@ -23,6 +23,29 @@ pub enum PauseKeys {
     Legacy,
 }
 
+/// The pause keys of the running ffmpeg, published once by the startup probe.
+///
+/// The probe is a real-time ffmpeg job (about a second or more), so it runs after
+/// boot rather than on it. A transcode that starts before it finishes reads "no
+/// keys yet" and picks them up on a later throttle tick.
+#[derive(Debug, Clone, Default)]
+pub struct PauseKeySlot(std::sync::Arc<std::sync::OnceLock<Option<PauseKeys>>>);
+
+impl PauseKeySlot {
+    /// Publishes the probe's result (`None`: this ffmpeg has no pause keys).
+    /// Only the first result is kept.
+    pub fn set(&self, keys: Option<PauseKeys>) {
+        let _ = self.0.set(keys);
+    }
+
+    /// The published keys, or `None` while the probe is still running or when
+    /// it found none.
+    #[must_use]
+    pub fn get(&self) -> Option<PauseKeys> {
+        self.0.get().copied().flatten()
+    }
+}
+
 impl PauseKeys {
     /// Selects the exact upstream capability/version gate.
     ///

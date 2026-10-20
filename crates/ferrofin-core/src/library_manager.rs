@@ -300,6 +300,134 @@ fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::A
     }
 }
 
+/// `Season.GetEpisodes` → `Series.GetSeasonEpisodes(parentSeason, user, options,
+/// shouldIncludeMissingEpisodes: true)`: the series' episodes (its seasons
+/// alongside, to resolve each episode's parent) narrowed to `season`'s by
+/// `FilterEpisodesBySeason` — with `include_specials`
+/// (`DisplaySpecialsWithinSeasons`), a special airing within a numbered
+/// season belongs to it — and sorted in aired order (season 0 keeps the
+/// series' `SortName` order). Empty when the season has no series.
+/// `season_id` is the season's id; `query` supplies the user and the DTO
+/// options the series query runs with.
+#[allow(clippy::too_many_lines)] // source relation resolution, then selection
+pub(crate) async fn season_episode_rows(
+    items: &dyn ItemRepository,
+    season_id: Uuid,
+    season: BaseItemEntity,
+    query: &InternalItemsQuery,
+    include_specials: bool,
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let series_id = episode_relation_id(season.series_id.as_deref())
+        .or_else(|| episode_relation_id(season.parent_id.as_deref()));
+    let series = match series_id {
+        Some(id) => items.retrieve_item(id).await?,
+        None => None,
+    }
+    .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
+    let Some(series) = series else {
+        return Ok(Vec::new());
+    };
+    let rows = items
+        .get_item_list(&InternalItemsQuery {
+            user: query.user.clone(),
+            series_presentation_unique_key: Some(episode_presentation_key(&series)),
+            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Ascending,
+            )],
+            dto_options: query.dto_options.clone(),
+            // Season.GetItemsInternal passes shouldIncludeMissing=true.
+            ..Default::default()
+        })
+        .await?;
+    let series_seasons: Vec<_> = rows
+        .iter()
+        .filter(|row| row.type_.rsplit('.').next() == Some("Season"))
+        .cloned()
+        .collect();
+    let mut seasons: HashMap<_, _> = series_seasons
+        .iter()
+        .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
+        .collect();
+    seasons.insert(season_id, season.clone());
+    let mut unknown = std::collections::HashSet::new();
+    for row in &rows {
+        if row.type_.rsplit('.').next() == Some("Episode")
+            && let Some(id) = episode_relation_id(row.season_id.as_deref())
+                .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+            && !seasons.contains_key(&id)
+        {
+            unknown.insert(id);
+        }
+    }
+    if !unknown.is_empty() {
+        for row in items
+            .retrieve_items(&unknown.into_iter().collect::<Vec<_>>())
+            .await?
+        {
+            if row.type_.rsplit('.').next() == Some("Season")
+                && let Some(id) = episode_relation_id(Some(&row.id))
+            {
+                seasons.insert(id, row);
+            }
+        }
+    }
+    let key = episode_presentation_key(&season);
+    let number = season.index_number;
+    let support_specials = include_specials && number.is_some_and(|number| number != 0);
+    let mut matches = Vec::new();
+    for row in rows
+        .into_iter()
+        .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
+    {
+        let parent = episode_relation_id(row.season_id.as_deref())
+            .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+            .and_then(|id| seasons.get(&id))
+            .or_else(|| {
+                (episode_relation_id(row.parent_id.as_deref()) == series_id)
+                    .then(|| {
+                        series_seasons
+                            .iter()
+                            .find(|parent| parent.index_number == row.parent_index_number)
+                    })
+                    .flatten()
+            });
+        let same_season = parent.is_some_and(|parent| {
+            ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                &episode_presentation_key(parent),
+                &key,
+            )
+        });
+        // The disabled source query is restricted to the season's
+        // presentation ancestry, before FilterEpisodesBySeason runs.
+        if !include_specials && !same_season {
+            continue;
+        }
+        let order = episode_air_order(&row);
+        let current = if support_specials {
+            order
+                .airs_after_season
+                .or(order.airs_before_season)
+                .or(order.season)
+        } else {
+            order.season
+        };
+        let matches_number = current.is_some() && number.is_some() && current == number;
+        let matches_virtual = current.is_none()
+            && number.is_none()
+            && episode_virtual_location(&season)
+            && parent.is_none_or(episode_virtual_location);
+        if matches_number || matches_virtual || same_season {
+            matches.push((order, row));
+        }
+    }
+    if number != Some(0) {
+        matches.sort_by(|(left, _), (right, _)| left.compare(right));
+    }
+    Ok(matches.into_iter().map(|(_, row)| row).collect())
+}
+
 /// One scan request: what it covers, the options its items refresh with,
 /// and why it was made.
 #[derive(Debug, Clone, PartialEq)]
@@ -1333,126 +1461,25 @@ impl FerrofinLibraryManager {
 
     /// Season.GetItemsInternal: select aired episodes before Filter and paging.
     /// The existing LibraryManager traits query seam keeps API independent of core.
-    #[allow(clippy::too_many_lines)] // source relation resolution, selection, then Filter/PostFilterAndSort
     async fn season_display_result(
         &self,
         query: &InternalItemsQuery,
         include_specials: bool,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         let season = self.items.retrieve_item(query.parent_id).await?;
-        let series_id = season.as_ref().and_then(|season| {
-            episode_relation_id(season.series_id.as_deref())
-                .or_else(|| episode_relation_id(season.parent_id.as_deref()))
-        });
-        let series = match series_id {
-            Some(id) => self.items.retrieve_item(id).await?,
-            None => None,
-        }
-        .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
-        let mut episodes = Vec::new();
-        if let (Some(season), Some(series)) = (season, series) {
-            let rows = self
-                .items
-                .get_item_list(&InternalItemsQuery {
-                    user: query.user.clone(),
-                    series_presentation_unique_key: Some(episode_presentation_key(&series)),
-                    include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
-                    order_by: vec![(
-                        ferrofin_model::live_tv::ItemSortBy::SortName,
-                        ferrofin_model::dto::SortOrder::Ascending,
-                    )],
-                    dto_options: query.dto_options.clone(),
-                    // Season.GetItemsInternal passes shouldIncludeMissing=true.
-                    ..Default::default()
-                })
-                .await?;
-            let series_seasons: Vec<_> = rows
-                .iter()
-                .filter(|row| row.type_.rsplit('.').next() == Some("Season"))
-                .cloned()
-                .collect();
-            let mut seasons: HashMap<_, _> = series_seasons
-                .iter()
-                .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
-                .collect();
-            seasons.insert(query.parent_id, season.clone());
-            let mut unknown = std::collections::HashSet::new();
-            for row in &rows {
-                if row.type_.rsplit('.').next() == Some("Episode")
-                    && let Some(id) = episode_relation_id(row.season_id.as_deref())
-                        .or_else(|| episode_relation_id(row.parent_id.as_deref()))
-                    && !seasons.contains_key(&id)
-                {
-                    unknown.insert(id);
-                }
+        let episodes = match season {
+            Some(season) => {
+                season_episode_rows(
+                    self.items.as_ref(),
+                    query.parent_id,
+                    season,
+                    query,
+                    include_specials,
+                )
+                .await?
             }
-            if !unknown.is_empty() {
-                for row in self
-                    .items
-                    .retrieve_items(&unknown.into_iter().collect::<Vec<_>>())
-                    .await?
-                {
-                    if row.type_.rsplit('.').next() == Some("Season")
-                        && let Some(id) = episode_relation_id(Some(&row.id))
-                    {
-                        seasons.insert(id, row);
-                    }
-                }
-            }
-            let key = episode_presentation_key(&season);
-            let number = season.index_number;
-            let support_specials = include_specials && number.is_some_and(|number| number != 0);
-            let mut matches = Vec::new();
-            for row in rows
-                .into_iter()
-                .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
-            {
-                let parent = episode_relation_id(row.season_id.as_deref())
-                    .or_else(|| episode_relation_id(row.parent_id.as_deref()))
-                    .and_then(|id| seasons.get(&id))
-                    .or_else(|| {
-                        (episode_relation_id(row.parent_id.as_deref()) == series_id)
-                            .then(|| {
-                                series_seasons
-                                    .iter()
-                                    .find(|parent| parent.index_number == row.parent_index_number)
-                            })
-                            .flatten()
-                    });
-                let same_season = parent.is_some_and(|parent| {
-                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(
-                        &episode_presentation_key(parent),
-                        &key,
-                    )
-                });
-                // The disabled source query is restricted to the season's
-                // presentation ancestry, before FilterEpisodesBySeason runs.
-                if !include_specials && !same_season {
-                    continue;
-                }
-                let order = episode_air_order(&row);
-                let current = if support_specials {
-                    order
-                        .airs_after_season
-                        .or(order.airs_before_season)
-                        .or(order.season)
-                } else {
-                    order.season
-                };
-                let matches_number = current.is_some() && number.is_some() && current == number;
-                let matches_virtual = current.is_none()
-                    && number.is_none()
-                    && episode_virtual_location(&season)
-                    && parent.is_none_or(episode_virtual_location);
-                if matches_number || matches_virtual || same_season {
-                    matches.push((order, row));
-                }
-            }
-            if number != Some(0) {
-                matches.sort_by(|(left, _), (right, _)| left.compare(right));
-            }
-            episodes = matches.into_iter().map(|(_, row)| row).collect();
-        }
+            None => Vec::new(),
+        };
         let mut episodes = self.items.filter_folder_children(episodes, query).await?;
         let mut post_query = query.clone();
         if let [(ferrofin_model::live_tv::ItemSortBy::AiredEpisodeOrder, direction)] =
