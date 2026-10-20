@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 from metadata import CheckError
-from synthetic_fixture import Api, USERS, drop_dangling_chain, seed, seed_database
+from synthetic_fixture import Api, USERS, drop_dangling_chain, seed, seed_database, wait_for_live_members
 from synthetic_media import generate
 
 
@@ -121,6 +121,7 @@ def build(root, only, port):
                     api.scan(300, interval=1)
             else:
                 manifest = seed(api.base)
+                wait_for_live_members(config / "data/jellyfin.db", manifest)
                 api = api.login(USERS[0])
             save(config / "synthetic.json", manifest)
             # Added by the preservation checker; a source-version baseline is

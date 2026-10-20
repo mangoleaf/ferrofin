@@ -5,7 +5,7 @@ import base64
 from contextlib import closing
 from io import BytesIO
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 import time
@@ -237,6 +237,42 @@ def seed(base):
     return manifest
 
 
+LINKED_ROLES = ("collection", "playlist", "pathless")
+
+
+def live_member(conn, manifest, role):
+    """The linked `role` container's Path and its first LinkedChildren entry, the live
+    member seed() created; the entry is None until 10.11.8 has saved its ItemId."""
+    wanted = uuid.UUID(manifest["linked_" + role]).hex
+    row = conn.execute('SELECT "Path", "Data" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                       (wanted,)).fetchone()
+    if row is None:
+        raise CheckError("synthetic seed: no BaseItems row for a manifest id")
+    children = json.loads(row[1] or "{}").get("LinkedChildren")
+    first = children[0] if children else {}
+    return row[0], first if first.get("ItemId") and first.get("Path") else None
+
+
+def wait_for_live_members(db, manifest, timeout=300, interval=1):
+    """Wait, with 10.11.8 still running, until it has saved every linked container's live
+    member with its ItemId; seed_database needs both ItemId and Path.
+
+    10.11.8 saves a new playlist's or collection's LinkedChildren with a Path only
+    (LinkedChild.Create). The ItemId reaches the database when the refresh the add queued
+    saves the item (ProviderManager.QueueRefresh, ForceSave). That queue is no scheduled
+    task, so Api.idle() does not cover it, and no API reports it. The database is opened
+    read-only."""
+    end = time.monotonic() + timeout
+    while True:
+        with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            pending = [role for role in LINKED_ROLES if live_member(conn, manifest, role)[1] is None]
+        if not pending:
+            return
+        if time.monotonic() >= end:
+            raise CheckError(f"synthetic seed: the linked {pending[0]} has no live member after {timeout} s")
+        time.sleep(interval)
+
+
 def seed_id(name):
     """A fixed id for a seeded row, so a rerun writes the same rows again."""
     return uuid.uuid5(uuid.NAMESPACE_URL, "ferrofin:adoption:synthetic:" + name)
@@ -330,16 +366,13 @@ def seed_database(db, manifest):
                          (spelled(source[0], second), user, history, *ORPHAN_PLAY.values()))
 
             linked = {}
-            for role, entries_of in (("collection", collection_entries), ("playlist", playlist_entries),
-                                     ("pathless", pathless_entries)):
+            for role, entries_of in zip(LINKED_ROLES, (collection_entries, playlist_entries, pathless_entries)):
                 container = stored("BaseItems", uuid.UUID(manifest["linked_" + role]))
-                path, data = conn.execute('SELECT "Path", "Data" FROM "BaseItems" WHERE "Id" = ?',
-                                          (container,)).fetchone()
-                children = json.loads(data or "{}").get("LinkedChildren")
-                if not children or not children[0].get("ItemId") or not children[0].get("Path"):
+                path, live = live_member(conn, manifest, role)
+                if live is None:
                     raise CheckError(f"synthetic seed: the linked {role} has no live member")
                 folder = PurePosixPath(path.replace("%AppDataPath%", APP_DATA_PATH))
-                entries, members = entries_of(conn, manifest, folder, children[0])
+                entries, members = entries_of(conn, manifest, folder, live)
                 conn.execute('UPDATE "BaseItems" SET "Data" = json_set("Data", \'$.LinkedChildren\', json(?)) '
                              'WHERE "Id" = ?', (json.dumps(entries), container))
                 linked[role] = {"id": uuid.UUID(manifest["linked_" + role]).hex, "entries": entries, "members": members}

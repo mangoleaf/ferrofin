@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import uuid
@@ -20,7 +21,7 @@ from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, comparable, compare,
                           verify_database)
 from synthetic import VERSIONS
 import synthetic_fixture
-from synthetic_fixture import USERS, drop_dangling_chain, seed_database
+from synthetic_fixture import USERS, drop_dangling_chain, seed_database, wait_for_live_members
 from watch_history import orphaned_items
 from unchanged_scan import TABLES, audit, assert_unchanged, check
 from test_user_accounts import fixture as account_fixture
@@ -433,6 +434,22 @@ class SeededAdoptionTest(unittest.TestCase):
         self.sql(source, "UPDATE BaseItems SET Data = '{\"LinkedChildren\":[]}' WHERE Name = 'linked_collection'")
         with self.assertRaisesRegex(CheckError, 'the linked collection has no live member'):
             seed_database(source, manifest)
+
+    def test_the_seed_waits_until_10_11_8_has_saved_each_live_member(self):
+        # 10.11.8 first saves a new playlist's member with its Path only; the ItemId comes
+        # with the queued refresh, which no API reports (gl-603).
+        source = self.dir / 'pending.db'
+        manifest = canned_10_11_8(source)
+        member = uuid.UUID(guid(0xa2)).hex
+        self.sql(source, "UPDATE BaseItems SET Data = json_remove(Data, '$.LinkedChildren[0].ItemId') "
+                         "WHERE Name = 'linked_playlist'")
+        with self.assertRaisesRegex(CheckError, 'the linked playlist has no live member after 0 s'):
+            wait_for_live_members(source, manifest, timeout=0)
+        refresh = threading.Timer(0.2, self.sql, (source, "UPDATE BaseItems SET Data = json_set(Data, "
+                                  "'$.LinkedChildren[0].ItemId', ?) WHERE Name = 'linked_playlist'", member))
+        refresh.start()
+        self.addCleanup(refresh.cancel)
+        wait_for_live_members(source, manifest, timeout=30, interval=0.1)
 
     def test_a_linked_container_is_checked_only_where_the_source_held_its_seeds(self):
         pathless = self.seeds['linked_children']['pathless']
