@@ -1,7 +1,8 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 12.2 and Ferrofin, on identical test data, on one host. Archived runs retain
+Jellyfin 12.2 and Ferrofin, on identical test data, on one host. It also holds the
+[release gate](#release-gate), which compares Ferrofin with its previous release. Archived runs retain
 their recorded labels and raw measurements. Re-rendering archived results applies the current
 validation rules: previously published cells can become flagged (including archived
 Ferrofin detail/playback responses missing `IsOriginal`/`LocalizedOriginal`). Review
@@ -372,6 +373,21 @@ anything that would compete for the chosen cores before a release run.
 For repeated comparisons, rotate order explicitly, for example
 `--servers jellyfin,ferrofin` followed by `--servers ferrofin,jellyfin`.
 Use the same phase selection and settings; affinity alone does not make a busy host quiet.
+
+## Release gate
+
+What blocks a release is the interleaved A/B gate in [`gate.py`](gate.py), not the
+Jellyfin comparison above. [`RELEASE.md`](../RELEASE.md) has the gate's command, wall
+time, threshold table and blocking rules. `gate.py ab PREVIOUS CANDIDATE` runs Ferrofin
+only: three adjacent pairs of `run.sh --servers ferrofin --only shape,unloaded,loaded`. It
+judges each cell regressed, within noise or improved against the thresholds in
+[`gate.toml`](gate.toml). `gate.py aa IMAGE` measures the noise floor those thresholds are
+re-derived from. The three-server runs with both Jellyfins are for publication: they produce
+the root README and `docs/BENCHMARKS.md` tables and never decide a release.
+
+Cold start is not part of the gate and keeps the definition above: a restart until the
+first authenticated `GET /UserViews` succeeds, measured in full runs and never replaced by an
+unauthenticated probe such as `/System/Ping`.
 
 ## Scan and migration
 
