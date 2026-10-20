@@ -336,6 +336,22 @@ fn parse_inbound(text: &str) -> Option<Inbound> {
 /// malformed — jellyfin-web subscribes with "0,1500".
 const DEFAULT_STREAM_MILLIS: u64 = 1500;
 
+/// Fallback minimum period between pushes of a dashboard stream, used when the
+/// composition root does not configure one (chiefly unit tests). The server
+/// injects the operator-configured floor
+/// (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, default 100 ms) via
+/// [`crate::AppState::with_websocket_min_stream_period`]; this constant only
+/// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
+/// even then.
+///
+/// The floor exists because Ferrofin drives these streams on a timer — each
+/// tick recomputes and sends the full snapshot — whereas upstream's
+/// `BasePeriodicWebSocketListener` is event-driven and sends only when a
+/// session/playback event fires (the client period is a debounce ceiling
+/// there, never a poll clock). Without a floor a client could ask for a 1 ms
+/// period and turn each tick into back-to-back `get_sessions`/activity work.
+pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
+
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
 /// The initial delay is folded into the period (first send after one period).
@@ -544,7 +560,7 @@ async fn handle_socket(
     // (each is `None` until subscribed). Only a socket with a session may
     // subscribe — the streams answer as the socket's user — and the activity
     // stream is an administrator's alone (`may_subscribe`).
-    let mut streams = Streams::default();
+    let mut streams = Streams::new(state.websocket_min_stream_period);
     let mut task_updates = None;
 
     if open {
@@ -775,24 +791,31 @@ struct Streams {
     /// Only activity entries created after this instant are streamed (advanced
     /// on every send, so each entry is delivered once).
     activity_since: chrono::DateTime<chrono::Utc>,
+    /// The floor every armed stream's period is clamped up to (see
+    /// [`DEFAULT_WS_MIN_STREAM_PERIOD`]).
+    min_period: Duration,
 }
 
-impl Default for Streams {
-    fn default() -> Self {
+impl Streams {
+    /// A fresh, unsubscribed stream set whose periods are floored at
+    /// `min_period` (the operator-configured minimum stream period).
+    fn new(min_period: Duration) -> Self {
         Self {
             sessions: None,
             tasks: None,
             activity: None,
             activity_since: chrono::Utc::now(),
+            min_period,
         }
     }
-}
 
-impl Streams {
     /// Arms or cancels a stream for one subscription message.
     fn apply(&mut self, inbound: Inbound) {
+        // Floor the client-chosen period: a tiny period would otherwise make
+        // each tick recompute and resend the full snapshot back to back.
+        let min_period = self.min_period;
         let arm = |period: Duration| {
-            let mut interval = tokio::time::interval(period);
+            let mut interval = tokio::time::interval(period.max(min_period));
             // First send one period from now, not immediately.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.reset();
@@ -1005,12 +1028,40 @@ fn force_keep_alive_message() -> String {
 mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
-        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, action_for,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, Streams, action_for,
         force_keep_alive_message, keep_alive_ack, keep_alive_action, may_subscribe, parse_inbound,
         push_sink, visible_tasks,
     };
     use axum::extract::ws::Message;
+    use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stream_period_is_floored_at_the_configured_minimum() {
+        // A hostile or misconfigured client asks for a 1 ms period on every
+        // stream; each must be clamped up to the floor so a tick cannot become
+        // back-to-back `get_sessions`/activity work.
+        let floor = Duration::from_millis(100);
+        let mut streams = Streams::new(floor);
+        streams.apply(Inbound::SessionsStart(Duration::from_millis(1)));
+        streams.apply(Inbound::TasksStart(Duration::from_millis(1)));
+        streams.apply(Inbound::ActivityStart(Duration::from_millis(1)));
+        assert_eq!(streams.sessions.as_ref().unwrap().period(), floor);
+        assert_eq!(streams.tasks.as_ref().unwrap().period(), floor);
+        assert_eq!(streams.activity.as_ref().unwrap().period(), floor);
+    }
+
+    #[tokio::test]
+    async fn stream_period_above_the_floor_is_left_untouched() {
+        // jellyfin-web subscribes with 1500 ms, comfortably above the floor, so
+        // the floor must not slow a well-behaved client down.
+        let mut streams = Streams::new(Duration::from_millis(100));
+        streams.apply(Inbound::SessionsStart(Duration::from_millis(1500)));
+        assert_eq!(
+            streams.sessions.as_ref().unwrap().period(),
+            Duration::from_millis(1500)
+        );
+    }
 
     #[tokio::test]
     async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
