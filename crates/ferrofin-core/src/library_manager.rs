@@ -1626,9 +1626,11 @@ impl FerrofinLibraryManager {
     }
 
     /// `Folder.QueryWithPostFiltering` (v12.2 Folder.cs:1019-1062): the whole
-    /// unpaged list, kept to what the user may open (`IsVisibleStandalone`),
-    /// then counted and paged in memory. The total is 0 when the caller did
-    /// not ask for it, as upstream.
+    /// unpaged list (or, with `adjacent_to`, its adjacency window, which the
+    /// SQL path trims before this filter, as `GetItemList` does upstream),
+    /// kept to what the user may open (`IsVisibleStandalone`), then counted
+    /// and paged in memory. The total is 0 when the caller did not ask for
+    /// it, as upstream.
     async fn query_with_post_filtering(
         &self,
         query: &InternalItemsQuery,
@@ -1677,32 +1679,15 @@ impl FerrofinLibraryManager {
         }
         items = self.items.sort_folder_children(items, query).await?;
         if let Some(adjacent) = query.adjacent_to.filter(|id| !id.is_nil()) {
-            if let Some(index) = items
-                .iter()
-                .position(|item| Uuid::parse_str(&item.id).ok() == Some(adjacent))
-            {
-                items = items
-                    .into_iter()
-                    .skip(index.saturating_sub(1))
-                    .take(if index == 0 { 2 } else { 3 })
-                    .collect();
-            } else {
-                items.clear();
-            }
-        }
-        let start_index = query.start_index.unwrap_or(0);
-        let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
-        let start = usize::try_from(start_index.max(0)).unwrap_or(usize::MAX);
-        let limit = query
-            .limit
-            .filter(|limit| *limit > 0)
-            .map_or(usize::MAX, |limit| {
-                usize::try_from(limit).unwrap_or(usize::MAX)
+            items = crate::item_repository::adjacent_window(items, |item| {
+                Uuid::parse_str(&item.id).ok() == Some(adjacent)
             });
+        }
+        let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
         Ok(QueryResult::new(
-            Some(start_index),
+            Some(query.start_index.unwrap_or(0)),
             Some(total),
-            items.into_iter().skip(start).take(limit).collect(),
+            crate::item_repository::page(items, query),
         ))
     }
 
@@ -6843,6 +6828,7 @@ mod tests {
     async fn a_recursive_playlist_listing_shows_only_playlists_the_user_may_open() {
         use crate::user_entity_ext::set_permission;
         use ferrofin_db::enums::PermissionKind;
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
         let db = test_db().await;
         let data = tempfile::tempdir().unwrap();
         let base = manager(&db);
@@ -6952,6 +6938,37 @@ mod tests {
             (0, 3),
             "QueryWithPostFiltering reports 0 when no total was asked for"
         );
+        // `AdjacentTo` reaches `GetItemList` with the query, so the SQL result
+        // is trimmed to the item and its neighbours BEFORE the visibility
+        // filter: by name the window around "Open" is Open and Private, which
+        // the member cannot open, so their "Shared" is not in it.
+        let by_name = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
+        let open = library
+            .query_items(&InternalItemsQuery {
+                order_by: by_name.clone(),
+                ..listing(&users[0], None)
+            })
+            .await
+            .expect("listing")
+            .items
+            .into_iter()
+            .find(|item| item.name.as_deref() == Some("Open"))
+            .and_then(|item| Uuid::parse_str(&item.id).ok())
+            .expect("open playlist");
+        for (user, expected) in [
+            (&users[0], vec!["Open", "Private"]),
+            (&users[1], vec!["Open"]),
+        ] {
+            let around = library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(open),
+                    order_by: by_name.clone(),
+                    ..listing(user, None)
+                })
+                .await
+                .expect("adjacent listing");
+            assert_eq!(names(around), expected);
+        }
     }
 
     /// The same post-filter applies to a box-set-only listing (the Collections
@@ -7098,7 +7115,7 @@ mod tests {
         let set = collections
             .create_collection(&CollectionCreationOptions {
                 name: "Box".into(),
-                item_id_list: members,
+                item_id_list: members.clone(),
                 ..Default::default()
             })
             .await
@@ -7167,6 +7184,20 @@ mod tests {
         let added = ["Zeta", "Alpha", "Mid", "Beta"];
         assert_eq!(list(false, vec![]).await, added);
         assert_eq!(list(true, vec![]).await, by_name);
+        // `AdjacentTo` follows the set's own order: by the order added, Alpha
+        // sits between Zeta and Mid, and Beta falls outside its window.
+        let around = library
+            .query_items(&InternalItemsQuery {
+                user: Some(user.clone()),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                apply_folder_display_options: true,
+                adjacent_to: Some(members[1]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(names(around), ["Zeta", "Alpha", "Mid"]);
     }
 
     #[tokio::test]
