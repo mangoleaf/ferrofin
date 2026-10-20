@@ -540,6 +540,15 @@ impl ScanRequest {
             && (whole_libraries || self.ancestors == other.ancestors)
     }
 
+    /// Whether this is a full library validation — upstream's
+    /// `ValidateMediaLibraryInternal`, the span its `IsScanRunning` covers:
+    /// every library, with the library's closing passes. A refresh of the
+    /// root folder over the API covers every library too, but it is
+    /// `ProviderManager.RefreshItem` upstream, not a validation.
+    fn is_library_validation(&self) -> bool {
+        self.scope == ScanTarget::All && self.passes == ScanPasses::Library
+    }
+
     /// Whether two requests refresh alike, so that one may cover the other.
     fn refreshes_like(&self, other: &Self) -> bool {
         self.options == other.options
@@ -608,6 +617,9 @@ struct RunningScan {
     waiters: Waiters,
     /// Stops it between two items once nobody wants it any more.
     cancel: ScanCancel,
+    /// It is a full library validation ([`ScanRequest::is_library_validation`]),
+    /// what `is_scan_running` reports.
+    validation: bool,
 }
 
 /// How a scan a caller waited for ended.
@@ -956,6 +968,7 @@ impl ScanWorker {
                     queue.running = Some(RunningScan {
                         waiters: pending.waiters,
                         cancel: cancel.clone(),
+                        validation: pending.request.is_library_validation(),
                     });
                     Some((pending.request, cancel, waited))
                 } else {
@@ -1978,7 +1991,7 @@ impl FerrofinLibraryManager {
 
     /// Attaches a scan stand-in in place of the filesystem scanner.
     #[cfg(test)]
-    fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
+    pub(crate) fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
         self.scanner = Some(runner);
         self
     }
@@ -3310,6 +3323,13 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
+    fn is_scan_running(&self) -> bool {
+        lock_queue(&self.scan_queue)
+            .running
+            .as_ref()
+            .is_some_and(|running| running.validation)
+    }
+
     async fn shutdown_scans(&self) {
         let mut progress = self.scan_progress.subscribe();
         {
@@ -3800,6 +3820,54 @@ mod tests {
         runner.release(2 * GatedRunner::ITEMS);
         waiter.await.expect("joined");
         assert_eq!(runner.runs().len(), 3, "the queued run scanned");
+        until_idle(&mgr).await;
+    }
+
+    /// `is_scan_running` is upstream's `IsScanRunning`: it holds for the whole
+    /// of a full library validation and for nothing that never enters
+    /// `ValidateMediaLibraryInternal` — one library's scan, the library
+    /// monitor's changed paths, a refresh of every library over the API.
+    #[tokio::test]
+    async fn only_a_full_library_validation_reports_the_scan_running() {
+        use crate::library_monitor::LibraryScanTrigger as _;
+
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        assert!(!mgr.is_scan_running(), "nothing is running");
+
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        assert!(
+            mgr.is_scan_running(),
+            "a full library validation is running"
+        );
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert!(!mgr.is_scan_running(), "the validation finished");
+
+        mgr.queue_library_scan_scoped(Uuid::new_v4())
+            .await
+            .expect("queued");
+        runner.started(2).await;
+        assert!(!mgr.is_scan_running(), "one library's scan");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+
+        mgr.queue_scan_paths(vec!["/m/a.mkv".to_owned()], ScanTrigger::Watcher)
+            .await
+            .expect("queued");
+        runner.started(3).await;
+        assert!(!mgr.is_scan_running(), "the library monitor's scan");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+
+        mgr.queue_refresh_scan(ScanTarget::All, &MetadataRefreshOptions::default())
+            .await
+            .expect("queued");
+        runner.started(4).await;
+        assert!(!mgr.is_scan_running(), "a refresh of every library");
+        runner.release(GatedRunner::ITEMS);
         until_idle(&mgr).await;
     }
 
@@ -4866,6 +4934,7 @@ mod tests {
             running: Some(RunningScan {
                 waiters: Waiters { tickets, detached },
                 cancel: ScanCancel::new(),
+                validation: true,
             }),
             ..ScanQueue::default()
         };
