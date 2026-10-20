@@ -36,10 +36,10 @@
 //!
 //! Accepted divergences from C#: `IsFavoriteOrLiked` is approximated as
 //! favorite-only (as elsewhere in the query layer); the person-recommendation
-//! IMDb de-dup is dropped; and results are ordered **deterministically**
-//! rather than by C#'s `Random` — the weighted path by score then
-//! (`SortName`, `Id`), the flat path by `SortName` — so a client sees a stable
-//! answer instead of a fresh shuffle per request.
+//! IMDb de-dup is dropped; and the weighted path breaks equal scores
+//! **deterministically**, by (`SortName`, `Id`), where C# keeps whatever
+//! dictionary order the candidates arrived in, so a client sees a stable answer.
+//! The flat path orders by `Random`, as C# does.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
