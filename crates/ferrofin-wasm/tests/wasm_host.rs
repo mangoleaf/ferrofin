@@ -1135,7 +1135,7 @@ impl ferrofin_traits::library::VirtualFolderManager for SwitchDuringWriteFolders
         name: &str,
         collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
         options: &ferrofin_model::configuration::LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         self.inner
             .add_virtual_folder(name, collection_type, options)
             .await
