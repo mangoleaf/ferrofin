@@ -141,7 +141,7 @@ Wired and working, with a documented limitation or lighter verification:
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
-  providers (TMDB similar titles, ListenBrainz similar artists) run only for a library
+  providers (TMDB recommendations, ListenBrainz similar artists) run only for a library
   that ticked them under "Similarity providers", and resolve against items already in the
   library. The local scorer is a single query rather than upstream's six per-kind
   providers, which are identical in behaviour.
