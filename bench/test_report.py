@@ -1304,6 +1304,72 @@ class GateTests(unittest.TestCase):
         self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
         self.assertIn('Noise per cell', (aa / 'report.html').read_text())
 
+    def viewer(self, target):
+        status, _, body = report.handle(target, {'benchmark': str(self.root), 'adoption': None, 'parity': None})
+        return status, body.decode('utf-8')
+
+    def test_ab_verdicts_reach_the_candidate_runs_in_the_viewer(self):
+        out = self.session('ab', [10, 20, 10, 20, 10, 20])
+        for name in ('01-a', '02-b'):  # what run.sh left beside each run, before the gate judged it
+            (out / name / 'report.html').write_text('<p>written by run.sh</p>')
+        gate.render(str(out))
+        runs = [n for n, _ in report.discover('benchmark', str(self.root))]
+        self.assertEqual(sorted(runs), [f'gate-ab/0{i}-{r}' for i, r in zip(range(1, 7), 'ababab')])
+        status, tab = self.viewer('/benchmark')
+        self.assertEqual(status, 200)
+        self.assertIn("href='/report/benchmark/gate-ab/02-b'", tab)
+        self.assertEqual(self.viewer('/report/benchmark/gate-ab%2F02-b'), self.viewer('/report/benchmark/gate-ab/02-b'))
+        self.assertEqual(self.viewer('/report/benchmark/gate-ab/02-b/x')[0], 404)
+        # all 13 screens and endpoints doubled; the two memory cells did not move
+        tally = 'A/B gate — 13 regressed, 0 not comparable, 2 within noise, 0 improved'
+        for name in ('02-b', '04-b', '06-b'):
+            with self.subTest(name):
+                cells = report.load_verdicts([str(out / name)])
+                self.assertEqual(next(c for c in cells if c['cell'] == 'loaded/screens/home'),
+                                 {'cell': 'loaded/screens/home', 'verdict': 'regressed', 'baseline': 10, 'candidate': 20,
+                                  'unit': 'ms', 'delta_pct': 100.0})
+                status, page = self.viewer('/report/benchmark/gate-ab/' + name)
+                self.assertEqual(status, 200)
+                self.assertIn(tally, page)
+                self.assertIn(tally, (out / name / 'report.html').read_text())  # the static report too
+        self.assertIsNone(report.load_verdicts([str(out / '01-a')]))  # the previous release is not judged
+        self.assertEqual((out / '01-a' / 'report.html').read_text(), '<p>written by run.sh</p>')
+        status, page = self.viewer('/benchmark?run=gate-ab%2F02-b&run=gate-ab%2F04-b&baseline=gate-ab%2F01-a')
+        self.assertEqual(status, 200)
+        self.assertIn(tally, page)
+        aa = self.session('aa', [10, 10])
+        gate.render(str(aa))
+        self.assertFalse(any(aa.glob('*/ab-verdicts.json')))
+
+    def test_a_cell_the_gate_could_not_judge_reaches_the_viewer_with_its_reason(self):
+        out = self.session('ab', [10, 20, 10, 20, 10, 20])
+        self.edit(out / '04-b/ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
+        gate.render(str(out))
+        cell = next(c for c in report.load_verdicts([str(out / '02-b')]) if c['cell'] == 'loaded/screens/home')
+        self.assertEqual(cell['verdict'], 'not comparable')
+        self.assertIn('measured requests failed', cell['reason'])
+        page = self.viewer('/report/benchmark/gate-ab/02-b')[1]
+        self.assertIn("class='verdict not-comparable'>not comparable: measured requests failed", page)
+
+    def test_a_verdict_reason_is_text_and_shown_escaped(self):
+        cell = {'cell': 'loaded/screens/home', 'verdict': 'not comparable', 'reason': '<b>status 500</b>'}
+        self.assertIn(': &lt;b&gt;status 500&lt;/b&gt;</td>', report.verdict_html([cell]))
+        run = self.root / 'run'
+        self.write(run / 'ab-verdicts.json', {'cells': [dict(cell, reason=5)]})
+        with self.assertRaisesRegex(ValueError, 'ab-verdicts.json'):
+            report.load_verdicts([str(run)])
+
+    def test_viewer_cells_are_the_gated_rows_in_the_viewer_shape(self):
+        rows = {'loaded/screens/home': {'unit': 'ms', 'verdict': 'regressed', 'diff': 10, 'pct': 100.0, 'slower': 3,
+                                        'a_median': 10, 'b_median': 20, 'gated': True},
+                'loaded/endpoints/x': {'unit': 'ms', 'verdict': 'regressed', 'diff': 0.4, 'pct': 80.0, 'slower': 3,
+                                       'a_median': 0.5, 'b_median': 0.9, 'gated': False},
+                'unloaded/screens/y': {'unit': 'ms', 'verdict': 'not comparable', 'reason': 'missing values', 'gated': True}}
+        self.assertEqual(gate.viewer_cells(rows), [
+            {'cell': 'loaded/screens/home', 'verdict': 'regressed', 'baseline': 10, 'candidate': 20, 'unit': 'ms', 'delta_pct': 100.0},
+            {'cell': 'unloaded/screens/y', 'verdict': 'not comparable', 'baseline': None, 'candidate': None, 'unit': 'ms',
+             'delta_pct': None, 'reason': 'missing values'}])
+
     def scan_session(self, name, candidate_walls):
         """A scan session: the previous release scans in 100 s every run, the candidate in
         `candidate_walls` (one per pair); memory and migration are equal on both sides."""

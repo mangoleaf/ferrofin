@@ -300,11 +300,17 @@ impl QuickConnect for OkQuickConnect {
     async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
         Ok(true)
     }
-    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
-        Ok(SessionInfoDto {
-            user_id: ADMIN_ID,
-            user_name: Some("admin".to_owned()),
-            ..SessionInfoDto::default()
+    async fn get_authorized_request(
+        &self,
+        _secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto {
+                user_id: ADMIN_ID,
+                user_name: Some("admin".to_owned()),
+                ..SessionInfoDto::default()
+            },
+            access_token: "qc-token".into(),
         })
     }
 }
