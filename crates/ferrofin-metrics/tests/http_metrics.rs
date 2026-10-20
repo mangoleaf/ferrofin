@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::get;
 use ferrofin_metrics::RouteLabels;
+use std::time::Duration;
 use tower::ServiceExt as _;
 
 /// A one-route spec so the stub `RouteLabels` maps `GET /Items/{itemId}` →
@@ -23,6 +24,7 @@ fn stub_labels() -> RouteLabels {
 fn app() -> Router {
     Router::new()
         .route("/Items/{itemId}", get(|| async { "ok" }))
+        .route("/hang", get(std::future::pending::<&'static str>))
         .layer(axum::middleware::from_fn(ferrofin_metrics::track_http))
 }
 
@@ -58,6 +60,8 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
         .await
         .unwrap();
     assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+    drop_mid_handler(&app).await;
 
     let out = handle.render();
 
@@ -104,6 +108,7 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
             .any(|l| l.starts_with("http_requests_in_progress") && l.trim_end().ends_with(" 0")),
         "in-progress did not return to 0:\n{out}"
     );
+    assert_dropped_request_left_in_progress(&out);
     // Unmatched request rendered with empty-string labels (prometheus-net convention).
     assert!(
         out.contains(r#"endpoint="""#) && out.contains(r#"code="404""#),
@@ -127,6 +132,31 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
             "portable Jellyfin metric `{name}` is absent from Ferrofin's exposition:\n{out}"
         );
     }
+}
+
+/// Drops a request mid-handler, the way hyper drops the service future on a
+/// client disconnect.
+async fn drop_mid_handler(app: &Router) {
+    // Any short bound works: the increment happens on the first poll.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(50),
+        app.clone()
+            .oneshot(Request::builder().uri("/hang").body(Body::empty()).unwrap()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the hanging handler completed");
+}
+
+/// The dropped request no longer counts as in progress.
+fn assert_dropped_request_left_in_progress(out: &str) {
+    let hang = out
+        .lines()
+        .find(|l| l.starts_with("http_requests_in_progress{") && l.contains(r#"endpoint="/hang""#))
+        .unwrap_or_else(|| panic!("missing in-progress series for /hang:\n{out}"));
+    assert!(
+        hang.trim_end().ends_with(" 0"),
+        "a dropped request left the in-progress gauge raised: {hang}"
+    );
 }
 
 /// The Jellyfin (prometheus-net) metric names whose concept exists in Rust and

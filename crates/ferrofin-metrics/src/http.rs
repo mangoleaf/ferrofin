@@ -96,11 +96,11 @@ pub async fn track_http(req: Request, next: Next) -> Response {
             .unwrap_or(("", "", matched.as_str()));
     let shared = shared_labels(&method, controller, action, endpoint);
 
-    inst.in_progress.add(1, &shared);
+    let in_progress = InProgress::enter(&inst.in_progress, &shared);
     let start = Instant::now();
     let response = next.run(req).await;
     let elapsed = start.elapsed().as_secs_f64();
-    inst.in_progress.add(-1, &shared);
+    drop(in_progress);
 
     let mut labelled = shared;
     labelled.push(KeyValue::new(
@@ -111,6 +111,27 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     inst.duration.record(elapsed, &labelled);
 
     response
+}
+
+/// Counts one request in `http_requests_in_progress` until dropped, so a
+/// request whose future is dropped mid-handler (client disconnect, panic) still
+/// leaves the gauge — prometheus-net's `using (… TrackInProgress())`.
+struct InProgress<'a> {
+    gauge: &'a UpDownCounter<i64>,
+    labels: &'a [KeyValue],
+}
+
+impl<'a> InProgress<'a> {
+    fn enter(gauge: &'a UpDownCounter<i64>, labels: &'a [KeyValue]) -> Self {
+        gauge.add(1, labels);
+        Self { gauge, labels }
+    }
+}
+
+impl Drop for InProgress<'_> {
+    fn drop(&mut self) {
+        self.gauge.add(-1, self.labels);
+    }
 }
 
 /// The labels shared by every `http_*` instrument (in-progress omits `code`,
