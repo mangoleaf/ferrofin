@@ -268,6 +268,42 @@ async fn extract_all_records_ffmpeg_args() {
     assert!(outputs.iter().any(|o| o.ends_with("/1.srt")));
 }
 
+/// `ExtractAllExtractableSubtitlesMKS`: an external `.mks` is its own ffmpeg
+/// input, each of its tracks mapped by its position inside that file, and a
+/// VobSub track re-muxed as Matroska (no `.idx`/`.sub` muxer). The embedded
+/// pass keeps reading the video file.
+#[tokio::test]
+async fn extract_all_extracts_external_mks_tracks_from_their_own_file() {
+    let ass = sub_stream(0, "ass", None, false);
+    let srt = sub_stream(2, "subrip", Some("/media/subs.mks"), true);
+    let vob = sub_stream(3, "dvdsub", Some("/media/subs.mks"), true);
+    let source = source_with("guid9", "/media/movie.mkv", vec![ass, srt, vob]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 2, "the video file, then the .mks: {calls:?}");
+    let (embedded, outputs) = &calls[0];
+    assert!(
+        embedded.starts_with("-y -i file:\"/media/movie.mkv\""),
+        "{embedded}"
+    );
+    assert_eq!(outputs, &["/cache/guid9/0.ass"]);
+    let (mks, outputs) = &calls[1];
+    assert!(mks.starts_with("-y -i file:\"/media/subs.mks\""), "{mks}");
+    assert!(
+        mks.contains("-map 0:0 -an -vn -c:s copy -flush_packets 1"),
+        "{mks}"
+    );
+    assert!(
+        mks.contains("-map 0:1 -an -vn -c:s copy -f matroska -flush_packets 1"),
+        "{mks}"
+    );
+    assert_eq!(outputs, &["/cache/guid9/2.srt", "/cache/guid9/3.mks"]);
+}
+
 /// File names come from the library. One built to close the quote must reach
 /// ffmpeg as the single `-i` value, in both the extraction and the conversion
 /// command, never as extra options.
