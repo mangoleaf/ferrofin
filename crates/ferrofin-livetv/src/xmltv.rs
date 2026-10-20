@@ -97,13 +97,28 @@ pub struct Xmltv {
     pub channels: Vec<XmltvChannel>,
     /// Programme airings.
     pub programmes: Vec<XmltvProgramme>,
+    /// Why the document is not a readable XMLTV guide, when it is not: empty,
+    /// not well-formed, cut off inside an element, or rooted at something other
+    /// than `<tv>`. A guide refresh treats such a document the way Jellyfin 12.1
+    /// treats a throwing `GetProgramsAsync` (`hasErrors`): it keeps the stored
+    /// guide rather than replacing it with what was read.
+    pub error: Option<String>,
 }
 
 /// Parses an XMLTV document. Malformed XML yields whatever was read before the
-/// error (lenient, matching how tuner guides are consumed in practice); a
-/// completely unparseable document yields an empty guide.
+/// error, with [`Xmltv::error`] saying what went wrong, so a caller can tell a
+/// partial read from a complete guide.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one pull-parser state machine
 pub fn parse_xmltv(xml: &str) -> Xmltv {
+    if xml.trim().is_empty() {
+        // `XmlTvListingsProvider.UnzipIfNeededAndCopy`: "Downloaded XMLTV file
+        // is empty".
+        return Xmltv {
+            error: Some("the XMLTV document is empty".to_owned()),
+            ..Xmltv::default()
+        };
+    }
     let mut reader = Reader::from_str(xml);
     let config = reader.config_mut();
     config.check_end_names = false;
@@ -116,14 +131,32 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     let mut episode_system: Option<String> = None;
     // The number of elements open around the current one. An unbalanced tag
     // (`check_end_names` is off) skews it until the programme or channel it
-    // sits in ends, losing that one's later children; upstream's `XmlReader`
-    // rejects the whole guide instead.
+    // sits in ends, losing that one's later children. A tag still open at EOF
+    // sets `error`, so the refresh keeps the stored guide, as upstream's
+    // `XmlReader` rejecting the document does. Best-effort only: a stray end
+    // tag can cancel an unclosed one.
     let mut depth = 0_usize;
     let mut channel: Option<OpenChannel> = None;
     let mut programme: Option<OpenProgramme> = None;
+    let mut root_seen = false;
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        if !root_seen && let Ok(Event::Start(e) | Event::Empty(e)) = &event {
+            root_seen = true;
+            // Stricter than .NET's `XmlReader`, which rejects an HTML error
+            // page only when it is not well-formed: with `check_end_names` off
+            // this reader cannot tell, so any root but `<tv>` keeps the stored
+            // guide.
+            if e.local_name().as_ref() != "tv" {
+                out.error = Some(format!(
+                    "the document's root element is <{}>, not <tv>",
+                    e.local_name().as_ref()
+                ));
+                break;
+            }
+        }
+        match event {
             Ok(Event::Start(e)) => {
                 match e.local_name().as_ref().as_bytes() {
                     b"channel" => {
@@ -206,7 +239,18 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                 }
                 text.clear();
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                if depth > 0 {
+                    out.error = Some("the XMLTV document ends inside an open element".to_owned());
+                } else if !root_seen {
+                    out.error = Some("the XMLTV document has no root element".to_owned());
+                }
+                break;
+            }
+            Err(e) => {
+                out.error = Some(format!("the XMLTV document is not well-formed: {e}"));
+                break;
+            }
             Ok(_) => {}
         }
     }
@@ -672,6 +716,32 @@ mod tests {
         let g = parse_xmltv("");
         assert!(g.channels.is_empty());
         assert!(g.programmes.is_empty());
+        assert!(
+            g.error.is_some(),
+            "an empty body is an error, not an empty guide"
+        );
+    }
+
+    /// Which documents a guide refresh refuses (`error` set) and which it
+    /// takes as authoritative, even when they carry no programmes.
+    #[rstest::rstest]
+    #[case::whitespace(" \n\t", true)]
+    #[case::text_only("Service Unavailable", true)]
+    #[case::bare_ampersand_in_text(
+        "<tv><programme channel=\"a\"><title>A & B</title></programme></tv>",
+        true
+    )]
+    #[case::unclosed_at_eof("<tv><channel id=\"a\">", true)]
+    #[case::html_root("<!DOCTYPE html><html><body>503</body></html>", true)]
+    #[case::empty_tv("<tv></tv>", false)]
+    #[case::self_closing_tv("<tv/>", false)]
+    #[case::prolog(
+        "<?xml version=\"1.0\"?><!DOCTYPE tv SYSTEM \"xmltv.dtd\"><!-- grabber --><tv></tv>",
+        false
+    )]
+    #[case::prefixed_tv("<x:tv xmlns:x=\"urn:x\"></x:tv>", false)]
+    fn unreadable_documents_report_an_error(#[case] xml: &str, #[case] unreadable: bool) {
+        assert_eq!(parse_xmltv(xml).error.is_some(), unreadable, "{xml}");
     }
 
     /// Attribute values carry XML entity references just like element text does,
