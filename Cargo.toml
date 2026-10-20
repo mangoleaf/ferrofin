@@ -198,6 +198,9 @@ icu_provider = "2.3.1"
 zerovec = "0.11.8"
 fancy-regex = "0.19.2"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
+# Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
+# ffprobe's tag map cannot give — the scan's port of ATL's `Track.Lyrics`.
+lofty = "0.25.4"
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.27.0"         # [Theory]/[InlineData] → #[case] transliteration
