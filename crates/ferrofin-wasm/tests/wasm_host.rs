@@ -1305,13 +1305,23 @@ async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart
     drop(host);
 
     // The restart: the same plugin, now healthy and counting its offers.
+    // Each offer copies the item, temp-dir path included, into the fixture's
+    // one-page memory, whose bump allocator never frees. So every offer
+    // starts again at the allocator's first address. Otherwise a few hundred
+    // offers fill the page (fewer under a long TMPDIR), and the trap
+    // restarts the guest and its count.
+    assert!(
+        FIXTURE_WAT.contains("(global $bump (mut i32) (i32.const 4096))"),
+        "the fixture's allocator start moved"
+    );
     write_fixture(
         dir.path(),
         "analyzer",
         &count_in_three_digits(&FIXTURE_WAT.replace(
             scan_media,
             &format!(
-                "{scan_media} (global.set $events (i32.add (global.get $events) (i32.const 1)))"
+                "{scan_media} (global.set $bump (i32.const 4096)) \
+                 (global.set $events (i32.add (global.get $events) (i32.const 1)))"
             ),
         )),
     );
