@@ -19392,12 +19392,14 @@ fn settle_extra_name(
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
 /// to a persistable [`PeopleEntity`]. NFO people carry no remote id/image, so those
-/// are left empty; the person-type key is the Jellyfin `PersonType` name.
+/// are left empty; the person-type key is the Jellyfin `PersonType` name
+/// (`PersonInfo.Type.ToString()`, `PeopleRepository.cs:122`): the member name,
+/// or the C# integer of an undeclared value.
 fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> PeopleEntity {
     PeopleEntity {
         id: guid_to_db(Uuid::new_v4()),
         name: p.name,
-        person_type: Some(format!("{:?}", p.type_)),
+        person_type: Some(p.type_.json_name().into_owned()),
         role: p.role,
         primary_image_url: None,
         provider_id: None,
@@ -31775,6 +31777,15 @@ mod tests {
         assert_eq!(e.role.as_deref(), Some("Self"));
         assert!(e.provider_id.is_none());
         assert!(e.primary_image_url.is_none());
+
+        // An NFO `<type>27</type>` (or `Director,Narrator`) parses to an
+        // undeclared value, which C#'s `ToString()` stores as its integer.
+        let undeclared = super::person_to_entity(PersonInfo {
+            type_: PersonKind::Unrecognized(27),
+            ..PersonInfo::new("Jane Doe")
+        });
+        assert_eq!(undeclared.person_type.as_deref(), Some("27"));
+        assert_eq!(PersonKind::from_stored("27"), PersonKind::Unrecognized(27));
     }
 
     // A track's embedded cover becomes its Primary image, stored in the

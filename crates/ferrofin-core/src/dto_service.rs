@@ -1851,7 +1851,7 @@ impl FerrofinDtoService {
                     .person_type
                     .as_deref()
                     .map_or(ferrofin_model::data::PersonKind::Unknown, |t| {
-                        person_kind_from_str(t)
+                        ferrofin_model::data::PersonKind::from_stored(t)
                     }),
                 primary_image_tag,
                 image_blur_hashes: None,
@@ -3570,7 +3570,6 @@ fn f64_to_f32(value: f64) -> f32 {
     value as f32
 }
 
-/// Maps a stored `PersonType` string onto a [`PersonKind`].
 /// `AttachPeople`'s order (`DtoService.cs:900-935`) over an item's credits
 /// as `GetPeople` returns them (`ListOrder`): by `SortOrder ?? int.MaxValue`,
 /// then by kind — actors, guest stars, directors, writers, then producers
@@ -3584,7 +3583,7 @@ fn attach_order(
     let kind_rank = |person: &ferrofin_db::entities::base_items::PeopleEntity| match person
         .person_type
         .as_deref()
-        .map(person_kind_from_str)
+        .map(ferrofin_model::data::PersonKind::from_stored)
     {
         Some(PersonKind::Actor) => 0,
         Some(PersonKind::GuestStar) => 1,
@@ -3602,25 +3601,6 @@ fn attach_order(
         )
     });
     ordered
-}
-
-fn person_kind_from_str(value: &str) -> ferrofin_model::data::PersonKind {
-    use ferrofin_model::data::PersonKind;
-    match value {
-        "Actor" => PersonKind::Actor,
-        "Director" => PersonKind::Director,
-        "Composer" => PersonKind::Composer,
-        "Writer" => PersonKind::Writer,
-        "GuestStar" => PersonKind::GuestStar,
-        "Producer" => PersonKind::Producer,
-        "Conductor" => PersonKind::Conductor,
-        "Lyricist" => PersonKind::Lyricist,
-        "Artist" => PersonKind::Artist,
-        "AlbumArtist" => PersonKind::AlbumArtist,
-        "Author" => PersonKind::Author,
-        "Narrator" => PersonKind::Narrator,
-        _ => PersonKind::Unknown,
-    }
 }
 
 /// Maps the trickplay-manager manifest of stored rows onto the DTO's
@@ -10048,6 +10028,51 @@ mod tests {
             .filter_map(|p| p.name.as_deref())
             .collect();
         assert_eq!(names, expected);
+    }
+
+    /// `People[].Type` is the stored `PersonType` parsed the way upstream's
+    /// `PeopleRepository` does (`Enum.TryParse<PersonKind>(row.PersonType, out
+    /// var kind)`, `PeopleRepository.cs:346`, `:380`): every member name,
+    /// case-sensitively; anything else leaves `Unknown`.
+    #[tokio::test]
+    async fn people_carry_every_stored_person_kind() {
+        use ferrofin_model::json::enums::JsonEnum as _;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let item = fetch_item(&db, movie).await;
+        let mut stored: Vec<(&str, &str)> = ferrofin_model::data::PersonKind::members()
+            .iter()
+            .map(|(name, _)| (*name, *name))
+            .collect();
+        stored.extend([("actor", "Unknown"), ("Colorer", "Unknown")]);
+        let library = Arc::new(FakeLibrary {
+            people: (0_i64..)
+                .zip(&stored)
+                .map(|(order, (kind, _))| PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: format!("Person {order}"),
+                    person_type: Some((*kind).to_owned()),
+                    sort_order: Some(order),
+                    ..Default::default()
+                })
+                .collect(),
+            named_items: Vec::new(),
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let types: Vec<String> = dto
+            .people
+            .as_ref()
+            .expect("people")
+            .iter()
+            .map(|person| person.type_.json_name().into_owned())
+            .collect();
+        let expected: Vec<&str> = stored.iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(types, expected);
     }
 
     #[tokio::test]
