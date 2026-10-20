@@ -432,6 +432,9 @@ async fn serve_once(
     metrics: &mut Option<ProcessMetrics>,
     signals: &Signals,
 ) -> anyhow::Result<bool> {
+    // Process-wide SQLite setup must precede every open, the restore and the
+    // existing-database check below included.
+    ferrofin_db::init_sqlite();
     // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
     // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
     // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.
