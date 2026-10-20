@@ -1719,7 +1719,7 @@ mod tests {
             &self,
             _item_id: Uuid,
             _format: &str,
-            _lyrics: &str,
+            _lyrics: &[u8],
         ) -> Result<Option<LyricDto>, ServiceError> {
             unimplemented!("fake")
         }
