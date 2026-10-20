@@ -5813,7 +5813,7 @@ mod tests {
             source.id
         );
         assert_eq!(source.container.as_deref(), Some("ts"));
-        assert!(!source.supports_direct_play);
+        assert!(source.supports_direct_play);
         assert!(source.use_most_compatible_transcoding_profile);
         // `isHd` ⇒ the android-tv 1200 condition's dummy resolution.
         assert_eq!(source.media_streams[0].width, Some(1920));
