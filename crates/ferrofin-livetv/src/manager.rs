@@ -1132,7 +1132,7 @@ impl FerrofinLiveTvManager {
     ) -> Result<Vec<EpgChannel>, ServiceError> {
         Self::listings_provider_name(info.type_.as_deref())?;
         let path = info.path.clone().unwrap_or_default();
-        let body = self.fetcher.fetch(&path).await?;
+        let body = self.fetcher.fetch_listings(&path).await?;
         let guide = parse_xmltv(&body);
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
@@ -2176,7 +2176,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 clean_database = false;
                 continue;
             };
-            match self.fetcher.fetch(path).await {
+            match self.fetcher.fetch_listings(path).await {
                 // Jellyfin 12.1's `hasErrors` (`cleanDatabase &= !hasErrors`): an
                 // empty or unreadable document is a listings error like a failed
                 // fetch. The provider writes nothing, so `clean_programs` cannot
