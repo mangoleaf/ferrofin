@@ -276,11 +276,11 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     ///
     /// Port of `GetVideoBitrateParam`: the `libx264`/`libx265` (`-maxrate`/
     /// `-bufsize`) and `libsvtav1` (`-b:v`/`-bufsize`) arms, plus the generic
-    /// fallback every encoder with no arm of its own takes — NVENC among them.
-    /// The remaining per-vendor arms (the `h264_qsv` minimum-bitrate clamp and
-    /// `-mbbrc`, and the vaapi/amf/videotoolbox rate-control shapes) are the
-    /// work items of the hardware-transcoding roadmap phases 4-7. Returns empty when no output
-    /// bitrate is set.
+    /// fallback every encoder with no arm of its own takes — NVENC among them —
+    /// and the QSV arm. `-mbbrc` is not here: v12.2 moved it into
+    /// `GetEncoderParam` ([`encoder_param`]). The VAAPI rate-control shapes
+    /// are not ported yet; AMF and VideoToolbox are out of scope. Returns empty
+    /// when no output bitrate is set.
     #[must_use]
     pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
         let Some(mut bitrate) = state.output_video_bitrate else {
@@ -306,13 +306,6 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
         }
 
         if eq_any(video_codec, &["h264_qsv", "hevc_qsv", "av1_qsv"]) {
-            // MacroBlock-level rate control, for subjective quality. AV1 QSV
-            // does not take it.
-            let mbbrc = if eq_any(video_codec, &["h264_qsv", "hevc_qsv"]) {
-                " -mbbrc 1"
-            } else {
-                ""
-            };
             // Some weaker H.264 hardware decoders need a strict CPB, so the
             // buffer optimisation is withheld below level 5.1.
             let factor = if state
@@ -335,7 +328,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             let init_occupancy = clamp(i64::from(bitrate) * i64::from(factor));
             let bufsize = clamp(i64::from(bitrate) * 2 * i64::from(factor));
             return format!(
-                "{mbbrc} -b:v {bitrate} -maxrate {maxrate} \
+                " -b:v {bitrate} -maxrate {maxrate} \
                  -rc_init_occupancy {init_occupancy} -bufsize {bufsize}"
             );
         }
@@ -453,19 +446,42 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
     // ----- quality param (software path) -------------------------------------
 
-    /// Builds the software `-preset`/`-crf`/`-profile`/`-level`/codec-opts
-    /// quality argument for `video_encoder`.
+    /// Builds the encoder's quality argument for `video_encoder`: preset,
+    /// CRF or bitrate, `-r`, profile, level and the codec-specific options.
     ///
-    /// Port of the **software slice** of `GetVideoQualityParam`. The hardware
-    /// low-power/i915-workaround preamble belongs to the hardware-transcoding roadmap phases
-    /// 4-5 — low-power covers vaapi and qsv, and the `-async_depth 1` i915
-    /// workaround is qsv-only (it is inert when the
-    /// hardware-acceleration type is `none`, i.e. the software path); the
-    /// libx264/libx265/libsvtav1 preset, CRF, profile, level, and codec-specific
-    /// option strings are ported verbatim.
+    /// Port of `GetVideoQualityParam` minus its hardware low-power and i915
+    /// preamble, which the planner emits from the concrete capabilities
+    /// (`hw::quality::hardware_quality_preamble`). It reads the capabilities
+    /// this helper was built with; see [`Self::video_quality_param_with`] for
+    /// a job whose VAAPI driver was probed later.
     #[must_use]
     pub fn video_quality_param(
         &self,
+        state: &EncodingJobInfo,
+        video_encoder: &str,
+        encoding_options: &EncodingOptions,
+        default_preset: EncoderPreset,
+    ) -> String {
+        self.video_quality_param_with(
+            &self.capabilities,
+            state,
+            video_encoder,
+            encoding_options,
+            default_preset,
+        )
+    }
+
+    /// [`Self::video_quality_param`] against `capabilities` instead of the
+    /// ones this helper was built with.
+    ///
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, and the
+    /// driver behind the configured render node is only known once the
+    /// planner has probed it for the job. The boot capabilities never carry
+    /// it, so the planner passes its per-job probe here.
+    #[must_use]
+    pub fn video_quality_param_with(
+        &self,
+        capabilities: &C,
         state: &EncodingJobInfo,
         video_encoder: &str,
         encoding_options: &EncodingOptions,
@@ -480,6 +496,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             encoding_options,
             video_encoder,
             is_libx265,
+            capabilities.is_vaapi_device_intel_ihd(),
         ));
         param.push_str(&self.video_bitrate_param(state, video_encoder));
 
@@ -514,8 +531,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
         // which libsvtav1 takes from ffmpeg 5.1 on (`GetVideoQualityParam`,
         // :2409-2413).
         if video_encoder.eq_ignore_ascii_case("libsvtav1")
-            && self
-                .capabilities
+            && capabilities
                 .ffmpeg_version()
                 .is_some_and(|version| version >= super::hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS)
         {
@@ -946,14 +962,19 @@ fn codec_specific_quality_args(
     param
 }
 
-/// Builds the `-preset`/`-crf` argument for software encoders. Port of the
-/// software branches of `GetEncoderParam` (libx264/libx265/libsvtav1).
+/// Builds the encoder's preset/quality argument. Port of `GetEncoderParam`:
+/// the libx264/libx265, libsvtav1, VAAPI, QSV and NVENC arms. AMF has no arm,
+/// as it is out of scope (CLAUDE.md, "Current scope").
+///
+/// `vaapi_intel_ihd` is `IMediaEncoder.IsVaapiDeviceInteliHD`, which gates
+/// the VAAPI arm.
 fn encoder_param(
     preset: EncoderPreset,
     _default_preset: EncoderPreset,
     encoding_options: &EncodingOptions,
     video_encoder: &str,
     is_libx265: bool,
+    vaapi_intel_ihd: bool,
 ) -> String {
     let mut param = String::new();
     // EncodingOptions.EncoderPreset is non-nullable and defaults to auto.
@@ -999,6 +1020,48 @@ fn encoder_param(
             _ => " -preset 10",
         };
         param.push_str(preset);
+    } else if eq_any(video_encoder, &["h264_vaapi", "hevc_vaapi", "av1_vaapi"]) {
+        // "-compression_level is not reliable on AMD." `auto` and `placebo`
+        // get nothing.
+        if vaapi_intel_ihd {
+            #[allow(clippy::match_same_arms)]
+            let level = match encoder_preset {
+                EncoderPreset::veryslow => " -compression_level 1",
+                EncoderPreset::slower => " -compression_level 2",
+                EncoderPreset::slow => " -compression_level 3",
+                EncoderPreset::medium => " -compression_level 4",
+                EncoderPreset::fast => " -compression_level 5",
+                EncoderPreset::faster => " -compression_level 6",
+                EncoderPreset::veryfast | EncoderPreset::superfast | EncoderPreset::ultrafast => {
+                    " -compression_level 7"
+                }
+                _ => "",
+            };
+            param.push_str(level);
+        }
+    } else if eq_any(video_encoder, &["h264_qsv", "hevc_qsv", "av1_qsv"]) {
+        // QSV names seven of x264's presets; anything else, `auto` included,
+        // runs at veryfast.
+        let preset = if matches!(
+            encoder_preset,
+            EncoderPreset::veryslow
+                | EncoderPreset::slower
+                | EncoderPreset::slow
+                | EncoderPreset::medium
+                | EncoderPreset::fast
+                | EncoderPreset::faster
+                | EncoderPreset::veryfast
+        ) {
+            encoder_preset
+        } else {
+            EncoderPreset::veryfast
+        };
+        let _ = write!(param, " -preset {}", preset_name(preset));
+        // MacroBlock-level rate control, for subjective quality. AV1 QSV
+        // does not take it.
+        if eq_any(video_encoder, &["h264_qsv", "hevc_qsv"]) {
+            param.push_str(" -mbbrc 1");
+        }
     } else if is_nvenc_encoder(video_encoder) {
         // NVENC's presets run p1 (fastest) to p7 (best quality), the opposite
         // direction to x264's names. The mapping is not monotonic in x264's
@@ -1014,9 +1077,12 @@ fn encoder_param(
             _ => " -preset p1",
         };
         param.push_str(preset);
+        // Spatial adaptive quantisation, for subjective quality (12.2). H.264
+        // is left out because Maxwell 1 does not support it.
+        if !video_encoder.eq_ignore_ascii_case("h264_nvenc") {
+            param.push_str(" -spatial-aq 1 -aq-strength 15");
+        }
     }
-    // The remaining hardware encoder branches (vaapi/qsv/amf/videotoolbox) are
-    // the per-vendor work items of the hardware-transcoding roadmap phases 4-7.
 
     param
 }
@@ -2224,14 +2290,14 @@ mod tests {
     // ----- video_bitrate_param (QSV) -----------------------------------------
 
     #[rstest]
-    // `-mbbrc 1` keys on the ENCODER name; `factor` keys on the output CODEC
-    // name — two different strings decided in the same block. AV1 QSV takes no
-    // mbbrc.
+    // `factor` keys on the output CODEC name. `-mbbrc 1` is not part of the
+    // bitrate any more: v12.2 moved it into `GetEncoderParam` (see
+    // `video_quality_param_gives_qsv_its_preset_and_mbbrc`).
     #[case(
         "h264_qsv",
         "h264",
         None,
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
     )]
     // Below level 5.1 some weaker H.264 decoders need a strict CPB, so the
     // buffer optimisation is withheld — halving both derived sizes.
@@ -2239,27 +2305,27 @@ mod tests {
         "h264_qsv",
         "h264",
         Some("40"),
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
     )]
     // The boundary is strict: 51 itself does NOT get the tighter factor.
     #[case(
         "h264_qsv",
         "h264",
         Some("51"),
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
     )]
     // Parsed as a double, so the dotted spelling works too — and 4.0 < 51.
     #[case(
         "h264_qsv",
         "h264",
         Some("4.0"),
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
     )]
     #[case(
         "hevc_qsv",
         "hevc",
         None,
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
     )]
     #[case(
         "av1_qsv",
@@ -2396,6 +2462,103 @@ mod tests {
             assert!(param.contains(expected), "{encoder}: {param}");
             // No `-crf`: that is a libx264/libx265 argument and NVENC rejects it.
             assert!(!param.contains("-crf"), "{encoder}: {param}");
+        }
+    }
+
+    /// v12.2 `GetEncoderParam` (PR 18261): HEVC and AV1 NVENC encodes get
+    /// spatial adaptive quantisation after the preset. H.264 is left out
+    /// because Maxwell 1 does not support it.
+    #[rstest]
+    #[case::h264("h264_nvenc", false)]
+    #[case::hevc("hevc_nvenc", true)]
+    #[case::av1("av1_nvenc", true)]
+    fn video_quality_param_gives_hevc_and_av1_nvenc_spatial_aq(
+        #[case] encoder: &str,
+        #[case] spatial_aq: bool,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("hevc".to_owned());
+        let opts = default_encoding_options(0);
+
+        let param =
+            helper(vec![]).video_quality_param(&state, encoder, &opts, EncoderPreset::veryfast);
+
+        assert_eq!(
+            param.contains(" -preset p1 -spatial-aq 1 -aq-strength 15"),
+            spatial_aq,
+            "{param}"
+        );
+    }
+
+    /// v12.2 `GetEncoderParam`'s QSV arm: `-preset` with the configured preset
+    /// when it is one of veryslow…veryfast and `veryfast` otherwise (`auto`
+    /// and the three fastest included), then `-mbbrc 1` for H.264/HEVC, moved
+    /// here from `GetVideoBitrateParam` by PR 18261.
+    #[rstest]
+    #[case::auto_h264("h264_qsv", EncoderPreset::auto, " -preset veryfast -mbbrc 1 -b:v")]
+    #[case::slow_hevc("hevc_qsv", EncoderPreset::slow, " -preset slow -mbbrc 1 -b:v")]
+    #[case::ultrafast_h264(
+        "h264_qsv",
+        EncoderPreset::ultrafast,
+        " -preset veryfast -mbbrc 1 -b:v"
+    )]
+    #[case::placebo_hevc("hevc_qsv", EncoderPreset::placebo, " -preset veryfast -mbbrc 1 -b:v")]
+    #[case::medium_av1("av1_qsv", EncoderPreset::medium, " -preset medium -b:v")]
+    fn video_quality_param_gives_qsv_its_preset_and_mbbrc(
+        #[case] encoder: &str,
+        #[case] preset: EncoderPreset,
+        #[case] expected: &str,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        state.output_video_bitrate = Some(3_000_000);
+        let mut opts = default_encoding_options(0);
+        opts.encoder_preset = preset;
+
+        let param =
+            helper(vec![]).video_quality_param(&state, encoder, &opts, EncoderPreset::veryfast);
+
+        assert!(param.contains(expected), "{param}");
+        assert_eq!(
+            param.matches("-mbbrc").count(),
+            usize::from(encoder != "av1_qsv"),
+            "{param}"
+        );
+    }
+
+    /// v12.2 `GetEncoderParam`'s VAAPI arm: an explicit preset becomes
+    /// `-compression_level 1..7` on an Intel iHD device only ("-compression_level
+    /// is not reliable on AMD"); `auto` gets nothing.
+    #[rstest]
+    #[case::ihd_slow(true, EncoderPreset::slow, Some(" -compression_level 3"))]
+    #[case::ihd_veryslow(true, EncoderPreset::veryslow, Some(" -compression_level 1"))]
+    #[case::ihd_ultrafast(true, EncoderPreset::ultrafast, Some(" -compression_level 7"))]
+    #[case::ihd_auto(true, EncoderPreset::auto, None)]
+    #[case::amd_slow(false, EncoderPreset::slow, None)]
+    fn video_quality_param_maps_the_preset_to_compression_level_on_intel_vaapi(
+        #[case] intel_ihd: bool,
+        #[case] preset: EncoderPreset,
+        #[case] expected: Option<&str>,
+    ) {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .vaapi_driver(!intel_ihd, intel_ihd, false)
+            .build();
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        let mut opts = default_encoding_options(0);
+        opts.encoder_preset = preset;
+
+        for encoder in ["h264_vaapi", "hevc_vaapi", "av1_vaapi"] {
+            let param = EncodingHelper::with_processor_count(caps.clone(), 8).video_quality_param(
+                &state,
+                encoder,
+                &opts,
+                EncoderPreset::veryfast,
+            );
+            match expected {
+                Some(level) => assert!(param.contains(level), "{encoder}: {param}"),
+                None => assert!(!param.contains("-compression_level"), "{encoder}: {param}"),
+            }
         }
     }
 

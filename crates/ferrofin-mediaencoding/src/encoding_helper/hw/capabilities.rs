@@ -418,6 +418,10 @@ impl EncoderCapabilities for FfmpegCapabilities {
     fn ffmpeg_version(&self) -> Option<FfmpegVersion> {
         self.ffmpeg_version
     }
+
+    fn is_vaapi_device_intel_ihd(&self) -> bool {
+        self.is_vaapi_device_intel_ihd
+    }
 }
 
 /// `StringComparer.OrdinalIgnoreCase` membership, which is how every C#

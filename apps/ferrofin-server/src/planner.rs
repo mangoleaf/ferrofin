@@ -1716,9 +1716,12 @@ impl FerrofinStreamStatePlanner {
                 &mut args,
                 &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
             );
+            // The probed capabilities, not the helper's boot ones: only the
+            // probe knows whether the VAAPI driver is iHD.
             push_split(
                 &mut args,
-                &self.encoding_helper.video_quality_param(
+                &self.encoding_helper.video_quality_param_with(
+                    caps,
                     state,
                     &video_encoder,
                     options,
@@ -5053,6 +5056,40 @@ mod tests {
                 "{codecs} with AllowAv1Encoding={allow_av1}, AllowHevcEncoding={allow_hevc}"
             );
         }
+    }
+
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, which
+    /// only the per-job probe learns: an explicit preset on a probed iHD device
+    /// becomes `-compression_level`. The boot capabilities the encoding helper
+    /// was built with never carry the driver, so reading those would leave the
+    /// arm dead on every Intel server.
+    #[tokio::test]
+    async fn a_probed_ihd_device_maps_the_preset_to_compression_level() {
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                encoder_preset: EncoderPreset::slow,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+
+        assert!(args.contains("-c:v h264_vaapi"), "{args}");
+        assert!(args.contains(" -compression_level 3"), "{args}");
     }
 
     #[tokio::test]

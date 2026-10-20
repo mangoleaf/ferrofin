@@ -47,6 +47,14 @@ pub trait EncoderCapabilities: Send + Sync {
     fn ffmpeg_version(&self) -> Option<crate::encoder::FfmpegVersion> {
         None
     }
+
+    /// Whether the VAAPI device runs Intel's iHD driver, the one VAAPI driver
+    /// whose `-compression_level` upstream trusts. Port of
+    /// `IMediaEncoder.IsVaapiDeviceInteliHD`; `false` (the default) when
+    /// nothing was probed.
+    fn is_vaapi_device_intel_ihd(&self) -> bool {
+        false
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.
