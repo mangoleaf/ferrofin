@@ -278,7 +278,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// `-bufsize`) and `libsvtav1` (`-b:v`/`-bufsize`) arms, plus the generic
     /// fallback every encoder with no arm of its own takes — NVENC among them —
     /// and the QSV arm. `-mbbrc` is not here: v12.2 moved it into
-    /// `GetEncoderParam` ([`encoder_param`]). The VAAPI rate-control shapes
+    /// `GetEncoderParam`. The VAAPI rate-control shapes
     /// are not ported yet; AMF and VideoToolbox are out of scope. Returns empty
     /// when no output bitrate is set.
     #[must_use]
@@ -531,13 +531,22 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
         // which libsvtav1 takes from ffmpeg 5.1 on (`GetVideoQualityParam`,
         // :2409-2413).
         if video_encoder.eq_ignore_ascii_case("libsvtav1")
-            && capabilities
-                .ffmpeg_version()
-                .is_some_and(|version| version >= super::hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS)
+            && capabilities.ffmpeg_at_least(super::hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS)
         {
             param.push_str(
                 " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0",
             );
+        }
+
+        // From ffmpeg 6.0 the VAAPI H.26x encoders embed A/53 closed-caption
+        // SEI, which can overflow the driver's packed-header limit ("Access
+        // unit too large: 8192 < 20880"); `-sei -a53_cc` clears that flag
+        // (`GetVideoQualityParam`, :2415-2421).
+        if eq_any(video_encoder, &["h264_vaapi", "hevc_vaapi"])
+            && capabilities
+                .ffmpeg_at_least(super::hw::versions::MIN_FFMPEG_VAAPI_H26X_ENC_A53_CC_SEI)
+        {
+            param.push_str(" -sei -a53_cc");
         }
 
         param
@@ -2428,6 +2437,36 @@ mod tests {
             expected,
             "{param}"
         );
+    }
+
+    /// v12.2 `GetVideoQualityParam` (:2415-2421): from ffmpeg 6.0
+    /// (`_minFFmpegVaapiH26xEncA53CcSei`) the VAAPI H.264/HEVC encoders get
+    /// `-sei -a53_cc`, which clears the A/53 caption SEI that can overflow the
+    /// driver ("Access unit too large"). AV1 VAAPI and an unknown version get
+    /// nothing.
+    #[rstest]
+    #[case::h264_on_7_1("h264_vaapi", Some((7, 1)), true)]
+    #[case::hevc_on_6_0("hevc_vaapi", Some((6, 0)), true)]
+    #[case::h264_on_5_1("h264_vaapi", Some((5, 1)), false)]
+    #[case::unknown_version("h264_vaapi", None, false)]
+    #[case::av1("av1_vaapi", Some((7, 1)), false)]
+    fn video_quality_param_clears_vaapi_caption_sei_on_ffmpeg_6(
+        #[case] encoder: &str,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: bool,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        let opts = default_encoding_options(0);
+
+        let param = probed_helper(version).video_quality_param(
+            &state,
+            encoder,
+            &opts,
+            EncoderPreset::veryfast,
+        );
+
+        assert_eq!(param.contains(" -sei -a53_cc"), expected, "{param}");
     }
 
     // ----- video_quality_param (NVENC) ---------------------------------------

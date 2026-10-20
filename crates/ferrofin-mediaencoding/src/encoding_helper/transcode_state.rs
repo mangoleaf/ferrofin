@@ -48,6 +48,12 @@ pub trait EncoderCapabilities: Send + Sync {
         None
     }
 
+    /// Whether the probed ffmpeg is at least `min`: the shape every
+    /// `_minFFmpeg*` gate in C# takes. False when the version is unknown.
+    fn ffmpeg_at_least(&self, min: crate::encoder::FfmpegVersion) -> bool {
+        self.ffmpeg_version().is_some_and(|version| version >= min)
+    }
+
     /// Whether the VAAPI device runs Intel's iHD driver, the one VAAPI driver
     /// whose `-compression_level` upstream trusts. Port of
     /// `IMediaEncoder.IsVaapiDeviceInteliHD`; `false` (the default) when
