@@ -3643,6 +3643,25 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
+    /// What each album's shared cover was last published from, so an
+    /// unchanged source is not read and hashed again on every scan
+    /// ([`shared_album_cover`](Self::shared_album_cover)). One small entry per
+    /// album the scanner has seen, never pruned: bounded by the library.
+    album_cover_sources: std::sync::Mutex<HashMap<Uuid, SharedCoverSource>>,
+}
+
+/// The source an album's shared cover was hashed from, with the stamp it had
+/// then ([`LibraryScanner::shared_album_cover`]).
+#[derive(Debug, Clone)]
+struct SharedCoverSource {
+    /// The source image's path.
+    source: String,
+    /// Its size when it was hashed.
+    len: u64,
+    /// Its mtime when it was hashed.
+    modified: std::time::SystemTime,
+    /// The shared copy it was published as.
+    shared_path: String,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -3830,6 +3849,7 @@ impl LibraryScanner {
             display_specials_within_seasons: None,
             nfo_configuration: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
+            album_cover_sources: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -7861,20 +7881,51 @@ impl LibraryScanner {
                 cache.track_albums.insert(item.id, *album);
             }
         }
-        for (id, album) in albums {
+        let has_primary =
+            |images: &[ItemImageInfo]| images.iter().any(|i| i.image_type == ImageType::Primary);
+        // Each album's own artwork, listed afresh (the walk may have saved
+        // artwork into the album's folder since the run listed it), off the
+        // runtime workers: a directory listing per album.
+        let mut listed: Vec<(Uuid, Vec<ItemImageInfo>)> = Vec::with_capacity(albums.len());
+        for (&id, album) in &albums {
             touched.extend(Box::pin(self.serve_lane(run)).await);
-            // Listed afresh: the walk may have saved artwork into the
-            // album's folder since the run listed it.
-            let mut images = discover_local_images(album, &FsDirectoryService::new());
-            self.append_art_dir_images(album, &mut images);
-            if !images.iter().any(|i| i.image_type == ImageType::Primary)
-                && let Some(items) = &self.item_repository
-                && let Ok(stored) = items.get_image_infos(id).await
-            {
-                images.extend(stored);
+            let images = off_runtime(|| {
+                let mut images = discover_local_images(album, &FsDirectoryService::new());
+                self.append_art_dir_images(album, &mut images);
+                images
+            });
+            listed.push((id, images));
+        }
+        // The stored artwork of every album with no local Primary, in one read.
+        let lacking: Vec<Uuid> = listed
+            .iter()
+            .filter(|(_, images)| !has_primary(images))
+            .map(|(id, _)| *id)
+            .collect();
+        // Read once, after the listing: a lane refresh served below may
+        // change an album's rows after this, as one served between two
+        // albums could before.
+        let mut stored = match &self.item_repository {
+            Some(items) if !lacking.is_empty() => {
+                match items.get_image_infos_for_items(&lacking).await {
+                    Ok(stored) => stored,
+                    Err(err) => {
+                        tracing::warn!(%err, "could not read the albums' stored artwork");
+                        HashMap::new()
+                    }
+                }
             }
+            _ => HashMap::new(),
+        };
+        for (id, mut images) in listed {
+            touched.extend(Box::pin(self.serve_lane(run)).await);
+            if !has_primary(&images) {
+                images.extend(stored.remove(&id).unwrap_or_default());
+            }
+            // Publishing the shared copy reads and hashes the cover the first
+            // time: off the runtime workers too.
             if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary)
-                && let Some(mut cover) = self.shared_album_cover(id, primary)
+                && let Some(mut cover) = off_runtime(|| self.shared_album_cover(id, primary))
             {
                 adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
                 self.fill_image_metadata(std::slice::from_mut(&mut cover))
@@ -7888,7 +7939,25 @@ impl LibraryScanner {
     /// Immutable, content-addressed album assets are outside item upload dirs.
     /// Replacing a track/album image therefore cannot overwrite another item's
     /// file. Old assets are retained as a persistent cache, including on delete.
+    ///
+    /// A source keeping the size and mtime it had when it was last hashed is
+    /// taken to be the same cover, and its shared copy is reused unread
+    /// ([`album_cover_sources`](Self::album_cover_sources)); a cover edited in
+    /// place without changing either keeps the old copy until it does.
     fn shared_album_cover(&self, album: Uuid, image: &ItemImageInfo) -> Option<ItemImageInfo> {
+        self.publish_album_cover(album, image, true)
+    }
+
+    /// [`shared_album_cover`](Self::shared_album_cover), consulting and
+    /// recording the source stamp only when `remember` is set: a transient
+    /// source (a cover just extracted from a track, deleted right after) must
+    /// not evict the album's real cover from the stamp cache.
+    fn publish_album_cover(
+        &self,
+        album: Uuid,
+        image: &ItemImageInfo,
+        remember: bool,
+    ) -> Option<ItemImageInfo> {
         use sha2::{Digest as _, Sha256};
         use std::fmt::Write as _;
         let root = self.metadata_dir.as_ref()?;
@@ -7898,6 +7967,29 @@ impl LibraryScanner {
             .join(guid_to_db(album));
         if source.starts_with(&dir) && source.is_file() {
             return Some(image.clone());
+        }
+        // A source with the size and mtime it had when it was last hashed is
+        // the same cover: reuse its shared copy (while it exists) rather than
+        // reading and hashing the whole file on every scan.
+        let stamp = remember
+            .then(|| std::fs::metadata(source).ok())
+            .flatten()
+            .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
+        let known = stamp.and_then(|(len, modified)| {
+            self.album_cover_sources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&album)
+                .filter(|known| {
+                    known.source == image.path && known.len == len && known.modified == modified
+                })
+                .map(|known| known.shared_path.clone())
+        });
+        if let Some(shared_path) = known.filter(|path| Path::new(path).is_file()) {
+            let mut shared = image.clone();
+            shared.date_modified = file_date_modified(Path::new(&shared_path));
+            shared.path = shared_path;
+            return Some(shared);
         }
         let bytes = std::fs::read(source).ok()?;
         let mut digest = String::with_capacity(64);
@@ -7921,6 +8013,20 @@ impl LibraryScanner {
         let mut shared = image.clone();
         shared.path = dest.to_string_lossy().into_owned();
         shared.date_modified = file_date_modified(&dest);
+        if let Some((len, modified)) = stamp {
+            self.album_cover_sources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    album,
+                    SharedCoverSource {
+                        source: image.path.clone(),
+                        len,
+                        modified,
+                        shared_path: shared.path.clone(),
+                    },
+                );
+        }
         Some(shared)
     }
 
@@ -7957,7 +8063,7 @@ impl LibraryScanner {
             height: 0,
             blur_hash: None,
         };
-        let shared = self.shared_album_cover(album, &image);
+        let shared = self.publish_album_cover(album, &image, false);
         let _ = std::fs::remove_file(extracted);
         let Some(mut cover) = shared else {
             return Vec::new();
@@ -20899,6 +21005,67 @@ mod tests {
         assert_eq!(kept(&promoted, &stored), None);
         assert_eq!(kept(&moved, &stored), None);
         assert_eq!(kept(&none, &row(Some(owner), Some(1))), None);
+    }
+
+    /// An album's cover is read and hashed into the shared, content-addressed
+    /// store once: while the file keeps its size and mtime (and the shared
+    /// copy is still there), a later scan reuses that copy without reading the
+    /// cover again. A change its metadata shows is read and hashed afresh.
+    #[tokio::test]
+    async fn an_unchanged_album_cover_is_not_read_and_hashed_again() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::library::VirtualFolderManager;
+        use ferrofin_traits::options::ItemImageInfo;
+
+        let db = crate::test_support::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db));
+        let vf: std::sync::Arc<dyn VirtualFolderManager> = std::sync::Arc::new(
+            crate::FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(
+            vf,
+            std::sync::Arc::new(FerrofinFileSystem::new()),
+            persistence,
+        )
+        .with_metadata_dir(tmp.path().join("metadata"));
+        let album = uuid::Uuid::new_v4();
+        let cover = tmp.path().join("folder.jpg");
+        std::fs::write(&cover, b"first cover").unwrap();
+        let image = ItemImageInfo {
+            path: cover.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: super::file_date_modified(&cover),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let first = scanner.shared_album_cover(album, &image).expect("shared");
+
+        // Other bytes, the same size and mtime: only a re-read would notice.
+        let modified = std::fs::metadata(&cover).unwrap().modified().unwrap();
+        std::fs::write(&cover, b"other cover").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&cover)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let again = scanner.shared_album_cover(album, &image).expect("shared");
+        assert_eq!(again.path, first.path, "the shared copy is reused unread");
+
+        // A shared copy that is gone is published again.
+        std::fs::remove_file(&first.path).unwrap();
+        let republished = scanner.shared_album_cover(album, &image).expect("shared");
+        assert!(
+            std::path::Path::new(&republished.path).is_file(),
+            "{republished:?}"
+        );
+
+        std::fs::write(&cover, b"a new, longer cover").unwrap();
+        let changed = scanner.shared_album_cover(album, &image).expect("shared");
+        assert_ne!(changed.path, first.path, "a changed cover is hashed afresh");
     }
 
     /// After the walk, each planned primary's local versions are written

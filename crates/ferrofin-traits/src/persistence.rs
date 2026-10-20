@@ -492,6 +492,29 @@ pub trait ItemRepository: Send + Sync {
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
+    /// [`get_image_infos`](Self::get_image_infos) for several items in one
+    /// read, keyed by item, each in the same order; an item with no images has
+    /// no entry.
+    ///
+    /// The default asks item by item (for stub/fake repositories).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn get_image_infos_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut images = HashMap::new();
+        for &item_id in item_ids {
+            let found = self.get_image_infos(item_id).await?;
+            if !found.is_empty() {
+                images.insert(item_id, found);
+            }
+        }
+        Ok(images)
+    }
+
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///
