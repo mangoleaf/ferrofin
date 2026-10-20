@@ -3882,6 +3882,38 @@ mod tests {
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
 
+    /// A page's artist and music-video album links resolve through one
+    /// `(Type, CleanName)` index search per chunk ([`item_ids_by_clean_name`]),
+    /// never a scan of `BaseItems`.
+    #[tokio::test]
+    async fn item_ids_by_clean_name_seeks_the_type_clean_name_index() {
+        let db = test_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {}", item_ids_by_clean_name_sql(2));
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind("MediaBrowser.Controller.Entities.Audio.MusicAlbum")
+            .bind("a")
+            .bind("b")
+            .fetch_all(db.pool())
+            .await
+            .expect("plan")
+            .iter()
+            .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.starts_with("SEARCH BaseItems USING")
+                    && detail.contains("Type_CleanName")
+                    && detail.contains("(Type=? AND CleanName=?)")),
+            "{plan:#?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.starts_with("SCAN BaseItems")),
+            "{plan:#?}"
+        );
+    }
+
     /// A page's image read comes off the `(ItemId, ImageType)` index already
     /// in `rowid` order; ordering by `Id` added a temp B-tree sort.
     #[tokio::test]
@@ -12459,27 +12491,25 @@ mod folder_forced_sort_tests {
     }
 }
 
-/// The id of the `MusicArtist` item for each clean artist name in `cleans`
-/// (`LinkedChildrenService.FindArtists`): a name with no such item is absent
-/// from the map; when several match, the first by sort name, then id.
+/// The id of the item of stored type `type_name` for each clean name in
+/// `cleans`: a name with no such item is absent from the map; when several
+/// match, the first by sort name, then id. Serves the artist links
+/// (`LinkedChildrenService.FindArtists`, `MusicArtist`) and a music video's
+/// album (`SetMusicVideoProperties`, `MusicAlbum`).
 ///
 /// # Errors
 ///
 /// A database error.
-pub(crate) async fn music_artist_ids_by_clean_name(
+pub(crate) async fn item_ids_by_clean_name(
     db: &Database,
+    type_name: &str,
     cleans: &[&String],
 ) -> Result<HashMap<String, Uuid>, ServiceError> {
     let mut ids: HashMap<String, Uuid> = HashMap::new();
     for chunk in cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            r#"SELECT "CleanName", "Id" FROM "BaseItems"
-               WHERE "Type" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist'
-                 AND "CleanName" IN ({placeholders})
-               ORDER BY "SortName", "Id""#,
-        );
-        let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+        let sql = item_ids_by_clean_name_sql(chunk.len());
+        let mut query =
+            sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql)).bind(type_name);
         for clean in chunk {
             query = query.bind(clean.as_str());
         }
@@ -12494,6 +12524,17 @@ pub(crate) async fn music_artist_ids_by_clean_name(
         }
     }
     Ok(ids)
+}
+
+/// The statement behind [`item_ids_by_clean_name`] for `names` clean names,
+/// after the stored type name.
+fn item_ids_by_clean_name_sql(names: usize) -> String {
+    let placeholders = vec!["?"; names].join(", ");
+    format!(
+        r#"SELECT "CleanName", "Id" FROM "BaseItems"
+           WHERE "Type" = ? AND "CleanName" IN ({placeholders})
+           ORDER BY "SortName", "Id""#,
+    )
 }
 
 /// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys of three
