@@ -1020,7 +1020,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         name: &str,
         collection_type: Option<CollectionTypeOptions>,
         options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         let name = Self::valid_filename(name);
         if name.is_empty() {
             return Err(ServiceError::invalid_input("library name cannot be empty"));
@@ -1082,7 +1082,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         self.ensure_collection_folder(&folder_path, &dedup_name)
             .await?;
 
-        Ok(())
+        Ok(self.collection_folder_id(&folder_path))
     }
 
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
@@ -2075,20 +2075,30 @@ mod tests {
         let (tmp, mgr) = manager();
         let m1 = media_dir(&tmp, "a");
         let m2 = media_dir(&tmp, "b");
-        mgr.add_virtual_folder("Lib", None, &opts_with_paths(&[m1]))
+        let first = mgr
+            .add_virtual_folder("Lib", None, &opts_with_paths(&[m1]))
             .await
             .unwrap();
-        mgr.add_virtual_folder("Lib", None, &opts_with_paths(&[m2]))
+        let second = mgr
+            .add_virtual_folder("Lib", None, &opts_with_paths(&[m2]))
             .await
             .unwrap();
-        let names: Vec<_> = mgr
+        let folders: Vec<_> = mgr
             .get_virtual_folders()
             .await
             .unwrap()
             .into_iter()
-            .filter_map(|f| f.name)
+            .map(|f| (f.name.unwrap(), f.item_id.unwrap()))
             .collect();
-        assert_eq!(names, vec!["Lib".to_owned(), "Lib2".to_owned()]);
+        // The returned id is the created library's, never the name-sake it
+        // de-duplicated against: the add handler scopes its scan by it.
+        assert_eq!(
+            folders,
+            vec![
+                ("Lib".to_owned(), first.unwrap().simple().to_string()),
+                ("Lib2".to_owned(), second.unwrap().simple().to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

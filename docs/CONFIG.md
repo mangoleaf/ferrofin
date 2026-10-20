@@ -35,6 +35,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
 | `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
+| `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `100` | Smallest period, in milliseconds, between pushes of a dashboard WebSocket stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). A client names the period in its `*Start` subscription; Ferrofin drives these streams on a timer (each tick recomputes and resends the full snapshot), so the client's period is clamped up to this floor to stop a tiny period becoming back-to-back `get_sessions`/activity work. Well-behaved clients ask for 1500 ms and are unaffected. The `config.toml` key is `websocket_min_stream_period_ms`. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax. |
 
 ## Admin seeding (fresh database only)

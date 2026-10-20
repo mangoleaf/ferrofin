@@ -2514,22 +2514,24 @@ impl VirtualFolderManager for FakeVirtualFolders {
         name: &str,
         collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
         options: &ferrofin_model::configuration::LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         self.guard()?;
         if name.trim().is_empty() {
             return Err(ServiceError::invalid_input("empty name"));
         }
+        let item_id = Self::projected_item_id(name);
+        let id = uuid::Uuid::parse_str(&item_id).ok();
         self.folders.lock().expect("lock").push(
             ferrofin_model::entities_media::VirtualFolderInfo {
                 name: Some(name.to_owned()),
                 locations: options.path_infos.iter().map(|p| p.path.clone()).collect(),
                 collection_type,
                 library_options: Some(options.clone()),
-                item_id: Some(Self::projected_item_id(name)),
+                item_id: Some(item_id),
                 ..ferrofin_model::entities_media::VirtualFolderInfo::default()
             },
         );
-        Ok(())
+        Ok(id)
     }
 
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
