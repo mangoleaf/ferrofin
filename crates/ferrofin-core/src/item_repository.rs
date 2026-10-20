@@ -262,24 +262,31 @@ impl FerrofinItemRepository {
     /// The C# `ItemsController.GetItems` **non-query** branch, or `None` when
     /// this request is not it.
     ///
-    /// Upstream (ItemsController.cs:307, 525-529):
+    /// Upstream (v12.2 ItemsController.cs:592; 10.11.8 lacked the last term):
     ///
     /// ```text
-    /// if ((recursive ?? false) || ids.Length != 0 || item is not UserRootFolder) { …query… }
+    /// if ((recursive.HasValue && recursive.Value) || ids.Length != 0
+    ///     || item is not UserRootFolder || query.HasFilters) { …query… }
     /// else { result = new QueryResult<BaseItem>(folder.GetChildren(user, true)); }
     /// ```
     ///
-    /// `GetChildren` builds its OWN `InternalItemsQuery`, so the request's sort,
-    /// paging, item types and filters are all discarded — measured against
-    /// 10.11.8 on the batch pair, `sortBy=SortName&sortOrder=Descending`,
-    /// `sortBy=DateCreated`, `limit=2&startIndex=1`, `includeItemTypes=Movie` and
-    /// a bare `/Items` (no `parentId` at all —
+    /// `GetChildren` builds its OWN `InternalItemsQuery`, so the request's sort
+    /// and paging are discarded — measured against 10.11.8 on the batch pair,
+    /// `sortBy=SortName&sortOrder=Descending`, `sortBy=DateCreated`,
+    /// `limit=2&startIndex=1`, `includeItemTypes=Movie` (on 10.11.8 only; a
+    /// filter now takes the query branch) and a bare `/Items` (no `parentId` at all —
     /// `LibraryManager.GetParentItem(null, userId)` returns the user root) each
     /// answered with the identical seven root rows in the identical order.
     ///
     /// Ferrofin used to answer that bare `/Items` with the WHOLE server (554
     /// rows against Jellyfin's 7) and to sort the concatenated playlists folder
     /// inline instead of appending it.
+    ///
+    /// Jellyfin 12 reaches `GetChildren` only for an UNFILTERED request: its
+    /// `GetItems` runs a filtered one (`HasFilters`, such as the
+    /// `includeItemTypes=Movie` above) recursively, so the `/Items` handler
+    /// no longer sets this flag for one. Internal callers (resume, Next Up)
+    /// still pass item types with it on purpose.
     ///
     /// Needs [`RootFolderIds`] to recognise the user root, so it is inert on a
     /// repository built without them (unit tests, and any composition that has
