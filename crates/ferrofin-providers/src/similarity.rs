@@ -26,7 +26,8 @@ use crate::tmdb::{TmdbClient, TmdbKind};
 /// `Plugins/Tmdb/Configuration/PluginConfiguration.SimilarItemsCacheDays`.
 pub const TMDB_SIMILAR_CACHE_DAYS: i64 = 7;
 
-/// TMDB's "similar titles" for a movie or series.
+/// TMDB's recommendations for a movie or series (Jellyfin 12 reads them, not
+/// TMDB's keyword-based "similar" list).
 pub struct TmdbSimilarProvider {
     tmdb: Arc<TmdbClient>,
     kind: TmdbKind,
@@ -90,7 +91,10 @@ impl RemoteSimilarItemsProvider for TmdbSimilarProvider {
         // result set is cached for `cache_days`, so the walk happens once per
         // seed per cache window rather than once per request.
         while page <= total_pages {
-            let (ids, reported) = self.tmdb.similar_page(self.kind, tmdb_id, page).await;
+            let (ids, reported) = self
+                .tmdb
+                .recommendations_page(self.kind, tmdb_id, page)
+                .await;
             if ids.is_empty() {
                 break;
             }
