@@ -1201,6 +1201,26 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Users/AuthenticateWithQuickConnect",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "AuthenticateWithQuickConnect",
+        ferrofin: "handlers/users.rs authenticate_with_quick_connect, authentication_result → \
+               ferrofin-core quick_connect_manager.rs get_authorized_request (the result \
+               authorize_request stored)",
+        date: "2026-10-20",
+        divergences: &[
+            "The User member is built at the exchange, from the user as it is then, where \
+         upstream returns the UserDto it snapshotted when the code was authorized, up to \
+         10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
+         session, token and ServerId are the stored ones on both. Jellyfin bug not \
+         ported.",
+            "The 401 (Quick Connect disabled) and 404 (unknown or expired secret) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

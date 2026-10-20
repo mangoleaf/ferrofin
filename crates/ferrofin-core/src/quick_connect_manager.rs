@@ -12,9 +12,9 @@
 //! the injected [`SessionManager`](ferrofin_traits::session::SessionManager)'s
 //! `authenticate_direct` (as the C# manager delegates to `AuthenticateDirect`).
 //!
-//! The trait's [`QuickConnect::get_authorized_request`] returns a
-//! [`SessionInfoDto`] directly (the ported stand-in for the C#
-//! `AuthenticationResult` envelope that has no `ferrofin-model` port yet).
+//! The trait's [`QuickConnect::get_authorized_request`] returns the
+//! [`AuthenticationResultData`] minted at authorization (the C#
+//! `AuthenticationResult`, whose `User`/`ServerId` the API layer adds).
 //!
 //! Expiry uses the same [`REQUEST_TIMEOUT_MINUTES`] window as C# (`Timeout = 10`);
 //! stale requests and secrets are swept lazily on each state-changing call.
@@ -24,7 +24,6 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use ferrofin_model::dto::SessionInfoDto;
 use ferrofin_model::quick_connect::QuickConnectResult;
 use uuid::Uuid;
 
@@ -32,7 +31,7 @@ use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::security::QuickConnect;
-use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
+use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 
 use std::sync::Arc;
 
@@ -45,11 +44,11 @@ const CODE_LENGTH: u32 = 6;
 /// Byte length of the opaque request secret (C# `GenerateSecureRandom(32)`).
 const SECRET_BYTES: usize = 32;
 
-/// An authorized secret's captured session plus the time it was authorized (for
-/// expiry), mirroring the C# `(DateTime, AuthenticationResult)` tuple.
+/// An authorized secret's authentication result plus the time it was authorized
+/// (for expiry), mirroring the C# `(DateTime, AuthenticationResult)` tuple.
 struct AuthorizedSecret {
     authorized_at: chrono::DateTime<Utc>,
-    session: SessionInfoDto,
+    result: AuthenticationResultData,
 }
 
 /// The concrete Quick Connect manager.
@@ -235,10 +234,8 @@ impl QuickConnect for FerrofinQuickConnect {
         };
 
         // Open a session for the authorizing user with the request's device.
-        // The minted access token is not carried through the Quick Connect seam
-        // (its `get_authorized_request` surfaces only the session DTO), so only
-        // the session is retained here.
-        let session = match self
+        // Its result, token included, is what the secret exchange hands back.
+        let result = match self
             .session_manager
             .authenticate_direct(&AuthenticationRequest {
                 user_id: Some(user_id),
@@ -250,7 +247,7 @@ impl QuickConnect for FerrofinQuickConnect {
             })
             .await
         {
-            Ok(result) => result.session,
+            Ok(result) => result,
             Err(err) => {
                 // The claim above must not outlive a failed authorization, or a
                 // transient error would burn the code for good.
@@ -273,7 +270,7 @@ impl QuickConnect for FerrofinQuickConnect {
                 request.secret.expose().to_owned(),
                 AuthorizedSecret {
                     authorized_at: Utc::now(),
-                    session,
+                    result,
                 },
             );
 
@@ -288,7 +285,10 @@ impl QuickConnect for FerrofinQuickConnect {
         Ok(true)
     }
 
-    async fn get_authorized_request(&self, secret: &str) -> Result<SessionInfoDto, ServiceError> {
+    async fn get_authorized_request(
+        &self,
+        secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError> {
         self.assert_active().await?;
         self.expire_stale();
 
@@ -298,7 +298,7 @@ impl QuickConnect for FerrofinQuickConnect {
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
         secrets
             .get(secret)
-            .map(|s| s.session.clone())
+            .map(|s| s.result.clone())
             .ok_or_else(|| ServiceError::not_found("unable to find request"))
     }
 }
@@ -641,6 +641,7 @@ mod tests {
             mgr.get_authorized_request(pending.secret.expose())
                 .await
                 .expect("exchange")
+                .session
                 .user_id,
             user
         );
@@ -662,6 +663,7 @@ mod tests {
             mgr.get_authorized_request(pending.secret.expose())
                 .await
                 .expect("retained authorization")
+                .session
                 .user_id,
             user
         );
@@ -690,11 +692,14 @@ mod tests {
                 .expect("authorize")
         );
 
-        // The device exchanges its secret for the authenticated session.
-        let session = mgr
+        // The device exchanges its secret for the session and token minted at
+        // authorization.
+        let result = mgr
             .get_authorized_request(request.secret.expose())
             .await
             .expect("authorized");
+        assert_eq!(result.access_token.expose(), "quick-connect-token");
+        let session = result.session;
         assert_eq!(session.user_id, user_id);
         assert_eq!(session.device_id.as_deref(), Some("dev-1"));
 

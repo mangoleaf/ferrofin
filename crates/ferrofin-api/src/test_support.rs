@@ -1725,7 +1725,10 @@ impl QuickConnect for FakeQuickConnect {
     async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
+    async fn get_authorized_request(
+        &self,
+        _secret: &str,
+    ) -> Result<ferrofin_traits::session::AuthenticationResultData, ServiceError> {
         unimplemented!("fake")
     }
 }
