@@ -71,6 +71,7 @@ fn extraction<'a>(
     TrickplayExtraction {
         input_path,
         video_stream: Some(video_stream),
+        media_streams: std::slice::from_ref(video_stream),
         interval_ms: 2_000,
         max_width: 64,
         qscale: 4,

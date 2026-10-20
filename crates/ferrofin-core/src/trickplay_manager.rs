@@ -120,6 +120,10 @@ struct WidthRefreshContext<'a> {
     /// needs the codec, and a hardware scaler takes fixed pixel dimensions, so
     /// an anamorphic source has to be un-stretched from its aspect ratio.
     video_stream: Option<MediaStream>,
+    /// Every stream of the item in stream order (`mediaSource.MediaStreams`),
+    /// which the extractor needs to find `video_stream`'s ffmpeg index for
+    /// `-map 0:N` (`EncodingHelper.FindIndex`).
+    media_streams: Vec<MediaStream>,
     /// The selected trickplay directory for the item.
     trickplay_dir: &'a str,
     /// Whether `trickplay_dir` is beside the media (`SaveTrickplayWithMedia`),
@@ -449,6 +453,7 @@ impl FerrofinTrickplayManager {
             .extract_trickplay_frames(&TrickplayExtraction {
                 input_path: ctx.media_path,
                 video_stream: ctx.video_stream.as_ref(),
+                media_streams: &ctx.media_streams,
                 interval_ms: options.interval,
                 max_width: actual_width,
                 qscale: options.qscale,
@@ -875,11 +880,15 @@ impl FerrofinTrickplayManager {
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
-        video_stream: Option<MediaStream>,
-        has_streams: bool,
+        media_streams: Vec<MediaStream>,
         replace: bool,
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
+        let has_streams = !media_streams.is_empty();
+        let video_stream = media_streams
+            .iter()
+            .find(|stream| stream.stream_type == MediaStreamType::Video)
+            .cloned();
         let mut options = self.trickplay_options().await?;
         let Some(media_path) = Self::can_generate_trickplay(
             entity,
@@ -936,6 +945,7 @@ impl FerrofinTrickplayManager {
             item_id,
             media_path: &media_path,
             video_stream,
+            media_streams,
             trickplay_dir: &trickplay_dir,
             save_with_media: library_options.save_trickplay_with_media,
         };
@@ -966,19 +976,10 @@ impl TrickplayManager for FerrofinTrickplayManager {
             return Ok(());
         };
         let streams = self.media_streams(item_id).await?;
-        let has_streams = !streams.is_empty();
-        let stream = streams
-            .into_iter()
-            .find(|stream| {
-                stream.stream_type
-                    == crate::db_error::media_stream_type_to_disc(MediaStreamType::Video)
-            })
-            .map(stream_to_dto);
         self.refresh_media(
             item_id,
             &entity,
-            stream,
-            has_streams,
+            streams.into_iter().map(stream_to_dto).collect(),
             replace,
             library_options,
         )
@@ -1000,19 +1001,10 @@ impl TrickplayManager for FerrofinTrickplayManager {
             stored_streams = self.media_streams(item_id).await?;
             &stored_streams
         };
-        let stream = streams
-            .iter()
-            .find(|stream| {
-                stream.stream_type
-                    == crate::db_error::media_stream_type_to_disc(MediaStreamType::Video)
-            })
-            .cloned()
-            .map(stream_to_dto);
         self.refresh_media(
             item_id,
             entity,
-            stream,
-            !streams.is_empty(),
+            streams.iter().cloned().map(stream_to_dto).collect(),
             replace,
             library_options,
         )
@@ -1606,6 +1598,8 @@ mod tests {
         /// The video stream the last request carried, which is what decides
         /// whether the extractor can take the hardware path at all.
         last_stream: Mutex<Option<MediaStream>>,
+        /// Every stream the last request carried, in order.
+        last_streams: Mutex<Vec<MediaStream>>,
         last_output: Mutex<Option<String>>,
         hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
@@ -1618,6 +1612,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
                 last_stream: Mutex::new(None),
+                last_streams: Mutex::new(Vec::new()),
                 last_output: Mutex::new(None),
                 hold: None,
             }
@@ -1648,6 +1643,7 @@ mod tests {
             *self.last_request.lock().expect("lock") =
                 Some((request.interval_ms, request.max_width));
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
+            *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
             let output_dir = request.output_dir;
             *self.last_output.lock().unwrap() = Some(output_dir.to_owned());
             let max_width = request.max_width;
@@ -1859,6 +1855,55 @@ mod tests {
         repo.save_media_streams(item, std::slice::from_ref(&row))
             .await
             .expect("save video stream");
+    }
+
+    /// `ExtractVideoImagesOnIntervalAccelerated` maps the video stream by its
+    /// index among the source's streams (`FindIndex`, `MediaEncoder.cs:925-932`),
+    /// so the extractor needs all of them, in stream order: with an audio
+    /// stream stored ahead of the video, the video is ffmpeg's `0:1`.
+    #[tokio::test]
+    async fn refresh_hands_the_extractor_every_stream_in_order() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
+        let rows: Vec<_> = [
+            (0, ferrofin_model::entities::MediaStreamType::Audio, "aac"),
+            (1, ferrofin_model::entities::MediaStreamType::Video, "h264"),
+        ]
+        .into_iter()
+        .map(
+            |(index, kind, codec)| ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                item_id: guid_to_db(item),
+                stream_index: index,
+                stream_type: crate::db_error::media_stream_type_to_disc(kind),
+                codec: Some(codec.to_owned()),
+                width: (kind == ferrofin_model::entities::MediaStreamType::Video).then_some(1920),
+                height: (kind == ferrofin_model::entities::MediaStreamType::Video).then_some(1080),
+                ..Default::default()
+            },
+        )
+        .collect();
+        repo.save_media_streams(item, &rows)
+            .await
+            .expect("save streams");
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let streams = r.extractor.last_streams.lock().expect("lock").clone();
+        let video = r.extractor.last_stream().expect("the video stream arrived");
+        assert_eq!(
+            streams.iter().map(|s| s.stream_type).collect::<Vec<_>>(),
+            [
+                ferrofin_model::entities::MediaStreamType::Audio,
+                ferrofin_model::entities::MediaStreamType::Video,
+            ]
+        );
+        assert_eq!(streams[1], video, "the video is the second stream: 0:1");
     }
 
     #[tokio::test]
