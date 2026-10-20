@@ -753,6 +753,8 @@ pub async fn build_app_state(
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+        // A local video probe reads its first frame for HDR10+ when ffprobe can.
+        .with_first_video_frame_probe(ffmpeg.capabilities.prober_supports_first_video_frame())
         .with_localization(Arc::clone(&localization))
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);

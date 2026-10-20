@@ -210,6 +210,7 @@ pub struct FfmpegCapabilities {
     vaapi_vulkan_drm_interop: bool,
     is_videotoolbox_av1_decode: bool,
     low_priority_hwaccel_flag: bool,
+    prober_first_video_frame: bool,
     validated: bool,
 }
 
@@ -399,6 +400,14 @@ impl FfmpegCapabilities {
         self.low_priority_hwaccel_flag
     }
 
+    /// Whether ffprobe accepts `-only_first_vframe`, which a local video probe
+    /// adds so the first frame's side data can flag HDR10+. Port of
+    /// `MediaEncoder._proberSupportsFirstVideoFrame`.
+    #[must_use]
+    pub fn prober_supports_first_video_frame(&self) -> bool {
+        self.prober_first_video_frame
+    }
+
     /// Whether these capabilities describe an ffmpeg that passed startup
     /// validation. `false` for the placeholder a failed discovery leaves, whose
     /// binary name must never be run again.
@@ -566,6 +575,13 @@ impl FfmpegCapabilitiesBuilder {
     #[must_use]
     pub fn low_priority_hwaccel_flag(mut self, supported: bool) -> Self {
         self.caps.low_priority_hwaccel_flag = supported;
+        self
+    }
+
+    /// Sets whether ffprobe accepts `-only_first_vframe`.
+    #[must_use]
+    pub fn prober_first_video_frame(mut self, supported: bool) -> Self {
+        self.caps.prober_first_video_frame = supported;
         self
     }
 

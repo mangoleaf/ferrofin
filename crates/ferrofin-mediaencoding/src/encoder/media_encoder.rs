@@ -82,9 +82,21 @@ pub struct MediaEncoderImpl<T: Transcoder> {
     config: MediaEncoderConfig,
     paths: RwLock<Paths>,
     normalizer: ProbeResultNormalizer<Box<dyn ProbeLocalization + Send + Sync>>,
+    /// `_proberSupportsFirstVideoFrame`: whether ffprobe accepts
+    /// `-only_first_vframe`. Off until the host reports the probed answer.
+    prober_first_video_frame: bool,
 }
 
 impl<T: Transcoder> MediaEncoderImpl<T> {
+    /// Lets a local video probe ask ffprobe for its first frame
+    /// (`-show_frames -only_first_vframe`), which is what flags HDR10+. The host
+    /// passes the startup capability probe's answer.
+    #[must_use]
+    pub fn with_first_video_frame_probe(mut self, supported: bool) -> Self {
+        self.prober_first_video_frame = supported;
+        self
+    }
+
     /// Shares the startup thumbnail/trickplay ceiling with the other extractor.
     /// The host resolves the dashboard setting and supplies a nonzero pool.
     #[must_use]
@@ -137,6 +149,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 ffprobe: ffprobe_path.into(),
             }),
             normalizer: ProbeResultNormalizer::new(Box::new(PassthroughLocalization)),
+            prober_first_video_frame: false,
         }
     }
 
@@ -203,20 +216,31 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// input path is inserted once and never re-scanned, so a file name
     /// holding `{threads}` reaches ffprobe unchanged.
     ///
-    /// TODO(parity, open work item gl-347): upstream also appends
-    /// `-show_frames -only_first_vframe` for a local, non-audio probe when
-    /// ffprobe supports `only_first_vframe`, which is what sets
+    /// A local, non-audio probe also asks for the first video frame
+    /// (`-show_frames -only_first_vframe`) when ffprobe supports it, so the
+    /// normalizer can read that frame's side data and set
     /// `Hdr10PlusPresentFlag`.
-    fn probe_arguments(&self, input_path: &str, extract_chapters: bool, extra: &str) -> String {
+    fn probe_arguments(
+        &self,
+        input_path: &str,
+        extract_chapters: bool,
+        extra: &str,
+        first_video_frame: bool,
+    ) -> String {
         let chapters = if extract_chapters {
             " -show_chapters"
+        } else {
+            ""
+        };
+        let frames = if first_video_frame {
+            " -show_frames -only_first_vframe"
         } else {
             ""
         };
         let threads = self.config.threads;
         format!(
             "{extra} -i {input_path} -threads {threads} -v warning -print_format json \
-             -show_streams{chapters} -show_format"
+             -show_streams{chapters} -show_format{frames}"
         )
         .trim()
         .to_owned()
@@ -395,7 +419,16 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         };
         let input_path = get_input_argument(prefix, input_file, source.protocol);
         let extra = self.get_extra_arguments(request);
-        let args = self.probe_arguments(&input_path, request.extract_chapters, &extra);
+        // `protocol == MediaProtocol.File && !isAudio && _proberSupportsFirstVideoFrame`.
+        let first_video_frame = source.protocol == MediaProtocol::File
+            && !request.media_is_audio
+            && self.prober_first_video_frame;
+        let args = self.probe_arguments(
+            &input_path,
+            request.extract_chapters,
+            &extra,
+            first_video_frame,
+        );
 
         let probe = self.probe_path();
         let output = self
@@ -1870,5 +1903,49 @@ mod tests {
             extract_chapters,
             "{arguments}"
         );
+    }
+
+    /// `GetMediaInfoInternal`: `-show_frames -only_first_vframe` is appended
+    /// only for a local (`File`), non-audio probe, and only when ffprobe
+    /// supports `only_first_vframe` — the first frame's side data is what sets
+    /// `Hdr10PlusPresentFlag`.
+    #[rstest]
+    #[case::local_video(true, MediaProtocol::File, false, true)]
+    #[case::unsupported_prober(false, MediaProtocol::File, false, false)]
+    #[case::audio(true, MediaProtocol::File, true, false)]
+    #[case::remote(true, MediaProtocol::Http, false, false)]
+    #[tokio::test]
+    async fn a_local_video_probe_asks_for_its_first_frame(
+        #[case] supported: bool,
+        #[case] protocol: MediaProtocol,
+        #[case] media_is_audio: bool,
+        #[case] expected: bool,
+    ) {
+        let transcoder = Arc::new(RecordingProbe(std::sync::Mutex::new(Vec::new())));
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        )
+        .with_first_video_frame_probe(supported);
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some("/media/hdr.mkv".to_owned()),
+                protocol,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio,
+        };
+        enc.get_media_info(&request).await.expect("probe parses");
+
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            arguments.ends_with("-show_format -show_frames -only_first_vframe"),
+            expected,
+            "{arguments}"
+        );
+        assert!(arguments.contains("-show_format"), "{arguments}");
     }
 }
