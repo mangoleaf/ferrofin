@@ -760,13 +760,24 @@ const PERSON_TYPE: &str = "MediaBrowser.Controller.Entities.Person";
 pub struct PeopleValidationTask {
     db: Database,
     providers: Arc<dyn ProviderManager>,
+    library: Arc<dyn LibraryManager>,
 }
 
 impl PeopleValidationTask {
-    /// Builds the task over the database and provider-manager seams.
+    /// Builds the task over the database and provider-manager seams, and the
+    /// library manager (the run is skipped, as upstream, while a library scan
+    /// runs).
     #[must_use]
-    pub fn new(db: Database, providers: Arc<dyn ProviderManager>) -> Self {
-        Self { db, providers }
+    pub fn new(
+        db: Database,
+        providers: Arc<dyn ProviderManager>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            db,
+            providers,
+            library,
+        }
     }
 
     /// Phase 1: merge duplicate people and drop orphans.
@@ -957,6 +968,12 @@ impl ScheduledTask for PeopleValidationTask {
         vec![interval_hours(7 * 24)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `PeopleValidationTask.ExecuteAsync`: its heavy writes contend with a
+        // library scan's, so the run waits for the next trigger.
+        if self.library.is_scan_running() {
+            tracing::info!("skipping people validation: a library scan is running");
+            return Ok(());
+        }
         self.dedupe_and_orphans().await?;
         progress.report(33.0);
         self.validate_person_items().await?;
@@ -2794,7 +2811,11 @@ mod tests {
         .await;
 
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(db.clone(), providers.clone());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
         assert_eq!(task.key(), "RefreshPeople");
         task.execute(&TaskProgress::default()).await.expect("run");
 
@@ -2847,6 +2868,40 @@ mod tests {
         );
     }
 
+    /// `PeopleValidationTask.ExecuteAsync` returns at once while a library
+    /// scan runs (`IsScanRunning`): its de-duplication and person refreshes
+    /// are heavy writes that would contend with the scan's. The skipped run
+    /// still succeeds, so the task records `Completed`.
+    #[tokio::test]
+    async fn people_validation_skips_while_a_library_scan_runs() {
+        let db = test_db().await;
+        let person = Uuid::from_u128(0xC1);
+        seed_named_item(&db, person, BaseItemKind::Person, "Jane Doe").await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xC2), "Jane Doe", "Actor")
+            .await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xC3), "Jane Doe", "Actor")
+            .await;
+        let providers = Arc::new(RecordingProviders::default());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            crate::test_support::library_manager_mid_scan(db.clone()).await,
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+
+        assert_eq!(
+            crate::people_repository::people_row_count(&db).await,
+            2,
+            "the duplicate is not merged during a scan"
+        );
+        assert!(
+            providers.refreshed.lock().expect("lock").is_empty(),
+            "no person is refreshed during a scan"
+        );
+        assert!(progress.current().abs() < f64::EPSILON, "nothing ran");
+    }
+
     /// The image/overview pass fetches only the half a person lacks: a
     /// person with an overview but no image asks a `FullRefresh` of its
     /// images and `ValidationOnly` of its metadata.
@@ -2866,7 +2921,11 @@ mod tests {
         )
         .await;
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(db.clone(), providers.clone());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
         task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
             .await
             .expect("new people");

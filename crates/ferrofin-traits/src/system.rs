@@ -62,6 +62,19 @@ pub trait SystemManager: Send + Sync {
         let _ = dest;
         Ok(())
     }
+
+    /// The free space, in bytes, of the filesystem holding `path`:
+    /// `StorageHelper.GetFreeSpaceOf(path).FreeSpace`, the space an
+    /// unprivileged writer may still use, or `-1` when it cannot be read (the
+    /// C# catch arm). The backup's free-space check reads it.
+    ///
+    /// The default reports `-1`: an implementation with no filesystem to probe
+    /// (a test fake) cannot know; the server's implementation probes the real
+    /// one.
+    async fn free_space_of(&self, path: &std::path::Path) -> i64 {
+        let _ = path;
+        -1
+    }
 }
 
 fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}

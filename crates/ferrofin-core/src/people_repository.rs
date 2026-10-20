@@ -1405,6 +1405,16 @@ pub(crate) async fn seed_people_row(db: &Database, id: uuid::Uuid, name: &str, p
         .expect("seed people row");
 }
 
+/// Test-only: how many `Peoples` rows there are, so the raw SQL stays inside
+/// the repository boundary.
+#[cfg(test)]
+pub(crate) async fn people_row_count(db: &Database) -> i64 {
+    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Peoples""#)
+        .fetch_one(db.pool())
+        .await
+        .expect("count people rows")
+}
+
 #[cfg(test)]
 mod tests {
     /// `Person` is the only 10.11.8 entity with

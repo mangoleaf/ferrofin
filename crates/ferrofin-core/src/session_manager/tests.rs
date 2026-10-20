@@ -2548,3 +2548,117 @@ async fn progress_is_kept_against_the_version_the_media_source_names() {
     );
     assert_eq!(position(stranger).await, 0);
 }
+
+/// A session recreated mid-playback (a restart, a WebSocket-close session end,
+/// a relogin) only ever receives progress reports: the client never resends
+/// PlaybackStart. C# `OnPlaybackProgress` → `UpdateNowPlayingItem` restores the
+/// now-playing item from the first one, and keeps the first pause's date.
+#[tokio::test]
+async fn progress_alone_restores_the_now_playing_item() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-recreated", "TV", "e", &user)
+        .await
+        .unwrap();
+    assert!(!mgr.has_active_playback().await.unwrap());
+
+    let paused = PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id,
+        position_ticks: Some(1000),
+        is_paused: true,
+        ..PlaybackProgressInfo::default()
+    };
+    mgr.on_playback_progress(&paused, false).await.unwrap();
+    assert!(
+        mgr.has_active_playback().await.unwrap(),
+        "progress names the now-playing item"
+    );
+    let id = session.id.as_deref().unwrap();
+    let first = mgr.get_session_snapshot(id).await.unwrap();
+    assert_eq!(first.now_playing_item_id, Some(item_id));
+    assert!(
+        super::session_info_to_dto(&first)
+            .play_state
+            .unwrap()
+            .can_seek
+    );
+    let paused_since = first
+        .last_paused_date
+        .expect("a paused report dates the pause");
+
+    // A later paused report keeps the date the pause began.
+    mgr.on_playback_progress(&paused, false).await.unwrap();
+    let again = mgr.get_session_snapshot(id).await.unwrap();
+    assert_eq!(again.last_paused_date, Some(paused_since));
+}
+
+/// The rest of C# `UpdateNowPlayingItem`: an item the library cannot resolve
+/// and a report without an item leave nothing playing, and an automated report
+/// does not count as a check-in.
+#[tokio::test]
+async fn progress_names_only_items_the_library_knows() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-unknown", "TV", "e", &user)
+        .await
+        .unwrap();
+    let id = session.id.as_deref().unwrap();
+    let report = |item_id| PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id,
+        ..PlaybackProgressInfo::default()
+    };
+
+    // The user-data write then rejects the unknown item; only the session
+    // state matters here.
+    let _ = mgr
+        .on_playback_progress(&report(Uuid::new_v4()), false)
+        .await;
+    assert!(!mgr.has_active_playback().await.unwrap(), "unknown item");
+
+    mgr.on_playback_progress(&report(item_id), false)
+        .await
+        .unwrap();
+    assert!(mgr.has_active_playback().await.unwrap());
+    let checked_in = mgr
+        .get_session_snapshot(id)
+        .await
+        .unwrap()
+        .last_playback_check_in;
+
+    mgr.on_playback_progress(&report(item_id), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.get_session_snapshot(id)
+            .await
+            .unwrap()
+            .last_playback_check_in,
+        checked_in,
+        "an automated report is no check-in"
+    );
+
+    mgr.on_playback_progress(&report(Uuid::nil()), false)
+        .await
+        .unwrap();
+    assert!(
+        !mgr.has_active_playback().await.unwrap(),
+        "no item reported"
+    );
+}
