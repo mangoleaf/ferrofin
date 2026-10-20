@@ -54,12 +54,13 @@ def artwork(api, item):
         return {"size": list(rgb.size), "rgb": ImageStat.Stat(rgb).mean}
 
 
-def snapshot(admin, manifest):
-    """Use authenticated users for permissions and views, not an admin impersonation."""
+def snapshot(admin, manifest, images=None):
+    """Use authenticated users for permissions and views, not an admin impersonation.
+    images: the client user avatars are fetched as (user_accounts.snapshot)."""
     result = {"version": 1, "libraries": {},
               "visibility": {}, "denials": {}, "views": {}, "playlists": {}}
     from user_accounts import snapshot as account_snapshot
-    result["accounts"] = account_snapshot(admin, manifest)
+    result["accounts"] = account_snapshot(admin, manifest, images)
     for library in admin.get("/Library/VirtualFolders"):
         if library["Name"] in manifest["libraries"]:
             result["libraries"][library["Name"]] = select(library["LibraryOptions"], LIBRARY_OPTIONS)

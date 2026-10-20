@@ -466,3 +466,19 @@ EOS
   run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_user_accounts.py
   [ "$status" -eq 0 ]
 }
+
+@test "populated upgrade: user state, boot checks and the runner's refusals" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_upgrade.py
+  [ "$status" -eq 0 ]
+}
+
+@test "synthetic.py upgrade: refuses without a start release, then without the fixture, before docker runs" {
+  fake_docker; mkdir fixtures
+  run python3 "$ADOPTION/synthetic.py" upgrade --fixtures fixtures --image any
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"at least one --from image"* ]]
+  run python3 "$ADOPTION/synthetic.py" upgrade --fixtures fixtures --image any --from ghcr.io/x/ferrofin:v1.3.2
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"jellyfin-10.11.8 is not built"* ]]
+  [[ "$output" != *"unexpected docker"* ]]
+}
