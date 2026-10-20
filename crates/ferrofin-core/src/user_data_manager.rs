@@ -39,10 +39,26 @@ use ferrofin_traits::library::{
 use ferrofin_traits::persistence::ItemCountService;
 
 use crate::db_error::db_err;
+use crate::dto_service::parse_media_type;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::{supports_played_status, supports_position_ticks_resume};
 use crate::user_data_key_repository::extra_type_name;
 use crate::user_data_keys::{KeySource, user_data_keys, uses_provider_ids};
+
+/// `RunTimeTicks`, `Type`, `MediaType` and `ExtraType` of one `BaseItems` row.
+type PlayStateRow = (Option<i64>, String, Option<String>, Option<i32>);
+
+/// What the play-state paths read about one item: its runtime and kind, and
+/// the two C# virtuals, resolved from the row's `MediaType` (a playlist's
+/// played state) and `ExtraType` (a video extra's resume).
+struct PlayStateItem {
+    runtime_ticks: i64,
+    kind: BaseItemKind,
+    /// `SupportsPlayedStatus`.
+    played_status: bool,
+    /// `SupportsPositionTicksResume`.
+    resume: bool,
+}
 
 /// One tick is 100 nanoseconds; there are 10,000,000 ticks per second (the
 /// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
@@ -240,27 +256,39 @@ impl FerrofinUserDataManager {
         )
     }
 
-    /// Reads the item's runtime ticks and [`BaseItemKind`], for the play-state
-    /// heuristics. A missing item yields `None`.
+    /// Reads what the play-state heuristics need about an item: its runtime
+    /// ticks and kind, and its `SupportsPlayedStatus`/`SupportsPositionTicksResume`
+    /// resolved from the row's `MediaType` and `ExtraType`. A missing item
+    /// yields `None`.
     async fn item_runtime_and_kind(
         &self,
         item_id: Uuid,
-    ) -> Result<Option<(i64, BaseItemKind)>, ServiceError> {
-        let row: Option<(Option<i64>, String)> = sqlx::query_as(
-            r#"SELECT "RunTimeTicks", "Type" FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
+    ) -> Result<Option<PlayStateItem>, ServiceError> {
+        let row: Option<PlayStateRow> = sqlx::query_as(
+            r#"SELECT "RunTimeTicks", "Type", "MediaType", "ExtraType" FROM "BaseItems"
+               WHERE "Id" = ?1 LIMIT 1"#,
         )
         .bind(guid_to_db(item_id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
 
-        Ok(row.map(|(ticks, type_name)| {
-            (
-                ticks.unwrap_or(0),
-                // Unknown stored types default to Folder (a conservative choice that
-                // disables the position-resume heuristics).
-                kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder),
-            )
+        Ok(row.map(|(ticks, type_name, media_type, extra_type)| {
+            // Unknown stored types default to Folder (a conservative choice that
+            // disables the position-resume heuristics).
+            let kind = kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder);
+            PlayStateItem {
+                runtime_ticks: ticks.unwrap_or(0),
+                kind,
+                played_status: supports_played_status(
+                    kind,
+                    parse_media_type(media_type.as_deref()),
+                ),
+                resume: supports_position_ticks_resume(
+                    kind,
+                    extra_type.and_then(crate::dto_service::extra_type_from_disc),
+                ),
+            }
         }))
     }
 
@@ -622,7 +650,11 @@ impl FerrofinUserDataManager {
             .unwrap_or_else(|| to_dto(&Self::empty_row(container.id, user_id), container.id));
         if let Some(members) = self.members.get()
             && kind_from_type_name(&container.root.type_).is_some_and(|kind| {
-                crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)
+                crate::kinds::supports_user_data_from_children(kind)
+                    && supports_played_status(
+                        kind,
+                        parse_media_type(container.root.media_type.as_deref()),
+                    )
             })
         {
             let counts = self
@@ -692,7 +724,9 @@ impl FerrofinUserDataManager {
             return Ok(());
         }
         // No item DTO, so only the `SupportsPlayedStatus` half applies.
-        if !(crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)) {
+        if !(crate::kinds::supports_user_data_from_children(kind)
+            && supports_played_status(kind, parse_media_type(item.media_type.as_deref())))
+        {
             return Ok(());
         }
         let Some(user) = crate::item_repository::query_user(&self.db, user_id).await? else {
@@ -1210,7 +1244,12 @@ impl UserDataManager for FerrofinUserDataManager {
         reason: UserDataSaveReason,
     ) -> Result<bool, ServiceError> {
         let config = self.config.configuration().await?;
-        let (runtime_ticks, kind) = self
+        let PlayStateItem {
+            runtime_ticks,
+            kind,
+            played_status,
+            resume,
+        } = self
             .item_runtime_and_kind(item_id)
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
@@ -1225,7 +1264,7 @@ impl UserDataManager for FerrofinUserDataManager {
                 // Source SessionManager's successful stop without a position
                 // counts a completed play before its PlaybackFinished event.
                 row.play_count += 1;
-                row.played = supports_played_status(kind);
+                row.played = played_status;
                 row.playback_position_ticks = 0;
                 row.last_played_date = Some(chrono::Utc::now());
                 self.upsert_row(&row).await?;
@@ -1281,11 +1320,11 @@ impl UserDataManager for FerrofinUserDataManager {
             position_ticks = 0;
         }
 
-        if !supports_played_status(kind) {
+        if !played_status {
             position_ticks = 0;
             row.played = false;
         }
-        if !supports_position_ticks_resume(kind) {
+        if !resume {
             position_ticks = 0;
         }
 
@@ -1369,12 +1408,12 @@ impl UserDataManager for FerrofinUserDataManager {
             .await?
             .unwrap_or_else(|| Self::empty_row(item_id, user_id));
         row.play_count += 1;
-        let kind = self.item_runtime_and_kind(item_id).await?.map(|(_, k)| k);
-        let resumable = kind.is_some_and(supports_position_ticks_resume);
+        let item = self.item_runtime_and_kind(item_id).await?;
+        let resumable = item.as_ref().is_some_and(|item| item.resume);
         if !row.played || !resumable {
             row.last_played_date = Some(chrono::Utc::now());
         }
-        if kind.is_some_and(|k| supports_played_status(k) && !supports_position_ticks_resume(k)) {
+        if item.is_some_and(|item| item.played_status && !item.resume) {
             row.played = true;
         }
         self.upsert_row(&row).await?;
@@ -2747,6 +2786,44 @@ mod tests {
             .expect("read")
             .expect("some");
         assert_eq!(dto.playback_position_ticks, position);
+    }
+
+    /// Upstream's overrides reach the play-state paths: `Audio` never resumes
+    /// (`BaseItem.cs:190`), so a song is played outright at start and drops a
+    /// reported position; so does a trailer extra (`Video.cs:63-88`). A movie
+    /// keeps its position (`update_play_state_midway_keeps_resume_point`).
+    #[tokio::test]
+    async fn songs_and_trailer_extras_never_keep_a_resume_point() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let runtime = 3600 * TICKS_PER_SECOND;
+        let song = Uuid::from_u128(0x50);
+        let trailer = Uuid::from_u128(0x51);
+        seed_item(&db, song, BaseItemKind::Audio).await;
+        seed_item(&db, trailer, BaseItemKind::Video).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?1"#)
+            .bind(runtime)
+            .execute(db.writer())
+            .await
+            .expect("set runtime");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ExtraType" = 2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(trailer))
+            .execute(db.writer())
+            .await
+            .expect("mark trailer extra");
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        for item in [song, trailer] {
+            mgr.record_playback_start(user, item).await.expect("start");
+            let row = mgr.read_row(item, user).await.expect("read").expect("row");
+            assert!(row.played, "played outright at start: {item}");
+            mgr.update_play_state(user, item, Some(runtime / 2))
+                .await
+                .expect("stop");
+            let row = mgr.read_row(item, user).await.expect("read").expect("row");
+            assert_eq!(row.playback_position_ticks, 0, "no resume point: {item}");
+        }
     }
 
     #[tokio::test]

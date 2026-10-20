@@ -771,7 +771,7 @@ pub(crate) fn parse_media_type(stored: Option<&str>) -> MediaType {
 /// Maps a stored `ExtraType` discriminant onto the enum, or `None` for a value
 /// with no corresponding extra type (the `0`/`Unknown` sentinel and any
 /// out-of-range discriminant).
-fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
+pub(crate) fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
     Some(match disc {
         1 => ExtraType::Clip,
         2 => ExtraType::Trailer,
@@ -2330,7 +2330,10 @@ impl FerrofinDtoService {
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
-                    if kinds::supports_played_status(kind) {
+                    if kinds::supports_played_status(
+                        kind,
+                        parse_media_type(item.media_type.as_deref()),
+                    ) {
                         fill_folder_played(
                             dto.user_data
                                 .get_or_insert_with(|| empty_user_data_dto(item_id)),
@@ -4484,8 +4487,10 @@ impl FerrofinDtoService {
                     .filter(|i| {
                         let kind = row_kind(i);
                         kinds::supports_user_data_from_children(kind)
-                            && (kinds::supports_played_status(kind)
-                                || options.contains_field(ItemFields::RecursiveItemCount))
+                            && (kinds::supports_played_status(
+                                kind,
+                                parse_media_type(i.media_type.as_deref()),
+                            ) || options.contains_field(ItemFields::RecursiveItemCount))
                     })
                     .map(row_id)
                     .filter(|id| !counts.contains_key(id))
@@ -5330,6 +5335,38 @@ mod tests {
         assert_eq!(ud.played_percentage, None);
         assert!(ud.played);
         assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
+    /// only a video playlist carries the folder played numbers.
+    #[tokio::test]
+    async fn only_a_video_playlist_carries_played_counts() {
+        let db = test_db().await;
+        let playlist_id = Uuid::new_v4();
+        seed_folder_item(&db, playlist_id, BaseItemKind::Playlist, "Mix", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service_with_counts(
+            db.clone(),
+            FakeCounts {
+                played: 1,
+                ..FakeCounts::default()
+            },
+        );
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        for (media_type, counted) in [("Video", true), ("Audio", false)] {
+            let mut playlist = fetch_item(&db, playlist_id).await;
+            playlist.media_type = Some(media_type.to_owned());
+            let dto = svc
+                .get_base_item_dto(&playlist, &narrow, Some(&user), None)
+                .await
+                .unwrap();
+            let ud = dto.user_data.as_ref().unwrap();
+            assert_eq!(ud.unplayed_item_count.is_some(), counted, "{media_type}");
+            assert_eq!(ud.played_percentage.is_some(), counted, "{media_type}");
+        }
     }
 
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
