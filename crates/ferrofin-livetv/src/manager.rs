@@ -5992,19 +5992,23 @@ mod tests {
         );
     }
 
-    /// Flags as Jellyfin 12 reads them (`Jellyfin.XmlTv` 10.12.0-pre1,
-    /// `XmlTvListingsProvider.GetProgramInfo`): `<live>` and `<premiere>` count
-    /// in either form.
+    /// Flags and ratings as Jellyfin 12 reads them (`Jellyfin.XmlTv`
+    /// 10.12.0-pre1, `XmlTvListingsProvider.GetProgramInfo`): `<live>` and
+    /// `<premiere>` count in either form, the rating comes from `<rating>`
+    /// alone, and programme child names are matched case-insensitively.
     const FLAGGED_XMLTV: &str = "<tv>\
         <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
         <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
         <title>NFL Football</title><live/></programme>\
         <programme start=\"20260725070000 +0000\" stop=\"20260725090000 +0000\" channel=\"one.tv\">\
-        <title>Cup Final</title><live>yes</live><premiere lang=\"en\">First showing</premiere></programme>\
+        <title>Cup Final</title><live>yes</live><premiere lang=\"en\">First showing</premiere>\
+        <star-rating system=\"IMDb\"><value>7.2/10</value></star-rating></programme>\
+        <programme start=\"20260725090000 +0000\" stop=\"20260725100000 +0000\" channel=\"one.tv\">\
+        <Title>Shouted</Title><Rating system=\"VCHIP\"><Value>TV-14</Value></Rating></programme>\
         </tv>";
 
     #[tokio::test]
-    async fn guide_refresh_reads_live_and_premiere_like_jellyfin_12() {
+    async fn guide_refresh_reads_live_premiere_and_rating_like_jellyfin_12() {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
         sources.insert("http://guide/xmltv.xml".to_owned(), dated(FLAGGED_XMLTV));
@@ -6042,12 +6046,19 @@ mod tests {
         assert_eq!(football.is_premiere, None);
 
         // `IsPremiere = program.Premiere is not null`: a `<premiere>` with text
-        // counts as much as `<premiere/>`.
+        // counts as much as `<premiere/>`. A star rating is not an
+        // OfficialRating (`Ratings.FirstOrDefault()?.Value`).
         let final_ = by_name("Cup Final");
         assert_eq!(
             (final_.is_live, final_.is_premiere),
             (Some(true), Some(true))
         );
+        assert_eq!(final_.official_rating, None);
+
+        // Programme children are lower-cased before matching.
+        let shouted = by_name("Shouted");
+        assert_eq!(shouted.official_rating.as_deref(), Some("TV-14"));
+        assert_eq!(shouted.is_live, None);
     }
 
     #[tokio::test]
