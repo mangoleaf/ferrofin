@@ -553,12 +553,18 @@ fn append_inherited_tags(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQu
                 qb.push(")");
             }
         }
+        // `ItemsBelowTaggedAncestor` (v12.2): the items below a tagged
+        // ancestor as one uncorrelated set read by `ParentItemId`, built once
+        // and probed per row. A correlated `EXISTS` seeks `(ItemId,
+        // ParentItemId)` for every tagged id on every row. `AncestorIds.ItemId`
+        // is `NOT NULL`, so `NOT IN` is exact.
         qb.push(join)
-            .push(if blocked { "NOT EXISTS (" } else { "EXISTS (" });
-        qb.push(format!(
-            r#"SELECT 1 FROM "AncestorIds" tag_parent
-            WHERE tag_parent."ItemId" = {alias}."Id" AND tag_parent."ParentItemId" IN ("#
-        ));
+            .push(format!(r#"{alias}."Id""#))
+            .push(membership)
+            .push(
+                r#"SELECT tag_parent."ItemId" FROM "AncestorIds" tag_parent
+            WHERE tag_parent."ParentItemId" IN ("#,
+            );
         append_tagged_item_ids(qb, &tags);
         qb.push("))");
         if !blocked {

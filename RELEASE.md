@@ -107,6 +107,7 @@ from.
    | `memory` | peak (under load) and steady idle anon memory; scan and migration peak anon | 25 % | 40 MiB |
    | `scan` | library-scan and adoption-migration wall time | 15 % | 1 s |
    | `ramp` | throughput ceiling (higher is better; *Throughput ceiling* below) | 15 % | 5 screens/s |
+   | `soak` | one-hour anon-memory slope (not a median rule: see *Memory soak*) | limit 20 MiB/h | |
 
    A `[cells."…"]` entry in `gate.toml` overrides its row for a single cell. Change the table
    only by a reviewed commit, after re-measuring the noise floor with
@@ -118,9 +119,10 @@ from.
    side's evidence is flagged, a side has missing values, or the candidate's responses
    differ from the previous release's. Either blocks the release until it is fixed or the
    maintainer accepts it. Gated cells are the screen and endpoint p50s at the unloaded and
-   loaded levels, plus peak and steady memory, all four cells of the scan session, and the
-   throughput ceiling of the ramp session below, which blocks whenever it is run. The stress
-   level and endpoint cells whose medians are both under 1 ms are reported but never block.
+   loaded levels, plus peak and steady memory, all four cells of the scan session, the
+   throughput ceiling of the ramp session below, which blocks whenever it is run, and the
+   soak's `soak/slope` when the soak was run. The stress level and endpoint cells whose
+   medians are both under 1 ms are reported but never block.
 
    **Throughput ceiling.** Measure it in the same window as the gate. It is a separate
    session (output in `bench/runs/gate-ramp-<date>-<time>/`, with the same oracle-pin
@@ -135,6 +137,20 @@ from.
    screens/s, in at least 2 of the 3 pairs. A ramp that ended on the load client, or found
    no passing step, cannot be judged and blocks like a regression. The thresholds are
    starting values, to be re-derived after the first two ramps.
+
+   **Memory soak.** Anon memory that creeps up over hours is invisible in a two-minute window,
+   so measure it separately, in the same window as the gate:
+   `python3 bench/gate.py soak ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`
+   ([`bench/README.md`](bench/README.md#memory-soak)). It runs the previous release and then the
+   candidate back to back, one hour each at the loaded rate (`run.sh --only soak`), and fits a
+   least-squares line through the anon samples after the first 10 minutes. The candidate
+   *regressed* when its slope exceeds **20 MiB/h** (`[soak]` in
+   [`bench/gate.toml`](bench/gate.toml)) and the previous release's does not; *improved* is
+   the mirror image; anything else, including both over the limit, is *within noise*. A soak
+   that left no slope cannot be judged, and a regressed one blocks, both like any other gated
+   cell. It takes about two hours of a quiet host (two soaks of an hour each, plus startup
+   and the settle and steady phases), so book it with the rest of the gate. The limit and the
+   10 minutes are starting values, to be re-derived after two soaks.
 
    **The Jellyfin comparison is publication only.** The three-server `bench/run.sh` runs
    (Ferrofin and both Jellyfins, three runs, median) produce the published tables in the root
