@@ -106,6 +106,14 @@ pub struct Inner {
     /// `NetworkManager::update_settings` rewrites its caches when an admin
     /// saves the network configuration.
     pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
+    /// Floor for a dashboard WebSocket stream's push period (Sessions /
+    /// ScheduledTasksInfo / ActivityLogEntry). The client names the period in
+    /// its `*Start` subscription and it is clamped up to this value, because
+    /// Ferrofin drives these streams on a timer rather than off events. Set by
+    /// the composition root from `FERROFIN_WS_MIN_STREAM_PERIOD_MS` via
+    /// [`AppState::with_websocket_min_stream_period`]; defaults to
+    /// [`crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD`].
+    pub websocket_min_stream_period: std::time::Duration,
     /// Library catalogue queries and item resolution.
     pub library: Arc<dyn LibraryManager>,
     /// User accounts, authentication policy, and profiles.
@@ -311,6 +319,22 @@ impl AppState {
         Arc::clone(&self.request_culture)
     }
 
+    /// Sets the floor for dashboard WebSocket stream periods (see
+    /// [`Inner::websocket_min_stream_period`]). The composition root resolves it
+    /// from `FERROFIN_WS_MIN_STREAM_PERIOD_MS`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned), as the other
+    /// `with_*` builders do — it must run before the state is handed out.
+    #[must_use]
+    pub fn with_websocket_min_stream_period(mut self, period: std::time::Duration) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_websocket_min_stream_period must be called before the state is shared");
+        inner.websocket_min_stream_period = period;
+        self
+    }
+
     /// Builds an [`AppState`] from each manager trait object.
     ///
     /// The composition root passes the concrete `ferrofin-core` impls (as
@@ -358,6 +382,10 @@ impl AppState {
             configuration_validators: std::collections::HashMap::new(),
             // Wired by the composition root via `with_network`.
             network: None,
+            // Overridden by the composition root via
+            // `with_websocket_min_stream_period`; this fallback floors
+            // client-chosen stream periods even on a bare state.
+            websocket_min_stream_period: crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD,
             library,
             users,
             user_views,

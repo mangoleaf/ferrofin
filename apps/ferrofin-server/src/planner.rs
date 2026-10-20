@@ -36,7 +36,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
-use ferrofin_mediaencoding::encoder::split_args;
+use ferrofin_mediaencoding::encoder::{FfmpegVersion, split_args};
 use ferrofin_mediaencoding::encoding_helper::helper::{
     shift_audio_codecs_if_needed, shift_video_codecs_if_needed, should_encode_subtitle,
 };
@@ -66,6 +66,11 @@ use crate::encoding_options::EncodingOptionsReader;
 /// this many seconds are encoded, so it directly sets time-to-first-segment.
 /// Used when the request declares no `SegmentLength`.
 const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 3;
+
+/// The first ffmpeg that takes `-hls_segment_options`; older ones call the
+/// option `-hls_ts_options`. Port of `DynamicHlsController`'s
+/// `_minFFmpegHlsSegmentOptions` (an option rename, not a tuning value).
+const MIN_FFMPEG_HLS_SEGMENT_OPTIONS: FfmpegVersion = FfmpegVersion::new(5, 0);
 
 /// The default HLS segment container when the request declares none.
 ///
@@ -133,8 +138,8 @@ pub struct FerrofinStreamStatePlanner {
     /// ffmpeg path and the boot capabilities — is already held, and it is
     /// pure cache in front of a probe.
     vaapi_prober: crate::vaapi_probe::VaapiProber,
-    /// Resolves item/series/library display names onto the plan's
-    /// [`TranscodeDisplayNames`] so transcode logs name what they play.
+    /// Resolves item/series/library display names for a starting job (see
+    /// `display_names`) so transcode logs name what they play.
     /// Optional: `None` (the composition unit test) leaves the names empty —
     /// they are logging metadata, never load-bearing.
     library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
@@ -204,37 +209,6 @@ impl FerrofinStreamStatePlanner {
     ) -> Self {
         self.virtual_folders = Some(folders);
         self
-    }
-
-    /// Resolves the human-readable names for the playing item — its own title,
-    /// its series (episodes), and its library — for the transcode logs.
-    /// Best-effort by design: any miss leaves the field empty.
-    async fn display_names(
-        &self,
-        item_id: uuid::Uuid,
-    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
-        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
-        let Some(library) = &self.library else {
-            return names;
-        };
-        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
-            return names;
-        };
-        names.item_name = item.name.clone();
-        names.series_name = item.series_name.clone();
-        // The library whose location holds the item (its `TopParentId` is
-        // that location's folder; a row an older scan wrote names the library).
-        if let Some(folders) = &self.virtual_folders
-            && let Ok(folders) = folders.get_virtual_folders().await
-        {
-            names.library_name = ferrofin_model::entities_media::owning_library(
-                &folders,
-                item.top_parent_id.as_deref(),
-                item.path.as_deref(),
-            )
-            .and_then(|folder| folder.name.clone());
-        }
-        names
     }
 
     /// The effective [`EncodingOptions`] for this planner, read from the persisted
@@ -596,6 +570,38 @@ fn hls_segment_type(segment_container: &str) -> &'static str {
 
 #[async_trait]
 impl StreamStatePlanner for FerrofinStreamStatePlanner {
+    /// Resolves the human-readable names for the playing item — its own title,
+    /// its series (episodes), and its library — for the transcode logs.
+    /// Best-effort by design: any miss leaves the field empty. Asked only when
+    /// a job starts: the library lookup walks every configured library.
+    async fn display_names(
+        &self,
+        item_id: uuid::Uuid,
+    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
+        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
+        let Some(library) = &self.library else {
+            return names;
+        };
+        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
+            return names;
+        };
+        names.item_name = item.name.clone();
+        names.series_name = item.series_name.clone();
+        // The library whose location holds the item (its `TopParentId` is
+        // that location's folder; a row an older scan wrote names the library).
+        if let Some(folders) = &self.virtual_folders
+            && let Ok(folders) = folders.get_virtual_folders().await
+        {
+            names.library_name = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path.as_deref(),
+            )
+            .and_then(|folder| folder.name.clone());
+        }
+        names
+    }
+
     // The plan is the linear `GetStreamingState` → `GetCommandLineArguments`
     // orchestration: five clearly-labelled steps (resolve source, copy-vs-
     // transcode, populate state, build args, return). Splitting it would only
@@ -852,7 +858,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // A probe state used only for the copy decision (the final state is
         // populated below with the resolved output codecs).
         let mut probe_state = EncodingJobInfo {
-            display: self.display_names(request.item_id).await,
+            display: ferrofin_mediaencoding::TranscodeDisplayNames::default(),
             base_request: base_request.clone(),
             video_stream: video_stream.clone(),
             audio_stream: audio_stream.clone(),
@@ -1989,6 +1995,24 @@ impl FerrofinStreamStatePlanner {
         if segment_container.eq_ignore_ascii_case("mp4") {
             push_split(&mut args, "-hls_fmp4_init_filename");
             args.push(format!("{stem}-1.{ext}"));
+            // fMP4 with video (`DynamicHlsController.cs:1610-1617`, PR 17501):
+            // `frag_discont` writes each track's real start DTS, the audio
+            // priming delay included, into the fragments' `tfdt`; `skip_sidx`
+            // stops movenc rewriting an open-GOP boundary packet's PTS for a
+            // SIDX that HLS never reads. An audio request has no video stream
+            // here, which is upstream's `VideoStream is not null &&
+            // IsOutputVideo`.
+            if state.video_stream.is_some() {
+                push_split(
+                    &mut args,
+                    if caps.ffmpeg_at_least(MIN_FFMPEG_HLS_SEGMENT_OPTIONS) {
+                        "-hls_segment_options"
+                    } else {
+                        "-hls_ts_options"
+                    },
+                );
+                args.push("movflags=+frag_discont+skip_sidx".to_owned());
+            }
         }
         // Number the output segments from the requested index (GetStartNumber).
         // A seek asks for segment N: we seek the input (`-ss`) to N and restart
@@ -3580,6 +3604,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_text_codec_burns_with_the_subtitles_filter_alone() {
+        // `MediaStream.IsTextFormat` is a deny-list of the bitmap codecs, so
+        // SAMI, TTML or SubViewer is text too. Its burn-in is the `-vf
+        // subtitles` chain alone: an overlay graph and `-map [v]` beside it
+        // make ffmpeg refuse the command.
+        for codec in ["sami", "ttml", "subviewer"] {
+            let p = planner(vec![source(
+                "abc",
+                vec![
+                    video_stream("h264"),
+                    audio_stream("aac"),
+                    subtitle_stream(codec, 2),
+                ],
+            )]);
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.subtitle_stream_index = Some(2);
+            req.subtitle_method = Some("Encode".to_owned());
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains("subtitles=f='/media/movie.mkv':si=0"),
+                "{codec}: {args}"
+            );
+            assert!(!args.contains("overlay"), "{codec}: {args}");
+            assert!(!args.contains("-map [v]"), "{codec}: {args}");
+            assert_eq!(args.matches(" -vf ").count(), 1, "{codec}: {args}");
+        }
+    }
+
+    #[tokio::test]
     async fn plan_seek_wraps_text_burn_in_setpts_shift() {
         // A seek restart input-seeks with `-ss`, resetting frame PTS to ~0; the
         // subtitles filter picks cues by PTS, so the chain must shift PTS to
@@ -3869,6 +3925,67 @@ mod tests {
                 .iter()
                 .any(|a| a == "-hls_fmp4_init_filename")
         );
+    }
+
+    /// `DynamicHlsController.GetCommandLineArguments` (v12.2, :1610-1617; PR
+    /// 17501): fMP4 HLS with video carries `movflags=+frag_discont+skip_sidx`
+    /// as `-hls_segment_options`, or as `-hls_ts_options` on ffmpeg older than
+    /// 5.0 (`_minFFmpegHlsSegmentOptions`) and when the version is unknown (a
+    /// null `EncoderVersion` compares below 5.0). Audio-only output, a source
+    /// without video and MPEG-TS segments get neither.
+    #[rstest::rstest]
+    #[case::fmp4_video(Some((7, 1)), "mp4", false, true, Some("-hls_segment_options"))]
+    #[case::fmp4_video_on_5_0(Some((5, 0)), "mp4", false, true, Some("-hls_segment_options"))]
+    #[case::fmp4_video_before_5_0(Some((4, 4)), "mp4", false, true, Some("-hls_ts_options"))]
+    #[case::fmp4_video_unknown_version(None, "mp4", false, true, Some("-hls_ts_options"))]
+    #[case::fmp4_audio_request(Some((7, 1)), "mp4", true, true, None)]
+    #[case::fmp4_source_without_video(Some((7, 1)), "mp4", false, false, None)]
+    #[case::mpegts_video(Some((7, 1)), "ts", false, true, None)]
+    #[tokio::test]
+    async fn fmp4_video_segments_carry_frag_discont_and_skip_sidx(
+        #[case] version: Option<(i32, i32)>,
+        #[case] segment_container: &str,
+        #[case] is_audio: bool,
+        #[case] has_video: bool,
+        #[case] option: Option<&str>,
+    ) {
+        use ferrofin_mediaencoding::encoder::FfmpegVersion;
+
+        let mut streams = vec![audio_stream("aac")];
+        if has_video {
+            streams.insert(0, video_stream("h264"));
+        }
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            capabilities = capabilities.ffmpeg_version(FfmpegVersion::new(major, minor));
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", streams)],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.segment_container = Some(segment_container.to_owned());
+        let plan = p
+            .plan(&req, is_audio, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let found: Vec<_> = plan
+            .arguments
+            .windows(2)
+            .filter(|w| w[0] == "-hls_segment_options" || w[0] == "-hls_ts_options")
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        let expected: Vec<_> = option
+            .map(|name| (name, "movflags=+frag_discont+skip_sidx"))
+            .into_iter()
+            .collect();
+        assert_eq!(found, expected, "{:?}", plan.arguments);
     }
 
     #[tokio::test]

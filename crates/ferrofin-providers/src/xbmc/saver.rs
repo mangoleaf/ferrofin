@@ -643,7 +643,8 @@ fn add_actors(writer: &mut NfoWriter, people: &[PersonInfo], collation: &Collati
             writer.element("role", role);
         }
         if person.type_ != PersonKind::Unknown {
-            writer.element("type", &format!("{:?}", person.type_));
+            // `person.Type.ToString()`: the name, or an undeclared value's integer.
+            writer.element("type", &person.type_.json_name());
         }
         if let Some(order) = person.sort_order {
             writer.element("sortorder", &order.to_string());
@@ -1029,6 +1030,32 @@ fn people_slice(result: &MetadataResult<NfoBaseItem>) -> &[PersonInfo] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `<type>` is `person.Type.ToString()`: a member's name, or an undeclared
+    /// value's integer; an `Unknown` credit writes no `<type>` at all.
+    #[test]
+    fn actor_type_writes_the_csharp_enum_text() {
+        let mut result = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Movie));
+        result.item.name = Some("Film".to_owned());
+        result.people = Some(vec![
+            PersonInfo {
+                type_: PersonKind::Penciller,
+                ..PersonInfo::new("Pat")
+            },
+            PersonInfo {
+                type_: PersonKind::Unrecognized(27),
+                ..PersonInfo::new("Odd")
+            },
+            PersonInfo {
+                type_: PersonKind::Unknown,
+                ..PersonInfo::new("Nobody")
+            },
+        ]);
+        let xml = save_movie(&result, &NfoConfiguration::default());
+        assert!(xml.contains("<type>Penciller</type>"), "{xml}");
+        assert!(xml.contains("<type>27</type>"), "{xml}");
+        assert_eq!(xml.matches("<type>").count(), 2, "{xml}");
+    }
 
     #[test]
     fn strip_html_is_non_greedy_and_keeps_orphan_brackets() {

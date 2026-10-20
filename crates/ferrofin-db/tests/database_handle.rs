@@ -163,6 +163,61 @@ async fn snapshot_is_a_complete_copy_and_refuses_an_existing_destination() {
 }
 
 #[tokio::test]
+async fn snapshot_runs_while_both_pools_are_busy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite://{}", dir.path().join("live.db").display());
+    let db = Database::connect_sized(&url, Some(1))
+        .await
+        .expect("file connect");
+    db.meta_set("snapshot_probe", "committed")
+        .await
+        .expect("write before snapshot");
+
+    // An open write transaction checks out the one writer connection, as a
+    // long scan or a queued progress report does, and a request holds the
+    // one reader. The snapshot must queue behind neither: it reads on a
+    // connection of its own.
+    let mut tx = db.writer().begin().await.expect("begin");
+    sqlx::query(
+        r#"UPDATE "FerrofinMeta" SET "Value" = 'uncommitted' WHERE "Key" = 'snapshot_probe'"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("write inside the transaction");
+    let reader = db.pool().acquire().await.expect("hold the reader");
+
+    // The copy of this tiny database takes milliseconds; the failure this
+    // guards against is waiting on a pool forever, not slowness.
+    let dest = dir.path().join("backup.db");
+    tokio::time::timeout(std::time::Duration::from_secs(5), db.snapshot_to(&dest))
+        .await
+        .expect("the snapshot waited for a pooled connection")
+        .expect("snapshot");
+    drop(reader);
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        db.meta_get("snapshot_probe")
+            .await
+            .expect("read the live database")
+            .as_deref(),
+        Some("uncommitted"),
+        "the live database sees the transaction committed after the snapshot"
+    );
+
+    let copy = Database::connect_sized(&format!("sqlite://{}", dest.display()), Some(1))
+        .await
+        .expect("open the snapshot");
+    assert_eq!(
+        copy.meta_get("snapshot_probe")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("committed"),
+        "the snapshot holds the last committed value, not the open transaction's"
+    );
+}
+
+#[tokio::test]
 async fn close_is_idempotent_and_observable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let url = format!("sqlite://{}", dir.path().join("close.db").display());
@@ -171,6 +226,10 @@ async fn close_is_idempotent_and_observable() {
         .expect("file connect");
     let clone = db.clone();
     assert!(!db.is_closed());
+    // Opens the snapshot pool's connection, so the close below has one to shut.
+    db.snapshot_to(&dir.path().join("before-close.db"))
+        .await
+        .expect("snapshot before close");
 
     db.close().await;
     assert!(db.is_closed());
@@ -180,6 +239,14 @@ async fn close_is_idempotent_and_observable() {
     );
     // A query on a closed handle fails cleanly rather than hanging.
     assert!(clone.meta_get("anything").await.is_err());
+    // The snapshot pool is closed with the others, so no backup connection
+    // outlives the handle either.
+    assert!(
+        clone
+            .snapshot_to(&dir.path().join("after-close.db"))
+            .await
+            .is_err()
+    );
 
     // Closing again is a no-op.
     db.close().await;

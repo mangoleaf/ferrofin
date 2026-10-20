@@ -59,8 +59,9 @@ pub enum ApiError {
 
     /// The operation cannot run right now because a conflicting one already is
     /// → `503`. The contract documents this for `POST /Backup/Create`, which is
-    /// serialized: two creates in the same second would write the same archive
-    /// path, and each holds the whole database in memory.
+    /// serialized (two creates in the same second would write the same archive
+    /// path, and each writes a database-sized snapshot) and refused while a
+    /// library scan runs.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
@@ -166,7 +167,9 @@ impl ApiError {
             }
             Self::Service(ServiceError::Conflict(_)) | Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Service(ServiceError::Forbidden(_)) | Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Service(ServiceError::Unavailable(_)) | Self::ServiceUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::Problem(p) => p.status(),
             // `Db`/`Backend` (and any future non-exhaustive variant) are internal
@@ -189,7 +192,11 @@ impl IntoResponse for ApiError {
         let status = self.status();
         // 5xx messages can leak internals, so log the detail server-side but
         // return a generic body; 4xx/501 messages are safe to surface.
-        if status.is_server_error() {
+        if let Self::Service(ServiceError::Unavailable(_)) = self {
+            // Load shedding, not a failure. Its volume follows the request
+            // rate (an anonymous flood), so it is debug, not error.
+            tracing::debug!(error = %self, "request shed");
+        } else if status.is_server_error() {
             tracing::error!(error = %self, "handler failed");
         }
         if let Self::Problem(problem) = self {
@@ -234,6 +241,10 @@ mod tests {
         assert_eq!(
             ApiError::from(ServiceError::backend("x")).status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ApiError::from(ServiceError::unavailable("x")).status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

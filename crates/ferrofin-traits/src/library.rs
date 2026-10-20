@@ -1212,6 +1212,23 @@ pub trait LibraryManager: Send + Sync {
         self.queue_library_scan().await.map(|()| true)
     }
 
+    /// Whether a full library validation is running: upstream's
+    /// `ILibraryManager.IsScanRunning`, which `ValidateMediaLibraryInternal`
+    /// holds for the whole of a full scan (the "Scan Media Library" task,
+    /// `POST /Library/Refresh`), its closing passes included. The library
+    /// monitor's path-scoped scans, one library's or one folder's refresh and
+    /// the item refreshes never enter that method upstream, so they do not
+    /// count.
+    ///
+    /// The database-heavy maintenance work stands down while it holds: the
+    /// "Optimize database" and "Refresh People" tasks skip their run, and
+    /// `POST /Backup/Create` refuses.
+    ///
+    /// A manager with no scanner runs no scan, so the default is `false`.
+    fn is_scan_running(&self) -> bool {
+        false
+    }
+
     /// Stops scanning for good, as the host tears down: cancels the running
     /// scan (it stops before its next item, the one in progress written
     /// whole), drops the queued ones, refuses new ones, and returns once no
@@ -2212,12 +2229,17 @@ pub trait VirtualFolderManager: Send + Sync {
     /// exists), each media path must exist on disk (else
     /// [`ServiceError::InvalidInput`]), the collection marker + `options.xml` are
     /// written, and one `.mblink` shortcut is created per media path.
+    ///
+    /// Returns the created library's `CollectionFolder` id (`None` when its
+    /// folder projects none). A caller acting on the new library must use it,
+    /// not `name`: sanitizing and de-duplicating can store it under another
+    /// name, possibly an existing library's.
     async fn add_virtual_folder(
         &self,
         name: &str,
         collection_type: Option<CollectionTypeOptions>,
         options: &LibraryOptions,
-    ) -> Result<(), ServiceError>;
+    ) -> Result<Option<Uuid>, ServiceError>;
 
     /// Removes the named virtual folder (its whole directory).
     ///
@@ -2337,6 +2359,19 @@ pub struct SimilarItemReference {
     pub score: Option<f32>,
 }
 
+/// One page of a remote similarity provider's references — what one step of
+/// the C# provider's `IAsyncEnumerable` walk yields (a TMDB results page).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SimilarItemsPage {
+    /// The page's references, in the provider's order. Empty when the walk is
+    /// over: no such page, the seed has no id the provider is keyed by, or the
+    /// source failed.
+    pub references: Vec<SimilarItemReference>,
+    /// How many pages the source reports in all (TMDB's `total_pages`); the
+    /// manager asks for the next page only below it.
+    pub total_pages: i32,
+}
+
 /// The query options a similarity provider is handed — port of
 /// `MediaBrowser.Controller.Library.SimilarItemsQuery`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2373,21 +2408,29 @@ pub trait RemoteSimilarItemsProvider: Send + Sync {
         None
     }
 
-    /// The similar-item references for `seed`.
+    /// Page `page` (1-based) of the similar-item references for `seed`.
+    ///
+    /// Upstream's provider is an `IAsyncEnumerable` that pages its source as
+    /// it is consumed, so the manager's early stop also stops the paging. Here
+    /// the manager drives the walk itself: page 1, then each next page while
+    /// the last one was not empty, is below its `total_pages`, and the manager
+    /// still wants references. A source with no pages answers everything on
+    /// page 1 and reports one page.
     ///
     /// `seed_provider_ids` are the seed's external ids (`BaseItemProviders`),
     /// resolved by the manager: a remote provider is keyed by one of them and
     /// has no repository of its own. C# reads them off the item, which carries
     /// its `ProviderIds` dictionary in memory.
     ///
-    /// Best-effort: a provider that fails returns an empty list rather than an
-    /// error, matching the C# manager's per-provider `catch`.
-    async fn get_similar_items(
+    /// Best-effort: a provider that fails returns an empty page rather than an
+    /// error, matching the C# provider's `yield break` on a failed request.
+    async fn similar_items_page(
         &self,
         seed: &BaseItemEntity,
         seed_provider_ids: &std::collections::HashMap<String, String>,
         query: &SimilarItemsQuery,
-    ) -> Vec<SimilarItemReference>;
+        page: i32,
+    ) -> SimilarItemsPage;
 }
 
 fn _assert_object_safe_remote_similar_items_provider(_: &dyn RemoteSimilarItemsProvider) {}
