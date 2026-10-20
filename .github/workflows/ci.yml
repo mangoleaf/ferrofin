@@ -67,7 +67,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
           version: v0.16.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - name: sccache stats
@@ -116,7 +116,7 @@ jobs:
         with:
           version: v0.16.0
       # No per-partition key: the three partitions build the same thing, so they share one entry.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
       # Pin a release tag (on install-action's main), never a per-tool tag such as
       # @nextest: those commits sit off main and are orphaned when the tag moves,
       # which zizmor reports as an impostor commit.
@@ -214,7 +214,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
           version: v0.16.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
           key: ${{ matrix.shard }} # a cache entry per shard, so they do not overwrite one another
       # Same release-tag pin as lint-tests (see the note there): never a per-tool tag.
