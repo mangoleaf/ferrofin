@@ -165,6 +165,27 @@ def prepare_jellyfin(url, ids_path, summary_path, out):
     print(json.dumps({"version": info["Version"], "counts": counts, "multi_version_groups": versions}), flush=True)
 
 
+def scan_library(url, ids_path, out):
+    """One full library scan of a benchmark server's disposable config, requested and awaited
+    the way the Jellyfin preparation does it, so both servers are measured after the same
+    12.x scan work (album-artist people, library view images, …) and not one of them only."""
+    with open(ids_path) as f:
+        ids = json.load(f)
+    api = Api(url, timeout=10, attempts=1)
+    api.token = ids["token"]
+    timeout = int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
+    deadline = time.monotonic() + timeout
+    while running_tasks(api):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("startup tasks did not drain before the library scan")
+        time.sleep(2)
+    t0 = time.monotonic()
+    scan = refresh_and_wait(api, timeout)
+    with open(out, "w") as f:
+        json.dump({"scan": scan, "elapsed_s": round(time.monotonic() - t0, 1)}, f, indent=2)
+    print(f"library scan {scan.get('Status')} in {time.monotonic() - t0:.0f}s", flush=True)
+
+
 def normalized_id(value):
     return str(value).replace('-', '').lower()
 
@@ -449,6 +470,8 @@ if __name__ == "__main__":
         compare_states(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin":
         prepare_jellyfin(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--scan":
+        scan_library(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--export-pools":
         export_existing_pools(*sys.argv[2:])
     else:
