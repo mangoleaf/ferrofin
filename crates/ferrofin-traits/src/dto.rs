@@ -18,7 +18,7 @@
 //!   a real projection touches image/user-data lookups behind the trait.
 //!
 //! The trait is object-safe (`AppState` holds it behind `Arc<dyn _>`) and
-//! carries a [`_assert_object_safe_dto_service`] compile-time assertion.
+//! carries a `_assert_object_safe_dto_service` compile-time assertion.
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;

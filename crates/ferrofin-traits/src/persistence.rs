@@ -1605,7 +1605,7 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// Sets a single image (`image`) on an item, replacing any existing rows of
-    /// the same [`ImageType`](ferrofin_model::entities::ImageType) — the write path
+    /// the same [`ImageType`] — the write path
     /// for an uploaded poster/backdrop/logo (`ImageController.SetItemImage`).
     ///
     /// The default is a no-op; the real service deletes the item's rows of that
