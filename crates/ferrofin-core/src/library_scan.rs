@@ -7055,6 +7055,9 @@ impl LibraryScanner {
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
+        // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
+        // episode cannot end before it starts.
+        ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
         self.apply_parental_rating_score(&mut entity).await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
@@ -18071,6 +18074,9 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
         ("AirsBeforeSeasonNumber", n.airs_before_season_number),
         ("AirsAfterSeasonNumber", n.airs_after_season_number),
         ("AirsBeforeEpisodeNumber", n.airs_before_episode_number),
+        // The episode range end (`<episodenumberend>`, or the last of several
+        // `<episodedetails>` blocks): `IndexNumberEnd` lives in `Data`.
+        ("IndexNumberEnd", n.index_number_end),
     ] {
         fill_provider_data(entity, key, value.map(|value| serde_json::json!(value)));
     }
@@ -22271,6 +22277,26 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// An NFO episode range (`<episodenumberend>`, or the last of several
+    /// `<episodedetails>` blocks) is stored where `IndexNumberEnd` lives, the
+    /// `Data` blob the DTO reads it from (PR 17805). `apply_nfo` used to drop
+    /// it, so no NFO range ever reached a client.
+    #[test]
+    fn apply_nfo_stores_the_episode_range_in_the_data_blob() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Episode);
+        n.index_number = Some(1);
+        n.index_number_end = Some(2);
+
+        let mut e = BaseItemEntity::default();
+        super::apply_nfo(&mut e, &n);
+
+        let data = crate::item_data::parse_data(e.data.as_deref());
+        assert_eq!(e.index_number, Some(1));
+        assert_eq!(data.get("IndexNumberEnd"), Some(&serde_json::json!(2)));
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's

@@ -540,6 +540,41 @@ fn episode_fetch_multi_episode_success() {
     assert_eq!(item.production_year, Some(2004));
 }
 
+/// Port of v12.2 `Fetch_Valid_MultiEpisode_Unordered_Success` (PR 17805):
+/// the `<episodedetails>` blocks are stored in descending order (as Sonarr
+/// writes them), and the merged episode must still be in ascending order.
+#[test]
+fn episode_fetch_multi_episode_unordered_success() {
+    let external_ids = StaticExternalIds::new(["Imdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "Test Data/Rising-Reversed.nfo",
+        &read_fixture("Test Data/Rising-Reversed.nfo"),
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    let item = &result.item;
+
+    assert_eq!(item.name.as_deref(), Some("Rising (1) / Rising (2)"));
+    assert_eq!(item.index_number, Some(1));
+    assert_eq!(item.index_number_end, Some(2));
+    assert_eq!(item.parent_index_number, Some(1));
+    assert_eq!(
+        item.overview.as_deref(),
+        Some(
+            "A new Stargate team embarks on a dangerous mission to a distant galaxy, where they discover a mythical lost city -- and a deadly new enemy. / Sheppard tries to convince Weir to mount a rescue mission to free Colonel Sumner, Teyla, and the others captured by the Wraith."
+        )
+    );
+    assert_eq!(
+        item.premiere_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        Some("2004-07-16".to_owned())
+    );
+    assert_eq!(item.production_year, Some(2004));
+}
+
 #[test]
 fn episode_fetch_multi_episode_with_missing_tags() {
     let external_ids = StaticExternalIds::new(["Imdb"]);
