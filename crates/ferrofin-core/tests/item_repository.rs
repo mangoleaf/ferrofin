@@ -333,6 +333,132 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     );
 }
 
+/// `Person` + `PersonTypes` (movie recommendations' "directed by") stays a
+/// correlated lookup: the credit is found through the item's own map rows
+/// and the `Peoples` primary key, never by scanning `Peoples` for the type.
+#[tokio::test]
+async fn person_type_filter_plan_stays_on_the_items_credits() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB10)).await;
+    let by_name = InternalItemsQuery {
+        user: Some(user.clone()),
+        include_item_types: vec![BaseItemKind::Movie],
+        person: Some("Chris Maker".to_owned()),
+        person_types: vec!["Director".to_owned()],
+        limit: Some(7),
+        ..Default::default()
+    };
+    let by_id = InternalItemsQuery {
+        person: None,
+        person_ids: vec![Uuid::from_u128(0xB11)],
+        ..by_name.clone()
+    };
+    for filter in [by_name, by_id] {
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("SEARCH pm USING"), "{plan}");
+        assert!(plan.contains("(ItemId=?"), "{plan}");
+        assert!(!plan.contains("SCAN pp"), "{plan}");
+    }
+}
+
+#[tokio::test]
+async fn person_types_restrict_the_matching_credit() {
+    // TranslateQuery: `f.People.Name == filter.Person && (personTypes.Length == 0
+    // || personTypes.Contains(f.People.PersonType))`, and the same for PersonIds.
+    use ferrofin_core::people_repository::FerrofinPeopleRepository;
+    use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_traits::persistence::PeopleRepository as _;
+
+    let db = fresh_db().await;
+    let acted = Uuid::from_u128(0xB21);
+    let directed = Uuid::from_u128(0xB22);
+    for (id, name) in [(acted, "Acted"), (directed, "Directed")] {
+        // The DB GUID form, which the credit writer keys its rows by.
+        let movie = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            ..item(id, BaseItemKind::Movie, name)
+        };
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[movie])
+            .await
+            .expect("seed");
+    }
+    for (id, person_type) in [(acted, "Actor"), (directed, "Director")] {
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(
+                id,
+                &[PeopleEntity {
+                    name: "Chris Maker".to_owned(),
+                    person_type: Some(person_type.to_owned()),
+                    ..PeopleEntity::default()
+                }],
+            )
+            .await
+            .expect("credit");
+    }
+    let names = |filter: InternalItemsQuery| {
+        let db = db.clone();
+        async move {
+            let mut names: Vec<String> = repo(&db)
+                .get_item_list(&filter)
+                .await
+                .expect("items")
+                .into_iter()
+                .filter_map(|i| i.name)
+                .collect();
+            names.sort();
+            names
+        }
+    };
+    let by_name = |person_types: Vec<String>| InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie],
+        person: Some("Chris Maker".to_owned()),
+        person_types,
+        ..Default::default()
+    };
+    assert_eq!(names(by_name(Vec::new())).await, ["Acted", "Directed"]);
+    assert_eq!(
+        names(by_name(vec!["Director".to_owned()])).await,
+        ["Directed"]
+    );
+
+    // The PersonIds arm, through its name bridge: the browsable Person item's
+    // id resolves to the credited name.
+    let person = Uuid::from_u128(0xB23);
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(person),
+            ..item(person, BaseItemKind::Person, "Chris Maker")
+        }])
+        .await
+        .expect("seed person");
+    let by_id = |person_types: Vec<String>| InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie],
+        person_ids: vec![person],
+        person_types,
+        ..Default::default()
+    };
+    assert_eq!(names(by_id(Vec::new())).await, ["Acted", "Directed"]);
+    assert_eq!(
+        names(by_id(vec!["Director".to_owned()])).await,
+        ["Directed"]
+    );
+}
+
 #[tokio::test]
 async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
     use ferrofin_core::translate_query::{QueryShape, build_query};

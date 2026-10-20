@@ -2151,8 +2151,16 @@ pub(crate) fn push_user_data_exists(
 /// Appends the credited-person predicates: `person` (by name) and `person_ids`
 /// (a person's filmography). Each is an `EXISTS` over the `PeopleBaseItemMap`
 /// join, so `/Items?PersonIds=<id>` returns everything that person is credited
-/// on (port of C# `WhereContainsPerson` / the `people` sub-query).
+/// on (port of C# `WhereContainsPerson` / the `people` sub-query). A non-empty
+/// `person_types` restricts the matching credit to those types in both arms
+/// (`personTypes.Length == 0 || personTypes.Contains(…PersonType)`).
 fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    let push_person_types = |qb: &mut QueryBuilder<Sqlite>| {
+        if !filter.person_types.is_empty() {
+            qb.push(" AND ");
+            push_in_list(qb, r#"pp."PersonType""#, &filter.person_types);
+        }
+    };
     if let Some(name) = non_blank(filter.person.as_ref()) {
         qb.push(
             r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
@@ -2160,6 +2168,7 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
                 WHERE pm."ItemId" = bi."Id" AND pp."Name" = "#,
         );
         qb.push_bind(name.to_owned());
+        push_person_types(qb);
         qb.push(")");
     }
     if !filter.person_ids.is_empty() {
@@ -2178,7 +2187,9 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
         push_in_list(qb, r#"pm."PeopleId""#, &ids);
         qb.push(r#" OR pp."Name" IN (SELECT "Name" FROM "BaseItems" WHERE "#);
         push_in_list(qb, r#""Id""#, &ids);
-        qb.push(")))");
+        qb.push("))");
+        push_person_types(qb);
+        qb.push(")");
     }
 }
 
