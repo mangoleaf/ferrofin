@@ -54,6 +54,7 @@
 // is allowed for this module.
 #![allow(clippy::assigning_clones)]
 
+use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -92,6 +93,9 @@ use crate::item_type_lookup::kind_from_type_name;
 struct Prefetched {
     /// Counts of owned extras, loaded only when either count field is requested.
     extra_counts: HashMap<Uuid, ExtraCounts>,
+    /// The configured `PathSubstitutions`, read once per page when the `Path`
+    /// or `MediaSources` field is requested.
+    path_substitutions: Vec<PathSubstitution>,
     /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
@@ -1267,6 +1271,10 @@ pub struct FerrofinDtoService {
     /// is `Clone` and the composition root wires the seam after the clones
     /// exist — every copy must see the value once it lands.
     live_tv: Arc<OnceLock<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>>,
+    /// The server configuration whose `PathSubstitutions` the `Path` field and
+    /// the static media sources go through (`DtoService.GetMappedPath`).
+    /// Without it, paths are served as stored.
+    configuration: Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The localization the per-user default-stream selection normalizes
     /// languages through (`MediaSourceManager.NormalizeLanguage`) — the same
     /// one the media-source manager holds, so the item DTO and `PlaybackInfo`
@@ -1314,7 +1322,20 @@ impl FerrofinDtoService {
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
             localization: None,
+            configuration: None,
         }
+    }
+
+    /// Installs the server configuration whose `PathSubstitutions` map the
+    /// `Path` field and the media sources' paths. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_configuration(
+        mut self,
+        configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.configuration = Some(configuration);
+        self
     }
 
     /// Installs the localization the `MediaSources`' default-stream selection
@@ -2454,6 +2475,14 @@ impl FerrofinDtoService {
                     attachments.get(&id).cloned().unwrap_or_default(),
                 )
             });
+            // `GetStaticMediaSources(item, true, user)`: the DTO always asks for
+            // path substitution.
+            for source in &mut sources {
+                crate::media_source_manager::map_source_path(
+                    source,
+                    &prefetched.path_substitutions,
+                );
+            }
             // A version the user may not open is no source for them; the item
             // itself always is (`MediaSourceManager.cs:397-403`).
             if let Some(visible) = &prefetched.version_visible {
@@ -2781,7 +2810,15 @@ impl FerrofinDtoService {
                 .filter(|id| !id.is_nil());
         }
         if options.contains_field(ItemFields::Path) {
-            dto.path = item.path.clone();
+            // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
+            // path after the network substitutions.
+            dto.path = item.path.as_deref().map(|path| {
+                if crate::media_info_resolver::is_file_protocol(path) {
+                    path_after_network_substitution(path, &prefetched.path_substitutions)
+                } else {
+                    path.to_owned()
+                }
+            });
         }
 
         dto.premiere_date = item.premiere_date;
@@ -4614,8 +4651,24 @@ impl FerrofinDtoService {
         } else {
             crate::item_deletion::DeleteFacts::default()
         };
+        // `GetMappedPath` maps the `Path` field and the static sources through
+        // the configured substitutions: read them once for the page.
+        let path_substitutions = match &self.configuration {
+            Some(configuration)
+                if options.contains_field(ItemFields::Path)
+                    || options.contains_field(ItemFields::MediaSources) =>
+            {
+                configuration
+                    .configuration()
+                    .await?
+                    .path_substitutions
+                    .clone()
+            }
+            _ => Vec::new(),
+        };
         Ok(Prefetched {
             extra_counts,
+            path_substitutions,
             images,
             user_data,
             media_streams,
@@ -5330,6 +5383,47 @@ mod tests {
         assert_eq!(ud.played_percentage, None);
         assert!(ud.played);
         assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `DtoService.GetMappedPath` (`DtoService.cs:1827`) and
+    /// `GetStaticMediaSources(item, true, user)`: a file-protocol `Path` and the
+    /// item's media source go through `PathSubstitutions`; a remote path is
+    /// left as it is.
+    #[tokio::test]
+    async fn path_and_media_sources_apply_path_substitutions() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = service(db.clone()).with_configuration(
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/media",
+                "//nas/media",
+            )
+            .await,
+        );
+        let id = Uuid::new_v4();
+        crate::test_support::seed_video_item(&db, id, BaseItemKind::Movie).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::Path, ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let mut movie = fetch_item(&db, id).await;
+        movie.path = Some("/media/movies/a.mkv".to_owned());
+        movie.media_type = Some("Video".to_owned());
+        let dto = svc
+            .get_base_item_dto(&movie, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("//nas/media/movies/a.mkv"));
+        let sources = dto.media_sources.expect("sources");
+        assert_eq!(sources[0].path.as_deref(), Some("//nas/media/movies/a.mkv"));
+
+        movie.path = Some("http://origin/stream".to_owned());
+        let dto = svc
+            .get_base_item_dto(&movie, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("http://origin/stream"));
     }
 
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
