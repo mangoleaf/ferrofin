@@ -1,7 +1,8 @@
 name: Adoption
 
-# The full synthetic adoption validation (adoption/README.md): adoption/run.sh and the
-# synthetic preservation matrix, all ten Jellyfin paths, against an image built from this
+# The full synthetic adoption validation (adoption/README.md): adoption/run.sh (eleven Jellyfin
+# paths, including the fresh-install 12.2 row) and the synthetic preservation matrix (ten paths;
+# the seedless fresh-install row is validated by run.sh alone), against an image built from this
 # commit. A green run on the frozen release commit is the release's adoption evidence
 # (RELEASE.md, "Validate adoption"). Every push to a release branch runs it; a patch
 # release from main runs it by hand (workflow_dispatch). Not on PRs: it is long, and the

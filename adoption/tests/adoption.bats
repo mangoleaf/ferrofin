@@ -267,16 +267,47 @@ EOS
   for f in jellyfin-12.2-from-10 jellyfin-12.2-from-12 jellyfin-12.2-from-121; do
     grep -q "\"12.2.0|$f|[0-9]*\"" "$ADOPTION/run.sh"
   done
-  # ten paths, each on its own port
+  # eleven paths, each on its own port
   run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
   [ -z "$output" ]
-  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh")" -eq 10 ]
+  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh")" -eq 11 ]
+}
+
+@test "run.sh and build-fixtures.sh carry a fresh-install 12.2 row that adopts as 12.2.0" {
+  # The live row for a database created by a Jellyfin 12.2 first run (not upgraded from
+  # 10.11): run.sh adopts it as generation 12.2.0 against its own fresh-install 12.2 oracle,
+  # and build-fixtures.sh checks its fresh-install EF history id count (105, fewer than any
+  # upgrade route, which never records the retired 10.11-era routines).
+  grep -q "\"12.2.0|jellyfin-12.2-fresh|[0-9]*\"" "$ADOPTION/run.sh"
+  grep -q '("jellyfin-12.2-fresh", "12.2", None)' "$ADOPTION/synthetic.py"
+  grep -q 'FRESH_INSTALL' "$ADOPTION/synthetic.py"
+  grep -q '12.2-fresh:105' "$ADOPTION/build-fixtures.sh"
+  # A clean first-run install is a distinct library from the seeded routes, so it gets its own
+  # Jellyfin 12.2 oracle; build-fixtures.sh builds it and run.sh compares the fresh row to it.
+  grep -q '^build_oracle 12.2-fresh jellyfin-12.2-fresh [0-9]* jellyfin/jellyfin:12.2$' "$ADOPTION/build-fixtures.sh"
+  grep -q 'smoke-jellyfin-12.2-fresh.txt' "$ADOPTION/run.sh"
+  # build_oracle takes the image as a required 4th argument and threads it into the container,
+  # so the fresh oracle really is a 12.2 image's answers (not the non-existent :12.2-fresh tag).
+  # The full build_oracle path needs a live Jellyfin (readiness probe + smoke.sh), so it is
+  # exercised by the live build-fixtures.sh run in the Adoption workflow, not offline here.
+  grep -qE 'local version=\$1 source=\$FIXTURES/\$2 port=\$3 image=\$4' "$ADOPTION/build-fixtures.sh"
+  grep -qE 'docker run .*"\$image"' "$ADOPTION/build-fixtures.sh"
+}
+
+@test "run.sh: the fresh-install row is skipped, named, when its own oracle is missing" {
+  # The shared 12.2 oracle present (so the run starts) but the fresh-install oracle absent:
+  # the fresh row alone is skipped and named, not compared against the wrong oracle.
+  fake_docker; mkdir -p fixtures/oracle fixtures/media fixtures/jellyfin-12.2-fresh/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-fresh
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == SKIP*12.2.0*jellyfin-12.2-fresh*"smoke-jellyfin-12.2-fresh.txt missing"* ]]
 }
 
 @test "run.sh: only a 10.11 source compares /Persons, and the whole smoke again, after the scan" {
   grep -qF "case \$expected in 10.11.*) after_scan='/Persons\\?';; *) after_scan=;; esac" "$ADOPTION/run.sh"
-  grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke.txt\" \"\$after_scan\")" "$ADOPTION/run.sh"
-  grep -qF "adoption_compare_smoke \"\$ORACLE\" \"\$dst.smoke-scan.txt\" | sed 's/^/after scan: /')" "$ADOPTION/run.sh"
+  grep -qF "adoption_compare_smoke \"\$oracle\" \"\$dst.smoke.txt\" \"\$after_scan\")" "$ADOPTION/run.sh"
+  grep -qF "adoption_compare_smoke \"\$oracle\" \"\$dst.smoke-scan.txt\" | sed 's/^/after scan: /')" "$ADOPTION/run.sh"
 }
 
 @test "run.sh: the second-boot log starts at the restarted container's own start, and must hold a server start" {
@@ -383,7 +414,7 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
   PATH="$TMP/bin:$PATH"
   recipe=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import synthetic; print(synthetic.recipe())' "$ADOPTION")
   for f in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
-           12.2-from-10:107 12.2-from-12:108 12.2-from-121:109; do
+           12.2-from-10:107 12.2-from-12:108 12.2-from-121:109 12.2-fresh:105; do
     mkdir -p "fixtures/jellyfin-${f%:*}/data"
     printf '{"fixture": "jellyfin-%s", "recipe": "%s"}' "${f%:*}" "$recipe" > "fixtures/jellyfin-${f%:*}/synthetic-ready.json"
     sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
