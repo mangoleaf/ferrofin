@@ -313,8 +313,9 @@ keeps day-to-day work fast:
 
 The fast stdlib reporter correctness tests (`bench/test_report.py`) do run in CI and gate
 releases; they start no servers and impose no performance thresholds. The benchmark
-reference is Jellyfin **12.2**, pinned by digest in `bench/testdata/jellyfin-image.txt`;
-this does not change the source-verification `UPSTREAM_TAG` recorded below.
+reference is the Jellyfin release named by `UPSTREAM_TAG` (below), pinned by digest in
+`bench/testdata/jellyfin-image.txt`; `bench/oracle.py` refuses a release-gate run while a
+newer Jellyfin release exists, and an ad-hoc run warns.
 
 Parity in the project's sense, implementation compared against the upstream C# and recorded
 in `handlers::VERIFIED`, is still done per change. Only measurement moved.

@@ -170,6 +170,8 @@ awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN {
 mkdir -p "$OUT"
 IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
+# The Jellyfin oracle pin; behind the latest Jellyfin release it only warns here (gate.py refuses).
+ORACLE=$(python3 bench/oracle.py check) || die "cannot read the Jellyfin oracle pin"
 # The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
 FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' ferrofin:bench)
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
@@ -179,12 +181,12 @@ jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(base
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \
   --argjson ready "$READY_TIMEOUT_S" --argjson drain "$DRAIN_TIMEOUT_S" --argjson http "$HTTP_TIMEOUT_S" --argjson stream_http "$STREAM_HTTP_TIMEOUT_S" \
   --argjson phase "$PHASE_TIMEOUT_S" --argjson cleanup "$CLEANUP_TIMEOUT_S" --argjson restarts "$RESTARTS" --argjson ttfs_reps "$TTFS_REPS" \
-  --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
+  --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" --argjson oracle "$ORACLE" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
   '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
-    window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
+    window_s:$window, mem_sample_ms:$sample_ms, oracle:$oracle, date: (now|todate)}' > "$OUT/run.json"
 
 api() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -H "$AUTH" "$URL$1"; }
 wait_ready() {
@@ -476,6 +478,7 @@ PY_ISOLATION
   if [ "$1" = jellyfin ]; then
     local expected_version; expected_version=$(jq -r '.validation.system_info.Version' "$TESTDATA/jellyfin/preparation.json")
     [ "$(jq -r .Version "$D/system-info.json")" = "$expected_version" ] || die "expected Jellyfin $expected_version"
+    python3 bench/oracle.py matches "$expected_version" || die "the Jellyfin image is not the oracle release"
   fi
   disable_plugins "$cfg"
   disable_schedules || die "$NAME: could not disable automatic tasks"

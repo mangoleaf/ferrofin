@@ -33,7 +33,16 @@ printed: agreement is the absence of a range, not a claim about one.
 The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was not a
 reliable pass/fail test. Reports retain ranges for review instead.
 
-The benchmark reference is separate from the C# source-parity pin in `handlers/mod.rs`.
+The benchmark reference is the Jellyfin release named by the C# source-parity pin
+(`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
+in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
+Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
+fails, a release-gate session (`gate.py aa|ab`) refuses to start and `run.sh` warns and
+continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
+and digest. A run that boots Jellyfin also stops unless the pinned image reports the
+`UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
+Moving the pin means moving `UPSTREAM_TAG`, pinning that release's image and preparing the
+corpus again.
 The owner requested plugin checks and background scan suppression; the isolation
 policy below implements that request on disposable configurations.
 
@@ -163,6 +172,15 @@ excluded from keys. Counts, ordered IDs (including duplicates), nested array len
 per-item field types are checked per response; no cross-item field union or arbitrary
 value diff is used. Each image belongs to its screen, and binary byte lengths detect
 empty bodies. Different nonzero JPEG sizes remain valid, unflagged diagnostics.
+`/Items/{id}/Similar` (`detail:similar`, `series:similar`) is the one exception: Jellyfin
+breaks equal similarity scores in arbitrary order (series in random order), and the
+response carries no score, so which items fill the limit is the server's free pick. Those
+responses are checked for status, counts, totals, content type and their own top-level
+fields, not item IDs or per-item fields, and the posters of their items are checked by
+count, status and type per slot and screen rather than by item (which assumes every
+candidate has a Primary poster, as every fixture item does). A Similar response that repeats an item or returns the item
+it was asked about still fails. Which items score as similar is covered by the code
+comparison recorded in `handlers::VERIFIED`, not by this check.
 
 Timed iterations emit one compact selection record after recording screen latency,
 without a full structural comparison. The reporter checks observed keys and request

@@ -15,6 +15,9 @@
     gate.py render SESSION_DIR
         rewrite a finished session's report.md and report.html from its run dirs
 
+Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
+latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
+
 Each run is `run.sh --servers ferrofin --only PHASES` (below) into SESSION_DIR/NN-a or
 NN-b. The shape pass is what makes a cell comparable: without it every cell is caveated
 for a missing phase and the change in the responses behind a cell cannot be seen.
@@ -40,6 +43,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+import oracle
 import report
 import soak
 
@@ -348,7 +352,9 @@ def md_table(head, rows):
 
 def header(plan):
     imgs = "; ".join(f"{role} = {i['ref']} ({i['id'][:19]})" for role, i in plan["images"].items())
-    return f"{plan['mode'].upper()} session {plan['name']}, {len(plan['schedule'])} runs, {plan['date']}: {imgs}"
+    o = plan.get("oracle")
+    pin = f"; Jellyfin oracle {o['tag']} ({o['image']})" if o else ""
+    return f"{plan['mode'].upper()} session {plan['name']}, {len(plan['schedule'])} runs, {plan['date']}: {imgs}{pin}"
 
 
 def render_md(plan, result):
@@ -453,6 +459,13 @@ def main(argv):
         return 0
     if os.path.exists(session):
         sys.exit(f"gate: {session} exists — a session directory is never reused")
+    # A release gate never runs against a Jellyfin pin behind the latest release (DO).
+    try:
+        plan["oracle"], problem = oracle.check()
+    except (OSError, ValueError) as err:
+        problem = f"cannot read the Jellyfin oracle pin ({err})"
+    if problem:
+        sys.exit(f"gate: refusing: {problem}")
     plan["images"] = {}
     for role, image in images.items():
         ref = image_ref(image)

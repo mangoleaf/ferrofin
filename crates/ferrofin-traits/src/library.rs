@@ -1518,6 +1518,29 @@ pub trait UserDataManager: Send + Sync {
         Ok((None, None))
     }
 
+    /// Batch form of [`Self::get_stream_default_data`] for one user across
+    /// many items, keyed by item id; an item that remembers neither index
+    /// (or has no user-data row) is absent.
+    ///
+    /// Lets the item DTO's `MediaSources` select each page item's default
+    /// streams (`GetStaticMediaSources(item, true, user)`, v12.2
+    /// `DtoService.cs:410`) in one read instead of one per item. The default
+    /// loops the single-item form; the concrete manager overrides it.
+    async fn get_stream_default_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, (Option<i32>, Option<i32>)>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &item_id in item_ids {
+            let remembered = self.get_stream_default_data(item_id, user_id).await?;
+            if remembered != (None, None) {
+                map.insert(item_id, remembered);
+            }
+        }
+        Ok(map)
+    }
+
     /// Gets the presentation DTO of a user's data for an item, or `None`.
     async fn get_user_data_dto(
         &self,

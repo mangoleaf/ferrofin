@@ -1,6 +1,8 @@
-//! Generated: the embedded `Emby.Server.Implementations/Localization/Core/*.json`
-//! UI-culture dictionaries (`GetLocalizationDictionary`). Regenerate with the
-//! snippet in `localization_manager.rs` after re-vendoring the directory.
+//! The embedded `Emby.Server.Implementations/Localization/Core/*.json`
+//! UI-culture dictionaries (`GetLocalizationDictionary`), copied verbatim from
+//! Jellyfin v12.2 (`ca0f16eb7c`), the `UPSTREAM_TAG` release pinned in
+//! `ferrofin-api`'s `handlers/mod.rs`. After re-vendoring, keep this table in
+//! step with the directory's file list.
 
 /// `(culture code, JSON dictionary)` for every shipped core translation.
 pub(super) const CORE_DICTIONARIES: &[(&str, &str)] = &[
