@@ -14,9 +14,10 @@ use thiserror::Error;
 ///
 /// A deliberately small, transport-agnostic taxonomy: the HTTP layer maps each
 /// variant to a status code (`NotFound` → 404, `Unauthorized` → 401, `Forbidden` → 403,
-/// `InvalidInput` → 400, `Conflict` → 409, `Db`/`Backend` → 500). Keep it flat —
-/// richer, domain-specific context belongs in the message strings, not new
-/// variants (a variant is only added for a genuinely distinct HTTP semantic).
+/// `InvalidInput` → 400, `Conflict` → 409, `Unavailable` → 503, `Db`/`Backend` →
+/// 500). Keep it flat — richer, domain-specific context belongs in the message
+/// strings, not new variants (a variant is only added for a genuinely distinct
+/// HTTP semantic).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServiceError {
@@ -41,6 +42,13 @@ pub enum ServiceError {
     /// a name that already exists (C# `ConflictResult`). Maps to HTTP `409`.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The service cannot take the request right now but may later: it is
+    /// shedding load because a bounded queue or a concurrency limit is full.
+    /// Maps to HTTP `503`. Unlike [`Backend`](Self::Backend) it is not a
+    /// failure, and the caller may retry.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
 
     /// A persistence-layer failure surfaced from [`ferrofin_db`].
     #[error("database error: {0}")]
@@ -88,6 +96,11 @@ impl ServiceError {
         Self::Conflict(why.into())
     }
 
+    /// Constructs a [`ServiceError::Unavailable`] from anything string-like.
+    pub fn unavailable(why: impl Into<String>) -> Self {
+        Self::Unavailable(why.into())
+    }
+
     /// Constructs a [`ServiceError::Backend`] from anything string-like.
     pub fn backend(why: impl Into<String>) -> Self {
         Self::Backend(why.into())
@@ -125,6 +138,10 @@ mod tests {
         assert!(matches!(
             ServiceError::conflict("name taken"),
             ServiceError::Conflict(_)
+        ));
+        assert!(matches!(
+            ServiceError::unavailable("queue full"),
+            ServiceError::Unavailable(_)
         ));
     }
 
