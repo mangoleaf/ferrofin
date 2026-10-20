@@ -91,6 +91,10 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   NVENC's) but **have not yet been run on an Intel or AMD GPU**.
   **AMF, VideoToolbox, RKMPP and V4L2M2M are not supported** — see the note in
   `CLAUDE.md`; selecting one falls back to a software transcode and logs a warning.
+  - **Accepted divergence (a fix, not a gap):** Jellyfin puts the configured VAAPI device
+    path into the `-init_hw_device` string unquoted, so a path with a space or quote breaks
+    the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
+    is passed exactly as Jellyfin passes it.
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed
   DVR timers & recordings. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
   `discover.json`/`lineup.json`, UDP device discovery, the per-channel HTTP stream with

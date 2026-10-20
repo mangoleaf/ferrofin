@@ -13,6 +13,8 @@
 //! and the tuner `-user_agent` value raw inside their quotes. Ferrofin quotes
 //! all of them: a remote source or header is no more trusted than a file name.
 
+use std::borrow::Cow;
+
 use ferrofin_model::media_info::MediaProtocol;
 
 /// Gets the ffmpeg input argument for a single input file.
@@ -104,6 +106,17 @@ pub fn quote(value: &str) -> String {
     format!("\"{}\"", escape_process_argument(value))
 }
 
+/// Quotes `value` for [`split_args`] unless it is made only of ASCII letters,
+/// digits and `+ - . / : @ ] _` (shlex 2's unquoted set; non-ASCII is quoted
+/// too), using shlex's POSIX quoting (or [`quote`] for a value with a NUL byte,
+/// which shlex refuses). A plain value such as
+/// `/dev/dri/renderD128` therefore stays byte-identical to upstream's command
+/// line, while one with a space, quote or backslash still splits back whole.
+#[must_use]
+pub fn quote_if_needed(value: &str) -> Cow<'_, str> {
+    shlex::try_quote(value).unwrap_or_else(|_| quote(value).into())
+}
+
 /// Splits an ffmpeg argument string into argv, honouring the quoting [`quote`]
 /// emits: `-i file:"/path/with spaces/f.mkv"` reaches ffmpeg as one `-i`
 /// value, not two.
@@ -178,6 +191,33 @@ mod tests {
             split_args(&get_input_argument("file", &url, MediaProtocol::Http)).unwrap(),
             [url]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::space("/dev/dri/my gpu")]
+    #[case::single_quote("/dev/dri/a'b")]
+    #[case::double_quote(r#"/dev/dri/a"b"#)]
+    #[case::backslash(r"/dev/dri/a\b")]
+    #[case::shell_chars("/dev/$HOME #x")]
+    #[case::non_ascii("/dev/dri/gpu-é")]
+    #[case::nul("/dev/dri/a\0b")]
+    fn quote_if_needed_round_trips_through_split(#[case] value: &str) {
+        let args = format!("-init_hw_device drm=dr:{}", quote_if_needed(value));
+        assert_eq!(
+            split_args(&args).unwrap(),
+            ["-init_hw_device", &format!("drm=dr:{value}")]
+        );
+    }
+
+    // The golden-string guarantee: an ordinary device path is not rewritten.
+    #[test]
+    fn quote_if_needed_leaves_a_plain_device_path_untouched() {
+        for path in [
+            "/dev/dri/renderD128",
+            "/dev/dri/by-path/pci-0000:03:00.0-render",
+        ] {
+            assert!(matches!(quote_if_needed(path), Cow::Borrowed(p) if p == path));
+        }
     }
 
     /// Transliteration of upstream's `EscapeProcessArgument_ValidInput_Corrects`

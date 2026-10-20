@@ -1419,9 +1419,9 @@ impl FerrofinStreamStatePlanner {
         // `-hwaccel_output_format` in upstream's order. The string is
         // shell-quoted like every other ffmpeg command line (AMD's OpenCL
         // device is `device_vendor="Advanced Micro Devices"`), so it takes the
-        // shared splitter, with the same one-token fallback as the input. Only
-        // a configured render-node path containing a quote can reach it, and
-        // ffmpeg then rejects the string, so say why.
+        // shared splitter, with the same one-token fallback as the input. The
+        // device builders quote a configured render-node path, so the
+        // fallback is only a safety net; if it ever fires, say why.
         args.extend(split_args(&hwaccel_input.args).unwrap_or_else(|error| {
             tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
             vec![hwaccel_input.args.clone()]
