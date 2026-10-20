@@ -18,12 +18,13 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::sync_play::{
-    BufferRequestDto, GroupInfoDto, IgnoreWaitRequestDto, JoinGroupRequestDto,
-    MovePlaylistItemRequestDto, NewGroupRequestDto, NextItemRequestDto, PingRequestDto,
-    PlayRequestDto, PreviousItemRequestDto, QueueRequestDto, ReadyRequestDto,
+    BufferRequestDto, GROUP_NAME_MAX_UTF16_UNITS, GroupInfoDto, IgnoreWaitRequestDto,
+    JoinGroupRequestDto, MovePlaylistItemRequestDto, NewGroupRequestDto, NextItemRequestDto,
+    PingRequestDto, PlayRequestDto, PreviousItemRequestDto, QueueRequestDto, ReadyRequestDto,
     RemoveFromPlaylistRequestDto, SeekRequestDto, SetPlaylistItemRequestDto,
     SetRepeatModeRequestDto, SetShuffleModeRequestDto,
 };
@@ -34,7 +35,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, ProblemDetails};
 use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
@@ -162,15 +163,27 @@ async fn dispatch_with(
 // ── group lifecycle ────────────────────────────────────────────────────────
 
 /// `POST /SyncPlay/New` — create a group owned by the caller.
+///
+/// `NewGroupRequestDto.GroupName` carries `[StringLength(200)]`
+/// (GHSA-v2jv-54xj-h76w). Model validation runs after the authorization
+/// policy and before the action, on the name as sent (the controller trims it
+/// afterwards), counting UTF-16 code units as .NET string lengths do.
 async fn new_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<NewGroupRequestDto>,
-) -> Result<Json<GroupInfoDto>, ApiError> {
+) -> Result<Response, ApiError> {
     require_access(&state, &auth, SyncPlayAccess::CreateGroup).await?;
+    if body.group_name.encode_utf16().count() > GROUP_NAME_MAX_UTF16_UNITS {
+        return Ok(ProblemDetails::member_validation(
+            "GroupName",
+            "Group name must not exceed 200 characters.",
+        )
+        .into_response());
+    }
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
-    Ok(Json(mgr.new_group(&session, &body.group_name).await?))
+    Ok(Json(mgr.new_group(&session, &body.group_name).await?).into_response())
 }
 
 /// `POST /SyncPlay/Join` — join an existing group.

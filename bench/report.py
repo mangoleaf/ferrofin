@@ -50,6 +50,7 @@ import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+import ramp
 import soak
 
 #: The thresholds a baseline delta must cross, relative and absolute, before it is
@@ -1076,6 +1077,28 @@ def phase_table(m, as_html=False):
                             "Start (UTC)", "End (UTC)", "Reason"], rows, as_html)
 
 
+def ramp_table(m, as_html=False):
+    """The saturation ramp of every run that has one (`run.sh --only ramp`): the ceiling in
+    the heading and every step beneath it, so the step that ended the ramp is visible."""
+    out = []
+    head = ["Rate (screens/s)", "Worst screen p95 (ms)", "Success", "Dropped iterations", "Step"]
+    for i, run in enumerate(m["runs"], 1):
+        doc = load(os.path.join(run, "ferrofin", "ramp.json"))
+        if not doc:
+            continue
+        ceiling = f"{doc['ceiling']} screens/s" if doc.get("ceiling") is not None else "none (the first step failed)"
+        title = f"Throughput ramp, run {i} — ceiling {ceiling}"
+        why = f"Limit: {doc['limit']} — {doc['reason']}. Bound: worst screen p95 ≤ {doc['bound_ms']} ms; {doc['step_s']} s per step."
+        rows = ramp.rows(doc)
+        if as_html:
+            body = "".join("<tr>" + "".join(f"<td class='num'>{html.escape(str(v))}</td>" for v in row) + "</tr>" for row in rows)
+            out.append(f"<h2>{html.escape(title)}</h2><p class='lede'>{html.escape(why)}</p><div class='scroll'><table><thead><tr>"
+                       + "".join(f"<th>{html.escape(h)}</th>" for h in head) + f"</tr></thead><tbody>{body}</tbody></table></div>")
+        else:
+            out.append(diagnostic_table(title, head, rows) + f"\n{why}\n")
+    return "\n".join(out)
+
+
 def soak_table(m, as_html=False):
     """The memory soak of every run that has one (`run.sh --only soak`): the anon-memory
     slope and what it was fitted on."""
@@ -1138,6 +1161,8 @@ def render_md(m):
             escape = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
             p("| " + escape(label) + " | " + " | ".join(escape(cells[k]) for k, _ in servers) + " |")
         p("")
+    if table := ramp_table(m):
+        p(table)
     if table := soak_table(m):
         p(table)
     p(phase_table(m))
@@ -1486,7 +1511,7 @@ def comparable_levels(m, base):
 
 def load_gate(path=GATE_PATH):
     """The gate.toml thresholds: one row per kind of cell (`screens`, `endpoints`,
-    `memory`), each `relative_pct` and `absolute` (in the cell's unit), and optional
+    `memory`, `scan`, `ramp`), each `relative_pct` and `absolute` (in the cell's unit), and optional
     per-cell bands under `[cells."<Cell.key>"]` from the A/A noise table."""
     import tomllib  # Python 3.11+, needed only with a baseline
     try:
@@ -1494,7 +1519,7 @@ def load_gate(path=GATE_PATH):
             gate = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"gate thresholds unreadable: {error}") from error
-    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory")},
+    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory", "scan", "ramp")},
             **{f"cells.{k}": v for k, v in (gate.get("cells") or {}).items()}}
     for name, row in rows.items():
         if not isinstance(row, dict) or not all(number(row.get(f)) for f in ("relative_pct", "absolute")):
@@ -1740,6 +1765,8 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
         body = "".join("<tr><th>" + e(label) + "</th>" + "".join(
             f"<td class='num{' flagged' if '⚠' in cells[k] else ''}'>{e(cells[k])}</td>" for k, _ in servers) + "</tr>" for label, cells in rows)
         parts.append(f"<h3>{e(title)}</h3><div class='scroll'><table><thead><tr><th>Window / metric</th>{head}</tr></thead><tbody>{body}</tbody></table></div>")
+    if table := ramp_table(m, True):
+        parts.append(table)
     if table := soak_table(m, True):
         parts.append(table)
     parts.append(phase_table(m, True))

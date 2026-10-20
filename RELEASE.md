@@ -61,6 +61,7 @@ from.
    docker build -t ferrofin:vX.Y.Z-rc .                    # the frozen release commit
    docker pull ghcr.io/mangoleaf/ferrofin:vPREV            # the previous release
    python3 bench/gate.py ab ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+   python3 bench/gate.py scan ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
    ```
 
    - **What it runs.** Six runs in the order previous, candidate, previous, candidate,
@@ -84,6 +85,14 @@ from.
    - **Output.** `bench/runs/gate-ab-<date>-<time>/` holds `verdict.json`, `report.md` and a
      self-contained `report.html` that opens from disk. The command exits `1` when the gate
      blocks.
+   - **Scan and migration.** `gate.py scan` runs the same six-run order with
+     `bench/scan.py` in place of `run.sh`: a full library scan of the bench corpus on an
+     empty data dir, and the adoption boot of a fresh copy of its Jellyfin 10.11.8 database,
+     each timed with its peak anon memory (`bench/README.md`, "Scan and migration"). It
+     needs the same idle cores and the same test data (at least 10,000 items), and refuses
+     a stale oracle pin the same way, although it never boots Jellyfin. A self-A/B
+     of v1.3.2 took 20 minutes from start to report on the shared host. Output goes to
+     `bench/runs/gate-scan-<date>-<time>/` in the same form, and it exits `1` when it blocks.
 
    **Thresholds.** A cell regressed when the median of the candidate's runs exceeds the
    median of the previous release's runs by more than **both** thresholds of its row **and**
@@ -95,21 +104,39 @@ from.
    |---|---|---:|---:|
    | `screens` | screen p50 | 15 % | 2 ms |
    | `endpoints` | endpoint p50 | 15 % | 0.5 ms |
-   | `memory` | peak (under load) and steady idle anon memory | 25 % | 40 MiB |
+   | `memory` | peak (under load) and steady idle anon memory; scan and migration peak anon | 25 % | 40 MiB |
+   | `scan` | library-scan and adoption-migration wall time | 15 % | 1 s |
+   | `ramp` | throughput ceiling (higher is better; *Throughput ceiling* below) | 15 % | 5 screens/s |
    | `soak` | one-hour anon-memory slope (not a median rule: see *Memory soak*) | limit 20 MiB/h | |
 
    A `[cells."…"]` entry in `gate.toml` overrides its row for a single cell. Change the table
    only by a reviewed commit, after re-measuring the noise floor with
    `python3 bench/gate.py aa <image>` (six runs of one image), and keep this table in step
-   with it.
+   with it. The `ramp` row has no A/A: its values are re-derived after the first two ramps
+   (see *Throughput ceiling*).
 
    **What blocks.** A gated cell that *regressed*, or one that is *not comparable* because a
    side's evidence is flagged, a side has missing values, or the candidate's responses
    differ from the previous release's. Either blocks the release until it is fixed or the
    maintainer accepts it. Gated cells are the screen and endpoint p50s at the unloaded and
-   loaded levels, plus peak and steady memory, and the soak's `soak/slope` when the soak was
-   run. The stress level and endpoint cells whose medians are both under 1 ms are reported
-   but never block.
+   loaded levels, plus peak and steady memory, all four cells of the scan session, the
+   throughput ceiling of the ramp session below, which blocks whenever it is run, and the
+   soak's `soak/slope` when the soak was run. The stress level and endpoint cells whose
+   medians are both under 1 ms are reported but never block.
+
+   **Throughput ceiling.** Measure it in the same window as the gate. It is a separate
+   session (output in `bench/runs/gate-ramp-<date>-<time>/`, with the same oracle-pin
+   refusal and the same rule that a failed run stops the session):
+   `python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`
+   ([`bench/README.md`](bench/README.md#throughput-ceiling-the-saturation-ramp)). Each run is
+   `bench/run.sh --servers ferrofin --only ramp`, which steps the loaded mix up from 25
+   screens/s and reports the last rate whose worst-screen p95 stayed within 100 ms with no
+   failed request and no dropped load-client iteration. The ceiling is judged by the `ramp`
+   row on the same rule as the other cells, with higher being better: it regressed when the
+   candidate's median ceiling is below the previous release's by more than 15 % **and** 5
+   screens/s, in at least 2 of the 3 pairs. A ramp that ended on the load client, or found
+   no passing step, cannot be judged and blocks like a regression. The thresholds are
+   starting values, to be re-derived after the first two ramps.
 
    **Memory soak.** Anon memory that creeps up over hours is invisible in a two-minute window,
    so measure it separately, in the same window as the gate:
@@ -150,9 +177,10 @@ from.
 4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
    Watch it finish, then verify (below).
 5. **Record the results** after the tag, so the record never moves the frozen head: attach
-   the benchmark gate's `report.md` to the release PR (release branch → `main`), or to the
-   GitHub Release for a patch release from `main`, and update the adoption test record in
-   `adoption/README.md` with the link to the green `Adoption` run from step 2.
+   the benchmark gate's `report.md` files (A/B, scan and, when it was run, ramp) to the release
+   PR (release branch → `main`), or to the GitHub Release for a patch release from `main`, and
+   update the adoption test record in `adoption/README.md` with the link to the green
+   `Adoption` run from step 2.
    After a patch release from `main`, merge `main` into the open release branch so the fix
    is carried forward.
 

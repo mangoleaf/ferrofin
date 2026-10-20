@@ -105,8 +105,9 @@ pub(crate) async fn effective_user_id(
 ///
 /// The id itself comes from [`effective_user_id`] (the full
 /// `RequestHelpers.GetUserId` port, nil-fallback *and* the administrator gate).
-/// A `user_id` that resolves to no account is a `400`; a caller with neither an
-/// explicit id nor an authenticated user is likewise rejected.
+/// A caller with neither an explicit id nor an authenticated user (a nil
+/// effective id) is a `400`, as `GetUserById(Guid.Empty)` throws
+/// `ArgumentException`; an id that resolves to no account is a `404`.
 pub(crate) async fn resolve_user(
     state: &AppState,
     auth: &AuthorizationInfo,
@@ -512,6 +513,7 @@ async fn get_items(
     {
         internal.collapse_box_set_items = Some(false);
     }
+    order_search_by_sort_name(&mut internal);
     apply_media_stream_filter_rules(&mut internal);
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
@@ -611,6 +613,32 @@ fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
         if internal.user.is_some() {
             reroot_to_user_root(internal);
         }
+    }
+}
+
+/// Leads a searched query's sort keys with `SortName` ascending.
+///
+/// v12.2 `ItemsController.GetItems` (ItemsController.cs:596-600) orders a
+/// searched page by the search providers' score, then `SortName`, with a
+/// stable in-memory sort of what `folder.GetItems` returned in the caller's
+/// order — so the caller's `sortBy` only orders rows tied on both. The
+/// repository's search branch (v12.2 `ApplyOrder`) emits the relevance rank,
+/// then these keys (the leading `SortName` earning its `Name` tiebreaker), so
+/// this reproduces that order with the relevance rank standing in for the
+/// provider score until those providers are ported (gl-450). The extra `Name`
+/// term only reorders rows tied on `SortName`. Upstream falls back to `ApplyOrder` alone when no provider
+/// returns a candidate; that fallback belongs to the same port.
+pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    if internal
+        .search_term
+        .as_deref()
+        .is_some_and(|term| !term.trim().is_empty())
+    {
+        internal
+            .order_by
+            .insert(0, (ItemSortBy::SortName, SortOrder::Ascending));
     }
 }
 

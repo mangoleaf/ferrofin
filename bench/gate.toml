@@ -16,9 +16,17 @@ absolute = 2
 relative_pct = 15
 absolute = 0.5
 
-[memory]        # peak under load and steady idle anon memory, MiB
+[memory]        # peak under load and steady idle anon memory, MiB (and gate.py scan's peaks)
 relative_pct = 25
 absolute = 40
+
+[scan]          # library-scan and adoption-migration wall time (gate.py scan), s
+relative_pct = 15
+absolute = 1
+
+[ramp]          # throughput ceiling (highest rate with worst-screen p95 <= the bound), screens/s
+relative_pct = 15
+absolute = 5
 
 # One-hour anon-memory slope, MiB/h (soak.py): the candidate regresses only when its slope
 # exceeds this and the previous release's does not.
@@ -26,7 +34,9 @@ absolute = 40
 max_slope_mib_per_hour = 20
 
 # A per-cell band from the A/A noise table replaces its row for that one cell, keyed
-# `<level>/screens/<screen>`, `<level>/endpoints/<endpoint>` or `memory/<row>`:
+# `<level>/screens/<screen>`, `<level>/endpoints/<endpoint>`, `memory/<row>` or, for
+# gate.py scan, `scan|migration/wall time|peak anon`. `ramp/ceiling` has no A/A, so only an
+# owner can set a band for it:
 #
 # [cells."loaded/screens/detail"]
 # relative_pct = 40

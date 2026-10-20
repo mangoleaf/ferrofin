@@ -315,13 +315,15 @@ impl HdHomerunHost {
         Ok(host_info)
     }
 
-    /// `HdHomerunHost.GetMediaSource` (v10.11.8 HdHomerunHost.cs:182-311) — the
+    /// `HdHomerunHost.GetMediaSource` (v12.2 HdHomerunHost.cs:187-343) — the
     /// media source for one `(channel, profile)` pair.
     ///
     /// The profile table, the HD/SD bit-rate defaults, the `mpeg2 → mpeg2video`
     /// normalization, the `NalLengthSize = "0"` marker on h264 and the
     /// `{profile}_{md5(channelId)}_{md5(apiUrl)}` id are all upstream's, byte
-    /// for byte.
+    /// for byte. `SupportsDirectPlay` is `true` since v12.0-rc6
+    /// (jellyfin/jellyfin#17682; v12.2 HdHomerunHost.cs:329), so a client whose
+    /// profile plays MPEG-TS with the channel's codecs direct plays the stream.
     ///
     /// # Errors
     ///
@@ -413,7 +415,7 @@ impl HdHomerunHost {
             buffer_ms: Some(0),
             container: Some("ts".to_owned()),
             id: Some(id),
-            supports_direct_play: false,
+            supports_direct_play: true,
             supports_direct_stream: true,
             supports_transcoding: true,
             is_infinite_stream: true,
@@ -831,6 +833,10 @@ mod tests {
         assert_eq!(video.is_interlaced, codec == "mpeg2video");
         // `isHd` ⇒ 448 kbps audio.
         assert_eq!(source.media_streams[1].bit_rate, Some(448_000));
+        // v12.0-rc6 (HdHomerunHost.cs:329): every profile may direct play.
+        assert!(source.supports_direct_play);
+        assert!(source.supports_direct_stream);
+        assert!(source.supports_transcoding);
         // `{profile}_{md5(channelId)}_{md5(apiUrl)}`.
         let expected_id = format!(
             "{profile}_{}_{}",

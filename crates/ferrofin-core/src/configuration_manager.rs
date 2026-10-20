@@ -388,7 +388,7 @@ impl FerrofinServerConfigurationManager {
                 .await
                 .map_err(|e| io_err("read configuration", &config_file, &e))?;
             let mut config = serde_json::from_slice::<ServerConfiguration>(&bytes)
-                .map_err(|e| ServiceError::Backend(format!("invalid configuration JSON: {e}")))?;
+                .map_err(|e| json_err("invalid configuration JSON", &config_file, &e))?;
             // Backfill the per-type MetadataOptions on an older config that
             // predates them (was written empty), so the library editor lists them.
             if config.metadata_options.is_empty() {
@@ -719,7 +719,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .await
             .map_err(|e| io_err("read branding", &self.branding_file, &e))?;
         serde_json::from_slice::<BrandingOptions>(&bytes)
-            .map_err(|e| ServiceError::Backend(format!("invalid branding JSON: {e}")))
+            .map_err(|e| json_err("invalid branding JSON", &self.branding_file, &e))
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
@@ -754,7 +754,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .await
             .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
         serde_json::from_slice::<EncodingOptions>(&bytes)
-            .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
+            .map_err(|e| json_err("invalid encoding options JSON", &self.encoding_file, &e))
     }
 }
 
@@ -808,13 +808,21 @@ async fn initialize_transcode_path(
         Ok(bytes) => match serde_json::from_slice::<EncodingOptions>(&bytes) {
             Ok(options) => options,
             Err(error) => {
-                tracing::warn!(%error, "loading encoding configuration for transcode path failed; using defaults");
+                tracing::warn!(
+                    path = %encoding_file.display(),
+                    %error,
+                    "loading encoding configuration for transcode path failed; using defaults"
+                );
                 EncodingOptions::default()
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => EncodingOptions::default(),
         Err(error) => {
-            tracing::warn!(%error, "reading encoding configuration for transcode path failed; using defaults");
+            tracing::warn!(
+                path = %encoding_file.display(),
+                %error,
+                "reading encoding configuration for transcode path failed; using defaults"
+            );
             EncodingOptions::default()
         }
     };
@@ -1015,7 +1023,7 @@ pub fn startup_wizard_completed_files(
         let bytes =
             std::fs::read(&json_path).map_err(|e| io_err("read configuration", &json_path, &e))?;
         let config = serde_json::from_slice::<ServerConfiguration>(&bytes)
-            .map_err(|e| ServiceError::Backend(format!("invalid configuration JSON: {e}")))?;
+            .map_err(|e| json_err("invalid configuration JSON", &json_path, &e))?;
         if config.is_startup_wizard_completed {
             completed.push(json_path);
         }
@@ -1066,6 +1074,15 @@ async fn write_config(
 /// Wraps a filesystem error touching `path` as a [`ServiceError`].
 fn io_err(action: &str, path: &std::path::Path, err: &std::io::Error) -> ServiceError {
     ServiceError::Backend(format!("{action} ({}): {err}", path.display()))
+}
+
+/// Wraps a parse error in the JSON document at `path` as a [`ServiceError`]
+/// naming the file, as [`io_err`] does for a failed read. Upstream's
+/// `MyXmlSerializer.DeserializeFromFile` attaches the same `Filename` to any
+/// deserialization failure, so a broken configuration file can be found from
+/// the log.
+fn json_err(what: &str, path: &std::path::Path, err: &serde_json::Error) -> ServiceError {
+    ServiceError::Backend(format!("{what} ({}): {err}", path.display()))
 }
 
 #[cfg(test)]
@@ -1575,7 +1592,95 @@ mod tests {
         tokio::fs::write(&mgr.encoding_file, b"not json")
             .await
             .expect("write bad encoding");
-        assert!(mgr.get_encoding_options().await.is_err());
+        let error = mgr
+            .get_encoding_options()
+            .await
+            .expect_err("invalid encoding JSON");
+        // Every reader logs this error as it is (the throttle, the segment
+        // cleaner, trickplay, the planner), so it has to say which file it is.
+        assert!(
+            error
+                .to_string()
+                .contains(&mgr.encoding_file.display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// Upstream's `MyXmlSerializer.DeserializeFromFile` attaches the file name
+    /// to any deserialization failure; a broken `branding.json` names itself.
+    #[tokio::test]
+    async fn invalid_branding_json_names_the_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        std::fs::create_dir_all(mgr.branding_file.parent().expect("named dir"))
+            .expect("create named dir");
+        std::fs::write(&mgr.branding_file, b"{ \"LoginDisclaimer\": \"hi\", }")
+            .expect("write bad branding");
+
+        let error = mgr.get_branding().await.expect_err("invalid branding JSON");
+        assert!(
+            error
+                .to_string()
+                .contains(&mgr.branding_file.display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// A hand-edited `system.json` that no longer parses stops the boot with
+    /// an error naming the file, so an operator with several data directories
+    /// does not have to guess which one broke.
+    #[tokio::test]
+    async fn a_malformed_system_json_names_the_file_at_boot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("config").join("system.json");
+        std::fs::create_dir_all(file.parent().expect("config dir")).expect("config dir");
+        std::fs::write(&file, b"{ \"EnableMetrics\": true, }").expect("system.json");
+
+        let error = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect_err("must not boot on a broken system.json");
+        assert!(
+            error.to_string().contains(&file.display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// The boot-time transcode-path read falls back to the defaults for a
+    /// broken `encoding.json`, and its warning names the file.
+    #[tokio::test]
+    async fn a_malformed_encoding_json_at_boot_is_logged_with_its_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let file = tmp
+            .path()
+            .join("config")
+            .join("users")
+            .join(FerrofinServerConfigurationManager::NAMED_SUBDIR)
+            .join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME);
+        std::fs::create_dir_all(file.parent().expect("named dir")).expect("named dir");
+        std::fs::write(&file, b"{ not json").expect("encoding.json");
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+                .await
+                .expect("a broken encoding.json does not stop the boot");
+        }
+        let text = logs.text();
+        let warning = text
+            .lines()
+            .find(|line| line.contains("transcode path"))
+            .unwrap_or_else(|| panic!("no transcode-path warning in:\n{text}"));
+        assert!(warning.contains(" WARN "), "{warning}");
+        assert!(warning.contains(&file.display().to_string()), "{warning}");
     }
 
     #[cfg(unix)]
@@ -2380,7 +2485,41 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("config dir");
         std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("xml");
         assert!(startup_wizard_completed_files(&dir).is_err());
-        std::fs::write(dir.join("system.json"), b"{ not json").expect("json");
-        assert!(startup_wizard_completed_files(&dir).is_err());
+        let json = dir.join("system.json");
+        std::fs::write(&json, b"{ not json").expect("json");
+        let error = startup_wizard_completed_files(&dir).expect_err("invalid system.json");
+        // The first boot step to read it, so its error is the one an operator
+        // sees for a hand-edited `system.json`.
+        assert!(
+            error.to_string().contains(&json.display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// An in-memory log sink for a scoped `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }
