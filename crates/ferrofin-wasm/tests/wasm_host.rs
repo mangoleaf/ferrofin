@@ -719,6 +719,143 @@ async fn dispatcher_routes_by_id_and_gates_on_enabled() {
     );
 }
 
+/// How long the back-pressure tests give a spawned call to reach the runtime
+/// thread, or its queue slot, before probing.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// What "at once" means for a turned-away web request: well inside the 2 s
+/// deadline that a waiting request would sit out.
+const AT_ONCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The fixture loaded with a 2 s deadline and a queue of four commands (so
+/// web requests get two slots), and a dispatcher over it.
+async fn backpressure_host(
+    dir: &std::path::Path,
+) -> (WasmPluginHost, Arc<ferrofin_wasm::WasmRequestDispatcher>) {
+    write_fixture(dir, "hello", FIXTURE_WAT);
+    let settings = WasmSettings {
+        call_timeout_secs: 2,
+        event_queue_capacity: 4,
+        ..tight_settings()
+    };
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.to_path_buf();
+        move || WasmPluginHost::load(&dir, &settings)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let dispatcher = Arc::new(ferrofin_wasm::WasmRequestDispatcher::new(
+        &host,
+        Arc::new(common::EnabledStub(b"{}".to_vec())),
+    ));
+    (host, dispatcher)
+}
+
+/// An anonymous `GET` of `path` in the plugin's URL space.
+fn web_get(path: &str) -> ferrofin_traits::plugins::PluginWebRequest {
+    ferrofin_traits::plugins::PluginWebRequest {
+        method: "GET".to_owned(),
+        path: path.to_owned(),
+        query: String::new(),
+        headers: vec![],
+        body: None,
+        user_id: None,
+        is_admin: false,
+        is_authenticated: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_plugin_queue_turns_a_web_request_away_at_once() {
+    use ferrofin_traits::plugins::PluginRequestHandler as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (host, dispatcher) = backpressure_host(dir.path()).await;
+    let plugin = Arc::clone(&host.plugins()[0]);
+    let plugin_id = plugin.descriptor.id;
+
+    // The runtime thread spins on `loop` until its deadline...
+    let spinning = {
+        let plugin = Arc::clone(&plugin);
+        tokio::spawn(async move { plugin.run_task_for_test("loop".to_owned()).await })
+    };
+    tokio::time::sleep(SETTLE).await;
+    // ...while four task runs fill the whole queue behind it.
+    let queued: Vec<_> = (0..4)
+        .map(|_| {
+            let plugin = Arc::clone(&plugin);
+            tokio::spawn(async move { plugin.run_task_for_test("ok".to_owned()).await })
+        })
+        .collect();
+    tokio::time::sleep(SETTLE).await;
+
+    // A web request finds no room and is answered at once, not parked.
+    let answer = tokio::time::timeout(AT_ONCE, dispatcher.handle(plugin_id, web_get("/ping")))
+        .await
+        .expect("the web request waited for queue room instead of failing fast");
+    assert!(
+        matches!(answer, Err(ServiceError::Unavailable(_))),
+        "{answer:?}"
+    );
+
+    // The task runs keep their place, and all run once the loop is cut off.
+    assert!(
+        spinning.await.unwrap().is_err(),
+        "the loop hits its deadline"
+    );
+    for run in queued {
+        run.await.unwrap().expect("a queued task run still runs");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_requests_hold_at_most_half_the_plugin_queue() {
+    use ferrofin_traits::plugins::PluginRequestHandler as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (host, dispatcher) = backpressure_host(dir.path()).await;
+    let plugin_id = host.plugins()[0].descriptor.id;
+    let send = |path: &'static str| {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.handle(plugin_id, web_get(path)).await })
+    };
+
+    // One web request spins on the runtime thread and a second queues
+    // behind it: together they hold both web slots (half the queue of four).
+    let spinning = send("/spin");
+    tokio::time::sleep(SETTLE).await;
+    let waiting = send("/ping");
+    tokio::time::sleep(SETTLE).await;
+
+    // A third is turned away at once, though the queue still has room: that
+    // room stays for scans, tasks and events.
+    let answer = tokio::time::timeout(AT_ONCE, dispatcher.handle(plugin_id, web_get("/ping")))
+        .await
+        .expect("the third web request was queued instead of turned away");
+    assert!(
+        matches!(answer, Err(ServiceError::Unavailable(_))),
+        "{answer:?}"
+    );
+
+    // The spin is cut off at its deadline, the queued request is answered,
+    // and the slots come back: the next request goes through.
+    assert!(
+        spinning.await.unwrap().is_err(),
+        "the spin hits its deadline"
+    );
+    let queued = waiting
+        .await
+        .unwrap()
+        .expect("dispatch")
+        .expect("known plugin");
+    assert_eq!(queued.status, 200);
+    let reply = dispatcher
+        .handle(plugin_id, web_get("/ping"))
+        .await
+        .expect("the web slots were released")
+        .expect("known plugin");
+    assert_eq!(reply.status, 200);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn analysis_driver_offers_each_item_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -1135,7 +1272,7 @@ impl ferrofin_traits::library::VirtualFolderManager for SwitchDuringWriteFolders
         name: &str,
         collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
         options: &ferrofin_model::configuration::LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         self.inner
             .add_virtual_folder(name, collection_type, options)
             .await

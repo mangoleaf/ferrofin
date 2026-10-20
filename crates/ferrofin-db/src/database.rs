@@ -49,7 +49,8 @@ pub struct ImageParentRow {
 
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
-/// single-connection **writer** pool ([`Database::writer`]).
+/// single-connection **writer** pool ([`Database::writer`]), plus a private
+/// one-connection pool for [`Database::snapshot_to`].
 ///
 /// SQLite under WAL serves many concurrent readers but exactly one writer at a
 /// time. Funnelling every write through a 1-connection pool turns would-be
@@ -64,6 +65,10 @@ pub struct ImageParentRow {
 pub struct Database {
     pool: SqlitePool,
     writer: SqlitePool,
+    /// One connection, opened on first use, for [`Database::snapshot_to`], so
+    /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
+    /// [`Database::close`] still waits for it.
+    snapshotter: SqlitePool,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -102,7 +107,7 @@ impl Database {
         // SQLITE_BUSY failures for every in-flight request (a real
         // mid-playback black-screen). The maintenance task now also skips the
         // vacuum during playback; the long timeout is the second seatbelt.
-        configure_sqlite_for_concurrency();
+        init_sqlite();
         let read_options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
@@ -165,7 +170,7 @@ impl Database {
         // Same process-wide setup as the file-backed path: without it this
         // pool's connection would have no `ferrofin_random()` and every
         // random-ordered query would fail with "no such function".
-        configure_sqlite_for_concurrency();
+        init_sqlite();
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -174,14 +179,17 @@ impl Database {
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
         let writer = pool.clone();
+        let snapshotter = pool.clone();
         Ok(Self {
             pool,
             writer,
+            snapshotter,
             file_path: None,
         })
     }
 
-    /// Builds the reader + writer pools from fully-formed connect options.
+    /// Builds the reader, writer and snapshot pools from fully-formed connect
+    /// options.
     ///
     /// `pool_size` `None` selects [`default_pool_size`] for the reader pool;
     /// the writer pool is always exactly one connection (SQLite allows one
@@ -195,6 +203,9 @@ impl Database {
         file_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let max_connections = pool_size.unwrap_or_else(default_pool_size);
+        let snapshotter = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(read_options.clone());
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(read_options)
@@ -214,6 +225,7 @@ impl Database {
         Ok(Self {
             pool,
             writer,
+            snapshotter,
             file_path,
         })
     }
@@ -857,7 +869,7 @@ impl Database {
         &self.writer
     }
 
-    /// Closes both pools, waiting for checked-out connections to be returned.
+    /// Closes every pool, waiting for checked-out connections to be returned.
     ///
     /// The composition root calls this when a server lifetime ends so that an
     /// in-process restart reopens the file with NO connection from the previous
@@ -866,6 +878,7 @@ impl Database {
     pub async fn close(&self) {
         self.pool.close().await;
         self.writer.close().await;
+        self.snapshotter.close().await;
     }
 
     /// Whether [`Database::close`] has run.
@@ -880,13 +893,20 @@ impl Database {
     /// WAL-mode database, which a checkpoint can tear mid-read. `dest` must not
     /// exist.
     ///
+    /// It runs on the snapshot pool's one connection. `VACUUM INTO` needs only
+    /// a read transaction, and holding a writer or reader connection for the
+    /// whole copy would queue every write behind it (the writer pool has one
+    /// connection) or, on a one-connection reader pool, every read. The cost
+    /// is a WAL that cannot be checkpointed back to empty until the snapshot's
+    /// read transaction ends.
+    ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the statement fails
     /// (including when `dest` already exists).
     pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
         let dest = dest.to_string_lossy().replace('\'', "''");
         sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
-            .execute(&self.writer)
+            .execute(&self.snapshotter)
             .await?;
         Ok(())
     }
@@ -1539,6 +1559,8 @@ pub async fn inspect_migration_history(path: &std::path::Path) -> Result<Migrati
     if !path.try_exists().map_err(sqlx::Error::Io)? {
         return Ok(MigrationHistory::Missing);
     }
+    // On a set-up server this is the first SQLite open of the process.
+    init_sqlite();
     let mut conn = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -1792,20 +1814,28 @@ const MMAP_SIZE_BYTES: i64 = 0x7FFF_0000;
 /// sort on the global PRNG mutex.
 ///
 /// Must run before the first connection is opened — `sqlite3_config` fails once
-/// SQLite has initialized, which is why this is a process-wide `Once` on the
-/// connect path rather than per-pool setup. A failure is not fatal: it means
-/// SQLite was already initialized and we keep the default behaviour.
-fn configure_sqlite_for_concurrency() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// SQLite has initialized, which is why this is a process-wide one-shot on the
+/// connect path rather than per-pool setup. Every path in this crate that opens
+/// SQLite calls it first, and the server calls it before anything else at boot;
+/// any new raw open (a `SqliteConnectOptions` connect) must call it first too.
+/// A failure is not fatal: SQLite was already initialized and keeps its default
+/// allocator bookkeeping, which is logged as a warning because it brings the
+/// capacity cliff back.
+///
+/// Returns whether `MEMSTATUS` was turned off (the answer of the first call).
+pub fn init_sqlite() -> bool {
+    static MEMSTATUS_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MEMSTATUS_OFF.get_or_init(|| {
         // SAFETY: `sqlite3_config` is only unsafe because it must not race with
-        // an initialized library or a live connection. The `Once` plus its
-        // placement before the first pool open give that ordering.
+        // an initialized library or a live connection. The `OnceLock` serializes
+        // callers of this function; ordering against other SQLite use rests on
+        // every opener calling it first, and `serve_once` calling it before any
+        // other boot work.
         let rc = unsafe {
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MEMSTATUS, 0_i32)
         };
         if rc != libsqlite3_sys::SQLITE_OK {
-            tracing::debug!(
+            tracing::warn!(
                 rc,
                 "sqlite3_config(MEMSTATUS, 0) declined — SQLite was already \
                  initialized; keeping default allocator bookkeeping"
@@ -1816,7 +1846,8 @@ fn configure_sqlite_for_concurrency() {
         // once that has happened.
         crate::sqlite_random::register_random_function();
         crate::sqlite_casing::register();
-    });
+        rc == libsqlite3_sys::SQLITE_OK
+    })
 }
 
 #[cfg(test)]

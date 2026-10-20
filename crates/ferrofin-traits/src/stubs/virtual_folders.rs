@@ -45,7 +45,7 @@ impl VirtualFolderManager for DisabledVirtualFolderManager {
         _name: &str,
         _collection_type: Option<CollectionTypeOptions>,
         _options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         Err(Self::unconfigured())
     }
 

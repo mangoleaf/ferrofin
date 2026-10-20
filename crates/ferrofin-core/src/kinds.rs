@@ -325,6 +325,20 @@ pub fn forced_sort_name_for(kind: BaseItemKind, forced: &str) -> String {
     ferrofin_util::sort_name::get_sort_name(forced, enable_alpha_numeric_sorting(kind))
 }
 
+/// The `SortName` a save of a named item of this kind stores — the C#
+/// `SortName` getter (`BaseItem.cs:540-561`): [`forced_sort_name_for`] when
+/// `forced` is non-empty (`string.IsNullOrEmpty`), else [`sort_name_for`].
+///
+/// For the kinds whose `CreateSortName` is not overridden; an episode, season,
+/// track or channel derives its key from more than its name.
+#[must_use]
+pub fn saved_sort_name(kind: BaseItemKind, name: &str, forced: Option<&str>) -> String {
+    match forced.filter(|forced| !forced.is_empty()) {
+        Some(forced) => forced_sort_name_for(kind, forced),
+        None => sort_name_for(kind, name),
+    }
+}
+
 /// Whether items of this kind can own media sources — the rows in
 /// `MediaStreamInfos`, `Chapters` and `TrickplayInfos`, and the alternate
 /// versions that point at them through `PrimaryVersionId`.
@@ -710,10 +724,10 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
 mod tests {
     use super::{
         collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
-        latest_items_index_container_kind, presentation_unique_key, series_presentation_unique_key,
-        series_user_data_keys, supports_adding_to_playlist, supports_ancestors,
-        supports_inherited_parent_images, supports_people, supports_played_status,
-        supports_similarity, supports_theme_media,
+        latest_items_index_container_kind, presentation_unique_key, saved_sort_name,
+        series_presentation_unique_key, series_user_data_keys, supports_adding_to_playlist,
+        supports_ancestors, supports_inherited_parent_images, supports_people,
+        supports_played_status, supports_similarity, supports_theme_media,
     };
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
@@ -721,6 +735,30 @@ mod tests {
 
     /// The series key a `Season` case carries.
     const SERIES_KEY: Option<&str> = Some("595f611d217e8273327033dd5d500d81");
+
+    /// The C# `SortName` getter: a sort title wins only when
+    /// `!string.IsNullOrEmpty`, and goes through the same cleaning as the
+    /// name; a `Person` keeps either verbatim apart from `TrimStart()`.
+    #[rstest]
+    #[case(BaseItemKind::Playlist, "The Road Trip", None, "road trip")]
+    #[case(BaseItemKind::Playlist, "The Road Trip", Some(""), "road trip")]
+    #[case(BaseItemKind::Playlist, "The Road Trip", Some("The Zed"), "zed")]
+    #[case(BaseItemKind::BoxSet, "Heat 2", None, "heat 0000000002")]
+    #[case(BaseItemKind::Person, "  Alice Parity", None, "Alice Parity")]
+    #[case(
+        BaseItemKind::Person,
+        "Alice Parity",
+        Some("  Parity, Alice"),
+        "Parity, Alice"
+    )]
+    fn saved_sort_name_reads_the_sort_title_first(
+        #[case] kind: BaseItemKind,
+        #[case] name: &str,
+        #[case] forced: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(saved_sort_name(kind, name, forced), expected);
+    }
 
     /// The presentation keys a real Jellyfin 10.11.8 database stores, read out
     /// of one row per kind and pinned here.

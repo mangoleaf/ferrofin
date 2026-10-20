@@ -55,6 +55,15 @@ const DATABASE_FILE_NAME: &str = "ferrofin.db";
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
 
+/// Minimum period, in milliseconds, between pushes of a dashboard WebSocket
+/// stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). The client names
+/// the period in its `*Start` subscription; Ferrofin floors it because it drives
+/// these streams on a timer — each tick recomputes and resends the full snapshot
+/// — unlike upstream's event-driven `BasePeriodicWebSocketListener`, where the
+/// period is only a debounce ceiling. 100 ms allows far faster updates than
+/// jellyfin-web's 1500 ms while bounding the worst case for a hostile client.
+const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
+
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
 /// Only the knobs a operator commonly overrides on the command line are
@@ -135,6 +144,7 @@ struct FileConfig {
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
+    websocket_min_stream_period_ms: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
@@ -437,6 +447,13 @@ pub struct Config {
     /// `config.toml` > 30.
     pub shutdown_timeout_secs: u32,
 
+    /// Minimum period (milliseconds) between pushes of a dashboard WebSocket
+    /// stream; the client-chosen Sessions / ScheduledTasksInfo /
+    /// ActivityLogEntry period is clamped up to it. Resolved
+    /// `FERROFIN_WS_MIN_STREAM_PERIOD_MS` env > `websocket_min_stream_period_ms`
+    /// in `config.toml` > 100. See [`DEFAULT_WS_MIN_STREAM_PERIOD_MS`].
+    pub websocket_min_stream_period_ms: u32,
+
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
     /// order: `FERROFIN_SCAN_PROGRESS_EVERY` env, then `scan_progress_every` in
@@ -498,7 +515,8 @@ pub struct Config {
 
     /// Per-plugin event queue depth for WASM plugins. `None` = the 256
     /// default. A full queue drops events for that plugin only (events are
-    /// hints; the DB is the truth). Resolved
+    /// hints; the DB is the truth), and web requests may hold at most half
+    /// of it. Resolved
     /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
     /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
     /// treated as unset.
@@ -769,6 +787,9 @@ impl Config {
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+            websocket_min_stream_period_ms: parse_var(env, "FERROFIN_WS_MIN_STREAM_PERIOD_MS")
+                .or(file.websocket_min_stream_period_ms)
+                .unwrap_or(DEFAULT_WS_MIN_STREAM_PERIOD_MS),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
@@ -959,6 +980,7 @@ impl Config {
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            websocket_min_stream_period_ms: DEFAULT_WS_MIN_STREAM_PERIOD_MS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
@@ -1232,6 +1254,23 @@ mod tests {
         assert!(cfg.ffmpeg_path.is_none());
         // With no XDG/HOME the system location is used.
         assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
+        assert_eq!(
+            cfg.websocket_min_stream_period_ms,
+            DEFAULT_WS_MIN_STREAM_PERIOD_MS
+        );
+    }
+
+    #[test]
+    fn websocket_min_stream_period_resolves_env_over_default() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            cfg.websocket_min_stream_period_ms,
+            DEFAULT_WS_MIN_STREAM_PERIOD_MS
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_WS_MIN_STREAM_PERIOD_MS", "250");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.websocket_min_stream_period_ms, 250);
     }
 
     #[test]

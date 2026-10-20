@@ -4306,7 +4306,25 @@ mod tests {
             .join(" | ");
         assert_eq!(plan.matches("SEARCH tag_value USING").count(), 8, "{plan}");
         assert_eq!(plan.matches("SEARCH tag_map USING").count(), 8, "{plan}");
+        // v12.2 `ItemsBelowTaggedAncestor`: each ancestor arm is one
+        // uncorrelated set read by `ParentItemId`, never a per-row seek of
+        // `(ItemId, ParentItemId)` for every tagged id.
+        assert_eq!(
+            plan.matches(
+                "SEARCH tag_parent USING INDEX IX_AncestorIds_ParentItemId (ParentItemId=?)"
+            )
+            .count(),
+            2,
+            "{plan}"
+        );
         assert_eq!(plan.matches("SEARCH tag_parent USING").count(), 2, "{plan}");
+        let steps: Vec<&str> = plan.split(" | ").collect();
+        assert!(
+            steps
+                .windows(2)
+                .all(|w| !(w[0].starts_with("CORRELATED") && w[1].contains(" tag_"))),
+            "no tag arm is a per-row subquery: {plan}"
+        );
         assert!(!plan.contains("SCAN tag_"), "{plan}");
     }
 
