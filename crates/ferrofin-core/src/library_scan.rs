@@ -18799,8 +18799,9 @@ fn names_its_own_folder(row: &BaseItemEntity) -> bool {
 /// nothing. A season number still missing then takes the season's
 /// (`season_index`).
 ///
-/// Resolved as the planner resolves episodes: the path alone, and no
-/// plain-folder parent (the planner creates none).
+/// Resolved as the planner resolves episodes: the path below its library
+/// ([`below_library`]), and no plain-folder parent (the planner creates
+/// none).
 ///
 /// A series whose `DisplayOrder` is `absolute` resolves with
 /// `isAbsoluteNaming` (`LibraryManager.cs:3292-3298`): only the expressions
