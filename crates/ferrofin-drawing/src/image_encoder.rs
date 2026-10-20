@@ -366,6 +366,128 @@ impl ImageCrateEncoder {
         )?;
         Ok(output_path.to_owned())
     }
+
+    /// The synchronous body of [`ImageEncoder::get_image_blur_hash`]: decode,
+    /// downscale to fit 128×128, then BlurHash-encode. CPU-bound (plus the
+    /// decode's file read), so it runs on the blocking pool, never inline.
+    fn blur_hash_blocking(x_comp: i32, y_comp: i32, path: &str) -> Result<String, ServiceError> {
+        let decoded = Self::decode(path)?;
+        let small = decoded
+            .resize(128, 128, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        let x = u32::try_from(x_comp.clamp(1, 9)).unwrap_or(1);
+        let y = u32::try_from(y_comp.clamp(1, 9)).unwrap_or(1);
+        blurhash::encode(x, y, small.width(), small.height(), small.as_raw())
+            .map_err(|e| ServiceError::backend(e.to_string()))
+    }
+
+    /// The build + write body of [`ImageEncoder::create_image_collage`]: several
+    /// decodes, Lanczos3 resizes and an encode. CPU-bound, so it runs on the
+    /// blocking pool. Assumes the caller has validated `width`/`height`.
+    fn create_image_collage_blocking(options: &ImageCollageOptions) -> Result<(), ServiceError> {
+        let ratio = f64::from(options.width) / f64::from(options.height);
+        let canvas = if ratio >= COLLAGE_THUMB_RATIO {
+            build_thumb_collage(&options.input_paths, options.width, options.height)
+        } else {
+            build_square_collage(&options.input_paths, options.width, options.height)
+        };
+
+        let format = Self::format_for_path(&options.output_path);
+        // Collages are written at the C# fixed quality of 90.
+        Self::write(
+            &DynamicImage::ImageRgba8(canvas),
+            &options.output_path,
+            format,
+            COLLAGE_QUALITY,
+        )
+    }
+
+    /// The decode + overlay + JPEG-encode body of
+    /// [`ImageEncoder::create_trickplay_tile`]: up to `tile_width`×`tile_height`
+    /// (default 100) JPEG decodes packed into one large grid. CPU- and
+    /// file-I/O-bound with no yield points, so it runs on the blocking pool.
+    /// Assumes the caller has validated the O(1) arguments (non-empty inputs,
+    /// positive tile dimensions and `img_width`, and that the inputs fit the
+    /// grid); the per-image dimension checks stay here with the decode.
+    fn create_trickplay_tile_blocking(
+        options: &ImageCollageOptions,
+        quality: i32,
+        img_width: i32,
+        img_height: Option<i32>,
+    ) -> Result<i32, ServiceError> {
+        let paths = &options.input_paths;
+        let tile_width = options.width;
+        let tile_height = options.height;
+
+        // If no height provided, use the first image's height (after validating
+        // its width matches img_width), matching the Skia default path.
+        let first = Self::decode(&paths[0])?;
+        let first_w = i32::try_from(first.width()).unwrap_or(i32::MAX);
+        if first_w != img_width {
+            return Err(ServiceError::invalid_input(
+                "Image width does not match provided width.",
+            ));
+        }
+        let img_height = match img_height {
+            Some(h) if h > 0 => h,
+            _ => i32::try_from(first.height()).unwrap_or(i32::MAX),
+        };
+
+        // Checked: a wrapped i32 product would ask RgbaImage::new for a huge buffer.
+        let (Some(grid_w), Some(grid_h)) = (
+            img_width
+                .checked_mul(tile_width)
+                .and_then(|w| u32::try_from(w).ok()),
+            img_height
+                .checked_mul(tile_height)
+                .and_then(|h| u32::try_from(h).ok()),
+        ) else {
+            return Err(ServiceError::invalid_input(format!(
+                "A {tile_width}x{tile_height} grid of {img_width}x{img_height} images is too large.",
+            )));
+        };
+        let mut grid = RgbaImage::new(grid_w, grid_h);
+
+        let mut img_index = 0usize;
+        'outer: for y in 0..tile_height {
+            for x in 0..tile_width {
+                if img_index >= paths.len() {
+                    break 'outer;
+                }
+
+                let img = if img_index == 0 {
+                    first.clone()
+                } else {
+                    Self::decode(&paths[img_index])?
+                };
+                img_index += 1;
+
+                if i32::try_from(img.width()).unwrap_or(i32::MAX) != img_width {
+                    return Err(ServiceError::invalid_input(
+                        "Image width does not match provided width.",
+                    ));
+                }
+                if i32::try_from(img.height()).unwrap_or(i32::MAX) != img_height {
+                    return Err(ServiceError::invalid_input(
+                        "Image height does not match first image height.",
+                    ));
+                }
+
+                let px = u32::try_from(x * img_width).unwrap_or(0);
+                let py = u32::try_from(y * img_height).unwrap_or(0);
+                imageops::overlay(&mut grid, &img.to_rgba8(), i64::from(px), i64::from(py));
+            }
+        }
+
+        Self::write(
+            &DynamicImage::ImageRgba8(grid),
+            &options.output_path,
+            CrateFormat::Jpeg,
+            quality,
+        )?;
+
+        Ok(img_height)
+    }
 }
 
 /// Port of `ImageHelper.GetNewImageSize`: `DrawingUtils.Resize`, then
@@ -466,14 +588,18 @@ impl ImageEncoder for ImageCrateEncoder {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path is empty"));
         }
-        let decoded = Self::decode(path)?;
-        let small = decoded
-            .resize(128, 128, image::imageops::FilterType::Triangle)
-            .to_rgba8();
-        let x = u32::try_from(x_comp.clamp(1, 9)).unwrap_or(1);
-        let y = u32::try_from(y_comp.clamp(1, 9)).unwrap_or(1);
-        blurhash::encode(x, y, small.width(), small.height(), small.as_raw())
-            .map_err(|e| ServiceError::backend(e.to_string()))
+        // A full decode (4K backdrops included) plus a Triangle resize is
+        // CPU-bound synchronous work, and the decode's file read can be a cold
+        // NFS/SMB read; offload it to the blocking pool under the shared encode
+        // permit so it never pins an async worker (see `encode_image`).
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::blur_hash_blocking(x_comp, y_comp, &path))
+            .await
+            .map_err(|e| ServiceError::backend(format!("blur hash task failed: {e}")))?
     }
 
     /// Port of `EncodeImage`. Rejects unsupported inputs (returns `input_path`
@@ -546,21 +672,17 @@ impl ImageEncoder for ImageCrateEncoder {
             ));
         }
 
-        let ratio = f64::from(options.width) / f64::from(options.height);
-        let canvas = if ratio >= COLLAGE_THUMB_RATIO {
-            build_thumb_collage(&options.input_paths, options.width, options.height)
-        } else {
-            build_square_collage(&options.input_paths, options.width, options.height)
-        };
-
-        let format = Self::format_for_path(&options.output_path);
-        // Collages are written at the C# fixed quality of 90.
-        Self::write(
-            &DynamicImage::ImageRgba8(canvas),
-            &options.output_path,
-            format,
-            COLLAGE_QUALITY,
-        )
+        // Several poster decodes, Lanczos3 resizes and a final encode are
+        // CPU-bound synchronous work; offload under the shared encode permit so
+        // it never pins an async worker (see `encode_image`).
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || Self::create_image_collage_blocking(&options))
+            .await
+            .map_err(|e| ServiceError::backend(format!("image collage task failed: {e}")))?
     }
 
     /// Deferred feature — always [`ServiceError::Backend`]. Port of
@@ -613,74 +735,21 @@ impl ImageEncoder for ImageCrateEncoder {
             return Err(ServiceError::invalid_input("img_width must be positive"));
         }
 
-        // If no height provided, use the first image's height (after validating
-        // its width matches img_width), matching the Skia default path.
-        let first = Self::decode(&paths[0])?;
-        let first_w = i32::try_from(first.width()).unwrap_or(i32::MAX);
-        if first_w != img_width {
-            return Err(ServiceError::invalid_input(
-                "Image width does not match provided width.",
-            ));
-        }
-        let img_height = match img_height {
-            Some(h) if h > 0 => h,
-            _ => i32::try_from(first.height()).unwrap_or(i32::MAX),
-        };
-
-        // Checked: a wrapped i32 product would ask RgbaImage::new for a huge buffer.
-        let (Some(grid_w), Some(grid_h)) = (
-            img_width
-                .checked_mul(tile_width)
-                .and_then(|w| u32::try_from(w).ok()),
-            img_height
-                .checked_mul(tile_height)
-                .and_then(|h| u32::try_from(h).ok()),
-        ) else {
-            return Err(ServiceError::invalid_input(format!(
-                "A {tile_width}x{tile_height} grid of {img_width}x{img_height} images is too large.",
-            )));
-        };
-        let mut grid = RgbaImage::new(grid_w, grid_h);
-
-        let mut img_index = 0usize;
-        'outer: for y in 0..tile_height {
-            for x in 0..tile_width {
-                if img_index >= paths.len() {
-                    break 'outer;
-                }
-
-                let img = if img_index == 0 {
-                    first.clone()
-                } else {
-                    Self::decode(&paths[img_index])?
-                };
-                img_index += 1;
-
-                if i32::try_from(img.width()).unwrap_or(i32::MAX) != img_width {
-                    return Err(ServiceError::invalid_input(
-                        "Image width does not match provided width.",
-                    ));
-                }
-                if i32::try_from(img.height()).unwrap_or(i32::MAX) != img_height {
-                    return Err(ServiceError::invalid_input(
-                        "Image height does not match first image height.",
-                    ));
-                }
-
-                let px = u32::try_from(x * img_width).unwrap_or(0);
-                let py = u32::try_from(y * img_height).unwrap_or(0);
-                imageops::overlay(&mut grid, &img.to_rgba8(), i64::from(px), i64::from(py));
-            }
-        }
-
-        Self::write(
-            &DynamicImage::ImageRgba8(grid),
-            &options.output_path,
-            CrateFormat::Jpeg,
-            quality,
-        )?;
-
-        Ok(img_height)
+        // Up to tile_width×tile_height (default 100) JPEG decodes, overlaid onto
+        // one large grid and JPEG-encoded — CPU- and file-I/O-bound with no yield
+        // points. Offload to the blocking pool under the shared encode permit
+        // (one per tile, not per film, so tiling cannot starve request-path
+        // poster encodes that share the same core-count semaphore).
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::create_trickplay_tile_blocking(&options, quality, img_width, img_height)
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("trickplay tile task failed: {e}")))?
     }
 }
 
@@ -1586,6 +1655,83 @@ mod tests {
             hog.await.expect("hog joined");
             let dims = encoder.get_image_size(&path).await.expect("probe");
             assert_eq!((dims.width, dims.height), (64, 32));
+        });
+    }
+
+    #[test]
+    fn blur_hash_collage_and_trickplay_go_through_the_blocking_pool() {
+        // Like the probe test above: the three CPU/decode methods must offload
+        // to the blocking pool, not run inline on the async worker. With the one
+        // blocking thread hogged, each call must fail to complete in the window.
+        // Inputs are valid so the O(1) validation passes and execution reaches
+        // the offloaded work; the decode never runs because the pool is starved.
+        const STARVED_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let dir = TempDir::new().expect("tempdir");
+        let img = fixture(&dir, "work.png", 100, 100);
+        let collage_inputs: Vec<String> = (0..4)
+            .map(|i| fixture(&dir, &format!("w{i}.png"), 200, 200))
+            .collect();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let encoder = ImageCrateEncoder;
+
+            // Occupy the single blocking thread, provably, before the calls.
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.expect("hog started");
+
+            let blur =
+                tokio::time::timeout(STARVED_WAIT, encoder.get_image_blur_hash(4, 3, &img)).await;
+            assert!(
+                blur.is_err(),
+                "get_image_blur_hash completed with the blocking pool starved, so it ran inline"
+            );
+
+            let collage_options = ImageCollageOptions {
+                input_paths: collage_inputs.clone(),
+                output_path: out_path(&dir, "work-collage.png"),
+                width: 400,
+                height: 400,
+            };
+            let collage = tokio::time::timeout(
+                STARVED_WAIT,
+                encoder.create_image_collage(&collage_options, None),
+            )
+            .await;
+            assert!(
+                collage.is_err(),
+                "create_image_collage completed with the blocking pool starved, so it ran inline"
+            );
+
+            let tile_options = ImageCollageOptions {
+                input_paths: vec![img.clone()],
+                output_path: out_path(&dir, "work-tile.jpg"),
+                width: 1,
+                height: 1,
+            };
+            let tile = tokio::time::timeout(
+                STARVED_WAIT,
+                encoder.create_trickplay_tile(&tile_options, 90, 100, Some(100)),
+            )
+            .await;
+            assert!(
+                tile.is_err(),
+                "create_trickplay_tile completed with the blocking pool starved, so it ran inline"
+            );
+
+            release_tx.send(()).expect("release hog");
+            hog.await.expect("hog joined");
         });
     }
 }
