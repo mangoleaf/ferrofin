@@ -869,6 +869,22 @@ impl Database {
         &self.writer
     }
 
+    /// Checks that a reader connection can be had and answers a query: the
+    /// `/health` and `/health/ready` probe (upstream
+    /// `DbContextFactoryHealthCheck`, which asks `CanConnectAsync`). It never
+    /// touches the writer, so a long write cannot fail it. It waits at most
+    /// the reader pool's acquire timeout, which is not set here (sqlx's
+    /// default, 30 s).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when no connection can be acquired (the pool is
+    /// closed, or saturated past its acquire timeout) or the query fails.
+    pub async fn can_connect(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Closes every pool, waiting for checked-out connections to be returned.
     ///
     /// The composition root calls this when a server lifetime ends so that an

@@ -934,8 +934,16 @@ async fn canonicalize_path_case(
     // sent: `ferrofin_api::extract::Query` binds them to each handler's members
     // ignoring case, as ASP.NET does. Preserve the original query for
     // authentication, streaming URLs and plugin forwarding.
+    // Jellyfin's `/health` is an ASP.NET route too, so its case is not
+    // significant either, unlike Ferrofin's own `/health/live` and `/health/ready`.
     let path = request.uri().path();
-    if let Some(new_path) = ferrofin_api::routes::canonicalize_path(path)
+    let canonical = if path.eq_ignore_ascii_case("/health") || path.eq_ignore_ascii_case("/health/")
+    {
+        Some(path.to_ascii_lowercase())
+    } else {
+        ferrofin_api::routes::canonicalize_path(path)
+    };
+    if let Some(new_path) = canonical
         && new_path != path
     {
         let target = match request.uri().query() {
