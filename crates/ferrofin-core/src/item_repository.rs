@@ -2115,27 +2115,30 @@ pub(crate) async fn physical_folders_by_view(
     let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
         return Ok(HashMap::new());
     };
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        // `+"Type"`: the id list is the selective side; see `append_type_filters`.
-        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = "#,
-    );
-    qb.push_bind(collection_folder).push(" AND ");
-    push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
-    let rows: Vec<(String, String)> = qb
-        .build_query_as::<(String, String)>()
-        .fetch_all(db.pool())
-        .await
-        .map_err(db_err)?;
-    Ok(rows
-        .iter()
-        .filter_map(|(id, blob)| {
+    let mut by_view = HashMap::new();
+    // Chunked: a count batch passes a whole unpaged page, which can exceed
+    // SQLite's bind limit.
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            // `+"Type"`: the id list is the selective side; see `append_type_filters`.
+            r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = "#,
+        );
+        qb.push_bind(collection_folder).push(" AND ");
+        push_in_list(&mut qb, r#""Id""#, &to_guid_strings(chunk));
+        let rows: Vec<(String, String)> = qb
+            .build_query_as::<(String, String)>()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        by_view.extend(rows.iter().filter_map(|(id, blob)| {
             let folders = parse_physical_folder_ids(blob);
             if folders.is_empty() {
                 return None;
             }
             Some((Uuid::parse_str(id).ok()?, folders))
-        })
-        .collect())
+        }));
+    }
+    Ok(by_view)
 }
 
 /// The `TopParentId`s the items of each of `ids` carry, for those that are

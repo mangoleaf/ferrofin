@@ -803,3 +803,51 @@ fn season_fetch_valid_success() {
         Some("/config/metadata/People/O/Olivia Rodrigo/poster.jpg")
     );
 }
+
+// ---------------------------------------------------------------------------
+// GetPersonFromXmlNode `<type>` (not in the C# suites)
+// ---------------------------------------------------------------------------
+
+/// `XmlReaderExtensions.GetPersonFromXmlNode` reads `<type>` with
+/// `Enum.TryParse(text, true, out type)`: any member name in any case binds,
+/// and a value that does not parse leaves `default(PersonKind)`, `Unknown`,
+/// not the `Actor` a missing `<type>` keeps.
+#[test]
+fn person_type_parses_like_enum_try_parse() {
+    let nfo = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<movie>
+  <title>T</title>
+  <actor><name>Missing</name></actor>
+  <actor><name>Lower</name><type>lyricist</type></actor>
+  <actor><name>Comic</name><type>CoverArtist</type></actor>
+  <actor><name>Bogus</name><type>Chief Vibes Officer</type></actor>
+  <actor><name>Empty</name><type></type></actor>
+</movie>"#;
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "inline.nfo",
+        nfo,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    let kinds: Vec<(&str, PersonKind)> = result
+        .people
+        .as_ref()
+        .expect("people")
+        .iter()
+        .map(|person| (person.name.as_str(), person.type_))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("Missing", PersonKind::Actor),
+            ("Lower", PersonKind::Lyricist),
+            ("Comic", PersonKind::CoverArtist),
+            ("Bogus", PersonKind::Unknown),
+            ("Empty", PersonKind::Unknown),
+        ]
+    );
+}
