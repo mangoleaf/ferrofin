@@ -129,6 +129,25 @@ down). The live result above is therefore recorded as **pending**: the `Adoption
 exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
 it is green. Update the table row and this note once that run lands.
 
+### 2026-10-20 messy rows, first slice (gl-629)
+
+Fixtures built fresh by `build-fixtures.sh` into a new directory (the build had stopped at the
+fresh-install fixture on every run until gl-701, so this is also the first complete build at that
+recipe: eleven fixtures, three oracle smoke files, the schema pin), then `messy.py build` for
+the two messy copies. The oracle was Jellyfin 12.2 image id `sha256:357724bf0ae2…` (pulled by the
+build and recorded in each `messy-oracle.json`); its all-shapes run matched its single-shape runs
+on both lineages. Ferrofin image `ferrofin:adopt-gl663b` (built 2026-10-19 21:00 MDT from the
+gl-663 branch, which includes migration 0044; it was not rebuilt from the current
+`release/v1.4.0` head, so the release run must use its own candidate image). `run.sh --only
+jellyfin-10.11.11-messy`: **PASS** (the shapes end as the oracle and the written divergences
+say, the table digests hold, the second boot is quiet). `run.sh --only jellyfin-12.2-messy`:
+**FAIL, as expected**: Ferrofin refuses the database (`database has 1 foreign-key violation(s)
+after migrating (BaseItems → BaseItems: 1)`) because of the dangling-owner extra, which Jellyfin
+12.2 boots; gl-707 tracks it, and the row passes only once that is fixed. The run ends at once
+with every reason named, not after the readiness deadlines. The other two shapes on that lineage
+were checked on a scratch copy without the extra (`messy.py check` exit 0). The eleven clean rows
+and `synthetic.py run` were not re-run for this change, which touches none of them.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -156,6 +175,9 @@ it is green. Update the table row and this note once that run lands.
    database and movie/episode API responses, including watched flags and progress.
 7. Every row of the Jellyfin-owned tables no other check covers survives each stage, bar
    the rewrites listed under the table digests below.
+8. After the eleven paths, two **messy** fixtures are adopted (see [Messy rows](#messy-rows)):
+   each shape of rows real databases carry ends as Jellyfin 12.2 left it, or as a divergence
+   written down.
 
 The table digests (`table_digests.py`) hash every row of those tables whole, keyed by its
 primary key, and take the baseline from each fixture copy before Ferrofin starts. A row that
@@ -237,6 +259,54 @@ about two minutes for the boot probes, plus a library scan of the small syntheti
 library. Run it before
 any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 `database.rs`, or the boot repairs in `adoption_repairs.rs`, and before a release.
+
+## Messy rows
+
+Long-lived databases carry rows no API produces, and the clean fixtures never hold them.
+`messy.py` writes the shapes of this first slice by SQL into a stopped copy of a finished
+fixture, one function and one manifest entry (`messy.json`) per shape:
+
+| Shape | What is written |
+|---|---|
+| `deleted_user` | UserData, Permissions, Preferences, Devices and DisplayPreferences rows of a user that does not exist |
+| `dangling_owner_extra` | a copy of an extra whose `OwnerId` names no item, at a path no file has |
+| `duplicate_paths` | two `BaseItems` rows with one `Path`, the copy being the older |
+
+They go into `jellyfin-10.11.11-messy` and `jellyfin-12.2-messy`, copies of the latest 10.11.x and
+the latest 12.x fixture (`jellyfin-12.2-from-121`), one per lineage: the 10.11 lineage runs 0032
+and `FixIncorrectOwnerIdRelationships` on adoption, a 12.x database already has. The copies leave
+the eleven clean paths and their smoke oracle as the control; `build-fixtures.sh` builds them last.
+
+The expectation per shape is what **Jellyfin 12.2 itself did**, not an assumption:
+`messy.py build` pulls `jellyfin/jellyfin:12.2` (a stale local tag would record another release;
+the image id goes into the record), boots it on a clean copy of the source carrying only that
+shape, waits for its tasks to settle, and records the outcome and the end state read from the
+database (`messy-oracle.json`). It then boots it once on a copy carrying all three, because
+Ferrofin adopts the combined fixture, and fails the build if that differs from the single runs.
+A boot that neither answers nor exits within the deadline is an error, never a recorded
+refusal; a failed build removes its own derived copy, leaving the clean fixtures as they were.
+Each oracle boot's server log stays in `work/` as `messy-oracle-<fixture>-<shape>.server.log`,
+the evidence behind a recorded outcome.
+`run.sh` then adopts a fresh copy of each messy fixture with the image under test and fails when
+a shape ends differently, when the boot log has an `ERROR`, when the file fails its integrity or
+foreign-key check, when a second boot repairs again, or when the table digests (check 7, baseline
+taken before Ferrofin starts) show a row lost beside the messy ones. A container that exits (a
+refused database) ends the wait at once. Where Ferrofin is meant to end differently,
+`DIVERGENCES` in `messy.py` names the state it must reach and why; a difference that is not
+written there fails, a shape Jellyfin refuses needs a written expectation, and a fixture built
+with a different list of shapes is refused rather than partly checked. What Jellyfin 12.2 did:
+
+| Shape | 10.11 lineage (upgraded by 12.2) | 12.x lineage (booted as is) |
+|---|---|---|
+| `deleted_user` | deletes Permissions and Preferences; keeps UserData, Devices, DisplayPreferences | keeps every row |
+| `dangling_owner_extra` | deletes the extra | keeps it, dangling |
+| `duplicate_paths` | deletes the copy | keeps both |
+
+And what Ferrofin is expected to reach where it differs: every row of the missing user deleted
+on both lineages (migration 0044); on 12.x the dangling extra removed as on 10.11 (today
+Ferrofin refuses that database instead: gl-707) and the duplicate path collapsed by the ported
+routine. The next slice of shapes (GUID casing, case duplicates, orphaned ancestors, virtual
+seasons) goes into the same module.
 
 ## The fixtures are synthetic
 
@@ -340,7 +410,9 @@ date/GUID normalization, private baselines, fixtures missing watched/resume data
 failure reporting. Its fixtures contain only invented IDs and playback data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
-next to it that must still fail).
+next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state
+reader on a scratch SQLite database, the comparison with Jellyfin 12.2's record, and that every
+written divergence names a seeded shape, a derived lineage and a whole state.
 CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.
