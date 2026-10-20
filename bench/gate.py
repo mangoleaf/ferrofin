@@ -21,7 +21,8 @@
 Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
 latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
 
-Each run is `run.sh --servers ferrofin --only PHASES` (below) into SESSION_DIR/NN-a or
+Each run is `run.sh --servers ferrofin --only PHASES[mode]` (below; `scan` runs `scan.py`
+instead) into SESSION_DIR/NN-a or
 NN-b. The shape pass is what makes a cell comparable: without it every cell is caveated
 for a missing phase and the change in the responses behind a cell cannot be seen.
 `ferrofin:bench` is only ever inspected by run.sh, so the driver retags it before every run,

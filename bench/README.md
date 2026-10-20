@@ -442,7 +442,9 @@ time, threshold table and blocking rules. `gate.py ab PREVIOUS CANDIDATE` runs F
 only: three adjacent pairs of `run.sh --servers ferrofin --only shape,unloaded,loaded`. It
 judges each cell regressed, within noise or improved against the thresholds in
 [`gate.toml`](gate.toml). `gate.py aa IMAGE` measures the noise floor those thresholds are
-re-derived from. The three-server runs with both Jellyfins are for publication: they produce
+re-derived from. `gate.py scan` and `gate.py ramp` are the same interleaved pairs for the
+[scan and migration](#scan-and-migration) and [throughput ceiling](#throughput-ceiling-the-saturation-ramp)
+phases; RELEASE.md says which of them block. The three-server runs with both Jellyfins are for publication: they produce
 the root README and `docs/BENCHMARKS.md` tables and never decide a release.
 
 Cold start is not part of the gate and keeps the definition above: a restart until the
