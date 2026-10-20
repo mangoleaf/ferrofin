@@ -1453,6 +1453,7 @@ async fn verify_artwork_destinations(
     // ImageSaver retains existing local art even during replacement refresh.
     // Remove it to exercise a genuinely new automatic acquisition.
     std::fs::remove_file(media.join("folder.png")).unwrap();
+    let _ = std::fs::remove_file(media.join("backdrop.png"));
     options["TypeOptions"][0]["ImageFetchers"] = json!(["TheMovieDb"]);
     api.post(
         "/Library/VirtualFolders/LibraryOptions",
@@ -1460,9 +1461,26 @@ async fn verify_artwork_destinations(
     )
     .await;
     api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=true"),&Value::Null).await;
+    // The refresh saves the poster, then the backdrop the image options from
+    // `verify_movie_image_options` still select (one, at least 3000 wide).
+    // Waiting for the poster alone let the backdrop land after the backdrop
+    // steps below had reset the slots, as `backdrop.png` ahead of `fanart.png`.
+    // The backdrop steps count the item's image rows, so the row must be
+    // saved too, not only the file.
+    let saved = |name: &str, tail: &[u8]| {
+        std::fs::read(media.join(name)).is_ok_and(|bytes| bytes.ends_with(tail))
+    };
+    let backdrop = media.join("backdrop.png").to_string_lossy().into_owned();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if std::fs::read(media.join("folder.png")).is_ok_and(|bytes| bytes.ends_with(b"/large.png"))
+        let rows = api.get(&format!("/Items/{id}/Images")).await;
+        let backdrop_row =
+            rows.as_array().unwrap().iter().any(|image| {
+                image["ImageType"] == "Backdrop" && image["Path"] == backdrop.as_str()
+            });
+        if saved("folder.png", b"/large.png")
+            && saved("backdrop.png", b"/backdrop-three.png")
+            && backdrop_row
         {
             break;
         }

@@ -4236,6 +4236,52 @@ mod tests {
         );
     }
 
+    /// Plan pin for the resumable roll-up's played arm: driven from the
+    /// materialized played-leaf list through the leaf's primary key, then its
+    /// closure by `ItemId` — never a scan of every leaf or every closure row.
+    #[tokio::test]
+    async fn resumable_played_arm_drives_from_the_played_leaf_list() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xA0F0)).await;
+        let filter = InternalItemsQuery {
+            user: Some(user),
+            is_resumable: Some(true),
+            ..Default::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().unwrap().unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        let pl = plan
+            .iter()
+            .position(|d| d == "SCAN pl")
+            .unwrap_or_else(|| panic!("the played leaves drive the arm: {plan:#?}"));
+        assert_eq!(
+            plan[pl + 1],
+            "SEARCH l USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
+            "{plan:#?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.starts_with("SEARCH l USING INDEX IX_BaseItems_IsFolder")),
+            "no walk over every leaf: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|d| !d.starts_with("SCAN") || d == "SCAN pl"),
+            "{plan:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn tag_query_keeps_tag_value_map_and_ancestor_index_seeks() {
         use sqlx::{Execute, Row};
