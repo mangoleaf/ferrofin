@@ -1268,7 +1268,9 @@ impl PeopleRepository for FerrofinPeopleRepository {
             )
             .bind(guid_to_db(item_id))
             .bind(people_id)
-            .bind(person.role.clone().unwrap_or_default())
+            // `person.Role = person.Role?.Trim() ?? string.Empty`
+            // (v12.2 `PeopleRepository.cs:117`).
+            .bind(person.role.as_deref().map(str::trim).unwrap_or_default())
             .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
             // `SortOrder = credit.Person.SortOrder` (`PeopleRepository.cs:
             // 146,218,231`): the credit's own order (TMDB billing, NFO
@@ -1982,6 +1984,33 @@ mod tests {
         assert_eq!(result.items[0].name, "Alice");
         assert_eq!(result.items[1].name, "Bob");
         assert_eq!(result.items[2].name, "Carol");
+    }
+
+    /// `UpdatePeople` trims every credit's role and stores a missing one as
+    /// `""` (v12.2 `PeopleRepository.cs:114-118`).
+    #[rstest::rstest]
+    #[case(Some(" Himself "), "Himself")]
+    #[case(Some("   "), "")]
+    #[case(None, "")]
+    #[tokio::test]
+    async fn update_people_stores_the_role_trimmed(
+        #[case] role: Option<&str>,
+        #[case] stored: &str,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        let mut credit = person("Narrator", "Actor");
+        credit.role = role.map(str::to_owned);
+        repo.update_people(item, &[credit]).await.expect("update");
+        let roles: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Role" FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(item))
+                .fetch_all(db.pool())
+                .await
+                .expect("roles");
+        assert_eq!(roles, [stored]);
     }
 
     #[tokio::test]

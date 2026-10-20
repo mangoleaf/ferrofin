@@ -605,7 +605,10 @@ fn episode_people_from(
                 tmdb_id: c.id,
                 name: c.name,
                 person_type: person_type.to_owned(),
-                role: c.character.filter(|r| !r.is_empty()),
+                role: c
+                    .character
+                    .map(|r| r.trim().to_owned())
+                    .filter(|r| !r.is_empty()),
                 // `SortOrder = actor.Order` / `guest.Order`
                 // (`TmdbEpisodeProvider.cs:233,264`).
                 sort_order: Some(c.order),
@@ -814,7 +817,10 @@ fn credits_to_people(
                 tmdb_id: c.id,
                 name: c.name,
                 person_type: "Actor".to_owned(),
-                role: c.character.filter(|r| !r.is_empty()),
+                role: c
+                    .character
+                    .map(|r| r.trim().to_owned())
+                    .filter(|r| !r.is_empty()),
                 sort_order: Some(c.order),
                 profile_url: c
                     .profile_path
@@ -3134,6 +3140,39 @@ mod tests {
                 ("Billed First", Some(510)),
                 ("Billed Second", Some(520)),
                 ("Billed Third", Some(530)),
+            ]
+        );
+    }
+
+    /// `Role = actor.Character?.Trim() ?? string.Empty` (v12.2
+    /// `TmdbMovieProvider.cs:297`, `TmdbEpisodeProvider.cs:231,262`): a
+    /// padded character is trimmed, and a blank one is no role.
+    #[test]
+    fn cast_characters_are_trimmed() {
+        let json = r#"{
+          "cast": [
+            {"id": 1, "name": "Kevin Conroy", "character": " Batman (voice) ", "order": 0},
+            {"id": 2, "name": "Extra", "character": "   ", "order": 1}
+          ],
+          "guest_stars": [{"id": 3, "name": "Guest", "character": " Villain ", "order": 2}]
+        }"#;
+        let cfg = crate::plugin_config::TmdbConfig::default();
+        let roles = |people: Vec<TmdbPerson>| -> Vec<Option<String>> {
+            people.into_iter().map(|p| p.role).collect()
+        };
+        assert_eq!(
+            roles(credits_to_people(serde_json::from_str(json).ok(), &cfg)),
+            [Some("Batman (voice)".to_owned()), None]
+        );
+        assert_eq!(
+            roles(episode_people_from(
+                serde_json::from_str(json).expect("credits"),
+                &cfg
+            )),
+            [
+                Some("Batman (voice)".to_owned()),
+                None,
+                Some("Villain".to_owned())
             ]
         );
     }
