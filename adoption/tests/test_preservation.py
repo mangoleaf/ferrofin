@@ -12,15 +12,15 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, comparable, compare, expectation, normalize, run_matrix,
-                          seed_failures, seed_state, validate, validate_oracle, validate_seed_state, same_artwork,
-                          verify_database)
-from synthetic import VERSIONS
+from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, UPGRADED_FROM_10, comparable, compare, expectation,
+                          normalize, run_matrix, seed_failures, seed_state, validate, validate_oracle,
+                          validate_seed_state, same_artwork, verify_database)
+from synthetic import VERSIONS, FRESH_INSTALL
 import synthetic_fixture
 from synthetic_fixture import USERS, drop_dangling_chain, seed_database, wait_for_live_members
 from watch_history import orphaned_items
@@ -743,6 +743,21 @@ class SeededAdoptionTest(unittest.TestCase):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
+    def test_the_matrix_skips_the_fresh_install_fixture(self):
+        # A first-run install carries no seeds, so run_matrix skips it instead of raising
+        # "lacks the database seeds" / "no completed baseline"; run.sh validates it live. The
+        # skip fires before the fixture dir or its seeds.json is read, so neither need exist.
+        from synthetic import recipe
+        for name in (ORACLE, UPGRADED_FROM_10):
+            ready = self.dir / name
+            ready.mkdir()
+            (ready / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
+            (ready / 'preservation.json').write_text('{}')
+        (fresh,) = FRESH_INSTALL
+        run_matrix(self.dir, 'unused-image', fresh, 0)  # must not raise, must start no container
+        self.assertFalse((self.dir / 'work').exists())
+        self.assertFalse((self.dir / fresh).exists())
+
     def test_every_release_maps_to_its_adopted_generation(self):
         self.assertEqual({version: GENERATIONS[version] for _, version, _ in VERSIONS},
                          {'10.11.8': '10.11.8', '10.11.9': '10.11.8', '10.11.10': '10.11.11',
@@ -750,12 +765,51 @@ class SeededAdoptionTest(unittest.TestCase):
 
     def test_the_12_2_paths_upgrade_from_their_contract_parents(self):
         paths = {name: parent for name, _, parent in VERSIONS}
-        self.assertEqual({name: paths[name] for name in paths if name.startswith('jellyfin-12.2')},
+        # The 12.2 upgrade routes derive from their contract parents; the fresh install
+        # (FRESH_INSTALL) is a first run with no parent.
+        self.assertEqual({name: paths[name] for name in paths
+                          if name.startswith('jellyfin-12.2') and name not in FRESH_INSTALL},
                          {'jellyfin-12.2-from-10': 'jellyfin-10.11.8', 'jellyfin-12.2-from-12': 'jellyfin-12.0',
                           'jellyfin-12.2-from-121': 'jellyfin-12.1-from-12'})
+        self.assertEqual({name: paths[name] for name in FRESH_INSTALL}, {'jellyfin-12.2-fresh': None})
         names = [name for name, _, _ in VERSIONS]
         self.assertTrue(all(names.index(parent) < names.index(name) for name, parent in paths.items() if parent))
         self.assertIn(ORACLE, paths)
+
+
+class FreshInstallBuildTest(unittest.TestCase):
+    """build() handling of a FRESH_INSTALL fixture: seeded through the API like any fixture,
+    but with none of seed_database's aged states and no seeds.json, so run.sh (not the
+    seed-driven matrix) validates it."""
+
+    def setUp(self):
+        import synthetic
+        self.synthetic = synthetic
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / "media").mkdir()  # already generated, so build() does not invoke ffmpeg
+        (self.fresh,) = FRESH_INSTALL
+
+    def test_a_fresh_install_is_built_without_seeds(self):
+        api = MagicMock()
+        api.login.return_value = api
+        server = MagicMock()
+        server.return_value.__enter__.return_value = api
+        with patch.object(self.synthetic, "server", server), \
+                patch.object(self.synthetic, "seed", return_value={"version": 1}) as seed, \
+                patch.object(self.synthetic, "wait_for_live_members"), \
+                patch.object(self.synthetic, "seed_database") as seed_database, \
+                patch("preservation.snapshot", return_value={}), \
+                patch("preservation.validate"):
+            self.synthetic.build(self.root, self.fresh, 0)
+        config = self.root / self.fresh
+        seed.assert_called_once()                       # seeded through the 12.2 API
+        seed_database.assert_not_called()               # but none of the aged stopped-DB states
+        self.assertFalse((config / "seeds.json").exists())
+        ready = json.loads((config / "synthetic-ready.json").read_text())
+        self.assertEqual(ready["fixture"], self.fresh)  # still a completed, usable fixture
+        self.assertEqual(ready["version"], "12.2")
 
 
 if __name__ == '__main__':
