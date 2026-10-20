@@ -771,7 +771,7 @@ pub(crate) fn parse_media_type(stored: Option<&str>) -> MediaType {
 /// Maps a stored `ExtraType` discriminant onto the enum, or `None` for a value
 /// with no corresponding extra type (the `0`/`Unknown` sentinel and any
 /// out-of-range discriminant).
-fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
+pub(crate) fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
     Some(match disc {
         1 => ExtraType::Clip,
         2 => ExtraType::Trailer,
@@ -1712,21 +1712,32 @@ impl FerrofinDtoService {
         &self,
         clean_pairs: &[(BaseItemKind, String)],
     ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+        // Artist names link to an actual `MusicArtist` item found by its clean
+        // name (`LinkedChildrenService.FindArtists`), and a music video's album
+        // to the `MusicAlbum` of that name (`SetMusicVideoProperties`) — both
+        // independent of the `ItemValues` rows; a name with no such item has
+        // no id at all.
+        const ITEM_KINDS: [BaseItemKind; 2] = [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum];
         // Dedup the (kind, clean) keys we need.
         let want: std::collections::HashSet<&(BaseItemKind, String)> = clean_pairs.iter().collect();
-        // Artist names link to an actual `MusicArtist` item found by its clean
-        // name (`LinkedChildrenService.FindArtists`), independent of the
-        // `ItemValues` rows; a name with no such item has no id at all.
-        let (artist_keys, keys): (Vec<_>, Vec<_>) = want
+        let (item_keys, keys): (Vec<_>, Vec<_>) = want
             .into_iter()
-            .partition(|(kind, _)| *kind == BaseItemKind::MusicArtist);
+            .partition(|(kind, _)| ITEM_KINDS.contains(kind));
         let keys: Vec<(BaseItemKind, String)> = keys.into_iter().cloned().collect();
         let mut map = crate::item_repository::by_name_ids_by_clean_name(&self.db, &keys).await?;
-        let artist_cleans: Vec<&String> = artist_keys.iter().map(|(_, clean)| clean).collect();
-        let artists =
-            crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
+        for kind in ITEM_KINDS {
+            let cleans: Vec<&String> = item_keys
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, clean)| clean)
+                .collect();
+            let type_name = crate::item_type_lookup::stored_type_name(kind).ok_or_else(|| {
+                ServiceError::backend(format!("no stored type name for {kind:?}"))
+            })?;
+            let ids = crate::item_repository::item_ids_by_clean_name(&self.db, type_name, &cleans)
                 .await?;
-        map.insert(BaseItemKind::MusicArtist, artists);
+            map.insert(kind, ids);
+        }
         Ok(map)
     }
 
@@ -1851,7 +1862,7 @@ impl FerrofinDtoService {
                     .person_type
                     .as_deref()
                     .map_or(ferrofin_model::data::PersonKind::Unknown, |t| {
-                        person_kind_from_str(t)
+                        ferrofin_model::data::PersonKind::from_stored(t)
                     }),
                 primary_image_tag,
                 image_blur_hashes: None,
@@ -2330,7 +2341,10 @@ impl FerrofinDtoService {
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
-                    if kinds::supports_played_status(kind) {
+                    if kinds::supports_played_status(
+                        kind,
+                        parse_media_type(item.media_type.as_deref()),
+                    ) {
                         fill_folder_played(
                             dto.user_data
                                 .get_or_insert_with(|| empty_user_data_dto(item_id)),
@@ -2886,6 +2900,23 @@ impl FerrofinDtoService {
             dto.video_type = Some(format.video_type);
             dto.video3d_format = format.video3d_format;
             dto.iso_type = format.iso_type;
+            // `IHasAspectRatio.AspectRatio` (v12.2 DtoService.cs:1138) and,
+            // only when true, `ISupportsPlaceHolders.IsPlaceHolder` (:1290):
+            // `Video` implements both, off its `Data`.
+            let display = crate::item_data::video_display(item.data.as_deref());
+            dto.aspect_ratio = display.aspect_ratio;
+            if display.is_place_holder {
+                dto.is_place_holder = Some(true);
+            }
+            // `SetMusicVideoProperties` (:842-860): the album, and the id of the
+            // `MusicAlbum` of that name when one exists.
+            if kind == BaseItemKind::MusicVideo {
+                if let Some(album) = item.album.as_deref().filter(|a| !a.is_empty()) {
+                    dto.album_id = prefetched
+                        .lookup_clean(BaseItemKind::MusicAlbum, &prefetched.clean_key(album));
+                }
+                dto.album = item.album.clone();
+            }
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // C# only assigns when true, so the key is absent otherwise (the
             // `skip_serializing_if` on the DTO matches that omission).
@@ -3570,7 +3601,6 @@ fn f64_to_f32(value: f64) -> f32 {
     value as f32
 }
 
-/// Maps a stored `PersonType` string onto a [`PersonKind`].
 /// `AttachPeople`'s order (`DtoService.cs:900-935`) over an item's credits
 /// as `GetPeople` returns them (`ListOrder`): by `SortOrder ?? int.MaxValue`,
 /// then by kind — actors, guest stars, directors, writers, then producers
@@ -3584,7 +3614,7 @@ fn attach_order(
     let kind_rank = |person: &ferrofin_db::entities::base_items::PeopleEntity| match person
         .person_type
         .as_deref()
-        .map(person_kind_from_str)
+        .map(ferrofin_model::data::PersonKind::from_stored)
     {
         Some(PersonKind::Actor) => 0,
         Some(PersonKind::GuestStar) => 1,
@@ -3602,25 +3632,6 @@ fn attach_order(
         )
     });
     ordered
-}
-
-fn person_kind_from_str(value: &str) -> ferrofin_model::data::PersonKind {
-    use ferrofin_model::data::PersonKind;
-    match value {
-        "Actor" => PersonKind::Actor,
-        "Director" => PersonKind::Director,
-        "Composer" => PersonKind::Composer,
-        "Writer" => PersonKind::Writer,
-        "GuestStar" => PersonKind::GuestStar,
-        "Producer" => PersonKind::Producer,
-        "Conductor" => PersonKind::Conductor,
-        "Lyricist" => PersonKind::Lyricist,
-        "Artist" => PersonKind::Artist,
-        "AlbumArtist" => PersonKind::AlbumArtist,
-        "Author" => PersonKind::Author,
-        "Narrator" => PersonKind::Narrator,
-        _ => PersonKind::Unknown,
-    }
 }
 
 /// Maps the trickplay-manager manifest of stored rows onto the DTO's
@@ -4368,6 +4379,13 @@ impl FerrofinDtoService {
                     wanted.extend(split_multi_str(item.artists.as_deref()).map(artist));
                     wanted.extend(split_multi_str(item.album_artists.as_deref()).map(artist));
                 }
+                // `SetMusicVideoProperties`: the `MusicAlbum` named like the
+                // music video's album.
+                if row_kind(item) == BaseItemKind::MusicVideo
+                    && let Some(album) = item.album.as_deref().filter(|a| !a.is_empty())
+                {
+                    wanted.insert((BaseItemKind::MusicAlbum, album));
+                }
             }
             let mut clean_values: HashMap<String, String> = HashMap::new();
             let mut pairs: Vec<(BaseItemKind, String)> = Vec::with_capacity(wanted.len());
@@ -4484,8 +4502,10 @@ impl FerrofinDtoService {
                     .filter(|i| {
                         let kind = row_kind(i);
                         kinds::supports_user_data_from_children(kind)
-                            && (kinds::supports_played_status(kind)
-                                || options.contains_field(ItemFields::RecursiveItemCount))
+                            && (kinds::supports_played_status(
+                                kind,
+                                parse_media_type(i.media_type.as_deref()),
+                            ) || options.contains_field(ItemFields::RecursiveItemCount))
                     })
                     .map(row_id)
                     .filter(|id| !counts.contains_key(id))
@@ -5330,6 +5350,38 @@ mod tests {
         assert_eq!(ud.played_percentage, None);
         assert!(ud.played);
         assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
+    /// only a video playlist carries the folder played numbers.
+    #[tokio::test]
+    async fn only_a_video_playlist_carries_played_counts() {
+        let db = test_db().await;
+        let playlist_id = Uuid::new_v4();
+        seed_folder_item(&db, playlist_id, BaseItemKind::Playlist, "Mix", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service_with_counts(
+            db.clone(),
+            FakeCounts {
+                played: 1,
+                ..FakeCounts::default()
+            },
+        );
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        for (media_type, counted) in [("Video", true), ("Audio", false)] {
+            let mut playlist = fetch_item(&db, playlist_id).await;
+            playlist.media_type = Some(media_type.to_owned());
+            let dto = svc
+                .get_base_item_dto(&playlist, &narrow, Some(&user), None)
+                .await
+                .unwrap();
+            let ud = dto.user_data.as_ref().unwrap();
+            assert_eq!(ud.unplayed_item_count.is_some(), counted, "{media_type}");
+            assert_eq!(ud.played_percentage.is_some(), counted, "{media_type}");
+        }
     }
 
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
@@ -8444,6 +8496,68 @@ mod tests {
         }
     }
 
+    /// `DtoService.AttachBasicFields` (v12.2 :1138, :1290, :842-860): a video
+    /// carries its stored `AspectRatio`, and `IsPlaceHolder` only when true;
+    /// a music video its `Album` and the id of the `MusicAlbum` of that name,
+    /// on the single and the page path alike.
+    #[tokio::test]
+    async fn videos_carry_aspect_ratio_place_holder_and_music_video_album() {
+        let db = test_db().await;
+        let (wide, stub, clip, album) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, wide, BaseItemKind::Movie, "Wide").await;
+        seed_named_item(&db, stub, BaseItemKind::Movie, "Stub").await;
+        seed_named_item(&db, clip, BaseItemKind::MusicVideo, "Clip").await;
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Greatest Hits").await;
+        crate::test_support::set_clean_name(&db, album, "Greatest Hits").await;
+        let mut wide = fetch_item(&db, wide).await;
+        wide.data = Some(r#"{"AspectRatio":"2.35:1"}"#.to_owned());
+        let mut stub = fetch_item(&db, stub).await;
+        stub.data = Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#.to_owned());
+        let mut clip = fetch_item(&db, clip).await;
+        clip.album = Some("Greatest Hits".to_owned());
+        let svc = service(db);
+        let options = DtoOptions {
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+
+        let page = svc
+            .get_base_item_dtos(
+                &[wide.clone(), stub, clip.clone()],
+                &options,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page[0].aspect_ratio.as_deref(), Some("2.35:1"));
+        assert_eq!(page[0].is_place_holder, None, "only a placeholder says so");
+        assert_eq!(page[1].is_place_holder, Some(true));
+        assert_eq!(page[1].aspect_ratio, None);
+        assert_eq!(page[2].album.as_deref(), Some("Greatest Hits"));
+        assert_eq!(page[2].album_id, Some(album));
+
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album_id, Some(album));
+        clip.album = Some("No Such Album".to_owned());
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album.as_deref(), Some("No Such Album"));
+        assert_eq!(single.album_id, None, "no album of that name, no id");
+    }
+
     #[tokio::test]
     async fn can_delete_true_for_non_virtual_item() {
         let db = test_db().await;
@@ -10048,6 +10162,51 @@ mod tests {
             .filter_map(|p| p.name.as_deref())
             .collect();
         assert_eq!(names, expected);
+    }
+
+    /// `People[].Type` is the stored `PersonType` parsed the way upstream's
+    /// `PeopleRepository` does (`Enum.TryParse<PersonKind>(row.PersonType, out
+    /// var kind)`, `PeopleRepository.cs:346`, `:380`): every member name,
+    /// case-sensitively; anything else leaves `Unknown`.
+    #[tokio::test]
+    async fn people_carry_every_stored_person_kind() {
+        use ferrofin_model::json::enums::JsonEnum as _;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let item = fetch_item(&db, movie).await;
+        let mut stored: Vec<(&str, &str)> = ferrofin_model::data::PersonKind::members()
+            .iter()
+            .map(|(name, _)| (*name, *name))
+            .collect();
+        stored.extend([("actor", "Unknown"), ("Colorer", "Unknown")]);
+        let library = Arc::new(FakeLibrary {
+            people: (0_i64..)
+                .zip(&stored)
+                .map(|(order, (kind, _))| PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: format!("Person {order}"),
+                    person_type: Some((*kind).to_owned()),
+                    sort_order: Some(order),
+                    ..Default::default()
+                })
+                .collect(),
+            named_items: Vec::new(),
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let types: Vec<String> = dto
+            .people
+            .as_ref()
+            .expect("people")
+            .iter()
+            .map(|person| person.type_.json_name().into_owned())
+            .collect();
+        let expected: Vec<&str> = stored.iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(types, expected);
     }
 
     #[tokio::test]

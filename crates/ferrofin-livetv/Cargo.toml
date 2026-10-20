@@ -34,5 +34,7 @@ uuid = { workspace = true, features = ["v5"] }
 [dev-dependencies]
 rstest.workspace = true
 tempfile.workspace = true
+# Paused-clock tests (the XMLTV download timeout).
+tokio = { workspace = true, features = ["test-util"] }
 # The real user manager, for the EnabledUsers test (no cycle: core does not depend on livetv).
 ferrofin-core.workspace = true

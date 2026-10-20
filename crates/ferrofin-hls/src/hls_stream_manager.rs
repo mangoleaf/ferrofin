@@ -1512,6 +1512,7 @@ mod tests {
                 },
                 supported_video_codecs: Vec::new(),
                 supported_audio_codecs: Vec::new(),
+                supported_subtitle_codecs: Vec::new(),
                 segment_length_secs: 6,
                 wait_for_path: (kind == PlaylistKind::Progressive).then(|| playlist.clone()),
                 segment_container: Some(self.segment_container.clone()),
