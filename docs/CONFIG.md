@@ -36,6 +36,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax. |
+| `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` | `10` | How many unauthorized Quick Connect requests one client IP may hold at once. `POST /QuickConnect/Initiate` needs no sign-in, so past this cap the IP's oldest pending request is dropped and its code stops working. Jellyfin has no cap. Behind a reverse proxy that is not in **Known proxies**, every client shares the proxy's IP, so the cap then counts all clients together. The cap is per address, so an IPv6 client can spread requests across its prefix. `0` means the default. The `config.toml` key is `quick_connect_pending_per_ip`. |
 
 ## Admin seeding (fresh database only)
 

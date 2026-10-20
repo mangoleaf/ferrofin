@@ -1145,6 +1145,27 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/QuickConnect/Initiate",
+        upstream_file: "Jellyfin.Api/Controllers/QuickConnectController.cs",
+        upstream_method: "InitiateQuickConnect",
+        ferrofin: "handlers/quick_connect.rs initiate → ferrofin-core quick_connect_manager.rs \
+               try_connect (make_room, draw_free_code)",
+        date: "2026-10-20",
+        divergences: &[
+            "A drawn code that a pending request already holds is drawn again; upstream \
+         TryConnect's `_currentRequests[code] = result` overwrites the other device's \
+         request, so authorizing that code would pair the wrong device. Jellyfin bug not \
+         ported. Once all 900,000 codes are pending, Initiate fails with 500 instead.",
+            "Each remote IP holds at most FERROFIN_QUICK_CONNECT_PENDING_PER_IP (default 10) \
+         unauthorized requests, and the next Initiate from that IP drops its oldest, whose \
+         poll then gets 404 as an expired one does; authorized requests are exempt. \
+         Upstream has no cap, so the anonymous endpoint can grow the map toward the whole \
+         code space.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

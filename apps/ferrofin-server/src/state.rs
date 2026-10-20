@@ -2315,9 +2315,12 @@ pub async fn build_app_state(
     let auth_context: Arc<dyn ferrofin_traits::net::AuthorizationContext> =
         Arc::new(auth_context_concrete);
 
-    let quick_connect: Arc<dyn ferrofin_traits::security::QuickConnect> = Arc::new(
-        FerrofinQuickConnect::new(Arc::clone(&config_trait), Arc::clone(&sessions)),
-    );
+    let quick_connect: Arc<dyn ferrofin_traits::security::QuickConnect> =
+        Arc::new(FerrofinQuickConnect::with_pending_per_ip(
+            Arc::clone(&config_trait),
+            Arc::clone(&sessions),
+            config.quick_connect_pending_per_ip.unwrap_or(0) as usize,
+        ));
 
     // Clone the collaborators the media-encoding pair needs before they are
     // moved into `AppState::new` below.
