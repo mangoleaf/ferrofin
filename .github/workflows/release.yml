@@ -52,7 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --json conclusion -q '.[0].conclusion')
+          # The push run only: the release PR's run on the same commit skips every job.
+          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --event push --json conclusion -q '.[0].conclusion')
           if [ "$conclusion" != "success" ]; then
             echo "CI for $GITHUB_SHA is '${conclusion:-missing}', not success — not releasing"
             exit 1
