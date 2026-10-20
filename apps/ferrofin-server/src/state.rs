@@ -1274,6 +1274,12 @@ pub async fn build_app_state(
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().dummy_chapter_duration
     })
+    // "Display specials within seasons" decides a season's episodes when its
+    // premiere date is derived from them. Read live, once per season refresh.
+    .with_display_specials_within_seasons({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().display_specials_within_seasons
+    })
     // The saved `xbmcmetadata` options (ReleaseDateFormat, UserId) every NFO
     // sidecar is parsed with, re-read when the dashboard changes the file.
     .with_nfo_configuration({
@@ -1970,7 +1976,10 @@ pub async fn build_app_state(
         // The music "Links" row points at the configured MusicBrainz mirror, as
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url)
-        .with_virtual_paths(virtual_paths),
+        .with_virtual_paths(virtual_paths)
+        // The `MediaSources`' default-stream selection normalizes languages
+        // through the same localization the media-source manager does.
+        .with_localization(Arc::clone(&localization)),
     );
     // `DtoService` finishes a Live TV channel's DTO itself (C#
     // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV

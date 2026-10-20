@@ -1260,6 +1260,54 @@ async fn sync_play_new_requires_create_access() {
     }
 }
 
+/// `NewGroupRequestDto.GroupName` carries `[StringLength(200)]`
+/// (GHSA-v2jv-54xj-h76w): ASP.NET counts UTF-16 code units and validates the
+/// name as sent, before the controller trims it, and answers a longer one with
+/// a 400 `ValidationProblemDetails` keyed by the member, never reaching
+/// `SyncPlayManager.NewGroup`.
+#[tokio::test]
+async fn sync_play_new_caps_the_group_name_at_200_utf16_units() {
+    let non_bmp = "\u{1F3AC}"; // two UTF-16 units
+    for (name, allowed) in [
+        ("a".repeat(200), true),
+        ("a".repeat(201), false),
+        (format!("{}{non_bmp}", "a".repeat(198)), true),
+        (format!("{}{non_bmp}", "a".repeat(199)), false),
+        // Validated before the trim: trailing blanks still count.
+        (format!("{}  ", "a".repeat(199)), false),
+    ] {
+        let (state, reached) = policy_state(CREATE_AND_JOIN, false);
+        let body = serde_json::json!({ "GroupName": name }).to_string();
+        let (status, bytes) = send(state, "POST", "/SyncPlay/New", Body::from(body)).await;
+        let units = name.encode_utf16().count();
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), allowed);
+        if allowed {
+            assert_eq!(status, StatusCode::OK, "{units} units");
+            continue;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+                "title": "One or more validation errors occurred.",
+                "status": 400,
+                "errors": { "GroupName": ["Group name must not exceed 200 characters."] },
+            }),
+            "{units} units"
+        );
+    }
+
+    // The policy gate is an authorization filter, which runs before model
+    // validation: a caller who may not create groups is 403 whatever the name.
+    let (state, reached) = policy_state(JOIN_ONLY, false);
+    let body = serde_json::json!({ "GroupName": "a".repeat(201) }).to_string();
+    let (status, _) = send(state, "POST", "/SyncPlay/New", Body::from(body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn sync_play_join_and_list_require_join_access() {
     for (method, uri, body) in [

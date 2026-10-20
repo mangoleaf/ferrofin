@@ -1376,8 +1376,8 @@ pub trait UserManager: Send + Sync {
     /// Projects a user row into the full public [`UserDto`].
     ///
     /// Port of `UserManager.GetUserDto`: assembles the user's
-    /// [`UserConfiguration`](ferrofin_model::configuration::UserConfiguration) and
-    /// [`UserPolicy`](ferrofin_model::users::UserPolicy) from the `Users` row plus
+    /// [`UserConfiguration`] and
+    /// [`UserPolicy`] from the `Users` row plus
     /// its `Permissions`/`Preferences`/`AccessSchedules`. `server_id` is the
     /// hosting application's system id; `remote_endpoint` is accepted for parity
     /// (the profile-image cache tag it feeds is not yet ported).
@@ -1516,6 +1516,29 @@ pub trait UserDataManager: Send + Sync {
     ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
         let _ = (item_id, user_id);
         Ok((None, None))
+    }
+
+    /// Batch form of [`Self::get_stream_default_data`] for one user across
+    /// many items, keyed by item id; an item that remembers neither index
+    /// (or has no user-data row) is absent.
+    ///
+    /// Lets the item DTO's `MediaSources` select each page item's default
+    /// streams (`GetStaticMediaSources(item, true, user)`, v12.2
+    /// `DtoService.cs:410`) in one read instead of one per item. The default
+    /// loops the single-item form; the concrete manager overrides it.
+    async fn get_stream_default_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, (Option<i32>, Option<i32>)>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &item_id in item_ids {
+            let remembered = self.get_stream_default_data(item_id, user_id).await?;
+            if remembered != (None, None) {
+                map.insert(item_id, remembered);
+            }
+        }
+        Ok(map)
     }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.
@@ -1764,7 +1787,7 @@ pub trait UserViewManager: Send + Sync {
     /// `GetUserRootFolder().Children` sorted by `SortName`. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
     /// only), this also includes the auto-provisioned
-    /// [`BaseItemKind`](ferrofin_model::data::BaseItemKind)`::ManualPlaylistsFolder`,
+    /// [`BaseItemKind`]`::ManualPlaylistsFolder`,
     /// provisioning it on first read if absent (Jellyfin lazily materializes it as
     /// a user-root child).
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;

@@ -27,7 +27,7 @@
 //! result. [`MediaEncoder::get_media_info`] returns the narrower
 //! [`MediaSourceInfo`] (streams/container) most callers need;
 //! [`MediaEncoder::get_media_info_full`] returns the full
-//! [`MediaInfo`](ferrofin_model::media_info::MediaInfo) including the embedded
+//! [`MediaInfo`] including the embedded
 //! metadata the library scan reads from audio tags.
 
 use async_trait::async_trait;

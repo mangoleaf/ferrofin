@@ -256,6 +256,34 @@ def oracle_failed(shape_oracle, names, oracle_label=ORACLE_LABEL):
     return None
 
 
+#: Responses whose items upstream picks among equal scores at will: `/Items/{id}/Similar`
+#: (`MovieSimilarItemsProvider` breaks ties in dictionary order, `SeriesSimilarItemsProvider`
+#: orders randomly) carries no score, so which items fill the limit — and their own fields —
+#: cannot match the oracle. The status, counts and the response's own fields still must.
+TIED_PICKS = ("detail:similar", "series:similar")
+ITEM_FIELD = re.compile(r"^\$(?:\.Items)?\[\d+\]")
+IMAGE_ITEM = re.compile(r"/Items/([^/?]+)/Images/")
+
+
+def split_tied_posters(shape, samples):
+    """A server's image samples split into those keyed exactly and the posters of items
+    returned from one of its own `TIED_PICKS` responses in the same slot, which only count
+    per slot and screen (with each one's status and type): those items were its free pick."""
+    def parsed(key):
+        return json.loads(key) if isinstance(key, str) and key.startswith("[") else None
+    tied = {(k[0], i) for n in TIED_PICKS for key, rs in shape.get(n, {}).get("samples", {}).items()
+            if (k := parsed(key)) for r in rs for i in r.get("ids") or []}
+    exact, loose = {}, Counter()
+    for key, rs in samples.items():
+        k = parsed(key)
+        item = k and IMAGE_ITEM.search(k[4])
+        if item and (k[0], item.group(1)) in tied:
+            loose.update((k[0], k[1], r.get("status"), r.get("content_type"), r.get("bytes", 1) > 0) for r in rs)
+        else:
+            exact[key] = rs
+    return exact, loose
+
+
 def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
     """None if comparable, else the reason."""
     if shape_oracle is None:
@@ -277,22 +305,34 @@ def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
         if s["total"] != o["total"]:
             return f"{n}: TotalRecordCount {sorted(s['total'])} vs {sorted(o['total'])}"
         if s.get("samples") is not None and o.get("samples") is not None:
-            if s["samples"].keys() != o["samples"].keys():
+            image = n == "image" or n.endswith(":image")
+            srv, srv_tied = split_tied_posters(shape_srv, s["samples"]) if image else (s["samples"], Counter())
+            orc, orc_tied = split_tied_posters(shape_oracle, o["samples"]) if image else (o["samples"], Counter())
+            if image and any(not nonempty for (*_, nonempty) in srv_tied | orc_tied):
+                return f"{n}: empty response"
+            if srv.keys() != orc.keys() or srv_tied != orc_tied:
                 return f"{n}: request picks differ"
-            for key, expected in o["samples"].items():
-                actual = s["samples"][key]
+            tied = n in TIED_PICKS
+            # Free picks still exclude the seed item itself and never repeat one.
+            if tied and any(len(set(ids := r.get("ids") or [])) != len(ids) or
+                            (isinstance(key, str) and any(f"/Items/{i}/" in key for i in ids))
+                            for key, rs in srv.items() for r in rs):
+                return f"{n}: seed or duplicate item for a request pick"
+            for key, expected in orc.items():
+                actual = srv[key]
                 if len(actual) != len(expected):
                     return f"{n}: request count differs"
                 for a, b in zip(actual, expected):
                     for field in ("status", "count", "total", "content_type", "ids", "invalid_json"):
-                        if a.get(field) != b.get(field):
+                        if a.get(field) != b.get(field) and not (tied and field == "ids"):
                             return f"{n}: {field} differs for a request pick"
-                    if any(a.get("types", {}).get(path) != kind for path, kind in b.get("types", {}).items()):
+                    if any(a.get("types", {}).get(path) != kind for path, kind in b.get("types", {}).items()
+                           if not (tied and ITEM_FIELD.match(path))):
                         return f"{n}: per-item fields/types differ for a request pick"
-                    if set(b.get("fields") or []) - set(a.get("fields") or []):
+                    if {f for f in b.get("fields") or [] if not (tied and ITEM_FIELD.match(f))} - set(a.get("fields") or []):
                         return f"{n}: missing fields for a request pick"
                     # Encoding sizes vary legitimately. Only an empty image is invalid.
-                    if (n == "image" or n.endswith(":image")) and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
+                    if image and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
                         return f"{n}: empty response"
     return None
 
@@ -1122,9 +1162,11 @@ README_END = "<!-- END GENERATED BENCHMARKS -->"
 #: ordinary use (unloaded is a control, stress exists to find the knee).
 README_LEVEL = "loaded"
 #: The time-to-first-screen and memory rows the README headlines, by row name. HLS is
-#: excluded on purpose: the three servers pick different transcode parameters, so no two
-#: of them are comparable. The interference/swap rows describe the run, not the server.
-README_TTFS = ("cold start (restart → authenticated views; host caches retained)", "direct-play TTFB (1 MiB range)")
+#: withheld like any flagged cell whenever a repetition's transcode parameters or
+#: first-segment properties differ from the oracle's. The interference/swap rows describe
+#: the run, not the server.
+README_TTFS = ("cold start (restart → authenticated views; host caches retained)", "HLS first segment (forced transcode)",
+               "direct-play TTFB (1 MiB range)")
 README_MEMORY = ("peak under load", "steady idle")
 
 
@@ -1422,7 +1464,7 @@ def comparable_levels(m, base):
 
 def load_gate(path=GATE_PATH):
     """The gate.toml thresholds: one row per kind of cell (`screens`, `endpoints`,
-    `memory`), each `relative_pct` and `absolute` (in the cell's unit), and optional
+    `memory`, `scan`), each `relative_pct` and `absolute` (in the cell's unit), and optional
     per-cell bands under `[cells."<Cell.key>"]` from the A/A noise table."""
     import tomllib  # Python 3.11+, needed only with a baseline
     try:
@@ -1430,7 +1472,7 @@ def load_gate(path=GATE_PATH):
             gate = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"gate thresholds unreadable: {error}") from error
-    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory")},
+    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory", "scan")},
             **{f"cells.{k}": v for k, v in (gate.get("cells") or {}).items()}}
     for name, row in rows.items():
         if not isinstance(row, dict) or not all(number(row.get(f)) for f in ("relative_pct", "absolute")):
@@ -1636,6 +1678,7 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
              f"{e(str(meta.get('memory_limit', '?')))} limit, no swap · test data {e(str(tc.get('movies', '?')))} movies / {e(str(tc.get('series', '?')))} series / {e(str(tc.get('episodes', '?')))} episodes · "
              f"windows {e(str(meta.get('window_s', '?')))} s · {run_list(m['runs'], 'run')}"
+             + (f" · Jellyfin oracle {e(o['tag'])} ({e(o['image'])})" if (o := meta.get("oracle")) else "")
              + (f" · baseline, median of {run_list(base['runs'], 'run')}" if base else "") + "</p>"]
     # tiles: the four headline numbers
     tiles = []

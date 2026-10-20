@@ -21,6 +21,7 @@ import sqlite3
 import sys
 import uuid
 
+from clean_value import repaired_clean_value
 from metadata import CheckError
 from watch_history import timestamp
 
@@ -33,20 +34,36 @@ TABLES = (
 )
 # Columns dropped before hashing, with the reason.
 IGNORED = {
-    "ItemValues": ("CleanValue",),  # 0031 re-derives keys that matched the previous derivation
-    # A client that authenticates again from the same device replaces its row: a new Id, token,
-    # creation date and IsActive (as Jellyfin does), and every request re-announces the client.
-    # What stays is whose device it is (KEYS), so a lost device still fails.
-    "Devices": ("Id", "AccessToken", "IsActive", "DateCreated", "AppName", "AppVersion", "DeviceName",
-                "DateModified", "DateLastActivity"),
+    # Every authenticated request re-announces these, so they move on any device the harness
+    # touches. The device's own identity (Id, token, activation, creation date) is kept and
+    # compared below, so a reset token or a deactivated device fails.
+    "Devices": ("AppName", "AppVersion", "DeviceName", "DateModified", "DateLastActivity"),
     "ApiKeys": ("DateLastActivity",),
 }
+# Dropped only for the DeviceIds the harness itself logs in from (reauthenticated_devices):
+# authenticating again from one replaces its row with a new Id, token, IsActive and creation
+# date, as Jellyfin does. On every other device these are compared, so an adoption bug that
+# reset a token or deactivated a device — logging that client out — fails the check.
+REAUTH_VOLATILE = ("Id", "AccessToken", "IsActive", "DateCreated")
+# Columns re-derived from a sibling raw column, as {table: (derived, source)}. Migration 0031
+# and the boot repair repair_clean_values (the port of 12.0's RefreshCleanNamesAsync) rewrite
+# ItemValues.CleanValue to what repaired_clean_value(Value) yields, changing nearly every row of
+# a 10.11 source (an all-punctuation or whitespace-only Value derives to ''). A whole-row hash
+# would see every rewrite as a change, so the derived column is excluded from the hash and
+# checked on its own (compare()): the stored value must stay what it was or become what the
+# derivation yields, so a rewrite passes but a value NULLed or corrupted by adoption fails. The
+# derivation is ported in clean_value.py and proven against the Rust oracle.
+DERIVED = {"ItemValues": ("CleanValue", "Value")}
 # 0007 rewrites ISO 'T' timestamps to the space form; both spell one instant.
 TIMESTAMPS = {
     "ActivityLogs": ("DateCreated",),
     "ApiKeys": ("DateCreated",),
     "Chapters": ("ImageDateModified",),
+    "Devices": ("DateCreated",),  # compared on devices the harness did not re-authenticate
 }
+# Bumped when the baseline's shape changes so a stale file is rejected, not mis-read. 2: rows
+# sharing a key became a list (multiset). 3: a re-derived column carries a `clean` map (DERIVED).
+SNAPSHOT_VERSION = 3
 KEYS = {"Devices": ("UserId", "DeviceId")}
 # Tables whose ItemId names a library item. The rehome repair re-keys a local alternate version
 # to the id its primary's type derives, as Jellyfin 12.2 does, so an item is identified by its
@@ -75,6 +92,17 @@ def digest(row):
     return hashlib.sha256(json.dumps(row, sort_keys=True, default=repr).encode()).hexdigest()
 
 
+def reauthenticated_devices(users, passwordless):
+    """The DeviceIds the synthetic runner authenticates from after taking the baseline, whose
+    device rows it legitimately replaces: ``synthetic_fixture.Api.login`` logs in from
+    ``synthetic-login-<user>`` and ``user_accounts.snapshot`` from ``account-login-<user>`` for
+    every user and the passwordless account. ``run.sh`` authenticates from none of these (it
+    replays a stored token), so it compares every device's full row."""
+    return {"synthetic-login-" + name for name in users} | {
+        "account-login-" + name for name in (*users, passwordless)
+    }
+
+
 def identities(conn):
     """{item id: 'path:<Path>'} for every owned item whose path no other item shares."""
     items = [(normalize(item), path, normalize(owner))
@@ -84,20 +112,31 @@ def identities(conn):
             if path and counts[path] == 1 and owner and owner not in NO_OWNER}
 
 
-def table_rows(conn, table, only=None, identity=None, users=None):
-    """(columns, {key: row hash}) of one table, normalised; `only` limits the hashed columns."""
+def table_rows(conn, table, only=None, identity=None, users=None, reauthenticated=frozenset()):
+    """(columns, {key: sorted row hashes}, {key: [stored, derived]}) of one table, normalised.
+
+    `only` limits the hashed columns. Rows that share a key are kept as a multiset so losing one
+    of them still fails. The third map carries a re-derived column (DERIVED) and the value its
+    source column derives to, so compare() can tell a rewrite from damage.
+    """
     info = list(conn.execute(f'PRAGMA table_info("{table}")'))
     if not info:
         raise CheckError(f"table {table} is missing")
+    present = {row[1] for row in info}
     columns = [row[1] for row in info if row[1] not in IGNORED.get(table, ()) and (only is None or row[1] in only)]
     keys = KEYS.get(table) or [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5]]
     if not keys:
         raise CheckError(f"table {table} has no primary key to name its rows by")
+    derived_col, source_col = DERIVED.get(table, (None, None))
     rows = {}
+    clean = {}
     for record in conn.execute(f'SELECT * FROM "{table}"'):
         if table in USER_OWNED and record["UserId"] is not None and normalize(record["UserId"]) not in users:
             continue
         row = {name: normalize(record[name]) for name in columns}
+        if table == "Devices" and record["DeviceId"] in reauthenticated:
+            for name in REAUTH_VOLATILE:
+                row.pop(name, None)
         if table in ITEM_KEYED and identity and "ItemId" in row:
             row["ItemId"] = identity.get(row["ItemId"], row["ItemId"])
         for name in TIMESTAMPS.get(table, ()):
@@ -107,21 +146,31 @@ def table_rows(conn, table, only=None, identity=None, users=None):
                 row[name] = timestamp(row[name])
             except ValueError:
                 pass  # not a date: hashed as stored, so any change to it still shows
+        if derived_col in row:
+            # Still hashed (so a dropped column shows as lost) but as a constant, so a legitimate
+            # re-derivation is not a row change; its real check is in compare() via `clean`.
+            row[derived_col] = None
         key = "/".join(str(row[name]) for name in keys)
-        rows[key] = digest(row)
-    return columns, rows
+        rows.setdefault(key, []).append(digest(row))
+        if derived_col in present and source_col in present:
+            clean[key] = [record[derived_col], repaired_clean_value(record[source_col])]
+    return columns, {key: sorted(digests) for key, digests in rows.items()}, clean
 
 
-def snapshot(db, baseline=None):
-    """Every table's rows. With a baseline, only the columns it holds (0032 adds some)."""
+def snapshot(db, baseline=None, reauthenticated=frozenset()):
+    """Every table's rows. With a baseline, only the columns it holds (0032 adds some).
+    `reauthenticated` names the DeviceIds the harness logs in from (reauthenticated_devices);
+    on a path that re-authenticates, baseline and comparison snapshots must pass the same set."""
+    reauthenticated = frozenset(reauthenticated)
     with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         identity = identities(conn)
         users = {normalize(user) for (user,) in conn.execute('SELECT "Id" FROM "Users"')}
-        return {"version": 1, "tables": {
-            table: dict(zip(("columns", "rows"), table_rows(
-                conn, table, baseline and baseline["tables"][table]["columns"], identity, users))) for table in TABLES}}
+        return {"version": SNAPSHOT_VERSION, "tables": {
+            table: dict(zip(("columns", "rows", "clean"), table_rows(
+                conn, table, baseline and baseline["tables"][table]["columns"], identity, users,
+                reauthenticated))) for table in TABLES}}
 
 
 def compare(before, after):
@@ -133,11 +182,29 @@ def compare(before, after):
         if gone:
             failures.append(f"{table} lost column {', '.join(gone)}")
             continue
-        for key, value in was["rows"].items():
-            if key not in now["rows"]:
+        for key, before_digests in was["rows"].items():
+            after_digests = now["rows"].get(key)
+            if after_digests is None:
                 failures.append(f"{table} row {key} is gone")
-            elif now["rows"][key] != value:
-                failures.append(f"{table} row {key} changed")
+            elif len(before_digests) == 1 and len(after_digests) == 1:
+                if before_digests[0] != after_digests[0]:
+                    failures.append(f"{table} row {key} changed")
+            else:
+                # Rows sharing a key are a multiset: a lost or changed one leaves a digest
+                # the after side can no longer account for.
+                lost = Counter(before_digests) - Counter(after_digests)
+                if lost:
+                    failures.append(
+                        f"{table} row {key}: {sum(lost.values())} of {len(before_digests)} rows sharing its key gone or changed")
+        # A re-derived column (DERIVED): the stored value may stay as it was or become what the
+        # source derives to; anything else — a value NULLed or corrupted by adoption — is damage.
+        for key, (stored_before, _) in was.get("clean", {}).items():
+            after_clean = now.get("clean", {}).get(key)
+            if after_clean is None:
+                continue  # the row is gone or new: the row check above already covers it
+            stored_after, derived_after = after_clean
+            if stored_after != stored_before and stored_after != derived_after:
+                failures.append(f"{table} row {key} CleanValue changed")
     return failures
 
 
@@ -154,6 +221,8 @@ def main(argv=None):
                 json.dump(snapshot(args.db), output, sort_keys=True)
             return 0
         before = json.loads(Path(args.baseline).read_text())
+        if before.get("version") != SNAPSHOT_VERSION:
+            raise CheckError("table baseline was written by an incompatible version; regenerate it")
         failures = compare(before, snapshot(args.db, before))
         for line in failures:
             print(line)

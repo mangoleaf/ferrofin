@@ -5,7 +5,7 @@
 //!
 //! Port rules applied:
 //! - The C# `BoxSet` / `Folder` / `Playlist` domain items become
-//!   [`BaseItemEntity`](ferrofin_db::entities::base_items::BaseItemEntity) rows
+//!   [`BaseItemEntity`] rows
 //!   (a box set and a playlist are both `BaseItem`s); item and user identities
 //!   become [`uuid::Uuid`].
 //! - `CollectionCreationOptions` lives under `MediaBrowser.Controller`

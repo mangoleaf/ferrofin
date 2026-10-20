@@ -30,14 +30,17 @@ copies, as shown below.
 | 12.2.0 | 10.11.8 → 12.2.0 | 107 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.2.0 | 108 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 | 109 | `12.2.0` | PASS (synthetic) |
+| 12.2.0 | Fresh 12.2 install (not upgraded) | 105 | `12.2.0` | pending — Adoption workflow |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
 Both 12.1 paths are accepted because the older rating-level migration ID is optional;
-both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward.
-Unknown or incomplete histories are refused; the listed versions do not imply support
-for other 10.11.x or 12.x releases. Fresh-install databases and other upgrade routes were
-not separately exercised by the live run.
+both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward. A fresh
+12.2 install carries the smallest set (105 ids, without the retired 10.11-era routines) and
+the fresh-install schema (no `IX_CustomItemDisplayPreferences_UserId`), yet still adopts as
+`12.2.0`; `0041` gives it that index. Unknown or incomplete histories are refused; the listed
+versions do not imply support for other 10.11.x or 12.x releases. Other upgrade routes were not
+separately exercised by the live run.
 
 The tested server image for 10.11–12.1 was `ferrofin:adopt121`, supplied as built from
 server commit `1732f97c`, with local image ID
@@ -113,6 +116,19 @@ to the new item id. The fixtures hold rows in only some of the listed tables (Ch
 TrickplayInfos, KeyframeData, MediaSegments and the display-preference tables are empty
 until the fixtures populate them).
 
+### 2026-10-20 fresh-install 12.2 row (gl-632)
+
+A fresh-install Jellyfin 12.2 database (a first run, not upgraded from 10.11) was added as the
+eleventh live `run.sh` row (`jellyfin-12.2-fresh`), seeded from scratch through the 12.2 API and
+compared against its own Jellyfin 12.2 oracle (`smoke-jellyfin-12.2-fresh.txt`), since a clean
+install is a distinct library from the seeded upgrade routes. It carries the fresh-install EF id
+set (105) and schema and adopts as `12.2.0`. The offline gates all pass — `bats adoption/tests`,
+`python3 -m unittest discover -s adoption/tests` (170 tests) and ShellCheck — but the live
+`run.sh`/`build-fixtures.sh` could not run on the author's host (its system `containerd` was
+down). The live result above is therefore recorded as **pending**: the `Adoption` workflow
+exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
+it is green. Update the table row and this note once that run lands.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -154,8 +170,10 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
-| `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
-| a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |
+| `ItemValues.CleanValue` is checked on its own: it must stay what it was or become what `Value` derives to | 0031 and the boot repair `repair_clean_values` (12.0's `RefreshCleanNamesAsync`) re-derive it with `get_clean_value`, ported in `clean_value.py` (needs PyICU) and proven against the Rust oracle; a value NULLed or corrupted by adoption still fails |
+| a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
+| a `Devices` row's `Id`, `AccessToken`, `IsActive` and `DateCreated` (as an instant, since 0007 rewrites it) are compared, except on the `DeviceId`s the harness logs in from (`synthetic-login-*`, `account-login-*`) | authenticating again from a device replaces its row with a new id, token, activation and creation date, as Jellyfin does; the harness does this only from its own `DeviceId`s, so on every other device a reset token or a deactivated device fails. `run.sh` logs in from none and compares them all |
+| rows that share a key are a multiset, not one row | `(UserId, DeviceId)` is not unique, so losing or changing one of two devices for the same user and device must still fail |
 | rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
@@ -250,7 +268,9 @@ $FIXTURES/
   jellyfin-12.2-from-10/       built: jellyfin/jellyfin:12.2 on 10.11.8
   jellyfin-12.2-from-12/       built: jellyfin/jellyfin:12.2 on 12.0
   jellyfin-12.2-from-121/      built: jellyfin/jellyfin:12.2 on 12.1-from-12
+  jellyfin-12.2-fresh/         built: jellyfin/jellyfin:12.2 seeded from scratch (a first run)
   oracle/smoke-jellyfin-12.{1,2}.txt  built: each release's own smoke answers
+  oracle/smoke-jellyfin-12.2-fresh.txt  built: Jellyfin 12.2's answers on the fresh-install library
   oracle/user.txt              built: the account those answers were probed as
   jellyfin-12.2-schema.sql     built: the 12.2 schema the other 12.2 routes are diffed against
   work/                        scratch: synthetic.py's copies, work/run/ for run.sh's; failures stay here
@@ -260,7 +280,8 @@ The probes run as the synthetic administrator, which has a **Jellyfin Web** sess
 `Devices` and an **API key** in `ApiKeys`; `oracle/user.txt` records it, and `--user NAME`
 or `ADOPTION_USER` overrides. Credentials are read from the copy at run time and never
 written. The builder and runner need Docker, Python 3, Pillow (`python3-pil` on
-Debian/Ubuntu), `sqlite3`, `jq` and `curl`. Media encoding uses the Jellyfin image's FFmpeg.
+Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3`, `jq` and
+`curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
@@ -491,7 +512,7 @@ verify that unlisted future policy/configuration fields are compared.
 
 ### Running the synthetic matrix
 
-Requires Docker, Python 3, Pillow, Bash, and jq. Media encoding uses
+Requires Docker, Python 3, Pillow, PyICU (`python3-icu`), Bash, and jq. Media encoding uses
 `/usr/lib/jellyfin-ffmpeg/ffmpeg` from the official Jellyfin container; no host
 FFmpeg installation is needed. Docker must be available to the invoking user.
 Use a fresh fixture directory on a local disk, outside the checkout.
