@@ -1422,7 +1422,7 @@ def comparable_levels(m, base):
 
 def load_gate(path=GATE_PATH):
     """The gate.toml thresholds: one row per kind of cell (`screens`, `endpoints`,
-    `memory`), each `relative_pct` and `absolute` (in the cell's unit), and optional
+    `memory`, `scan`), each `relative_pct` and `absolute` (in the cell's unit), and optional
     per-cell bands under `[cells."<Cell.key>"]` from the A/A noise table."""
     import tomllib  # Python 3.11+, needed only with a baseline
     try:
@@ -1430,7 +1430,7 @@ def load_gate(path=GATE_PATH):
             gate = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"gate thresholds unreadable: {error}") from error
-    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory")},
+    rows = {**{k: gate.get(k) for k in ("screens", "endpoints", "memory", "scan")},
             **{f"cells.{k}": v for k, v in (gate.get("cells") or {}).items()}}
     for name, row in rows.items():
         if not isinstance(row, dict) or not all(number(row.get(f)) for f in ("relative_pct", "absolute")):
