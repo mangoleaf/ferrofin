@@ -995,7 +995,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
             _options: &ferrofin_model::configuration::LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {

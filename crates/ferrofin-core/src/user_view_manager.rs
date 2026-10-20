@@ -2270,7 +2270,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<CollectionTypeOptions>,
             _options: &LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!("fake")
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
