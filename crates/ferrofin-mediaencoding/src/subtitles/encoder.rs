@@ -17,10 +17,12 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::entities::IsoType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 
 use crate::encoder::{get_input_argument, quote};
+use crate::encoding_helper::helper;
 use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Subtitle, TimeCode};
@@ -506,10 +508,12 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
 
     /// Extracts every extractable subtitle from a media source via ffmpeg.
     ///
-    /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitles`, reduced to the
-    /// embedded (non-`.mks`) extraction path; each output cache path is
-    /// serialized with the keyed lock. Errors are swallowed (logged in C#) so a
-    /// single un-extractable stream cannot abort the caller.
+    /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitles`: the embedded
+    /// streams in one ffmpeg run over the video file, then each external
+    /// `.mks` file in its own ([`Self::extract_all_extractable_subtitles_mks`]);
+    /// each output cache path is serialized with the keyed lock. Errors are
+    /// swallowed (logged in C#) so a single un-extractable stream cannot abort
+    /// the caller.
     pub async fn extract_all_extractable_subtitles(&self, media_source: &MediaSourceInfo) {
         let source_path = media_source.path.clone().unwrap_or_default();
         // TODO(parity): upstream's `GetInputPathArgument` also picks a disc rip's
@@ -570,15 +574,95 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             );
         }
 
-        if output_paths.is_empty() {
-            return;
+        if !output_paths.is_empty() {
+            let result = self.io.extract(&args, &output_paths).await;
+            self.validate_extraction(&source_path, &output_paths, result)
+                .await;
+        }
+        drop(held);
+
+        self.extract_all_extractable_subtitles_mks(media_source)
+            .await;
+    }
+
+    /// The external `.mks` half of [`Self::extract_all_extractable_subtitles`].
+    ///
+    /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitlesMKS`: one ffmpeg
+    /// run per `.mks` file, each of its tracks mapped by its position inside
+    /// that file (`EncodingHelper.FindIndex`) and a VobSub track re-muxed as
+    /// Matroska, since ffmpeg has no `.idx`/`.sub` muxer. Each output is locked
+    /// and a cache hit skipped, as in the embedded pass.
+    async fn extract_all_extractable_subtitles_mks(&self, media_source: &MediaSourceInfo) {
+        let streams: Vec<&MediaStream> = media_source
+            .media_streams
+            .iter()
+            .filter(|stream| stream.is_extractable_subtitle_stream() && mks_path(stream).is_some())
+            .collect();
+        let mut files: Vec<&str> = Vec::new();
+        for file in streams.iter().filter_map(|stream| mks_path(stream)) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
         }
 
-        let result = self.io.extract(&args, &output_paths).await;
-        self.validate_extraction(&source_path, &output_paths, result)
-            .await;
-
-        drop(held);
+        for file in files {
+            // `MediaEncoder.GetInputArgument(mksFile, mediaSource)`.
+            let prefix = if media_source.iso_type == Some(IsoType::BluRay) {
+                "bluray"
+            } else {
+                "file"
+            };
+            let input_path = get_input_argument(prefix, file, media_source.protocol);
+            let mut args = format!("-y -i {input_path}");
+            let mut output_paths: Vec<String> = Vec::new();
+            let mut held = Vec::new();
+            for &stream in streams.iter().filter(|stream| {
+                mks_path(stream).is_some_and(|path| path.eq_ignore_ascii_case(file))
+            }) {
+                let ext = get_extractable_subtitle_file_extension(stream);
+                let Some(output_path) = self.subtitle_cache_path(media_source, stream.index, &ext)
+                else {
+                    continue;
+                };
+                let stream_index = helper::find_index(&media_source.media_streams, stream);
+                if stream_index == -1 {
+                    tracing::error!(
+                        path = %file,
+                        index = stream.index,
+                        "cannot find subtitle stream index, skipping this stream"
+                    );
+                    continue;
+                }
+                let guard = self.locks.get(&output_path).lock_owned().await;
+                if self.io.file_exists(&output_path) {
+                    continue;
+                }
+                held.push(guard);
+                let codec = stream.codec.clone().unwrap_or_default();
+                let output_codec = if is_codec_copyable(&codec) {
+                    "copy"
+                } else {
+                    "srt"
+                };
+                let output_format_option = if MediaStream::is_vob_sub_format(Some(&codec)) {
+                    " -f matroska"
+                } else {
+                    ""
+                };
+                output_paths.push(output_path.clone());
+                let _ = write!(
+                    args,
+                    " -map 0:{stream_index} -an -vn -c:s {output_codec}{output_format_option} -flush_packets 1 {}",
+                    quote(&output_path)
+                );
+            }
+            if output_paths.is_empty() {
+                continue;
+            }
+            let result = self.io.extract(&args, &output_paths).await;
+            self.validate_extraction(file, &output_paths, result).await;
+            drop(held);
+        }
     }
 
     /// Validates and cleans up the outputs of a subtitle extraction.
@@ -960,6 +1044,14 @@ fn get_extractable_subtitle_format(subtitle_stream: &MediaStream) -> String {
     } else {
         "srt".to_owned()
     }
+}
+
+/// The `.mks` file a subtitle stream lives in, if it is one.
+fn mks_path(stream: &MediaStream) -> Option<&str> {
+    stream
+        .path
+        .as_deref()
+        .filter(|path| ends_with_ignore_ascii_case(path, ".mks"))
 }
 
 /// Whether a stream codec can be copied (rather than transcoded) on extraction.
