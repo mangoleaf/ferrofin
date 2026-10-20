@@ -235,11 +235,79 @@ class TableDigests(unittest.TestCase):
         self.sql("UPDATE Devices SET AppVersion = '10.11.8', DeviceName = 'Chrome', DateModified = 'later'")
         self.assertEqual(self.failures(), [])
 
-    def test_a_device_authenticating_again_is_the_same_device_but_not_another_users(self):
+    def test_a_reauthenticated_device_may_be_replaced(self):
+        # The fixture device's DeviceId is 'x'. A path that logs back in from it excludes it,
+        # so a new Id, token and creation date pass; a device it did not log in from does not.
+        reauth = {"x"}
+        before = digests.snapshot(self.db, reauthenticated=reauth)
         self.sql("UPDATE Devices SET Id = 'new', AccessToken = 'fresh', DateCreated = 'now'")
-        self.assertEqual(self.failures(), [])
+        self.assertEqual(digests.compare(before, digests.snapshot(self.db, before, reauthenticated=reauth)), [])
+
+    def test_a_reset_token_on_an_untouched_device_fails(self):
+        # gl-667: a device the harness never logs in from must keep its exact token.
+        self.sql("UPDATE Devices SET AccessToken = 'reset'")
+        self.assertEqual(self.failures(), ["Devices row 000000000000000000000000000000a1/x changed"])
+
+    def test_a_deactivated_device_on_an_untouched_device_fails(self):
+        self.sql("ALTER TABLE Devices ADD COLUMN IsActive INTEGER DEFAULT 1")
+        self.before = digests.snapshot(self.db)
+        self.sql("UPDATE Devices SET IsActive = 0")
+        self.assertEqual(self.failures(), ["Devices row 000000000000000000000000000000a1/x changed"])
+
+    def test_a_device_moved_to_another_user_fails(self):
         self.sql(f"UPDATE Devices SET UserId = '{GONE_USER}'")
+        # The baselined (UserId, DeviceId) key no longer exists.
+        self.assertEqual(self.failures(), ["Devices row 000000000000000000000000000000a1/x is gone"])
+
+    def test_two_rows_sharing_a_key_are_both_counted(self):
+        # gl-668: (UserId, DeviceId) is not unique; two devices for one user+device must not
+        # collapse into one row, or losing one would pass unseen.
+        self.sql(f"INSERT INTO Devices(Id, UserId, DeviceId, AccessToken) VALUES ('second', '{USER}', 'x', 'other')")
+        self.before = digests.snapshot(self.db)
+        self.assertEqual(len(self.before["tables"]["Devices"]["rows"]["000000000000000000000000000000a1/x"]), 2)
+        self.sql("DELETE FROM Devices WHERE Id = 'second'")
+        failures = self.failures()
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(
+            failures[0], "Devices row 000000000000000000000000000000a1/x: 1 of 2 rows sharing its key gone or changed")
+
+    def test_device_date_created_is_one_instant_0007(self):
+        # 0007 rewrites DateCreated from the ISO 'T' form; an untouched device must not fail.
+        self.sql("UPDATE Devices SET DateCreated = '2026-01-02T03:04:05.5Z'")
+        self.before = digests.snapshot(self.db)
+        self.sql("UPDATE Devices SET DateCreated = '2026-01-02 03:04:05.500'")
+        self.assertEqual(self.failures(), [])
+        self.sql("UPDATE Devices SET DateCreated = '2026-01-02 03:04:06.500'")
         self.assertEqual(len(self.failures()), 1)
+
+    def test_a_reauthenticated_device_that_vanishes_still_fails(self):
+        reauth = {"x"}
+        before = digests.snapshot(self.db, reauthenticated=reauth)
+        self.sql("DELETE FROM Devices")
+        self.assertEqual(
+            digests.compare(before, digests.snapshot(self.db, before, reauthenticated=reauth)),
+            ["Devices row 000000000000000000000000000000a1/x is gone"])
+
+    def test_reauthenticated_devices_is_exactly_the_harness_logins(self):
+        self.assertEqual(
+            digests.reauthenticated_devices(("admin", "adult"), "guest"),
+            {"synthetic-login-admin", "synthetic-login-adult",
+             "account-login-admin", "account-login-adult", "account-login-guest"})
+
+    def test_compare_treats_rows_sharing_a_key_as_a_multiset(self):
+        def snap(hashes):
+            tables = {table: {"columns": [], "rows": {}} for table in digests.TABLES}
+            tables["Devices"] = {"columns": ["UserId"], "rows": {"k": sorted(hashes)}}
+            return {"version": digests.SNAPSHOT_VERSION, "tables": tables}
+        # losing one of two distinct duplicates fails
+        self.assertEqual(digests.compare(snap(["a", "b"]), snap(["a"])),
+                         ["Devices row k: 1 of 2 rows sharing its key gone or changed"])
+        # losing one of two byte-identical rows fails
+        self.assertEqual(len(digests.compare(snap(["a", "a"]), snap(["a"]))), 1)
+        # changing one of two duplicates fails
+        self.assertEqual(len(digests.compare(snap(["a", "b"]), snap(["a", "c"]))), 1)
+        # a duplicate only the later database holds passes
+        self.assertEqual(digests.compare(snap(["a"]), snap(["a", "b"])), [])
 
     def test_cli_snapshot_then_check(self):
         baseline = self.db + ".tables.json"
@@ -248,6 +316,14 @@ class TableDigests(unittest.TestCase):
         self.sql("DELETE FROM Chapters")
         self.assertEqual(digests.main(["check", self.db, baseline]), 1)
         self.assertEqual(digests.main(["check", self.db, baseline + ".missing"]), 1)
+
+    def test_cli_rejects_an_incompatible_baseline_version(self):
+        baseline = self.db + ".tables.json"
+        self.assertEqual(digests.main(["snapshot", self.db, baseline]), 0)
+        stale = json.loads(Path(baseline).read_text())
+        stale["version"] = 1
+        Path(baseline).write_text(json.dumps(stale))
+        self.assertEqual(digests.main(["check", self.db, baseline]), 1)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@
 #   jellyfin-10.11.8/                 Jellyfin 10.11.8 seeded from scratch
 #   jellyfin-10.11.9/  10.11.10/  10.11.11/   that release booted and scanned on a copy of 10.11.8
 #   jellyfin-12.0/  12.1-from-10/  12.1-from-12/  12.2-from-10/  12.2-from-12/  12.2-from-121/
+#   jellyfin-12.2-fresh/              Jellyfin 12.2 seeded from scratch (a first run, not upgraded)
 # Then, next to them:
 #   oracle/smoke-jellyfin-12.1.txt smoke.sh against Jellyfin 12.1 on a throwaway copy of 12.1-from-12
 #   oracle/smoke-jellyfin-12.2.txt smoke.sh against Jellyfin 12.2 on a throwaway copy of 12.2-from-121
+#   oracle/smoke-jellyfin-12.2-fresh.txt  smoke.sh against Jellyfin 12.2 on a copy of 12.2-fresh
 #   oracle/user.txt                the account both oracles (and run.sh) probe as
-#   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat1/sqlite_sequence,
+#   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat*/sqlite_sequence,
 #                                  rewritten every run; the other 12.2 routes are diffed against it
 # Existing fixtures and oracles are kept; synthetic.py refuses fixtures from an older recipe, so
 # build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
@@ -45,9 +47,10 @@ python3 "$HERE/synthetic.py" build --fixtures "$FIXTURES"
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 
 # Each fixture must carry exactly its release's EF history ids (the v12.2 C# gives 107 from
-# 10.11, 108 from 12.0, 109 from 12.1), with the WAL folded in so read-only readers see it all.
+# 10.11, 108 from 12.0, 109 from 12.1, and 105 on a first run, which records none of the retired
+# 10.11-era routines), with the WAL folded in so read-only readers see it all.
 for spec in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
-            12.2-from-10:107 12.2-from-12:108 12.2-from-121:109; do
+            12.2-from-10:107 12.2-from-12:108 12.2-from-121:109 12.2-fresh:105; do
   db=$FIXTURES/jellyfin-${spec%:*}/data/jellyfin.db
   [ -f "$db" ] || { echo "jellyfin-${spec%:*} has no data/jellyfin.db" >&2; exit 1; }
   sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
@@ -55,10 +58,12 @@ for spec in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:
   [ "$ids" = "${spec#*:}" ] || { echo "jellyfin-${spec%:*} has $ids EF history ids, expected ${spec#*:}" >&2; exit 1; }
 done
 
-build_oracle() { # build_oracle <version> <fixture> <port> — that release's own answers on a throwaway copy
-  local version=$1 source=$FIXTURES/$2 port=$3 user=${ADOPTION_USER:-}
+build_oracle() { # build_oracle <label> <fixture> <port> <image> — that image's own answers on a throwaway copy
+  # label names the oracle file (smoke-jellyfin-<label>.txt); image is explicit, since the
+  # fresh-install label (12.2-fresh) has no image tag of its own — a 12.2 image answers it.
+  local version=$1 source=$FIXTURES/$2 port=$3 image=$4 user=${ADOPTION_USER:-}
   local out=$FIXTURES/oracle/smoke-jellyfin-$version.txt tmp
-  case $version in 12.1|12.2) ;; *) echo "build_oracle: no oracle for $version" >&2; return 2;; esac
+  case $version in 12.1|12.2|12.2-fresh) ;; *) echo "build_oracle: no oracle for $version" >&2; return 2;; esac
   [ ! -f "$out" ] || return 0
   # every oracle probes as the account run.sh probes as
   [ -n "$user" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || user=$(cat "$FIXTURES/oracle/user.txt")
@@ -67,7 +72,7 @@ build_oracle() { # build_oracle <version> <fixture> <port> — that release's ow
   tmp=$(mktemp -d "$FIXTURES/work/oracle-$version.XXXXXX")
   cp -a "$source" "$tmp/config"; mkdir "$tmp/cache"
   docker rm -f fixture-oracle >/dev/null 2>&1 || true
-  docker run -d --name fixture-oracle --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" -v "$tmp/config:/config" -v "$tmp/cache:/cache" "${MEDIA[@]}" "jellyfin/jellyfin:$version" >/dev/null
+  docker run -d --name fixture-oracle --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" -v "$tmp/config:/config" -v "$tmp/cache:/cache" "${MEDIA[@]}" "$image" >/dev/null
   for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && break; sleep 3; done; sleep 30
   # Write the oracle aside and move it into place only once smoke.sh succeeded: a partial
   # file would otherwise be skipped by the next run and fail every path against it.
@@ -88,11 +93,15 @@ build_oracle() { # build_oracle <version> <fixture> <port> — that release's ow
 }
 
 dump_schema() { # dump_schema <fixture dir> — the schema without SQLite's own bookkeeping tables
-  sqlite3 -readonly "$1/data/jellyfin.db" .schema | grep -v -E '^CREATE TABLE (sqlite_stat1|sqlite_sequence)'
+  # ANALYZE writes sqlite_stat1 and, on a build with SQLITE_ENABLE_STAT4 (Arch, Fedora, …),
+  # sqlite_stat4 too; strip every sqlite_stat* and sqlite_sequence. Real fixtures never ANALYZE,
+  # so this changes nothing there; it keeps the schema pin stable across host sqlite builds.
+  sqlite3 -readonly "$1/data/jellyfin.db" .schema | grep -v -E '^CREATE TABLE (sqlite_stat[0-9]+|sqlite_sequence)'
 }
 
-build_oracle 12.1 jellyfin-12.1-from-12 18095
-build_oracle 12.2 jellyfin-12.2-from-121 18085
+build_oracle 12.1 jellyfin-12.1-from-12 18095 jellyfin/jellyfin:12.1
+build_oracle 12.2 jellyfin-12.2-from-121 18085 jellyfin/jellyfin:12.2
+build_oracle 12.2-fresh jellyfin-12.2-fresh 18084 jellyfin/jellyfin:12.2
 if [ -d "$FIXTURES/jellyfin-12.2-from-121" ]; then
   # The real 12.2 schema, for crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql; the other
   # routes must leave the same one.
