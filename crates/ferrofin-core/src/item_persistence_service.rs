@@ -3946,6 +3946,21 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn user_data_detach_epoch(&self) -> Result<Option<i64>, ServiceError> {
+        // Every detach (`detach_user_data`, from `delete_items` and the boot
+        // repairs) inserts its source snapshots, and the table's
+        // `AUTOINCREMENT` sequence never goes back, not even when expired
+        // snapshots are purged.
+        let seq: Option<i64> = sqlx::query_scalar(
+            r#"SELECT "seq" FROM "sqlite_sequence"
+               WHERE "name" = 'FerrofinUserDataRetentionSnapshots'"#,
+        )
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(Some(seq.unwrap_or(0)))
+    }
+
     async fn reattach_all_user_data(&self) -> Result<(), ServiceError> {
         // Snapshot candidate keys once, rather than reading all detached
         // history again for each page. Actual state is read under the writer

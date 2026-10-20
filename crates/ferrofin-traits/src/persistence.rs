@@ -1745,6 +1745,22 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// A counter that moves whenever history is detached for recovery (an item
+    /// with user data deleted): two equal readings mean nothing was detached
+    /// between them, so compare readings for equality only (a database
+    /// restored from an older backup reads lower). It counts per database,
+    /// whichever service instance did the detaching, and survives a restart.
+    ///
+    /// `None` means the store cannot tell, so a caller must assume history was
+    /// detached; the default, for stub/fake services.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn user_data_detach_epoch(&self) -> Result<Option<i64>, ServiceError> {
+        Ok(None)
+    }
+
     /// Recomputes and persists inherited values across the item tree.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }

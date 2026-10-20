@@ -719,6 +719,16 @@ impl<'a> FetcherPolicy<'a> {
         ferrofin_providers::library_options::global_metadata_options(self.global?, kind)
     }
 
+    /// Whether a metadata saver will rewrite `row`'s metadata
+    /// ([`ferrofin_providers::nfo_save::saves_metadata`]), with this policy's
+    /// library and server-wide options. It reads the configuration only, not
+    /// whether this scanner was given savers: the composition root always
+    /// wires the Nfo saver, as upstream always registers it.
+    fn saves_metadata(self, row: &BaseItemEntity) -> bool {
+        let kind = row.type_.rsplit('.').next().unwrap_or_default();
+        ferrofin_providers::nfo_save::saves_metadata(row, self.options, self.global_for(kind))
+    }
+
     /// Whether the library enabled metadata fetcher `name` for `kind`.
     ///
     /// Delegates to the shared gate so the scan and the on-demand refresh in
@@ -3643,6 +3653,13 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
+    /// The persistence's [`user_data_detach_epoch`] when the last full
+    /// user-data recovery sweep began; `None` until one has run, so the first
+    /// scan after a start always sweeps ([`recover_user_data`]).
+    ///
+    /// [`user_data_detach_epoch`]: ferrofin_traits::persistence::ItemPersistenceService::user_data_detach_epoch
+    /// [`recover_user_data`]: Self::recover_user_data
+    swept_at_epoch: std::sync::Mutex<Option<i64>>,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -3830,6 +3847,7 @@ impl LibraryScanner {
             display_specials_within_seasons: None,
             nfo_configuration: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
+            swept_at_epoch: std::sync::Mutex::new(None),
         }
     }
 
@@ -5579,6 +5597,43 @@ impl LibraryScanner {
             .collect())
     }
 
+    /// The full user-data recovery sweep after a scan
+    /// ([`reattach_all_user_data`]), when it can find something: history
+    /// whose destination no save of this scan reattached.
+    ///
+    /// Every item a scan saves reattaches its own history on the spot. What
+    /// that misses is a pair matched across time: history detached after its
+    /// destination was saved (later in this scan, or by an earlier watcher
+    /// event outside this one's scope), and a destination whose keys changed
+    /// after its save or outside a scan (music's closing pass, a series'
+    /// re-pointed children, an edit). A `ScanPasses::Library` scan (the
+    /// scheduled scan, `POST /Library/Refresh`, one library's scan) always
+    /// sweeps for them. A `ScanPasses::Touched` scan (watcher and webhook
+    /// batches, item and folder refreshes) sweeps only when history was
+    /// detached since the last sweep: otherwise it has no new history to
+    /// place, and the next library scan catches a late key change.
+    ///
+    /// [`reattach_all_user_data`]: ItemPersistenceService::reattach_all_user_data
+    async fn recover_user_data(&self, passes: ScanPasses) -> Result<(), ServiceError> {
+        let epoch = self.persistence.user_data_detach_epoch().await?;
+        let swept = *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if passes == ScanPasses::Touched && epoch.is_some() && epoch == swept {
+            tracing::debug!(
+                "user-data recovery sweep skipped: nothing detached since the last one"
+            );
+            return Ok(());
+        }
+        self.persistence.reattach_all_user_data().await?;
+        *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+        Ok(())
+    }
+
     /// The shared scan pipeline over an already-planned item set: probe +
     /// metadata + persistence per item, deleted-item pruning (restricted to
     /// `scope`'s roots when given), the `LibraryChanged` push, and the music
@@ -6137,10 +6192,7 @@ impl LibraryScanner {
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
         if !outcome.stopped {
-            // New destinations may have been saved before old paths were
-            // pruned, or by an earlier watcher event outside this scope.
-            // Music's closing pass must also have persisted its final keys.
-            self.persistence.reattach_all_user_data().await?;
+            self.recover_user_data(run.passes).await?;
             run.report(100.0);
         }
         // Announce what the scan changed (`LibraryChanged`) so open clients
@@ -6765,9 +6817,14 @@ impl LibraryScanner {
         // plus the external ids the file pins. It runs only when the plan
         // runs the local readers (`BaseNfoProvider.HasChanged`: the NFO is
         // newer than the last save by over a minute, or every provider runs).
-        // Identifying skips the local readers ("Do not execute local
-        // providers if we are identifying", `MetadataService.cs:802-803`).
-        let run_local = plan.local_metadata && !locked && search.is_none();
+        // Identifying skips the local readers, and so does "Replace all
+        // metadata" for an item a saver will rewrite ("Do not execute local
+        // providers if we are identifying or replacing with local metadata
+        // saving enabled", `MetadataService.cs:802-803`).
+        let run_local = plan.local_metadata
+            && !locked
+            && search.is_none()
+            && !(options.replace_all_metadata && policy.saves_metadata(&entity));
         let local = if run_local {
             self.fetch_local_nfo(&mut entity, policy).await
         } else {
@@ -31554,19 +31611,29 @@ mod tests {
     /// returns a list, `BaseNfoParser` → `ResetPeople`) clears the stored cast
     /// only under "Replace all metadata", where `RemoveOldMetadata` skips
     /// "add existing metadata to provider result" (`:905`); every other mode
-    /// turns the empty list into null there and keeps the cast.
+    /// turns the empty list into null there and keeps the cast. That needs a
+    /// library that saves no metadata: where the Nfo saver is on (the existing
+    /// NFO turns it on), "Replace all metadata" reads no NFO at all
+    /// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`),
+    /// and with no provider answering the cast stands.
     #[rstest::rstest]
-    #[case::scan("scan", 2)]
-    #[case::missing("missing", 2)]
-    #[case::replace_all("replace", 0)]
+    #[case::scan("scan", false, 2)]
+    #[case::missing("missing", false, 2)]
+    #[case::replace_all("replace", false, 0)]
+    #[case::replace_all_with_a_saver("replace", true, 2)]
     #[tokio::test]
     async fn an_nfo_naming_no_actors_clears_the_cast_only_under_replace_all(
         #[case] choice: &str,
+        #[case] saving: bool,
         #[case] expected: usize,
     ) {
         let tmp = tempfile::tempdir().unwrap();
+        let options = LibraryOptions {
+            metadata_savers: (!saving).then(Vec::new),
+            ..LibraryOptions::default()
+        };
         let (vf, persistence, people, episode_id, items) =
-            library_with_a_stale_episode_cast(tmp.path()).await;
+            library_with_a_stale_episode_cast_in(tmp.path(), options).await;
         let nfo = tmp.path().join("tv/GoT/Season 01/GoT S01E01.nfo");
         std::fs::write(
             &nfo,
@@ -34921,6 +34988,9 @@ mod tests {
                         path_infos: vec![MediaPathInfo {
                             path: media.to_string_lossy().into_owned(),
                         }],
+                        // No saver, so "Replace all metadata" still reads
+                        // the NFO (`isSavingMetadata`, `MetadataService.cs:803`).
+                        metadata_savers: Some(Vec::new()),
                         ..Default::default()
                     },
                 )
