@@ -3604,6 +3604,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_text_codec_burns_with_the_subtitles_filter_alone() {
+        // `MediaStream.IsTextFormat` is a deny-list of the bitmap codecs, so
+        // SAMI, TTML or SubViewer is text too. Its burn-in is the `-vf
+        // subtitles` chain alone: an overlay graph and `-map [v]` beside it
+        // make ffmpeg refuse the command.
+        for codec in ["sami", "ttml", "subviewer"] {
+            let p = planner(vec![source(
+                "abc",
+                vec![
+                    video_stream("h264"),
+                    audio_stream("aac"),
+                    subtitle_stream(codec, 2),
+                ],
+            )]);
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.subtitle_stream_index = Some(2);
+            req.subtitle_method = Some("Encode".to_owned());
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains("subtitles=f='/media/movie.mkv':si=0"),
+                "{codec}: {args}"
+            );
+            assert!(!args.contains("overlay"), "{codec}: {args}");
+            assert!(!args.contains("-map [v]"), "{codec}: {args}");
+            assert_eq!(args.matches(" -vf ").count(), 1, "{codec}: {args}");
+        }
+    }
+
+    #[tokio::test]
     async fn plan_seek_wraps_text_burn_in_setpts_shift() {
         // A seek restart input-seeks with `-ss`, resetting frame PTS to ~0; the
         // subtitles filter picks cues by PTS, so the chain must shift PTS to
