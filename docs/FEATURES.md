@@ -114,6 +114,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
     be extracted for that layout there at all. Ferrofin emits the balanced form, the same
     shape Jellyfin's own half-side-by-side case already has.
+  - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
+    (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
+    no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with
   their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
   library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF

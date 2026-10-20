@@ -288,8 +288,13 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // which is what upstream passes here.
         let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
         let resolution = image_resolution_parameter(image_resolution);
+        // The graph is quoted, unlike upstream's bare `-vf {3}`: the 3D
+        // scalers contain spaces, so the split into argv would cut them into
+        // stray ffmpeg arguments and 3D sources would get no images (a
+        // Jellyfin bug, not ported).
         let mut args = format!(
             "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 {output}",
+            vf = quote(&vf),
             output = quote(output_path),
         );
 
@@ -1321,6 +1326,43 @@ mod tests {
                 args.matches(')').count(),
                 "{threed_format:?} produced unbalanced brackets: {args}"
             );
+        }
+    }
+
+    // The 3D graphs carry spaces and ffmpeg's `\,` escape, and the argument
+    // string is split into argv by `split_args`. Upstream's bare `-vf {3}`
+    // splits such a graph at every space; quoted, ffmpeg gets it whole.
+    #[test]
+    fn each_3d_scaler_reaches_ffmpeg_as_one_filter_argument() {
+        for threed_format in [
+            Video3DFormat::HalfSideBySide,
+            Video3DFormat::FullSideBySide,
+            Video3DFormat::HalfTopAndBottom,
+            Video3DFormat::FullTopAndBottom,
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "",
+                None,
+                None,
+                Some(threed_format),
+                None,
+                true,
+                "/tmp/out.jpg",
+                None,
+                0,
+                ImageResolution::MatchSource,
+            );
+            let tokens = crate::encoder::split_args(&args).unwrap();
+            let vf = tokens.iter().position(|a| a == "-vf").unwrap() + 1;
+            let graph = &tokens[vf];
+            assert!(
+                graph.starts_with("crop=iw")
+                    && graph.contains(",crop=min(iw\\,ih*dar):min(ih\\,iw/dar):")
+                    && graph.ends_with(":(ih - min (ih\\,ih/sar))/2,setsar=sar=1,thumbnail=n=24"),
+                "{threed_format:?}: {tokens:?}"
+            );
+            assert_eq!(tokens[vf + 1], "-vsync", "{threed_format:?}: {tokens:?}");
         }
     }
 
