@@ -22,7 +22,8 @@ import subprocess
 import sys
 
 from metadata import CheckError
-from synthetic_fixture import Api, USERS, drop_dangling_chain, seed, seed_database, wait_for_live_members
+from synthetic_fixture import (Api, USERS, drop_dangling_chain, require_populated, seed, seed_database,
+                               wait_for_live_members)
 from synthetic_media import generate
 
 
@@ -147,6 +148,7 @@ def build(root, only, port):
                 raise CheckError(f"Jellyfin 12.2 left the dangling chain as {state['orphans']}, "
                                  f"history {state['history']}; the run's expectation is wrong")
         save(config / "seeds.json", state)
+        require_populated(config / "data/jellyfin.db")
         save(config / "synthetic-ready.json", {"fixture": name, "version": version, "recipe": recipe()})
         print(name + " built and validated", flush=True)
 

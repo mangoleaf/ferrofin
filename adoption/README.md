@@ -417,10 +417,21 @@ own setup, library, user, metadata, and playlist APIs. It uses invented accounts
 titles, tags, provider IDs, solid-color images, silent video, and generated tones.
 It neither reads nor modifies a personal media server.
 
-The fixture has five movie titles (one with two versions), one extra, one series
-with two seasons and six episodes, and six music tracks across two artists and
-two albums. One album spans two discs. English subtitle files accompany every
-movie and episode. Seven users provide an administrator, an adult with access to
+The fixture has eight movie titles (one with two versions, one HDR10, one with two
+audio languages and an attached font, one under a non-ASCII path), one extra, one
+series with two seasons and six episodes, six music tracks across two artists and
+two albums, a book and two photos. One album spans two discs. English subtitle files
+accompany every movie and episode, every video has chapters, and every movie and
+episode NFO credits two actors. Chapter-image and trickplay extraction run during
+the scan, and the builder runs the keyframe-extraction task, saves display
+preferences and a device name, and writes two media segments under the Intro
+Skipper plugin's provider id (no API creates one). So every table the
+[table digests](#2026-10-19-table-digests-check-7) compare holds rows on every
+fixture, and the builder fails when one of them is empty. Measured on 2026-10-20 on
+an idle host, this made a full `build-fixtures.sh` take 420 s instead of 396 s
+(+6 %), and the fixture directory 29 MB instead of 18 MB.
+
+Seven users provide an administrator, an adult with access to
 every library, a child with library/parental restrictions, an administratively
 disabled account, an account locked by failed logins, a passwordless account, and
 a dedicated account with populated policy and configuration settings. Downloads

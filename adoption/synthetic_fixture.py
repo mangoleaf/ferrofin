@@ -3,6 +3,7 @@ can produce, written into the stopped 10.11.8 fixture (seed_database)."""
 
 import base64
 from contextlib import closing
+import hashlib
 from io import BytesIO
 import json
 from pathlib import Path, PurePosixPath
@@ -37,7 +38,15 @@ USERS = ("synthetic-admin", "synthetic-adult", "synthetic-child")
 LIBRARIES = (("Synthetic Movies", "movies", "movies"),
              ("Synthetic Private", "movies", "private"),
              ("Synthetic Shows", "tvshows", "shows"),
-             ("Synthetic Music", "music", "music"))
+             ("Synthetic Music", "music", "music"),
+             ("Synthetic Books", "books", "books"),
+             ("Synthetic Photos", "homevideos", "photos"))
+# Jellyfin ships no media segment provider, so real databases hold the rows a plugin wrote.
+# The Intro Skipper plugin is the common writer; the rows carry its provider id.
+SEGMENT_PROVIDER = "Intro Skipper"
+# MediaSegmentType: (type, start seconds, end seconds) on the locked movie.
+SEGMENTS = ((5, 0, 30), (4, 570, 600))
+TICKS = 10_000_000
 
 
 class Api:
@@ -135,11 +144,13 @@ def seed(base):
     api.post("/Auth/Keys", app="Synthetic adoption")
     for name in USERS[1:]:
         api.post("/Users/New", {"Name": name, "Password": PASSWORD})
-    types = ("Movie", "Series", "Season", "Episode", "MusicArtist", "MusicAlbum", "Audio")
+    types = ("Movie", "Series", "Season", "Episode", "MusicArtist", "MusicAlbum", "Audio", "Book",
+             "Photo", "PhotoAlbum", "Video")
     options = {
         "EnableRealtimeMonitor": False, "EnableInternetProviders": False,
-        "EnableChapterImageExtraction": False, "ExtractChapterImagesDuringLibraryScan": False,
-        "EnableTrickplayImageExtraction": False, "ExtractTrickplayImagesDuringLibraryScan": False,
+        # On, so Chapters carry images and TrickplayInfos holds rows.
+        "EnableChapterImageExtraction": True, "ExtractChapterImagesDuringLibraryScan": True,
+        "EnableTrickplayImageExtraction": True, "ExtractTrickplayImagesDuringLibraryScan": True,
         "EnableLUFSScan": False, "SaveLocalMetadata": False, "MetadataSavers": [],
         "AutomaticRefreshIntervalDays": 0, "PreferredMetadataLanguage": "en",
         "MetadataCountryCode": "US", "SubtitleDownloadLanguages": ["eng"],
@@ -155,6 +166,12 @@ def seed(base):
             **options, "PathInfos": [{"Path": "/media/" + folder}]}},
             name=name, collectionType=kind, refreshLibrary="false")
     api.scan(300, interval=1)
+    api.idle()
+    # KeyframeData is written only by this task (it has no default trigger) or on demand by HLS.
+    keyframes = next((task for task in api.get("/ScheduledTasks") if task["Key"] == "KeyframeExtraction"), None)
+    if keyframes is None:
+        raise CheckError("synthetic server has no KeyframeExtraction task")
+    api.post(f"/ScheduledTasks/Running/{keyframes['Id']}")
     api.idle()
     users = {row["Name"]: row for row in api.get("/Users")}
     libraries = {row["Name"]: row for row in api.get("/Library/VirtualFolders")}
@@ -184,12 +201,15 @@ def seed(base):
     episodes = sorted((r for r in rows if r["Type"] == "Episode"),
                       key=lambda r: (r["ParentIndexNumber"], r["IndexNumber"]))
     tracks = sorted((r for r in rows if r["Type"] == "Audio"), key=lambda r: r["Path"])
-    if len(episodes) != 6 or len(tracks) != 6 or len(movies) < 5:
+    if len(episodes) != 6 or len(tracks) != 6 or len(movies) < 8:
         raise CheckError("synthetic media was not fully scanned")
 
     adult = users[USERS[1]]["Id"]
     movie = movies["Blue Orchard"]["Id"]
     edited = api.get(f"/Items/{movie}", userId=api.user)
+    # 10.11.8 serves Trickplay but cannot read it back (TrickplayInfoDto has no bindable
+    # constructor: 500).
+    edited.pop("Trickplay", None)
     edited.update({"Name": "Manually edited orchard", "Overview": "A deliberate manual description.",
                    "ForcedSortName": "000 synthetic manual order", "LockData": True,
                    "LockedFields": ["Name", "Overview", "Genres"],
@@ -208,6 +228,17 @@ def seed(base):
         api.post(f"/UserItems/{item}/UserData", {"Played": False, "PlaybackPositionTicks": ticks,
                  "LastPlayedDate": "2026-01-06T12:00:00Z"}, userId=user)
     api.post(f"/UserFavoriteItems/{tracks[0]['Id']}", userId=adult)
+
+    # One save writes DisplayPreferences, ItemDisplayPreferences and, for the keys it does not
+    # map to a column, CustomItemDisplayPreferences (DisplayPreferencesController).
+    owner = api.login(USERS[1])
+    owner.post(f"/DisplayPreferences/{libraries['Synthetic Movies']['ItemId']}", {
+        "SortBy": "DateCreated", "SortOrder": "Descending", "RememberSorting": True, "RememberIndexing": False,
+        "ShowBackdrop": True, "ShowSidebar": False, "ScrollDirection": "Horizontal", "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250, "ViewType": "Poster",
+        "CustomPrefs": {"homesection0": "resume", "homesection1": "latestmedia", "skipBackLength": "10000",
+                        "synthetic-view": "posters"}}, userId=owner.user, client="emby")
+    api.post("/Devices/Options", {"CustomName": "Synthetic living room"}, id=owner.device)
 
     playlist = api.post("/Playlists", {"Name": "Synthetic mixed order", "MediaType": "Audio",
         "Ids": [tracks[3]["Id"], tracks[0]["Id"], tracks[2]["Id"]], "UserId": adult,
@@ -305,6 +336,8 @@ def seed_database(db, manifest):
        each the same way; "members" is what they resolve to. Every entry of the first two
        has a Path that exists on disk, so 10.11.9+'s startup
        CleanupCollectionAndPlaylistPathsTask keeps it; it drops the path-less ones.
+    5. Media segments on the locked movie (SEGMENTS), as a SEGMENT_PROVIDER plugin writes
+       them: no API creates one.
     """
     adult = uuid.UUID(manifest["users"][USERS[1]])
     with closing(sqlite3.connect(db)) as conn:
@@ -381,12 +414,37 @@ def seed_database(db, manifest):
                 conn.execute('UPDATE "BaseItems" SET "Data" = json_set("Data", \'$.LinkedChildren\', json(?)) '
                              'WHERE "Id" = ?', (json.dumps(entries), container))
                 linked[role] = {"id": uuid.UUID(manifest["linked_" + role]).hex, "entries": entries, "members": members}
+
+            provider = segment_provider_id(SEGMENT_PROVIDER)
+            for kind, start, end in SEGMENTS:
+                conn.execute('INSERT OR REPLACE INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId", '
+                             '"StartTicks", "Type") VALUES (?, ?, ?, ?, ?, ?)',
+                             (spelled(item, seed_id(f"segment-{kind}")), end * TICKS, item, provider,
+                              start * TICKS, kind))
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return {"ratings": ratings,
             "conflict": {"item": locked.hex, "user": adult.hex, "keys": keys},
             "orphans": [first.hex, second.hex],
             "orphan_history": {"user": adult.hex, "key": history, **ORPHAN_PLAY},
             "linked_children": linked}
+
+
+def segment_provider_id(name):
+    """MediaSegmentManager.GetProviderId: the MD5 of the lower-cased name's UTF-16LE bytes,
+    read as a .NET Guid and written without dashes."""
+    return uuid.UUID(bytes_le=hashlib.md5(name.lower().encode("utf-16-le")).digest()).hex
+
+
+def require_populated(db):
+    """Fail the build unless every table the table digests compare holds a row: an empty
+    table is a check that compares nothing (a task that never ran, a media type lost)."""
+    from table_digests import TABLES
+    with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        empty = [table for table in TABLES if table not in present
+                 or conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None]
+    if empty:
+        raise CheckError("synthetic fixture has no rows in " + ", ".join(empty))
 
 
 def stale_id(role, name):
