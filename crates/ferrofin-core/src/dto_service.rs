@@ -1359,11 +1359,11 @@ impl FerrofinDtoService {
     }
 
     /// Loads an item's image rows from `BaseItemImageInfos`, ordered by type then
-    /// by row id for a stable presentation order.
+    /// by insertion order (`rowid`), the order the image routes address them.
     async fn load_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
         let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
             r#"SELECT * FROM "BaseItemImageInfos"
-               WHERE "ItemId" = ?1 ORDER BY "ImageType", "Id""#,
+               WHERE "ItemId" = ?1 ORDER BY "ImageType", rowid"#,
         )
         .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
@@ -1391,12 +1391,9 @@ impl FerrofinDtoService {
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!(
-                r#"SELECT * FROM "BaseItemImageInfos"
-                   WHERE "ItemId" IN ({placeholders})
-                   ORDER BY "ItemId", "ImageType", "Id""#,
-            );
-            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(sql));
+            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
+                crate::item_repository::images_of_items_sql(&placeholders),
+            ));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
