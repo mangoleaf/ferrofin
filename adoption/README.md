@@ -100,6 +100,19 @@ Two earlier builds on the same host, under a load average near 27, stopped in th
 with "the linked … has no live member"; each was rebuilt into a new directory. That seeding
 failure is tracked separately.
 
+### 2026-10-19 table digests (check 7)
+
+Fixtures built fresh by `build-fixtures.sh` (recipe at this commit). Image `ferrofin:bench`,
+id `4961433c3034`, built 2026-10-19 18:26 MDT from `release/v1.4.0` (its commit was not
+recorded; the harness-only change here does not depend on it). `run.sh`: **PASS** on all ten
+paths. `synthetic.py run`: **PASS** on all ten paths at all four stages (40 of 40). The first
+runs failed on three things the normaliser now names, none a Ferrofin data loss: a re-login
+replaces a `Devices` row, a client re-announces itself, and the rehome repair re-keys a local
+alternate version (as Jellyfin 12.2 does), moving its MediaStreamInfos and ItemValuesMap rows
+to the new item id. The fixtures hold rows in only some of the listed tables (Chapters,
+TrickplayInfos, KeyframeData, MediaSegments and the display-preference tables are empty
+until the fixtures populate them).
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -125,6 +138,25 @@ failure is tracked separately.
    result does not pass this check.
 6. Each user's watch history remains unchanged at all three stages, in both the
    database and movie/episode API responses, including watched flags and progress.
+7. Every row of the Jellyfin-owned tables no other check covers survives each stage, bar
+   the rewrites listed under the table digests below.
+
+The table digests (`table_digests.py`) hash every row of those tables whole, keyed by its
+primary key, and take the baseline from each fixture copy before Ferrofin starts. A row that
+is gone, or whose hash moved, fails and names the table and key; a row only the later
+database holds does not (a scan or login adds some), and neither does a column only the later
+database holds (0032 adds some to MediaStreamInfos). The normaliser removes only what the
+migration chain or the running server rewrites by design, and each rule is a change the check
+stops seeing, so add one only with a migration or server behaviour to point at:
+
+| Rule | Why |
+|---|---|
+| GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
+| `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
+| the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
+| `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
+| a `Devices` row is its user and `DeviceId`; nothing else of it is compared (token included), as are `ApiKeys.DateLastActivity` | a client that authenticates again from the same device replaces its row with a new Id, token and creation date, and every request re-announces the client; the harness itself logs in this way, so a lost device row fails but a reset device token does not |
+| rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
 It checks overview, original title, tagline, community/critic ratings, official rating,
@@ -285,6 +317,9 @@ history, changes to each playback field, deleted provider-keyed rows, progress f
 another user, unwatched-to-watched changes, missing API history, hidden versions,
 date/GUID normalization, private baselines, fixtures missing watched/resume data, and
 failure reporting. Its fixtures contain only invented IDs and playback data.
+`tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
+lost and an added column, and a case per normaliser rule (each with the unrewritten change
+next to it that must still fail).
 CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.

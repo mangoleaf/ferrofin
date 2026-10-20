@@ -15,6 +15,8 @@
 #   4. a second boot runs no repair and changes no answer;
 #   5. populated metadata survives both boots and an explicit library scan (DB + HTTP).
 #   6. watch history survives each stage for every user (DB + HTTP).
+#   7. every row of the Jellyfin-owned tables no other check covers (table_digests.py) survives
+#      each stage, bar the rewrites the migration chain makes by design.
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
 # includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
 # build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
@@ -28,7 +30,7 @@ ORACLE_VERSION=${ADOPTION_ORACLE:-12.2}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
   --oracle) ORACLE_VERSION=$2; shift 2;;
-  -h|--help) sed -n 2,21p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  -h|--help) sed -n 2,23p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
 case $ORACLE_VERSION in 12.1|12.2) ;; *) echo "run: --oracle must be 12.1 or 12.2, not '$ORACLE_VERSION'" >&2; exit 2;; esac
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
@@ -81,6 +83,13 @@ metadata_check() {
   else
     printf 'PASS watch history %s\n' "$stage" > "$log"
   fi
+  log=$dst.tables-${stage// /-}.log
+  if ! result=$(python3 "$HERE/table_digests.py" check "$dst/data/jellyfin.db" "$dst.tables.json" 2>&1); then
+    printf '%s\n' "${result:-check failed}" > "$log"
+    why+=("tables $stage: $(wc -l <<<"${result:-check failed}") difference(s), first: $(head -n 1 <<<"${result:-check failed}"); all in $log")
+  else
+    printf 'PASS tables %s\n' "$stage" > "$log"
+  fi
 }
 failed=0
 for spec in "${FIXTURE_TABLE[@]}"; do
@@ -103,6 +112,11 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   fi
   if ! baseline=$(python3 "$HERE/watch_history.py" snapshot "$dst/data/jellyfin.db" "$dst.watch-history.json" 2>&1); then
     printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "watch history baseline: $baseline"
+    failed=1
+    continue
+  fi
+  if ! baseline=$(python3 "$HERE/table_digests.py" snapshot "$dst/data/jellyfin.db" "$dst.tables.json" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "table baseline: ${baseline:-check failed}"
     failed=1
     continue
   fi
