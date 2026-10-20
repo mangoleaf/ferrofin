@@ -340,7 +340,7 @@ class ReportTests(unittest.TestCase):
         self.edit(self.b / 'ferrofin/ttfs.json', lambda x: x.update(direct=x['direct'][:1]))
         m = self.build(self.a, self.b)
         for name, cells in m['ttfs']:
-            if name in report.README_TTFS:
+            if name.startswith(('cold start', 'direct-play')):  # the two rows edited above
                 self.assertIn('successful repetitions', cells['ferrofin'].flag)
                 self.assertIsNotNone(cells['ferrofin'].median)
 
@@ -545,6 +545,12 @@ class ReportTests(unittest.TestCase):
         model=self.build()
         cell=dict(model['ttfs'])['HLS first segment (forced transcode)']['ferrofin']
         self.assertIn('parameters differ',cell.flag)
+
+    def test_hls_headlines_the_readme_unless_its_transcode_differs(self):
+        row = lambda: next(line for line in self.readme().splitlines() if line.startswith('| HLS first segment'))
+        self.assertNotIn('⚠', row())
+        self.edit(self.a/'ferrofin/ttfs.json', lambda t: t['hls'][1].update(transcoding_url='/master.m3u8?VideoCodec=hevc'))
+        self.assertIn('— ⚠', row())
 
     def test_stream_probe_failure_in_later_run_is_not_ignored(self):
         self.edit(self.b/'run.json', lambda m:m.update(streaming_validation=1))
@@ -776,6 +782,49 @@ class BoundedEvidenceTests(unittest.TestCase):
         response['types']['$.Items[1].Name'] = 'null'
         self.log(self.root/'shape.log', [response])
         self.assertIn('per-item', report.comparable(report.load_shape(self.root), original, ['movies:items']))
+
+    def test_similar_ties_compare_only_what_upstream_specifies(self):
+        # Upstream breaks equal similarity scores arbitrarily (series: randomly), so which
+        # items fill the limit, and their own fields, cannot match; the response still must.
+        response = {'shape': 'detail:similar', 'key': 'pick', 'status': 200, 'count': 2,
+                    'ids': ['a', 'b'], 'total': 2,
+                    'types': {'$.TotalRecordCount': 'number', '$.Items[0].Name': 'string',
+                              '$.Items[1].ImageTags.Logo': 'string'}}
+        self.log(self.root/'shape.log', [response])
+        original = report.load_shape(self.root)
+        response['ids'] = ['c', 'a']
+        response['types'] = {'$.TotalRecordCount': 'number', '$.Items[0].Name': 'string',
+                             '$.Items[1].Name': 'string'}
+        self.log(self.root/'shape.log', [response])
+        self.assertIsNone(report.comparable(report.load_shape(self.root), original, ['detail:similar']))
+        response['types']['$.TotalRecordCount'] = 'string'
+        self.log(self.root/'shape.log', [response])
+        self.assertIn('fields/types', report.comparable(report.load_shape(self.root), original, ['detail:similar']))
+        response['types']['$.TotalRecordCount'] = 'number'
+        response.update(count=1, ids=['c'])
+        self.log(self.root/'shape.log', [response])
+        self.assertIn('items', report.comparable(report.load_shape(self.root), original, ['detail:similar']))
+
+    def test_posters_of_similar_items_compare_by_count(self):
+        def detail(similar, posters, last=None):
+            key = lambda name, i, path: json.dumps([0, name, i, 'GET', path, {}])
+            records = [{'shape': 'detail:similar', 'key': key('detail:similar', 0, '/Items/m/Similar'),
+                        'status': 200, 'count': len(similar), 'ids': similar, 'types': {}}]
+            records += [{'shape': 'detail:image', 'key': key('detail:image', i, f'/Items/{p}/Images/Primary'),
+                         'status': 200, 'content_type': 'image/jpeg', 'bytes': 9} for i, p in enumerate(posters)]
+            records[-1].update(last or {})  # the last poster is always a Similar item's
+            self.log(self.root/'shape.log', records)
+            return report.load_shape(self.root)
+        oracle = detail(['x', 'y'], ['m', 'x', 'y'])
+        for name in ('detail:image', 'image'):
+            self.assertIsNone(report.comparable(detail(['y', 'z'], ['m', 'z', 'y']), oracle, [name]))
+            self.assertIn('picks differ', report.comparable(detail(['x', 'y'], ['n', 'x', 'y']), oracle, [name]))
+            self.assertIn('picks differ', report.comparable(detail(['x', 'y'], ['m', 'x']), oracle, [name]))
+            self.assertIn('status', report.comparable(detail(['y', 'z'], ['m', 'z', 'y'], {'status': 404}), oracle, [name]))
+            self.assertIn('empty', report.comparable(detail(['y', 'z'], ['m', 'z', 'y'], {'bytes': 0}), oracle, [name]))
+        self.assertIsNone(report.comparable(detail(['y', 'z'], ['m', 'z', 'y']), oracle, ['detail:similar']))
+        for similar in (['m', 'z'], ['z', 'z']):
+            self.assertIn('seed or duplicate', report.comparable(detail(similar, ['m', 'z', 'y']), oracle, ['detail:similar']))
 
     def test_pool_export_uses_source_ids_and_fixed_cutoff(self):
         api = Mock()
