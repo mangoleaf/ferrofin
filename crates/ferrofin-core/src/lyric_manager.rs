@@ -379,7 +379,8 @@ fn sidecar_file_name(media_path: &Path, ext: &str) -> std::ffi::OsString {
 /// The save-path list for a lyric of `media_path`, in `TrySaveLyric` order:
 /// the media folder only when the library opts in (`SaveLyricsWithMedia`),
 /// then always the item's internal metadata folder. The file name is the
-/// media base name plus the lowercased lyric format.
+/// media base name plus the lowercased lyric format. A target that leaves its
+/// folder is dropped (`PathHelper.IsContainedIn`, `LyricManager.cs:407,416`).
 pub(crate) fn save_targets(
     media_path: &Path,
     save_with_media: bool,
@@ -387,23 +388,39 @@ pub(crate) fn save_targets(
     format: &str,
 ) -> Vec<PathBuf> {
     let name = sidecar_file_name(media_path, &normalise_format(format));
-    let mut targets = Vec::new();
-    if save_with_media && let Some(folder) = media_path.parent() {
-        targets.push(folder.join(&name));
-    }
-    if let Some(dir) = metadata_dir {
-        targets.push(dir.join(&name));
-    }
-    targets
+    let media_folder = media_path.parent().filter(|_| save_with_media);
+    [media_folder, metadata_dir]
+        .into_iter()
+        .flatten()
+        // An empty folder (a bare file name) has nothing to contain
+        // the target; `is_contained_in` would panic on it.
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .filter_map(|folder| {
+            let target = folder.join(&name);
+            let contained = ferrofin_util::path_helper::is_contained_in(
+                &folder.to_string_lossy(),
+                &target.to_string_lossy(),
+            );
+            if !contained {
+                tracing::debug!(path = %target.display(), "refusing a lyric save path outside its folder");
+            }
+            contained.then_some(target)
+        })
+        .collect()
 }
 
 /// Writes `content` to the first path that accepts it and returns that path
 /// — port of `TrySaveToFiles`, which returns after the first successful write
-/// and only throws when every candidate failed.
+/// and only throws when every candidate failed. With no target at all,
+/// `TrySaveLyric` logs an error and saves nothing (`None`), without failing.
 pub(crate) fn try_save_to_files<'a>(
     targets: &'a [PathBuf],
     content: &str,
-) -> Result<&'a Path, ServiceError> {
+) -> Result<Option<&'a Path>, ServiceError> {
+    if targets.is_empty() {
+        tracing::error!("lyric could not be saved because the resulting paths were invalid");
+        return Ok(None);
+    }
     let mut last_error: Option<std::io::Error> = None;
     for target in targets {
         let written = target
@@ -411,12 +428,12 @@ pub(crate) fn try_save_to_files<'a>(
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::write(target, content));
         match written {
-            Ok(()) => return Ok(target),
+            Ok(()) => return Ok(Some(target)),
             Err(e) => last_error = Some(e),
         }
     }
     Err(last_error.map_or_else(
-        || ServiceError::backend("no lyric save path is configured"),
+        || ServiceError::backend("write lyrics"),
         |e| ServiceError::backend(format!("write lyrics: {e}")),
     ))
 }
@@ -572,8 +589,9 @@ impl LyricManager for FerrofinLyricManager {
         let targets = self
             .save_targets(item_id, &item, path, &response.format)
             .await;
-        let saved = try_save_to_files(&targets, &response.text)?;
-        tracing::info!(path = %saved.display(), "saved lyrics");
+        if let Some(saved) = try_save_to_files(&targets, &response.text)? {
+            tracing::info!(path = %saved.display(), "saved lyrics");
+        }
         Ok(Some(dto))
     }
 
@@ -610,8 +628,9 @@ impl LyricManager for FerrofinLyricManager {
             return Ok(None);
         };
         let targets = self.save_targets(item_id, &item, path, format).await;
-        let saved = try_save_to_files(&targets, lyrics)?;
-        tracing::info!(path = %saved.display(), "saved lyrics");
+        if let Some(saved) = try_save_to_files(&targets, lyrics)? {
+            tracing::info!(path = %saved.display(), "saved lyrics");
+        }
         Ok(Some(dto))
     }
 
@@ -1083,7 +1102,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        FerrofinLyricManager, parse_by_name, parse_lrc, parse_txt, provider_id, split_lines,
+        FerrofinLyricManager, parse_by_name, parse_lrc, parse_txt, provider_id, save_targets,
+        split_lines,
     };
     use crate::test_support;
 
@@ -2045,6 +2065,44 @@ mod tests {
                 .expect("movie")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn save_targets_drop_paths_that_leave_their_folder() {
+        // `TrySaveLyric` keeps a target only while `PathHelper.IsContainedIn`
+        // holds for its folder (`LyricManager.cs:407,416`).
+        let media = std::path::Path::new("/music/album/song.flac");
+        let meta = std::path::Path::new("/meta/library/ab/abcd");
+        assert_eq!(
+            save_targets(media, true, Some(meta), "lrc"),
+            [
+                PathBuf::from("/music/album/song.lrc"),
+                PathBuf::from("/meta/library/ab/abcd/song.lrc"),
+            ]
+        );
+        assert_eq!(
+            save_targets(media, false, Some(meta), "lrc"),
+            [PathBuf::from("/meta/library/ab/abcd/song.lrc")]
+        );
+        assert!(save_targets(media, true, Some(meta), "x/../../../evil").is_empty());
+        // Each target is checked against its own folder: `..` stops at the
+        // root, so the same name stays inside `/` but leaves the metadata folder.
+        assert_eq!(
+            save_targets(
+                std::path::Path::new("/song.flac"),
+                true,
+                Some(meta),
+                "x/../../evil"
+            ),
+            [PathBuf::from("/song.x/../../evil")]
+        );
+        // A folder-less media path has no media-folder target to check.
+        assert_eq!(
+            save_targets(std::path::Path::new("song.flac"), true, Some(meta), "lrc"),
+            [PathBuf::from("/meta/library/ab/abcd/song.lrc")]
+        );
+        // No target left: `TrySaveLyric` logs and saves nothing, without failing.
+        assert_eq!(super::try_save_to_files(&[], "x").expect("no error"), None);
     }
 
     // ---------------------------------------------------------------- parsers

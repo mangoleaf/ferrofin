@@ -823,10 +823,7 @@ pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
 /// but not against [`UPSTREAM_TAG`], and the parity line counts them apart.
 /// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
 /// from this list. `v12.0-rc7` is commit `4910aafa1a`.
-pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
-    ("get", "/Shows/NextUp", "v12.0-rc7"),
-    ("get", "/UserItems/Resume", "v12.0-rc7"),
-];
+pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -884,7 +881,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
                (TVSeriesManager) → next_up_service.rs (NextUpService)",
-        date: "2026-09-02",
+        date: "2026-10-19",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
@@ -895,10 +892,8 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
-            "ApplyAccessFiltering's parental-rating / blocked-tag row filter is not applied — \
-         no Ferrofin query path applies InternalItemsQuery.max_parental_rating / \
-         block_unrated_items / exclude_inherited_tags yet; NextUp inherits that \
-         cross-cutting gap (its alternate-version / owned-item exclusion is applied).",
+            VERSION_RESUME_DATA_DIVERGENCE,
+            USER_DATA_RETIRED_KEYS_DIVERGENCE,
         ],
     },
     Verified {
@@ -961,7 +956,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
                get_items → translate_query.rs (push_resumable_predicate, \
                push_order_expression DatePlayed)",
-        date: "2026-09-03",
+        date: "2026-10-19",
         divergences: RESUME_DIVERGENCES,
     },
 ];
@@ -1025,19 +1020,29 @@ const UNKNOWN_PARENT_ID_DIVERGENCE: &str = "A `parentId` naming no item: v12's G
 /// does differently from v12's `ItemsController.GetResumeItems` +
 /// `TranslateQuery`'s `IsResumable` block.
 const RESUME_DIVERGENCES: &[&str] = &[
-    "Video.GetAllVersions spans the local alternates of every version in the group; \
-     Ferrofin groups by COALESCE(PrimaryVersionId, Id), which covers a primary's local and \
-     merged versions but not the local versions of a version MERGED onto another primary \
-     (they point at the merged version), so the per-version resumable test, the \
-     most-recently-played dedupe and the DatePlayed order miss those. Un-defer path: group \
-     by the primary of the version's primary (one more level) in translate_query.",
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
-    "GetAccessFilteredLeafItemsQuery's parental-rating / blocked-tag filter on the leaf \
-     sets is not applied (the cross-cutting gap recorded on /Shows/NextUp); its \
-     owned-item / alternate-version rule is.",
+    VERSION_RESUME_DATA_DIVERGENCE,
+    USER_DATA_RETIRED_KEYS_DIVERGENCE,
+    "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
+     count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
+     through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
+     alternate-version arm in item_count_service's played statements (gl-441).",
 ];
+
+/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
+const VERSION_RESUME_DATA_DIVERGENCE: &str = "VersionResumeData.ApplyTo is not ported \
+     (DtoService via UserDataManager.GetResumeUserDataBatch): a returned video's UserData \
+     is its own row, where v12 takes Played, LastPlayedDate and the resume position from \
+     the most recently played version of its group. The write-side propagate_played_state \
+     covers finishing a version through playback. Fix path: gl-47.";
+
+/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
+const USER_DATA_RETIRED_KEYS_DIVERGENCE: &str = "v12.2 SaveUserData also rewrites the \
+     user's rows under keys the item no longer reports; Ferrofin writes the current keys \
+     only, so a stale-key row can keep an item played or in progress here. Fix path: \
+     gl-398.";
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

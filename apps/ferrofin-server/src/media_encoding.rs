@@ -575,10 +575,10 @@ impl AttachmentIo for FfmpegAttachmentIo {
     }
 
     fn attachment_path(&self, media_source_id: &str, file_name: &str) -> String {
-        // The path manager refuses a file name that is not a plain leaf
-        // (`..`, separators). Such a name came from the file's own `filename`
-        // tag, so it must never reach the command line as-is: fall back to a
-        // sanitized leaf inside the cache folder rather than the raw name.
+        // The path manager keeps a name's leaf and refuses a name with none
+        // (`..`, a trailing separator). Such a name came from the file's own
+        // `filename` tag, so it must never reach the command line as-is: fall
+        // back to a sanitized leaf inside the cache folder rather than the raw name.
         self.path_manager
             .attachment_path(media_source_id, file_name)
             .or_else(|| {
@@ -1233,20 +1233,20 @@ mod tests {
     #[test]
     fn attachment_path_never_lets_a_traversal_file_name_leave_the_cache_folder() {
         // The name comes from the file's own `filename` tag; the path manager
-        // refuses anything but a plain leaf, and the fallback must stay inside
-        // the cache folder rather than hand the raw name to ffmpeg.
+        // keeps only its leaf, and the fallback for a name with no leaf must
+        // stay inside the cache folder rather than hand the raw name to ffmpeg.
         let (_, paths) = config_and_paths();
         let io = FfmpegAttachmentIo {
             path_manager: Arc::new(ferrofin_core::path_manager::FerrofinPathManager::new(paths)),
         };
         let id = "d37ecb9d75b0c0a8e9ecb0a864ec670e";
         let folder = io.attachment_folder_path(id).expect("guid folder");
-        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf"] {
+        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf", "a/..", "a/"] {
             let path = io.attachment_path(id, evil);
             assert!(path.starts_with(&folder), "{evil} -> {path}");
             // A plain leaf: no separator after the folder, so `..` is inert.
             assert!(
-                !path[folder.len() + 1..].contains(['/', '\\']),
+                !path[folder.len() + 1..].contains(std::path::is_separator),
                 "{evil} -> {path}"
             );
         }

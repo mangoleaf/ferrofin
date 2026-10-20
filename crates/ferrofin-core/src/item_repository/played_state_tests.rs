@@ -4,12 +4,11 @@
 //!
 //! The first two groups transliterate upstream's xUnit oracles (v12.2), fixture
 //! for fixture: all of `BaseItemRepositoryPlayedOrderingTests.cs`, and the four
-//! `IsPlayed` facts of `BaseItemRepositoryPlayedVersionTests.cs`. Its other two
-//! facts test other code and are open work items there:
+//! `IsPlayed` facts and the `IsResumable` fact of
+//! `BaseItemRepositoryPlayedVersionTests.cs`. Its remaining fact tests other
+//! code and is an open work item there:
 //! `GetIsPlayed_CountsASeriesWatchedThroughAnEpisodeAlternateVersion`
-//! (`ItemRepository::get_is_played`) and
-//! `IsResumable_DropsASeriesWhoseLastEpisodeWasPlayedThroughAnAlternateVersion`
-//! (the version-group rule in the resumable roll-up). The last group covers
+//! (`ItemRepository::get_is_played`). The last group covers
 //! what Ferrofin's data adds: a folder's own played row, a series reached
 //! through a box set, versions whose primary is in another library, the
 //! access-filtered leaf set, and the by-name counts scope.
@@ -452,6 +451,52 @@ async fn is_played_counts_a_series_watched_through_an_episode_alternate_version(
     assert_eq!(played, HashSet::from([e, g]));
     let unplayed = played_set(&lib.repository, &lib.user, BaseItemKind::Series, false).await;
     assert_eq!(unplayed, HashSet::from([f, h]));
+}
+
+/// Upstream `IsResumable_DropsASeriesWhoseLastEpisodeWasPlayedThroughAnAlternateVersion`:
+/// the resumable roll-up's played and unplayed arms read the leaf's version
+/// group (`BuildLeafIsPlayedFilter`), so a series whose last episode was
+/// watched through its alternate has nothing left and is not half finished.
+#[tokio::test]
+async fn is_resumable_drops_a_series_whose_last_episode_was_played_through_an_alternate() {
+    let lib = Versions::new().await;
+    let [_, _, g, h] = lib.series;
+    let resumable: HashSet<Uuid> = ids(
+        &lib.repository,
+        &InternalItemsQuery {
+            user: Some(lib.user.clone()),
+            is_resumable: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .into_iter()
+    .collect();
+    assert!(!resumable.contains(&g));
+    assert!(resumable.contains(&h));
+}
+
+/// The played arm of the same roll-up: a series whose one watched episode was
+/// watched only through its alternate (hidden behind its primary) still has a
+/// played leaf, so with an unwatched episode left it is half finished.
+#[tokio::test]
+async fn is_resumable_counts_an_episode_played_only_through_its_alternate() {
+    let (db, repository, user, user_id) = library().await;
+    let mut seed = Seed::default();
+    let series = seed.series(&db, "Watched via 4K", 0, 2).await;
+    let first = seed.ancestors[0].0;
+    seed.version(&db, first, BaseItemKind::Episode, true).await;
+    seed.write(&db, user_id).await;
+    let resumable = ids(
+        &repository,
+        &InternalItemsQuery {
+            user: Some(user),
+            is_resumable: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resumable.contains(&series));
 }
 
 /// The sort's leaf arm is the filter's: a movie watched only through its
