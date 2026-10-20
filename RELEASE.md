@@ -61,6 +61,7 @@ from.
    docker build -t ferrofin:vX.Y.Z-rc .                    # the frozen release commit
    docker pull ghcr.io/mangoleaf/ferrofin:vPREV            # the previous release
    python3 bench/gate.py ab ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+   python3 bench/gate.py scan ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
    ```
 
    - **What it runs.** Six runs in the order previous, candidate, previous, candidate,
@@ -79,6 +80,13 @@ from.
    - **Output.** `bench/runs/gate-ab-<date>-<time>/` holds `verdict.json`, `report.md` and a
      self-contained `report.html` that opens from disk. The command exits `1` when the gate
      blocks.
+   - **Scan and migration.** `gate.py scan` runs the same six-run order with
+     `bench/scan.py` in place of `run.sh`: a full library scan of the bench corpus on an
+     empty data dir, and the adoption boot of a fresh copy of its Jellyfin 10.11.8 database,
+     each timed with its peak anon memory (`bench/README.md`, "Scan and migration"). It
+     needs the same idle cores and the same test data (at least 10,000 items). A self-A/B
+     of v1.3.2 took 20 minutes from start to report on the shared host. Output goes to
+     `bench/runs/gate-scan-<date>-<time>/` in the same form, and it exits `1` when it blocks.
 
    **Thresholds.** A cell regressed when the median of the candidate's runs exceeds the
    median of the previous release's runs by more than **both** thresholds of its row **and**
@@ -90,7 +98,8 @@ from.
    |---|---|---:|---:|
    | `screens` | screen p50 | 15 % | 2 ms |
    | `endpoints` | endpoint p50 | 15 % | 0.5 ms |
-   | `memory` | peak (under load) and steady idle anon memory | 25 % | 40 MiB |
+   | `memory` | peak (under load) and steady idle anon memory; scan and migration peak anon | 25 % | 40 MiB |
+   | `scan` | library-scan and adoption-migration wall time | 15 % | 1 s |
 
    A `[cells."…"]` entry in `gate.toml` overrides its row for a single cell. Change the table
    only by a reviewed commit, after re-measuring the noise floor with
@@ -101,8 +110,9 @@ from.
    side's evidence is flagged, a side has missing values, or the candidate's responses
    differ from the previous release's. Either blocks the release until it is fixed or the
    maintainer accepts it. Gated cells are the screen and endpoint p50s at the unloaded and
-   loaded levels, plus peak and steady memory. The stress level and endpoint cells whose
-   medians are both under 1 ms are reported but never block.
+   loaded levels, plus peak and steady memory, and all four cells of the scan session. The
+   stress level and endpoint cells whose medians are both under 1 ms are reported but never
+   block.
 
    **The Jellyfin comparison is publication only.** The three-server `bench/run.sh` runs
    (Ferrofin and both Jellyfins, three runs, median) produce the published tables in the root
@@ -128,9 +138,9 @@ from.
 4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
    Watch it finish, then verify (below).
 5. **Record the results** after the tag, so the record never moves the frozen head: attach
-   the benchmark gate's `report.md` to the release PR (release branch → `main`), or to the
-   GitHub Release for a patch release from `main`, and update the adoption test record in
-   `adoption/README.md` with the link to the green `Adoption` run from step 2.
+   the benchmark gate's `report.md` files (A/B and scan) to the release PR (release branch →
+   `main`), or to the GitHub Release for a patch release from `main`, and update the adoption
+   test record in `adoption/README.md` with the link to the green `Adoption` run from step 2.
    After a patch release from `main`, merge `main` into the open release branch so the fix
    is carried forward.
 
