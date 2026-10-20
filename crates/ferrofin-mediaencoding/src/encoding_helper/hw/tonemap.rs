@@ -50,41 +50,47 @@ pub const DEFAULT_TONEMAP_FORMAT: &str = "nv12";
 /// ordinary HDR10, so a decoder that ignores the Dolby Vision RPU still gets a
 /// usable HDR picture — which is what makes them tonemappable by hardware that
 /// knows nothing about Dolby Vision.
+///
+/// Like every range check here it reads the range the stream's metadata
+/// gives ([`MediaStream::video_range_type`]), as upstream's computed
+/// `VideoRangeType` does, not the field the DTO caches.
 #[must_use]
 pub fn is_dovi_with_hdr10_bl(stream: Option<&MediaStream>) -> bool {
-    matches!(
-        stream.and_then(|s| s.video_range_type),
-        Some(
+    stream.is_some_and(|s| {
+        matches!(
+            s.video_range_type(),
             VideoRangeType::DoviWithHdr10
                 | VideoRangeType::DoviWithEl
                 | VideoRangeType::DoviWithHdr10Plus
                 | VideoRangeType::DoviWithElhdr10Plus
                 | VideoRangeType::DoviInvalid
         )
-    )
+    })
 }
 
 /// Whether the stream carries Dolby Vision at all. Port of `IsDovi`.
 #[must_use]
 pub fn is_dovi(stream: Option<&MediaStream>) -> bool {
     is_dovi_with_hdr10_bl(stream)
-        || matches!(
-            stream.and_then(|s| s.video_range_type),
-            Some(VideoRangeType::Dovi | VideoRangeType::DoviWithHlg | VideoRangeType::DoviWithSdr)
-        )
+        || stream.is_some_and(|s| {
+            matches!(
+                s.video_range_type(),
+                VideoRangeType::Dovi | VideoRangeType::DoviWithHlg | VideoRangeType::DoviWithSdr
+            )
+        })
 }
 
 /// Whether the stream carries HDR10+ dynamic metadata. Port of `IsHdr10Plus`.
 #[must_use]
 pub fn is_hdr10_plus(stream: Option<&MediaStream>) -> bool {
-    matches!(
-        stream.and_then(|s| s.video_range_type),
-        Some(
+    stream.is_some_and(|s| {
+        matches!(
+            s.video_range_type(),
             VideoRangeType::Hdr10Plus
                 | VideoRangeType::DoviWithHdr10Plus
                 | VideoRangeType::DoviWithElhdr10Plus
         )
-    )
+    })
 }
 
 /// Whether the software `tonemapx` filter can run. Port of
@@ -100,7 +106,7 @@ pub fn is_sw_tonemap_available(caps: &FfmpegCapabilities, stream: Option<&MediaS
     };
     video_color_bit_depth(Some(stream)) >= 10
         && caps.supports_filter("tonemapx")
-        && stream.video_range == Some(VideoRange::Hdr)
+        && stream.video_range() == VideoRange::Hdr
 }
 
 /// Whether the Vulkan `libplacebo` tonemap can run. Port of
@@ -118,7 +124,7 @@ pub fn is_vulkan_hw_tonemap_available(
         return false;
     };
     options.enable_tonemapping
-        && stream.video_range == Some(VideoRange::Hdr)
+        && stream.video_range() == VideoRange::Hdr
         && video_color_bit_depth(Some(stream)) == 10
 }
 
@@ -146,8 +152,8 @@ pub fn is_intel_vpp_tonemap_available(
     {
         return false;
     }
-    stream.video_range == Some(VideoRange::Hdr)
-        && (stream.video_range_type == Some(VideoRangeType::Hdr10)
+    stream.video_range() == VideoRange::Hdr
+        && (stream.video_range_type() == VideoRangeType::Hdr10
             || is_hdr10_plus(Some(stream))
             || is_dovi_with_hdr10_bl(Some(stream)))
 }
@@ -170,11 +176,11 @@ pub fn is_videotoolbox_tonemap_available(
     if !options.enable_video_toolbox_tonemapping || video_color_bit_depth(Some(stream)) < 10 {
         return false;
     }
-    stream.video_range == Some(VideoRange::Hdr)
-        && (stream.video_range_type == Some(VideoRangeType::Hdr10)
+    stream.video_range() == VideoRange::Hdr
+        && (stream.video_range_type() == VideoRangeType::Hdr10
             || is_hdr10_plus(Some(stream))
             || is_dovi_with_hdr10_bl(Some(stream))
-            || stream.video_range_type == Some(VideoRangeType::Hlg))
+            || stream.video_range_type() == VideoRangeType::Hlg)
 }
 
 /// The hardware tonemap filter for a backend suffix. Port of
@@ -367,6 +373,7 @@ fn lower(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::encoder::FfmpegVersion;
+    use crate::encoding_helper::test_streams::with_range;
     use rstest::rstest;
 
     // Hand-derived from the C# (10.11.z 337-438, 1368-1402, 3600-3742,
@@ -380,14 +387,16 @@ mod tests {
             .build()
     }
 
+    /// A 10-bit HEVC stream whose metadata gives `range_type`.
     fn hdr(range_type: VideoRangeType) -> MediaStream {
-        MediaStream {
-            codec: Some("hevc".to_owned()),
-            pixel_format: Some("yuv420p10le".to_owned()),
-            video_range: Some(VideoRange::Hdr),
-            video_range_type: Some(range_type),
-            ..MediaStream::default()
-        }
+        with_range(
+            MediaStream {
+                codec: Some("hevc".to_owned()),
+                pixel_format: Some("yuv420p10le".to_owned()),
+                ..MediaStream::default()
+            },
+            range_type,
+        )
     }
 
     // ----- range classifiers -------------------------------------------------
@@ -423,6 +432,21 @@ mod tests {
         assert_eq!(is_hdr10_plus(Some(&s)), hdr10_plus, "{range_type:?}");
     }
 
+    /// The classifiers read the range type the stream's metadata gives, as
+    /// upstream's computed `VideoRangeType` does: a stream nobody populated
+    /// is still Dolby Vision with HDR10+ (gl-268).
+    #[test]
+    fn the_range_classifiers_derive_the_range_type() {
+        let mut stream = with_range(MediaStream::default(), VideoRangeType::DoviWithHdr10Plus);
+        assert_eq!(stream.video_range_type, None, "not populated");
+        assert!(is_dovi_with_hdr10_bl(Some(&stream)));
+        assert!(is_dovi(Some(&stream)));
+        assert!(is_hdr10_plus(Some(&stream)));
+        // A cached value that disagrees with the metadata is not read either.
+        stream.video_range_type = Some(VideoRangeType::Sdr);
+        assert!(is_dovi(Some(&stream)));
+    }
+
     #[test]
     fn no_stream_is_no_range() {
         assert!(!is_dovi_with_hdr10_bl(None));
@@ -455,8 +479,7 @@ mod tests {
         let mut eight = s.clone();
         eight.pixel_format = Some("yuv420p".to_owned());
         assert!(!is_sw_tonemap_available(&caps, Some(&eight)));
-        let mut sdr = s.clone();
-        sdr.video_range = Some(VideoRange::Sdr);
+        let sdr = hdr(VideoRangeType::Sdr);
         assert!(!is_sw_tonemap_available(&caps, Some(&sdr)));
         assert!(!is_sw_tonemap_available(&caps, None));
     }

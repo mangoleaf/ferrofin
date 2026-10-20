@@ -28,6 +28,7 @@ use std::fmt::Write as _;
 
 use ferrofin_mediaencoding::EncodingJobInfo;
 use ferrofin_mediaencoding::encoding_helper::helper::normalize_transcoding_level;
+use ferrofin_mediaencoding::encoding_helper::hw::tonemap::{is_dovi, is_hdr10_plus};
 use ferrofin_model::data::{VideoRange, VideoRangeType};
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::entities_media::MediaStream;
@@ -248,43 +249,6 @@ fn url_encode(value: &str) -> String {
 /// Whether `codec` is the stream-copy sentinel (`EncodingHelper.IsCopyCodec`).
 fn is_copy(codec: Option<&str>) -> bool {
     EncodingJobInfo::is_copy_codec(codec)
-}
-
-/// `EncodingHelper.IsDoviWithHdr10Bl`.
-fn is_dovi_with_hdr10_bl(stream: Option<&MediaStream>) -> bool {
-    stream.is_some_and(|s| {
-        matches!(
-            s.video_range_type(),
-            VideoRangeType::DoviWithHdr10
-                | VideoRangeType::DoviWithEl
-                | VideoRangeType::DoviWithHdr10Plus
-                | VideoRangeType::DoviWithElhdr10Plus
-                | VideoRangeType::DoviInvalid
-        )
-    })
-}
-
-/// `EncodingHelper.IsDovi`.
-fn is_dovi(stream: Option<&MediaStream>) -> bool {
-    is_dovi_with_hdr10_bl(stream)
-        || stream.is_some_and(|s| {
-            matches!(
-                s.video_range_type(),
-                VideoRangeType::Dovi | VideoRangeType::DoviWithHlg | VideoRangeType::DoviWithSdr
-            )
-        })
-}
-
-/// `EncodingHelper.IsHdr10Plus`.
-fn is_hdr10_plus(stream: Option<&MediaStream>) -> bool {
-    stream.is_some_and(|s| {
-        matches!(
-            s.video_range_type(),
-            VideoRangeType::Hdr10Plus
-                | VideoRangeType::DoviWithHdr10Plus
-                | VideoRangeType::DoviWithElhdr10Plus
-        )
-    })
 }
 
 /// Builds the master playlist text for `plan` + `request`.

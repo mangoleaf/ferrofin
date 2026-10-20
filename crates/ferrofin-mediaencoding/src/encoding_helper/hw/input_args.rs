@@ -70,11 +70,11 @@ pub fn is_hw_tonemap_available(ctx: &DecodeContext<'_>, video_decoder: &str) -> 
     if !ctx.options.enable_tonemapping || video_color_bit_depth(Some(stream)) < 10 {
         return false;
     }
-    if stream.video_range != Some(VideoRange::Hdr) {
+    if stream.video_range() != VideoRange::Hdr {
         return false;
     }
 
-    if stream.video_range_type == Some(VideoRangeType::Dovi) {
+    if stream.video_range_type() == VideoRangeType::Dovi {
         // hevc_rkmpp learned to parse Dolby Vision RPUs in ffmpeg 7.1.1.
         let is_rkmpp = contains(video_decoder, "rkmpp");
         if is_rkmpp
@@ -466,6 +466,7 @@ mod tests {
     use crate::encoder::{FfmpegVersion, REQUIRED_DECODERS, REQUIRED_FILTERS};
     use crate::encoding_helper::hw::capabilities::{FfmpegCapabilities, Platform};
     use crate::encoding_helper::hw::decoder::RequestedSize;
+    use crate::encoding_helper::test_streams::with_range;
     use ferrofin_model::configuration::EncodingOptions;
     use ferrofin_model::entities::HardwareAccelerationType;
 
@@ -789,9 +790,7 @@ mod tests {
         // No hardware decode for this codec, so the decoder is software.
         options.hardware_decoding_codecs = vec!["vc1".to_owned()];
 
-        let mut s = stream("hevc", "yuv420p10le");
-        s.video_range = Some(VideoRange::Hdr);
-        s.video_range_type = Some(VideoRangeType::Hdr10);
+        let s = with_range(stream("hevc", "yuv420p10le"), VideoRangeType::Hdr10);
 
         let out = args_for(&ctx(&caps, &options, &s), "hevc_vaapi", node());
         assert_eq!(
@@ -815,9 +814,7 @@ mod tests {
         options.enable_tonemapping = true;
         options.hardware_decoding_codecs = vec!["vc1".to_owned()];
 
-        let mut s = stream("hevc", "yuv420p10le");
-        s.video_range = Some(VideoRange::Hdr);
-        s.video_range_type = Some(VideoRangeType::Hdr10);
+        let s = with_range(stream("hevc", "yuv420p10le"), VideoRangeType::Hdr10);
 
         let out = args_for(&ctx(&caps, &options, &s), "hevc_vaapi", node());
         assert_eq!(
@@ -839,10 +836,12 @@ mod tests {
 
     /// A 10-bit HDR10 source.
     fn hdr_stream() -> MediaStream {
-        let mut s = stream("hevc", "yuv420p10le");
-        s.video_range = Some(VideoRange::Hdr);
-        s.video_range_type = Some(VideoRangeType::Hdr10);
-        s
+        with_range(stream("hevc", "yuv420p10le"), VideoRangeType::Hdr10)
+    }
+
+    /// Dolby Vision profile 5 (no compatible base layer).
+    fn dovi_stream() -> MediaStream {
+        with_range(stream("hevc", "yuv420p10le"), VideoRangeType::Dovi)
     }
 
     #[test]
@@ -857,8 +856,7 @@ mod tests {
         assert!(!is_hw_tonemap_available(&ctx(&caps, &off, &s), ""));
 
         // An SDR source has nothing to tonemap.
-        let mut sdr = s.clone();
-        sdr.video_range = Some(VideoRange::Sdr);
+        let sdr = with_range(stream("hevc", "yuv420p10le"), VideoRangeType::Sdr);
         assert!(!is_hw_tonemap_available(&ctx(&caps, &on, &sdr), ""));
 
         // An 8-bit source is not HDR in practice.
@@ -871,8 +869,7 @@ mod tests {
     fn dolby_vision_needs_a_decoder_that_can_read_the_rpu() {
         let caps = caps(Platform::Linux);
         let options = tonemap_options(HardwareAccelerationType::vaapi);
-        let mut s = hdr_stream();
-        s.video_range_type = Some(VideoRangeType::Dovi);
+        let s = dovi_stream();
         let c = ctx(&caps, &options, &s);
 
         // The software decoder and these four accelerators surface the RPU.
@@ -901,8 +898,7 @@ mod tests {
                 .build()
         };
         let options = tonemap_options(HardwareAccelerationType::rkmpp);
-        let mut s = hdr_stream();
-        s.video_range_type = Some(VideoRangeType::Dovi);
+        let s = dovi_stream();
 
         let new = build(FfmpegVersion::with_build(7, 1, 1));
         assert!(is_hw_tonemap_available(

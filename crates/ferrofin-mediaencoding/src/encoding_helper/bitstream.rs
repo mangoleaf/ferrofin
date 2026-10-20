@@ -92,7 +92,7 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     let Some(video) = state.video_stream.as_ref() else {
         return HdrMetadataRemoval::None;
     };
-    if video.video_range != Some(VideoRange::Hdr) {
+    if video.video_range() != VideoRange::Hdr {
         return HdrMetadataRemoval::None;
     }
     let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
@@ -109,23 +109,23 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     let has_dovi = wants(VideoRangeType::Dovi);
     let has_dovi_with_el = wants(VideoRangeType::DoviWithEl);
     let has_dovi_with_el_hdr10plus = wants(VideoRangeType::DoviWithElhdr10Plus);
-    let range_type = video.video_range_type;
+    let range_type = video.video_range_type();
 
     let mut remove_hdr10plus = false;
     // Case 1: the client plays HDR10 but not an enhancement layer, and this
     // file has one.
     let mut remove_dovi =
-        !has_dovi_with_el && has_hdr10 && range_type == Some(VideoRangeType::DoviWithEl);
+        !has_dovi_with_el && has_hdr10 && range_type == VideoRangeType::DoviWithEl;
 
     // Case 2: a Dolby Vision player refuses a broken DOVI configuration. A
     // client that never claimed DOVI is deliberately left alone — an HDR10
     // player ignores metadata it does not understand rather than crashing, so
     // copying the bad data through is safe and cheaper.
-    remove_dovi = remove_dovi || (has_dovi && range_type == Some(VideoRangeType::DoviInvalid));
+    remove_dovi = remove_dovi || (has_dovi && range_type == VideoRangeType::DoviInvalid);
 
     // Both an enhancement layer and HDR10+ in one file. A client that handles
     // EL but not the combination loses HDR10+; anything else loses DOVI.
-    if range_type == Some(VideoRangeType::DoviWithElhdr10Plus) {
+    if range_type == VideoRangeType::DoviWithElhdr10Plus {
         remove_hdr10plus = has_dovi_with_el && !has_dovi_with_el_hdr10plus;
         remove_dovi = remove_dovi || !remove_hdr10plus;
     }
@@ -136,7 +136,7 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
 
     // A Dolby Vision player is confused by coexisting HDR10+ metadata.
     remove_hdr10plus =
-        remove_hdr10plus || (has_dovi && range_type == Some(VideoRangeType::DoviWithHdr10Plus));
+        remove_hdr10plus || (has_dovi && range_type == VideoRangeType::DoviWithHdr10Plus);
     if remove_hdr10plus {
         HdrMetadataRemoval::RemoveHdr10Plus
     } else {
@@ -353,6 +353,7 @@ pub fn audio_bit_stream_arguments(
 mod tests {
     use super::*;
     use crate::encoding_helper::hw::capabilities::FfmpegCapabilities;
+    use crate::encoding_helper::test_streams::with_range;
     use ferrofin_model::entities::MediaStreamType;
     use rstest::rstest;
 
@@ -360,14 +361,14 @@ mod tests {
     // transliteration written without reference to this file.
 
     fn video(codec: &str, range_type: VideoRangeType) -> MediaStream {
-        MediaStream {
-            codec: Some(codec.to_owned()),
-            index: 0,
-            stream_type: MediaStreamType::Video,
-            video_range: Some(VideoRange::Hdr),
-            video_range_type: Some(range_type),
-            ..MediaStream::default()
-        }
+        with_range(
+            MediaStream {
+                codec: Some(codec.to_owned()),
+                index: 0,
+                ..MediaStream::default()
+            },
+            range_type,
+        )
     }
 
     /// A job carrying `streams`, with nothing else set that matters here.
@@ -507,11 +508,11 @@ mod tests {
     }
 
     #[test]
-    fn an_sdr_stream_never_reaches_the_decision_at_all() {
-        // The range check comes first, before the client's list is even read.
-        let mut stream = video("hevc", VideoRangeType::DoviWithElhdr10Plus);
-        stream.video_range = Some(VideoRange::Sdr);
-        let state = state_with(stream, &["HDR10"]);
+    fn an_sdr_dolby_vision_stream_is_left_alone() {
+        // Dolby Vision on an SDR base layer needs nothing removed. The early
+        // range check only short-cuts it: no SDR range type meets a removal
+        // rule here.
+        let state = state_with(video("hevc", VideoRangeType::DoviWithSdr), &["HDR10"]);
         assert_eq!(
             should_remove_dynamic_hdr_metadata(&state),
             HdrMetadataRemoval::None
