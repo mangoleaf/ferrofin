@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import urllib.error
 
 import gate
+import oracle
 import report
 import coldstart
 import mem_sample
@@ -1369,6 +1370,116 @@ class GateTests(unittest.TestCase):
         by_type['Episode'] = 7489
         with self.assertRaisesRegex(RuntimeError, r"fewer items.*'episodes': '7489 \(fixture 7490\)'"):
             scan.counts(api, 'u', summary)
+
+    def test_a_gate_run_refuses_a_stale_oracle_pin_before_anything_starts(self):
+        out = self.root / 'session'
+        with patch.object(gate.oracle, 'check', return_value=({'tag': 'v12.2', 'image': 'jf@sha256:x'},
+                                                              'Jellyfin v12.3 is out; the oracle pin is v12.2')), \
+                patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
+            with self.assertRaisesRegex(SystemExit, 'v12.3 is out'):
+                gate.main(['ab', 'old', 'new', '--out', str(out)])
+        self.assertFalse(out.exists())
+
+    def test_a_gate_run_records_the_oracle_it_checked_in_gate_json(self):
+        out = self.root / 'session'
+        pin = {'tag': 'v12.2', 'image': 'jf@sha256:x'}
+        with patch.object(gate.oracle, 'check', return_value=(pin, None)), \
+                patch.object(gate, 'image_ref', return_value='sha256:img'), \
+                patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
+            self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out)]), 0)
+        self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
+
+    def test_the_session_report_names_the_oracle(self):
+        out = self.session('ab', [10, 10, 10, 10, 10, 10])
+        self.edit(out / 'gate.json', lambda p: p.update(oracle={'tag': 'v12.2', 'image': 'jf@sha256:abc'}))
+        gate.render(str(out))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', (out / 'report.html').read_text())
+
+
+class OracleTests(unittest.TestCase):
+    """The Jellyfin oracle pin (oracle.py): release-tag parsing, the stale-pin check, and where it shows."""
+    write, make_run, shapes = ReportTests.write, ReportTests.make_run, ReportTests.shapes
+    LS_REMOTE = '\n'.join(f'{"0" * 40}\trefs/tags/{t}' for t in (
+        'v10.11.8', 'v10.11.11', 'v12.0-rc7', 'v12.0', 'v12.0^{}', 'v12.1', 'v12.2', 'v12.3-rc1', 'nightly'))
+
+    def test_release_tags_skip_release_candidates_peeled_refs_and_non_versions(self):
+        self.assertEqual(sorted(oracle.release_tags(self.LS_REMOTE), key=oracle.version),
+                         ['v10.11.8', 'v10.11.11', 'v12.0', 'v12.1', 'v12.2'])
+        self.assertEqual(oracle.latest(oracle.release_tags(self.LS_REMOTE)), 'v12.2')
+
+    def test_versions_compare_numerically_and_ignore_trailing_zeros(self):
+        self.assertLess(oracle.version('v10.11.8'), oracle.version('v10.11.11'))
+        self.assertLess(oracle.version('v12.9'), oracle.version('v12.10'))
+        self.assertEqual(oracle.version('v12.2'), oracle.version('v12.2.0'))
+
+    def check(self, upstream, *tags):
+        listing = '\n'.join(f'{"0" * 40}\trefs/tags/{t}' for t in tags)
+        with patch.object(oracle, 'upstream_tag', return_value=upstream), \
+                patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+            return oracle.check(ls_remote=lambda: listing)
+
+    def test_a_pin_behind_the_latest_release_is_a_problem_and_equal_or_newer_is_not(self):
+        info, problem = self.check('v12.2', 'v12.1', 'v12.2', 'v12.3')
+        self.assertEqual(info, {'tag': 'v12.2', 'image': 'jf@sha256:abc'})
+        self.assertIn('Jellyfin v12.3 is out', problem)
+        self.assertIsNone(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3-rc1')[1])
+        self.assertIsNone(self.check('v12.2.0', 'v12.2')[1])
+        self.assertIsNone(self.check('v12.3', 'v12.2')[1])
+
+    def test_a_failed_or_empty_lookup_is_a_problem(self):
+        failures = (OSError('network unreachable'), subprocess.TimeoutExpired(['git'], 10),
+                    subprocess.CalledProcessError(128, ['git'], stderr='fatal: unable to access\n'))
+
+        for failure, reason in zip(failures, ('network unreachable', 'timed out', 'fatal: unable to access')):
+            def lookup():
+                raise failure
+            with self.subTest(reason), patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                    patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+                self.assertIn(reason, oracle.check(ls_remote=lookup)[1])
+        with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+            self.assertIn('no Jellyfin release tags', oracle.check(ls_remote=lambda: '')[1])
+
+    def test_matches_accepts_only_the_oracle_release_the_pinned_image_reports(self):
+        with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(oracle.main(['matches', '12.2.0']), 0)
+            self.assertEqual(oracle.main(['matches', '12.1.0']), 1)
+            self.assertEqual(oracle.main(['matches', '12.2.0-beta']), 1)
+        self.assertIn('reports Jellyfin 12.1.0, not the oracle v12.2', err.getvalue())
+
+    def test_gate_refuses_and_an_ad_hoc_run_warns_and_continues(self):
+        stale = ({'tag': 'v12.2', 'image': 'jf@sha256:abc'}, 'Jellyfin v12.3 is out')
+        for flags, code in (([], 0), (['--gate'], 1)):
+            with self.subTest(flags), patch.object(oracle, 'check', return_value=stale), \
+                    patch('sys.stdout', new_callable=io.StringIO) as out, \
+                    patch('sys.stderr', new_callable=io.StringIO) as err:
+                self.assertEqual(oracle.main(['check', *flags]), code)
+            self.assertEqual(json.loads(out.getvalue()), stale[0])
+            self.assertIn('v12.3 is out', err.getvalue())
+            self.assertIn('refusing' if code else 'warning', err.getvalue())
+
+    def test_upstream_tag_is_read_from_the_rust_source_and_fails_clearly_without_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / oracle.UPSTREAM_SOURCE
+            src.parent.mkdir(parents=True)
+            src.write_text('/// The tag.\npub const UPSTREAM_TAG: &str = "v12.2";\n')
+            self.assertEqual(oracle.upstream_tag(tmp), 'v12.2')
+            src.write_text('pub const OTHER: &str = "v1";\n')
+            with self.assertRaisesRegex(ValueError, 'UPSTREAM_TAG'):
+                oracle.upstream_tag(tmp)
+        self.assertRegex(oracle.upstream_tag(), r'^v\d+(\.\d+)*$')  # the real source still matches
+        self.assertIn('@sha256:', oracle.pinned_image())
+
+    def test_a_run_report_names_the_oracle_tag_and_digest(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        run = self.make_run('r')
+        meta = json.loads((run / 'run.json').read_text())
+        meta['oracle'] = {'tag': 'v12.2', 'image': 'jf@sha256:abc'}
+        (run / 'run.json').write_text(json.dumps(meta))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', report.render_html(report.build([str(run)])))
 
 
 if __name__ == '__main__':
