@@ -95,6 +95,7 @@ create-release:
       parallel:
         matrix:
           - SHARD: [core, heavy, rest]   # every shard; keep in step with the `coverage` job's matrix
+    - job: benchmark-report
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
@@ -303,6 +304,11 @@ sccache-creds:
     # published before lint/coverage pull it; ignored on runs where it's skipped.
     - job: ci-image
       optional: true
+  # Runs on failure too, in the job's container, so the sccache server started by
+  # .sccache-setup is still up. The creds are re-passed in case it is not. A no-op when
+  # sccache is off (no creds); the stats are informational, so never fail the job on them.
+  after_script:
+    - '[ -z "${SCCACHE_ACCESS_KEY:-}" ] || AWS_ACCESS_KEY_ID="$SCCACHE_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SCCACHE_SECRET_KEY" sccache --show-stats || true'
 
 # Install the sccache binary and enable it when Vault creds are present.
 # !reference'd as the first step of each rust job's before_script.
@@ -323,6 +329,17 @@ sccache-creds:
 # ---------------------------------------------------------------------------
 # test
 # ---------------------------------------------------------------------------
+benchmark-report:
+  stage: test
+  image: python:3.13-slim
+  script:
+    # Reporter correctness only; never run performance measurements on shared CI.
+    - python3 -m unittest discover -s bench -p test_report.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
 lint:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in

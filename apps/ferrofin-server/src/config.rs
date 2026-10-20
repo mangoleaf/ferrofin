@@ -137,6 +137,8 @@ struct FileConfig {
     shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
+    scan_directory_cache_records: Option<u32>,
+    scan_directory_cache_idle_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
@@ -208,6 +210,34 @@ pub struct ProviderEndpoints {
     pub audiodb: Option<String>,
     /// Replaces `https://lrclib.net` for scheduled-lyrics integration tests.
     pub lrclib: Option<String>,
+}
+
+/// The base URL [`Config::test_stub`] gives the remote providers a scan or a
+/// refresh reaches: a loopback port nothing serves (TCP 9, the discard port),
+/// so a test server's provider requests are refused at once instead of
+/// reaching the public internet.
+#[doc(hidden)]
+pub const OFFLINE_PROVIDER_URL: &str = "http://127.0.0.1:9";
+
+impl ProviderEndpoints {
+    /// Every provider here pointed at [`OFFLINE_PROVIDER_URL`]: what
+    /// [`Config::test_stub`] uses. A test that mocks one provider overrides
+    /// that field and keeps the rest offline with
+    /// `..ProviderEndpoints::offline()`.
+    #[must_use]
+    pub fn offline() -> Self {
+        let nowhere = Some(OFFLINE_PROVIDER_URL.to_owned());
+        Self {
+            tmdb: nowhere.clone(),
+            tmdb_images: nowhere.clone(),
+            omdb: nowhere.clone(),
+            opensubtitles: nowhere.clone(),
+            tvdb: nowhere.clone(),
+            fanart: nowhere.clone(),
+            audiodb: nowhere.clone(),
+            lrclib: nowhere,
+        }
+    }
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -424,6 +454,25 @@ pub struct Config {
     /// `FERROFIN_SCAN_PROBE_CONCURRENCY` env > `scan_probe_concurrency` in
     /// `config.toml` > default.
     pub scan_probe_concurrency: Option<u32>,
+
+    /// The directory listings one library scan keeps: dropped whole once
+    /// they hold this many records (a folder counts each entry plus one).
+    /// A scan lists each folder once and its items read that listing, so
+    /// this bounds the memory a huge library's scan spends on them; past it,
+    /// a folder is listed again. `None` = upstream's
+    /// `DirectoryService.MaxCachedRecords` (100 000). Resolved
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` env >
+    /// `scan_directory_cache_records` in `config.toml` > default; `0` is an
+    /// error.
+    pub scan_directory_cache_records: Option<u32>,
+
+    /// How long, in seconds, a library scan's directory listings survive
+    /// unread before they are dropped whole. `None` = upstream's
+    /// `DirectoryService.IdleTimeoutMs` (300 s). Resolved
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` env >
+    /// `scan_directory_cache_idle_secs` in `config.toml` > default; `0` is an
+    /// error.
+    pub scan_directory_cache_idle_secs: Option<u32>,
 
     /// How many trickplay generations (one item width each, an ffmpeg frame
     /// extraction plus tile packing) run at once. A library scan runs several;
@@ -724,6 +773,18 @@ impl Config {
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
                 .or(file.scan_probe_concurrency),
+            scan_directory_cache_records: resolve_positive(
+                env,
+                "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
+                "scan_directory_cache_records",
+                file.scan_directory_cache_records,
+            )?,
+            scan_directory_cache_idle_secs: resolve_positive(
+                env,
+                "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
+                "scan_directory_cache_idle_secs",
+                file.scan_directory_cache_idle_secs,
+            )?,
             trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
@@ -843,9 +904,19 @@ impl Config {
     }
 
     /// A minimal [`Config`] for tests: all directories under `root`, empty
-    /// credentials/keys, ephemeral ports. Callers override the one or two fields
-    /// they exercise via struct-update syntax (`..Config::test_stub(root)`), so
-    /// adding a new field only needs a default here — not an edit at every site.
+    /// credentials/keys, ephemeral ports, and the remote providers a scan or a
+    /// refresh reaches (the [`ProviderEndpoints`], MusicBrainz and the studio
+    /// artwork repository) offline at [`OFFLINE_PROVIDER_URL`], so a scan in a
+    /// test never waits on the public internet. ListenBrainz, asked only for
+    /// similar artists on request, keeps its public host. As with any
+    /// MusicBrainz mirror, the music items' MusicBrainz links point at the
+    /// configured base URL, here the offline one. The two URLs are operator
+    /// settings, which win over the dashboard's MusicBrainz `Server` and Studio
+    /// Images `RepositoryUrl`: a test of those dashboard settings sets them
+    /// back to `String::new()`. Callers override the one or two fields they
+    /// exercise via struct-update syntax (`..Config::test_stub(root)`), so
+    /// adding a new field only needs a default here — not an edit at every
+    /// site.
     ///
     /// `#[doc(hidden)] pub` (not `#[cfg(test)]`) so the integration tests in
     /// `tests/`, which link the crate compiled normally, can reach it too.
@@ -862,19 +933,19 @@ impl Config {
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
             bind_addr_explicit: true,
             discovery_bind_addr: None,
-            provider_endpoints: ProviderEndpoints::default(),
+            provider_endpoints: ProviderEndpoints::offline(),
             port: 0,
             https_port: 0,
             published_url: None,
             base_url: String::new(),
             omdb_api_key: String::new(),
-            studios_repo_url: String::new(),
+            studios_repo_url: OFFLINE_PROVIDER_URL.to_owned(),
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
             tvdb_cache_hours: None,
             tvdb_token_days: None,
             fanart_personal_api_key: String::new(),
-            musicbrainz_base_url: String::new(),
+            musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
             ffmpeg_path: None,
             ffprobe_path: None,
             library_roots: Vec::new(),
@@ -890,6 +961,8 @@ impl Config {
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
+            scan_directory_cache_records: None,
+            scan_directory_cache_idle_secs: None,
             trickplay_concurrency: None,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
@@ -959,6 +1032,31 @@ fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Resu
             "invalid db_pool `{s}` in config.toml: expected an integer or \"auto\""
         )),
     }
+}
+
+/// Resolves a count that must be positive: the `env_key` env var > `file_key`
+/// in `config.toml` > `None` (the default). Zero and anything that is not a
+/// non-negative integer are errors, so a typo or a `0` meant as "off" is
+/// noticed instead of silently disabling a cache. An empty env value is
+/// unset.
+fn resolve_positive(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+) -> anyhow::Result<Option<u32>> {
+    if let Some(raw) = env.var(env_key).filter(|s| !s.trim().is_empty()) {
+        let n: u32 = raw.trim().parse().map_err(|_| {
+            anyhow::anyhow!("invalid {env_key} `{raw}`: expected a positive integer")
+        })?;
+        anyhow::ensure!(n > 0, "invalid {env_key} `0`: expected a positive integer");
+        return Ok(Some(n));
+    }
+    anyhow::ensure!(
+        file != Some(0),
+        "invalid {file_key} `0` in config.toml: expected a positive integer"
+    );
+    Ok(file)
 }
 
 /// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
@@ -1709,6 +1807,62 @@ mod tests {
     }
 
     #[test]
+    fn scan_directory_cache_limits_resolve_and_reject_zero() {
+        // Unset → None (the scanner keeps upstream's values).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, None);
+        assert_eq!(cfg.scan_directory_cache_idle_secs, None);
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "5000")
+            .with("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "60");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(5000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(60));
+
+        for (key, value) in [
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "0"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "0"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5"),
+        ] {
+            let err = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{key}={value}: {err}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let load = |body: &str| {
+            std::fs::write(&toml, body).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            Config::load_from(cli, &FakeEnv::new())
+        };
+        let cfg =
+            load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 9\n").unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(7));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(9));
+        let err = load("scan_directory_cache_idle_secs = 0\n").unwrap_err();
+        assert!(
+            err.to_string().contains("scan_directory_cache_idle_secs"),
+            "{err}"
+        );
+        // Env wins over the file.
+        std::fs::write(&toml, "scan_directory_cache_records = 7\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(11));
+    }
+
+    #[test]
     fn scan_progress_every_resolves_from_env_and_preserves_zero() {
         // Env value is used verbatim.
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "250");
@@ -1723,5 +1877,48 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "0");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.scan_progress_every, Some(0));
+    }
+
+    /// A test server's scan never reaches a public metadata provider:
+    /// `test_stub` points each one a scan reaches at [`OFFLINE_PROVIDER_URL`],
+    /// where nothing answers, so its requests fail at once instead of waiting
+    /// on the network (a three-library scan once spent a minute on 181
+    /// requests to the live providers).
+    #[test]
+    fn test_stub_keeps_every_remote_provider_offline() {
+        let cfg = Config::test_stub(Path::new("/tmp/ferrofin"));
+        // Exhaustive: a new provider field fails to compile here until it is
+        // listed, and the assertion below then requires it offline.
+        let ProviderEndpoints {
+            tmdb,
+            tmdb_images,
+            omdb,
+            opensubtitles,
+            tvdb,
+            fanart,
+            audiodb,
+            lrclib,
+        } = cfg.provider_endpoints;
+        for endpoint in [
+            tmdb,
+            tmdb_images,
+            omdb,
+            opensubtitles,
+            tvdb,
+            fanart,
+            audiodb,
+            lrclib,
+        ] {
+            assert_eq!(endpoint.as_deref(), Some(OFFLINE_PROVIDER_URL));
+        }
+        assert_eq!(cfg.musicbrainz_base_url, OFFLINE_PROVIDER_URL);
+        assert_eq!(cfg.studios_repo_url, OFFLINE_PROVIDER_URL);
+        let addr = OFFLINE_PROVIDER_URL
+            .strip_prefix("http://")
+            .expect("a plain http URL");
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "something answers on {OFFLINE_PROVIDER_URL}, so test servers would reach it"
+        );
     }
 }

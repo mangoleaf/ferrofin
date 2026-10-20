@@ -160,6 +160,11 @@ ferrofin:
     # How many ffprobe processes a library scan runs at once (default: 8, capped
     # at the core count). Lower it for libraries on NFS or spinning disks.
     # FERROFIN_SCAN_PROBE_CONCURRENCY: "4"
+    # A scan lists each folder once and keeps the listings for its items: they
+    # are dropped past this many records (default 100000, Jellyfin's
+    # MaxCachedRecords) or after this many idle seconds (default 300).
+    # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
+    # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
     # How many trickplay images are generated at once (default: auto, up to the
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.

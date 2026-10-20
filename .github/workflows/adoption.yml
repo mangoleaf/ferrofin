@@ -1,0 +1,93 @@
+name: Adoption
+
+# The full synthetic adoption validation (adoption/README.md): adoption/run.sh and the
+# synthetic preservation matrix, all ten Jellyfin paths, against an image built from this
+# commit. A green run on the frozen release commit is the release's adoption evidence
+# (RELEASE.md, "Validate adoption"). Every push to a release branch runs it; a patch
+# release from main runs it by hand (workflow_dispatch). Not on PRs: it is long, and the
+# release branch is where the evidence is needed.
+on:
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions: {} # each job grants only what it needs
+
+jobs:
+  adoption:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3 jq curl python3-pil
+      # A cache miss needs all seven Jellyfin images (~17 GB) beside the Ferrofin build;
+      # the runner has ~14 GB free without this.
+      - name: free runner disk (~25 GB of preinstalled toolchains)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - name: build the Ferrofin image
+        run: |
+          docker build -t ferrofin:adoption-ci .
+          docker builder prune --all --force
+          df -h /
+      # The fixtures depend on the synthetic recipe and on each Jellyfin release that builds
+      # one (digests read from the registry, nothing pulled); the oracles also on smoke.sh
+      # and build-fixtures.sh, which build_oracle runs.
+      - name: fixture cache key
+        id: key
+        run: |
+          set -euo pipefail
+          # Captured first: a failed command substitution in a for list or an echo argument
+          # would not stop the script, and an empty digest would still make a key.
+          tags=$(cd adoption && python3 -c 'from synthetic import VERSIONS; print(*sorted({v for _, v, _ in VERSIONS}))')
+          [ -n "$tags" ]
+          {
+            (cd adoption && python3 -c 'from synthetic import recipe; print(recipe())')
+            sha256sum adoption/smoke.sh adoption/build-fixtures.sh
+            for tag in $tags; do
+              digest=$(docker buildx imagetools inspect "jellyfin/jellyfin:$tag" --format '{{json .Manifest.Digest}}')
+              [ -n "$digest" ]
+              echo "$tag $digest"
+            done
+          } > "$RUNNER_TEMP/fixture-key-inputs"
+          cat "$RUNNER_TEMP/fixture-key-inputs"
+          echo "key=adoption-fixtures-$(sha256sum < "$RUNNER_TEMP/fixture-key-inputs" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: fixtures
+        with:
+          path: |
+            ${{ runner.temp }}/adoption
+            !${{ runner.temp }}/adoption/work
+          key: ${{ steps.key.outputs.key }}
+      - name: build the fixtures (cache miss)
+        if: steps.fixtures.outputs.cache-hit != 'true'
+        run: |
+          adoption/build-fixtures.sh --fixtures "$RUNNER_TEMP/adoption"
+          df -h /
+      # Saved before the checks, so a failing image does not cost the next run a rebuild.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.fixtures.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}/adoption
+            !${{ runner.temp }}/adoption/work
+          key: ${{ steps.key.outputs.key }}
+      - name: adoption/run.sh
+        id: run-sh
+        run: adoption/run.sh --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
+      # Runs even when run.sh failed, so one run reports both.
+      - name: synthetic preservation matrix
+        if: ${{ !cancelled() && steps.run-sh.conclusion != 'skipped' }}
+        run: python3 adoption/synthetic.py run --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
+      # Server logs, smoke diffs and reports of the disposable copies; all synthetic data.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: adoption-work
+          path: ${{ runner.temp }}/adoption/work
+          if-no-files-found: ignore

@@ -1621,8 +1621,11 @@ fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::Ferrofi
     )
 }
 
+/// v12.2 `BuildMaxParentalRatingFilter` (45d7760a14): a container is only as
+/// visible as its Manual members, whatever rating it carries itself — the rc7
+/// rule let a rated container pass on its own rating alone.
 #[tokio::test]
-async fn maximum_rating_only_uses_linked_children_for_an_unrated_parent() {
+async fn maximum_rating_gates_every_container_on_its_members() {
     use ferrofin_model::entities_media::ParentalRatingScore;
     use ferrofin_traits::persistence::LinkedChildrenService as _;
     let db = fresh_db().await;
@@ -1653,12 +1656,9 @@ async fn maximum_rating_only_uses_linked_children_for_an_unrated_parent() {
         max_parental_rating: Some(ParentalRatingScore::new(12, None)),
         ..Default::default()
     };
-    let found = repo(&db).get_item_list(&query).await.unwrap();
-    assert_eq!(
-        found.iter().map(|i| i.name.as_deref()).collect::<Vec<_>>(),
-        vec![Some("rated")]
-    );
-    // A child below the limit admits an unrated container too.
+    // Every member over the limit hides the rated container as well.
+    assert!(repo(&db).get_item_list(&query).await.unwrap().is_empty());
+    // A member within the limit admits both.
     let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "child");
     child.inherited_parental_rating_value = Some(12);
     child.inherited_parental_rating_sub_value = Some(0);

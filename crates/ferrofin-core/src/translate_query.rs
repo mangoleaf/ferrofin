@@ -48,14 +48,14 @@ pub(crate) const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 /// 12.1 `ApplyAlternateVersionFiltering`: keep a row unless it is a version
 /// of a primary that still exists in the same library.
-const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#;
+pub(crate) const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#;
 
 /// The "unowned" predicate. C# treats `OwnerId = Guid.Empty` as "no owner": a
 /// real Jellyfin database stores the ZERO GUID on virtually every row
 /// (adopted-DB evidence), while Ferrofin's writer leaves the column NULL — every
 /// ownership predicate must accept both spellings of "unowned" or an adopted
 /// library filters to nothing.
-const NO_OWNER: &str =
+pub(crate) const NO_OWNER: &str =
     r#"(bi."OwnerId" IS NULL OR bi."OwnerId" = '00000000-0000-0000-0000-000000000000')"#;
 
 /// HD/UHD resolution thresholds used by the `IsHD` / `Is4K` filters
@@ -603,16 +603,22 @@ fn append_max_parental_rating(
     let Some((score, subscore)) = limit else {
         return;
     };
-    qb.push(format!(
-        r#" AND (({alias}."InheritedParentalRatingValue" IS NOT NULL AND "#
-    ));
+    // v12.2 `BuildMaxParentalRatingFilter` (`QueryBuilding.cs:663-689`): the
+    // item's own rating, where it has one, is within the limit, AND a container
+    // is only as visible as its members — an item with Manual links needs one
+    // member within the limit. Only a Manual link makes an item a container,
+    // so alternate-version links never gate a video.
+    let manual = i32::from(LinkedChildType::Manual);
+    qb.push(" AND (");
     push_rating_limit(qb, alias, score, subscore);
-    qb.push(format!(r#") OR ({alias}."InheritedParentalRatingValue" IS NULL AND
-        (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc WHERE lc."ParentId" = {alias}."Id")
+    qb.push(format!(
+        r#" AND (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc
+            WHERE lc."ParentId" = {alias}."Id" AND lc."ChildType" = {manual})
         OR EXISTS (SELECT 1 FROM "LinkedChildren" lc JOIN "BaseItems" rated ON rated."Id" = lc."ChildId"
-        WHERE lc."ParentId" = {alias}."Id" AND "#));
+        WHERE lc."ParentId" = {alias}."Id" AND lc."ChildType" = {manual} AND "#
+    ));
     push_rating_limit(qb, "rated", score, subscore);
-    qb.push("))))");
+    qb.push(")))");
 }
 
 fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, subscore: i64) {
@@ -1786,22 +1792,39 @@ pub(crate) fn push_is_played(
 /// the title played. Same uncorrelated-`IN` shape as
 /// [`push_user_data_exists`]: each list is materialized once per statement.
 fn push_leaf_is_played(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str) {
-    let played_groups = |qb: &mut QueryBuilder<Sqlite>| {
-        qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
-            .push_bind(user_id.to_owned())
-            .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
-    };
     qb.push(format!(
         r#"({alias}."Id" IN (SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#
     ))
     .push_bind(user_id.to_owned())
     .push(format!(r#" AND ud."Played" = 1) OR {alias}."Id" IN "#));
-    played_groups(qb);
+    push_played_groups(qb, user_id);
     qb.push(format!(
         r#" OR ({alias}."PrimaryVersionId" IS NOT NULL AND {alias}."PrimaryVersionId" IN "#
     ));
-    played_groups(qb);
+    push_played_groups(qb, user_id);
     qb.push("))");
+}
+
+/// `playedGroupIds` of v12 `BuildLeafIsPlayedFilter`: the primaries of every
+/// version group holding a played row of the user's, whichever version
+/// carries it.
+fn push_played_groups(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
+    qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
+        .push_bind(user_id.to_owned())
+        .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
+}
+
+/// The ids [`push_leaf_is_played`] holds for, as one uncorrelated list: the
+/// user's own played rows, the played groups' primaries, and every version of
+/// those primaries.
+fn push_played_leaf_ids(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
+    qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
+        .push_bind(user_id.to_owned())
+        .push(r#" AND ud."Played" = 1 UNION SELECT g."PrimaryVersionId" FROM "#);
+    push_played_groups(qb, user_id);
+    qb.push(r#" g UNION SELECT v2."Id" FROM "BaseItems" v2 WHERE v2."PrimaryVersionId" IN "#);
+    push_played_groups(qb, user_id);
+    qb.push(")");
 }
 
 /// v12.2 `BuildHasDescendantFilter` (`QueryBuilding.cs:707-721`) over the
@@ -1941,7 +1964,22 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str, filter: &I
         filter,
     );
     qb.push(" OR (");
-    push_folders_with_leaf(qb, uid, ACCESSIBLE_LEAF, r#"ud."Played" = 1"#, filter);
+    // The played arm (v12.2 `TranslateQuery.cs:574-577`,
+    // `BuildLeafIsPlayedFilter`): a leaf counts as played across its version
+    // group, so a play recorded on a hidden alternate reaches the primary.
+    // `CROSS JOIN` pins the drive from the materialized played-leaf list
+    // through the leaf's primary key, then its closure; as an `IN` test the
+    // planner walks every leaf in the library (`IsFolder=?`) instead.
+    qb.push(r#"bi."Id" IN (SELECT a."ParentItemId" FROM "#);
+    push_played_leaf_ids(qb, uid);
+    qb.push(
+        r#" pl CROSS JOIN "BaseItems" l ON l."Id" = pl."ItemId"
+            CROSS JOIN "AncestorIds" a ON a."ItemId" = l."Id"
+            WHERE "#,
+    )
+    .push(ACCESSIBLE_LEAF);
+    append_parental_restrictions(qb, filter, "l");
+    qb.push(")");
     // "Has an unplayed leaf descendant" is the one arm that cannot be driven
     // from the user's rows (the leaf has none), so it walks the folder's
     // descendants — evaluated only for the folders the played arm let through,
@@ -1958,12 +1996,9 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str, filter: &I
     )
     .push(ACCESSIBLE_LEAF);
     append_parental_restrictions(qb, filter, "l");
-    qb.push(
-        r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud
-                    WHERE ud."ItemId" = l."Id" AND ud."UserId" = "#,
-    )
-    .push_bind(uid.to_owned())
-    .push(r#" AND ud."Played" = 1)))))"#);
+    qb.push(" AND NOT ");
+    push_leaf_is_played(qb, "l", uid);
+    qb.push("))))");
 }
 
 /// Appends the v12 `IsResumable` predicate

@@ -19,15 +19,17 @@ pub fn get_safe_leaf_file_name(file_name: Option<&str>) -> Option<String> {
         return None;
     }
 
-    let leaf = Path::new(file_name)
-        .file_name()?
-        .to_string_lossy()
-        .into_owned();
+    // `Path.GetFileName` is what follows the last separator. `Path::file_name`
+    // would normalise `sub/` and `sub/.` to `sub`, which upstream rejects.
+    let leaf = file_name
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or_default();
     if leaf.is_empty() || leaf == "." || leaf == ".." {
         return None;
     }
 
-    Some(leaf)
+    Some(leaf.to_owned())
 }
 
 /// Lexically resolves a path: collapses `.` and `..` segments without consulting
@@ -115,6 +117,11 @@ mod tests {
     #[case(Some(""))]
     #[case(Some("."))]
     #[case(Some(".."))]
+    // `Path.GetFileName` takes what follows the last separator, so a trailing
+    // separator or `.` leaves no usable leaf.
+    #[case(Some("sub/"))]
+    #[case(Some("sub/."))]
+    #[case(Some("sub/.."))]
     fn get_safe_leaf_file_name_rejects_unusable_leaf(#[case] input: Option<&str>) {
         assert_eq!(None, get_safe_leaf_file_name(input));
     }

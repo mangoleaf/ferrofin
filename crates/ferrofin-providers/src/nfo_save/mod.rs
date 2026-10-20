@@ -201,8 +201,10 @@ impl NfoSaver {
             Vec::new()
         };
         let user = self.user_data(item_id, row, options).await?;
-        let old = match tokio::fs::read_to_string(&path).await {
-            Ok(old) => Some(old),
+        // `BaseNfoSaver` reads the old document through `new StreamReader(fs,
+        // Encoding.UTF8)`, so a Latin-1 or UTF-16 NFO merges instead of failing.
+        let old = match tokio::fs::read(&path).await {
+            Ok(old) => Some(ferrofin_util::stream_extensions::decode_stream_text(old)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(ServiceError::backend(format!(

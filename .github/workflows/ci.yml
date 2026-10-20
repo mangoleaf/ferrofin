@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** too: its push run writes the sccache entries that PRs into the branch
+    # read (GitHub lets a PR read its base branch's caches, never a sibling PR's). The
+    # price is a second run of every job while a release->main PR is open.
+    branches: [main, "release/**"]
   pull_request:
 
 permissions: {} # each job grants only what it needs
@@ -23,10 +26,24 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
+  benchmark-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # Reporter correctness only: no containers, media fixture or timing gate.
+      - run: python3 -m unittest discover -s bench -p test_report.py
+
   lint:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -49,6 +66,12 @@ jobs:
           components: rustfmt, clippy
           # Builds the WASM example guest for the end-to-end plugin-host test.
           targets: wasm32-wasip2
+      # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
+      # The version matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the
+      # registry and compiled dependencies; sccache serves the workspace crates it discards.
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
+        with:
+          version: v0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Pin a release tag (on install-action's main), never a per-tool tag such as
       # @nextest: those commits sit off main and are orphaned when the tag moves,
@@ -64,6 +87,9 @@ jobs:
         # names); no CI job runs plain `cargo test`'s threads-in-one-process model.
       - run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --workspace
       - run: cargo test --workspace --doc # nextest cannot run doctests
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
       - name: disk at end
         if: always()
         run: |
@@ -74,10 +100,11 @@ jobs:
   shell-tests:
     # The shell tooling has its own tests: scripts/version.sh (release versioning),
     # adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
-    # throwaway SQLite files; the real fixtures never run here) and verify/ (the live
+    # throwaway SQLite files; the real fixtures never run here), verify/ (the live
     # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
     # against a python3 static file server, and whole runs against verify/tests/fake_server.py,
-    # which plays back a scripted server's scans).
+    # which plays back a scripted server's scans) and scripts/ci-timings.py (CI time medians —
+    # its log parsing is driven with canned job logs).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -90,6 +117,7 @@ jobs:
       - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
       - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats verify/tests/verify.bats
       - run: bats scripts/tests adoption/tests verify/tests
+      - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: scripts/ci-config-check.sh check
 
   # The 80% per-crate gate (scripts/coverage-gate.sh) runs as three parallel shards;
@@ -99,6 +127,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     strategy:
       fail-fast: false # one failing shard must not hide another's result
       matrix:
@@ -118,6 +149,12 @@ jobs:
         with:
           toolchain: 1.98.1 # = rust-toolchain.toml
           components: llvm-tools-preview
+      # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
+      # The version matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the
+      # registry and compiled dependencies; sccache serves the workspace crates it discards.
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
+        with:
+          version: v0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.shard }} # a cache entry per shard, so they do not overwrite one another
@@ -130,6 +167,9 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: scripts/coverage-gate.sh "$SHARD"
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
       - name: disk at end
         if: always()
         run: |

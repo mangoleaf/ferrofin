@@ -299,14 +299,15 @@ impl MediaInfoResolver {
             return Vec::new();
         }
 
-        let mut files = self.file_paths(folder);
+        let prefix = video.file_name_without_extension();
+        let mut files = self.file_paths(folder, prefix);
         files.retain(|file| file != &video.path);
         if let Some(internal) = video
             .internal_metadata_path
             .as_deref()
             .filter(|p| self.file_system.directory_exists(p))
         {
-            files.extend(self.file_paths(internal));
+            files.extend(self.file_paths(internal, prefix));
         }
         if files.is_empty() {
             return Vec::new();
@@ -329,7 +330,6 @@ impl MediaInfoResolver {
         let paired_vob_sub_keys =
             (self.profile_type == DlnaProfileType::Subtitle).then(|| paired_vob_sub_keys(&files));
 
-        let prefix = video.file_name_without_extension();
         let mut external_path_infos = Vec::new();
         for file in &files {
             if is_suppressed_vob_sub_file(file, paired_vob_sub_keys.as_ref()) {
@@ -354,13 +354,25 @@ impl MediaInfoResolver {
     }
 
     /// The paths of the plain files directly inside `folder`
-    /// (`IDirectoryService.GetFilePaths`, non-recursive).
-    fn file_paths(&self, folder: &str) -> Vec<String> {
+    /// (`IDirectoryService.GetFilePaths`, non-recursive) whose stem starts
+    /// with `prefix` (ignoring case): the only ones [`get_external_files`]
+    /// can match, taken before the paths are copied out of the listing,
+    /// which a scan shares between every item in the folder.
+    ///
+    /// [`get_external_files`]: Self::get_external_files
+    fn file_paths(&self, folder: &str, prefix: &str) -> Vec<String> {
         self.file_system
-            .get_file_system_entries(folder)
-            .into_iter()
+            .shared_file_system_entries(folder)
+            .iter()
             .filter(|entry| entry.type_ == FileSystemEntryType::File)
-            .map(|entry| entry.path)
+            .filter(|entry| {
+                strip_prefix_ignore_case(
+                    naming_path::file_name_without_extension(&entry.path),
+                    prefix,
+                )
+                .is_some()
+            })
+            .map(|entry| entry.path.clone())
             .collect()
     }
 
@@ -961,6 +973,29 @@ mod tests {
     // GetExternalFiles_VobSubIdxAndSubWithMismatchedNames_DoesNotPair
     #[case(&["My.Video.idx", "My.Video.en.sub"], &[], &[".sub"])]
     fn get_external_files_pairs_vob_sub_index_and_payload(
+        #[case] video_files: &[&str],
+        #[case] metadata_files: &[&str],
+        #[case] expected_extensions: &[&str],
+    ) {
+        let paths = external_paths(video_files, metadata_files);
+        let extensions: Vec<&str> = paths.iter().map(|p| naming_path::extension(p)).collect();
+        assert_eq!(extensions, expected_extensions, "{paths:?}");
+    }
+
+    /// The files [`MediaInfoResolver::file_paths`] leaves out (another
+    /// item's, whatever their case) never change how the item's own
+    /// `.idx`/`.sub` pair: a pair matched ignoring case still pairs, in the
+    /// video folder or the internal metadata folder, and still not across
+    /// the two.
+    #[rstest]
+    #[case(
+        &["my.video.idx", "my.video.sub", "Other.idx", "Other.sub", "Other.srt"],
+        &[],
+        &[".idx"]
+    )]
+    #[case(&["Other.sub"], &["MY.VIDEO.en.idx", "MY.VIDEO.en.sub", "Other.idx"], &[".idx"])]
+    #[case(&["MY.VIDEO.sub", "Other.idx"], &["my.video.idx"], &[".sub"])]
+    fn vob_sub_pairing_ignores_other_items_files(
         #[case] video_files: &[&str],
         #[case] metadata_files: &[&str],
         #[case] expected_extensions: &[&str],
