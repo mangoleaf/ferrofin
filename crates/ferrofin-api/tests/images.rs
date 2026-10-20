@@ -207,14 +207,16 @@ struct OkAuth {
     elevated: bool,
     /// The caller's `EnableUserPreferenceAccess` is off (`AssertCanUpdateUser`).
     restricted: bool,
+    /// The caller is an API key with no user, so its effective user id is nil.
+    userless: bool,
 }
 
 impl OkAuth {
-    fn caller(&self) -> UserEntity {
-        UserEntity {
+    fn caller(&self) -> Option<UserEntity> {
+        (!self.userless).then(|| UserEntity {
             enable_user_preference_access: !self.restricted,
             ..user_entity(USER_ID, "alice")
-        }
+        })
     }
 }
 
@@ -232,8 +234,8 @@ impl AuthService for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: Some(self.caller()),
-            is_api_key: self.elevated,
+            user: self.caller(),
+            is_api_key: self.elevated || self.userless,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
         })
@@ -254,8 +256,8 @@ impl AuthorizationContext for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: Some(self.caller()),
-            is_api_key: self.elevated,
+            user: self.caller(),
+            is_api_key: self.elevated || self.userless,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
         })
@@ -771,6 +773,8 @@ struct Stubs {
     elevated: bool,
     /// Whether the caller lacks `EnableUserPreferenceAccess` (see [`OkAuth`]).
     restricted: bool,
+    /// Whether the caller is an API key with no user (see [`OkAuth`]).
+    userless: bool,
 }
 
 /// Builds the image stubs, serving `image_path` for item/by-name images and
@@ -793,6 +797,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
         }),
         elevated: false,
         restricted: false,
+        userless: false,
     }
 }
 
@@ -825,10 +830,12 @@ fn state(s: &Stubs) -> AppState {
         Arc::new(OkAuth {
             elevated: s.elevated,
             restricted: s.restricted,
+            userless: s.userless,
         }),
         Arc::new(OkAuth {
             elevated: s.elevated,
             restricted: s.restricted,
+            userless: s.userless,
         }),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
@@ -1485,6 +1492,67 @@ async fn post_user_image_bad_content_type_is_400() {
     let s = stubs(String::new(), String::new());
     let (status, _) = send(&s, "POST", "/UserImage", Some(("text/plain", "aGk="))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// `PostUserImage`/`DeleteUserImage` (and the legacy forms forwarding to them):
+/// `GetUserById` finds no account for the id, so the action returns `NotFound()`
+/// before anything is written (gl-685).
+#[rstest::rstest]
+#[case::post_user_image("POST", format!("/UserImage?userId={MISSING_ID}"))]
+#[case::delete_user_image("DELETE", format!("/UserImage?userId={MISSING_ID}"))]
+#[case::post_legacy("POST", format!("/Users/{MISSING_ID}/Images/Primary"))]
+#[case::delete_legacy("DELETE", format!("/Users/{MISSING_ID}/Images/Primary"))]
+#[tokio::test]
+async fn user_image_writes_for_an_unknown_user_are_404(#[case] method: &str, #[case] uri: String) {
+    // Elevated, so the administrator gate of `GetUserId` lets the other id through.
+    let s = elevated_stubs(String::new(), String::new());
+    let (status, _) = send(&s, method, &uri, Some(("image/png", "aGk="))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(s.users.saved.lock().expect("lock").is_empty());
+}
+
+/// `GetUserId`'s administrator gate runs before the lookup: a caller who is not
+/// an administrator naming another (here unknown) user is a `403`, not a `404`.
+#[rstest::rstest]
+#[case::post("POST")]
+#[case::delete("DELETE")]
+#[tokio::test]
+async fn user_image_writes_for_another_user_are_403_before_the_lookup(#[case] method: &str) {
+    let s = stubs(String::new(), String::new());
+    let uri = format!("/UserImage?userId={MISSING_ID}");
+    let (status, _) = send(&s, method, &uri, Some(("image/png", "aGk="))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(s.users.saved.lock().expect("lock").is_empty());
+}
+
+/// An all-zero `userId` is `IsNullOrEmpty` to `GetUserId`, so it falls back to
+/// the caller.
+#[tokio::test]
+async fn post_user_image_with_an_empty_user_id_targets_the_caller() {
+    let s = stubs(String::new(), String::new());
+    let uri = format!("/UserImage?userId={}", Uuid::nil());
+    let (status, _) = send(&s, "POST", &uri, Some(("image/png", "aGk="))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.users.saved.lock().expect("lock").as_slice(),
+        [(USER_ID.to_string(), "image/png".to_owned())]
+    );
+}
+
+/// An API key with no user has a nil effective id, and `GetUserById(Guid.Empty)`
+/// throws `ArgumentException`, which the exception middleware answers `400`.
+#[rstest::rstest]
+#[case::post("POST")]
+#[case::delete("DELETE")]
+#[tokio::test]
+async fn user_image_writes_without_a_user_are_400(#[case] method: &str) {
+    let s = Stubs {
+        userless: true,
+        ..stubs(String::new(), String::new())
+    };
+    let (status, _) = send(&s, method, "/UserImage", Some(("image/png", "aGk="))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(s.users.saved.lock().expect("lock").is_empty());
 }
 
 // ---- image missing / bad type (handler_success_paths) -------------------------
