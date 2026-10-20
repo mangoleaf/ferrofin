@@ -365,11 +365,17 @@ pub struct UtcTimeResponse {
     pub response_transmission_time: DateTime<Utc>,
 }
 
+/// The longest [`NewGroupRequestDto::group_name`], in UTF-16 code units:
+/// upstream's `[StringLength(200)]`, added for GHSA-v2jv-54xj-h76w and declared
+/// as `maxLength: 200` in the vendored contract. A protocol limit, not a knob.
+pub const GROUP_NAME_MAX_UTF16_UNITS: usize = 200;
+
 /// Request body for `POST /SyncPlay/New` — create a group.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NewGroupRequestDto {
-    /// The name for the new group.
+    /// The name for the new group, at most [`GROUP_NAME_MAX_UTF16_UNITS`]
+    /// UTF-16 code units.
     pub group_name: String,
 }
 
