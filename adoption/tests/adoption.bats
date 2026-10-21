@@ -274,9 +274,10 @@ EOS
   # eleven paths, each on its own port
   run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
   [ -z "$output" ]
-  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -- '-messy|')" -eq 11 ]
-  # and the two messy copies, on ports of their own (the uniqueness check above covers them too)
+  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -e '-messy|' -e '-scale|')" -eq 11 ]
+  # and the two messy copies and the scale copy, on ports of their own (the uniqueness check above covers them too)
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-messy\|' "$ADOPTION/run.sh")" -eq 2 ]
+  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-scale\|' "$ADOPTION/run.sh")" -eq 1 ]
 }
 
 @test "run.sh and build-fixtures.sh carry a fresh-install 12.2 row that adopts as 12.2.0" {
@@ -435,6 +436,8 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
     python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import messy; print(json.dumps({"shapes": {s: {} for s in messy.SHAPES}}))' \
       "$ADOPTION" > "fixtures/$f/messy.json"
   done
+  # and the scale copy, so scale.py's step finds nothing to do either
+  mkdir -p fixtures/jellyfin-10.11.11-scale; echo '{}' > fixtures/jellyfin-10.11.11-scale/scale.json
 }
 
 @test "build-fixtures.sh: pulls the release of each fixture still to build, and 10.11.8, before building" {
@@ -699,6 +702,98 @@ EOS
 
 @test "build-fixtures.sh: the messy copies are built last, after the schema diff" {
   [ "$(grep -n 'messy.py" build' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" -gt "$(grep -n 'jellyfin-12.2-schema.sql: ' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" ]
+}
+
+@test "scale fixture: cloning, survival check, disk requirement, sampling and recording" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_scale.py
+  [ "$status" -eq 0 ]
+}
+
+# A scale fixture: the table shapes table_digests.py reads, and one cloned item.
+scale_fixture() { # scale_fixture <directory>
+  mkdir -p "$1/data"
+  empty_adoption_db "$1/data/jellyfin.db"
+  sqlite3 "$1/data/jellyfin.db" "INSERT INTO BaseItems VALUES ('A', '/media/movies/scale-00001/a.mkv', NULL)"
+}
+
+@test "check_scale: nothing lost says nothing; a lost clone is named; an unreadable baseline is a reason" {
+  scale_fixture f
+  python3 "$ADOPTION/scale.py" counts f/data/jellyfin.db base.json
+  run adoption_check_scale f/data/jellyfin.db base.json
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  sqlite3 f/data/jellyfin.db "DELETE FROM BaseItems"
+  run adoption_check_scale f/data/jellyfin.db base.json
+  [[ "$output" == "scale: BaseItems: 1 rows before, 0 after"* ]]
+  run adoption_check_scale f/data/jellyfin.db missing.json
+  [[ "$output" == "scale: the checker failed: scale: "* ]]
+}
+
+@test "run.sh: the scale fixture is skipped, named, when it is not built, and --only a clean fixture never reaches it" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == SKIP*10.11.11*jellyfin-10.11.11-scale*"fixture missing" ]]
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "${#lines[@]}" -eq 1 ]
+}
+
+@test "run.sh: the scale row refuses, naming the disk it needs, before it copies or starts anything" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  scale_fixture fixtures/jellyfin-10.11.11-scale
+  truncate -s 8T fixtures/jellyfin-10.11.11-scale/data/jellyfin.db   # a sparse database no disk has six times over
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*10.11.11*jellyfin-10.11.11-scale*"needs "*" free in "*"6x the 8192.0 GiB database"* ]]
+  [ ! -e fixtures/work/run/jellyfin-10.11.11-scale ]
+  [[ "$output" != *"unexpected docker"* ]]
+}
+
+@test "run.sh: a scale fixture whose container exits fails at once, saying which numbers were not measured" {
+  mkdir -p bin fixtures/oracle fixtures/media
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  scale_fixture fixtures/jellyfin-10.11.11-scale
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  start=$SECONDS
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*10.11.11*jellyfin-10.11.11-scale*"never became ready"*"second boot never ready"* ]]
+  [[ "$output" == *"not measured: "* ]]     # the numbers that could not be taken are named, never defaulted
+  [ $((SECONDS - start)) -lt 60 ]
+  [[ "$output" != *"unexpected docker"* ]]
+}
+
+@test "run.sh: the scale row gives up on a server that never answers after ADOPTION_SCALE_TIMEOUT, on both boots" {
+  mkdir -p bin fixtures/oracle fixtures/media
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  scale_fixture fixtures/jellyfin-10.11.11-scale
+  # the container stays up and never answers; without the limit the first wait alone is 30 minutes
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo true; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  start=$SECONDS
+  ADOPTION_SCALE_TIMEOUT=1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*jellyfin-10.11.11-scale*"never became ready"*"second boot never ready"* ]]
+  [ $((SECONDS - start)) -lt 60 ]
+}
+
+@test "build-fixtures.sh: the scale copy is built after the messy copies, the last step" {
+  [ "$(grep -n 'scale.py" build' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" -gt "$(grep -n 'messy.py" build' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" ]
 }
 
 @test "populated upgrade: user state, boot checks and the runner's refusals" {

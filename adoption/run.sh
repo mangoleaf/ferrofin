@@ -22,6 +22,12 @@
 # owner, duplicate paths) are adopted too, each shape held to the end state Jellyfin 12.2 gave it,
 # and the table digests (check 7) checked beside them. --only NAME also selects a messy fixture,
 # by its directory name or by its generation (10.11.11, 12.2.0).
+# Last, the scale fixture (scale.py: the 10.11.11 library cloned up to 40,000 items) is adopted, after
+# a check that the disk can hold it. Every cloned item must survive, and the run records what the
+# adoption cost: migration time, peak memory, disk high-water (WAL and .pre-* snapshots included)
+# and the time of the every-boot foreign_key_check, on its PASS line and in
+# WORK/scale-measurements-<fixture>.json. Recorded, not gated. The boot may take
+# ADOPTION_SCALE_TIMEOUT seconds (default 1800) to answer. --only selects it like a messy fixture.
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
 # includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
 # build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
@@ -35,7 +41,7 @@ ORACLE_VERSION=${ADOPTION_ORACLE:-12.2}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
   --oracle) ORACLE_VERSION=$2; shift 2;;
-  -h|--help) sed -n 2,28p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  -h|--help) sed -n 2,34p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
 case $ORACLE_VERSION in 12.1|12.2) ;; *) echo "run: --oracle must be 12.1 or 12.2, not '$ORACLE_VERSION'" >&2; exit 2;; esac
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
@@ -73,11 +79,12 @@ FIXTURE_TABLE=(
   "12.2.0|jellyfin-12.2-fresh|18082"
 )
 wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
-# wait_up <container> <port>: ready, or failed as soon as the container has exited (a server that
-# refuses its database exits at once, and nothing is gained by waiting out the whole deadline).
+# wait_up <container> <port> [seconds]: ready, or failed as soon as the container has exited (a server
+# that refuses its database exits at once, and nothing is gained by waiting out the whole deadline),
+# or after `seconds` (default 600, the deadline of wait_ready).
 wait_up() {
-  local name=$1 port=$2
-  for _ in $(seq 1 300); do
+  local name=$1 port=$2 deadline=$((SECONDS + ${3:-600}))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
     [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
     sleep 2
@@ -259,6 +266,89 @@ for spec in "${MESSY_TABLE[@]}"; do
   verdict=PASS; [ "${#why[@]}" = 0 ] || verdict=FAIL
   docker logs "$name" > "$dst.server.log" 2>&1; docker rm -f "$name" >/dev/null
   printf '%-5s %-9s %-28s %s\n' "$verdict" "$expected" "$src" "$(IFS='; '; echo "${why[*]:-}")"
+  if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache" "$dst".*; else failed=1; fi
+done
+# The scale fixture (scale.py): the clean 10.11.11 library cloned up to 40,000 items by SQL. The same
+# image adopts a fresh copy, and the run records what that cost (recorded, not gated). No scan
+# runs and no HTTP probe is compared: the clones have no files, so only the boot, the file's
+# integrity, a quiet second boot, the table digests and the survival of every cloned item are
+# checked. The disk it needs is checked first; a run that fills the disk takes the host with it.
+# expected generation|fixture directory|host port
+SCALE_TABLE=(
+  "10.11.11|jellyfin-10.11.11-scale|18079"
+)
+# Seconds each boot of the 40,000-item library may take to answer: long enough to record a slow
+# migration instead of failing it, short enough to catch a hang the same hour. A first boot that never
+# answers costs two of them, since the row restarts the container and waits again.
+SCALE_TIMEOUT=${ADOPTION_SCALE_TIMEOUT:-1800}
+sampler=
+trap '[ -z "$sampler" ] || kill "$sampler" 2>/dev/null' EXIT
+for spec in "${SCALE_TABLE[@]}"; do
+  IFS='|' read -r expected src port <<<"$spec"
+  [ -z "$ONLY" ] || [ "$ONLY" = "$src" ] || [ "$ONLY" = "$expected" ] || continue
+  [ -d "$FIXTURES/$src" ] || { printf '%-5s %-9s %-28s %s\n' SKIP "$expected" "$src" "fixture missing"; continue; }
+  name=adopt-$src; dst=$WORK/$src
+  # The previous run's copy and numbers go first: it frees the disk this run needs, and a stale
+  # samples file must never be read as this run's.
+  docker rm -f "$name" >/dev/null 2>&1
+  rm -rf "$dst" "$dst-cache" "$dst".tables-*.log "$dst.samples.json" "$WORK/scale-measurements-$src.json"; mkdir -p "$WORK"
+  if ! reason=$(python3 "$HERE/scale.py" need-disk "$FIXTURES/$src" "$WORK" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "${reason:-disk check failed}"
+    failed=1
+    continue
+  fi
+  cp -a "$FIXTURES/$src" "$dst"; mkdir -p "$dst-cache"
+  if ! baseline=$(python3 "$HERE/table_digests.py" snapshot "$dst/data/jellyfin.db" "$dst.tables.json" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "table baseline: ${baseline:-check failed}"
+    failed=1
+    continue
+  fi
+  if ! counts=$(python3 "$HERE/scale.py" counts "$dst/data/jellyfin.db" "$dst.scale.json" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "scale baseline: ${counts:-check failed}"
+    failed=1
+    continue
+  fi
+  docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" \
+    -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
+    -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 \
+    -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost \
+    -v "$dst:/config" -v "$dst-cache:/cache" "${MEDIA[@]}" "$IMAGE" >/dev/null
+  # Disk and memory are sampled from the start of the first boot until it has settled.
+  python3 "$HERE/scale.py" sample "$name" "$dst" "$dst.samples.json" & sampler=$!
+  why=()
+  if wait_up "$name" "$port" "$SCALE_TIMEOUT"; then
+    settle "$port" "$(auth_for "$dst/data/jellyfin.db")"
+  else
+    why+=("never became ready")
+  fi
+  kill -TERM "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null; sampler=
+  docker logs "$name" > "$dst.boot.log" 2>&1
+  measured=$(python3 "$HERE/scale.py" record "$dst.boot.log" "$dst.samples.json" "$dst/data/jellyfin.db" \
+             "$WORK/scale-measurements-$src.json" 2>&1); rc=$?
+  summary=$(head -n 1 <<<"$measured")
+  case $rc in
+    0) ;;
+    1) mapfile -t -O "${#why[@]}" why < <(tail -n +2 <<<"$measured");;
+    *) why+=("scale: ${measured:-recording failed}"); summary=;;
+  esac
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_boot_log "$dst.boot.log" "$expected")
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_tables "$dst/data/jellyfin.db" "$dst.tables.json" "$dst.tables-after-adoption.log" | sed 's/^/after adoption: /')
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_scale "$dst/data/jellyfin.db" "$dst.scale.json" | sed 's/^/after adoption: /')
+  docker restart "$name" >/dev/null
+  if wait_up "$name" "$port" "$SCALE_TIMEOUT"; then settle "$port" "$(auth_for "$dst/data/jellyfin.db")"; else why+=("second boot never ready"); fi
+  docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' "$name")" "$name" > "$dst.boot2.log" 2>&1
+  grep -q '"ferrofin-server starting"' "$dst.boot2.log" || why+=("second boot log has no server start")
+  second=$(adoption_second_boot_repairs "$dst.boot2.log")
+  [ -z "$second" ] || why+=("second boot repaired again: $second")
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db" | sed 's/^/after restart: /')
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_tables "$dst/data/jellyfin.db" "$dst.tables.json" "$dst.tables-after-restart.log" | sed 's/^/after restart: /')
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_scale "$dst/data/jellyfin.db" "$dst.scale.json" | sed 's/^/after restart: /')
+  verdict=PASS; [ "${#why[@]}" = 0 ] || verdict=FAIL
+  docker logs "$name" > "$dst.server.log" 2>&1; docker rm -f "$name" >/dev/null
+  detail=$(IFS='; '; echo "${why[*]:-}")
+  [ -z "$summary" ] || detail="${detail:+$detail; }$summary"
+  printf '%-5s %-9s %-28s %s\n' "$verdict" "$expected" "$src" "$detail"
   if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache" "$dst".*; else failed=1; fi
 done
 exit $failed

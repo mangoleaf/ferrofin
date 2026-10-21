@@ -7,6 +7,7 @@
 //! `tokio::process` spawn stays out of the coverage/parity numbers.
 
 use async_trait::async_trait;
+use ferrofin_model::configuration::ProcessPriorityClass;
 
 /// What one process run produced.
 ///
@@ -65,6 +66,31 @@ pub trait Transcoder: Send + Sync {
         test_key: Option<&str>,
         env: &[(String, String)],
     ) -> Result<ProcessOutput, String>;
+
+    /// [`Self::get_process_output`], with the process then set to `priority`:
+    /// the trickplay extraction's `TrickplayOptions.ProcessPriority`
+    /// (`MediaEncoder.ExtractVideoImagesOnIntervalInternal`).
+    ///
+    /// The default ignores `priority`; the production transcoder starts every
+    /// process it runs through `get_process_output` or this method at
+    /// `BelowNormal`, and then applies it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_process_output`]; failing to set the priority is not
+    /// one.
+    async fn get_process_output_at_priority(
+        &self,
+        path: &str,
+        arguments: &str,
+        read_stderr: bool,
+        env: &[(String, String)],
+        priority: ProcessPriorityClass,
+    ) -> Result<ProcessOutput, String> {
+        let _ = priority;
+        self.get_process_output(path, arguments, read_stderr, None, env)
+            .await
+    }
 
     /// Runs `path arguments` and returns whether it exited with code `0`.
     ///

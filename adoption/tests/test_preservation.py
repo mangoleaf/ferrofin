@@ -17,15 +17,78 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, UPGRADED_FROM_10, comparable, compare, expectation,
-                          normalize, run_matrix, seed_failures, seed_state, validate, validate_oracle,
-                          validate_seed_state, same_artwork, verify_database)
+from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, UPGRADED_FROM_10, all_items, comparable,
+                          compare, expectation, normalize, run_matrix, seed_failures, seed_state, validate,
+                          validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS, FRESH_INSTALL
 import synthetic_fixture
 from synthetic_fixture import USERS, drop_dangling_chain, seed_database, wait_for_live_members
 from watch_history import orphaned_items
 from unchanged_scan import TABLES, audit, assert_unchanged, check
 from test_user_accounts import fixture as account_fixture
+
+
+class AllItemsTest(unittest.TestCase):
+    """The snapshot reads every item of a library, not the first PAGE_SIZE."""
+
+    class Server:
+        """GET /Items over `count` items, honouring startIndex and limit as Jellyfin does."""
+
+        def __init__(self, count, total=None):
+            self.rows = [{"Id": f"{index:032x}"} for index in range(count)]
+            self.total = len(self.rows) if total is None else total
+            self.requests = []
+
+        def get(self, path, **query):
+            self.requests.append(query)
+            start, limit = query["startIndex"], query["limit"]
+            return {"Items": self.rows[start:start + limit], "TotalRecordCount": self.total}
+
+    def test_a_library_larger_than_a_page_is_read_whole_in_order(self):
+        server = self.Server(PAGE_SIZE * 2 + 500)
+        items = all_items(server, userId="u", recursive="true")
+        self.assertEqual([row["Id"] for row in items], [row["Id"] for row in server.rows])
+        self.assertEqual([request["startIndex"] for request in server.requests], [0, PAGE_SIZE, 2 * PAGE_SIZE])
+        self.assertTrue(all(request["limit"] == PAGE_SIZE and request["userId"] == "u" for request in server.requests))
+
+    def test_a_library_of_exactly_one_page_is_one_request(self):
+        server = self.Server(PAGE_SIZE)
+        self.assertEqual(len(all_items(server)), PAGE_SIZE)
+        self.assertEqual(len(server.requests), 1)
+
+    def test_an_empty_library_is_one_request_and_no_items(self):
+        server = self.Server(0)
+        self.assertEqual(all_items(server), [])
+        self.assertEqual(len(server.requests), 1)
+
+    def test_a_server_that_counts_more_than_it_serves_is_an_error_not_a_short_snapshot_or_a_loop(self):
+        server = self.Server(3, total=10)
+        with self.assertRaisesRegex(CheckError, "served 3 of the 10 items"):
+            all_items(server)
+        self.assertEqual(len(server.requests), 2)
+
+    def test_a_response_with_no_count_fails_loudly_instead_of_stopping_after_one_page(self):
+        class NoCount(self.Server):
+            def get(self, path, **query):
+                page = super().get(path, **query)
+                del page["TotalRecordCount"]
+                return page
+
+        with self.assertRaises(KeyError):
+            all_items(NoCount(PAGE_SIZE + 1))
+        with self.assertRaises(KeyError):   # also when the first page is empty
+            all_items(NoCount(0))
+
+    def test_an_item_on_two_pages_is_an_error_not_a_quietly_shorter_snapshot(self):
+        class Shifting(self.Server):
+            def get(self, path, **query):
+                page = super().get(path, **query)
+                if query["startIndex"]:   # the order moved between requests: the last item came back again
+                    page["Items"] = [self.rows[PAGE_SIZE - 1]] + page["Items"][:-1]
+                return page
+
+        with self.assertRaisesRegex(CheckError, "on two pages"):
+            all_items(Shifting(PAGE_SIZE + 10))
 
 
 class WriteAuditTest(unittest.TestCase):
