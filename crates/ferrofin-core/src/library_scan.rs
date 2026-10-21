@@ -62,8 +62,8 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{
     ItemPathRow, ItemPersistenceService, ItemRekey, ItemRepository, ItemUserWeight,
-    LocalVersionGroup, MediaStreamRepository, PathlessSeasonRow, StoredImageMetadata,
-    StoredItemLinks,
+    LocalVersionGroup, MediaStreamRepository, OwnerExtrasRefresh, PathlessSeasonRow,
+    StoredImageMetadata, StoredItemLinks,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
@@ -2687,6 +2687,9 @@ struct ItemState<'s, 'a> {
     probes: &'s mut ProbePipeline<'a>,
     folders: &'s [VirtualFolderInfo],
     refresh: &'s RefreshContext<'s>,
+    /// Set by [`LibraryScanner::scan_item`] for an extra whose stored name
+    /// it changes (`RefreshExtras`' `renamedExtraIds`).
+    renamed_extra: bool,
 }
 
 /// Whether [`LibraryScanner::scan_item`] wrote the item.
@@ -5897,7 +5900,7 @@ impl LibraryScanner {
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
-                self.copy_to_owned_videos(&owners).await;
+                self.copy_to_owned_videos(&owners, false).await;
                 self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
                     &mut probes,
@@ -5992,11 +5995,13 @@ impl LibraryScanner {
                 probes: &mut probes,
                 folders: key_folders,
                 refresh: &refresh,
+                renamed_extra: false,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
             let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
+            let renamed_extra = state.renamed_extra;
             if scope.is_some() && !matches!(saved, ItemSaved::Cancelled) {
                 let reason = if refresh.is_context(item, !is_new) {
                     "context"
@@ -6092,7 +6097,7 @@ impl LibraryScanner {
                     }
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
-                    self.copy_to_owned_videos(&owners).await;
+                    self.copy_to_owned_videos(&owners, false).await;
                     self.sync_playlists(&due_playlists, key_folders).await;
                     return Ok(self
                         .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
@@ -6127,6 +6132,26 @@ impl LibraryScanner {
             {
                 owners.stacked.push(item.id);
             }
+            // `BaseItem.RefreshExtras`, run by every refresh of an owner: an
+            // extra this walk created, re-owned or renamed, or refreshes in
+            // full, gives its owner's extras the owner's title metadata; any
+            // other, the owner's dates.
+            if !matches!(saved, ItemSaved::Cancelled)
+                && item.entity.extra_type.is_some()
+                && let Some(owner) = item
+                    .entity
+                    .owner_id
+                    .as_deref()
+                    .and_then(|o| Uuid::parse_str(o).ok())
+            {
+                // A row not stored before (or not readable) is a new extra.
+                let changed = match stored {
+                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || renamed_extra,
+                    _ => true,
+                } || request.options.replace_all_metadata
+                    || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh;
+                owners.extras.push((owner, item.id, changed));
+            }
             if let Some(owner) = released_by {
                 released.entry(owner).or_default().push(item.id);
             }
@@ -6145,7 +6170,7 @@ impl LibraryScanner {
         // and the closing passes, as one between items does.
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
-            self.copy_to_owned_videos(&owners).await;
+            self.copy_to_owned_videos(&owners, false).await;
             self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
                 &mut probes,
@@ -6161,8 +6186,9 @@ impl LibraryScanner {
         self.sync_local_version_groups(&resolved_groups, &released)
             .await;
         // After the groups are linked, so each local version points at its
-        // primary.
-        self.copy_to_owned_videos(&owners).await;
+        // primary. A whole scan of a library found every extra of it, so an
+        // extra stored but not found is one gone.
+        self.copy_to_owned_videos(&owners, scope.is_none()).await;
         // After every row is saved, so each entry finds its item, and before
         // the closing passes, whose collage draws the members.
         self.sync_playlists(&due_playlists, key_folders).await;
@@ -6314,7 +6340,7 @@ impl LibraryScanner {
     /// only rows that differ are written, so a quiet rescan stays quiet.
     /// Best-effort, as the version links are: a failure is logged, and the
     /// primary's next save copies again.
-    async fn copy_to_owned_videos(&self, owners: &OwnedCopies) {
+    async fn copy_to_owned_videos(&self, owners: &OwnedCopies, found_all: bool) {
         let mut saved = owners.saved.clone();
         saved.sort_unstable();
         saved.dedup();
@@ -6339,6 +6365,37 @@ impl LibraryScanner {
                     "could not copy metadata to owned versions and parts; the next save of their primary retries"
                 );
             }
+        }
+        let mut by_owner: HashMap<Uuid, OwnerExtrasRefresh> = HashMap::new();
+        for &(owner, extra, changed) in &owners.extras {
+            let refresh = by_owner.entry(owner).or_insert_with(|| OwnerExtrasRefresh {
+                owner,
+                found: found_all.then(Vec::new),
+                changed: false,
+            });
+            refresh.changed |= changed;
+            if let Some(found) = &mut refresh.found {
+                found.push(extra);
+            }
+        }
+        // TODO(parity, open work item — NOT an accepted divergence; gl-742):
+        // upstream gives the title metadata as the start of each extra's own
+        // refresh (`RefreshMetadataForOwnedItem` copies, then refreshes the
+        // extra), so an extra's own NFO wins; copied here after the walk, the
+        // owner's values win. Un-defer path: apply the copy to the extra
+        // before its own readers run in the walk, and test an extra NFO's
+        // plot surviving a full refresh.
+        let refreshes: Vec<OwnerExtrasRefresh> = by_owner.into_values().collect();
+        if let Err(err) = self
+            .persistence
+            .copy_owner_metadata_to_extras(&refreshes)
+            .await
+        {
+            tracing::warn!(
+                %err,
+                owners = refreshes.len(),
+                "could not copy their owners' metadata to extras"
+            );
         }
     }
 
@@ -7109,6 +7166,9 @@ impl LibraryScanner {
         // that ran can then apply a permitted embedded title.
         if embedded_title.is_none() {
             settle_extra_name(&mut entity, &item.entity, locked_fields);
+        }
+        if entity.extra_type.is_some() && stored_row.is_some_and(|row| row.name != entity.name) {
+            state.renamed_extra = true;
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
@@ -13292,9 +13352,15 @@ impl LibraryScanner {
         entity.top_parent_id = None;
         // A video extra resolves through `BaseVideoResolver` like any
         // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
-        // its `VideoType` from the extension.
+        // its `VideoType` from the extension, and with its name parsed
+        // (`ExtraResolver`: `ResolveVideo<Video>(args, true)` and
+        // `parseName: true`), so the year in its file name is its own until
+        // its owner gives it one (`InheritDatesFromOwner`).
         if media_type == "Video" {
             set_video_type(&mut entity, file_video_type(path));
+            entity.production_year = video_resolver::resolve_file(Some(path), ctx.naming, None)
+                .and_then(|info| info.year)
+                .map(i64::from);
         }
         ctx.emit(
             out,
@@ -19487,6 +19553,9 @@ struct OwnedCopies {
     saved: Vec<Uuid>,
     /// Stacked primaries refreshed without a save: their parts only.
     stacked: Vec<Uuid>,
+    /// Each extra the walk refreshed: its owner, its id, and whether the
+    /// walk created, re-owned or renamed it or refreshed it in full.
+    extras: Vec<(Uuid, Uuid, bool)>,
 }
 
 /// Whether `entity` is a stacked movie's additional part as the planner
