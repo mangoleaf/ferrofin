@@ -614,6 +614,29 @@ fake_library_manager!(ScanningLibrary {
     }
 });
 
+/// An ffmpeg build with the common audio encoders (`SupportsEncoder`), for
+/// the routes whose negotiation transcodes audio; a state built by
+/// [`AppState::new`] has none.
+pub struct CommonEncoders;
+
+impl ferrofin_traits::media_encoding::EncoderSupport for CommonEncoders {
+    fn supports_encoder(&self, encoder: &str) -> bool {
+        [
+            "aac",
+            "ac3",
+            "eac3",
+            "flac",
+            "alac",
+            "libopus",
+            "libmp3lame",
+            "libvorbis",
+            "pcm_s16le",
+        ]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(encoder))
+    }
+}
+
 /// A plain, non-administrator [`UserEntity`] for tests that need the
 /// authenticated caller to *be* somebody — every permission extractor resolves
 /// the policy from `AuthorizationInfo::user`, so a `None` there is

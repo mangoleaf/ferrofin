@@ -2412,7 +2412,10 @@ pub async fn build_app_state(
     );
     let state = state
         .with_media_encoding(hls, attachments)
-        .with_subtitle_encoder(subtitle_encoder);
+        .with_subtitle_encoder(subtitle_encoder)
+        // The playback negotiation asks the probed ffmpeg's encoders
+        // (`MediaEncoder` as `ITranscoderSupport`).
+        .with_encoder_support(Arc::new(ffmpeg.capabilities.clone()));
 
     // One-shot: carry Jellyfin's Live TV configuration across on adoption.
     // Ferrofin keeps tuners and listing providers in the database rather than a

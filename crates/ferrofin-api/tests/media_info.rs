@@ -828,6 +828,27 @@ fn ok_state_parts(
     auth_service: Arc<dyn AuthService>,
     devices: Arc<dyn ferrofin_traits::devices::DeviceManager>,
 ) -> AppState {
+    ok_state_parts_with_config(
+        item_id,
+        media_sources,
+        users,
+        auth_context,
+        auth_service,
+        devices,
+        Arc::new(FakeConfig),
+    )
+}
+
+/// [`ok_state_parts`] with any server configuration.
+fn ok_state_parts_with_config(
+    item_id: Uuid,
+    media_sources: Arc<dyn MediaSourceManager>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    auth_context: Arc<dyn AuthorizationContext>,
+    auth_service: Arc<dyn AuthService>,
+    devices: Arc<dyn ferrofin_traits::devices::DeviceManager>,
+    config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary { item_id }),
         users,
@@ -837,7 +858,7 @@ fn ok_state_parts(
         Arc::new(OkSessions),
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
-        Arc::new(FakeConfig),
+        config,
         Arc::new(FakeProviders),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
@@ -1548,4 +1569,128 @@ async fn a_post_without_a_profile_negotiates_with_the_stored_capabilities() {
         json["MediaSources"][0]["SupportsDirectPlay"], false,
         "{json}"
     );
+}
+
+/// [`FakeConfig`] whose encoding options set `EnableSubtitleExtraction`.
+struct ExtractionConfig(bool);
+
+#[async_trait]
+impl ferrofin_traits::configuration::ServerConfigurationManager for ExtractionConfig {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        ferrofin_traits::configuration::ServerConfigurationManager::application_paths(&FakeConfig)
+    }
+    async fn configuration(
+        &self,
+    ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+        FakeConfig.configuration().await
+    }
+    async fn update_configuration(
+        &self,
+        _configuration: &ferrofin_model::configuration::ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_encoding_options(
+        &self,
+    ) -> Result<ferrofin_model::configuration::EncodingOptions, ServiceError> {
+        Ok(ferrofin_model::configuration::EncodingOptions {
+            enable_subtitle_extraction: self.0,
+            ..ferrofin_model::configuration::EncodingOptions::default()
+        })
+    }
+}
+
+/// The authenticated user, with a policy that allows every transcode.
+struct TranscodingAuth;
+
+impl TranscodingAuth {
+    fn info() -> AuthorizationInfo {
+        AuthorizationInfo {
+            user: Some(user_entity(USER_ID, "alice")),
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_audio_playback_transcoding: true,
+                enable_video_playback_transcoding: true,
+                enable_playback_remuxing: true,
+                ..ferrofin_model::users::UserPolicy::default()
+            })),
+            device_id: Some("dev-1".to_owned()),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthService for TranscodingAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for TranscodingAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+/// `MediaEncoder.CanExtractSubtitles` answers `EnableSubtitleExtraction`
+/// (jellyfin/jellyfin#16380): during a transcode, an embedded text
+/// subtitle is delivered External to a profile that takes it while the
+/// setting is on, and burned in (Encode) while it is off.
+#[tokio::test]
+async fn the_subtitle_extraction_setting_decides_external_delivery_in_a_transcode() {
+    for (extraction, expected) in [(true, "External"), (false, "Encode")] {
+        let item_id = Uuid::from_u128(0x5AB);
+        let primary = item_id.simple().to_string();
+        // dts audio the profile cannot play: the source is transcoded. Its
+        // embedded subrip can be served on its own, as a probe reports it.
+        let mut source = version(&primary, "dts");
+        source.media_streams[3].supports_external_stream = true;
+        let state = ok_state_parts_with_config(
+            item_id,
+            versioned(vec![source]),
+            Arc::new(OkUsers),
+            Arc::new(TranscodingAuth),
+            Arc::new(TranscodingAuth),
+            Arc::new(ferrofin_api::test_support::FakeDevices),
+            Arc::new(ExtractionConfig(extraction)),
+        )
+        .with_encoder_support(Arc::new(ferrofin_api::test_support::CommonEncoders));
+        let body = serde_json::json!({
+            "DeviceProfile": web_profile(),
+            "MediaSourceId": primary,
+            "SubtitleStreamIndex": 3,
+        });
+        let json = post_playback(state, item_id, Some(&body)).await;
+        let source = &json["MediaSources"][0];
+        assert!(source["TranscodingUrl"].is_string(), "transcoded: {json}");
+        let subtitle = source["MediaStreams"]
+            .as_array()
+            .expect("streams")
+            .iter()
+            .find(|stream| stream["Index"] == 3)
+            .expect("the subtitle stream");
+        assert_eq!(
+            subtitle["DeliveryMethod"], expected,
+            "extraction {extraction}: {subtitle}"
+        );
+    }
 }

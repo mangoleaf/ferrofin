@@ -448,7 +448,8 @@ fn router_as(
             served: Arc::clone(&served),
         }),
         Arc::new(NoAttachments),
-    );
+    )
+    .with_encoder_support(Arc::new(t::CommonEncoders));
     (create_router(state), served)
 }
 

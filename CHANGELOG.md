@@ -229,6 +229,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- During a transcode, PGS and VobSub subtitles a client can draw itself are delivered as
+  separate subtitle files, as in Jellyfin 12, instead of being burned into the video. The
+  "Allow subtitle extraction on the fly" setting now applies: with it off, other embedded
+  subtitles are burned in during a transcode. Playback negotiation also asks the installed
+  ffmpeg which audio encoders it has, instead of assuming a fixed list
 
 ## [1.0.0] - 2026-09-05
 
