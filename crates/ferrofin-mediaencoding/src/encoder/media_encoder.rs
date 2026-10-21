@@ -1512,6 +1512,7 @@ mod tests {
                     max_width: 320,
                     qscale: 4,
                     threads: 1,
+                    priority: ferrofin_model::configuration::ProcessPriorityClass::BelowNormal,
                     output_dir: &output_dir,
                     allow_hw_accel: false,
                     enable_hw_encoding: false,

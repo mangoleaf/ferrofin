@@ -13,37 +13,7 @@ use async_trait::async_trait;
 use regex::Regex;
 
 /// A .NET `ProcessPriorityClass` (`ProcessPriority`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Priority {
-    /// `Idle`.
-    Idle,
-    /// `BelowNormal` (the default).
-    BelowNormal,
-    /// `Normal`.
-    Normal,
-    /// `AboveNormal`.
-    AboveNormal,
-    /// `High`.
-    High,
-    /// `RealTime`.
-    RealTime,
-}
-
-impl Priority {
-    /// The nice value .NET sets for the class on Unix
-    /// (`Process.SetPriorityClassCore`).
-    #[must_use]
-    pub fn nice(self) -> i32 {
-        match self {
-            Self::Idle => 19,
-            Self::BelowNormal => 10,
-            Self::Normal => 0,
-            Self::AboveNormal => -6,
-            Self::High => -11,
-            Self::RealTime => -19,
-        }
-    }
-}
+pub use ferrofin_util::process_priority::ProcessPriority as Priority;
 
 /// How analysis processes run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +80,7 @@ pub(crate) async fn output(
 /// is, with one warning per run of the server rather than one per process.
 fn set_priority(child: &tokio::process::Child, priority: Priority) {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if let Err(error) = apply_priority(child, priority)
+    if let Err(error) = ferrofin_util::process_priority::set_process_priority(child, priority)
         && !WARNED.swap(true, Ordering::Relaxed)
     {
         tracing::warn!(
@@ -119,53 +89,6 @@ fn set_priority(child: &tokio::process::Child, priority: Priority) {
             "intro skipper: ffmpeg priority could not be modified (ProcessPriority)"
         );
     }
-}
-
-/// .NET's Unix `SetPriorityClassCore`: the class's nice value.
-#[cfg(unix)]
-fn apply_priority(child: &tokio::process::Child, priority: Priority) -> std::io::Result<()> {
-    let Some(pid) = child.id() else {
-        return Ok(());
-    };
-    // SAFETY: setpriority only reads its scalar arguments.
-    if unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::id_t::from(pid), priority.nice()) } == 0
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// .NET's Windows `SetPriorityClassCore`: the class itself.
-#[cfg(windows)]
-fn apply_priority(child: &tokio::process::Child, priority: Priority) -> std::io::Result<()> {
-    use windows_sys::Win32::System::Threading::{
-        ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-        IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS, SetPriorityClass,
-    };
-    let Some(handle) = child.raw_handle() else {
-        return Ok(());
-    };
-    let class = match priority {
-        Priority::Idle => IDLE_PRIORITY_CLASS,
-        Priority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
-        Priority::Normal => NORMAL_PRIORITY_CLASS,
-        Priority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
-        Priority::High => HIGH_PRIORITY_CLASS,
-        Priority::RealTime => REALTIME_PRIORITY_CLASS,
-    };
-    // SAFETY: the handle is the live child's, owned by `child`.
-    if unsafe { SetPriorityClass(handle.cast(), class) } == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Other targets have no priority to set.
-#[cfg(not(any(unix, windows)))]
-fn apply_priority(_child: &tokio::process::Child, _priority: Priority) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// `GetOutputAsync`'s ffmpeg command line: `-hide_banner -threads N

@@ -1,8 +1,10 @@
 //! Leaf utilities for Ferrofin — the Rust port of Jellyfin's `Jellyfin.Extensions`.
 //!
-//! Each module mirrors a C# file from the `Jellyfin.Extensions` namespace,
+//! Most modules mirror a C# file from the `Jellyfin.Extensions` namespace,
 //! translated to idiomatic Rust while preserving observable behavior (the
-//! upstream xUnit tests are ported verbatim as the oracle).
+//! upstream xUnit tests are ported verbatim as the oracle). [`process_priority`]
+//! is the OS process priority Jellyfin sets through .NET's
+//! `Process.PriorityClass`.
 
 pub mod copy_to_extensions;
 pub mod current_culture;
@@ -14,6 +16,7 @@ pub mod file_helper;
 pub mod formatting_stream_writer;
 pub mod guid_extensions;
 pub mod path_helper;
+pub mod process_priority;
 pub mod read_only_list_extension;
 pub mod shuffle_extensions;
 pub mod sort_name;
