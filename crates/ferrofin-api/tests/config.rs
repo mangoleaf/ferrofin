@@ -1436,6 +1436,78 @@ async fn a_committed_check_answers_every_named_save_after_it_is_kept() {
     );
 }
 
+/// `StartupController.SetRemoteAccess` saves through `SaveConfiguration`, so
+/// the network manager re-reads its settings at once: the wizard's choice
+/// applies to the next request, not after a restart.
+#[tokio::test]
+async fn the_startup_remote_access_toggle_applies_to_the_live_policy() {
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager, RemoteAccessPolicyResult};
+    let dir = tempfile::tempdir().unwrap();
+    // The rest of the saved document survives the toggle, a legacy spelling
+    // included (it is saved back under the contract's name).
+    write_named_config(
+        dir.path(),
+        "network",
+        br#"{"LocalNetworkSubnets":["10.1.0.0/16"],"KnownProxies":["10.1.0.1"],"InternalHttpPort":8097,"RemoteIpFilter":["198.51.100.0/24"]}"#,
+    );
+    let state = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_network(Arc::new(std::sync::RwLock::new(
+        NetworkManager::with_defaults(NetworkConfiguration::default(), ""),
+    )));
+    // In the saved document's allowlist; `outside` is not.
+    let remote = "198.51.100.7".parse().unwrap();
+    let outside = "203.0.113.9".parse().unwrap();
+    assert_eq!(
+        state.remote_access_policy(remote),
+        RemoteAccessPolicyResult::Allow
+    );
+    let toggle = |enabled: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                state,
+                "/Startup/RemoteAccess",
+                &serde_json::json!({"EnableRemoteAccess": enabled, "EnableAutomaticPortMapping": false}),
+            )
+            .await
+        }
+    };
+    assert_eq!(toggle(false).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.remote_access_policy(remote),
+        RemoteAccessPolicyResult::RejectDueToRemoteAccessDisabled
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["EnableRemoteAccess"], false);
+    assert_eq!(
+        saved["LocalNetworkSubnets"],
+        serde_json::json!(["10.1.0.0/16"])
+    );
+    assert_eq!(saved["KnownProxies"], serde_json::json!(["10.1.0.1"]));
+    assert_eq!(saved["InternalHttpPort"], 8097);
+    assert_eq!(
+        saved["RemoteIPFilter"],
+        serde_json::json!(["198.51.100.0/24"])
+    );
+    assert!(saved.get("RemoteIpFilter").is_none());
+
+    // Back on: the whole saved document is the live policy, its allowlist too.
+    assert_eq!(toggle(true).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.remote_access_policy(remote),
+        RemoteAccessPolicyResult::Allow
+    );
+    assert_eq!(
+        state.remote_access_policy(outside),
+        RemoteAccessPolicyResult::RejectDueToNotAllowlistedRemoteIp
+    );
+}
+
 #[tokio::test]
 async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() {
     use ferrofin_networking::{NetworkConfiguration, NetworkManager};

@@ -172,6 +172,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- The startup wizard's "Allow remote connections" choice applies at once, as in Jellyfin:
+  `POST /Startup/RemoteAccess` now saves the network configuration the way the dashboard
+  does, so the live remote-access policy takes it without a restart
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

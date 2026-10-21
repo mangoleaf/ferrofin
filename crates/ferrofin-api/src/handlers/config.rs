@@ -389,7 +389,11 @@ async fn update_named_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn save_named_configuration(
+/// `BaseConfigurationManager.SaveConfiguration(key, …)` for a store the API
+/// writes: validation, the atomic write under the save lock, the live network
+/// policy for `network`, the configuration listeners, then the committed
+/// checks. `body` is the document as it is saved.
+pub(crate) async fn save_named_configuration(
     state: AppState,
     key: String,
     body: Value,
