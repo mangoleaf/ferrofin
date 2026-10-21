@@ -93,10 +93,13 @@ pub fn is_dovi(stream: Option<&MediaStream>) -> bool {
 /// `GetSwVidFilterChain`'s `requireDoviReshaping`
 /// (`VideoRangeType == VideoRangeType.DOVI`; its `doToneMap` half is the
 /// chain's own software-tonemap gate). Every other Dolby Vision stream is
-/// tonemapped from its base layer, like the HDR flavour that layer is.
+/// tonemapped from its base layer, like the HDR flavour that layer is. The
+/// range is derived from the stream's metadata, as upstream's computed
+/// `VideoRangeType` does, never read from the cached field (a snapshot that
+/// `populate_computed_fields` or a deserialised DTO fills).
 #[must_use]
 pub fn requires_dovi_reshaping(stream: Option<&MediaStream>) -> bool {
-    stream.and_then(|s| s.video_range_type) == Some(VideoRangeType::Dovi)
+    stream.is_some_and(|s| s.video_range_type() == VideoRangeType::Dovi)
 }
 
 /// Whether the stream carries HDR10+ dynamic metadata. Port of `IsHdr10Plus`.
@@ -470,7 +473,8 @@ mod tests {
 
     /// The classifiers read the range type the stream's metadata gives, as
     /// upstream's computed `VideoRangeType` does: a stream nobody populated
-    /// is still Dolby Vision with HDR10+ (gl-268).
+    /// is still Dolby Vision with HDR10+ (gl-268), and a profile 5 stream is
+    /// reshaped (gl-753).
     #[test]
     fn the_range_classifiers_derive_the_range_type() {
         let mut stream = with_range(MediaStream::default(), VideoRangeType::DoviWithHdr10Plus);
@@ -481,6 +485,21 @@ mod tests {
         // A cached value that disagrees with the metadata is not read either.
         stream.video_range_type = Some(VideoRangeType::Sdr);
         assert!(is_dovi(Some(&stream)));
+
+        let mut profile_5 = with_range(MediaStream::default(), VideoRangeType::Dovi);
+        assert_eq!(profile_5.video_range_type, None, "not populated");
+        assert!(requires_dovi_reshaping(Some(&profile_5)));
+        profile_5.video_range_type = Some(VideoRangeType::Sdr);
+        assert!(
+            requires_dovi_reshaping(Some(&profile_5)),
+            "a stale cache is not read"
+        );
+        let mut base_layer = with_range(MediaStream::default(), VideoRangeType::DoviWithHdr10);
+        base_layer.video_range_type = Some(VideoRangeType::Dovi);
+        assert!(
+            !requires_dovi_reshaping(Some(&base_layer)),
+            "a cache that says DOVI does not make a base-layer stream profile 5"
+        );
     }
 
     /// Upstream's `EncodingHelperDoviTests.CreateState` stream, in HEVC.
