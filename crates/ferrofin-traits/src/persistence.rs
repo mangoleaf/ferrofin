@@ -492,6 +492,21 @@ pub trait ItemRepository: Send + Sync {
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
+    /// [`Self::get_image_infos`] in the same read as whether the item's images
+    /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
+    /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or
+    /// not `TopLeft`. The default reads the rows and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_image_infos_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_image_infos(item_id).await?, false))
+    }
+
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///

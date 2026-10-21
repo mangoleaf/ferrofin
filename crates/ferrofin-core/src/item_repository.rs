@@ -3410,6 +3410,52 @@ impl ItemRepository for FerrofinItemRepository {
             .collect())
     }
 
+    async fn get_image_infos_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        /// An image row with its owner's photo facts.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            image: BaseItemImageInfoEntity,
+            #[sqlx(rename = "IsPhoto")]
+            is_photo: bool,
+            #[sqlx(rename = "PhotoData")]
+            photo_data: Option<String>,
+        }
+        // The image read of `get_image_infos`, plus the owner by primary key.
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT ii.*, bi."Type" = ?2 AS "IsPhoto",
+                    CASE WHEN bi."Type" = ?2 THEN bi."Data" END AS "PhotoData"
+                FROM "BaseItemImageInfos" ii
+                JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+                WHERE ii."ItemId" = ?1
+                ORDER BY ii."ImageType", ii.rowid"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(BaseItemKind::Photo.stored_type_name())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        // Every row has the same owner, so the first one speaks for all.
+        let auto_orient = rows.first().is_some_and(|row| {
+            row.is_photo
+                && crate::kinds::photo_auto_orients(
+                    crate::item_data::read_data_string(
+                        &crate::item_data::parse_data(row.photo_data.as_deref()),
+                        "Orientation",
+                    )
+                    .as_deref(),
+                )
+        });
+        let images = rows
+            .into_iter()
+            .map(|row| image_info_from_row(row.image, &self.virtual_paths))
+            .collect();
+        Ok((images, auto_orient))
+    }
+
     async fn swap_item_images(
         &self,
         item_id: Uuid,

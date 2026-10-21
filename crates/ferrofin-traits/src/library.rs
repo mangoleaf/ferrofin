@@ -398,6 +398,21 @@ pub trait LibraryManager: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`Self::get_item_images`] in the same read as whether they are
+    /// auto-oriented when served; delegates to
+    /// [`ItemRepository::get_image_infos_with_auto_orient`](crate::persistence::ItemRepository::get_image_infos_with_auto_orient).
+    /// The default reads the images and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_item_images(item_id).await?, false))
+    }
+
     /// The image of the item's `index`-th chapter, if it has one.
     ///
     /// Chapter thumbnails are not item image rows — they live on the chapter

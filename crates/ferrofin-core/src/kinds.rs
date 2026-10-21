@@ -698,6 +698,15 @@ pub fn latest_items_index_container_kind(kind: BaseItemKind) -> Option<BaseItemK
     }
 }
 
+/// Whether a `Photo` with the stored `orientation` (the `Data` value, an
+/// `ImageOrientation` name) has its images turned upright when served:
+/// `ImageProcessor.ProcessImage` sets `autoOrient` unless the orientation is
+/// known to be `TopLeft` ("Orientation unknown, so do it").
+#[must_use]
+pub fn photo_auto_orients(orientation: Option<&str>) -> bool {
+    !orientation.is_some_and(|o| o.eq_ignore_ascii_case("TopLeft"))
+}
+
 /// Maps a library's configured [`CollectionTypeOptions`] to the
 /// [`CollectionType`] its `CollectionFolder` reports (C#
 /// `CollectionFolder.CollectionType`, parsed from the `<type>.collection`
@@ -726,16 +735,30 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
 mod tests {
     use super::{
         collection_type_of, is_folder, is_item_by_name, is_video,
-        latest_items_index_container_kind, presentation_unique_key, saved_sort_name,
-        series_presentation_unique_key, series_user_data_keys, supports_adding_to_playlist,
-        supports_ancestors, supports_inherited_parent_images, supports_played_status,
-        supports_position_ticks_resume, supports_similarity, supports_theme_media,
+        latest_items_index_container_kind, photo_auto_orients, presentation_unique_key,
+        saved_sort_name, series_presentation_unique_key, series_user_data_keys,
+        supports_adding_to_playlist, supports_ancestors, supports_inherited_parent_images,
+        supports_played_status, supports_position_ticks_resume, supports_similarity,
+        supports_theme_media,
     };
     use ferrofin_model::data::MediaType;
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::entities::ExtraType;
     use rstest::rstest;
+
+    /// `ImageProcessor.ProcessImage`: only a known `TopLeft` skips orienting.
+    #[rstest]
+    #[case::top_left(Some("TopLeft"), false)]
+    #[case::rotated(Some("RightTop"), true)]
+    #[case::mirrored(Some("TopRight"), true)]
+    #[case::unknown(None, true)]
+    fn photo_auto_orients_unless_known_top_left(
+        #[case] orientation: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(photo_auto_orients(orientation), expected);
+    }
 
     /// The series key a `Season` case carries.
     const SERIES_KEY: Option<&str> = Some("595f611d217e8273327033dd5d500d81");
