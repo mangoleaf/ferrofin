@@ -1968,3 +1968,120 @@ async fn anonymous_profile_image_requires_a_nonempty_user_id() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+/// An image processor that records the options it is asked for and serves
+/// the original file back.
+#[derive(Default)]
+struct RecordingProcessor {
+    asked: Mutex<Vec<ferrofin_traits::options::ImageProcessingOptions>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
+    fn supported_input_formats(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn supports_image_collage_creation(&self) -> bool {
+        false
+    }
+    fn supported_image_output_formats(&self) -> Vec<ferrofin_model::drawing::ImageFormat> {
+        Vec::new()
+    }
+    async fn get_image_dimensions(
+        &self,
+        _path: &str,
+    ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+        Err(ServiceError::NotFound("unused".into()))
+    }
+    async fn get_item_image_dimensions(
+        &self,
+        _item_id: Uuid,
+        _info: &ItemImageInfo,
+    ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+        Err(ServiceError::NotFound("unused".into()))
+    }
+    async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
+        Err(ServiceError::NotFound("unused".into()))
+    }
+    async fn get_image_blur_hash_sized(
+        &self,
+        _path: &str,
+        _dimensions: ferrofin_model::drawing::ImageDimensions,
+    ) -> Result<String, ServiceError> {
+        Err(ServiceError::NotFound("unused".into()))
+    }
+    async fn get_image_cache_tag(
+        &self,
+        _item_id: Uuid,
+        _image: &ItemImageInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn get_image_cache_tag_for_path(
+        &self,
+        _path: &str,
+        _modified: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn process_image(
+        &self,
+        options: &ferrofin_traits::options::ImageProcessingOptions,
+    ) -> Result<ferrofin_traits::drawing::ProcessedImage, ServiceError> {
+        self.asked.lock().expect("asked lock").push(options.clone());
+        Ok(ferrofin_traits::drawing::ProcessedImage {
+            path: options.image.path.clone(),
+            mime_type: Some("image/jpeg".to_owned()),
+            date_modified: options.image.date_modified,
+        })
+    }
+    async fn create_image_collage(
+        &self,
+        _options: &ferrofin_traits::options::ImageCollageOptions,
+        _library_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// `GetItemImage2` takes `width`, `height`, `quality`, `fillWidth`,
+/// `fillHeight` and `blur` from the query string, and the format, the maximum
+/// size and the tag from the route, where a query parameter of the same name
+/// has no effect.
+#[tokio::test]
+async fn the_positional_route_reads_its_query_string_transforms() {
+    let img = TempImage::new(b"IMAGEBYTES");
+    let s = stubs(img.path(), String::new());
+    let processor = Arc::new(RecordingProcessor::default());
+    let request = Request::builder()
+        .uri(format!(
+            "/Items/{ITEM_ID}/Images/Primary/0/tag/jpg/100/0/0/0\
+             ?width=40&height=30&quality=60&fillWidth=50&fillHeight=20&blur=2\
+             &maxWidth=999&maxHeight=999&format=png"
+        ))
+        .header("Authorization", "Bearer token")
+        .body(Body::empty())
+        .expect("request");
+    let response = create_router(state(&s).with_image_processor(processor.clone()))
+        .oneshot(request)
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let asked = processor.asked.lock().expect("asked lock");
+    let options = asked.first().expect("the image was processed");
+    assert_eq!(
+        (options.width, options.height, options.quality),
+        (Some(40), Some(30), 60)
+    );
+    assert_eq!(
+        (options.fill_width, options.fill_height, options.blur),
+        (Some(50), Some(20), Some(2))
+    );
+    // The route's segments win: 100 wide, no height limit (`0`), JPEG.
+    assert_eq!((options.max_width, options.max_height), (Some(100), None));
+    assert_eq!(
+        options.supported_output_formats,
+        [ferrofin_model::drawing::ImageFormat::Jpg]
+    );
+}
