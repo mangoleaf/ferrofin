@@ -1363,6 +1363,27 @@ pub trait UserManager: Send + Sync {
     /// Persists changes to a user row.
     async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError>;
 
+    /// The user write of `SessionManager.LogSessionActivity`
+    /// (`SessionManager.cs:262-275`): stamps `user`'s `LastActivityDate` with
+    /// `at`, never moving it backwards, and leaves the rest of the row as
+    /// stored. Upstream saves the whole user (`UpdateUserAsync`) to change
+    /// that one column.
+    ///
+    /// The default stamps nothing, so impls without a user store compile
+    /// unchanged; the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error the concrete write surfaces.
+    async fn record_user_activity(
+        &self,
+        user: &UserEntity,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ServiceError> {
+        let _ = (user, at);
+        Ok(())
+    }
+
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
