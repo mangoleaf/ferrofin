@@ -162,6 +162,7 @@ struct FileConfig {
     wasm_write_content_mb: Option<u32>,
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
+    quick_connect_pending_per_ip: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -570,6 +571,13 @@ pub struct Config {
     /// `playback_metrics_queue` in `config.toml` > default.
     pub playback_metrics_queue: Option<u32>,
 
+    /// Unauthorized Quick Connect requests one remote IP may hold at once;
+    /// the next `POST /QuickConnect/Initiate` from that IP drops its oldest.
+    /// `None`/zero = `ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP` (10). Jellyfin has no
+    /// cap. Resolved `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` env >
+    /// `quick_connect_pending_per_ip` in `config.toml` > default.
+    pub quick_connect_pending_per_ip: Option<u32>,
+
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
     /// visible cores, at least one — plugin analysis must never starve
@@ -833,6 +841,8 @@ impl Config {
                 .or(file.wasm_subtitle_extract_mb),
             playback_metrics_queue: parse_var(env, "FERROFIN_PLAYBACK_METRICS_QUEUE")
                 .or(file.playback_metrics_queue),
+            quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
+                .or(file.quick_connect_pending_per_ip),
         })
     }
 
@@ -998,6 +1008,7 @@ impl Config {
             wasm_write_content_mb: None,
             wasm_subtitle_extract_mb: None,
             playback_metrics_queue: None,
+            quick_connect_pending_per_ip: None,
         }
     }
 }
@@ -1761,6 +1772,24 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn quick_connect_pending_per_ip_env_beats_file() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.quick_connect_pending_per_ip, None);
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "quick_connect_pending_per_ip = 4\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let from_file = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(from_file.quick_connect_pending_per_ip, Some(4));
+        let env = FakeEnv::new().with("FERROFIN_QUICK_CONNECT_PENDING_PER_IP", "20");
+        let from_env = Config::load_from(cli(), &env).unwrap();
+        assert_eq!(from_env.quick_connect_pending_per_ip, Some(20));
     }
 
     #[test]
