@@ -229,6 +229,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- Adding, removing or renaming a library, or adding or removing one of its folders, can
+  fail part-way, for example on a full disk. When it does, the request still fails, but
+  the server now also refreshes its folder watch and runs the scan the request asked for,
+  as Jellyfin does. Before, both were skipped until the next scan
 
 ## [1.0.0] - 2026-09-05
 
