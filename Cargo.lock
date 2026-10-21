@@ -1641,6 +1641,7 @@ dependencies = [
  "chrono",
  "ferrofin-common",
  "ferrofin-db",
+ "ferrofin-keyframes",
  "ferrofin-model",
  "ferrofin-util",
  "serde",

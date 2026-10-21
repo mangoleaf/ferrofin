@@ -41,6 +41,9 @@
 //!   ([`ferrofin_traits::persistence::PeopleRepository`]);
 //! - [`keyframe_repository`] — [`FerrofinKeyframeRepository`]
 //!   ([`ferrofin_traits::persistence::KeyframeRepository`]);
+//! - [`keyframe_extractors`] — the ffprobe and Matroska
+//!   [`ferrofin_traits::media_encoding::KeyframeExtractor`]s and the repository
+//!   cache in front of them;
 //! - [`linked_children_service`] — [`FerrofinLinkedChildrenService`]
 //!   ([`ferrofin_traits::persistence::LinkedChildrenService`]);
 //! - [`next_up_service`] — [`FerrofinNextUpService`]
@@ -196,6 +199,7 @@ pub mod item_repository;
 pub mod item_type_lookup;
 pub mod item_visibility;
 mod item_visibility_repository;
+pub mod keyframe_extractors;
 pub mod keyframe_repository;
 pub mod kinds;
 pub mod library_changed_notifier;

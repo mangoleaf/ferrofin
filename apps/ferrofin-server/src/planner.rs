@@ -102,6 +102,11 @@ const DEFAULT_EVENT_ENCODER_PRESET: EncoderPreset = EncoderPreset::superfast;
 /// `TimeSpan.TicksPerSecond`.
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// How far past an HLS remux segment's start the input seek goes: upstream's
+/// 0.5 s (`GetFastSeekCommandLineParameter`), so ffmpeg lands on the
+/// keyframe the segment starts at rather than the one before it.
+const HLS_REMUX_SEEK_OFFSET_TICKS: i64 = 5_000_000;
+
 /// The number of milliseconds per second.
 const MS_PER_SECOND: i32 = 1000;
 
@@ -829,12 +834,16 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             } else {
                 ferrofin_model::dlna::EncodingContext::Streaming
             }),
+            // A segment's transcode starts at the playlist time its URL
+            // carries (`StartTimeTicks = CurrentRuntimeTicks` in
+            // `GetDynamicSegment`), which for a remux cut on keyframes is not
+            // `segment_id * segment_length`.
             start_time_ticks: if progressive {
                 request.start_time_ticks
             } else {
                 segment_id
-                    .filter(|id| *id > 0)
-                    .map(|id| i64::from(id) * i64::from(segment_length_secs) * TICKS_PER_SECOND)
+                    .map(|_| request.current_runtime_ticks)
+                    .filter(|ticks| *ticks > 0)
             },
             subtitle_stream_index: subtitle_index,
             // The PlaybackInfo-negotiated caps: they drive the bitrate params
@@ -1291,6 +1300,15 @@ impl FerrofinStreamStatePlanner {
         // or `copy` is used.
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
+        // HLS segments of a copied video start at keyframes, but ffmpeg seeks
+        // to the keyframe before an exact frame time. Upstream seeks half a
+        // second later to land on the keyframe itself
+        // (`GetFastSeekCommandLineParameter`).
+        let remux_seek_offset = if !progressive && copying_video && state.video_stream.is_some() {
+            HLS_REMUX_SEEK_OFFSET_TICKS
+        } else {
+            0
+        };
         // Everything the ported hardware matrix reads about the job.
         let caps = probed_caps;
         let requested = hw::decoder::RequestedSize {
@@ -1421,7 +1439,8 @@ impl FerrofinStreamStatePlanner {
         };
 
         // ---- input ------------------------------------------------------------
-        // Seek to the segment start (GetTimeParameter): segment_id * segment_len.
+        // Seek to the segment start (`GetFastSeekCommandLineParameter`): the
+        // playlist time its URL carries.
         if let Some(seek_ticks) = state
             .base_request
             .start_time_ticks
@@ -1442,6 +1461,7 @@ impl FerrofinStreamStatePlanner {
                 } else {
                     seek_ticks
                 };
+            let seek_ticks = seek_ticks.saturating_add(remux_seek_offset);
             let ss = self.encoder.get_time_parameter(seek_ticks);
             push_split(&mut args, "-ss");
             push_split(&mut args, ss.trim_start_matches("-ss").trim());
@@ -1527,9 +1547,7 @@ impl FerrofinStreamStatePlanner {
         // (`negativeMapArgs + args + videoProcessParam`).
         let mut hw_graph: Option<(&'static str, String)> = None;
         if hw_filters {
-            let seek_offset = segment_id
-                .filter(|&id| id > 0)
-                .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
+            let seek_offset = segment_seek_seconds(state, segment_id);
             let sub_stream = state.subtitle_stream.as_ref().filter(|_| burn_sub);
             let (plain, alpha_sub2video) = sub_stream
                 .filter(|_| burn_text)
@@ -1929,9 +1947,7 @@ impl FerrofinStreamStatePlanner {
             for filter in &sw_filters {
                 let _ = write!(chain, "{filter},");
             }
-            let offset_secs = segment_id
-                .filter(|&id| id > 0)
-                .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
+            let offset_secs = segment_seek_seconds(state, segment_id);
             chain.push_str(&Self::text_subtitle_filter(
                 state,
                 sub,
@@ -2086,17 +2102,17 @@ impl FerrofinStreamStatePlanner {
             args.push(format!("hls/{stem}/"));
         }
         // Align a seek-restarted transcode's timestamps to this segment's place
-        // in the playlist. The `-ss` input seek makes ffmpeg reset output PTS to
-        // ~0, so segment N would carry PTS ~0 instead of N*segment_len — the
-        // player then sees a discontinuity across the seek boundary and stalls.
-        // Shift the (zero-based) output timestamps forward by the seek time so
-        // segment N's PTS is ≈ N*segment_len and hls.js can splice it in. (Not
+        // in the playlist. The `-ss` input seek makes ffmpeg subtract the seek
+        // time from the output PTS, so segment N would carry PTS ~0 instead of
+        // its playlist time — the player then sees a discontinuity across the
+        // seek boundary and stalls. Shift the output timestamps forward by that
+        // same seek time (a remux's half second included), so they keep the
+        // source's timeline and hls.js can splice the segment in. (Not
         // `-copyts`, which preserves the source's arbitrary start offset and
         // desyncs the muxer's segment numbering.)
-        if let Some(id) = segment_id.filter(|&id| id > 0) {
-            let offset_secs = i64::from(id) * i64::from(state.segment_length_secs);
+        if let Some(ticks) = segment_seek_ticks(state, segment_id) {
             push_split(&mut args, "-output_ts_offset");
-            args.push(offset_secs.to_string());
+            args.push(seconds_from_ticks(ticks.saturating_add(remux_seek_offset)));
         }
         push_split(&mut args, "-hls_segment_filename");
         args.push(format!("{dir}/{stem}%d.{ext}"));
@@ -2209,6 +2225,43 @@ fn opus_sample_rate(rate: i32) -> i32 {
         12_001..=16_000 => 16_000,
         16_001..=24_000 => 24_000,
         _ => 48_000,
+    }
+}
+
+/// Where a seeked segment's transcode starts, in ticks: its playlist time
+/// (see `start_time_ticks` in the plan). `None` for segment 0, the playlist
+/// build and progressive streams.
+fn segment_seek_ticks(state: &EncodingJobInfo, segment_id: Option<i32>) -> Option<i64> {
+    segment_id
+        .and(state.base_request.start_time_ticks)
+        .filter(|ticks| *ticks > 0)
+}
+
+/// [`segment_seek_ticks`] in whole seconds (see [`round_to_whole_seconds`]).
+fn segment_seek_seconds(state: &EncodingJobInfo, segment_id: Option<i32>) -> Option<i64> {
+    segment_seek_ticks(state, segment_id).map(round_to_whole_seconds)
+}
+
+/// Positive `ticks` in whole seconds, rounded half to even as upstream's
+/// subtitle filters round `TimeSpan.TotalSeconds` (`Math.Round`).
+fn round_to_whole_seconds(ticks: i64) -> i64 {
+    let (whole, rest) = (ticks / TICKS_PER_SECOND, ticks % TICKS_PER_SECOND);
+    match (2 * rest).cmp(&TICKS_PER_SECOND) {
+        std::cmp::Ordering::Less => whole,
+        std::cmp::Ordering::Greater => whole + 1,
+        std::cmp::Ordering::Equal => whole + (whole & 1),
+    }
+}
+
+/// Positive `ticks` as ffmpeg seconds: `6` for a whole second, `7.12` otherwise.
+fn seconds_from_ticks(ticks: i64) -> String {
+    let (whole, fraction) = (ticks / TICKS_PER_SECOND, ticks % TICKS_PER_SECOND);
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction:07}")
+            .trim_end_matches('0')
+            .to_owned()
     }
 }
 
@@ -2667,6 +2720,15 @@ mod tests {
             segment_container: Some("ts".to_owned()),
             query_string: "?x=1".to_owned(),
             ..HlsStreamRequest::default()
+        }
+    }
+
+    /// `request` as the URL of `segment` of a 3 s equal-length playlist
+    /// carries it: `runtimeTicks` is where the segment starts.
+    fn at_segment(request: HlsStreamRequest, segment: i64) -> HlsStreamRequest {
+        HlsStreamRequest {
+            current_runtime_ticks: segment * 3 * TICKS_PER_SECOND,
+            ..request
         }
     }
 
@@ -3797,6 +3859,8 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.query_string = "?SubtitleStreamIndex=2".to_owned();
+        // Segment 3 of a 3 s playlist starts at 9 s.
+        req.current_runtime_ticks = 9 * TICKS_PER_SECOND;
         let plan = p
             .plan(&req, false, Some(3), PlaylistKind::Vod)
             .await
@@ -4672,10 +4736,15 @@ mod tests {
         let src = source("abc", vec![video_stream("mpeg4"), audio_stream("aac")]);
         let p = planner(vec![src]);
         let plan = p
-            .plan(&request("abc"), true, Some(2), PlaylistKind::Vod)
+            .plan(
+                &at_segment(request("abc"), 2),
+                true,
+                Some(2),
+                PlaylistKind::Vod,
+            )
             .await
             .unwrap();
-        // Audio-only plan: segment 2 seeks to 2 * 3s = 6s worth of ticks.
+        // Audio-only plan: segment 2 seeks to its playlist time, 2 * 3s = 6s.
         assert!(
             plan.arguments.iter().any(|a| a == "-ss"),
             "{:?}",
@@ -4698,9 +4767,119 @@ mod tests {
             plan.arguments
                 .windows(2)
                 .any(|w| w == ["-output_ts_offset", "6"]),
-            "seek segment must set -output_ts_offset to N*segment_len: {:?}",
+            "seek segment must set -output_ts_offset to its playlist time: {:?}",
             plan.arguments
         );
+    }
+
+    #[tokio::test]
+    async fn a_seek_starts_at_the_segments_playlist_time_not_its_index() {
+        // A remux playlist is cut on keyframes, so segment 2 can start at
+        // 13.32 s where 2 * 3 s would be 6 s. The URL's runtimeTicks wins
+        // (`StartTimeTicks = CurrentRuntimeTicks`).
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.current_runtime_ticks = 133_200_000;
+
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert_eq!(plan.state.base_request.start_time_ticks, Some(133_200_000));
+        // The input seek goes half a second past the keyframe, so ffmpeg does
+        // not land on the keyframe before it (the fake renders raw ticks).
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "138200000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-output_ts_offset", "13.82"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-start_number", "2"]),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    /// Only a seeked HLS segment of a copied video seeks half a second late:
+    /// an HLS transcode and a progressive stream seek to the exact time.
+    #[rstest::rstest]
+    #[case::hls_remux(PlaylistKind::Vod, true, "65000000", Some("6.5"))]
+    #[case::hls_transcode(PlaylistKind::Vod, false, "60000000", Some("6"))]
+    #[case::progressive_remux(PlaylistKind::Progressive, true, "60000000", None)]
+    #[tokio::test]
+    async fn the_half_second_seek_offset_is_for_hls_remuxes_only(
+        #[case] kind: PlaylistKind,
+        #[case] copy_allowed: bool,
+        #[case] seek: &str,
+        #[case] ts_offset: Option<&str>,
+    ) {
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = copy_allowed;
+        let segment = if kind == PlaylistKind::Progressive {
+            req.start_time_ticks = Some(6 * TICKS_PER_SECOND);
+            None
+        } else {
+            req.current_runtime_ticks = 6 * TICKS_PER_SECOND;
+            Some(2)
+        };
+
+        let plan = p.plan(&req, false, segment, kind).await.unwrap();
+
+        assert_eq!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            copy_allowed,
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", seek]),
+            "{:?}",
+            plan.arguments
+        );
+        let offset = plan
+            .arguments
+            .windows(2)
+            .find(|w| w[0] == "-output_ts_offset")
+            .map(|w| w[1].as_str());
+        assert_eq!(offset, ts_offset, "{:?}", plan.arguments);
+    }
+
+    #[rstest::rstest]
+    #[case(60_000_000, 6)]
+    #[case(64_999_999, 6)]
+    #[case(65_000_000, 6)]
+    #[case(75_000_000, 8)]
+    #[case(133_200_000, 13)]
+    fn seek_seconds_round_half_to_even(#[case] ticks: i64, #[case] seconds: i64) {
+        assert_eq!(round_to_whole_seconds(ticks), seconds);
+    }
+
+    #[rstest::rstest]
+    #[case(60_000_000, "6")]
+    #[case(71_200_000, "7.12")]
+    #[case(1, "0.0000001")]
+    fn seconds_from_ticks_renders_ffmpeg_seconds(#[case] ticks: i64, #[case] seconds: &str) {
+        assert_eq!(seconds_from_ticks(ticks), seconds);
     }
 
     #[tokio::test]
@@ -4716,7 +4895,7 @@ mod tests {
         req.segment_container = Some("mp4".to_owned());
         req.video_codec = Some("hevc".to_owned()); // client supports hevc → copy
         let plan = p
-            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .plan(&at_segment(req, 2), false, Some(2), PlaylistKind::Vod)
             .await
             .unwrap();
         assert!(
@@ -4735,7 +4914,12 @@ mod tests {
         let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
         let p = planner(vec![src]);
         let plan = p
-            .plan(&request("abc"), false, Some(2), PlaylistKind::Vod)
+            .plan(
+                &at_segment(request("abc"), 2),
+                false,
+                Some(2),
+                PlaylistKind::Vod,
+            )
             .await
             .unwrap();
         assert!(
@@ -5902,7 +6086,12 @@ mod tests {
         req.subtitle_stream_index = Some(2);
         req.subtitle_method = Some("Encode".to_owned());
         let plan = p
-            .plan(&req, false, Some(10), PlaylistKind::Vod)
+            .plan(
+                &at_segment(req.clone(), 10),
+                false,
+                Some(10),
+                PlaylistKind::Vod,
+            )
             .await
             .unwrap();
         let args = plan.arguments.join(" ");
@@ -6460,6 +6649,7 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["-f", "mp4"])
         );
+        request.current_runtime_ticks = 3 * TICKS_PER_SECOND;
         let hls = planner
             .plan(&request, false, Some(1), PlaylistKind::Vod)
             .await
