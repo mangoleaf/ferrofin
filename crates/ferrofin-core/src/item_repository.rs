@@ -1152,27 +1152,8 @@ impl FerrofinItemRepository {
             .get("ViewType")
             .and_then(serde_json::Value::as_str)
             .map(str::to_ascii_lowercase);
-        // `movies`, `tvshows`, and an untyped view — `UserView.cs:22`. A view of any
-        // other type is never a grouping of libraries.
-        if !matches!(view_type.as_deref(), Some("movies" | "tvshows")) {
-            return Ok(Some(Vec::new()));
-        }
-        let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
-        if grouped.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-
         let mut scope = Vec::new();
-        for folder in visible_views(db, user).await? {
-            if !grouped.contains(&folder) {
-                continue;
-            }
-            // `CollectionType is null || CollectionType == view.ViewType` — an
-            // untyped library groups into any view.
-            let folder_type = Self::collection_type_of(db, folder).await?;
-            if folder_type.is_some() && folder_type != view_type {
-                continue;
-            }
+        for folder in grouped_libraries(db, user, view_type.as_deref()).await? {
             match Box::pin(Self::top_parent_ids_for_query(
                 db,
                 folder,
@@ -2586,6 +2567,42 @@ async fn scope_to_user_libraries_prepared(
     let mut resolved = filter.clone();
     resolved.top_parent_ids = scope;
     Ok(Some(resolved))
+}
+
+/// The libraries `user` grouped into a `view_type` view: of the views the
+/// user may see, those in their `GroupedFolders` preference whose
+/// `CollectionType` is the view's or none (an untyped library groups into any
+/// view). Empty unless `view_type` is `movies` or `tvshows`. Upstream's
+/// `UserView.IsEligibleForGrouping` (`UserView.cs:22`) also accepts an untyped
+/// view, which this does not group yet (gl-227).
+///
+/// The set a grouped view's browse is scoped to
+/// (`GetTopParentIdsForQuery`'s fifth arm) and the set its `ChildCount`
+/// counts (`DtoService.GetChildCountSourceIds`, v12.2 `DtoService.cs:781-792`).
+pub(crate) async fn grouped_libraries(
+    db: &Database,
+    user: &UserEntity,
+    view_type: Option<&str>,
+) -> Result<Vec<Uuid>, ServiceError> {
+    if !matches!(view_type, Some("movies" | "tvshows")) {
+        return Ok(Vec::new());
+    }
+    let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
+    if grouped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut libraries = Vec::new();
+    for folder in visible_views(db, user).await? {
+        if !grouped.contains(&folder) {
+            continue;
+        }
+        let folder_type = FerrofinItemRepository::collection_type_of(db, folder).await?;
+        if folder_type.is_some() && folder_type.as_deref() != view_type {
+            continue;
+        }
+        libraries.push(folder);
+    }
+    Ok(libraries)
 }
 
 /// The library views `user` may see, as item ids.
