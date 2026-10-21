@@ -680,7 +680,8 @@ const PLUGIN_REQUEST_BODY_MAX: usize = 1024 * 1024;
 /// `<script src>` tags, exactly like upstream plugin controllers marked
 /// `[AllowAnonymous]`); the caller's resolved identity is forwarded so the
 /// GUEST gates sensitive paths. The guest runs sandboxed, deadline-bound and
-/// breaker-protected; unknown or disabled plugins 404.
+/// breaker-protected; unknown or disabled plugins 404, and a plugin with no
+/// room for another request answers 503 at once rather than queueing it.
 async fn plugin_web_request(
     axum::extract::State(state): axum::extract::State<AppState>,
     method: axum::http::Method,

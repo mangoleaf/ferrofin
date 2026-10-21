@@ -540,6 +540,41 @@ fn episode_fetch_multi_episode_success() {
     assert_eq!(item.production_year, Some(2004));
 }
 
+/// Port of v12.2 `Fetch_Valid_MultiEpisode_Unordered_Success` (PR 17805):
+/// the `<episodedetails>` blocks are stored in descending order (as Sonarr
+/// writes them), and the merged episode must still be in ascending order.
+#[test]
+fn episode_fetch_multi_episode_unordered_success() {
+    let external_ids = StaticExternalIds::new(["Imdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "Test Data/Rising-Reversed.nfo",
+        &read_fixture("Test Data/Rising-Reversed.nfo"),
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    let item = &result.item;
+
+    assert_eq!(item.name.as_deref(), Some("Rising (1) / Rising (2)"));
+    assert_eq!(item.index_number, Some(1));
+    assert_eq!(item.index_number_end, Some(2));
+    assert_eq!(item.parent_index_number, Some(1));
+    assert_eq!(
+        item.overview.as_deref(),
+        Some(
+            "A new Stargate team embarks on a dangerous mission to a distant galaxy, where they discover a mythical lost city -- and a deadly new enemy. / Sheppard tries to convince Weir to mount a rescue mission to free Colonel Sumner, Teyla, and the others captured by the Wraith."
+        )
+    );
+    assert_eq!(
+        item.premiere_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        Some("2004-07-16".to_owned())
+    );
+    assert_eq!(item.production_year, Some(2004));
+}
+
 #[test]
 fn episode_fetch_multi_episode_with_missing_tags() {
     let external_ids = StaticExternalIds::new(["Imdb"]);
@@ -766,5 +801,53 @@ fn season_fetch_valid_success() {
     assert_eq!(
         nini.image_url.as_deref(),
         Some("/config/metadata/People/O/Olivia Rodrigo/poster.jpg")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GetPersonFromXmlNode `<type>` (not in the C# suites)
+// ---------------------------------------------------------------------------
+
+/// `XmlReaderExtensions.GetPersonFromXmlNode` reads `<type>` with
+/// `Enum.TryParse(text, true, out type)`: any member name in any case binds,
+/// and a value that does not parse leaves `default(PersonKind)`, `Unknown`,
+/// not the `Actor` a missing `<type>` keeps.
+#[test]
+fn person_type_parses_like_enum_try_parse() {
+    let nfo = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<movie>
+  <title>T</title>
+  <actor><name>Missing</name></actor>
+  <actor><name>Lower</name><type>lyricist</type></actor>
+  <actor><name>Comic</name><type>CoverArtist</type></actor>
+  <actor><name>Bogus</name><type>Chief Vibes Officer</type></actor>
+  <actor><name>Empty</name><type></type></actor>
+</movie>"#;
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "inline.nfo",
+        nfo,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    let kinds: Vec<(&str, PersonKind)> = result
+        .people
+        .as_ref()
+        .expect("people")
+        .iter()
+        .map(|person| (person.name.as_str(), person.type_))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("Missing", PersonKind::Actor),
+            ("Lower", PersonKind::Lyricist),
+            ("Comic", PersonKind::CoverArtist),
+            ("Bogus", PersonKind::Unknown),
+            ("Empty", PersonKind::Unknown),
+        ]
     );
 }

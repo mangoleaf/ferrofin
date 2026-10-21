@@ -350,6 +350,12 @@ const PLAYLIST_ID: Uuid = Uuid::from_u128(0x9F2);
 const PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x9F3);
 /// A stale Playlists view whose display parent no longer exists.
 const STALE_PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x9F4);
+/// A `tvshows` library's `CollectionFolder`.
+const TV_LIBRARY_ID: Uuid = Uuid::from_u128(0xC1F);
+/// A `boxsets` library's `CollectionFolder`.
+const BOXSETS_LIBRARY_ID: Uuid = Uuid::from_u128(0xC2F);
+/// A default-builder view that delegates to [`TV_LIBRARY_ID`].
+const TV_VIEW_ID: Uuid = Uuid::from_u128(0xC3F);
 /// The physical folder's on-disk path (= one of the library's locations).
 const PHYSICAL_PATH: &str = "/media/movies-real";
 
@@ -434,6 +440,22 @@ impl LibraryManager for OkLibrary {
                 "Playlists",
                 BaseItemKind::PlaylistsFolder,
             )));
+        }
+        if id == TV_VIEW_ID {
+            let mut view = item_entity(TV_VIEW_ID, "Shows", BaseItemKind::UserView);
+            view.data = Some(serde_json::json!({"DisplayParentId":TV_LIBRARY_ID}).to_string());
+            return Ok(Some(view));
+        }
+        for (library, name, collection_type) in [
+            (TV_LIBRARY_ID, "Shows", "tvshows"),
+            (BOXSETS_LIBRARY_ID, "Collections", "boxsets"),
+        ] {
+            if id == library {
+                let mut folder = item_entity(library, name, BaseItemKind::CollectionFolder);
+                folder.data =
+                    Some(serde_json::json!({"CollectionType":collection_type}).to_string());
+                return Ok(Some(folder));
+            }
         }
         if self.adopted_tree && id == COLLECTION_FOLDER_ID {
             return Ok(Some(item_entity(
@@ -724,7 +746,7 @@ impl VirtualFolderManager for OneLibrary {
         _name: &str,
         _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
         _options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -1494,6 +1516,79 @@ async fn playlists_view_browses_list_its_playlists() {
     assert_eq!(boxsets.parent_id, Uuid::nil());
     assert_eq!(boxsets.include_item_types, [BaseItemKind::BoxSet]);
     assert_eq!(boxsets.linked_child_ancestor_ids, [PLAYLISTS_FOLDER_ID]);
+}
+
+/// Jellyfin 12's `GetItems` dispatch (v12.2 ItemsController.cs:326-340, 592;
+/// `UserRootFolder.GetItemsInternal`):
+/// - at the user root a filtered request runs recursively, while the bare
+///   one stays the listing of the user's libraries;
+/// - an item-typed browse of a library that did not choose `recursive` is
+///   recursive, while an explicit `recursive=false` or an untyped browse
+///   lists direct children;
+/// - a `boxsets` library browsed untyped lists its box sets, recursively.
+#[tokio::test]
+async fn filtered_user_root_and_typed_library_browses_run_recursively() {
+    use ferrofin_model::data::BaseItemKind;
+    async fn query_for(params: &str) -> InternalItemsQuery {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock().unwrap().take().expect("query_items ran")
+    }
+    for (params, recursive) in [
+        ("includeItemTypes=Movie&isFavorite=true".to_owned(), true),
+        ("searchTerm=blade".to_owned(), true),
+        ("genres=Drama&recursive=false".to_owned(), true),
+        (String::new(), false),
+        (
+            format!("parentId={TV_LIBRARY_ID}&includeItemTypes=Episode"),
+            true,
+        ),
+        (
+            format!("parentId={TV_LIBRARY_ID}&includeItemTypes=Episode&recursive=false"),
+            false,
+        ),
+        (format!("parentId={TV_LIBRARY_ID}"), false),
+    ] {
+        let query = query_for(&params).await;
+        assert_eq!(query.recursive, recursive, "{params}");
+        assert_eq!(query.user_root_children, !recursive, "{params}");
+    }
+    let boxsets = query_for(&format!("parentId={BOXSETS_LIBRARY_ID}")).await;
+    assert_eq!(boxsets.parent_id, BOXSETS_LIBRARY_ID);
+    assert_eq!(boxsets.include_item_types, [BaseItemKind::BoxSet]);
+    assert!(boxsets.recursive);
+    // Explicit ids keep their own path: no parent, no recursion.
+    let ids = query_for(&format!("ids={ITEM_ID}&includeItemTypes=Movie")).await;
+    assert_eq!(ids.item_ids, [ITEM_ID]);
+    assert!(!ids.recursive && !ids.user_root_children);
+    // A BoxSet browse of a TV library re-roots to the user root, where its
+    // linked-ancestor constraint is a filter.
+    let rerooted = query_for(&format!("parentId={TV_LIBRARY_ID}&includeItemTypes=BoxSet")).await;
+    assert_eq!(rerooted.parent_id, Uuid::nil());
+    assert_eq!(rerooted.linked_child_ancestor_ids, [TV_LIBRARY_ID]);
+    assert!(rerooted.recursive);
+    // A view is no library (`ICollectionFolder`), even one delegating to a
+    // library: a typed browse of it stays a direct one.
+    let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;
+    assert_eq!(view.parent_id, TV_LIBRARY_ID);
+    assert!(!view.recursive);
 }
 
 #[tokio::test]

@@ -27,11 +27,31 @@ use quick_xml::events::{BytesStart, Event};
 pub struct XmltvChannel {
     /// The `id` attribute — the join key against tuner channels' `tvg-id`.
     pub id: String,
-    /// The first `<display-name>`.
+    /// The first `<display-name>`. Upstream `ProcessNode` prefers the one
+    /// whose `lang` matches the provider's or server's preferred language;
+    /// that pick is not ported yet and is tracked with the programme fields'
+    /// language pick in gl-684.
     pub display_name: String,
+    /// The channel number: the last `<display-name>` that reads as a number
+    /// once `-` and `_` become `.` (Jellyfin.XmlTv `SetChannelNumber`), in
+    /// that replaced form — `4-1` gives `4.1`.
+    pub number: Option<String>,
     /// The `src` of the channel's first own `<icon>` that has a `src`, `width`
     /// or `height` (`Icons.FirstOrDefault()?.Source`), when it has one.
     pub icon: Option<String>,
+}
+
+impl XmltvChannel {
+    /// The number a listings provider reports for this channel:
+    /// `string.IsNullOrWhiteSpace(c.Number) ? c.Id : c.Number`
+    /// (`XmlTvListingsProvider.GetChannels`).
+    #[must_use]
+    pub fn listings_number(&self) -> &str {
+        self.number
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(&self.id)
+    }
 }
 
 /// A single programme (an airing on a channel over a time range).
@@ -97,13 +117,28 @@ pub struct Xmltv {
     pub channels: Vec<XmltvChannel>,
     /// Programme airings.
     pub programmes: Vec<XmltvProgramme>,
+    /// Why the document is not a readable XMLTV guide, when it is not: empty,
+    /// not well-formed, cut off inside an element, or rooted at something other
+    /// than `<tv>`. A guide refresh treats such a document the way Jellyfin 12.1
+    /// treats a throwing `GetProgramsAsync` (`hasErrors`): it keeps the stored
+    /// guide rather than replacing it with what was read.
+    pub error: Option<String>,
 }
 
 /// Parses an XMLTV document. Malformed XML yields whatever was read before the
-/// error (lenient, matching how tuner guides are consumed in practice); a
-/// completely unparseable document yields an empty guide.
+/// error, with [`Xmltv::error`] saying what went wrong, so a caller can tell a
+/// partial read from a complete guide.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one pull-parser state machine
 pub fn parse_xmltv(xml: &str) -> Xmltv {
+    if xml.trim().is_empty() {
+        // `XmlTvListingsProvider.UnzipIfNeededAndCopy`: "Downloaded XMLTV file
+        // is empty".
+        return Xmltv {
+            error: Some("the XMLTV document is empty".to_owned()),
+            ..Xmltv::default()
+        };
+    }
     let mut reader = Reader::from_str(xml);
     let config = reader.config_mut();
     config.check_end_names = false;
@@ -116,14 +151,32 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     let mut episode_system: Option<String> = None;
     // The number of elements open around the current one. An unbalanced tag
     // (`check_end_names` is off) skews it until the programme or channel it
-    // sits in ends, losing that one's later children; upstream's `XmlReader`
-    // rejects the whole guide instead.
+    // sits in ends, losing that one's later children. A tag still open at EOF
+    // sets `error`, so the refresh keeps the stored guide, as upstream's
+    // `XmlReader` rejecting the document does. Best-effort only: a stray end
+    // tag can cancel an unclosed one.
     let mut depth = 0_usize;
     let mut channel: Option<OpenChannel> = None;
     let mut programme: Option<OpenProgramme> = None;
+    let mut root_seen = false;
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        if !root_seen && let Ok(Event::Start(e) | Event::Empty(e)) = &event {
+            root_seen = true;
+            // Stricter than .NET's `XmlReader`, which rejects an HTML error
+            // page only when it is not well-formed: with `check_end_names` off
+            // this reader cannot tell, so any root but `<tv>` keeps the stored
+            // guide.
+            if e.local_name().as_ref() != "tv" {
+                out.error = Some(format!(
+                    "the document's root element is <{}>, not <tv>",
+                    e.local_name().as_ref()
+                ));
+                break;
+            }
+        }
+        match event {
             Ok(Event::Start(e)) => {
                 match e.local_name().as_ref().as_bytes() {
                     b"channel" => {
@@ -206,7 +259,18 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                 }
                 text.clear();
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                if depth > 0 {
+                    out.error = Some("the XMLTV document ends inside an open element".to_owned());
+                } else if !root_seen {
+                    out.error = Some("the XMLTV document has no root element".to_owned());
+                }
+                break;
+            }
+            Err(e) => {
+                out.error = Some(format!("the XMLTV document is not well-formed: {e}"));
+                break;
+            }
             Ok(_) => {}
         }
     }
@@ -392,6 +456,79 @@ fn apply_start(
     }
 }
 
+/// Jellyfin.XmlTv `SetChannelNumber`: a display-name with `-` and `_` turned
+/// into `.` is the channel number when it parses as a `double` under
+/// `NumberStyles.Any` and the invariant culture.
+fn channel_number(display_name: &str) -> Option<String> {
+    let value = display_name.replace(['-', '_'], ".");
+    parses_as_invariant_double(&value).then_some(value)
+}
+
+/// Whether .NET's `double.TryParse(s, NumberStyles.Any,
+/// CultureInfo.InvariantCulture, out _)` accepts `s`. That style allows
+/// leading and trailing white space, a leading or trailing sign, a pair of
+/// parentheses, the currency symbol `¤`, `,` group separators, a decimal
+/// point and an exponent. The invariant `NaN` and infinity symbols parse too,
+/// ignoring case.
+///
+/// This is an approximation for channel display-names. It is stricter than
+/// .NET about white space inside the affixes (`( 5)`, `¤ 5`), and looser about
+/// `NaN`/`Infinity` wrapped in them (`(NaN)`). No real guide writes either.
+fn parses_as_invariant_double(s: &str) -> bool {
+    let white = |c: char| matches!(c, '\u{9}'..='\u{d}' | ' ');
+    let mut s = s.trim_matches(white);
+    // Parentheses are the sign, so a pair rules out `+`/`-`. A sign and the
+    // currency symbol may each appear once, at either end, in either order.
+    let mut signed = false;
+    if let Some(inner) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        s = inner;
+        signed = true;
+    }
+    let mut currency = false;
+    loop {
+        let sign = (!signed)
+            .then(|| {
+                s.strip_prefix(['+', '-'])
+                    .or_else(|| s.strip_suffix(['+', '-']))
+            })
+            .flatten();
+        if let Some(rest) = sign {
+            s = rest;
+            signed = true;
+            continue;
+        }
+        let symbol = (!currency)
+            .then(|| s.strip_prefix('¤').or_else(|| s.strip_suffix('¤')))
+            .flatten();
+        if let Some(rest) = symbol {
+            s = rest;
+            currency = true;
+            continue;
+        }
+        break;
+    }
+    if s.eq_ignore_ascii_case("nan") || s.eq_ignore_ascii_case("infinity") {
+        return true;
+    }
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(at) => (&s[..at], Some(&s[at + 1..])),
+        None => (s, None),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = |part: &str| part.chars().all(|c| c.is_ascii_digit());
+    let integer_ok =
+        !integer.starts_with(',') && integer.chars().all(|c| c.is_ascii_digit() || c == ',');
+    let has_digit = integer
+        .chars()
+        .chain(fraction.chars())
+        .any(|c| c.is_ascii_digit());
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && digits(e)
+    });
+    integer_ok && digits(fraction) && has_digit && exponent_ok
+}
+
 /// Applies the end of an element, or a self-closing one, to the channel or
 /// programme being read, using the accumulated `text`. `depth` is the number
 /// of elements open around it.
@@ -406,8 +543,13 @@ fn apply_end(
     let text = text.trim();
     if let Some(c) = channel {
         let c = &mut c.channel;
-        if name == b"display-name" && c.display_name.is_empty() && !text.is_empty() {
-            text.clone_into(&mut c.display_name);
+        if name == b"display-name" {
+            if c.display_name.is_empty() && !text.is_empty() {
+                text.clone_into(&mut c.display_name);
+            }
+            if let Some(number) = channel_number(text) {
+                c.number = Some(number);
+            }
         }
         return;
     }
@@ -667,11 +809,87 @@ mod tests {
         assert!(parse_xmltv_time("2026").is_none());
     }
 
+    /// Jellyfin.XmlTv `SetChannelNumber`: `-` and `_` become `.`, and the
+    /// result is the number when `double.TryParse(NumberStyles.Any,
+    /// InvariantCulture)` accepts it.
+    #[rstest::rstest]
+    #[case("4.1", Some("4.1"))]
+    #[case("4-1", Some("4.1"))]
+    #[case("4_1", Some("4.1"))]
+    #[case("704", Some("704"))]
+    #[case("1,234", Some("1,234"))]
+    #[case("(5)", Some("(5)"))]
+    #[case("+5", Some("+5"))]
+    #[case("5e3", Some("5e3"))]
+    #[case("¤5", Some("¤5"))]
+    #[case("4.1 WNBC", None)]
+    #[case("WNBC", None)]
+    #[case("12-1-1", None)]
+    #[case(".", None)]
+    #[case("5e", None)]
+    #[case(".5", Some(".5"))]
+    #[case("5.", Some("5."))]
+    #[case("5+", Some("5+"))]
+    #[case("¤+5", Some("¤+5"))]
+    #[case("NaN", Some("NaN"))]
+    #[case("infinity", Some("infinity"))]
+    #[case("1.2,3", None)]
+    #[case("(+5)", None)]
+    #[case("+ 5", None)]
+    #[case("", None)]
+    fn display_name_channel_numbers(#[case] display_name: &str, #[case] number: Option<&str>) {
+        assert_eq!(super::channel_number(display_name).as_deref(), number);
+    }
+
+    #[test]
+    fn the_last_numeric_display_name_numbers_the_channel() {
+        let g = parse_xmltv(
+            r#"<tv>
+  <channel id="I4.1.12345.zap2it.com">
+    <display-name>4.1 WNBC</display-name><display-name>4-1</display-name><display-name>WNBC</display-name>
+  </channel>
+  <channel id="news.example"><display-name>News</display-name></channel>
+</tv>"#,
+        );
+        assert_eq!(g.channels[0].display_name, "4.1 WNBC");
+        assert_eq!(g.channels[0].number.as_deref(), Some("4.1"));
+        assert_eq!(g.channels[0].listings_number(), "4.1");
+        // No numeric display-name: the provider reports the id as the number.
+        assert_eq!(g.channels[1].number, None);
+        assert_eq!(g.channels[1].listings_number(), "news.example");
+    }
+
     #[test]
     fn empty_document_is_empty_guide() {
         let g = parse_xmltv("");
         assert!(g.channels.is_empty());
         assert!(g.programmes.is_empty());
+        assert!(
+            g.error.is_some(),
+            "an empty body is an error, not an empty guide"
+        );
+    }
+
+    /// Which documents a guide refresh refuses (`error` set) and which it
+    /// takes as authoritative, even when they carry no programmes.
+    #[rstest::rstest]
+    #[case::whitespace(" \n\t", true)]
+    #[case::text_only("Service Unavailable", true)]
+    #[case::bare_ampersand_in_text(
+        "<tv><programme channel=\"a\"><title>A & B</title></programme></tv>",
+        true
+    )]
+    #[case::unclosed_at_eof("<tv><channel id=\"a\">", true)]
+    #[case::html_root("<!DOCTYPE html><html><body>503</body></html>", true)]
+    #[case::empty_tv("<tv></tv>", false)]
+    #[case::self_closing_tv("<tv/>", false)]
+    #[case::prolog(
+        "<?xml version=\"1.0\"?><!DOCTYPE tv SYSTEM \"xmltv.dtd\"><!-- grabber --><tv></tv>",
+        false
+    )]
+    #[case::prefixed_tv("<x:tv xmlns:x=\"urn:x\"></x:tv>", false)]
+    fn unreadable_documents_report_an_error(#[case] xml: &str, #[case] unreadable: bool) {
+        assert_eq!(parse_xmltv(xml).error.is_some(), unreadable, "{xml}");
     }
 
     /// Attribute values carry XML entity references just like element text does,

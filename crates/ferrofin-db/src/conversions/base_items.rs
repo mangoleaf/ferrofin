@@ -47,7 +47,7 @@ impl TryFrom<PersonCredit> for BaseItemPerson {
             type_: person
                 .person_type
                 .as_deref()
-                .map_or(PersonKind::Unknown, person_kind_from_str),
+                .map_or(PersonKind::Unknown, PersonKind::from_stored),
             primary_image_tag: None,
             image_blur_hashes: None,
         })
@@ -79,41 +79,5 @@ impl TryFrom<BaseItemImageInfoEntity> for ImageInfo {
             width: i32::try_from(entity.width).ok(),
             size: 0,
         })
-    }
-}
-
-/// Maps a stored `PersonType` string onto a [`PersonKind`].
-///
-/// The strings are the wire-contract `PersonKind` names (PascalCase); an
-/// unrecognized value maps to [`PersonKind::Unknown`], matching the upstream
-/// tolerant behaviour.
-fn person_kind_from_str(value: &str) -> PersonKind {
-    match value {
-        "Actor" => PersonKind::Actor,
-        "Director" => PersonKind::Director,
-        "Composer" => PersonKind::Composer,
-        "Writer" => PersonKind::Writer,
-        "GuestStar" => PersonKind::GuestStar,
-        "Producer" => PersonKind::Producer,
-        "Conductor" => PersonKind::Conductor,
-        "Lyricist" => PersonKind::Lyricist,
-        "Arranger" => PersonKind::Arranger,
-        "Engineer" => PersonKind::Engineer,
-        "Mixer" => PersonKind::Mixer,
-        "Remixer" => PersonKind::Remixer,
-        "Creator" => PersonKind::Creator,
-        "Artist" => PersonKind::Artist,
-        "AlbumArtist" => PersonKind::AlbumArtist,
-        "Author" => PersonKind::Author,
-        "Illustrator" => PersonKind::Illustrator,
-        "Penciller" => PersonKind::Penciller,
-        "Inker" => PersonKind::Inker,
-        "Colorist" => PersonKind::Colorist,
-        "Letterer" => PersonKind::Letterer,
-        "CoverArtist" => PersonKind::CoverArtist,
-        "Editor" => PersonKind::Editor,
-        "Translator" => PersonKind::Translator,
-        "Narrator" => PersonKind::Narrator,
-        _ => PersonKind::Unknown,
     }
 }

@@ -244,6 +244,8 @@ def canned_10_11_8(path):
                 IsFavorite INTEGER NOT NULL, LastPlayedDate TEXT, Likes INTEGER, PlayCount INTEGER NOT NULL,
                 PlaybackPositionTicks INTEGER NOT NULL, Played INTEGER NOT NULL, Rating REAL,
                 SubtitleStreamIndex INTEGER, RetentionDate TEXT, PRIMARY KEY (ItemId, UserId, CustomDataKey));
+            CREATE TABLE MediaSegments (Id TEXT NOT NULL PRIMARY KEY, EndTicks INTEGER NOT NULL, ItemId TEXT NOT NULL,
+                SegmentProviderId TEXT NOT NULL, StartTicks INTEGER NOT NULL, Type INTEGER NOT NULL);
             INSERT INTO Users VALUES ('{ADULT}', '{USERS[1]}'), ('{CHILD}', '{USERS[2]}');
             INSERT INTO BaseItems (Id, Type, Name, ParentId, TopParentId, SeriesId, SeasonId, OfficialRating)
               VALUES ('{guid(0x5e)}', 'MediaBrowser.Controller.Entities.TV.Season', 'Season 1', NULL, '{guid(0x70)}', NULL, NULL, 'G'),
@@ -425,6 +427,38 @@ class SeededAdoptionTest(unittest.TestCase):
         self.assertEqual(chain[1][1], chain[0][0])
         self.assertTrue(chain[0][0].isupper() and '-' in chain[0][0], 'ids are spelled like the source rows')
         self.assertEqual(history, [(chain[1][0], self.seeds['orphan_history']['key'], 1, 3)])
+
+    def test_media_segments_land_on_the_locked_movie_under_the_plugins_provider_id(self):
+        with closing(sqlite3.connect(self.source)) as conn:
+            rows = conn.execute('SELECT ItemId, SegmentProviderId, Type, StartTicks, EndTicks FROM MediaSegments '
+                                'ORDER BY Type').fetchall()
+        # GetProviderId("Intro Skipper"): MD5 of "intro skipper" in UTF-16LE, as a .NET Guid.
+        provider = 'b0338b450421c081992860f1d02f261f'
+        self.assertEqual(rows, [(guid(3), provider, 4, 5_700_000_000, 6_000_000_000),
+                                (guid(3), provider, 5, 0, 300_000_000)])
+
+    def test_a_fixture_with_an_empty_digest_table_fails_its_build(self):
+        from table_digests import TABLES
+        db = str(Path(self.source).with_name('populated.db'))
+        with closing(sqlite3.connect(db)) as conn, conn:
+            for table in TABLES:
+                conn.execute(f'CREATE TABLE "{table}" (Id INTEGER)')
+                conn.execute(f'INSERT INTO "{table}" VALUES (1)')
+        synthetic_fixture.require_populated(db)
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('DELETE FROM "KeyframeData"')
+        with self.assertRaisesRegex(CheckError, r"no rows in KeyframeData$"):
+            synthetic_fixture.require_populated(db)
+        # A fixture without seed_database may lack only what it writes.
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('INSERT INTO "KeyframeData" VALUES (1)')
+            conn.execute('DELETE FROM "MediaSegments"')
+        synthetic_fixture.require_populated(db, synthetic_fixture.SEEDED_ONLY)
+        with self.assertRaisesRegex(CheckError, r"no rows in MediaSegments$"):
+            synthetic_fixture.require_populated(db)
+        # A table the schema lacks fails the same way.
+        with self.assertRaisesRegex(CheckError, "no rows in MediaStreamInfos"):
+            synthetic_fixture.require_populated(self.source)
 
     def test_linked_children_seeds_land_beside_the_live_member(self):
         linked = self.seeds['linked_children']
@@ -798,14 +832,20 @@ class FreshInstallBuildTest(unittest.TestCase):
         server.return_value.__enter__.return_value = api
         with patch.object(self.synthetic, "server", server), \
                 patch.object(self.synthetic, "seed", return_value={"version": 1}) as seed, \
-                patch.object(self.synthetic, "wait_for_live_members"), \
+                patch.object(self.synthetic, "wait_for_live_members") as wait_for_live_members, \
                 patch.object(self.synthetic, "seed_database") as seed_database, \
+                patch.object(self.synthetic, "require_populated") as require_populated, \
                 patch("preservation.snapshot", return_value={}), \
                 patch("preservation.validate"):
             self.synthetic.build(self.root, self.fresh, 0)
         config = self.root / self.fresh
         seed.assert_called_once()                       # seeded through the 12.2 API
         seed_database.assert_not_called()               # but none of the aged stopped-DB states
+        # 12.2 keeps linked children in their own table, so the 10.11 wait would never end;
+        # only seed_database needs it.
+        wait_for_live_members.assert_not_called()
+        # Every digest table must hold rows, bar those only seed_database fills.
+        require_populated.assert_called_once_with(config / "data/jellyfin.db", synthetic_fixture.SEEDED_ONLY)
         self.assertFalse((config / "seeds.json").exists())
         ready = json.loads((config / "synthetic-ready.json").read_text())
         self.assertEqual(ready["fixture"], self.fresh)  # still a completed, usable fixture

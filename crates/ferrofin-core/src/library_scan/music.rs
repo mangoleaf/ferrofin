@@ -1251,12 +1251,10 @@ impl LibraryScanner {
     /// artist reads no `album.nfo` either, as the walk's `run_local` already
     /// has it (`search.is_none()`). `work.identified` is set for the
     /// identified item alone, so the scan's options decide here. Upstream
-    /// also skips it under "Replace all metadata" when the
-    /// item has a metadata saver (`isSavingMetadata`, the
-    /// `ProviderManager.GetMetadataSavers(...).Any()` of `:184`): Ferrofin
-    /// runs no saver yet (the open "NFO metadata saver is never run" item),
-    /// so under "Replace all metadata" the NFO seeds `temp` as it does in the
-    /// walk, which is upstream's behaviour for a library without a saver.
+    /// also skips it under "Replace all metadata" when the item has a
+    /// metadata saver (`isSavingMetadata`, the
+    /// `ProviderManager.GetMetadataSavers(...).Any()` of `:184`), as the
+    /// walk's `run_local` does.
     async fn music_fold_start<'p>(
         &self,
         work: &MusicRefresh<'_>,
@@ -1275,6 +1273,9 @@ impl LibraryScanner {
             is_folder: current.item.is_folder,
             ..BaseItemEntity::default()
         };
+        if work.request.options.replace_all_metadata && work.policy.saves_metadata(&local) {
+            return (fold, temp);
+        }
         let nfo = self.fetch_local_nfo(&mut local, work.policy).await;
         if nfo.found {
             temp = local;

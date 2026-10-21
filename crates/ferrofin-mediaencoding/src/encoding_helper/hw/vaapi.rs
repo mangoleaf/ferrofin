@@ -41,7 +41,7 @@
 
 use std::fmt::Write as _;
 
-use ferrofin_model::entities::HardwareAccelerationType;
+use ferrofin_model::entities::{HardwareAccelerationType, TonemappingRange};
 
 use super::contains;
 use super::decoder::fixed_output_size;
@@ -636,8 +636,18 @@ pub fn amd_vaapi_full_vid_filters_prefered(input: &ChainInput<'_>) -> FilterChai
     if do_vk_tonemap && !job.has_subs {
         chain.main.push("hwmap=derive_device=vaapi".to_owned());
         chain.main.push("format=vaapi".to_owned());
-        // Clears the surface's meta_offset and settles the output format.
-        chain.main.push("scale_vaapi=format=nv12".to_owned());
+        // Clears the surface's meta_offset and settles the output format,
+        // converting libplacebo's full-range RGB back to limited range unless
+        // the tonemap was asked for full range or the encoder is MJPEG
+        // (Jellyfin 12.1, jellyfin#18025).
+        chain.main.push(
+            if !job.is_mjpeg_encoder && options.tonemapping_range != TonemappingRange::pc {
+                "scale_vaapi=format=nv12:out_range=tv"
+            } else {
+                "scale_vaapi=format=nv12"
+            }
+            .to_owned(),
+        );
         if job.deinterlace {
             chain.main.push(hw_deinterlace_filter(
                 caps,
@@ -706,7 +716,17 @@ pub fn amd_vaapi_full_vid_filters_prefered(input: &ChainInput<'_>) -> FilterChai
         if job.is_vaapi_encoder {
             chain.overlay.push("hwmap=derive_device=vaapi".to_owned());
             chain.overlay.push("format=vaapi".to_owned());
-            chain.overlay.push("scale_vaapi=format=nv12".to_owned());
+            // Back to limited range unless a full-range tonemap ran (Jellyfin
+            // 12.1, jellyfin#18025). Unlike the main path, MJPEG is not
+            // exempt: that is what the C# emits.
+            chain.overlay.push(
+                if !do_vk_tonemap || options.tonemapping_range != TonemappingRange::pc {
+                    "scale_vaapi=format=nv12:out_range=tv"
+                } else {
+                    "scale_vaapi=format=nv12"
+                }
+                .to_owned(),
+            );
             if job.deinterlace {
                 chain.overlay.push(hw_deinterlace_filter(
                     caps,
@@ -1644,10 +1664,15 @@ mod tests {
 
     // ----- AMD (Vulkan / libplacebo) -----------------------------------------
 
-    const LIBPLACEBO_SDR: &str = "libplacebo=upscaler=none:downscaler=none:format=bgra";
+    // libplacebo outputs `bgra`, which is only ever full range (Jellyfin
+    // 12.1, jellyfin#18025).
+    const LIBPLACEBO_SDR: &str = "libplacebo=upscaler=none:downscaler=none:format=bgra:range=pc";
     const LIBPLACEBO_TONEMAP: &str = "libplacebo=upscaler=none:downscaler=none:format=bgra:\
                                       tonemapping=bt.2390:peak_detect=0:color_primaries=bt709:\
-                                      color_trc=bt709:colorspace=bt709";
+                                      color_trc=bt709:colorspace=bt709:range=pc";
+    /// The VAAPI conversion after the Vulkan frames are mapped back, writing
+    /// limited range (the default `TonemappingRange` is `auto`).
+    const CSC_TO_TV: &str = "scale_vaapi=format=nv12:out_range=tv";
 
     fn amd_caps(drm_modifier: bool, ffmpeg: FfmpegVersion) -> FfmpegCapabilities {
         FfmpegCapabilities::builder()
@@ -1701,7 +1726,7 @@ mod tests {
                 "format=vulkan".to_owned(),
                 "hwmap=derive_device=vaapi".to_owned(),
                 "format=vaapi".to_owned(),
-                "scale_vaapi=format=nv12".to_owned(),
+                CSC_TO_TV.to_owned(),
             ]
         );
     }
@@ -1732,7 +1757,7 @@ mod tests {
                 "format=vulkan".to_owned(),
                 "hwmap=derive_device=vaapi".to_owned(),
                 "format=vaapi".to_owned(),
-                "scale_vaapi=format=nv12".to_owned(),
+                CSC_TO_TV.to_owned(),
             ]
         );
     }
@@ -1862,7 +1887,7 @@ mod tests {
                 "overlay_vulkan=eof_action=pass:repeatlast=0".to_owned(),
                 "hwmap=derive_device=vaapi".to_owned(),
                 "format=vaapi".to_owned(),
-                "scale_vaapi=format=nv12".to_owned(),
+                CSC_TO_TV.to_owned(),
             ]
         );
     }
@@ -1895,11 +1920,104 @@ mod tests {
                 "format=vulkan".to_owned(),
             ]
         );
+        assert!(chain.overlay.contains(&CSC_TO_TV.to_owned()));
+    }
+
+    /// Jellyfin 12.1 (jellyfin#18025): after a Vulkan tonemap, the VAAPI
+    /// conversion writes limited range unless the tonemap range is `pc` or
+    /// the encoder is MJPEG (which wants full range).
+    #[rstest::rstest]
+    #[case(TonemappingRange::auto, "h264_vaapi", CSC_TO_TV)]
+    #[case(TonemappingRange::tv, "h264_vaapi", CSC_TO_TV)]
+    #[case(TonemappingRange::pc, "h264_vaapi", "scale_vaapi=format=nv12")]
+    #[case(TonemappingRange::auto, "mjpeg_vaapi", "scale_vaapi=format=nv12")]
+    fn amd_tonemap_maps_back_in_the_tonemap_range(
+        #[case] range: TonemappingRange,
+        #[case] encoder: &str,
+        #[case] expected: &str,
+    ) {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            tonemapping_range: range,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, encoder);
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        let main = amd_vaapi_full_vid_filters_prefered(&inp).main;
+        let csc: Vec<&String> = main
+            .iter()
+            .filter(|f| f.starts_with("scale_vaapi="))
+            .collect();
+        assert_eq!(csc, [expected], "{main:?}");
+    }
+
+    /// A software encoder takes the overlay back through Vulkan to system
+    /// memory, so no VAAPI conversion (and no `out_range`) is involved; the
+    /// burn-in still runs through the full-range libplacebo.
+    #[test]
+    fn amd_burn_in_for_a_software_encoder_downloads_from_vulkan() {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "libx264");
+        inp.subtitle = SubtitleOverlay::Graphical {
+            width: Some(1920),
+            height: Some(1080),
+        };
+        let chain = amd_vaapi_full_vid_filters_prefered(&inp);
         assert!(
-            chain
-                .overlay
-                .contains(&"scale_vaapi=format=nv12".to_owned())
+            chain.main.contains(&LIBPLACEBO_SDR.to_owned()),
+            "{:?}",
+            chain.main
         );
+        assert_eq!(
+            chain.overlay,
+            vec![
+                "overlay_vulkan=eof_action=pass:repeatlast=0".to_owned(),
+                "scale_vulkan=format=nv12".to_owned(),
+                "hwdownload".to_owned(),
+                "format=nv12".to_owned(),
+            ]
+        );
+    }
+
+    /// Jellyfin 12.1 (jellyfin#18025): after a Vulkan subtitle overlay, the
+    /// VAAPI conversion writes limited range unless a Vulkan tonemap ran with
+    /// range `pc`.
+    #[rstest::rstest]
+    #[case(false, TonemappingRange::pc, "h264_vaapi", CSC_TO_TV)]
+    #[case(true, TonemappingRange::auto, "h264_vaapi", CSC_TO_TV)]
+    #[case(true, TonemappingRange::pc, "h264_vaapi", "scale_vaapi=format=nv12")]
+    // Upstream exempts MJPEG on the main path only.
+    #[case(false, TonemappingRange::auto, "mjpeg_vaapi", CSC_TO_TV)]
+    fn amd_overlay_maps_back_in_the_tonemap_range(
+        #[case] vk_tonemap: bool,
+        #[case] range: TonemappingRange,
+        #[case] encoder: &str,
+        #[case] expected: &str,
+    ) {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: vk_tonemap,
+            tonemapping_range: range,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, encoder);
+        if vk_tonemap {
+            inp.color_transfer = Some("smpte2084");
+            inp.vulkan_tonemap_available = true;
+        }
+        inp.subtitle = SubtitleOverlay::Graphical {
+            width: Some(1920),
+            height: Some(1080),
+        };
+        let overlay = amd_vaapi_full_vid_filters_prefered(&inp).overlay;
+        let csc: Vec<&String> = overlay
+            .iter()
+            .filter(|f| f.starts_with("scale_vaapi="))
+            .collect();
+        assert_eq!(csc, [expected], "{overlay:?}");
     }
 
     #[test]

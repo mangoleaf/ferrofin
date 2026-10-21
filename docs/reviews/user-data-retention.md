@@ -52,13 +52,25 @@ watched state. Recovery and snapshot consumption share a transaction.
 
 Recovery runs after scanner and provider refreshes persist item metadata and
 provider IDs. A second recovery pass runs after scan pruning and closing passes,
-before the final library-change notification. It also runs on unchanged scans,
-so a prior interrupted recovery can be retried.
+before the final library-change notification.
 
 The completion pass considers persisted destinations outside the current scan
 scope. This handles both a new path saved before its old path is pruned and a
 destination indexed by an earlier watcher event. Music's closing pass has
 finished before this recovery, so its final metadata is available for keys.
+
+The completion pass always runs after a library scan (`ScanPasses::Library`:
+the scheduled scan, `POST /Library/Refresh`, one library's scan). After a path
+or item scan (`ScanPasses::Touched`: watcher and webhook batches, item and
+folder refreshes) it runs only when history was detached since the last pass,
+read from the retention snapshots' `AUTOINCREMENT` sequence, which every detach
+moves; the first scan after a start always runs it, and a pass that fails is
+retried by the next scan that detached history, and always by the next library
+scan. A touched scan that detached nothing has no new history to place: its own
+saves recovered their history as they were written. What it leaves to the next
+library scan is a destination whose keys changed after its save or outside a
+scan (music's closing pass, a series' re-pointed children, a metadata edit);
+the history waits, retained, for that pass.
 
 The pass processes 500 items per transaction, releases the writer between
 pages, and loads identity fields, providers, and series context in batches.

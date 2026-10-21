@@ -18,6 +18,24 @@ pub(super) async fn set_authentication_provider(
     Ok(())
 }
 
+/// Stores a user's password hash (`None` for a password-less user), bumping
+/// `RowVersion` as an EF save of the entity does.
+pub(super) async fn set_password(
+    pool: &SqlitePool,
+    user_id: &str,
+    hash: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
+           WHERE "Id" = ?1"#,
+    )
+    .bind(user_id)
+    .bind(hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// A user's `ImageInfos` row, or `None` when they have no profile image.
 pub(super) async fn profile_image<'e, E>(
     executor: E,

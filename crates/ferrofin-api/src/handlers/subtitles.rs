@@ -62,7 +62,8 @@ const FALLBACK_FONT_MAX_TOTAL_BYTES: i64 = 20 * 1024 * 1024;
 /// (`.woff`/`.woff2`/`.ttf`/`.otf`).
 const FALLBACK_FONT_EXTENSIONS: &[&str] = &[".woff", ".woff2", ".ttf", ".otf"];
 
-/// Ensures an item exists, returning `404` otherwise.
+/// Ensures an item exists, returning `404` otherwise
+/// (`GetItemById<BaseItem>`, as `DeleteSubtitle` resolves it).
 async fn require_item(
     state: &AppState,
     item_id: Uuid,
@@ -74,6 +75,28 @@ async fn require_item(
         .await?
         .is_none()
     {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+    Ok(())
+}
+
+/// Ensures the item exists **and is a video**, returning `404` otherwise.
+///
+/// Mirrors the C# `GetItemById<Video>(itemId, User.GetUserId())` null check of
+/// `SearchRemoteSubtitles`, `DownloadRemoteSubtitles`, `UploadSubtitle` and
+/// `GetSubtitlePlaylist`: a series, season or audio id is a `404`, so no
+/// subtitle sidecar is ever written beside a non-video path.
+async fn require_video(
+    state: &AppState,
+    item_id: Uuid,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
+    let is_video = state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_some_and(|item| super::videos::is_video(&item));
+    if !is_video {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     Ok(())
@@ -151,7 +174,7 @@ async fn upload_subtitle(
     Path(item_id): Path<Uuid>,
     JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
     let content = decode_base64(&body.data)
         .ok_or_else(|| ApiError::BadRequest("subtitle data is not valid base64".to_owned()))?;
     let response = SubtitleResponse {
@@ -199,7 +222,7 @@ async fn search_remote_subtitles(
     Path((item_id, language)): Path<(Uuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
     // The manager enriches this from the resolved item (name/year/imdb/…) before
     // querying providers; the handler supplies the caller-visible fields.
     let request = SubtitleSearchRequest {
@@ -237,7 +260,7 @@ async fn download_remote_subtitles(
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path((item_id, subtitle_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
     // The C# logs-and-continues on a provider failure, still returning 204, then
     // queues a refresh. A download that succeeds queues the refresh too.
     if state
@@ -482,7 +505,7 @@ async fn get_subtitle_playlist(
     Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
 ) -> Result<Response, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
 
     let user = resolve_user_opt(&state, &auth, None).await?;
     let user_id = user
