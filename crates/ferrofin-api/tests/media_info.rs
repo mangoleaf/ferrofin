@@ -513,6 +513,15 @@ fn media_source(path: &str) -> MediaSourceInfo {
     }
 }
 
+/// An opened live stream, as Live TV hands it back: HTTP, with its id.
+fn live_source(path: &str) -> MediaSourceInfo {
+    MediaSourceInfo {
+        live_stream_id: Some("live-1".to_owned()),
+        protocol: ferrofin_model::media_info::MediaProtocol::Http,
+        ..media_source(path)
+    }
+}
+
 #[async_trait]
 impl MediaSourceManager for OkMediaSources {
     async fn get_media_streams(
@@ -549,10 +558,10 @@ impl MediaSourceManager for OkMediaSources {
         request: &ferrofin_model::media_info::LiveStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
         *self.opened.lock().expect("lock") = Some(request.clone());
-        Ok(media_source(&self.path))
+        Ok(live_source(&self.path))
     }
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
-        unimplemented!()
+        Ok(live_source(&self.path))
     }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!()
@@ -1088,6 +1097,62 @@ async fn open_live_stream_self_as_non_admin_is_allowed() {
     );
 }
 
+/// Live TV's shared buffer URL, built on the loopback address for the
+/// server's own readers (its ffmpeg and the DVR)…
+const LOOPBACK_BUFFER: &str = "http://127.0.0.1:8096/LiveTv/LiveStreamFiles/abc/stream.ts";
+/// …and the same URL at the address this request reached the server by
+/// ([`ferrofin_api::test_support::FakeAppHost`]'s smart API URL).
+const PUBLISHED_BUFFER: &str = "http://localhost:8096/LiveTv/LiveStreamFiles/abc/stream.ts";
+
+/// `MediaInfoHelper.OpenMediaSource` → `RewritePublishedLiveStreamPath`
+/// (v12.2): the opened stream's response copy points its buffer URL at the
+/// request's smart API URL, not at the client's own loopback.
+#[tokio::test]
+async fn open_live_stream_publishes_the_buffer_url_at_the_request_url() {
+    let app = ok_state(Uuid::from_u128(0x0177), LOOPBACK_BUFFER);
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/LiveStreams/Open?userId={USER_ID}"))
+                .header("Authorization", "Bearer t")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"OpenToken":"tok"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["MediaSource"]["Path"],
+        PUBLISHED_BUFFER
+    );
+}
+
+/// `MediaInfoHelper.GetPlaybackInfo` rewrites the cloned sources the same
+/// way: an already-open live stream named by `liveStreamId` is published at
+/// the request's URL.
+#[tokio::test]
+async fn playback_info_publishes_an_open_live_stream_buffer_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let response = create_router(ok_state(item_id, LOOPBACK_BUFFER))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}/PlaybackInfo?liveStreamId=live-1"))
+                .header("X-Emby-Token", "valid")
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["MediaSources"][0]["LiveStreamId"], "live-1");
+    assert_eq!(json["MediaSources"][0]["Path"], PUBLISHED_BUFFER);
+}
+
 /// A [`MediaSourceManager`] serving a fixed set of versions and any open live
 /// stream by id, and recording what `open_live_stream` was asked to open.
 struct VersionedSources {
@@ -1134,6 +1199,8 @@ impl MediaSourceManager for VersionedSources {
         Ok(MediaSourceInfo {
             id: Some("opened".to_owned()),
             live_stream_id: Some("live-1".to_owned()),
+            protocol: ferrofin_model::media_info::MediaProtocol::Http,
+            path: Some(LOOPBACK_BUFFER.to_owned()),
             ..MediaSourceInfo::default()
         })
     }
@@ -1345,6 +1412,8 @@ async fn auto_open_live_stream_opens_a_source_that_requires_opening() {
     )
     .await;
     assert_eq!(json["MediaSources"][0]["Id"], "opened");
+    // Published as `POST /LiveStreams/Open` publishes it (`OpenMediaSource`).
+    assert_eq!(json["MediaSources"][0]["Path"], PUBLISHED_BUFFER);
     let opened = sources
         .opened
         .lock()
