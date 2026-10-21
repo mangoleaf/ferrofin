@@ -183,6 +183,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
