@@ -804,49 +804,55 @@ impl ItemCountService for FerrofinItemCountService {
             })
             .collect();
         let ids: Vec<String> = counted.iter().copied().map(guid_to_db).collect();
-        let grouped_count = |table: &str| {
+        let grouped_count = |table: &str, n: usize| {
             let mut sql =
                 format!(r#"SELECT "ParentId", COUNT(*) FROM "{table}" WHERE "ParentId" IN ("#);
-            sql.push_str(&placeholders(ids.len()));
+            sql.push_str(&placeholders(n));
             sql.push_str(r#") GROUP BY "ParentId""#);
             sql
         };
         let mut hierarchical: HashMap<String, i64> = HashMap::new();
         let mut linked: HashMap<String, i64> = HashMap::new();
-        for (table, into) in [
-            ("BaseItems", &mut hierarchical),
-            ("LinkedChildren", &mut linked),
-        ] {
-            let mut sql = grouped_count(table);
-            if table == "BaseItems" {
-                // Direct-child counts skip merged alternates too (a season's
-                // ChildCount is its DISTINCT episodes, not every version), and
-                // a stacked part or local version, which belongs to its owner
-                // (`DescendantQueryHelper.IsDistinctLibraryItem`).
-                sql = sql.replace(
-                    r#"WHERE "ParentId" IN ("#,
-                    r#"WHERE "PrimaryVersionId" IS NULL
+        // Chunked: an unpaged page can hold more parents than SQLite's bind
+        // limit (32,766). `restrict_count_query` adds only the parental binds,
+        // about four per tag in the user's tag policy plus a few tens, so a
+        // chunk overflows only past ~8,000 tags on one user.
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            for (table, into) in [
+                ("BaseItems", &mut hierarchical),
+                ("LinkedChildren", &mut linked),
+            ] {
+                let mut sql = grouped_count(table, chunk.len());
+                if table == "BaseItems" {
+                    // Direct-child counts skip merged alternates too (a season's
+                    // ChildCount is its DISTINCT episodes, not every version), and
+                    // a stacked part or local version, which belongs to its owner
+                    // (`DescendantQueryHelper.IsDistinctLibraryItem`).
+                    sql = sql.replace(
+                        r#"WHERE "ParentId" IN ("#,
+                        r#"WHERE "PrimaryVersionId" IS NULL
                          AND ("OwnerId" IS NULL OR "ExtraType" IS NOT NULL)
                          AND "ParentId" IN ("#,
+                    );
+                }
+                let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
+                for id in chunk {
+                    query = query.bind(id.as_str());
+                }
+                let id = if table == "BaseItems" {
+                    r#""BaseItems"."Id""#
+                } else {
+                    r#""LinkedChildren"."ChildId""#
+                };
+                let mut query = restrict_count_query(query, &access_filter, Some(id))?;
+                into.extend(
+                    query
+                        .build_query_as::<(String, i64)>()
+                        .fetch_all(self.db.pool())
+                        .await
+                        .map_err(db_err)?,
                 );
             }
-            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
-            for id in &ids {
-                query = query.bind(id.as_str());
-            }
-            let id = if table == "BaseItems" {
-                r#""BaseItems"."Id""#
-            } else {
-                r#""LinkedChildren"."ChildId""#
-            };
-            let mut query = restrict_count_query(query, &access_filter, Some(id))?;
-            into.extend(
-                query
-                    .build_query_as::<(String, i64)>()
-                    .fetch_all(self.db.pool())
-                    .await
-                    .map_err(db_err)?,
-            );
         }
 
         // The virtual children — one tiny indexed count, issued only when the
@@ -901,21 +907,20 @@ impl ItemCountService for FerrofinItemCountService {
         // library folder has no linked children, and the three kinds that read
         // this (MusicAlbum/Season/Playlist) are never virtual views.
         let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
-        let mut sql = String::from(
-            r#"SELECT "ParentId", COUNT(*) FROM "LinkedChildren" WHERE "ParentId" IN ("#,
-        );
-        sql.push_str(&placeholders(ids.len()));
-        sql.push_str(r#") GROUP BY "ParentId""#);
-        let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
-        for id in &ids {
-            query = query.bind(id.as_str());
+        let mut grouped: HashMap<String, i64> = HashMap::new();
+        // Chunked: an unpaged page can hold more parents than SQLite's bind limit.
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let mut sql = String::from(
+                r#"SELECT "ParentId", COUNT(*) FROM "LinkedChildren" WHERE "ParentId" IN ("#,
+            );
+            sql.push_str(&placeholders(chunk.len()));
+            sql.push_str(r#") GROUP BY "ParentId""#);
+            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id.as_str());
+            }
+            grouped.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
         }
-        let grouped: HashMap<String, i64> = query
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?
-            .into_iter()
-            .collect();
         let mut out = HashMap::with_capacity(parent_ids.len());
         for parent in parent_ids {
             if let Some(count) = grouped.get(&guid_to_db(*parent)) {
@@ -1879,6 +1884,59 @@ mod tests {
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    /// An unpaged browse can put more folders on one page than SQLite's
+    /// default bind limit (32,766); both count batches must still answer.
+    #[tokio::test]
+    async fn count_batches_answer_pages_past_the_sqlite_bind_limit() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let playlist = Uuid::from_u128(0xE201);
+        let child = Uuid::from_u128(0xE202);
+        let season = Uuid::from_u128(0xE203);
+        let episode = Uuid::from_u128(0xE204);
+        seed_item(&db, playlist, BaseItemKind::Playlist).await;
+        seed_item(&db, child, BaseItemKind::Audio).await;
+        seed_item(&db, season, BaseItemKind::Season).await;
+        seed_item(&db, episode, BaseItemKind::Episode).await;
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, 0, ?2, 0)"#,
+        )
+        .bind(guid_to_db(playlist))
+        .bind(guid_to_db(child))
+        .execute(db.writer())
+        .await
+        .expect("link child");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(episode))
+            .bind(guid_to_db(season))
+            .execute(db.writer())
+            .await
+            .expect("set parent");
+        // The counted parents sit in the first chunk and in a middle one, so
+        // every chunk's rows must survive the merge, not just the last's.
+        let mut page: Vec<Uuid> = (1..=33_000_u128).map(Uuid::from_u128).collect();
+        page[0] = playlist;
+        page[ferrofin_db::BATCH_BIND_CHUNK * 32] = season;
+
+        let linked = service
+            .get_linked_children_count_batch(&page)
+            .await
+            .expect("linked counts for a huge page");
+        assert_eq!(linked.get(&playlist), Some(&1));
+        let children = service
+            .get_child_count_batch(&page, None)
+            .await
+            .expect("child counts for a huge page");
+        assert_eq!(children.get(&playlist), Some(&1), "linked arm, first chunk");
+        assert_eq!(
+            children.get(&season),
+            Some(&1),
+            "hierarchical arm, middle chunk"
+        );
+        assert_eq!(children.len(), page.len());
     }
 
     #[tokio::test]

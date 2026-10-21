@@ -201,6 +201,44 @@ impl std::fmt::Debug for FerrofinUserViewManager {
     }
 }
 
+/// C# `LibraryManager.GetNamedViewId`: a user's view of a library,
+/// `GetNewItemId("38_namedview_" + user("N") + parent("N") + viewType,
+/// typeof(UserView))`.
+pub(crate) fn named_view_id(
+    derivation: &item_type_lookup::IdDerivation,
+    user_id: Uuid,
+    parent_id: Uuid,
+    view_type: &str,
+) -> Option<Uuid> {
+    item_type_lookup::derive_item_id_with(
+        derivation,
+        BaseItemKind::UserView,
+        &format!(
+            "38_namedview_{}{}{view_type}",
+            user_id.simple(),
+            parent_id.simple()
+        ),
+    )
+}
+
+/// C# `LibraryManager.GetShadowViewId`: the shadow view built from a library,
+/// `GetNewItemId("38_namedview_" + name + parentId + viewType,
+/// typeof(UserView))`, the parent id in its default (`D`) form. Ferrofin builds
+/// no shadow views, but a database adopted from Jellyfin can hold their ids in
+/// users' preferences.
+pub(crate) fn shadow_view_id(
+    derivation: &item_type_lookup::IdDerivation,
+    name: &str,
+    parent_id: Uuid,
+    view_type: &str,
+) -> Option<Uuid> {
+    item_type_lookup::derive_item_id_with(
+        derivation,
+        BaseItemKind::UserView,
+        &format!("38_namedview_{name}{}{view_type}", parent_id.hyphenated()),
+    )
+}
+
 impl FerrofinUserViewManager {
     /// Creates a user-view manager over the injected item repository.
     #[must_use]
@@ -544,15 +582,7 @@ impl FerrofinUserViewManager {
         parent_id: Uuid,
         view_type: &str,
     ) -> Option<Uuid> {
-        item_type_lookup::derive_item_id_with(
-            &self.id_derivation,
-            BaseItemKind::UserView,
-            &format!(
-                "38_namedview_{}{}{view_type}",
-                user_id.simple(),
-                parent_id.simple()
-            ),
-        )
+        named_view_id(&self.id_derivation, user_id, parent_id, view_type)
     }
 
     /// Keeps, of the `UserView` rows in `views`, only the ones `GetUserViews`
@@ -2270,7 +2300,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<CollectionTypeOptions>,
             _options: &LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!("fake")
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {

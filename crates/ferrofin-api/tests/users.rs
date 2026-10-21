@@ -325,11 +325,17 @@ impl QuickConnect for OkQuickConnect {
     async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
         Ok(true)
     }
-    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
-        Ok(SessionInfoDto {
-            user_id: ADMIN_ID,
-            user_name: Some("admin".to_owned()),
-            ..SessionInfoDto::default()
+    async fn get_authorized_request(
+        &self,
+        _secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto {
+                user_id: ADMIN_ID,
+                user_name: Some("admin".to_owned()),
+                ..SessionInfoDto::default()
+            },
+            access_token: "qc-token".into(),
         })
     }
 }
@@ -349,7 +355,7 @@ impl SessionManager for NoopSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
@@ -1217,7 +1223,7 @@ impl SessionManager for OkSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!()
     }

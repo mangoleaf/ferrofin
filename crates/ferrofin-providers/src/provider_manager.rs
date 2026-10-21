@@ -2656,6 +2656,10 @@ impl LocalProviderManager {
         } else {
             false
         };
+        // `EpisodeMetadataService.BeforeSaveInternal`'s range guard, on the
+        // path-less episodes this refresh saves (an adopted row can carry an
+        // inverted range that Jellyfin 12 clears on its next refresh).
+        crate::episode::discard_invalid_episode_range(&mut row);
         // `RefreshMetadata`'s tail — the stamp and `SaveInternal`'s save
         // rule, decided as the library scan decides them.
         let metadata_changed = row != stored;
@@ -5876,7 +5880,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
             _options: &ferrofin_model::configuration::LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -8769,7 +8773,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
             _options: &ferrofin_model::configuration::LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -10727,6 +10731,37 @@ mod tests {
         assert_eq!(row.overview.as_deref(), Some("Stored."));
         assert_eq!(row.date_last_refreshed, None);
         assert!(episode.people.written.lock().expect("lock").is_empty());
+    }
+
+    /// The path-less refresh runs `EpisodeMetadataService.BeforeSaveInternal`'s
+    /// range guard before it saves (v12.2): a stored range ending before the
+    /// episode starts (an adopted 2..1) is dropped from `Data`, and the rest of
+    /// the blob stays.
+    #[tokio::test]
+    async fn a_virtual_episode_refresh_drops_a_range_that_ends_before_it_starts() {
+        let (base, _log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399")],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |row| {
+                row.data = Some(r#"{"IndexNumberEnd":1,"AirsBeforeSeasonNumber":2}"#.to_owned());
+            },
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        let data: serde_json::Value =
+            serde_json::from_str(row.data.as_deref().expect("data")).expect("json");
+        assert_eq!(row.index_number, Some(2));
+        assert_eq!(data.get("IndexNumberEnd"), None);
+        assert_eq!(
+            data.get("AirsBeforeSeasonNumber"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     /// A path-less season has no library location, so its preferred

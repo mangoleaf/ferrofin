@@ -213,6 +213,10 @@ plugins like Home Screen Sections possible):
   controllers); the caller's resolved identity (`user-id`, `is-admin`,
   `is-authenticated`) is forwarded — never a token — and the plugin gates its own
   sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+  Requests never wait for the plugin: together they may hold at most half of its queue
+  (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`), queued or running, and past that, or when the
+  queue is full, the server answers `503` at once. So a flood of anonymous requests cannot
+  starve the scans, tasks and events that share the queue.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
   text). This is how a plugin injects its client-side hooks into jellyfin-web.
@@ -392,8 +396,8 @@ planned improvement.)
 plugin's declared `web-transforms` rewrite served jellyfin-web files for all
 users — a strictly larger grant than settings pages (admin-only) or plugin
 routes (opt-in fetches). It is the single strongest reason to install only
-plugins you trust; a disabled plugin's transforms are not applied
-(restart-required, like everything decided at boot).
+plugins you trust; a disabled or uninstalled plugin's transforms stop
+applying at once, and enabling a plugin starts them, with no restart.
 
 **Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
 executes in the **admin's browser with the admin's session** — the same trust
@@ -478,9 +482,8 @@ Two things to know:
 - **The opt-out is per plugin, by disabling it** (or removing the repository). Upstream
   honours an `AutoUpdate` flag in each installed plugin's manifest; Ferrofin's WASM
   artifacts carry no such manifest, so a disabled plugin is what the task skips. Disabling
-  takes effect live for tasks, providers and analysis, and keeps the plugin installed and
-  inert; a plugin's **web transforms** are wired at boot, so disarming those needs a
-  restart.
+  takes effect live for tasks, providers, analysis and the plugin's **web transforms**,
+  and keeps the plugin installed and inert.
 
 ## Roadmap
 

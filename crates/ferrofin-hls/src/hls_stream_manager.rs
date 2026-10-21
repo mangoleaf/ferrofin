@@ -41,7 +41,7 @@ use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
 use ferrofin_mediaencoding::transcoding::{
     FsFileCleaner, SessionReporter, WAIT_FOR_FILE_TIMEOUT_MS,
 };
-use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeManagerImpl};
+use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeDisplayNames, TranscodeManagerImpl};
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{
@@ -62,7 +62,8 @@ use crate::master_playlist::{MasterPlaylistContext, TrickplayResolution, build_m
 /// Port of the useful output of `StreamingHelpers.GetStreamingState` +
 /// `EncodingHelper.GetCommandLineArguments` — the fields the ported HLS
 /// orchestration consumes. Built by a [`StreamStatePlanner`]; the [`state`] is
-/// handed straight to [`TranscodeManagerImpl::start_ffmpeg`].
+/// handed to [`TranscodeManagerImpl::start_ffmpeg`] once named by
+/// [`StreamStatePlanner::display_names`].
 pub struct TranscodePlan {
     /// The fully-populated job state (media path, run-time ticks, segment
     /// container, output path, session/device ids) for `start_ffmpeg`.
@@ -137,6 +138,15 @@ pub trait StreamStatePlanner: Send + Sync {
         segment_id: Option<i32>,
         kind: PlaylistKind,
     ) -> Result<TranscodePlan, ServiceError>;
+
+    /// The item, series and library names the transcode logs show for
+    /// `item_id`. Asked only when a transcode actually starts, never by
+    /// [`plan`](Self::plan): every segment request plans, and resolving the
+    /// library walks every configured library. Best-effort; the default is
+    /// empty.
+    async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
+        TranscodeDisplayNames::default()
+    }
 }
 
 /// How long [`HlsStreamManagerImpl::wait_for_minimum_segment_count`] pauses
@@ -262,6 +272,13 @@ where
     /// beside the playlist instead kept them out of the dashboard entirely.
     fn log_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(self.paths.log_directory_path())
+    }
+
+    /// `state` named for the transcode logs, for a job about to start.
+    async fn labelled(&self, state: &EncodingJobInfo, item_id: uuid::Uuid) -> EncodingJobInfo {
+        let mut state = state.clone();
+        state.display = self.planner.display_names(item_id).await;
+        state
     }
 
     /// Wires the trickplay store so master playlists advertise the
@@ -486,7 +503,7 @@ where
         // written by the transcode itself via `-hls_fmp4_init_filename`, not a
         // normal segment. Serve it once a transcode has produced it.
         if segment_id < 0 {
-            return self.resolve_init_segment(request, is_audio).await;
+            return Box::pin(self.resolve_init_segment(request, is_audio)).await;
         }
 
         let plan = self
@@ -600,9 +617,10 @@ where
         }
 
         // (Re)start the transcode from this segment and wait for it.
+        let state = self.labelled(&plan.state, request.item_id).await;
         let start = StartFfMpegRequest {
             program: &self.ffmpeg_path,
-            state: &plan.state,
+            state: &state,
             output_path: &playlist_path,
             arguments: plan.arguments.clone(),
             log_dir: self.log_dir(),
@@ -745,7 +763,7 @@ where
                 // request then starts a second writer onto the same segment
                 // files — torn, unparsable fragments (the fragParsingError
                 // regression).
-                let mut state = plan.state.clone();
+                let mut state = self.labelled(&plan.state, request.item_id).await;
                 state.wait_for_path = Some(start_segment.clone());
                 let start_request = StartFfMpegRequest {
                     program: &self.ffmpeg_path,
@@ -923,9 +941,10 @@ where
                         log_dir.display()
                     )));
                 }
+                let state = self.labelled(&plan.state, request.item_id).await;
                 let start = StartFfMpegRequest {
                     program: &self.ffmpeg_path,
-                    state: &plan.state,
+                    state: &state,
                     output_path: &playlist_path,
                     arguments: plan.arguments.clone(),
                     log_dir: log_dir.clone(),
@@ -1048,9 +1067,10 @@ where
         let lock = self.playlist_lock(&output);
         let _guard = lock.lock().await;
         if !Path::new(&output).exists() {
+            let state = self.labelled(&plan.state, request.item_id).await;
             let start = StartFfMpegRequest {
                 program: &self.ffmpeg_path,
-                state: &plan.state,
+                state: &state,
                 output_path: Path::new(&output),
                 arguments: plan.arguments.clone(),
                 log_dir: self.log_dir(),
@@ -1444,6 +1464,8 @@ mod tests {
         dir: PathBuf,
         segment_container: String,
         requests: PlanCalls,
+        /// How often the manager asked for display names.
+        labels: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -1490,6 +1512,7 @@ mod tests {
                 },
                 supported_video_codecs: Vec::new(),
                 supported_audio_codecs: Vec::new(),
+                supported_subtitle_codecs: Vec::new(),
                 segment_length_secs: 6,
                 wait_for_path: (kind == PlaylistKind::Progressive).then(|| playlist.clone()),
                 segment_container: Some(self.segment_container.clone()),
@@ -1515,6 +1538,12 @@ mod tests {
                 encoding_options: EncodingOptions::default(),
                 min_segments: 3,
             })
+        }
+
+        async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
+            self.labels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            TranscodeDisplayNames::default()
         }
     }
 
@@ -1546,6 +1575,7 @@ mod tests {
             dir: dir.to_path_buf(),
             segment_container: container.to_owned(),
             requests: requests.clone(),
+            labels: std::sync::atomic::AtomicUsize::new(0),
         };
         let transcoder = FakeSegmentTranscoder::new(script);
         let spawns = transcoder.clone();
@@ -1968,6 +1998,32 @@ mod tests {
             mgr.segment_locks.len(),
             1,
             "a per-session playlist lock must be forgotten once nobody holds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_names_are_resolved_only_when_a_transcode_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        let labels = || mgr.planner.labels.load(std::sync::atomic::Ordering::SeqCst);
+
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        assert_eq!(labels(), 1, "the start names its job");
+
+        // The segment is on disk now: serving it again starts nothing, so it
+        // must not resolve names (a library walk) either.
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        mgr.variant_playlist(&req(), false).await.unwrap();
+        assert_eq!(
+            labels(),
+            1,
+            "a request that starts nothing resolves no names"
         );
     }
 

@@ -91,7 +91,12 @@ impl SchedulesDirect {
 
         let cache_dir = self.cache_dir.resolve();
         let cache_path = cache_dir.join(COUNTRIES_CACHE_FILE);
-        if cache_is_fresh(&cache_path).await {
+        if cache_is_fresh(
+            &cache_path,
+            Duration::from_secs(COUNTRY_CACHE_DAYS * 24 * 60 * 60),
+        )
+        .await
+        {
             match tokio::fs::read(&cache_path).await {
                 Ok(bytes) => {
                     self.remember(bytes.clone());
@@ -140,11 +145,12 @@ impl SchedulesDirect {
     }
 }
 
-/// Whether the on-disk cache exists and was written less than
-/// [`COUNTRY_CACHE_DAYS`] ago (`File.Exists && UtcNow - LastWriteTimeUtc <
-/// CountryCacheDays` upstream). A missing file, an unreadable mtime, or an mtime
-/// that cannot be compared all read as "not fresh".
-async fn cache_is_fresh(path: &Path) -> bool {
+/// Whether the on-disk cache file at `path` exists and was written less than
+/// `max_age` ago (`File.Exists && UtcNow - LastWriteTimeUtc < maxAge`, as the
+/// Schedules Direct country cache and `XmlTvListingsProvider.GetXml` check it).
+/// A missing file, an unreadable mtime, or an mtime that cannot be compared all
+/// read as "not fresh".
+pub(crate) async fn cache_is_fresh(path: &Path, max_age: Duration) -> bool {
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return false;
     };
@@ -155,7 +161,7 @@ async fn cache_is_fresh(path: &Path) -> bool {
     let age = SystemTime::now()
         .duration_since(modified)
         .unwrap_or(Duration::ZERO);
-    age < Duration::from_secs(COUNTRY_CACHE_DAYS * 24 * 60 * 60)
+    age < max_age
 }
 
 #[cfg(test)]

@@ -130,6 +130,36 @@ struct SessionInfo {
 }
 
 impl SessionInfo {
+    /// Records what a start or progress report says is playing (C#
+    /// `SessionManager.UpdateNowPlayingItem`, which both `OnPlaybackStart` and
+    /// `OnPlaybackProgress` call). A session recreated mid-playback gets its
+    /// now-playing item back from the first progress report, since clients
+    /// never resend the start. `now_playing` is the reported item when the
+    /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
+    /// item it cannot resolve).
+    fn update_now_playing(
+        &mut self,
+        now_playing: Option<Uuid>,
+        position_ticks: Option<i64>,
+        is_paused: bool,
+        update_check_in: bool,
+    ) {
+        let now = Utc::now();
+        self.now_playing_item_id = now_playing;
+        self.last_activity_date = now;
+        if update_check_in {
+            self.last_playback_check_in = now;
+        }
+        // The date the pause began: kept across paused reports.
+        if !is_paused {
+            self.last_paused_date = None;
+        } else if self.last_paused_date.is_none() {
+            self.last_paused_date = Some(now);
+        }
+        self.now_playing_is_paused = is_paused;
+        self.now_playing_position_ticks = position_ticks;
+    }
+
     /// Whether the session references `user_id` as its primary or an additional
     /// user (C# `SessionInfo.ContainsUser`).
     fn contains_user(&self, user_id: Uuid) -> bool {
@@ -1104,7 +1134,7 @@ impl SessionManager for FerrofinSessionManager {
         device_id: &str,
         device_name: &str,
         remote_endpoint: &str,
-        user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         self.upsert_session(
             app_name,
@@ -1112,7 +1142,7 @@ impl SessionManager for FerrofinSessionManager {
             device_id,
             device_name,
             remote_endpoint,
-            Some(user),
+            user,
         )
         .await
     }
@@ -1150,24 +1180,28 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
-        // Record the now-playing item + mark automatic progress started.
-        {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.now_playing_item_id = (!info.item_id.is_nil()).then_some(info.item_id);
-                s.now_playing_position_ticks = info.position_ticks;
-                s.now_playing_is_paused = info.is_paused;
-                s.is_playing = true;
-                s.last_playback_check_in = Utc::now();
-            }
-        }
-
-        // Resolve the library item (best-effort) for the event payload.
+        // Resolve the library item (best-effort): it names the now-playing
+        // item and the event payload.
         let item = if info.item_id.is_nil() {
             None
         } else {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
+
+        // Record the now-playing item + mark automatic progress started.
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
+                s.update_now_playing(
+                    item.as_ref().map(|_| info.item_id),
+                    info.position_ticks,
+                    info.is_paused,
+                    true,
+                );
+                s.is_playing = true;
+            }
+        }
+
         if item.is_some() {
             info!(
                 user = ?session.user_name,
@@ -1200,7 +1234,7 @@ impl SessionManager for FerrofinSessionManager {
     async fn on_playback_progress(
         &self,
         info: &PlaybackProgressInfo,
-        _is_automated: bool,
+        is_automated: bool,
     ) -> Result<(), ServiceError> {
         let session_id = info
             .session_id
@@ -1219,18 +1253,27 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
+        // C# `GetNowPlayingItem`: the item the session already plays is not
+        // looked up again, so a steady stream of reports costs no query.
+        let now_playing = if info.item_id.is_nil() {
+            None
+        } else if session.now_playing_item_id == Some(info.item_id) {
+            Some(info.item_id)
+        } else {
+            self.library_manager
+                .get_item_by_id(info.item_id)
+                .await?
+                .map(|_| info.item_id)
+        };
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.last_activity_date = Utc::now();
-                s.last_playback_check_in = Utc::now();
-                s.now_playing_position_ticks = info.position_ticks;
-                s.now_playing_is_paused = info.is_paused;
-                if info.is_paused {
-                    s.last_paused_date = Some(Utc::now());
-                } else {
-                    s.last_paused_date = None;
-                }
+                s.update_now_playing(
+                    now_playing,
+                    info.position_ticks,
+                    info.is_paused,
+                    !is_automated,
+                );
             }
         }
 
@@ -2435,19 +2478,19 @@ mod bus_fallback_tests {
 
         // Three sessions of the same user, one per regime.
         let direct = mgr
-            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", &user)
+            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", Some(&user))
             .await
             .expect("direct session")
             .id
             .expect("direct session id");
         let busonly = mgr
-            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", &user)
+            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", Some(&user))
             .await
             .expect("bus session")
             .id
             .expect("bus session id");
         let stale = mgr
-            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", &user)
+            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", Some(&user))
             .await
             .expect("stale session")
             .id
@@ -2589,7 +2632,7 @@ mod bus_fallback_tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user(&db, user_id).await;
         for device in ["dev-a", "dev-b", "dev-c"] {
-            mgr.log_session_activity("Web", "1.0", device, "Box", "e", &user)
+            mgr.log_session_activity("Web", "1.0", device, "Box", "e", Some(&user))
                 .await
                 .expect("session");
         }
@@ -2795,7 +2838,14 @@ mod broadcast_lock_tests {
         let user = crate::test_support::seed_user(&db, user_id).await;
 
         let stalled = mgr
-            .log_session_activity("Stalled Client", "1.0", "dev-stalled", "TV", "e", &user)
+            .log_session_activity(
+                "Stalled Client",
+                "1.0",
+                "dev-stalled",
+                "TV",
+                "e",
+                Some(&user),
+            )
             .await
             .expect("session created");
         let stalled_id = stalled.id.clone().expect("session id");
@@ -2840,7 +2890,7 @@ mod broadcast_lock_tests {
         timeout(PROGRESS_TIMEOUT, async {
             assert!(!mgr.has_active_playback().await.expect("playback probe"));
             let other = mgr
-                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", &user)
+                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", Some(&user))
                 .await
                 .expect("second session created");
             assert_ne!(other.id, stalled.id);
@@ -2881,7 +2931,7 @@ mod broadcast_lock_tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user(&db, user_id).await;
         let session = mgr
-            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", &user)
+            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", Some(&user))
             .await
             .expect("session created");
         let session_id = session.id.clone().expect("session id");

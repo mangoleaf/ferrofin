@@ -120,8 +120,15 @@ struct WidthRefreshContext<'a> {
     /// needs the codec, and a hardware scaler takes fixed pixel dimensions, so
     /// an anamorphic source has to be un-stretched from its aspect ratio.
     video_stream: Option<MediaStream>,
+    /// Every stream of the item in stream order (`mediaSource.MediaStreams`),
+    /// which the extractor needs to find `video_stream`'s ffmpeg index for
+    /// `-map 0:N` (`EncodingHelper.FindIndex`).
+    media_streams: Vec<MediaStream>,
     /// The selected trickplay directory for the item.
     trickplay_dir: &'a str,
+    /// Whether `trickplay_dir` is beside the media (`SaveTrickplayWithMedia`),
+    /// so generation probes it for write access first.
+    save_with_media: bool,
 }
 
 impl FerrofinTrickplayManager {
@@ -389,6 +396,13 @@ impl FerrofinTrickplayManager {
             }
         }
 
+        // Check for write permission before generating images
+        // (`TrickplayManager.cs:482-488`), so an unwritable media folder fails
+        // before any ffmpeg work rather than when the packed tiles are moved.
+        if ctx.save_with_media {
+            probe_write_access(&output_dir)?;
+        }
+
         // Generate: extract thumbnails into a temp dir, pack them into tiles.
         let _slot = self
             .generation_slots
@@ -411,8 +425,16 @@ impl FerrofinTrickplayManager {
         let frames_dir =
             std::env::temp_dir().join(format!("ferrofin_trickplay_{}", Uuid::new_v4().simple()));
         let _frames_cleanup = TemporaryTrickplayDirectory(frames_dir.clone());
-        self.extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
-            .await
+        let result = self
+            .extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
+            .await;
+        if result.is_err() && ctx.save_with_media {
+            // Drop the probed width folder when nothing was written into it;
+            // a non-empty or already removed folder makes this a no-op, and
+            // `prune_unexpected_folders` sweeps any row-less folder afterwards.
+            let _ = std::fs::remove_dir(&output_dir);
+        }
+        result
     }
 
     /// Runs the frame extraction plus [`Self::create_tiles`], saving the
@@ -431,6 +453,7 @@ impl FerrofinTrickplayManager {
             .extract_trickplay_frames(&TrickplayExtraction {
                 input_path: ctx.media_path,
                 video_stream: ctx.video_stream.as_ref(),
+                media_streams: &ctx.media_streams,
                 interval_ms: options.interval,
                 max_width: actual_width,
                 qscale: options.qscale,
@@ -857,11 +880,15 @@ impl FerrofinTrickplayManager {
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
-        video_stream: Option<MediaStream>,
-        has_streams: bool,
+        media_streams: Vec<MediaStream>,
         replace: bool,
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
+        let has_streams = !media_streams.is_empty();
+        let video_stream = media_streams
+            .iter()
+            .find(|stream| stream.stream_type == MediaStreamType::Video)
+            .cloned();
         let mut options = self.trickplay_options().await?;
         let Some(media_path) = Self::can_generate_trickplay(
             entity,
@@ -918,7 +945,9 @@ impl FerrofinTrickplayManager {
             item_id,
             media_path: &media_path,
             video_stream,
+            media_streams,
             trickplay_dir: &trickplay_dir,
+            save_with_media: library_options.save_trickplay_with_media,
         };
         for width in &options.width_resolutions {
             if *width <= 0 {
@@ -947,19 +976,10 @@ impl TrickplayManager for FerrofinTrickplayManager {
             return Ok(());
         };
         let streams = self.media_streams(item_id).await?;
-        let has_streams = !streams.is_empty();
-        let stream = streams
-            .into_iter()
-            .find(|stream| {
-                stream.stream_type
-                    == crate::db_error::media_stream_type_to_disc(MediaStreamType::Video)
-            })
-            .map(stream_to_dto);
         self.refresh_media(
             item_id,
             &entity,
-            stream,
-            has_streams,
+            streams.into_iter().map(stream_to_dto).collect(),
             replace,
             library_options,
         )
@@ -981,19 +1001,10 @@ impl TrickplayManager for FerrofinTrickplayManager {
             stored_streams = self.media_streams(item_id).await?;
             &stored_streams
         };
-        let stream = streams
-            .iter()
-            .find(|stream| {
-                stream.stream_type
-                    == crate::db_error::media_stream_type_to_disc(MediaStreamType::Video)
-            })
-            .cloned()
-            .map(stream_to_dto);
         self.refresh_media(
             item_id,
             entity,
-            stream,
-            !streams.is_empty(),
+            streams.iter().cloned().map(stream_to_dto).collect(),
             replace,
             library_options,
         )
@@ -1368,6 +1379,26 @@ fn jpg_files_sorted(dir: &Path) -> Vec<String> {
     files
 }
 
+/// The write-permission check `RefreshTrickplayDataInternal` runs before
+/// extracting into a media folder: creates `dir` and an empty probe file in
+/// it. Unlike upstream, the probe is removed again so it never sits beside
+/// the tiles; a concurrent refresh of the same width may remove it first.
+fn probe_write_access(dir: &Path) -> Result<(), ServiceError> {
+    tracing::debug!(directory = %dir.display(), "verifying write permission in media directory");
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ServiceError::backend(format!("cannot create {}: {e}", dir.display())))?;
+    let probe = dir.join(".jellyfin-trickplay");
+    std::fs::File::create(&probe)
+        .map_err(|e| ServiceError::backend(format!("cannot write {}: {e}", probe.display())))?;
+    match std::fs::remove_file(&probe) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ServiceError::backend(format!(
+            "cannot remove {}: {e}",
+            probe.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Moves the flat directory `src` to `dst`, replacing `dst` if present; falls
 /// back to copy-and-delete when a rename crosses filesystems.
 fn move_dir(src: &Path, dst: &Path) -> Result<(), ServiceError> {
@@ -1567,6 +1598,8 @@ mod tests {
         /// The video stream the last request carried, which is what decides
         /// whether the extractor can take the hardware path at all.
         last_stream: Mutex<Option<MediaStream>>,
+        /// Every stream the last request carried, in order.
+        last_streams: Mutex<Vec<MediaStream>>,
         last_output: Mutex<Option<String>>,
         hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
@@ -1579,6 +1612,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
                 last_stream: Mutex::new(None),
+                last_streams: Mutex::new(Vec::new()),
                 last_output: Mutex::new(None),
                 hold: None,
             }
@@ -1609,6 +1643,7 @@ mod tests {
             *self.last_request.lock().expect("lock") =
                 Some((request.interval_ms, request.max_width));
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
+            *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
             let output_dir = request.output_dir;
             *self.last_output.lock().unwrap() = Some(output_dir.to_owned());
             let max_width = request.max_width;
@@ -1820,6 +1855,55 @@ mod tests {
         repo.save_media_streams(item, std::slice::from_ref(&row))
             .await
             .expect("save video stream");
+    }
+
+    /// `ExtractVideoImagesOnIntervalAccelerated` maps the video stream by its
+    /// index among the source's streams (`FindIndex`, `MediaEncoder.cs:925-932`),
+    /// so the extractor needs all of them, in stream order: with an audio
+    /// stream stored ahead of the video, the video is ffmpeg's `0:1`.
+    #[tokio::test]
+    async fn refresh_hands_the_extractor_every_stream_in_order() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
+        let rows: Vec<_> = [
+            (0, ferrofin_model::entities::MediaStreamType::Audio, "aac"),
+            (1, ferrofin_model::entities::MediaStreamType::Video, "h264"),
+        ]
+        .into_iter()
+        .map(
+            |(index, kind, codec)| ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                item_id: guid_to_db(item),
+                stream_index: index,
+                stream_type: crate::db_error::media_stream_type_to_disc(kind),
+                codec: Some(codec.to_owned()),
+                width: (kind == ferrofin_model::entities::MediaStreamType::Video).then_some(1920),
+                height: (kind == ferrofin_model::entities::MediaStreamType::Video).then_some(1080),
+                ..Default::default()
+            },
+        )
+        .collect();
+        repo.save_media_streams(item, &rows)
+            .await
+            .expect("save streams");
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let streams = r.extractor.last_streams.lock().expect("lock").clone();
+        let video = r.extractor.last_stream().expect("the video stream arrived");
+        assert_eq!(
+            streams.iter().map(|s| s.stream_type).collect::<Vec<_>>(),
+            [
+                ferrofin_model::entities::MediaStreamType::Audio,
+                ferrofin_model::entities::MediaStreamType::Video,
+            ]
+        );
+        assert_eq!(streams[1], video, "the video is the second stream: 0:1");
     }
 
     #[tokio::test]
@@ -2795,6 +2879,55 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "failed writing cannot leave a manifest pointing at absent tiles"
+        );
+    }
+
+    /// A regular file where the `.trickplay` folder belongs blocks the
+    /// destination the way a read-only media folder does, and still blocks it
+    /// when the tests run as root.
+    #[tokio::test]
+    async fn unwritable_sidecar_destination_fails_before_any_frame_extraction() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320, 640]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, options) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
+        std::fs::write(&sidecar, b"blocked output destination").unwrap();
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "the write probe stops every width before ffmpeg runs"
+        );
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_file(&sidecar).unwrap();
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert_eq!(r.extractor.calls(), 2);
+        let mut names: Vec<String> = std::fs::read_dir(sidecar.join("320 - 2x2"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["0.jpg", "1.jpg"],
+            "the probe file is not left behind"
         );
     }
 

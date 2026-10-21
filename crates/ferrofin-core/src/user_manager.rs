@@ -962,16 +962,13 @@ impl UserManager for FerrofinUserManager {
         }
         // The built-in provider supplies the hash while this manager owns its
         // database write. External providers own their credential store.
-        let hash = self.default_provider.format_password_hash(new_password)?;
-        sqlx::query(
-            r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
-               WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(hash)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        let hash = self
+            .default_provider
+            .format_password_hash(new_password)
+            .await?;
+        user_repository::set_password(self.db.writer(), &guid_to_db(user_id), hash.as_deref())
+            .await
+            .map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -1034,6 +1031,25 @@ impl UserManager for FerrofinUserManager {
         if !success {
             self.record_login_failure(&user).await?;
             return Ok(None);
+        }
+
+        // Upstream's default provider migrates a legacy hash once the password
+        // verified ("Migrate old hashes to the new default"); the entity it
+        // changed is saved with the successful login.
+        if user
+            .authentication_provider_id
+            .eq_ignore_ascii_case(DEFAULT_AUTH_PROVIDER_ID)
+            && let Some(stored) = user.password.as_deref()
+            && let Some(hash) = self
+                .default_provider
+                .upgraded_hash(stored, password)
+                .await?
+        {
+            user_repository::set_password(self.db.writer(), &user.id, Some(&hash))
+                .await
+                .map_err(db_err)?;
+            tracing::info!(user_id = %user.id, "migrated password hash to the current default");
+            user.password = Some(hash);
         }
 
         // Success: reset the failure counter and, for a real user session, stamp
@@ -1707,6 +1723,7 @@ fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
 mod tests {
     use super::*;
     use crate::test_support::test_db;
+    use ferrofin_common::cryptography::PasswordHash;
 
     #[tokio::test]
     async fn profile_image_tags_follow_upload_replacement_and_removal() {
@@ -2406,6 +2423,55 @@ mod tests {
                 .await,
             Err(ServiceError::Unauthorized(_))
         ));
+    }
+
+    /// A successful login re-hashes a legacy hash with the current default, as
+    /// upstream `DefaultAuthenticationProvider.Authenticate` does ("Migrate old
+    /// hashes to the new default"); a failed one leaves it alone.
+    #[tokio::test]
+    async fn login_upgrades_a_legacy_password_hash() {
+        // PBKDF2-HMAC-SHA1, 1000 iterations, 32-byte key, of "legacy-pw".
+        const LEGACY: &str = "$PBKDF2$iterations=1000$69F420AABBCCDDEEFF00112233445566$\
+            28A5D139D2C7C66286E60F053FD55AFE9DAA7A94D4A45B84B8E08479F4D3122E";
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("erin").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        user_repository::set_password(db.writer(), &user.id, Some(LEGACY))
+            .await
+            .expect("seed legacy hash");
+        let stored = || async {
+            mgr.get_user_by_id(id)
+                .await
+                .expect("read")
+                .and_then(|user| user.password)
+                .expect("password")
+        };
+
+        let bad = mgr
+            .authenticate_user("erin", "wrong", "127.0.0.1", true)
+            .await
+            .expect("auth call");
+        assert!(bad.is_none());
+        assert_eq!(stored().await, LEGACY, "a failed login keeps the hash");
+
+        let ok = mgr
+            .authenticate_user("erin", "legacy-pw", "127.0.0.1", true)
+            .await
+            .expect("auth ok");
+        assert!(ok.is_some());
+        let upgraded = PasswordHash::parse(&stored().await).expect("parse");
+        assert!(
+            DefaultAuthenticationProvider::new().hash_is_current(&upgraded),
+            "upgraded to the current default: {upgraded}"
+        );
+        assert!(
+            mgr.authenticate_user("erin", "legacy-pw", "127.0.0.1", true)
+                .await
+                .expect("auth again")
+                .is_some(),
+            "the upgraded hash still verifies"
+        );
     }
 
     #[tokio::test]
