@@ -2431,3 +2431,158 @@ async fn a_file_that_becomes_or_stops_being_an_extra_moves() {
         (None, None, planned.parent_id)
     );
 }
+
+impl Fixture {
+    /// The `(Type, ExtraType, OwnerId)` of every row stored at `relative`.
+    async fn kinds_at(&self, relative: &str) -> Vec<(String, Option<i64>, Option<String>)> {
+        sqlx::query_as(r#"SELECT "Type", "ExtraType", "OwnerId" FROM "BaseItems" WHERE "Path" = ?"#)
+            .bind(self.media.join(relative).to_string_lossy().as_ref())
+            .fetch_all(self.db.pool())
+            .await
+            .unwrap()
+    }
+}
+
+/// An episode in a folder of its own below its season (Jellyfin 12.0-rc5's
+/// `RefreshedOwnedItems`, `[InlineData(true, true)]`): a grouped one — two
+/// versions — owns the extras folder beside it; a single-file one owns
+/// nothing, and an extras folder below a non-top folder is ignored
+/// (`CoreResolutionIgnoreRule`) and an extra-named file set aside
+/// (`ResolveVideos`), so neither is ever planned as an episode.
+#[tokio::test]
+async fn extras_in_an_episodes_own_folder_are_its_own_or_nothing() {
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 01/Show S01E01.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 1080p.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 720p.mkv",
+            "Show/Season 01/S01E02/featurettes/Making of.mkv",
+            "Show/Season 01/S01E03/Show S01E03.mkv",
+            "Show/Season 01/S01E03/featurettes/Behind.mkv",
+            "Show/Season 01/S01E03/Show S01E03-trailer.mkv",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+
+    let episode = stored_type_name(BaseItemKind::Episode).unwrap();
+    let primaries: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "OwnerId" IS NULL
+             AND "Path" LIKE '%S01E02/Show S01E02%'"#,
+    )
+    .bind(episode)
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(primaries.len(), 1, "one primary of the version group");
+
+    let owned = f
+        .kinds_at("Show/Season 01/S01E02/featurettes/Making of.mkv")
+        .await;
+    assert_eq!(owned.len(), 1, "{owned:?}");
+    assert!(owned[0].1.is_some(), "an extra, not an episode: {owned:?}");
+    assert_eq!(owned[0].2.as_deref(), Some(primaries[0].as_str()));
+
+    for path in [
+        "Show/Season 01/S01E03/featurettes/Behind.mkv",
+        "Show/Season 01/S01E03/Show S01E03-trailer.mkv",
+    ] {
+        assert!(f.kinds_at(path).await.is_empty(), "{path}");
+    }
+    let episodes: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" = ?1 AND "OwnerId" IS NULL"#,
+    )
+    .bind(episode)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(episodes, 3, "S01E01, S01E02 and S01E03 only");
+}
+
+/// The guards around an episode's own extras: a scoped scan of the extra
+/// (the watcher's) keeps it, an episode row an older scan stored at a
+/// set-aside path goes, and a version group whose folder also holds a loose
+/// extra file is in a mixed folder and owns nothing.
+#[tokio::test]
+async fn an_episodes_own_extras_survive_scoped_scans_and_mixed_folders_own_none() {
+    let making_of = "Show/Season 01/S01E02/featurettes/Making of.mkv";
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 01/S01E02/Show S01E02 - 1080p.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 720p.mkv",
+            making_of,
+            "Show/Season 01/S01E03/Show S01E03.mkv",
+            "Show/Season 01/S01E03/featurettes/Behind.mkv",
+            "Show/Season 01/S01E04/Show S01E04 - 1080p.mkv",
+            "Show/Season 01/S01E04/Show S01E04 - 720p.mkv",
+            "Show/Season 01/S01E04/trailer.mkv",
+            "Show/Season 01/S01E04/featurettes/Clip.mkv",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let owned = f.kinds_at(making_of).await;
+    assert!(owned.len() == 1 && owned[0].1.is_some(), "{owned:?}");
+
+    // A scoped scan of the extra alone, and of its folder: still owned.
+    for root in [making_of, "Show/Season 01/S01E02/featurettes"] {
+        f.scanner
+            .scan_paths(&[f.media.join(root).to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        assert_eq!(f.kinds_at(making_of).await, owned, "after scanning {root}");
+    }
+
+    // An episode an older scan stored at a set-aside path is removed.
+    let mut phantom = f.row("Show/Season 01/S01E03/Show S01E03.mkv").await;
+    phantom.id = guid_to_db(Uuid::new_v4());
+    phantom.path = Some(
+        f.media
+            .join("Show/Season 01/S01E03/featurettes/Behind.mkv")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let phantom_id = phantom.id.clone();
+    f.store.save_items(&[phantom]).await.unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert!(!f.has(&phantom_id).await, "the phantom episode goes");
+
+    // A mixed folder (a version group beside a loose extra) owns nothing.
+    for path in [
+        "Show/Season 01/S01E04/trailer.mkv",
+        "Show/Season 01/S01E04/featurettes/Clip.mkv",
+    ] {
+        assert!(f.kinds_at(path).await.is_empty(), "{path}");
+    }
+}
+
+/// A loose episode's own extras: a version group in a non-season folder of
+/// the series (a virtual season's episode, whose container is the series)
+/// owns the extras folder beside it, saved after it.
+#[tokio::test]
+async fn a_loose_episodes_own_folder_extras_are_its_own() {
+    let making_of = "Show/Specials/Show S01E05/featurettes/Making of.mkv";
+    let f = Fixture::with_type(
+        &[
+            "Show/Specials/Show S01E05/Show S01E05 - 1080p.mkv",
+            "Show/Specials/Show S01E05/Show S01E05 - 720p.mkv",
+            making_of,
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let primary: String = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "OwnerId" IS NULL"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Episode).unwrap())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    let owned = f.kinds_at(making_of).await;
+    assert_eq!(owned.len(), 1, "{owned:?}");
+    assert!(owned[0].1.is_some());
+    assert_eq!(owned[0].2.as_deref(), Some(primary.as_str()));
+}
