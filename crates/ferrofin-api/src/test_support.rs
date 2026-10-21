@@ -88,7 +88,9 @@ use ferrofin_traits::security::{ApiKeyManager, QuickConnect};
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use ferrofin_traits::stubs::LyricManager;
 use ferrofin_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
-use ferrofin_traits::system::{ServerApplicationHost, ServerApplicationPaths, SystemManager};
+use ferrofin_traits::system::{
+    LocalApiAccess, ServerApplicationHost, ServerApplicationPaths, SystemManager,
+};
 use ferrofin_traits::tasks::TaskManager;
 use ferrofin_traits::trickplay::TrickplayManager;
 use ferrofin_traits::tv::{NextUpQuery, TvSeriesManager};
@@ -1183,7 +1185,7 @@ impl SessionManager for FakeSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
@@ -1400,9 +1402,17 @@ impl SystemManager for FakeSystem {
     }
 }
 
-/// A fake [`ServerApplicationHost`]; getters return neutral values, URL builders
-/// are unused by INFRA-level tests.
+/// A fake [`ServerApplicationHost`]; getters return neutral values. The smart
+/// API URL is `http://localhost:8096` at the root; the other URL builders are
+/// unused by INFRA-level tests.
 pub struct FakeAppHost;
+
+#[async_trait]
+impl LocalApiAccess for FakeAppHost {
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        unimplemented!("fake")
+    }
+}
 
 #[async_trait]
 impl ServerApplicationHost for FakeAppHost {
@@ -1426,8 +1436,11 @@ impl ServerApplicationHost for FakeAppHost {
     fn friendly_name(&self) -> String {
         "ferrofin-test".to_owned()
     }
+    fn base_url(&self) -> String {
+        String::new()
+    }
     async fn get_smart_api_url(&self, _request: &RequestContext) -> Result<String, ServiceError> {
-        unimplemented!("fake")
+        Ok("http://localhost:8096".to_owned())
     }
     async fn get_smart_api_url_for_peer(
         &self,
