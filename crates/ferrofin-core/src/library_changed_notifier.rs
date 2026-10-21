@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::entities_media::LibraryUpdateInfo;
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::events::{EventManager, LibraryChangeAudience};
 use uuid::Uuid;
 
@@ -139,7 +140,12 @@ pub const ITEMS_CHANGED: &str = "ItemsChanged";
 /// end of each batch's window.
 pub struct LibraryChangedNotifier {
     events: Arc<dyn EventManager>,
+    /// The window length without a configuration to read, or when reading
+    /// it fails.
     debounce: Duration,
+    /// Where `LibraryUpdateDuration` is read as each window opens. `None`
+    /// (unit tests) uses `debounce`.
+    config: Option<Arc<dyn ServerConfigurationManager>>,
     pending: Mutex<Pending>,
     /// The id the next window gets ([`Pending::window`]).
     next_window: AtomicU64,
@@ -152,16 +158,27 @@ pub struct LibraryChangedNotifier {
 
 impl LibraryChangedNotifier {
     /// Creates a notifier that publishes through `events`, each batch
-    /// `debounce` after its first change.
+    /// `debounce` after its first change unless [`Self::with_config`] wires
+    /// the configured duration.
     #[must_use]
     pub fn new(events: Arc<dyn EventManager>, debounce: Duration) -> Self {
         Self {
             events,
             debounce,
+            config: None,
             pending: Mutex::new(Pending::default()),
             next_window: AtomicU64::new(0),
             audience: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Reads each window's length from the server configuration's
+    /// `LibraryUpdateDuration` as the window opens, so a change to it applies
+    /// to the next batch without a restart.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<dyn ServerConfigurationManager>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Wires the per-user fan-out. Called once by the composition root, after
@@ -272,11 +289,28 @@ impl LibraryChangedNotifier {
     fn close_window_after(self: &Arc<Self>, window: u64) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(this.debounce).await;
+            tokio::time::sleep(this.window_length().await).await;
             if let Some(pending) = this.take(Some(window)) {
                 this.publish(pending).await;
             }
         });
+    }
+
+    /// The length of a window opening now: `TimeSpan.FromSeconds(
+    /// LibraryUpdateDuration)`, read when the window opens, with zero sending
+    /// the batch at once. A negative value counts as zero (upstream's `Timer`
+    /// rejects it).
+    async fn window_length(&self) -> Duration {
+        let Some(config) = &self.config else {
+            return self.debounce;
+        };
+        match config.configuration().await {
+            Ok(c) => Duration::from_secs(u64::try_from(c.library_update_duration).unwrap_or(0)),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read LibraryUpdateDuration; using the default");
+                self.debounce
+            }
+        }
     }
 
     /// Takes the batch and closes its window, when `window` is the one open
@@ -567,6 +601,45 @@ mod tests {
         (n, events)
     }
 
+    /// A configuration whose `LibraryUpdateDuration` a test can change.
+    struct LiveConfig(Mutex<ferrofin_model::configuration::ServerConfiguration>);
+
+    impl LiveConfig {
+        fn set(&self, seconds: i32) {
+            self.0.lock().expect("lock").library_update_duration = seconds;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServerConfigurationManager for LiveConfig {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not used by the notifier")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.0.lock().expect("lock").clone()))
+        }
+        async fn update_configuration(
+            &self,
+            configuration: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            *self.0.lock().expect("lock") = configuration.clone();
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
     fn movie(id: Uuid, parent: Uuid, library: Uuid) -> BaseItemEntity {
         BaseItemEntity {
             id: id.to_string(),
@@ -688,6 +761,53 @@ mod tests {
         let pushed = events.library_updates();
         assert_eq!(pushed.len(), 5);
         assert_eq!(pushed[4].items_added.len(), 1);
+    }
+
+    /// `LibraryUpdateDuration` is read as each window opens
+    /// (`OnLibraryChange`), so a configuration change applies to the next
+    /// batch without a restart; zero, or a negative value, sends it at once.
+    #[tokio::test(start_paused = true)]
+    async fn each_window_reads_the_configured_duration() {
+        let config = Arc::new(LiveConfig(Mutex::new(
+            ferrofin_model::configuration::ServerConfiguration {
+                library_update_duration: 10,
+                ..Default::default()
+            },
+        )));
+        let events = Arc::new(RecordingEvents::default());
+        let n = Arc::new(
+            LibraryChangedNotifier::new(
+                Arc::clone(&events) as Arc<dyn EventManager>,
+                Duration::from_secs(30),
+            )
+            .with_config(Arc::clone(&config) as Arc<dyn ServerConfigurationManager>),
+        );
+        let (library, parent) = (Uuid::new_v4(), Uuid::new_v4());
+        let add = || n.record_added(&[movie(Uuid::new_v4(), parent, library)]);
+
+        add();
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(events.library_updates().is_empty());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(events.library_updates().len(), 1, "a 10 s window");
+
+        config.set(60);
+        add();
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(events.library_updates().len(), 1, "the new 60 s applies");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(events.library_updates().len(), 2);
+
+        for seconds in [0, -5] {
+            config.set(seconds);
+            add();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            events.library_updates().len(),
+            4,
+            "zero and below send at once"
+        );
     }
 
     /// A forced flush closes the window, so that window's timer, still
