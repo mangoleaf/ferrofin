@@ -2945,6 +2945,8 @@ struct PlanCtx<'a> {
     /// the walk's own [`LibraryScanner::list`] of the folder takes one
     /// instead of listing it again.
     prelisted: std::cell::RefCell<HashMap<String, Vec<FileSystemEntryInfo>>>,
+    /// The pass's `.ignore` lookups, cached for its length.
+    dot_ignore: std::cell::RefCell<crate::dot_ignore::DotIgnoreRule>,
     /// Each resolved primary's local alternate version paths
     /// ([`PlanOutput::local_versions`]).
     local_versions: std::cell::RefCell<Vec<(Uuid, Vec<String>)>>,
@@ -3003,6 +3005,7 @@ impl<'a> PlanCtx<'a> {
             owner_paths: std::cell::RefCell::new(HashMap::new()),
             rip_folds: std::cell::RefCell::new(Vec::new()),
             prelisted: std::cell::RefCell::new(HashMap::new()),
+            dot_ignore: std::cell::RefCell::default(),
             local_versions: std::cell::RefCell::new(Vec::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             episode_folders: std::cell::RefCell::new(HashMap::new()),
@@ -13082,18 +13085,17 @@ impl LibraryScanner {
                         .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
                         .count(),
                 );
-                // TODO(parity): only `IgnorePatterns` filters here; upstream's
-                // `DotIgnoreIgnoreRule` (`.ignore` files) has no port yet. It
-                // filters the resolver chain (`IgnoreFile`), `FindExtras`
-                // (`LibraryManager.cs:3445`) and the library monitor
-                // (`LibraryMonitor.cs:388`). Un-defer path: port the rule
-                // (gitignore matching per directory, cached by mtime), apply
-                // it here, in `plan_folder_extras`, and in
-                // `FerrofinLibraryMonitor::report_change`.
+                // `LibraryManager.IgnoreFile`: the `IgnorePatterns` table and
+                // `DotIgnoreIgnoreRule` (`.ignore` files). Every listing of the
+                // walk comes through here, `FindExtras`' own filter included.
+                let mut dot_ignore = ctx.dot_ignore.borrow_mut();
                 entries
                     .into_iter()
                     .filter(|entry| {
-                        if crate::resolvers::should_ignore_path(&entry.path) {
+                        let is_dir = entry.type_ == FileSystemEntryType::Directory;
+                        if crate::resolvers::should_ignore_path(&entry.path)
+                            || dot_ignore.should_ignore(&entry.path, is_dir)
+                        {
                             ctx.excluded.borrow_mut().push(entry.path.clone());
                             false
                         } else {
@@ -13332,6 +13334,9 @@ impl LibraryScanner {
                 if is_extras_dir(entry, ctx.naming) {
                     consumed.insert(entry.path.clone());
                     ctx.excluded.borrow_mut().push(entry.path.clone());
+                    // `list` applies the ignore rules here too; upstream's
+                    // `GetFiles` of an extras folder applies none (gl-755,
+                    // awaiting the owner: Jellyfin bug or behaviour to port).
                     let files: Vec<_> = self
                         .list(&entry.path, ctx)
                         .into_iter()
