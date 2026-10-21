@@ -12023,9 +12023,12 @@ impl LibraryScanner {
             let Some(cf) = collection_folder_id(folder) else {
                 continue;
             };
-            let out_dir = meta_root.join(guid_to_db(cf));
+            let out_dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), cf);
             let out = out_dir.join("primary.png");
-            if !Self::library_tile_due(items, cf, &out, force).await? {
+            if !self
+                .library_tile_due(items, &meta_root.resolve(), cf, force)
+                .await?
+            {
                 continue;
             }
             // Random content sample; over-fetch since not every row has art.
@@ -12116,24 +12119,22 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Whether `library`'s tile at `out` is drawn this pass. Never for a
-    /// locked library: `RefreshWithProviders` returns before its custom
-    /// providers (`MetadataService.cs:785-788`). When missing or older than 7
-    /// days (upstream's `HasChangedByDate` window), as the scan has always
-    /// drawn it. A fresh tile only when `force`d (`runAllProviders`), and,
-    /// as `FetchAsync`, not over a Primary this pass did not draw (a remote
-    /// one, or a file outside the library's art folder).
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence; gl-591): a
-    /// missing or stale tile is drawn over such a Primary too, and Jellyfin's
-    /// `{metadata}/library/{xx}/{id}` folder is not taken for the library's
-    /// own. Un-defer path: drop image rows whose file is gone
-    /// (`ValidateImages`), then apply the `FetchAsync` rule before the date
-    /// gate, accepting both folder layouts as `remove_item_images` does.
+    /// Whether `library`'s tile is drawn this pass
+    /// (`BaseDynamicImageProvider.HasChanged` / `FetchAsync`):
+    /// - never for a locked library: `RefreshWithProviders` returns before its
+    ///   custom providers (`MetadataService.cs:785-788`);
+    /// - never over a Primary that is not the library's own, a remote one or a
+    ///   file outside its art folders (Ferrofin's or the one Jellyfin drew
+    ///   into, [`internal_metadata_dirs`](crate::dynamic_images::internal_metadata_dirs)),
+    ///   after `ValidateImages` has dropped a Primary whose file is gone;
+    /// - otherwise when there is none, when it is older than 7 days by its
+    ///   row's date (`CollectionFolderImageProvider.HasChangedByDate`), or when
+    ///   `force`d (`runAllProviders`).
     async fn library_tile_due(
+        &self,
         items: &Arc<dyn ItemRepository>,
+        meta_root: &Path,
         library: Uuid,
-        out: &Path,
         force: bool,
     ) -> Result<bool, ServiceError> {
         if items
@@ -12143,23 +12144,25 @@ impl LibraryScanner {
         {
             return Ok(false);
         }
-        let fresh = std::fs::metadata(out)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
-        if !fresh || !force {
-            return Ok(!fresh);
+        let mut images = items.get_image_infos(library).await?;
+        if crate::dynamic_images::drop_missing_images(&mut images)
+            && let Err(err) = self.persistence.save_item_images(library, &images).await
+        {
+            // The pass goes on with the rows that are left, as the draw
+            // below does when its save fails.
+            tracing::warn!(%err, library = %library, "failed to drop the library's missing images");
         }
-        let art_dir = out.parent().unwrap_or(out);
-        Ok(items
-            .get_image_infos(library)
-            .await?
-            .iter()
-            .find(|i| i.image_type == ImageType::Primary)
-            .is_none_or(|primary| {
-                primary.is_local_file() && Path::new(&primary.path).starts_with(art_dir)
-            }))
+        // `HasChanged`: no Primary at all is a change.
+        let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) else {
+            return Ok(true);
+        };
+        if !crate::dynamic_images::is_own_image(meta_root, library, primary) {
+            return Ok(false);
+        }
+        // `CollectionFolderImageProvider.HasChangedByDate`: the row's date,
+        // `age.TotalDays > 7`.
+        let stale = Utc::now() - primary.date_modified > chrono::TimeDelta::days(7);
+        Ok(stale || force)
     }
 
     /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
@@ -12225,11 +12228,10 @@ impl LibraryScanner {
         let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
             return;
         };
-        let mut folders = vec![meta_root.join(&entity.id)];
-        if let Ok(id) = Uuid::parse_str(&entity.id) {
-            let simple = id.simple().to_string();
-            folders.push(meta_root.join(&simple[..2]).join(&simple));
-        }
+        let folders = Uuid::parse_str(&entity.id).map_or_else(
+            |_| vec![meta_root.join(&entity.id)],
+            |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
+        );
         let mut seen: Vec<ImageType> = Vec::new();
         for image in stored {
             let singular = matches!(
