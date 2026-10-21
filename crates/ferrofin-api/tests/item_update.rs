@@ -1770,12 +1770,16 @@ async fn refresh_library_folder_scans_that_library_with_the_request_options() {
         )
     };
     let (scans, queued) = refresh_folder(library(), Vec::new(), SCAN_FOR_NEW).await;
-    // "Scan for new and updated files" is the scan's own default refresh.
+    // "Scan for new and updated files" is the scan's own default refresh,
+    // not automated (`ItemRefreshController.cs:86`).
     assert_eq!(
         scans,
         vec![(
             ScanTarget::Library(folder_id),
-            MetadataRefreshOptions::default()
+            MetadataRefreshOptions {
+                is_automated: false,
+                ..MetadataRefreshOptions::default()
+            }
         )]
     );
     assert!(
@@ -1790,6 +1794,7 @@ async fn refresh_library_folder_scans_that_library_with_the_request_options() {
         replace_all_images: true,
         force_save: true,
         regenerate_trickplay: true,
+        is_automated: false,
         ..MetadataRefreshOptions::default()
     };
     assert_eq!(scans, vec![(ScanTarget::Library(folder_id), expected)]);
@@ -1802,6 +1807,7 @@ async fn refresh_library_folder_scans_that_library_with_the_request_options() {
         replace_all_images: true,
         remove_old_metadata: true,
         force_save: true,
+        is_automated: false,
         ..MetadataRefreshOptions::default()
     };
     assert_eq!(scans, vec![(ScanTarget::Library(folder_id), expected)]);
@@ -1828,6 +1834,7 @@ async fn refresh_nested_folder_scans_only_its_subtree() {
             MetadataRefreshOptions {
                 metadata_refresh_mode: MetadataRefreshMode::None,
                 image_refresh_mode: MetadataRefreshMode::None,
+                is_automated: false,
                 ..MetadataRefreshOptions::default()
             }
         )]
@@ -1991,7 +1998,7 @@ async fn refresh_root_folder_scans_every_library() {
     let (scans, _) = refresh_folder(root, Vec::new(), SCAN_FOR_NEW).await;
     assert_eq!(
         scans,
-        vec![(ScanTarget::All, MetadataRefreshOptions::default())]
+        vec![(ScanTarget::All, controller_options(SCAN_FOR_NEW))]
     );
 }
 
