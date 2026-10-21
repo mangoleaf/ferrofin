@@ -3225,9 +3225,30 @@ impl PlanCtx<'_> {
     }
 }
 
+/// The dead by-name sweep's genre and studio selections: the unlocked
+/// `Genre`/`MusicGenre` rows `IsDeadGenre` names
+/// (`GenresValidator.cs:107-112`) and the unlocked `Studio` rows
+/// `IsDeadStudio` names (`StudiosValidator.cs:108-113`).
+pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
+    [
+        InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Genre, BaseItemKind::MusicGenre],
+            is_dead_genre: Some(true),
+            is_locked: Some(false),
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Studio],
+            is_dead_studio: Some(true),
+            is_locked: Some(false),
+            ..InternalItemsQuery::default()
+        },
+    ]
+}
+
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 10;
+const POST_SCAN_PASSES: u32 = 11;
 
 /// How long each closing pass of one library validation took, logged once
 /// at its end and recorded on `ferrofin_library_scan_pass_duration_seconds`.
@@ -3237,6 +3258,7 @@ struct PassTimings {
     album_covers: std::time::Duration,
     years: std::time::Duration,
     artists: std::time::Duration,
+    dead_by_name: std::time::Duration,
     aggregates: std::time::Duration,
     by_name_paths: std::time::Duration,
     studios: std::time::Duration,
@@ -3254,6 +3276,7 @@ impl PassTimings {
             album_covers,
             years,
             artists,
+            dead_by_name,
             aggregates,
             by_name_paths,
             studios,
@@ -3266,6 +3289,7 @@ impl PassTimings {
             (album_covers, self.album_covers),
             (years, self.years),
             (artists, self.artists),
+            (dead_by_name, self.dead_by_name),
             (aggregates, self.aggregates),
             (by_name_paths, self.by_name_paths),
             (studios, self.studios),
@@ -3280,6 +3304,7 @@ impl PassTimings {
             album_covers_ms = ms(self.album_covers),
             years_ms = ms(self.years),
             artists_ms = ms(self.artists),
+            dead_by_name_ms = ms(self.dead_by_name),
             aggregates_ms = ms(self.aggregates),
             by_name_paths_ms = ms(self.by_name_paths),
             studios_ms = ms(self.studios),
@@ -8156,6 +8181,7 @@ impl LibraryScanner {
     /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
     /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
+    /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
@@ -8223,6 +8249,16 @@ impl LibraryScanner {
             tracing::warn!(%err, "by-name artist pass failed");
         }
         timings.artists = started.elapsed();
+        if !self.between_passes(run, &mut done).await {
+            return false;
+        }
+        // The validators' closing sweep: the by-name rows nothing in the
+        // library names any more.
+        let started = std::time::Instant::now();
+        if let Err(err) = self.delete_dead_by_name_items().await {
+            tracing::warn!(%err, "dead by-name sweep failed");
+        }
+        timings.dead_by_name = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -8369,6 +8405,43 @@ impl LibraryScanner {
             "retiring by-name MusicArtist rows superseded by resolved artist folders"
         );
         self.persistence.delete_items(&stale).await.map(|_| ())
+    }
+
+    /// The by-name validators' closing sweep: deletes the unlocked `Genre`,
+    /// `MusicGenre` and `Studio` rows whose name no item value carries any
+    /// more (`GenresValidator.cs:107-119` and `StudiosValidator.cs:108-120`,
+    /// over `IsDeadGenre`/`IsDeadStudio`), and the by-name `MusicArtist` rows
+    /// no item credits (`ArtistsValidator.cs:130-143`). Each goes through the
+    /// deletion path, so its user data follows the retention rules. A failed
+    /// read deletes nothing.
+    ///
+    /// A genre or studio reads dead once no `ItemValues` row carries its name,
+    /// and those rows go only with a deletion (as upstream's do), so a name a
+    /// retag alone dropped is swept after the next deletion. A save landing
+    /// between the selection and the delete loses the by-name row until its
+    /// next save or scan recreates it.
+    async fn delete_dead_by_name_items(&self) -> Result<(), ServiceError> {
+        let artists = self.persistence.dead_by_name_artists().await?;
+        let [genre_query, studio_query] = dead_by_name_queries();
+        let (genres, studios) = match &self.item_repository {
+            Some(items) => (
+                items.get_item_ids(&genre_query).await?,
+                items.get_item_ids(&studio_query).await?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        if artists.is_empty() && genres.is_empty() && studios.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            genres = genres.len(),
+            studios = studios.len(),
+            artists = artists.len(),
+            "deleting by-name rows nothing in the library names any more"
+        );
+        let dead: Vec<Uuid> = genres.into_iter().chain(studios).chain(artists).collect();
+        tracing::debug!(ids = ?dead, "dead by-name rows");
+        self.persistence.delete_items(&dead).await.map(|_| ())
     }
 
     /// The dynamic image providers over this scanner's stores, when it has all
