@@ -336,14 +336,12 @@ pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &s
     format!("{season}{episode}{name}")
 }
 
-/// Port of C# `Season.CreateSortName`: the zero-padded season number, or the
-/// name when the season has no number (so `Specials` (0000) sorts first).
+/// Port of C# `Season.CreateSortName`: the zero-padded season number (so
+/// `Specials` (0000) sorts first), or the name as it is when the season has
+/// no number, without the article-stripping, lower-casing name pipeline.
 #[must_use]
 pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
-    index.map_or_else(
-        || ferrofin_util::sort_name::create_sort_name(name),
-        |n| format!("{n:04}"),
-    )
+    index.map_or_else(|| name.to_owned(), |n| format!("{n:04}"))
 }
 
 /// Port of C# `Audio.CreateSortName` (v10.11.8
