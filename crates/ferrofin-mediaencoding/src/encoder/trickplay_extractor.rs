@@ -107,6 +107,7 @@ pub struct TrickplayFrameExtractorImpl<T: Transcoder> {
     ffmpeg_version: Option<FfmpegVersion>,
     caps: Arc<FfmpegCapabilities>,
     config: Option<Arc<dyn ServerConfigurationManager>>,
+    image_extraction_timeout_ms: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
 }
 
 impl<T: Transcoder> std::fmt::Debug for TrickplayFrameExtractorImpl<T> {
@@ -124,6 +125,18 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     #[must_use]
     pub fn with_image_encoding_pool(mut self, pool: Arc<tokio::sync::Semaphore>) -> Self {
         self.image_encoding_pool = pool;
+        self
+    }
+
+    /// Reads the live `ImageExtractionTimeoutMs` before each run: the window
+    /// within which ffmpeg must write a new frame. Without it, or when it is 0
+    /// or less, upstream's default applies.
+    #[must_use]
+    pub fn with_image_extraction_timeout(
+        mut self,
+        read: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
+        self.image_extraction_timeout_ms = Some(Arc::new(read));
         self
     }
 
@@ -151,6 +164,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             ffmpeg_version,
             caps: Arc::new(FfmpegCapabilities::default()),
             config: None,
+            image_extraction_timeout_ms: None,
         }
     }
 
@@ -728,7 +742,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
         let plan = self
             .plan(request, &output_pattern, pts_frame_rate, map_index)
             .await;
-        let first = self.run(&plan, request.priority).await?;
+        let first = self.run(&plan, request.priority, dir).await?;
         if let Some(frames) = Self::frames_of(dir, &first)? {
             return Ok(frames);
         }
@@ -759,7 +773,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
                     map_index,
                 )
                 .await;
-            let second = self.run(&retry, request.priority).await?;
+            let second = self.run(&retry, request.priority, dir).await?;
             if let Some(frames) = Self::frames_of(dir, &second)? {
                 return Ok(frames);
             }
@@ -926,10 +940,17 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     }
 
     /// Runs one plan, returning its captured stderr and exit status.
+    ///
+    /// `ExtractVideoImagesOnIntervalInternal`'s watchdog: a run may take as
+    /// long as it needs while new frames keep appearing in `dir`, and is
+    /// stopped once a whole `ImageExtractionTimeoutMs` window passes without
+    /// one. A stopped run comes back unsuccessful, so a keyframe-only run is
+    /// retried the standard way, as upstream's `FfmpegException` catch does.
     async fn run(
         &self,
         plan: &ExtractionPlan,
         priority: ferrofin_model::configuration::ProcessPriorityClass,
+        dir: &Path,
     ) -> Result<crate::encoder::ProcessOutput, ServiceError> {
         // The same convention the transcode manager follows: at debug, the
         // exact argument line. Whether a job took the hardware path is
@@ -945,16 +966,40 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
-        self.transcoder
-            .get_process_output_at_priority(
-                &self.ffmpeg_path,
-                &plan.args,
-                true,
-                &plan.env,
-                priority,
-            )
-            .await
-            .map_err(|e| MediaEncodingError::process(e).into())
+        let configured = self
+            .image_extraction_timeout_ms
+            .as_ref()
+            .map_or(0, |read| read());
+        let window = super::media_encoder::image_extraction_timeout(
+            configured,
+            super::media_encoder::DEFAULT_HDR_IMAGE_EXTRACTION_TIMEOUT,
+        );
+        let run = self.transcoder.get_process_output_at_priority(
+            &self.ffmpeg_path,
+            &plan.args,
+            true,
+            &plan.env,
+            priority,
+        );
+        tokio::pin!(run);
+        let mut last_count = 0;
+        loop {
+            if let Ok(result) = tokio::time::timeout(window, &mut run).await {
+                return result.map_err(|e| MediaEncodingError::process(e).into());
+            }
+            let count = jpg_files_sorted(dir)?.len();
+            if count <= last_count {
+                // Returning drops the run, which kills ffmpeg (`kill_on_drop`).
+                return Ok(crate::encoder::ProcessOutput {
+                    output: format!(
+                        "trickplay ffmpeg stopped: no new frame in {}ms",
+                        window.as_millis()
+                    ),
+                    success: false,
+                });
+            }
+            last_count = count;
+        }
     }
 }
 
@@ -1810,6 +1855,193 @@ mod tests {
             .expect("frames");
 
         assert!(!transcoder.recorded()[0].contains("-init_hw_device"));
+    }
+
+    /// One fake ffmpeg run: a frame every `every` of (paused) time, `frames`
+    /// times, then exit 0, or with `hang` never exit.
+    #[derive(Clone, Copy)]
+    struct Pace {
+        frames: usize,
+        every: std::time::Duration,
+        hang: bool,
+    }
+
+    /// A transcoder that plays one [`Pace`] per run. A hung run that is given
+    /// up on is counted in `abandoned`: the real runner kills ffmpeg when its
+    /// future is dropped.
+    struct PacedTranscoder {
+        paces: Mutex<std::collections::VecDeque<Pace>>,
+        runs: std::sync::atomic::AtomicUsize,
+        abandoned: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PacedTranscoder {
+        fn new(paces: &[Pace]) -> Self {
+            Self {
+                paces: Mutex::new(paces.iter().copied().collect()),
+                runs: 0.into(),
+                abandoned: Arc::default(),
+            }
+        }
+
+        fn runs_and_abandoned(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.runs.load(SeqCst), self.abandoned.load(SeqCst))
+        }
+    }
+
+    /// Counts a dropped (abandoned) run.
+    struct Abandoned(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Abandoned {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Transcoder for PacedTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pace = self
+                .paces
+                .lock()
+                .expect("paces lock")
+                .pop_front()
+                .expect("a pace for every run");
+            let argv = crate::encoder::split_args(arguments)?;
+            let pattern = argv.last().expect("output pattern present");
+            let dir = std::path::Path::new(pattern)
+                .parent()
+                .expect("pattern has a parent dir")
+                .to_path_buf();
+            for i in 1..=pace.frames {
+                tokio::time::sleep(pace.every).await;
+                std::fs::write(dir.join(format!("{i:08}.jpg")), b"jpg").expect("write frame");
+            }
+            if pace.hang {
+                let _abandoned = Abandoned(Arc::clone(&self.abandoned));
+                std::future::pending::<()>().await;
+            }
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
+        }
+
+        async fn get_process_output_at_priority(
+            &self,
+            path: &str,
+            arguments: &str,
+            read_stderr: bool,
+            env: &[(String, String)],
+            _priority: ferrofin_model::configuration::ProcessPriorityClass,
+        ) -> Result<ProcessOutput, String> {
+            self.get_process_output(path, arguments, read_stderr, None, env)
+                .await
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// `ExtractVideoImagesOnIntervalInternal`'s watchdog judges progress, not
+    /// total time: a run that writes a frame every 5 s for 50 s is never
+    /// stopped by the 20 s window.
+    #[tokio::test(start_paused = true)]
+    async fn a_trickplay_run_that_keeps_writing_frames_runs_to_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let five = std::time::Duration::from_secs(5);
+        let transcoder = Arc::new(PacedTranscoder::new(&[Pace {
+            frames: 10,
+            every: five,
+            hang: false,
+        }]));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+
+        let frames = extractor
+            .extract_trickplay_frames(&request("/m/v.mkv", &out.to_string_lossy()))
+            .await
+            .expect("frames");
+
+        assert_eq!(frames.len(), 10);
+        assert_eq!(transcoder.runs_and_abandoned(), (1, 0));
+    }
+
+    /// A run that stops writing frames is stopped once a whole window (20 s
+    /// when `ImageExtractionTimeoutMs` is unset) passes with no new frame. A
+    /// keyframe-only run is then retried the standard way, as upstream's
+    /// `FfmpegException` catch does.
+    #[tokio::test(start_paused = true)]
+    async fn an_unresponsive_trickplay_run_is_stopped_and_retried_the_standard_way() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let second = std::time::Duration::from_secs(1);
+        let transcoder = Arc::new(PacedTranscoder::new(&[
+            Pace {
+                frames: 2,
+                every: second,
+                hang: true,
+            },
+            Pace {
+                frames: 3,
+                every: second,
+                hang: false,
+            },
+        ]));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let start = tokio::time::Instant::now();
+
+        let frames = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            extractor.extract_trickplay_frames(&TrickplayExtraction {
+                keyframe_only: true,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            }),
+        )
+        .await
+        .expect("the hung run is stopped")
+        .expect("the standard-way retry extracts");
+
+        assert_eq!(frames.len(), 3, "only the retry's frames remain");
+        assert_eq!(transcoder.runs_and_abandoned(), (2, 1));
+        // Two frames by 2 s, so the window ending at 20 s saw progress and
+        // the one ending at 40 s did not; then the 3 s retry.
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(43));
+    }
+
+    /// The window is the live `ImageExtractionTimeoutMs`; a run that writes
+    /// nothing in it fails without a retry when keyframe-only is off.
+    #[tokio::test(start_paused = true)]
+    async fn the_configured_timeout_bounds_a_silent_trickplay_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(PacedTranscoder::new(&[Pace {
+            frames: 0,
+            every: std::time::Duration::ZERO,
+            hang: true,
+        }]));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None)
+            .with_image_extraction_timeout(|| 1500);
+        let start = tokio::time::Instant::now();
+
+        let err = extractor
+            .extract_trickplay_frames(&request("/m/v.mkv", &out.to_string_lossy()))
+            .await
+            .expect_err("a silent run is a failure");
+
+        assert!(err.to_string().contains("no new frame in 1500ms"), "{err}");
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(1500));
+        assert_eq!(transcoder.runs_and_abandoned(), (1, 1));
     }
 
     #[tokio::test]
