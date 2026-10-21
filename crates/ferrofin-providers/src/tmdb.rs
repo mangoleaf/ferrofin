@@ -2347,10 +2347,9 @@ impl TmdbClient {
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", cfg.api_key(self.api_key.expose_secret())),
-                (
-                    "append_to_response",
-                    "images,external_ids,tv_credits,movie_credits",
-                ),
+                // `PersonMethods.Images | PersonMethods.ExternalIds`: Jellyfin
+                // 12.1 dropped the credits, which nothing reads.
+                ("append_to_response", "images,external_ids"),
             ]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
@@ -2386,10 +2385,9 @@ impl TmdbClient {
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", key),
-                (
-                    "append_to_response",
-                    "images,external_ids,tv_credits,movie_credits",
-                ),
+                // `PersonMethods.Images | PersonMethods.ExternalIds`: Jellyfin
+                // 12.1 dropped the credits, which nothing reads.
+                ("append_to_response", "images,external_ids"),
             ]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
@@ -2776,6 +2774,21 @@ mod tests {
         assert!(!values[5].contains_key("include_image_language"));
         assert_eq!(values[6].get("language").map(String::as_str), Some("fr-CA"));
         assert!(!values[6].contains_key("include_image_language"));
+        // Jellyfin 12.1 (jellyfin/jellyfin#17973) asks for a person's images
+        // and external ids only: nothing reads the credits it used to append.
+        let person_requests: Vec<_> = seen
+            .iter()
+            .zip(&values)
+            .filter(|(path, _)| path.starts_with("/person/"))
+            .collect();
+        assert_eq!(person_requests.len(), 4, "{seen:?}");
+        for (path, query) in person_requests {
+            assert_eq!(
+                query.get("append_to_response").map(String::as_str),
+                Some("images,external_ids"),
+                "{path}"
+            );
+        }
     }
 
     /// Source metadata clients append Images and use the same exact normalized
