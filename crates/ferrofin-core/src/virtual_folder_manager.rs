@@ -73,6 +73,14 @@ fn is_shortcut(path: &Path) -> bool {
         .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case(SHORTCUT_EXTENSION))
 }
 
+/// .NET's `Path.GetFileNameWithoutExtension`: the text after the last native
+/// separator, up to its last `.`. A path ending in a separator gives `""`, so
+/// its shortcut is the `.mblink` dotfile upstream writes too.
+fn file_name_without_extension(path: &str) -> &str {
+    let name = path.rsplit(std::path::is_separator).next().unwrap_or(path);
+    name.rfind('.').map_or(name, |dot| &name[..dot])
+}
+
 /// The directory a caller-supplied library `name` denotes directly under
 /// `parent`, or `None` when the name would land anywhere else.
 ///
@@ -1031,26 +1039,24 @@ impl FerrofinVirtualFolderManager {
         None
     }
 
-    /// Creates a `.mblink` shortcut for `path_info` inside `folder_path`,
-    /// de-duplicating the base name (C# `CreateShortcut`: append `1`s while a
-    /// shortcut of that name already exists), then writing the target as plain
-    /// text.
+    /// Creates a `.mblink` shortcut for `path_info` inside `folder_path` (C#
+    /// `LibraryManager.CreateShortcut`): named `GetFileNameWithoutExtension`
+    /// of the path, with `1`s appended while a shortcut of that name already
+    /// exists, holding the path as plain text through `ReverseVirtualPath`,
+    /// so a path under the data directory is stored as `%AppDataPath%/…`.
     async fn create_shortcut(
+        &self,
         folder_path: &Path,
         path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
         let target = &path_info.path;
-        let mut stem = Path::new(target)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("path")
-            .to_owned();
+        let mut stem = file_name_without_extension(target).to_owned();
         let mut link = folder_path.join(format!("{stem}.{SHORTCUT_EXTENSION}"));
         while tokio::fs::try_exists(&link).await.unwrap_or(false) {
             stem.push('1');
             link = folder_path.join(format!("{stem}.{SHORTCUT_EXTENSION}"));
         }
-        tokio::fs::write(&link, target)
+        tokio::fs::write(&link, self.virtual_paths.reverse(target))
             .await
             .map_err(|e| Self::io_err("write shortcut", &e))
     }
@@ -1345,7 +1351,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         Self::save_options(&folder_path, options).await?;
 
         for path_info in &options.path_infos {
-            Self::create_shortcut(&folder_path, path_info).await?;
+            self.create_shortcut(&folder_path, path_info).await?;
         }
 
         // Create the library's CollectionFolder item so it appears in /UserViews
@@ -1484,7 +1490,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         }
         let folder_path = self.require_folder(virtual_folder_name).await?;
 
-        Self::create_shortcut(&folder_path, path_info).await?;
+        self.create_shortcut(&folder_path, path_info).await?;
 
         let mut options = Self::load_options(&folder_path).await;
         options.path_infos.push(path_info.clone());
@@ -1546,7 +1552,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         for path_info in &options.path_infos {
             let already = existing.path_infos.iter().any(|i| i.path == path_info.path);
             if !already {
-                Self::create_shortcut(&folder_path, path_info).await?;
+                self.create_shortcut(&folder_path, path_info).await?;
             }
         }
 
@@ -2233,6 +2239,67 @@ mod tests {
             .await
             .expect("remove");
         assert!(!folder.join("collections.mblink").exists());
+    }
+
+    /// `LibraryManager.CreateShortcut`: the link is named
+    /// `Path.GetFileNameWithoutExtension(path)`, so a dotted folder loses its
+    /// last suffix and a path entered with a trailing separator names a
+    /// `.mblink` dotfile; a taken name gains `1`s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shortcut_is_named_after_the_folder_without_its_extension() {
+        let (tmp, mgr) = manager();
+        let films = media_dir(&tmp, "Films.HD");
+        let other_films = media_dir(&tmp, "other/Films.SD");
+        let trailing = format!("{}/", media_dir(&tmp, "Docs"));
+        mgr.add_virtual_folder(
+            "Lib",
+            None,
+            &opts_with_paths(&[films, other_films, trailing]),
+        )
+        .await
+        .expect("add");
+        let root = mgr.require_folder("Lib").await.expect("folder");
+        let mut names: Vec<String> = std::fs::read_dir(&root)
+            .expect("read")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".mblink"))
+            .collect();
+        names.sort();
+        assert_eq!(names, [".mblink", "Films.mblink", "Films1.mblink"]);
+    }
+
+    /// `CreateShortcut` writes `ReverseVirtualPath(path)`: a media path
+    /// under the data directory is stored as `%AppDataPath%/…`, which the
+    /// listing and the removal expand back.
+    #[tokio::test]
+    async fn a_shortcut_under_the_data_directory_is_stored_virtual() {
+        let (tmp, mgr) = manager();
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            tmp.path().join("srv").to_str().expect("utf-8"),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        let mgr = mgr.with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+            Arc::clone(&paths),
+        ));
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref());
+        let media = format!("{data}/media/home");
+        std::fs::create_dir_all(&media).expect("media");
+        mgr.add_virtual_folder("Home", None, &opts_with_paths(std::slice::from_ref(&media)))
+            .await
+            .expect("add");
+        let root = mgr.require_folder("Home").await.expect("folder");
+        assert_eq!(
+            std::fs::read_to_string(root.join("home.mblink")).expect("shortcut"),
+            "%AppDataPath%/media/home"
+        );
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(folders[0].locations, vec![media.clone()]);
+        mgr.remove_media_path("Home", &media).await.expect("remove");
+        assert!(!root.join("home.mblink").exists());
     }
 
     #[cfg(unix)]
@@ -2973,7 +3040,7 @@ mod tests {
             .await
             .unwrap();
         let root = mgr.require_folder("Lib").await.unwrap();
-        FerrofinVirtualFolderManager::create_shortcut(
+        mgr.create_shortcut(
             &root,
             &MediaPathInfo {
                 path: second.clone(),

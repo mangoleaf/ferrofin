@@ -229,6 +229,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- A library's folder shortcuts are written as Jellyfin writes them. They are named after
+  the folder without its extension (`Films.HD` gives `Films.mblink`), and a folder inside
+  the server's data directory is stored as `%AppDataPath%/…`, so it keeps working if the
+  data directory moves
 
 ## [1.0.0] - 2026-09-05
 
