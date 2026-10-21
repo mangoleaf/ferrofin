@@ -106,7 +106,7 @@ impl PersonInfo {
             || self
                 .role
                 .as_deref()
-                .is_some_and(|r| r.eq_ignore_ascii_case(&format!("{type_:?}")))
+                .is_some_and(|r| r.eq_ignore_ascii_case(&type_.json_name()))
     }
 }
 
@@ -407,45 +407,48 @@ pub fn add_person(people: &mut Vec<PersonInfo>, mut person: PersonInfo) {
         }
     }
 
-    // GuestStar promotes an existing Actor entry of the same name.
-    if person.type_ == PersonKind::GuestStar
-        && let Some(existing) = people
-            .iter_mut()
-            .find(|p| p.name.eq_ignore_ascii_case(&person.name) && p.type_ == PersonKind::Actor)
-    {
-        existing.type_ = PersonKind::GuestStar;
-        merge_existing(existing, &person);
-        return;
-    }
-
-    if person.type_ == PersonKind::Actor {
-        // An Actor de-dupes against an existing Actor/GuestStar of the same name.
-        match people.iter_mut().find(|p| {
-            p.name.eq_ignore_ascii_case(&person.name)
-                && (p.type_ == PersonKind::Actor || p.type_ == PersonKind::GuestStar)
-        }) {
-            None => people.push(person),
-            Some(existing) => {
-                // Fill in a missing role if we have one.
-                if existing.role.as_deref().is_none_or(str::is_empty)
-                    && let Some(role) = person.role.as_deref()
-                    && !role.is_empty()
-                {
-                    existing.role = Some(role.to_owned());
-                }
-                merge_existing(existing, &person);
+    // Check for dupes based on the combination of Name, Type and Role
+    // (v12.2, jellyfin/jellyfin#17466).
+    let mut existing = people.iter().position(|p| {
+        is_same_credit(p, &person) && credit_role(p).eq_ignore_ascii_case(credit_role(&person))
+    });
+    if existing.is_none() {
+        if credit_role(&person).is_empty() {
+            existing = people.iter().position(|p| is_same_credit(p, &person));
+        } else {
+            // If the person already exists without a role and we have one,
+            // fill it in.
+            existing = people
+                .iter()
+                .position(|p| is_same_credit(p, &person) && credit_role(p).is_empty());
+            if let Some(index) = existing {
+                people[index].role.clone_from(&person.role);
             }
         }
-    } else {
-        // Everything else de-dupes on (Name, Type).
-        match people
-            .iter_mut()
-            .find(|p| p.name.eq_ignore_ascii_case(&person.name) && p.type_ == person.type_)
-        {
-            None => people.push(person),
-            Some(existing) => merge_existing(existing, &person),
-        }
     }
+    let Some(index) = existing else {
+        people.push(person);
+        return;
+    };
+    let existing = &mut people[index];
+    // A GuestStar merging into an Actor credit promotes it, avoiding dupes.
+    if person.type_ == PersonKind::GuestStar {
+        existing.type_ = PersonKind::GuestStar;
+    }
+    merge_existing(existing, &person);
+}
+
+/// A credit's role, `""` when it has none (C# `p.Role ?? string.Empty`).
+fn credit_role(person: &PersonInfo) -> &str {
+    person.role.as_deref().unwrap_or_default()
+}
+
+/// `PeopleHelper.IsSameCredit`: the same name, and the same type, Actor and
+/// GuestStar counting as one (a guest star is a promoted actor).
+fn is_same_credit(existing: &PersonInfo, person: &PersonInfo) -> bool {
+    let cast = |kind: PersonKind| matches!(kind, PersonKind::Actor | PersonKind::GuestStar);
+    existing.name.eq_ignore_ascii_case(&person.name)
+        && (existing.type_ == person.type_ || cast(existing.type_) && cast(person.type_))
 }
 
 /// Merges the mergeable fields of `person` into `existing`.
@@ -592,6 +595,96 @@ mod tests {
         );
         assert_eq!(people.len(), 1);
         assert_eq!(people[0].type_, PersonKind::GuestStar);
+    }
+
+    fn credit(name: &str, type_: PersonKind, role: Option<&str>) -> PersonInfo {
+        PersonInfo {
+            type_,
+            role: role.map(str::to_owned),
+            ..PersonInfo::new(name)
+        }
+    }
+
+    fn credits(people: &[PersonInfo]) -> Vec<(PersonKind, Option<&str>)> {
+        people
+            .iter()
+            .map(|p| (p.type_, p.role.as_deref()))
+            .collect()
+    }
+
+    /// v12.2 `AddPerson`: a credit is (name, type, role), with Actor and
+    /// GuestStar the same kind (jellyfin/jellyfin#17466).
+    #[test]
+    fn add_person_keeps_one_credit_per_role() {
+        // A Writer credited for the Novel and the Screenplay, and an actor in
+        // two parts, keep both credits.
+        let mut people = Vec::new();
+        add_person(
+            &mut people,
+            credit("Ann", PersonKind::Writer, Some("Novel")),
+        );
+        add_person(
+            &mut people,
+            credit("Ann", PersonKind::Writer, Some("Screenplay")),
+        );
+        add_person(&mut people, credit("Bo", PersonKind::Actor, Some("Hero")));
+        add_person(
+            &mut people,
+            credit("Bo", PersonKind::Actor, Some("Villain")),
+        );
+        assert_eq!(
+            credits(&people),
+            [
+                (PersonKind::Writer, Some("Novel")),
+                (PersonKind::Writer, Some("Screenplay")),
+                (PersonKind::Actor, Some("Hero")),
+                (PersonKind::Actor, Some("Villain")),
+            ]
+        );
+        // The same credit again, whatever its case, merges.
+        add_person(
+            &mut people,
+            credit("ann", PersonKind::Writer, Some("NOVEL")),
+        );
+        assert_eq!(people.len(), 4);
+    }
+
+    #[test]
+    fn add_person_merges_a_roleless_credit_and_fills_a_missing_role() {
+        // No role: it is the same credit as any role of that person and type.
+        let mut people = vec![credit("Ann", PersonKind::Writer, Some("Novel"))];
+        add_person(&mut people, credit("Ann", PersonKind::Writer, None));
+        assert_eq!(credits(&people), [(PersonKind::Writer, Some("Novel"))]);
+        // A role fills the credit that has none, of any type.
+        let mut people = vec![credit("Ann", PersonKind::Writer, None)];
+        add_person(
+            &mut people,
+            credit("Ann", PersonKind::Writer, Some("Screenplay")),
+        );
+        assert_eq!(credits(&people), [(PersonKind::Writer, Some("Screenplay"))]);
+    }
+
+    #[test]
+    fn add_person_guest_star_promotes_only_the_matching_role() {
+        let mut people = vec![credit("Dave", PersonKind::Actor, Some("Hero"))];
+        add_person(
+            &mut people,
+            credit("Dave", PersonKind::GuestStar, Some("Hero")),
+        );
+        assert_eq!(credits(&people), [(PersonKind::GuestStar, Some("Hero"))]);
+        // Another character is another credit, and the Actor one stays.
+        let mut people = vec![credit("Dave", PersonKind::Actor, Some("Hero"))];
+        add_person(
+            &mut people,
+            credit("Dave", PersonKind::GuestStar, Some("Villain")),
+        );
+        assert_eq!(
+            credits(&people),
+            [
+                (PersonKind::Actor, Some("Hero")),
+                (PersonKind::GuestStar, Some("Villain")),
+            ]
+        );
     }
 
     #[test]

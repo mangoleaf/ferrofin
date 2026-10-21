@@ -58,7 +58,61 @@ pub struct VaapiProber {
     /// Keyed by render-node path. A path probed once keeps its answer for the
     /// process's life; a *different* path probes afresh, which is what makes a
     /// dashboard change take effect without a restart.
-    cache: Mutex<HashMap<String, Arc<FfmpegCapabilities>>>,
+    cache: Mutex<HashMap<String, Probed>>,
+}
+
+/// One cached probe answer.
+struct Probed {
+    caps: Arc<FfmpegCapabilities>,
+    valid: Validity,
+}
+
+/// How long a cached probe answer stands.
+#[derive(Clone, Copy)]
+enum Validity {
+    /// A conclusive answer, kept for the process's life.
+    Forever,
+    /// An inconclusive answer, kept while the node is in the [`node_state`]
+    /// it was probed against.
+    UntilNodeChanges(Option<(i64, i64)>),
+}
+
+impl Validity {
+    fn holds(self, node: &str) -> bool {
+        match self {
+            Validity::Forever => true,
+            Validity::UntilNodeChanges(probed_against) => probed_against == node_state(node),
+        }
+    }
+}
+
+/// What the VAAPI spawn found.
+enum Answer {
+    /// ffmpeg opened the device and named its driver.
+    Driver,
+    /// ffmpeg ran but opened no device.
+    NoDevice,
+    /// ffmpeg could not be spawned at all.
+    SpawnFailed,
+}
+
+/// Whether the render node exists and when its inode last changed. `ctime`
+/// moves on a chmod or chown and on re-creation, which are the fixes for an
+/// unopenable node (a container device mapped later starts a new process).
+fn node_state(node: &str) -> Option<(i64, i64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(node)
+            .ok()
+            .map(|meta| (meta.ctime(), meta.ctime_nsec()))
+    }
+    // Never probed off Linux (the platform guard in `capabilities`).
+    #[cfg(not(unix))]
+    {
+        let _ = node;
+        None
+    }
 }
 
 impl VaapiProber {
@@ -94,43 +148,70 @@ impl VaapiProber {
             return Arc::clone(&self.base);
         }
 
-        if let Some(hit) = self
+        let hit = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(node)
+            .map(|hit| (Arc::clone(&hit.caps), hit.valid));
+        // The node is stat'ed outside the lock.
+        if let Some((caps, valid)) = hit
+            && valid.holds(node)
         {
-            return Arc::clone(hit);
+            return caps;
         }
 
         // The lock is deliberately NOT held across the probe. Holding it would
         // serialise every VAAPI lookup behind one ffmpeg spawn; two concurrent
         // first uses of the same path probing twice is idempotent and wasted
         // once.
-        let (probed, conclusive) = probe(&self.ffmpeg, &self.base, node).await;
+        //
+        // The node's state is read before the spawn, so a fix landing during
+        // the probe still invalidates the answer.
+        let state = node_state(node);
+        let (probed, answer) = probe(&self.ffmpeg, &self.base, node).await;
         let probed = Arc::new(probed);
-        // An inconclusive probe is NOT cached. The usual cause is transient and
-        // fixable — a render node the server user cannot read yet, a container
-        // whose device was not mapped at first use — and pinning "no hardware"
-        // for the process's life would mean the fix needs a restart, which is
-        // the thing this cache exists to avoid.
-        if conclusive {
+        // A probe that opened no device is cached only until the node changes.
+        // The usual cause is a render node the server user cannot read yet,
+        // fixed by a chmod or chown that moves the node's ctime, so that fix
+        // still needs no restart. A cause that leaves the node alone (a VA
+        // driver installed while the server runs) waits for a restart or a
+        // device-path change; upstream needs a restart for every case. Not
+        // caching it at all re-spawned both probes and re-logged the WARN on
+        // every plan, i.e. on every HLS segment request. A spawn that failed
+        // says nothing about the node and stays uncached.
+        let valid = match answer {
+            Answer::Driver => Some(Validity::Forever),
+            Answer::NoDevice => Some(Validity::UntilNodeChanges(state)),
+            Answer::SpawnFailed => None,
+        };
+        if let Some(valid) = valid {
             self.cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(node.to_owned(), Arc::clone(&probed));
+                .insert(
+                    node.to_owned(),
+                    Probed {
+                        caps: Arc::clone(&probed),
+                        valid,
+                    },
+                );
         }
         probed
     }
 }
 
 /// Runs the five checks across two ffmpeg spawns and returns `base` with their
-/// answers overlaid, plus whether the answer is worth caching.
+/// answers overlaid, plus what the VAAPI spawn found.
 ///
-/// "Conclusive" means the VAAPI spawn actually reached a driver — ffmpeg
-/// printed its `VAAPI driver:` line. A spawn that failed, or one that opened
-/// nothing, tells us nothing durable about the hardware.
-async fn probe(ffmpeg: &Path, base: &FfmpegCapabilities, node: &str) -> (FfmpegCapabilities, bool) {
+/// Only [`Answer::Driver`] — ffmpeg printed its `VAAPI driver:` line — is
+/// durable. A spawn that opened nothing, or failed, tells us nothing lasting
+/// about the hardware.
+async fn probe(
+    ffmpeg: &Path,
+    base: &FfmpegCapabilities,
+    node: &str,
+) -> (FfmpegCapabilities, Answer) {
     // Five checks, two spawns: upstream spawns once per driver name and once
     // per extension list, but within each pair the command is byte-identical
     // (the name and the list are only consumed after the spawn), so identical
@@ -150,7 +231,16 @@ async fn probe(ffmpeg: &Path, base: &FfmpegCapabilities, node: &str) -> (FfmpegC
     );
     // ffmpeg names the driver it opened on this line; its absence means the
     // device was never reached.
-    let conclusive = vaapi_stderr.contains(VAAPI_DRIVER_MARKER);
+    let answer = match &vaapi_stderr {
+        None => Answer::SpawnFailed,
+        Some(stderr) if stderr.contains(VAAPI_DRIVER_MARKER) => Answer::Driver,
+        Some(_) => Answer::NoDevice,
+    };
+    let conclusive = matches!(answer, Answer::Driver);
+    // A spawn failure makes every check answer `false`, the same outcome as
+    // C#'s catch-and-log.
+    let vaapi_stderr = vaapi_stderr.unwrap_or_default();
+    let vulkan_stderr = vulkan_stderr.unwrap_or_default();
 
     let amd = EncoderValidator::check_vaapi_driver_internal(&vaapi_stderr, AMD_DRIVER);
     let intel_ihd = EncoderValidator::check_vaapi_driver_internal(&vaapi_stderr, INTEL_IHD_DRIVER);
@@ -207,15 +297,14 @@ async fn probe(ffmpeg: &Path, base: &FfmpegCapabilities, node: &str) -> (FfmpegC
         .clone()
         .with_vaapi_driver(amd, intel_ihd, intel_i965)
         .with_vaapi_vulkan(drm_modifier, drm_interop);
-    (caps, conclusive)
+    (caps, answer)
 }
 
 /// Runs ffmpeg with the verbose flags the probes need and returns its stderr.
 ///
 /// Upstream reads stderr because `-init_hw_device` reports what it opened on
-/// the log stream, not on stdout. A spawn failure yields an empty string, which
-/// makes every check answer `false` — the same outcome as C#'s catch-and-log.
-async fn stderr_of(ffmpeg: &Path, args: &[&str]) -> String {
+/// the log stream, not on stdout. A spawn failure yields `None`.
+async fn stderr_of(ffmpeg: &Path, args: &[&str]) -> Option<String> {
     let output = tokio::process::Command::new(ffmpeg)
         .args(["-v", "verbose", "-hide_banner"])
         .args(args)
@@ -225,13 +314,13 @@ async fn stderr_of(ffmpeg: &Path, args: &[&str]) -> String {
         .output()
         .await;
     match output {
-        Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).into_owned()),
         Err(e) => {
             // C# logs this at error level; a probe that cannot even spawn is
             // not a routine miss, and at debug the vulkan half would be
             // completely silent.
             tracing::warn!(error = %e, "error probing the VAAPI render node");
-            String::new()
+            None
         }
     }
 }
@@ -460,30 +549,90 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_probe_that_never_reached_the_device_is_not_cached() {
-        // The transient failure that matters: a render node the server user
-        // cannot read yet, or a container device not mapped at first use.
-        // Pinning "no hardware" for the process lifetime would mean fixing the
-        // permissions needs a restart — the very thing this cache avoids.
+    async fn a_probe_that_never_reached_the_device_is_retried_once_the_node_changes() {
+        // The failure that matters: a render node the server user cannot read
+        // yet. Pinning "no hardware" for the process lifetime would mean fixing
+        // the permissions needs a restart — the very thing this cache avoids —
+        // but re-probing on every plan spawned two ffmpegs and a WARN per HLS
+        // segment request.
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let ffmpeg = fake_ffmpeg(
             dir.path(),
             "[AVHWDeviceContext] Failed to open the DRM device.",
         );
+        let node = dir.path().join("renderD128");
+        std::fs::write(&node, "").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o600)).unwrap();
         let prober = VaapiProber::new(ffmpeg, linux_vaapi_caps());
-        let opts = vaapi_options(Some("/dev/dri/renderD128"));
+        let opts = vaapi_options(node.to_str());
 
         assert!(!prober.capabilities(&opts).await.is_vaapi_device_intel_ihd());
         let after_first = recorded_argv(dir.path()).len();
         assert_eq!(after_first, 2, "two spawns per probe");
 
-        // A second look must probe again rather than serve the failure.
+        // An unchanged node is served the failure without another spawn.
+        let _ = prober.capabilities(&opts).await;
+        assert_eq!(
+            recorded_argv(dir.path()).len(),
+            after_first,
+            "an unchanged node must not be probed again"
+        );
+
+        // The operator's fix (a chmod moves the node's ctime) re-probes. The
+        // pause keeps the chmod off the creation's timestamp tick.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let before = node_state(node.to_str().unwrap());
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_ne!(
+            node_state(node.to_str().unwrap()),
+            before,
+            "the chmod moved ctime"
+        );
         let _ = prober.capabilities(&opts).await;
         assert_eq!(
             recorded_argv(dir.path()).len(),
             after_first * 2,
-            "an inconclusive probe must not be cached"
+            "a changed node must be probed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_could_not_spawn_is_not_cached() {
+        // A failed spawn says nothing about the node, so nothing pins it.
+        let dir = tempfile::tempdir().unwrap();
+        let prober = VaapiProber::new(dir.path().join("no-such-ffmpeg"), linux_vaapi_caps());
+        let _ = prober
+            .capabilities(&vaapi_options(Some("/dev/dri/renderD128")))
+            .await;
+        assert!(prober.cache.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_node_is_retried_once_it_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(dir.path(), "No VA display found for device");
+        let node = dir.path().join("renderD128");
+        let prober = VaapiProber::new(ffmpeg, linux_vaapi_caps());
+        let opts = vaapi_options(node.to_str());
+
+        let _ = prober.capabilities(&opts).await;
+        let _ = prober.capabilities(&opts).await;
+        assert_eq!(
+            recorded_argv(dir.path()).len(),
+            2,
+            "probed once while absent"
+        );
+
+        std::fs::write(&node, "").unwrap();
+        let _ = prober.capabilities(&opts).await;
+        assert_eq!(
+            recorded_argv(dir.path()).len(),
+            4,
+            "probed again once present"
         );
     }
 

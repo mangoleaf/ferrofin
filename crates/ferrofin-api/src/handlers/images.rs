@@ -58,9 +58,7 @@ use uuid::Uuid;
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::image_upload::{
-    decode_base64, image_extension_from_content_type, image_mime_from_content_type,
-};
+use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
@@ -1094,8 +1092,9 @@ async fn get_user_image(
 /// Port of `ImageController.PostUserImage`. Resolves the target user with
 /// [`resolve_user`] (the `userId` query parameter or the caller; a nil effective
 /// user is `GetUserById(Guid.Empty)`'s `400`, an id with no account the action's
-/// `404`), applies `AssertCanUpdateUser` (`403`), validates the `Content-Type` is an image type (`400` otherwise),
-/// base64-decodes the body, and stores it via
+/// `404`), applies `AssertCanUpdateUser` (`403`), validates the `Content-Type`
+/// with `TryGetImageExtensionFromContentType` (an image type `ToExtension` knows,
+/// else `400 Incorrect ContentType.`), base64-decodes the body, and stores it via
 /// [`UserManager::save_profile_image`], which writes
 /// `{config}/users/{Username}/profile{ext}` (a username escaping that directory is
 /// a `400`), replaces any prior image row and persists the user. Returns `204`.
@@ -1122,14 +1121,13 @@ async fn post_user_image(
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let mime = image_mime_from_content_type(content_type)
+    let image = try_get_image_extension_from_content_type(content_type)
         .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
-    let extension = image_extension_from_content_type(content_type).unwrap_or_default();
     let bytes = decode_base64(body.trim())
         .ok_or_else(|| ApiError::BadRequest("image data is not valid base64".to_owned()))?;
     state
         .users
-        .save_profile_image(&user, &bytes, &mime, &extension)
+        .save_profile_image(&user, &bytes, &image.mime_type, image.extension)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1258,7 +1256,8 @@ async fn delete_user_image_by_index_legacy(
 /// Reads the raw base64 upload body and its image MIME type, then saves it.
 ///
 /// Shared tail of `SetItemImage`/`SetItemImageByIndex`: validates the
-/// `Content-Type` is an image type (`400` otherwise), base64-decodes the body
+/// `Content-Type` with `TryGetImageExtensionFromContentType` (an image type
+/// `ToExtension` knows, else `400 Incorrect ContentType.`), base64-decodes the body
 /// (`400` on invalid base64), and stores the bytes via
 /// [`ProviderManager::save_image`] at `image_type`/`index`. Returns `204`.
 async fn save_item_image(
@@ -1269,22 +1268,22 @@ async fn save_item_image(
     content_type: Option<&str>,
     body: &str,
 ) -> Result<StatusCode, ApiError> {
-    let mime = image_mime_from_content_type(content_type)
+    let image = try_get_image_extension_from_content_type(content_type)
         .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
     let bytes = decode_base64(body.trim())
         .ok_or_else(|| ApiError::BadRequest("image data is not valid base64".to_owned()))?;
     state
         .providers
-        .save_image(item_id, &bytes, &mime, image_type, image_index)
+        .save_image(item_id, &bytes, &image.mime_type, image_type, image_index)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /Items/{itemId}/Images/{imageType}` — upload an item's image.
 ///
-/// Port of `ImageController.SetItemImage`. A missing item is `404`, a non-image
-/// `Content-Type` (or non-base64 body) is `400`, and on success the image is
-/// saved and the handler returns `204`.
+/// Port of `ImageController.SetItemImage`. A missing item is `404`, a
+/// `Content-Type` that is not a known image type (or a non-base64 body) is
+/// `400`, and on success the image is saved and the handler returns `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Images/{imageType}",

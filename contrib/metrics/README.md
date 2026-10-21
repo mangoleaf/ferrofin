@@ -148,6 +148,8 @@ is the route **template** with no leading slash (the spec path, e.g.
 Razor-Pages artifact prometheus-net emits on every series). Histogram buckets are
 prometheus-net.AspNetCore's default exponential series `0.001 × 2ⁿ`
 (`0.001, 0.002, … 32.768`). All four are copied verbatim from the live fixture.
+`method` is the request method for the nine standard methods and `_OTHER` for
+any other token (prometheus-net copies the raw method; Ferrofin bounds it).
 
 ### Ferrofin-specific (`ferrofin_*` — no Jellyfin equivalent)
 

@@ -37,7 +37,7 @@ The benchmark reference is the Jellyfin release named by the C# source-parity pi
 (`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
 in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
 Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab|scan`) refuses to start and `run.sh` warns and
+fails, a release-gate session (`gate.py aa|ab|scan|ramp|soak`) refuses to start and `run.sh` warns and
 continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
 and digest. A run that boots Jellyfin also stops unless the pinned image reports the
 `UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
@@ -70,10 +70,11 @@ recorded and checked; differing selections flag the affected screen.
 Three levels are published: **unloaded** (1 screen/s), **loaded** (5 screens/s — about
 24 API requests/s plus up to ~55 poster requests/s) and **stress** (25 screens/s, five
 times that), which exists to push both servers past a comfortable browse. All three are
-fixed arrival rates rather than a ramp: finding one server's knee is a different question
-from comparing two servers doing the same work, and `RATE_STRESS` is the knob if neither
-bends. Each window is 120 s after a 30 s warm-up at the same rate (different picks) that
-is discarded, and a window in which k6 could not hold its rate is flagged, not published.
+fixed arrival rates, because comparing two servers doing the same work is a different
+question from finding one server's knee; the knee has its own opt-in, Ferrofin-only phase,
+the [saturation ramp](#throughput-ceiling-the-saturation-ramp), and `RATE_STRESS` is the
+knob if neither server bends at the stress rate. Each window is 120 s after a 30 s
+warm-up at the same rate (different picks) that is discarded, and a window in which k6 could not hold its rate is flagged, not published.
 
 ## Definitions (one sentence each)
 
@@ -112,6 +113,9 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
 - **CPU seconds** — change in the raw cgroup `usage_usec` counter between the
   bracketing samples, divided by one million, for the server and its children; load
   windows include k6 setup/teardown and harness overhead, and steady is post-load idle.
+- **Throughput ceiling** — the highest loaded-mix arrival rate, in screens per second,
+  whose worst screen p95 stayed within 100 ms with no failed request and no dropped k6
+  iteration, found by the `ramp` phase.
 - **Parity** — `N / 412 operations deep-verified against <UPSTREAM_TAG>, plus M compared
   against an earlier release`: the number of contract operations whose Ferrofin
   implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the latest
@@ -287,12 +291,90 @@ validation, not full decoding or sustained playback evidence.
 | cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 
+## Throughput ceiling: the saturation ramp
+
+`run.sh --servers ferrofin --only ramp` (opt-in: no default run includes it, and it
+refuses Jellyfin) steps the loaded mix upward and reports where Ferrofin stops keeping up.
+It drains the server, discards one `WARMUP_S` warm-up at the start rate, then measures
+`RAMP_STEP_S` (30 s) at each rate from `RAMP_START` (25 screens/s, the stress rate Ferrofin
+is known to pass) in steps of `RAMP_STEP_RATE` (10), the last step being the highest
+start-plus-a-multiple-of-the-step not above `RAMP_CAP` (400; so 395). Each step is
+the `screens.js` workload at that rate, with the same picks as every other window.
+
+A step ends the ramp when, in this order of precedence, a screen's request failed
+(`errors`), k6 dropped an iteration so the client rather than the server was the limit
+(`client`), or the **worst screen's p95** went over `RAMP_BOUND_MS` (100 ms; `p95`). The
+ceiling is the last rate before that step. The mix has no single p95 in k6's per-screen
+summary, and the slowest screen is the one a client notices first, so that is the number
+bounded. If no step fails before the cap the ceiling is a lower bound (`cap`); if the first
+step fails there is no ceiling and the phase fails. The phase writes `ramp-params.json`,
+one `k6-ramp-<rate>.json` per step and `ramp.json` (the ceiling, what ended the ramp and
+every step), and the run's `report.html` gets a "Throughput ramp" section with the step
+table. The decisions live in `ramp.py` and are unit-tested in `test_ramp.py`.
+
+The release gate compares the candidate with the previous release in one window,
+interleaved, exactly as the latency gate does:
+
+```bash
+python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:rc --pairs 3
+```
+
+The ceiling is a higher-is-better cell, `ramp/ceiling`, judged by the `[ramp]` row of
+[`gate.toml`](gate.toml) (15 % and 5 screens/s) and the same rule: the median of the
+candidate's ceilings is below the previous release's by more than both thresholds, in at
+least two of three pairs. A ramp that ended on the client or has no passing step cannot be
+judged, and an unjudgeable gated cell blocks like a regression. These are starting values,
+to be re-derived after the first two ramps. The ramp pushes the shared host harder than any
+other phase: `run.sh` still refuses to start unless the server and client cores are idle,
+and a run that fails stops the session.
+
+## Memory soak
+
+`run.sh --servers ferrofin --only soak` (opt-in: no default run includes it, and it refuses
+Jellyfin) holds the loaded mix at `RATE_SOAK` (5 screens/s) for `SOAK_S` (3600 s, one hour)
+while the cgroup sampler records anon memory every `MEM_SAMPLE_MS`. It drains, discards the
+usual `WARMUP_S` warm-up, checks isolation before and after like the other levels, and
+then runs the usual 60 s steady window. A two-minute window cannot see a leak of a few MiB
+an hour, and steady anon memory has drifted by that much between releases without any gate
+noticing.
+
+The **soak slope** is the least-squares line through the anon samples of the hour after its
+first `SOAK_SKIP_S` seconds (600), in MiB per hour: heap growth in the first minutes is
+warm-up, not a leak. The phase writes `soak-params.json` and, once the sampler has stopped,
+`soak.json` (the slope, the samples it was fitted on, the fit window and the peak); the
+run's `report.html` gets a "Memory soak" section. The client timeout is extended by
+`SOAK_S` for this level only. Like every window, the soak's sampler coverage is checked
+(a gap of more than five sample intervals fails the run), and over an hour that is a
+stricter test of the sampler than the two-minute windows are; a run that fails is reported
+and never retried. The decisions live in `soak.py` and are unit-tested in
+`test_soak.py`.
+
+The release gate soaks the previous release and then the candidate back to back (one pair
+by default; the cost is two hours of a quiet host):
+
+```bash
+python3 bench/gate.py soak ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+```
+
+The cell is `soak/slope`, judged by the `[soak]` row of [`gate.toml`](gate.toml): the
+candidate **regressed** when its slope exceeds `max_slope_mib_per_hour` (20) and the previous
+release's does not, **improved** when it is the other way round, and *within noise* in every
+other case, so a candidate that leaks faster than a previous release that already leaked
+is not a new problem (both numbers are in the table). With more than one pair each side's
+median slope is used. A soak that left no slope cannot be judged and blocks like a
+regression. The 20 MiB/h limit and the 600 s skip are starting values, to be re-derived
+after the first two soaks. Memory is compared only between runs in one window: transparent
+huge pages shift anon memory by about 50 MiB between time windows, which is why the pair runs
+back to back.
+
 ## Running it
 
 The reporter has a fast correctness check, also run in CI:
 
 ```sh
 python3 -m unittest discover -s bench -p test_report.py
+python3 -m unittest discover -s bench -p test_ramp.py
+python3 -m unittest discover -s bench -p test_soak.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.
@@ -352,7 +434,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json` |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab` or `ramp` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -363,12 +445,13 @@ on demand. The adoption and parity tabs list whatever `report.html` files those 
 their directory, and a tab with no runs says so and names the flag. Pick an A and a B of the same harness to see their reports side by side;
 runs of different harnesses are never compared. If a benchmark run directory holds an
 `ab-verdicts.json` (`{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
-"delta_pct"}]}`, `verdict` one of `regressed`, `within noise`, `improved`), its
+"delta_pct", "reason"}]}`, `verdict` one of `regressed`, `not comparable`, `within noise`,
+`improved`, and `reason` saying why a cell was not comparable), its
 `report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
-regressions first; a malformed file is an error, not an omitted section. When several runs are rendered together the
-file of the first run that has one is used. A `report.html` written
-before the file existed does not show it: whatever writes `ab-verdicts.json` reruns
-`report.py --html RUN_DIR`.
+the blocking ones first; a malformed file is an error, not an omitted section. When several runs are rendered together the
+file of the first run that has one is used. `gate.py ab` (and `gate.py render`) writes the
+session's gated cells into every candidate run and rewrites that run's `report.html`, since a
+`report.html` written before the file existed does not show it.
 
 On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the
@@ -388,7 +471,7 @@ stdlib only, no JavaScript.
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
 `--only loaded` for a before/after on two builds, or a comma list such as
 `--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
-The default still selects all phases and both servers. A shared host must be quiet: stop
+The default still selects all phases (except the opt-in `ramp`) and both servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.
 
 For repeated comparisons, rotate order explicitly, for example
@@ -403,7 +486,9 @@ time, threshold table and blocking rules. `gate.py ab PREVIOUS CANDIDATE` runs F
 only: three adjacent pairs of `run.sh --servers ferrofin --only shape,unloaded,loaded`. It
 judges each cell regressed, within noise or improved against the thresholds in
 [`gate.toml`](gate.toml). `gate.py aa IMAGE` measures the noise floor those thresholds are
-re-derived from. The three-server runs with both Jellyfins are for publication: they produce
+re-derived from. `gate.py scan` and `gate.py ramp` are the same interleaved pairs for the
+[scan and migration](#scan-and-migration) and [throughput ceiling](#throughput-ceiling-the-saturation-ramp)
+phases; RELEASE.md says which of them block. The three-server runs with both Jellyfins are for publication: they produce
 the root README and `docs/BENCHMARKS.md` tables and never decide a release.
 
 Cold start is not part of the gate and keeps the definition above: a restart until the

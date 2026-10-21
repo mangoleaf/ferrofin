@@ -36,15 +36,52 @@ use crate::item_type_lookup::stored_type_name;
 /// backed by the real unit-1/2 repositories over the given database, for
 /// manager tests that need to resolve item kinds/rows through the library seam.
 pub fn library_manager_over(db: Database) -> Arc<dyn ferrofin_traits::library::LibraryManager> {
+    Arc::new(concrete_library_manager_over(db))
+}
+
+/// [`library_manager_over`], in the middle of a full library validation that
+/// never ends (its scan waits forever once started), for the maintenance work
+/// that stands down while a scan runs (`ILibraryManager.IsScanRunning`).
+pub async fn library_manager_mid_scan(
+    db: Database,
+) -> Arc<dyn ferrofin_traits::library::LibraryManager> {
+    use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::library::{LibraryManager as _, ScanTarget};
+
+    /// A scan that says it started, then never finishes.
+    struct EndlessScan(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl crate::library_manager::ScanRunner for EndlessScan {
+        async fn run(
+            &self,
+            _scope: &ScanTarget,
+            _run: crate::library_scan::ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    let scan = Arc::new(EndlessScan(tokio::sync::Notify::new()));
+    let manager = concrete_library_manager_over(db).with_scan_runner(scan.clone());
+    manager.queue_library_scan().await.expect("scan queued");
+    scan.0.notified().await;
+    assert!(manager.is_scan_running(), "the validation is running");
+    Arc::new(manager)
+}
+
+/// The concrete manager [`library_manager_over`] hands out.
+fn concrete_library_manager_over(db: Database) -> crate::library_manager::FerrofinLibraryManager {
     use crate::item_count_service::FerrofinItemCountService;
     use crate::people_repository::FerrofinPeopleRepository;
 
-    Arc::new(crate::library_manager::FerrofinLibraryManager::new(
+    crate::library_manager::FerrofinLibraryManager::new(
         item_repository_over(db.clone()),
         Arc::new(FerrofinItemCountService::new(db.clone())),
         Arc::new(FerrofinItemPersistenceService::new(db.clone())),
         Arc::new(FerrofinPeopleRepository::new(db)),
-    ))
+    )
 }
 
 /// Builds the real [`FerrofinItemRepository`](crate::item_repository::FerrofinItemRepository)

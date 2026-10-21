@@ -1456,6 +1456,49 @@ async fn invalid_progressive_containers_are_rejected_before_dispatch() {
     assert!(rec.last.lock().unwrap().is_none());
 }
 
+/// `subtitleCodec` is bound with `[RegularExpression(ContainerValidationRegexStr)]`
+/// on the stream routes (`VideosController.cs:363`), like the container and
+/// the other codecs: its first entry is written into the ffmpeg command line,
+/// so a value outside the pattern is a 400 before anything runs.
+#[tokio::test]
+async fn invalid_subtitle_codecs_are_rejected_before_dispatch() {
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    for path in [
+        format!("/Videos/{ITEM_ID}/stream?SubtitleCodec=ass%20-f%20null%20-"),
+        format!("/Videos/{ITEM_ID}/stream.mkv?subtitleCodec=a%3Bb"),
+        format!("/Videos/{ITEM_ID}/stream.mkv?SubtitleCodec=..%2Fout"),
+    ] {
+        let response = app.clone().oneshot(authed("HEAD", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(rec.last.lock().unwrap().is_none());
+}
+
+/// The subtitle codec list reaches the request whatever the key's case
+/// (`StreamInfo` writes `SubtitleCodec`; the binding ignores case).
+#[tokio::test]
+async fn the_subtitle_codec_list_binds_in_any_key_case() {
+    for key in ["SubtitleCodec", "subtitleCodec"] {
+        let rec = Arc::new(Recorded::default());
+        let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+        let path = format!("/Videos/{ITEM_ID}/stream.mkv?{key}=ass,srt");
+        let response = app.oneshot(authed("HEAD", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{key}");
+        assert_eq!(
+            rec.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .subtitle_codec
+                .as_deref(),
+            Some("ass,srt"),
+            "{key}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn ordinary_static_and_progressive_head_allow_anonymous_requests() {
     let directory = tempfile::tempdir().unwrap();
