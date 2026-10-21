@@ -431,12 +431,12 @@ fn answer(target: &str) -> Option<String> {
     }
     if path == "/audiodb/album-mb.php" {
         return Some(
-            r#"{"album":[{"strDescriptionEN":"Album text.","strGenre":"Jazz"}]}"#.to_owned(),
+            r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned(),
         );
     }
     if path == "/audiodb/artist-mb.php" {
         return Some(
-            r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned(),
+            r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned(),
         );
     }
     None
