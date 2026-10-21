@@ -1440,6 +1440,7 @@ dependencies = [
  "ferrofin-util",
  "icu_collator",
  "quick-xml",
+ "regex",
  "reqwest",
  "rstest",
  "serde",
