@@ -3136,6 +3136,23 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        // `if (!item.SupportsPeople) return;`
+        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+            .is_some_and(crate::kinds::supports_people)
+        {
+            return Ok(());
+        }
+        let Ok(item_id) = Uuid::parse_str(&item.id) else {
+            return Ok(());
+        };
+        self.people.update_people(item_id, people).await.map(|_| ())
+    }
+
     async fn get_people(
         &self,
         query: &InternalPeopleQuery,

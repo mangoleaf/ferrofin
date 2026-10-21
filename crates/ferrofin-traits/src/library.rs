@@ -699,6 +699,23 @@ pub trait LibraryManager: Send + Sync {
         Err(ServiceError::backend("get_additional_parts not supported"))
     }
 
+    /// Replaces `item`'s cast and crew with `people` when its kind credits
+    /// any (`LibraryManager.UpdatePeople`, gated on `SupportsPeople`),
+    /// creating the `Person` item each new name needs. The default writes
+    /// nothing (stub and fake libraries).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[ferrofin_db::entities::base_items::PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        let _ = (item, people);
+        Ok(())
+    }
+
     /// Gets the people rows attached to an item.
     async fn get_people(
         &self,

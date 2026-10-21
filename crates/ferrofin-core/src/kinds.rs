@@ -104,6 +104,24 @@ pub fn is_video(kind: BaseItemKind) -> bool {
     )
 }
 
+/// `BaseItem.SupportsPeople` and its overrides: the kinds that carry cast and
+/// crew — every video, audio and audiobook, book, series, season, box set and
+/// music album. `BaseItem`'s own answer, and so every other kind's, is no.
+#[must_use]
+pub fn supports_people(kind: BaseItemKind) -> bool {
+    is_video(kind)
+        || matches!(
+            kind,
+            BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+                | BaseItemKind::BoxSet
+                | BaseItemKind::MusicAlbum
+        )
+}
+
 /// The `PresentationUniqueKey` a row of `kind` is stored with — C#
 /// `BaseItem.CreatePresentationUniqueKey` and its overrides, which
 /// `MetadataService` stamps on every refresh.
@@ -720,6 +738,47 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
         CollectionTypeOptions::books => CollectionType::books,
         CollectionTypeOptions::mixed => return None,
     })
+}
+
+#[cfg(test)]
+mod people_tests {
+    use super::supports_people;
+    use ferrofin_model::data::BaseItemKind;
+
+    /// `SupportsPeople`: true where a class overrides it so, false on
+    /// `BaseItem` and the by-name, folder-view and person kinds.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::MusicVideo, true)]
+    #[case(BaseItemKind::Trailer, true)]
+    #[case(BaseItemKind::Video, true)]
+    #[case(BaseItemKind::Series, true)]
+    #[case(BaseItemKind::Season, true)]
+    #[case(BaseItemKind::Audio, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::Book, true)]
+    #[case(BaseItemKind::BoxSet, true)]
+    #[case(BaseItemKind::MusicAlbum, true)]
+    #[case(BaseItemKind::Person, false)]
+    #[case(BaseItemKind::Genre, false)]
+    #[case(BaseItemKind::MusicGenre, false)]
+    #[case(BaseItemKind::Studio, false)]
+    #[case(BaseItemKind::MusicArtist, false)]
+    #[case(BaseItemKind::Year, false)]
+    #[case(BaseItemKind::CollectionFolder, false)]
+    #[case(BaseItemKind::UserView, false)]
+    #[case(BaseItemKind::Folder, false)]
+    #[case(BaseItemKind::Playlist, false)]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::LiveTvChannel, false)]
+    #[case(BaseItemKind::LiveTvProgram, false)]
+    fn supports_people_follows_the_class_overrides(
+        #[case] kind: BaseItemKind,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(supports_people(kind), expected, "{kind:?}");
+    }
 }
 
 #[cfg(test)]
