@@ -1618,7 +1618,7 @@ impl FerrofinStreamStatePlanner {
                     video_stream,
                 ),
                 source_codec: video_stream.and_then(|v| v.codec.as_deref()),
-                is_dovi: hw::tonemap::is_dovi(video_stream),
+                requires_dovi_reshaping: hw::tonemap::requires_dovi_reshaping(video_stream),
                 is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
                 subtitle,
             };
