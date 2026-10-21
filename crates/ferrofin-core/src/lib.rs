@@ -224,6 +224,7 @@ pub mod plugin_manager;
 mod query_restrictions;
 pub mod quick_connect_manager;
 use ferrofin_providers::refresh_plan;
+mod library_preference_repository;
 pub mod resolvers;
 pub mod scan_metrics;
 pub mod scan_progress;
