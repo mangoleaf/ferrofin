@@ -2976,10 +2976,8 @@ impl LibraryManager for FerrofinLibraryManager {
         // in id order, that already has several sources and is itself no
         // version (`MediaSourceCount > 1 && !PrimaryVersionId.HasValue`) —
         // a video with versions, local or merged, which here is a row that
-        // points at it — else the widest default video stream, the first of
-        // equals (`ThenByDescending(...).First()`). The item's own `Width`
-        // column stands in for the default video stream width; the
-        // `Video3DFormat`/`VideoType` demotion before it is not modeled.
+        // points at it — else plain files before 3D and disc videos, then the
+        // widest ([`crate::video_versions::preferred_primary_version`]).
         let ids: Vec<Uuid> = items
             .iter()
             .filter_map(|item| Uuid::parse_str(&item.id).ok())
@@ -2991,15 +2989,7 @@ impl LibraryManager for FerrofinLibraryManager {
         let primary_index = items
             .iter()
             .position(|item| item.primary_version_id.is_none() && has_versions(item))
-            .unwrap_or_else(|| {
-                let mut best = 0;
-                for (index, item) in items.iter().enumerate().skip(1) {
-                    if item.width.unwrap_or(0) > items[best].width.unwrap_or(0) {
-                        best = index;
-                    }
-                }
-                best
-            });
+            .unwrap_or_else(|| crate::video_versions::preferred_primary_version(&items));
         let primary_id = items[primary_index].id.clone();
 
         // Link every non-primary item to the primary by pointer, and ensure the
@@ -6294,6 +6284,53 @@ mod tests {
                 .and_then(|s| Uuid::parse_str(s).ok()),
             Some(wide)
         );
+    }
+
+    /// `VideosController.MergeVersions` puts 3D and disc (non-`VideoFile`)
+    /// videos after plain files before it compares widths.
+    #[tokio::test]
+    async fn merge_versions_demotes_3d_and_disc_copies_below_a_plain_file() {
+        let db = test_db().await;
+        let three_d = Uuid::from_u128(0x311);
+        let disc = Uuid::from_u128(0x312);
+        let plain = Uuid::from_u128(0x313);
+        let blob = |id| {
+            if id == three_d {
+                r#"{"Video3DFormat":"HalfSideBySide"}"#
+            } else if id == disc {
+                r#"{"VideoType":"BluRay"}"#
+            } else {
+                "{}"
+            }
+        };
+        for (id, width) in [(three_d, 3840), (disc, 1920), (plain, 1280)] {
+            crate::test_support::seed_item_with_data(&db, id, BaseItemKind::Movie, "", blob(id))
+                .await;
+            set_width(&db, id, width).await;
+        }
+        let mgr = manager(&db);
+
+        mgr.merge_versions(&[three_d, disc, plain])
+            .await
+            .expect("merge");
+
+        let pointer = |row: Option<BaseItemEntity>| {
+            row.expect("some")
+                .primary_version_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        assert_eq!(
+            pointer(mgr.get_item_by_id(plain).await.expect("read")),
+            None
+        );
+        for id in [three_d, disc] {
+            assert_eq!(
+                pointer(mgr.get_item_by_id(id).await.expect("read")),
+                Some(plain),
+                "the wider 3D or disc copy is an alternate of the plain file"
+            );
+        }
     }
 
     #[tokio::test]
