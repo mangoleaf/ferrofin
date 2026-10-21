@@ -1593,6 +1593,196 @@ async fn a_stop_at_a_negative_position_releases_the_live_stream_and_keeps_the_re
     assert_eq!(resume, halfway, "nothing is saved for a refused stop");
 }
 
+/// C# `CloseIfNeededAsync`: when a session's last socket closes, the live
+/// stream it was playing (`PlayState.LiveStreamId`) is released before the
+/// session ends, so a client that vanishes without a stop does not hold its
+/// tuner until a restart.
+#[tokio::test]
+async fn the_last_socket_closing_releases_the_sessions_live_stream() {
+    use ferrofin_model::session::PlaybackStartInfo;
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "vanishing").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-vanish", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let session_id = session.id.clone().expect("session id");
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-vanish".to_owned()),
+        play_session_id: Some("play-vanish".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+
+    mgr.close_if_needed(&session_id).await.unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-vanish".to_owned()]
+    );
+    assert!(
+        mgr.get_session_snapshot(&session_id).await.is_err(),
+        "the session ended"
+    );
+}
+
+/// What the last socket closing does not release: a stream a stop already
+/// released (the session's play state no longer names it), and nothing at
+/// all for a logout (C# `ReportSessionEnded`, which only ends the session).
+#[tokio::test]
+async fn a_logout_or_an_already_stopped_stream_is_not_released_on_session_end() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let start = |session: &SessionInfoDto, stream: &str| PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some(stream.to_owned()),
+        play_session_id: Some(format!("play-{stream}")),
+        ..PlaybackStartInfo::default()
+    };
+
+    let logged_out = mgr
+        .log_session_activity("Web", "1.0", "dev-out", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&start(&logged_out, "live-out"))
+        .await
+        .unwrap();
+    mgr.report_session_ended(logged_out.id.as_deref().expect("id"))
+        .await
+        .unwrap();
+    assert!(
+        sources.closed.lock().expect("closed mutex").is_empty(),
+        "a logout releases nothing"
+    );
+
+    let stopped = mgr
+        .log_session_activity("Web", "1.0", "dev-stop", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&start(&stopped, "live-stop"))
+        .await
+        .unwrap();
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: stopped.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-stop".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        mgr.get_session_snapshot(stopped.id.as_deref().expect("id"))
+            .await
+            .unwrap()
+            .now_playing_live_stream_id,
+        None,
+        "a stop clears the session's live stream (C# `RemoveNowPlayingItem`)"
+    );
+    mgr.close_if_needed(stopped.id.as_deref().expect("id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-stop".to_owned()],
+        "released once, by the stop"
+    );
+}
+
+/// The session's live stream is what the latest report names (C#
+/// `PlayState.LiveStreamId = info.LiveStreamId`), so a progress report
+/// without one clears it. A stop refused for its negative position releases
+/// the stream and keeps the play state, so the socket closing afterwards
+/// releases nothing more.
+#[tokio::test]
+async fn the_sessions_live_stream_follows_the_reports() {
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-follow", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let session_id = session.id.clone().expect("session id");
+    let stream = |mgr: &Arc<FerrofinSessionManager>| {
+        let mgr = Arc::clone(mgr);
+        let session_id = session_id.clone();
+        async move {
+            mgr.get_session_snapshot(&session_id)
+                .await
+                .unwrap()
+                .now_playing_live_stream_id
+        }
+    };
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-follow".to_owned()),
+        play_session_id: Some("play-follow".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(stream(&mgr).await.as_deref(), Some("live-follow"));
+    mgr.on_playback_progress(
+        &PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            ..PlaybackProgressInfo::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stream(&mgr).await, None, "a report without one clears it");
+
+    mgr.on_playback_progress(
+        &PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("live-follow".to_owned()),
+            ..PlaybackProgressInfo::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let refused = mgr
+        .on_playback_stopped(&PlaybackStopInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("live-follow".to_owned()),
+            position_ticks: Some(-1),
+            ..PlaybackStopInfo::default()
+        })
+        .await;
+    assert!(matches!(refused, Err(ServiceError::InvalidInput(_))));
+    mgr.close_if_needed(&session_id).await.unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-follow".to_owned()],
+        "released once, by the refused stop"
+    );
+}
+
 /// A session recreated after its previous one ended (the socket closed, or an
 /// explicit logout) inherits the device's last reported capabilities — C#
 /// `OnSessionStarted` → `ReportCapabilities(info, _deviceManager.GetCapabilities

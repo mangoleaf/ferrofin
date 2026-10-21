@@ -116,6 +116,10 @@ struct SessionInfo {
     /// surfaced as the session's `PlayState` (C# `Session.PlayState`). Cleared on stop.
     now_playing_position_ticks: Option<i64>,
     now_playing_is_paused: bool,
+    /// The live stream the now-playing item is read from (C#
+    /// `PlayState.LiveStreamId`): released when the session's last socket
+    /// closes. Cleared on stop.
+    now_playing_live_stream_id: Option<String>,
     now_viewing_item_id: Option<Uuid>,
     additional_users: Vec<SessionUserInfo>,
     capabilities: ClientCapabilities,
@@ -136,12 +140,15 @@ impl SessionInfo {
     /// now-playing item back from the first progress report, since clients
     /// never resend the start. `now_playing` is the reported item when the
     /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
-    /// item it cannot resolve).
+    /// item it cannot resolve). `live_stream_id` is stored as reported, so a
+    /// report without one clears it (C# `PlayState.LiveStreamId =
+    /// info.LiveStreamId`).
     fn update_now_playing(
         &mut self,
         now_playing: Option<Uuid>,
         position_ticks: Option<i64>,
         is_paused: bool,
+        live_stream_id: Option<&str>,
         update_check_in: bool,
     ) {
         let now = Utc::now();
@@ -158,6 +165,7 @@ impl SessionInfo {
         }
         self.now_playing_is_paused = is_paused;
         self.now_playing_position_ticks = position_ticks;
+        self.now_playing_live_stream_id = live_stream_id.map(ToOwned::to_owned);
     }
 
     /// Whether the session references `user_id` as its primary or an additional
@@ -496,6 +504,7 @@ impl FerrofinSessionManager {
                 now_playing_item_id: None,
                 now_playing_position_ticks: None,
                 now_playing_is_paused: false,
+                now_playing_live_stream_id: None,
                 now_viewing_item_id: None,
                 additional_users: Vec::new(),
                 capabilities: device_capabilities,
@@ -1222,6 +1231,7 @@ impl SessionManager for FerrofinSessionManager {
                     item.as_ref().map(|_| info.item_id),
                     info.position_ticks,
                     info.is_paused,
+                    info.live_stream_id.as_deref(),
                     true,
                 );
                 s.is_playing = true;
@@ -1299,6 +1309,7 @@ impl SessionManager for FerrofinSessionManager {
                     now_playing,
                     info.position_ticks,
                     info.is_paused,
+                    info.live_stream_id.as_deref(),
                     !is_automated,
                 );
             }
@@ -1373,6 +1384,7 @@ impl SessionManager for FerrofinSessionManager {
                 s.now_playing_item_id = None;
                 s.now_playing_position_ticks = None;
                 s.now_playing_is_paused = false;
+                s.now_playing_live_stream_id = None;
                 s.is_playing = false;
                 s.last_activity_date = Utc::now();
             }
@@ -1405,6 +1417,29 @@ impl SessionManager for FerrofinSessionManager {
             .publish("PlaybackStopped", &payload)
             .await;
         saved.and(released)
+    }
+
+    async fn close_if_needed(&self, session_id: &str) -> Result<(), ServiceError> {
+        // C# `CloseIfNeededAsync`: the live stream the session plays
+        // (`PlayState.LiveStreamId`) is released, then the session ends.
+        let live_stream_id = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .find(|s| s.id == session_id)
+                .and_then(|s| s.now_playing_live_stream_id.clone())
+        };
+        let released = match live_stream_id.as_deref() {
+            Some(live_stream_id) => {
+                self.close_live_stream_if_needed(live_stream_id, session_id)
+                    .await
+            }
+            None => Ok(()),
+        };
+        // Ended whatever the release returned: a session whose socket is gone
+        // is not kept for it.
+        let ended = self.report_session_ended(session_id).await;
+        released.and(ended)
     }
 
     async fn report_session_ended(&self, session_id: &str) -> Result<(), ServiceError> {
