@@ -104,6 +104,9 @@ struct ArtworkCache {
     series_names: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
+    /// The libraries and their options the parental-score resolver reads,
+    /// once per scan rather than once per scanned item.
+    rating_libraries: Option<crate::item_visibility::RatingLibraries>,
     /// Lookup locales already resolved by this pass's metadata providers.
     resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
@@ -4171,6 +4174,7 @@ impl LibraryScanner {
     async fn apply_parental_rating_score(
         &self,
         entity: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
     ) -> Result<(), ServiceError> {
         let kind = crate::item_type_lookup::kind_from_type_name(&entity.type_)
             .unwrap_or(BaseItemKind::Folder);
@@ -4185,9 +4189,15 @@ impl LibraryScanner {
                 .into_owned(),
         );
         if let Some(resolver) = &self.rating_resolver {
-            return resolver
-                .update_rating_scores(std::slice::from_mut(entity))
+            let libraries = match cache.rating_libraries.take() {
+                Some(libraries) => libraries,
+                None => resolver.rating_libraries().await?,
+            };
+            let scored = resolver
+                .update_rating_scores_in(std::slice::from_mut(entity), &libraries)
                 .await;
+            cache.rating_libraries = Some(libraries);
+            return scored;
         }
         if let Some(localization) = &self.localization {
             let score = entity
@@ -7208,7 +7218,8 @@ impl LibraryScanner {
         // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
         // episode cannot end before it starts.
         ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
-        self.apply_parental_rating_score(&mut entity).await?;
+        self.apply_parental_rating_score(&mut entity, state.art_cache)
+            .await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
             let before = state
@@ -13416,12 +13427,39 @@ impl LibraryScanner {
 
     /// Resolve a folder owner's direct extras — `LibraryManager.FindExtras`
     /// for a series, a season, a music artist or a music album — before what
-    /// else is in it. Sort every candidate before applying scope, so type
-    /// numbering is stable. Returns the entries it took.
+    /// else is in it ([`Self::plan_owned_extras`] with the folder as owner).
+    /// Returns the entries it took.
     fn plan_folder_extras(
         &self,
         entries: &[FileSystemEntryInfo],
         owner_dir: &str,
+        owner: Uuid,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) -> std::collections::HashSet<String> {
+        let Some(owner_info) =
+            video_resolver::resolve_directory(Some(owner_dir), ctx.naming, true, Some(owner_dir))
+        else {
+            return std::collections::HashSet::new();
+        };
+        self.plan_owned_extras(entries, owner_dir, &owner_info, owner, cf, ctx, out)
+    }
+
+    /// `LibraryManager.FindExtras` over `entries`, the listing of `dir`, for
+    /// the owner `owner` resolved as `owner_info` (a folder's, or an
+    /// episode's file): the extras folders' files and the loose extras named
+    /// after it. Sort every candidate before applying scope, so type
+    /// numbering is stable. Returns the entries it took.
+    // `plan_folder_extras`' arguments plus the owner's resolved name: the
+    // scan's walk state (`ctx`, `out`) and the owner's identity are separate
+    // things, and every caller has them apart.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_owned_extras(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        owner_dir: &str,
+        owner_info: &ferrofin_naming::video::VideoFileInfo,
         owner: Uuid,
         cf: Uuid,
         ctx: &PlanCtx<'_>,
@@ -13453,11 +13491,6 @@ impl LibraryScanner {
             }
         }
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        let Some(owner_info) =
-            video_resolver::resolve_directory(Some(owner_dir), ctx.naming, true, Some(owner_dir))
-        else {
-            return consumed;
-        };
         let mut counts = HashMap::new();
         for (path, mixed) in candidates {
             let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
@@ -13471,7 +13504,7 @@ impl LibraryScanner {
             let Some(rule) = extra.rule.as_ref() else {
                 continue;
             };
-            if !extra_matches_owner(&path, rule.rule_type, &owner_info, ctx.naming) {
+            if !extra_matches_owner(&path, rule.rule_type, owner_info, ctx.naming) {
                 continue;
             }
             consumed.insert(path.clone());
@@ -15005,21 +15038,32 @@ impl LibraryScanner {
         let mut children = fanout::map(&dirs, ctx, |entry, ctx| {
             let mut rows = Vec::new();
             let mut paths = Vec::new();
+            let mut owned = Vec::new();
             let home = (cf, series_id, series_name, series_key);
-            self.plan_series_subfolder(series_dir, entry, home, &names, ctx, &mut rows, &mut paths);
-            (rows, paths)
+            self.plan_series_subfolder(
+                series_dir,
+                entry,
+                home,
+                &names,
+                ctx,
+                &mut rows,
+                (&mut paths, &mut owned),
+            );
+            (rows, paths, owned)
         })
         .into_iter();
+        let mut owned_extras = Vec::new();
         for entry in entries {
             if extras.contains(&entry.path) {
                 continue;
             }
             if entry.type_ == FileSystemEntryType::Directory {
                 if ctx.scope.visits(&entry.path)
-                    && let Some((rows, paths)) = children.next()
+                    && let Some((rows, paths, owned)) = children.next()
                 {
                     out.extend(rows);
                     loose.extend(paths);
+                    owned_extras.extend(owned);
                 }
             } else if video_resolver::is_video_file(&entry.path, naming)
                 && episode_file_kept(&entry.path, ctx)
@@ -15045,11 +15089,14 @@ impl LibraryScanner {
             ctx,
             out,
         );
+        // After the loose episodes: an extra's owner saves first.
+        out.extend(owned_extras);
     }
 
     /// One subfolder of a series: a season, planned with its episodes, or a
     /// folder whose videos are collected into `loose` as loose episodes
-    /// (grouped into virtual seasons by [`Self::plan_loose_episodes`]).
+    /// (grouped into virtual seasons by [`Self::plan_loose_episodes`]), the
+    /// extras such an episode owns into `owned_extras`, for after them.
     #[allow(clippy::too_many_arguments)]
     fn plan_series_subfolder(
         &self,
@@ -15059,7 +15106,7 @@ impl LibraryScanner {
         names: &SeasonNames,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
-        loose: &mut Vec<String>,
+        (loose, owned_extras): (&mut Vec<String>, &mut Vec<Planned>),
     ) {
         let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
         if !(season.season_number.is_some() || season.is_season_folder) {
@@ -15073,7 +15120,13 @@ impl LibraryScanner {
                 return;
             }
             // A non-season subfolder: collect its videos as loose episodes.
-            self.collect_videos(&entry.path, (cf, series_id), ctx, out, loose);
+            self.collect_videos(
+                &entry.path,
+                (cf, series_id),
+                ctx,
+                (out, owned_extras),
+                loose,
+            );
             return;
         }
         let num = season.season_number;
@@ -15121,17 +15174,24 @@ impl LibraryScanner {
     /// Collects every video file under `dir` (recursively) into `out_paths` —
     /// the ones `ctx`'s scope keeps, with the rest of a stack or version
     /// group it keeps a file of ([`episode_file_kept`]).
+    /// An episode's own extras go to `owned_extras`, for after the loose
+    /// episodes are planned ([`Self::plan_episode_folder_extras`]).
     fn collect_videos(
         &self,
         dir: &str,
         (cf, series_id): (Uuid, Uuid),
         ctx: &PlanCtx<'_>,
-        out: &mut Vec<Planned>,
+        (out, owned_extras): (&mut Vec<Planned>, &mut Vec<Planned>),
         out_paths: &mut Vec<String>,
     ) {
         let entries = self.list(dir, ctx);
         note_episode_folder(dir, &entries, ctx);
+        let extras = set_aside_extras(&entries, dir, ctx);
+        self.plan_episode_folder_extras(&entries, dir, cf, ctx, owned_extras);
         for entry in entries {
+            if extras.contains(&entry.path) {
+                continue;
+            }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
                     continue;
@@ -15141,7 +15201,13 @@ impl LibraryScanner {
                 let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
                 let home = (series_id, vec![cf, series_id]);
                 if !self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
-                    self.collect_videos(&entry.path, (cf, series_id), ctx, out, out_paths);
+                    self.collect_videos(
+                        &entry.path,
+                        (cf, series_id),
+                        ctx,
+                        (out, owned_extras),
+                        out_paths,
+                    );
                 }
             } else if video_resolver::is_video_file(&entry.path, ctx.naming)
                 && episode_file_kept(&entry.path, ctx)
@@ -15275,8 +15341,9 @@ impl LibraryScanner {
         let extras = if owner_dir.as_deref() == Some(dir) {
             self.plan_folder_extras(&entries, dir, owner, cf, ctx, out)
         } else {
-            std::collections::HashSet::new()
+            set_aside_extras(&entries, dir, ctx)
         };
+        let own_folder = owner_dir.as_deref() == Some(dir);
         for entry in entries {
             if extras.contains(&entry.path) {
                 continue;
@@ -15328,6 +15395,64 @@ impl LibraryScanner {
                 self.plan_untyped_audio(&entry, cf, parent, ctx, out);
             }
         }
+        // After the folder's episodes: an extra's owner saves first.
+        if !own_folder {
+            let entries = self.list(dir, ctx);
+            self.plan_episode_folder_extras(&entries, dir, cf, ctx, out);
+        }
+    }
+
+    /// The extras of `dir`, a folder below a series that is not its season's
+    /// or series' own (listed as `entries`), when an episode owns videos
+    /// there: the folder's one stack or version group, not in a mixed
+    /// folder, searches the folder it is in for its extras
+    /// (`Episode.SupportsOwnedItems`, `SearchesContainingFolderForExtras`;
+    /// its container keeps its own folder's, `RefreshedOwnedItems`,
+    /// Jellyfin 12.0-rc5). Run whatever the scope keeps of the episode, as a
+    /// folder owner's extras are, so a scoped scan of an extra re-plans it.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence): every
+    /// extra goes to the group's primary; upstream gives one to the version
+    /// it is named after (`Video.GetOwnerIdForExtra`, the movie walk's
+    /// [`owner_for_extra`]). Un-defer path: map the group's versions by name
+    /// as the movie walk does and pick each extra's owner by it.
+    fn plan_episode_folder_extras(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        dir: &str,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        let first = {
+            let folders = ctx.episode_folders.borrow();
+            let Some(folder) = folders.get(dir).filter(|folder| !folder.mixed) else {
+                return;
+            };
+            let Some([video]) = folder
+                .groups
+                .as_ref()
+                .map(|groups| groups.videos.as_slice())
+            else {
+                return;
+            };
+            video.files.first().map(|file| file.path.clone())
+        };
+        let Some(first) = first else {
+            return;
+        };
+        // The primary's id, derived as its row's is ([`Self::episode_row`]).
+        let Some(owner) = item_type_lookup::derive_item_id_with(
+            &self.id_derivation,
+            BaseItemKind::Episode,
+            &first,
+        ) else {
+            return;
+        };
+        let Some(info) = video_resolver::resolve_file(Some(&first), ctx.naming, Some(dir)) else {
+            return;
+        };
+        self.plan_owned_extras(entries, dir, &info, owner, cf, ctx, out);
     }
 
     /// Plans the episode file at `path` (one the scope keeps,
@@ -17693,6 +17818,38 @@ impl EpisodeHome<'_> {
             None => (self.series_id, vec![self.cf, self.series_id]),
         }
     }
+}
+
+/// The entries of `dir`, a folder below a series that is not its season's or
+/// series' own, that are never episodes: an extras folder below a non-top
+/// folder (`CoreResolutionIgnoreRule`) and a file the extra rules take
+/// (`ResolveVideos` sets it aside). A grouped episode in `dir` may own them
+/// ([`LibraryScanner::plan_episode_folder_extras`]); a stored row at one is
+/// reconciled away otherwise.
+fn set_aside_extras(
+    entries: &[FileSystemEntryInfo],
+    dir: &str,
+    ctx: &PlanCtx<'_>,
+) -> std::collections::HashSet<String> {
+    let set_aside: std::collections::HashSet<String> = entries
+        .iter()
+        .filter(|entry| {
+            if entry.type_ == FileSystemEntryType::Directory {
+                is_extras_dir(entry, ctx.naming)
+            } else {
+                ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+                    &entry.path,
+                    ctx.naming,
+                    Some(dir),
+                )
+                .extra_type
+                .is_some()
+            }
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+    ctx.excluded.borrow_mut().extend(set_aside.iter().cloned());
+    set_aside
 }
 
 /// Records what the episodes in `dir` (listed as `entries`) resolve to: a
@@ -21713,6 +21870,117 @@ mod tests {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+    /// The parental-score resolver reads the libraries and their options once
+    /// per scan, not once per scanned item; each item still reads its own
+    /// parent chain, so an ancestor saved earlier in the pass is seen.
+    #[tokio::test]
+    async fn a_scan_reads_the_rating_libraries_once() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, derive_item_id};
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        use ferrofin_traits::persistence::ItemRepository;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        let shows = tmp.path().join("shows");
+        // A rated series whose episode has no rating of its own inherits the
+        // series' score through the parent chain read for it in the pass.
+        let season = shows.join("Show (2001)/Season 01");
+        std::fs::create_dir_all(&season).expect("mkdir");
+        std::fs::write(
+            shows.join("Show (2001)/tvshow.nfo"),
+            "<tvshow><title>Show</title><mpaa>TV-MA</mpaa></tvshow>",
+        )
+        .expect("nfo");
+        let episode = season.join("Show S01E01.mkv");
+        std::fs::write(&episode, b"").expect("write");
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            let folder = movies.join(format!("{name} (2001)"));
+            std::fs::create_dir_all(&folder).expect("mkdir");
+            std::fs::write(folder.join(format!("{name} (2001).mkv")), b"").expect("write");
+            std::fs::write(
+                folder.join("movie.nfo"),
+                format!("<movie><title>{name}</title><mpaa>PG-13</mpaa></movie>"),
+            )
+            .expect("nfo");
+        }
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: movies.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("library");
+        vf.add_virtual_folder(
+            "Shows",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: shows.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("library");
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&items),
+            Arc::new(crate::LocalizationManager::new("US")),
+            tmp.path().join("data").to_string_lossy().into_owned(),
+        ));
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(Arc::clone(&items))
+                .with_rating_resolver(Arc::clone(&visibility));
+        scanner.scan_all().await.expect("scan");
+
+        assert_eq!(visibility.library_loads(), 1, "once for the whole scan");
+        let score = |rating: &str| {
+            crate::LocalizationManager::new("US")
+                .get_rating_score(rating, None)
+                .map(|score| i64::from(score.score))
+        };
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            let path = movies.join(format!("{name} (2001)/{name} (2001).mkv"));
+            let id = derive_item_id(BaseItemKind::Movie, &path.to_string_lossy()).expect("id");
+            let row = items.retrieve_item(id).await.expect("read").expect("movie");
+            assert_eq!(row.official_rating.as_deref(), Some("PG-13"), "{name}");
+            assert_eq!(
+                row.inherited_parental_rating_value,
+                score("PG-13"),
+                "{name}"
+            );
+        }
+        let id = derive_item_id(BaseItemKind::Episode, &episode.to_string_lossy()).expect("id");
+        let row = items
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("episode");
+        assert!(score("TV-MA").is_some());
+        assert_eq!(row.inherited_parental_rating_value, score("TV-MA"));
+    }
 
     #[rstest::rstest]
     #[case("ς", "σ", true)]
