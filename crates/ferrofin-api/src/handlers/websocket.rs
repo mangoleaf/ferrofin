@@ -536,10 +536,13 @@ async fn handle_socket(
     // it wakes every `IntervalFactor * WebSocketLostTimeout` and only sends a
     // `ForceKeepAlive` to a socket that has been SILENT for longer than
     // `ForceKeepAliveFactor * WebSocketLostTimeout`, where "silent" is reset by
-    // the client's own `KeepAlive`. A socket past the full timeout leaves the
-    // watchlist (`RemoveWebSocket`) and is never prodded again — upstream does
-    // not close it either, which is the `// TODO: handle session relative to the
-    // lost webSocket` still standing at SessionWebSocketListener.cs:246.
+    // the client's own `KeepAlive`. A socket past the full timeout is lost:
+    // upstream removes it from the watchlist and disposes it (since 12.0-rc3,
+    // jellyfin/jellyfin#17079), which ends the receive, so its session and
+    // SyncPlay seat go with it. Here the loop ends and the teardown below runs.
+    // Every socket has a session upstream (`RequestHelpers.GetSession`), but a
+    // sessionless one here (see `resolve_caller`) is only dropped from the
+    // watch, as before: nothing told it to send `KeepAlive`.
     //
     // A fixed 60 s metronome — what this loop used to run — is neither: it kept
     // prodding a socket the client was actively talking on, and its cadence
@@ -610,8 +613,8 @@ async fn handle_socket(
                     break;
                 },
                 _ = keepalive.tick(), if watched => {
-                    if !keep_alive_watchdog(
-                        &mut socket, &overflowed, last_keep_alive, &mut watched).await
+                    if !keep_alive_watchdog(&mut socket, &overflowed, last_keep_alive,
+                        caller.is_some(), &mut watched).await
                     {
                         break;
                     }
@@ -739,17 +742,25 @@ enum KeepAlive {
     /// so prompt it with another `ForceKeepAlive`.
     Prod,
     /// `lost` — silent past the whole `WebSocketLostTimeout`. Upstream drops it
-    /// from the watchlist (`RemoveWebSocket`) and does NOT close it: the
-    /// `// TODO: handle session relative to the lost webSocket` at :246 stands.
+    /// from the watchlist and disposes it (`KeepAliveSockets`, since 12.0-rc3),
+    /// so the socket closes and its session ends.
     Lost,
+    /// `lost`, but the socket has no session to end: it only leaves the watch.
+    /// Upstream gives every socket a session; Ferrofin's sessionless sockets
+    /// (an API key, see `resolve_caller`) were never greeted.
+    Unwatch,
 }
 
 /// Classifies one watchdog tick. The two bands are half-open exactly as the C#
 /// writes them: `inactive` is `elapsed > force && elapsed < timeout`, `lost` is
 /// `elapsed >= timeout`, so a socket exactly at the timeout is lost, not prodded.
-fn keep_alive_action(silent_secs: f64) -> KeepAlive {
+fn keep_alive_action(silent_secs: f64, has_session: bool) -> KeepAlive {
     if silent_secs >= KEEPALIVE_LOST_SECS {
-        KeepAlive::Lost
+        if has_session {
+            KeepAlive::Lost
+        } else {
+            KeepAlive::Unwatch
+        }
     } else if silent_secs > KEEPALIVE_FORCE_AFTER_SECS {
         KeepAlive::Prod
     } else {
@@ -758,18 +769,26 @@ fn keep_alive_action(silent_secs: f64) -> KeepAlive {
 }
 
 /// One tick of `SessionWebSocketListener.KeepAliveSockets` for a single socket.
-/// Returns whether the socket loop should continue.
+/// Returns whether the socket loop should continue: a lost socket with a
+/// session ends it.
 async fn keep_alive_watchdog(
     socket: &mut WebSocket,
     overflowed: &tokio::sync::Notify,
     last_keep_alive: tokio::time::Instant,
+    has_session: bool,
     watched: &mut bool,
 ) -> bool {
-    match keep_alive_action(last_keep_alive.elapsed().as_secs_f64()) {
+    let silent_secs = last_keep_alive.elapsed().as_secs_f64();
+    match keep_alive_action(silent_secs, has_session) {
         KeepAlive::Quiet => true,
         KeepAlive::Lost => {
+            // Upstream: `Lost {0} WebSockets.` at Information.
+            tracing::info!(silent_s = silent_secs, "websocket keep-alive lost; closing");
+            false
+        }
+        KeepAlive::Unwatch => {
             *watched = false;
-            tracing::debug!("websocket keep-alive lost; no longer watched");
+            tracing::debug!("sessionless websocket keep-alive lost; no longer watched");
             true
         }
         KeepAlive::Prod => {
@@ -1416,14 +1435,16 @@ mod tests {
         // `IntervalFactor * WebSocketLostTimeout`: the watchdog wakes far more
         // often than it speaks, so most ticks must be silent.
         for quiet in [0.0, 1.0, 12.0, 24.0, 44.9, KEEPALIVE_FORCE_AFTER_SECS] {
-            assert_eq!(keep_alive_action(quiet), KeepAlive::Quiet, "{quiet}");
+            assert_eq!(keep_alive_action(quiet, true), KeepAlive::Quiet, "{quiet}");
         }
         for prod in [45.1, 48.0, 59.9] {
-            assert_eq!(keep_alive_action(prod), KeepAlive::Prod, "{prod}");
+            assert_eq!(keep_alive_action(prod, true), KeepAlive::Prod, "{prod}");
         }
-        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod.
+        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod: a
+        // socket with a session closes, a sessionless one only leaves the watch.
         for lost in [KEEPALIVE_LOST_SECS, 60.1, 600.0] {
-            assert_eq!(keep_alive_action(lost), KeepAlive::Lost, "{lost}");
+            assert_eq!(keep_alive_action(lost, true), KeepAlive::Lost, "{lost}");
+            assert_eq!(keep_alive_action(lost, false), KeepAlive::Unwatch, "{lost}");
         }
         // ...and the bands are the C# factors of the one timeout the client is
         // told about in the `ForceKeepAlive` payload.
