@@ -179,8 +179,9 @@ pub struct ChainInput<'a> {
     /// The **source** video codec, which decides whether VAAPI can decode it
     /// at all — upstream's `IsVaapiSupported` rejects `mpeg4` outright.
     pub source_codec: Option<&'a str>,
-    /// Whether the source is Dolby Vision, which the software tonemap reshapes.
-    pub is_dovi: bool,
+    /// Whether the software tonemap reshapes the source's Dolby Vision
+    /// ([`super::tonemap::requires_dovi_reshaping`]: profile 5 only).
+    pub requires_dovi_reshaping: bool,
     /// Whether the source is HEVC Range Extensions, which decodes to a 10-bit
     /// surface and so changes the hardware scaler's output format.
     pub is_hevc_rext: bool,
@@ -249,9 +250,11 @@ pub fn sw_vid_filter_chain(input: &ChainInput<'_>) -> FilterChain {
     ));
 
     if input.do_sw_tonemap {
-        chain
-            .main
-            .push(sw_tonemap_filter(options, out_format, input.is_dovi));
+        chain.main.push(sw_tonemap_filter(
+            options,
+            out_format,
+            input.requires_dovi_reshaping,
+        ));
     } else {
         chain.main.push(format!("format={out_format}"));
     }
@@ -283,12 +286,20 @@ pub fn sw_vid_filter_chain(input: &ChainInput<'_>) -> FilterChain {
 /// The software tonemap filter. Port of the `tonemapx` block inside
 /// `GetSwVidFilterChain`.
 ///
-/// Dolby Vision is the reason this takes the source range: `tonemapx` needs
-/// `yuv420p10` input to reshape a DV stream, so the format is forced to
-/// `yuv420p` and ffmpeg is left to convert, rather than being handed the nv12
-/// the rest of the chain would use.
-fn sw_tonemap_filter(options: &EncodingOptions, out_format: &str, is_dovi: bool) -> String {
-    let tonemap_format = if is_dovi { "yuv420p" } else { out_format };
+/// Dolby Vision profile 5 is the reason this takes the source range:
+/// `tonemapx` needs `yuv420p10` input to reshape a stream with no compatible
+/// base layer, so the format is forced to `yuv420p` and ffmpeg is left to
+/// convert, rather than being handed the nv12 the rest of the chain would use.
+fn sw_tonemap_filter(
+    options: &EncodingOptions,
+    out_format: &str,
+    requires_dovi_reshaping: bool,
+) -> String {
+    let tonemap_format = if requires_dovi_reshaping {
+        "yuv420p"
+    } else {
+        out_format
+    };
     let algorithm = format!("{:?}", options.tonemapping_algorithm);
     let mut args = format!(
         "tonemapx=tonemap={algorithm}:desat={}:peak={}:t=bt709:m=bt709:p=bt709:\
@@ -592,7 +603,7 @@ mod tests {
             vpp_tonemap_available: false,
             vulkan_tonemap_available: false,
             source_codec: Some("h264"),
-            is_dovi: false,
+            requires_dovi_reshaping: false,
             is_hevc_rext: false,
             subtitle: SubtitleOverlay::None,
         }
@@ -978,14 +989,14 @@ scale=1280:trunc(1280/dar/2)*2"
     }
 
     #[test]
-    fn dolby_vision_forces_the_tonemap_to_yuv420p() {
-        // `tonemapx` needs yuv420p10 input to reshape a DV stream, so the
-        // format is forced even when the rest of the chain would use nv12.
+    fn dolby_vision_reshaping_forces_the_tonemap_to_yuv420p() {
+        // `tonemapx` needs yuv420p10 input to reshape a profile 5 stream, so
+        // the format is forced even when the rest of the chain would use nv12.
         let options = EncodingOptions::default();
         let caps = caps();
         let mut input = base_input(&caps, &options, "libx264");
         input.do_sw_tonemap = true;
-        input.is_dovi = true;
+        input.requires_dovi_reshaping = true;
         input.video_decoder = " -hwaccel cuda"; // would otherwise be nv12
         let chain = sw_vid_filter_chain(&input);
         assert!(

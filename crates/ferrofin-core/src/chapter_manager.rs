@@ -27,7 +27,7 @@ use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::persistence::ChapterRepository;
 
 use crate::item_type_lookup::kind_from_type_name;
-use crate::kinds::is_video;
+use crate::kinds::{is_audio, is_video};
 
 /// The concrete chapter-row manager.
 #[derive(Clone)]
@@ -89,8 +89,9 @@ impl ChapterManager for FerrofinChapterManager {
         let Some(item) = self.library_manager.get_item_by_id(item_id).await? else {
             return Ok(false);
         };
-        // Chapters are a `Video` behavior in C# (`item is Video`).
-        Ok(kind_from_type_name(&item.type_).is_some_and(is_video))
+        // `ChapterManager.Supports` (Jellyfin 12): `item is Video or Audio`, so
+        // an audiobook keeps the chapters its prober saves.
+        Ok(kind_from_type_name(&item.type_).is_some_and(|kind| is_video(kind) || is_audio(kind)))
     }
 
     async fn save_chapters(

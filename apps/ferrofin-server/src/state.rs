@@ -1563,7 +1563,10 @@ pub async fn build_app_state(
         // (`GetStaticMediaSources`' per-user filter).
         .with_users(Arc::clone(&users))
         .with_visibility(Arc::clone(&item_visibility))
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // `GetVersionInfo` maps a source's path through `PathSubstitutions`
+        // when the caller asks for it.
+        .with_configuration(Arc::clone(&config_trait)),
     );
 
     // ---- managers over library -------------------------------------------
@@ -1988,7 +1991,9 @@ pub async fn build_app_state(
         .with_virtual_paths(virtual_paths)
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // `GetMappedPath` maps `Path` and the sources through `PathSubstitutions`.
+        .with_configuration(Arc::clone(&config_trait)),
     );
     // `DtoService` finishes a Live TV channel's DTO itself (C#
     // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV
