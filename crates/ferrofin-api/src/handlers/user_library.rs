@@ -21,13 +21,13 @@
 //! the [`UserDataManager`](ferrofin_traits::library::UserDataManager), and returns
 //! the refreshed [`UserItemDataDto`].
 //!
-//! Faithfulness notes / deferrals: the C# `AssertCanUpdateUser` policy gate on
-//! the `UserData` reads/writes needs the un-ported per-user administration
-//! policy; the portable seam authenticates the caller (`RequireAuth`) and scopes
-//! to the resolved user. The person on-demand metadata refresh
-//! (`RefreshItemOnDemandIfNeeded`) is the filesystem/OOP-tree slice deferred
-//! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
-//! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
+//! The `UserData` reads and writes check `AssertCanUpdateUser` with the
+//! user-preference restriction, as `ItemsController` does
+//! ([`super::users::assert_can_update_user`]). TODO(parity, open work item
+//! gl-174): the person on-demand metadata refresh
+//! (`RefreshItemOnDemandIfNeeded`) is not ported. `GET /Items/Latest` is the
+//! full `GetLatestMedia` port (the grouping lives in the
+//! [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
@@ -344,6 +344,7 @@ async fn delete_rating(
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 200, description = "User data returned (UserItemDataDto)", body = UserItemDataDto),
+        (status = 403, description = "The user may not view this item user data"),
         (status = 404, description = "Item or user not found")
     ),
     tag = "ferrofin"
@@ -355,6 +356,8 @@ async fn get_item_user_data(
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    // C# `AssertCanUpdateUser(User, user, true)`, before the item lookup.
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     let user_uuid = user_uuid(&user)?;
     // C# `GetItemById<BaseItem>` requires a real item (no empty-guid fallback).
     state
@@ -380,6 +383,7 @@ async fn get_item_user_data(
     request_body = UpdateUserItemDataDto,
     responses(
         (status = 200, description = "User data updated (UserItemDataDto)", body = UserItemDataDto),
+        (status = 403, description = "The user may not update this item user data"),
         (status = 404, description = "Item or user not found")
     ),
     tag = "ferrofin"
@@ -392,6 +396,8 @@ async fn update_item_user_data(
     JsonBody(update): JsonBody<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    // C# `AssertCanUpdateUser(User, user, true)`, before the item lookup.
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     let user_uuid = user_uuid(&user)?;
     state
         .library
