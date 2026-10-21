@@ -2162,6 +2162,32 @@ async fn merge_onto(f: &Fixture, relative: &str, onto: &str) {
     .unwrap();
 }
 
+/// A version merged by hand (unowned, `PrimaryVersionId` at a primary of the
+/// same library) is weighed like any child, as Jellyfin 12.1's
+/// `Folder.GetChildrenForValidation` (`IncludeAlternateVersions = true`)
+/// does: kept while its file exists, and once it is gone pruned with its
+/// merge row, the primary untouched.
+#[tokio::test]
+async fn a_hand_merged_version_whose_file_is_gone_is_pruned() {
+    const ORIGINAL: &str = "A (2001)/A (2001).mkv";
+    const SECOND: &str = "A Second (2001)/A Second (2001).mkv";
+    let f = Fixture::movies(&[ORIGINAL, SECOND]).await;
+    f.scanner.scan_all().await.unwrap();
+    merge_onto(&f, SECOND, ORIGINAL).await;
+    let (primary, version) = (f.row(ORIGINAL).await.id, f.row(SECOND).await.id);
+
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.rows_at(SECOND).await, 1, "kept while its file exists");
+    assert_eq!(f.links(&primary).await, vec![(version.clone(), 3)]);
+
+    std::fs::remove_dir_all(f.media.join("A Second (2001)")).unwrap();
+    let report = f.scanner.scan_all().await.unwrap();
+    assert_eq!(report.removed, 1, "{report:?}");
+    assert_eq!(f.rows_at(SECOND).await, 0, "the version is pruned");
+    assert!(f.links(&primary).await.is_empty(), "its merge row goes too");
+    assert_eq!(f.rows_at(ORIGINAL).await, 1, "the primary stays");
+}
+
 /// Stores the row at `relative` as no version at all: unowned, pointing at
 /// nothing, keyed by its own id, no version rows under it.
 async fn unversion(f: &Fixture, relative: &str) {
