@@ -1490,14 +1490,23 @@ const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
 // Library-disabled items must remain eligible after another library advances the watermark.
 const SEGMENT_POLICY_PENDING_KEY: &str = "host:segment-policy-pending";
 
+/// Library items the analysis pass loads per page (the upstream
+/// `QueryPageLimit` the library tasks page with).
+const ANALYSIS_PAGE_SIZE: usize = 100;
+
 /// The dashboard task driving every analyzer plugin's `scan-media` pass:
 /// for each ENABLED plugin with non-empty `scan-targets`, offers each item
-/// newer than the plugin's watermark exactly once (host-tracked, in the
-/// plugin's own state file under a reserved key, unreadable and unwritable
-/// from the guest). An orderly guest error is logged (aggregated per pass)
-/// and never retried; TRAPS — not orderly errors — count toward the
-/// plugin's breaker, like every other guest call. The task itself never
-/// fails on a plugin's behavior.
+/// newer than the plugin's watermark once (host-tracked, in the plugin's
+/// own state file under a reserved key, unreadable and unwritable from the
+/// guest), oldest first and a page at a time. An orderly guest error is
+/// logged (aggregated per pass) and never retried; TRAPS — not orderly
+/// errors — count toward the plugin's breaker, like every other guest call.
+/// Once the runtime refuses a call (breaker open, runtime gone), the pass
+/// offers nothing more and the watermark stays below every item it did not
+/// reach; the plugin is skipped until the restart, whose first pass offers
+/// those. That pass can offer again an item sharing the cut-off item's
+/// DateCreated, and every item of a first pass cut short before its undated
+/// items. The task itself never fails on a plugin's behavior.
 struct WasmMediaAnalysisTask {
     plugins: Vec<Arc<LoadedPlugin>>,
     plugin_manager: Arc<dyn PluginManager>,
@@ -1521,7 +1530,7 @@ impl ScheduledTask for WasmMediaAnalysisTask {
         "Library"
     }
 
-    #[allow(clippy::too_many_lines)] // producer policy preserves the existing offer-once watermark
+    #[allow(clippy::too_many_lines)] // one pass per plugin: paging, the refusal stop and the pending items share its state
     async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
         let Some(cx) = self.collaborators.get() else {
             return Err(ServiceError::backend(
@@ -1529,6 +1538,11 @@ impl ScheduledTask for WasmMediaAnalysisTask {
             ));
         };
         for plugin in &self.plugins {
+            // A dead plugin refuses every offer until the restart: its pass
+            // would only re-read the library.
+            if plugin.runtime.is_dead() {
+                continue;
+            }
             let Some((config, kinds)) = plugin_pass_prelude(&self.plugin_manager, plugin).await?
             else {
                 continue;
@@ -1540,6 +1554,11 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     .unwrap_or(i64::MIN);
             let query = ferrofin_traits::options::InternalItemsQuery {
                 include_item_types: kinds,
+                // Oldest first, so a pass cut short leaves a tight watermark.
+                order_by: vec![(
+                    ferrofin_model::live_tv::ItemSortBy::DateCreated,
+                    ferrofin_model::dto::SortOrder::Ascending,
+                )],
                 // Push the watermark into the QUERY — materializing the
                 // whole library per pass per plugin would defeat the point.
                 // FIRST pass (no watermark yet) stays UNFILTERED so items
@@ -1554,79 +1573,119 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     .flatten(),
                 ..Default::default()
             };
-            let mut items = cx
+            // Ids first and rows a page at a time: the first pass covers
+            // every item of the target kinds.
+            let mut ids = cx
                 .library
-                .get_item_list(&query)
+                .get_item_ids(&query)
                 .await
                 .map_err(|e| ServiceError::backend(format!("analysis item query: {e}")))?;
             let pending: std::collections::HashSet<Uuid> =
                 capabilities::get_state(Some(&plugin.state_path), SEGMENT_POLICY_PENDING_KEY)
                     .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                     .unwrap_or_default();
-            if !pending.is_empty() {
-                let deferred = cx
-                    .library
-                    .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
-                        item_ids: pending.iter().copied().collect(),
-                        ..Default::default()
-                    })
-                    .await?;
-                items.extend(deferred);
-            }
+            let mut pending_ids: Vec<Uuid> = pending.iter().copied().collect();
+            pending_ids.sort_unstable();
+            ids.extend(pending_ids);
             let mut still_pending = std::collections::HashSet::new();
             let mut seen = std::collections::HashSet::new();
             let mut new_watermark = watermark;
+            // Set once the runtime refuses a call. The pass then offers
+            // nothing more but still reads the rest of its items, so
+            // `unreached` (the oldest one not offered) holds the watermark
+            // below every one of them.
+            let mut refused: Option<String> = None;
+            let mut unreached = i64::MAX;
             let mut offered = 0u32;
             let mut failed = 0u32;
             let mut first_failure: Option<String> = None;
-            for entity in items {
-                // NULL-dated items read as epoch: offered on the first
-                // (unfiltered) pass, then permanently behind the watermark.
-                let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
-                let item_id = uuid::Uuid::parse_str(&entity.id)
-                    .map_err(|error| ServiceError::backend(error.to_string()))?;
-                if !seen.insert(item_id) || (created <= watermark && !pending.contains(&item_id)) {
-                    continue;
-                }
-                new_watermark = new_watermark.max(created);
-                if cx
-                    .media_segments
-                    .is_registered_segment_provider(&format!("wasm:{}", plugin.descriptor.id))
-                    && !cx
-                        .media_segments
-                        .is_provider_enabled(item_id, &plugin.descriptor.name)
-                        .await?
-                {
-                    still_pending.insert(item_id);
-                    continue;
-                }
-                let item = capabilities::summarize(&entity, None);
-                let outcome = plugin.runtime.scan_media(item, config.clone()).await;
-                let result = match outcome {
-                    Ok(outcome) => {
-                        if outcome.policy_skipped {
+            for page_ids in ids.chunks(ANALYSIS_PAGE_SIZE) {
+                let mut page = cx
+                    .library
+                    .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                        item_ids: page_ids.to_vec(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| ServiceError::backend(format!("analysis item page: {e}")))?;
+                page.sort_by_key(|entity| entity.date_created);
+                for entity in page {
+                    // NULL-dated items read as epoch: offered on the first
+                    // (unfiltered) pass, then permanently behind the watermark.
+                    let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
+                    let item_id = uuid::Uuid::parse_str(&entity.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?;
+                    if !seen.insert(item_id)
+                        || (created <= watermark && !pending.contains(&item_id))
+                    {
+                        continue;
+                    }
+                    if refused.is_none() {
+                        if cx.media_segments.is_registered_segment_provider(&format!(
+                            "wasm:{}",
+                            plugin.descriptor.id
+                        )) && !cx
+                            .media_segments
+                            .is_provider_enabled(item_id, &plugin.descriptor.name)
+                            .await?
+                        {
                             still_pending.insert(item_id);
+                            new_watermark = new_watermark.max(created);
+                            continue;
                         }
-                        outcome.result
+                        let item = capabilities::summarize(&entity, None);
+                        match plugin.runtime.scan_media(item, config.clone()).await {
+                            Ok(outcome) => {
+                                if outcome.policy_skipped {
+                                    still_pending.insert(item_id);
+                                }
+                                if let Err(e) = outcome.result {
+                                    // Per-item detail stays at debug (volume
+                                    // scales with library size); one
+                                    // aggregated warn per pass below.
+                                    tracing::debug!(
+                                        plugin = plugin.descriptor.name,
+                                        item = %entity.id,
+                                        error = %e,
+                                        "scan-media failed for one item (offered once; not retried)"
+                                    );
+                                    failed += 1;
+                                    if first_failure.is_none() {
+                                        first_failure = Some(format!("{} -> {e}", entity.id));
+                                    }
+                                }
+                                offered += 1;
+                                new_watermark = new_watermark.max(created);
+                                continue;
+                            }
+                            // The runtime refused the call (breaker open,
+                            // runtime gone): the guest did not analyze it.
+                            Err(error) => refused = Some(error),
+                        }
                     }
-                    Err(error) => Err(error),
-                };
-                if let Err(e) = result {
-                    // Per-item detail stays at debug (volume scales with
-                    // library size); one aggregated warn per pass below.
-                    tracing::debug!(
-                        plugin = plugin.descriptor.name,
-                        item = %entity.id,
-                        error = %e,
-                        "scan-media failed for one item (offered once; not retried)"
-                    );
-                    failed += 1;
-                    if first_failure.is_none() {
-                        first_failure = Some(format!("{} -> {e}", entity.id));
+                    // Not reached this pass: the item stays eligible.
+                    if pending.contains(&item_id) {
+                        still_pending.insert(item_id);
+                    } else {
+                        // Only an unfiltered first pass holds undated items,
+                        // and a date filter would exclude them for good: the
+                        // next pass stays unfiltered.
+                        unreached = unreached.min(
+                            entity
+                                .date_created
+                                .map_or(i64::MIN, |d| d.timestamp_micros()),
+                        );
                     }
                 }
-                offered += 1;
-                new_watermark = new_watermark.max(created);
+            }
+            if let Some(error) = &refused {
+                new_watermark = new_watermark.min(unreached.saturating_sub(1));
+                warn!(
+                    plugin = plugin.descriptor.name,
+                    %error,
+                    offered,
+                    "analysis pass stopped: the plugin runtime refused a call; items not reached are offered after the restart"
+                );
             }
             if failed > 0 {
                 warn!(
@@ -1641,10 +1700,10 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                 let bytes = if still_pending.is_empty() {
                     None
                 } else {
-                    let mut ids: Vec<_> = still_pending.into_iter().collect();
-                    ids.sort_unstable();
+                    let mut pending_ids: Vec<_> = still_pending.into_iter().collect();
+                    pending_ids.sort_unstable();
                     Some(
-                        serde_json::to_vec(&ids)
+                        serde_json::to_vec(&pending_ids)
                             .map_err(|error| ServiceError::backend(error.to_string()))?,
                     )
                 };
