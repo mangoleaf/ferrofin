@@ -58,13 +58,37 @@ use ferrofin_traits::media_encoding::{
 
 use crate::encoding_options::EncodingOptionsReader;
 
-/// The default HLS segment length, in seconds.
-///
-/// Matches Jellyfin's `StreamState.SegmentLength` default of `3` for H.264/HEVC
-/// output: the first segment file can't close (and playback can't begin) until
-/// this many seconds are encoded, so it directly sets time-to-first-segment.
-/// Used when the request declares no `SegmentLength`.
+/// The HLS segment length, in seconds, of a re-encoded video (and of a copied
+/// live stream) when the request declares no `SegmentLength`
+/// (`StreamState.SegmentLength`): the first segment file can't close (and
+/// playback can't begin) until this many seconds are encoded, so it directly
+/// sets time-to-first-segment.
 const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 3;
+
+/// The HLS segment length, in seconds, of a copied video when the request
+/// declares no `SegmentLength` (`StreamState.SegmentLength`).
+const COPY_SEGMENT_LENGTH_SECS: i32 = 6;
+
+/// `StreamState.SegmentLength` for a request that declares none: a copied
+/// video gets [`COPY_SEGMENT_LENGTH_SECS`] unless it is a segmented live stream
+/// (`live`: no runtime) that no Apple client asked for; anything else gets
+/// [`DEFAULT_SEGMENT_LENGTH_SECS`].
+fn default_segment_length_secs(copied_video: bool, user_agent: Option<&str>, live: bool) -> i32 {
+    const APPLE_USER_AGENTS: [&str; 5] = ["appletv", "cfnetwork", "ipad", "iphone", "ipod"];
+    if !copied_video {
+        return DEFAULT_SEGMENT_LENGTH_SECS;
+    }
+    let user_agent = user_agent.unwrap_or_default().to_ascii_lowercase();
+    if live
+        && !APPLE_USER_AGENTS
+            .iter()
+            .any(|name| user_agent.contains(name))
+    {
+        DEFAULT_SEGMENT_LENGTH_SECS
+    } else {
+        COPY_SEGMENT_LENGTH_SECS
+    }
+}
 
 /// The first ffmpeg that takes `-hls_segment_options`; older ones call the
 /// option `-hls_ts_options`. Port of `DynamicHlsController`'s
@@ -737,17 +761,16 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let progressive = kind == PlaylistKind::Progressive;
         let options = self.encoding_options().await;
         // `StreamState.SegmentLength`: an explicit `SegmentLength` from the
-        // client wins outright, otherwise the 3s default. The request value was
+        // client wins outright; without one the length depends on the output
+        // video codec, so it is settled after step (2)
+        // ([`default_segment_length_secs`]). The request value was
         // previously gated on `encoding_thread_count >= 0` — an unrelated knob
         // that defaults to -1 (auto), so a client's negotiated `SegmentLength`
         // (device profiles emit it, `StreamInfo::to_url` forwards it) was
         // silently dropped on every default install: a 6s-segment profile got
         // 3s segments, doubling both the playlist and the number of segment
         // requests a client makes over a film.
-        let segment_length_secs = request
-            .segment_length
-            .filter(|&secs| secs > 0)
-            .unwrap_or(DEFAULT_SEGMENT_LENGTH_SECS);
+        let requested_segment_length = request.segment_length.filter(|&secs| secs > 0);
         let segment_container = request
             .segment_container
             .clone()
@@ -848,12 +871,12 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             } else {
                 ferrofin_model::dlna::EncodingContext::Streaming
             }),
+            // A segment's start follows from the segment length, settled
+            // after step (2).
             start_time_ticks: if progressive {
                 request.start_time_ticks
             } else {
-                segment_id
-                    .filter(|id| *id > 0)
-                    .map(|id| i64::from(id) * i64::from(segment_length_secs) * TICKS_PER_SECOND)
+                None
             },
             subtitle_stream_index: subtitle_index,
             // The PlaybackInfo-negotiated caps: they drive the bitrate params
@@ -931,7 +954,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             supported_video_codecs: supported_video_codecs.clone(),
             supported_audio_codecs: supported_audio_codecs.clone(),
             supported_subtitle_codecs,
-            segment_length_secs,
+            // Settled after step (2), with the segment's start.
+            segment_length_secs: 0,
             wait_for_path: None,
             segment_container: Some(segment_container.clone()),
             play_session_id: request.play_session_id.clone(),
@@ -1038,6 +1062,22 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             requested_audio_codec.clone()
         });
         let is_remuxing_video = EncodingJobInfo::is_copy_codec(output_video_codec.as_deref());
+        // `StreamState.SegmentLength`, now that the output video codec is
+        // known; every reader (`-hls_time`, the playlist, `MinSegments`, a
+        // segment's seek) takes this one value.
+        let segment_length_secs = requested_segment_length.unwrap_or_else(|| {
+            default_segment_length_secs(
+                is_remuxing_video,
+                request.user_agent.as_deref(),
+                !progressive && probe_state.run_time_ticks.is_none(),
+            )
+        });
+        probe_state.segment_length_secs = segment_length_secs;
+        if !progressive {
+            probe_state.base_request.start_time_ticks = segment_id
+                .filter(|id| *id > 0)
+                .map(|id| i64::from(id) * i64::from(segment_length_secs) * TICKS_PER_SECOND);
+        }
 
         // ---- (3) POPULATE EncodingJobInfo -----------------------------------
         // The deterministic output id (StreamingHelpers hash): a re-request with
@@ -3128,7 +3168,8 @@ mod tests {
             .unwrap();
         assert_eq!(plan.media_path, "/media/movie.mkv");
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
-        assert_eq!(plan.segment_length_ms, 3000);
+        // The H.264 source is copied: a copied video's 6 s segments.
+        assert_eq!(plan.segment_length_ms, 6000);
         assert_eq!(plan.segment_container, "ts");
     }
 
@@ -4430,12 +4471,13 @@ mod tests {
             plan.arguments
         );
 
-        // Absent → the 3s default.
+        // Absent → the default, 6 s for this copied H.264 video
+        // ([`plan_defaults_the_segment_length_by_the_output_video_codec`]).
         let plan = p
             .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
             .await
             .unwrap();
-        assert_eq!(plan.segment_length_ms, 3000);
+        assert_eq!(plan.segment_length_ms, 6000);
 
         // A degenerate 0 would make the playlist generator divide by zero
         // (`HlsError::InvalidOperation` → 500); it falls back to the default
@@ -4446,7 +4488,124 @@ mod tests {
             .plan(&req, false, Some(0), PlaylistKind::Vod)
             .await
             .unwrap();
+        assert_eq!(plan.segment_length_ms, 6000);
+    }
+
+    /// `StreamState.SegmentLength`'s defaults, its user-agent match ignoring
+    /// case.
+    #[rstest]
+    #[case(false, None, false, 3)]
+    #[case(false, Some("AppleTV/11.1"), true, 3)]
+    #[case(true, None, false, 6)]
+    #[case(true, None, true, 3)]
+    #[case(true, Some("Mozilla/5.0 (X11; Linux x86_64)"), true, 3)]
+    #[case(true, Some("AppleTV/11.1"), true, 6)]
+    #[case(true, Some("AppleCoreMedia CFNetwork/1410"), true, 6)]
+    #[case(true, Some("Mozilla/5.0 (iPad; CPU OS 17_0)"), true, 6)]
+    #[case(true, Some("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"), true, 6)]
+    #[case(true, Some("Mozilla/5.0 (iPod touch)"), true, 6)]
+    fn default_segment_length_follows_stream_state(
+        #[case] copied_video: bool,
+        #[case] user_agent: Option<&str>,
+        #[case] live: bool,
+        #[case] expected: i32,
+    ) {
+        assert_eq!(
+            default_segment_length_secs(copied_video, user_agent, live),
+            expected
+        );
+    }
+
+    /// `StreamState.SegmentLength` without a requested length: a copied video
+    /// gets 6 s segments, 3 s when it is a live stream without a runtime
+    /// unless an Apple user agent asks; a transcoded video gets 3 s. Every
+    /// reader sees that one value: `-hls_time`, the playlist's desired length
+    /// and a segment's seek.
+    #[tokio::test]
+    async fn plan_defaults_the_segment_length_by_the_output_video_codec() {
+        let copied = |req: &mut HlsStreamRequest| {
+            req.video_codec = Some("copy".to_owned());
+            req.audio_codec = Some("copy".to_owned());
+        };
+        let hls_time = |plan: &TranscodePlan| {
+            plan.arguments
+                .windows(2)
+                .find(|w| w[0] == "-hls_time")
+                .map(|w| w[1].clone())
+        };
+
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        copied(&mut req);
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(plan.is_remuxing_video);
+        assert_eq!(plan.segment_length_ms, 6000);
+        assert_eq!(
+            hls_time(&plan).as_deref(),
+            Some("6"),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-output_ts_offset", "12"]),
+            "segment 2 starts at 2 * 6 s: {:?}",
+            plan.arguments
+        );
+
+        // A requested length still wins.
+        req.segment_length = Some(4);
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(plan.segment_length_ms, 4000);
+
+        // A transcoded video: 3 s.
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("mpeg4"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(!plan.is_remuxing_video);
         assert_eq!(plan.segment_length_ms, 3000);
+        assert_eq!(
+            hls_time(&plan).as_deref(),
+            Some("3"),
+            "{:?}",
+            plan.arguments
+        );
+
+        // A copied live stream (no runtime): 3 s, but 6 s for an Apple client.
+        let mut live = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        live.run_time_ticks = None;
+        let p = planner(vec![live]);
+        let mut req = request("abc");
+        copied(&mut req);
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(plan.is_remuxing_video);
+        assert_eq!(plan.segment_length_ms, 3000);
+        req.user_agent = Some("AppleCoreMedia/1.0.0.21A329 (iPhone; U; CPU OS 17_0)".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(plan.segment_length_ms, 6000);
     }
 
     /// The live-TV tuner settings reach the transcode's input options in
@@ -4680,7 +4839,8 @@ mod tests {
             .await
             .unwrap();
         assert!(plan.arguments.windows(2).any(|w| w == ["-f", "hls"]));
-        assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "3"]));
+        // The H.264 source is copied: 6 s segments.
+        assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "6"]));
         assert!(
             plan.arguments
                 .windows(2)

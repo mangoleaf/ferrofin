@@ -507,6 +507,9 @@ pub struct HlsStreamRequest {
     pub context: Option<ferrofin_model::dlna::EncodingContext>,
     /// The desired segment length in seconds (`segmentLength`).
     pub segment_length: Option<i32>,
+    /// The request's `User-Agent` header (`StreamState.UserAgent`): without a
+    /// `segment_length`, it picks a copied video's segment length.
+    pub user_agent: Option<String>,
     /// This segment's starting position from the playlist's runtimeTicks query.
     pub current_runtime_ticks: i64,
     /// This segment's exact duration from actualSegmentLengthTicks.
@@ -648,6 +651,7 @@ impl Default for HlsStreamRequest {
             is_head_request: false,
             context: None,
             segment_length: None,
+            user_agent: None,
             current_runtime_ticks: 0,
             actual_segment_length_ticks: 0,
             audio_codec: None,
