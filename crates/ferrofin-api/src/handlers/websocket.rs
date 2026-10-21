@@ -781,8 +781,9 @@ enum KeepAlive {
     /// so the socket closes and its session ends.
     Lost,
     /// `lost`, but the socket has no session to end: it only leaves the watch.
-    /// Upstream gives every socket a session; Ferrofin's sessionless sockets
-    /// (an API key, see `resolve_caller`) were never greeted.
+    /// Upstream gives every socket a session (an API key's has no user, which
+    /// Ferrofin ports too); a socket here is sessionless only when that failed
+    /// ([`SessionlessReason`]), and such a socket was never greeted.
     Unwatch,
 }
 
