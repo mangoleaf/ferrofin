@@ -22,6 +22,8 @@ boots.
 | `FERROFIN_WEB_DIR` | `{data_dir}/web` | Built jellyfin-web `dist/` served at `/web`. Absent → API-only. |
 | `FERROFIN_CONFIG_FILE` | `{data_dir}/config.toml` | Path to the optional bootstrap `config.toml`. |
 
+The data, configuration and cache directories must be different directories: startup checks each against its Jellyfin marker file (`.jellyfin-data`, `.jellyfin-config`, `.jellyfin-cache`) and stops when two of them are one directory (see `docs/UPGRADING.md`).
+
 The database file is `{data_dir}/ferrofin.db`. For drop-in adoption Ferrofin also opens a
 Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — see [Migrating from Jellyfin](../README.md#migrating-from-jellyfin).
 

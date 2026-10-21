@@ -426,6 +426,10 @@ async fn record_restore_failure(
 /// One server lifetime: boot, serve until drained, tear the host down, and
 /// report whether an API restart was requested (`true` → the caller runs it
 /// again). A signal-initiated drain always reports `false`.
+// The boot is one ordered sequence (directories, restore, database, wiring,
+// serve, drain), each step depending on the one before; split into helpers it
+// would only re-thread the same state, as `build_app_state` notes.
+#[allow(clippy::too_many_lines)]
 async fn serve_once(
     config: &Config,
     started: std::time::Instant,
@@ -435,6 +439,8 @@ async fn serve_once(
     // Process-wide SQLite setup must precede every open, the restore and the
     // existing-database check below included.
     ferrofin_db::init_sqlite();
+    // Directories first (`Program.StartApp`), before a restore or an adopted database.
+    bootstrap::check_application_paths(config)?;
     // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
     // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
     // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.

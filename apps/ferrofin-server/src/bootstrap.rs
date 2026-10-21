@@ -381,6 +381,21 @@ pub fn application_paths(config: &Config) -> ferrofin_core::FerrofinServerApplic
     )
 }
 
+/// Port of `ServerApplicationPaths.MakeSanityCheckOrThrow`, which
+/// `Program.StartApp` runs before anything else touches the paths: every
+/// server directory exists and carries its `.jellyfin-<kind>` marker.
+///
+/// # Errors
+///
+/// Returns the first directory that cannot be created or marked, or the
+/// conflict when a directory carries another kind's marker (two server paths
+/// point at one directory).
+pub fn check_application_paths(config: &Config) -> anyhow::Result<()> {
+    application_paths(config)
+        .make_sanity_check()
+        .context("the server's directories failed their startup check")
+}
+
 /// Opens the SQLite database at `{data_dir}/ferrofin.db` and applies migrations.
 ///
 /// Creates the data directory (and the DB file) if missing, then runs all
@@ -1152,6 +1167,68 @@ async fn validate_binary(
 mod tests {
     use super::*;
     use crate::test_logs::CapturedLogs;
+
+    /// Startup runs `MakeSanityCheckOrThrow` (`Program.StartApp`): every
+    /// server directory exists and carries its `.jellyfin-<kind>` marker, and
+    /// the cache its `CACHEDIR.TAG`.
+    #[test]
+    fn the_startup_check_creates_and_marks_the_server_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        check_application_paths(&Config::test_stub(tmp.path())).expect("checked");
+
+        // `test_stub`'s data directory is `data/`, beside `config/` and `cache/`.
+        for (dir, marker) in [
+            ("config", "config"),
+            ("data/log", "log"),
+            ("data/plugins", "plugin"),
+            ("data", "data"),
+            ("cache", "cache"),
+            ("data/data", "data"),
+            ("data/root", "root"),
+        ] {
+            let path = tmp.path().join(dir).join(format!(".jellyfin-{marker}"));
+            assert!(path.is_file(), "missing {}", path.display());
+        }
+        assert!(tmp.path().join("cache/CACHEDIR.TAG").is_file());
+    }
+
+    /// A server directory carrying another kind's marker means two server
+    /// paths point at one directory: startup refuses it, as upstream's
+    /// `CheckOrCreateMarker` throws.
+    #[test]
+    fn the_startup_check_refuses_a_directory_marked_for_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data/root")).unwrap();
+        std::fs::write(tmp.path().join("data/root/.jellyfin-config"), "").unwrap();
+
+        let error = check_application_paths(&Config::test_stub(tmp.path()))
+            .expect_err("startup refuses the directory");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-root but found marker for")
+                && message.contains(".jellyfin-config"),
+            "{message}"
+        );
+    }
+
+    /// The likeliest clash: the cache directory set to the data directory.
+    #[test]
+    fn the_startup_check_refuses_a_cache_in_the_data_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::test_stub(tmp.path());
+        config.cache_dir = config.data_dir.clone();
+
+        let error = check_application_paths(&config).expect_err("startup refuses the layout");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-cache but found marker for")
+                && message.contains(".jellyfin-data"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn derive_ffprobe_replaces_basename_in_dir() {
