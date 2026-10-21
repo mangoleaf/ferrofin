@@ -104,17 +104,6 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
 const JELLYFIN_API_VERSION: &str = "12.2.0";
 
-/// The host a Live TV live stream's buffered file is served from.
-///
-/// Jellyfin's `GetApiUrlForLocalAccess()` is the server's own bind address and
-/// deliberately never consults `PublishedServerUrl` (only `GetSmartApiUrl`
-/// does). Loopback is the strictly-local form of that, and it is right for the
-/// readers that matter: this process's own ffmpeg — which probes and transcodes
-/// the channel — and the DVR recorder. Routing them out through a public
-/// hostname would add TLS, a reverse proxy and a dependency on external DNS
-/// resolving from inside the container, any of which breaks Live TV outright.
-const LIVE_STREAM_LOCAL_HOST: &str = "127.0.0.1";
-
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -735,6 +724,8 @@ pub async fn build_app_state(
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+        // A local video probe reads its first frame for HDR10+ when ffprobe can.
+        .with_first_video_frame_probe(ffmpeg.capabilities.prober_supports_first_video_frame())
         .with_localization(Arc::clone(&localization))
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);
@@ -2264,29 +2255,29 @@ pub async fn build_app_state(
                 listen_with_https: false,
                 published_server_url: config.published_url.clone(),
                 base_url: config.base_url.clone(),
-                enable_published_server_uri_by_request: false,
+                // Read live from the network manager attached below; this is
+                // only the startup fact.
+                enable_published_server_uri_by_request: network
+                    .read()
+                    .is_ok_and(|network| network.enable_published_server_uri_by_request()),
             },
             config.server_name.clone(),
         )
-        .with_network(Arc::clone(&network), config.bind_addr),
+        .with_network(
+            Arc::clone(&network),
+            config.bind_addr_explicit.then_some(config.bind_addr),
+        ),
     );
     config_mgr.add_configuration_listener(app_host.configuration_listener());
+    app_host.warn_if_published_url_base_path_differs();
     app_host
         .refresh_server_name()
         .await
         .context("failed to refresh advertised server name")?;
-    // The URL a live stream's buffered file is served from (C#
-    // `GetApiUrlForLocalAccess()`).
-    live_tv_impl.set_local_api_url(
-        ferrofin_traits::system::ServerApplicationHost::get_local_api_url(
-            app_host.as_ref(),
-            LIVE_STREAM_LOCAL_HOST,
-            None,
-            None,
-        )
-        .await
-        .context("failed to build the Live TV local api url")?,
-    );
+    // Where a live stream's buffered file and an in-progress recording are
+    // served from (C# `GetApiUrlForLocalAccess()`), asked per stream: the
+    // bound listener and the live network settings, never the published URL.
+    live_tv_impl.set_local_api_access(Arc::clone(&app_host) as Arc<_>);
     let app_host_trait: Arc<dyn ferrofin_traits::system::ServerApplicationHost> =
         Arc::clone(&app_host) as Arc<_>;
 
@@ -2457,6 +2448,17 @@ pub async fn build_app_state(
     // `maxWidth`/`format`/… requests resize/convert instead of serving the original.
     let state = state.with_image_processor(Arc::clone(&image_processor));
 
+    // `/health` and `/health/ready` check the database, as upstream's
+    // `DbContextFactoryHealthCheck` does.
+    let health_db = db.clone();
+    let state = state.with_health_checkers(vec![Arc::new(ferrofin_health::FnChecker::new(
+        "database",
+        move || {
+            let db = health_db.clone();
+            async move { db.can_connect().await.map_err(|e| e.to_string()) }
+        },
+    ))]);
+
     // Replace the `NoopLibraryMonitor` default with the webhook-driven monitor
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
     let state = state
@@ -2522,7 +2524,7 @@ pub async fn build_app_state(
         Arc::new(
             ferrofin_extensions::file_transformation::WebFileTransformationService::new(
                 Arc::clone(&plugins),
-                format!("http://127.0.0.1:{}", config.port),
+                Arc::clone(&app_host) as Arc<_>,
             ),
         );
     ferrofin_extensions::file_transformation::register_skip_button_transformer(
@@ -3059,6 +3061,62 @@ mod tests {
             https_port: 8920,
             ..Config::test_stub(root)
         }
+    }
+
+    /// `/health` and `/health/ready` run a real database check (upstream
+    /// `DbContextFactoryHealthCheck`): healthy while the database answers,
+    /// 503 once it cannot.
+    #[tokio::test]
+    async fn health_probes_check_the_database() {
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        let config = test_config(tmp.path());
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory db opens");
+        db.run_migrations().await.expect("migrations apply");
+        let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+            chromaprint_muxer: false,
+        };
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
+            .await
+            .expect("app state wires");
+        let router = ferrofin_api::create_router(wired.state.clone());
+        let status = |path: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("infallible router")
+                    .status()
+            }
+        };
+
+        assert_eq!(status("/health").await, axum::http::StatusCode::OK);
+        assert_eq!(status("/health/ready").await, axum::http::StatusCode::OK);
+
+        db.close().await;
+        assert_eq!(
+            status("/health").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status("/health/ready").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

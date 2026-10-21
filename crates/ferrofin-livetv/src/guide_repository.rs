@@ -543,6 +543,22 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every programme item's genre links as `(Id, genre)`, ordered — the
+    /// `ItemValues` the guide refresh's mirror wrote for its airings.
+    pub async fn program_genre_links(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT bi."Id", v."Value" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               JOIN "BaseItems" bi ON bi."Id" = m."ItemId"
+               WHERE bi."Type" = ?1 AND v."Type" = 2
+               ORDER BY bi."Id", v."Value""#,
+        )
+        .bind(crate::projection::PROGRAM_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// Marks an item favourite for a user, the way the playstate path stores it.
     pub async fn seed_favorite(
         db: &Database,
