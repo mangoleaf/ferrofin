@@ -210,6 +210,11 @@ Verify the following before resuming normal use:
   the adopted database. Investigate any configuration-import warnings.
 - Your existing users can log in, and watch history, libraries, library settings, and
   artwork are present. Library `options.xml` files are imported into `options.json`.
+- The server keeps Jellyfin's identity: `/System/Info/Public` reports the same `Id` as
+  Jellyfin's `data/device.txt`, so apps that already know the server reconnect without
+  being added again. Ferrofin reads it from `data/device.txt` under its data directory on
+  the first start, before it has stored an id of its own (`config/system_id`); if you
+  copied only `jellyfin.db`, copy `device.txt` to that place too.
 - Remote access, IP filters, trusted proxies, and local-network definitions match your
   intended policy; check them before exposing the replacement server to remote clients.
 - Playback uses the configured jellyfin-ffmpeg executable.
