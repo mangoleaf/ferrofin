@@ -334,7 +334,7 @@ impl PhotoLibrary {
         db.run_migrations().await.expect("migrate");
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+            FerrofinVirtualFolderManager::new(tmp.path().join("root").join("default"))
                 .with_item_store(persistence.clone()),
         );
         vf.add_virtual_folder(
@@ -496,21 +496,51 @@ async fn an_uploaded_photo_album_primary_survives_a_default_rescan() {
 
 const MUSIC_GENRE: &str = "MediaBrowser.Controller.Entities.Audio.MusicGenre";
 const PLAYLIST: &str = "MediaBrowser.Controller.Playlists.Playlist";
+const PERSON: &str = "MediaBrowser.Controller.Entities.Person";
+const STUDIO: &str = "MediaBrowser.Controller.Entities.Studio";
+const YEAR: &str = "MediaBrowser.Controller.Entities.Year";
+const MUSIC_ARTIST: &str = "MediaBrowser.Controller.Entities.Audio.MusicArtist";
+const BOX_SET: &str = "MediaBrowser.Controller.Entities.Movies.BoxSet";
+const COLLECTION_FOLDER: &str = "MediaBrowser.Controller.Entities.CollectionFolder";
 
-/// gl-590: a music genre's and a playlist folder's upload is saved beside the
-/// item's own path whatever the library says, as `IsSaveLocalMetadataEnabled`
-/// is overridden to true for both (`MusicGenre.cs:63`, `Playlist.cs:126`) —
-/// while that path is in the server's own directories. A playlist file inside
-/// a media library whose "Save artwork into media folders" is off keeps its
-/// upload in the internal metadata folder: nothing is written into the media.
+/// gl-590, gl-598: an upload is saved beside the item's own path whatever the
+/// library says for the kinds whose `IsSaveLocalMetadataEnabled` is
+/// overridden to true — a music genre and a playlist (`MusicGenre.cs:63`,
+/// `Playlist.cs:126`), a person, a studio, a year and a by-name artist (each
+/// also `ContainingFolderPath => Path`), a box set and a library
+/// (`CollectionFolder.cs:196`) — while that path is in the server's own
+/// directories: data, metadata, and the libraries' root folder. A playlist
+/// file or a box-set folder inside a media library whose "Save artwork into
+/// media folders" is off keeps its upload in the internal metadata folder:
+/// nothing is written into the media.
 #[rstest::rstest]
-#[case::music_genre(MUSIC_GENRE, "metadata/MusicGenre/Mix", false, Some("folder.png"))]
-#[case::playlist(PLAYLIST, "data/playlists/Mix", false, Some("folder.png"))]
-#[case::playlist_file_in_a_library(PLAYLIST, "photos/Mix.m3u", true, None)]
+#[case::music_genre(
+    MUSIC_GENRE,
+    "metadata/MusicGenre/Mix",
+    false,
+    false,
+    Some("folder.png")
+)]
+#[case::playlist(PLAYLIST, "data/playlists/Mix", true, false, Some("folder.png"))]
+#[case::playlist_file_in_a_library(PLAYLIST, "photos/Mix.m3u", true, true, None)]
+#[case::person(PERSON, "metadata/People/M/Mix", false, false, Some("folder.png"))]
+#[case::studio(STUDIO, "metadata/Studio/Mix", false, false, Some("folder.png"))]
+#[case::year(YEAR, "metadata/Year/2020", false, false, Some("folder.png"))]
+#[case::by_name_artist(MUSIC_ARTIST, "metadata/artists/Mix", false, false, Some("folder.png"))]
+#[case::box_set(
+    BOX_SET,
+    "data/collections/Mix [boxset]",
+    true,
+    false,
+    Some("folder.png")
+)]
+#[case::box_set_in_a_library(BOX_SET, "photos/Mix [boxset]", true, false, None)]
+#[case::library(COLLECTION_FOLDER, "root/default/Mix", true, false, Some("folder.png"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
+async fn uploads_save_beside_their_path_for_the_overriding_kinds(
     #[case] type_: &str,
     #[case] path: &str,
+    #[case] is_folder: bool,
     #[case] is_file: bool,
     #[case] beside: Option<&str>,
 ) {
@@ -523,7 +553,7 @@ async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
             type_: type_.to_owned(),
             name: Some("Mix".to_owned()),
             path: Some(path.to_string_lossy().into_owned()),
-            is_folder: type_ == PLAYLIST,
+            is_folder,
             is_in_mixed_folder: is_file,
             ..BaseItemEntity::default()
         }])
@@ -941,5 +971,83 @@ async fn a_library_whose_tile_file_is_gone_is_drawn_again() {
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
         RED
+    );
+}
+
+/// gl-598: a library's uploaded image is saved in the library's own folder
+/// (`CollectionFolder.IsSaveLocalMetadataEnabled`), so it moves with a rename,
+/// and the renamed library reads it back from there (`LocalImageProvider` on
+/// its `ContainingFolderPath`, then `MergeImages`). It is not the library's
+/// own drawing, so even a forced refresh never draws the collage over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_upload_survives_a_rename_and_a_forced_refresh() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    lib.uploader()
+        .await
+        .save_image(library, &png(BLUE), "image/png", ImageType::Primary, None)
+        .await
+        .expect("upload");
+    assert_eq!(
+        primary_of(&lib.items, library).await.path,
+        lib.tmp
+            .path()
+            .join("root/default/Photos/folder.png")
+            .to_string_lossy()
+    );
+
+    lib.vf
+        .rename_virtual_folder("Photos", "Pictures")
+        .await
+        .expect("rename");
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    lib.scanner.scan_with(None, &full).await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Pictures")
+            .await,
+        BLUE
+    );
+}
+
+/// gl-598: an image already in a library's own folder (`root/default/<name>`,
+/// where Jellyfin keeps an adopted library's `folder.jpg`) becomes the
+/// library's image on the next pass — unless the library is locked, which runs
+/// no image provider and keeps its tile.
+#[rstest::rstest]
+#[case::unlocked(false, BLUE)]
+#[case::locked(true, RED)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_librarys_own_folder_image_is_read_unless_it_is_locked(
+    #[case] locked: bool,
+    #[case] want: [u8; 3],
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    if locked {
+        let mut row = lib.row(BaseItemKind::CollectionFolder, "Photos").await;
+        row.is_locked = true;
+        lib.persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("lock");
+    }
+    std::fs::write(
+        lib.tmp.path().join("root/default/Photos/folder.png"),
+        png(BLUE),
+    )
+    .expect("folder image");
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        want
     );
 }

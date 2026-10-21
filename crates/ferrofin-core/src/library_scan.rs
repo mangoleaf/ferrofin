@@ -12036,6 +12036,7 @@ impl LibraryScanner {
             };
             let out_dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), cf);
             let out = out_dir.join("primary.png");
+            self.merge_library_local_images(items, cf).await;
             if !self
                 .library_tile_due(items, &meta_root.resolve(), cf, force)
                 .await?
@@ -12126,6 +12127,50 @@ impl LibraryScanner {
             if let Err(err) = self.persistence.save_item_images(cf, &images).await {
                 tracing::warn!(%err, library = %cf, "failed to persist the library image");
             }
+        }
+        Ok(())
+    }
+
+    /// The images in a library's own folder (`root/default/<name>`) become its
+    /// images before its tile is considered: `LocalImageProvider` on the
+    /// library's `ContainingFolderPath`, then `ItemImageProvider.MergeImages`.
+    /// That folder is where an upload to a library is saved
+    /// (`CollectionFolder.IsSaveLocalMetadataEnabled`) and where Jellyfin keeps
+    /// one, so the image survives a rename, which moves the folder and mints a
+    /// new row, and an adopted library's `folder.jpg` is found again. The
+    /// images in the library's media locations
+    /// (`CollectionFolderLocalImageProvider`) are a separate provider, not
+    /// read here yet (gl-788).
+    /// A failure is logged and leaves the library as it was: one library's
+    /// error never stops the others' tiles.
+    async fn merge_library_local_images(&self, items: &Arc<dyn ItemRepository>, library: Uuid) {
+        if let Err(err) = self.try_merge_library_local_images(items, library).await {
+            tracing::warn!(%err, library = %library, "failed to read the library's own images");
+        }
+    }
+
+    /// [`Self::merge_library_local_images`], with its errors.
+    async fn try_merge_library_local_images(
+        &self,
+        items: &Arc<dyn ItemRepository>,
+        library: Uuid,
+    ) -> Result<(), ServiceError> {
+        // A locked item runs no image provider (`RefreshWithProviders`
+        // returns first, `MetadataService.cs:785-788`).
+        let Some(row) = items
+            .retrieve_item(library)
+            .await?
+            .filter(|row| !row.is_locked)
+        else {
+            return Ok(());
+        };
+        let found = discover_local_images(&row, &FsDirectoryService::new());
+        if found.is_empty() {
+            return Ok(());
+        }
+        let mut images = items.get_image_infos(library).await?;
+        if merge_local_images(&mut images, &found) {
+            self.persistence.save_item_images(library, &images).await?;
         }
         Ok(())
     }
@@ -21133,6 +21178,73 @@ impl SeasonNames {
     }
 }
 
+/// Port of `ItemImageProvider.MergeImages` for images found on disk: for each
+/// singular type, the first found image replaces the item's first image of
+/// that type when the paths differ (ignoring case). Found backdrops are added
+/// as `BaseItem.AddImages` adds them: one not stored yet is appended, and
+/// none is removed or reordered. An image found again at the path it is
+/// stored under is refreshed (`refresh_found`). Returns whether anything is to
+/// be written.
+fn merge_local_images(images: &mut Vec<ItemImageInfo>, found: &[ItemImageInfo]) -> bool {
+    let mut changed = false;
+    let mut singular: Vec<ImageType> = Vec::new();
+    for image in found {
+        if image.image_type != ImageType::Backdrop && !singular.contains(&image.image_type) {
+            singular.push(image.image_type);
+        }
+    }
+    for image_type in singular {
+        let Some(new) = found.iter().find(|i| i.image_type == image_type) else {
+            continue;
+        };
+        match images.iter_mut().find(|i| i.image_type == image_type) {
+            Some(current) if current.path.eq_ignore_ascii_case(&new.path) => {
+                changed |= refresh_found(current, new);
+            }
+            Some(current) => {
+                *current = new.clone();
+                changed = true;
+            }
+            None => {
+                images.push(new.clone());
+                changed = true;
+            }
+        }
+    }
+    for new in found.iter().filter(|i| i.image_type == ImageType::Backdrop) {
+        if let Some(current) = images
+            .iter_mut()
+            .find(|i| i.image_type == ImageType::Backdrop && i.path.eq_ignore_ascii_case(&new.path))
+        {
+            changed |= refresh_found(current, new);
+        } else {
+            images.push(new.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// An image found again at the path it is stored under: when its file's
+/// modification time moved by more than a second and it has stored
+/// dimensions, they are cleared and the time taken, and the row is to be
+/// written. A smaller difference is the database's precision, not a change
+/// (`MergeImages`/`AddImages`: "an exact comparison would treat every
+/// unchanged image as modified").
+fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
+    let moved = (current.date_modified - new.date_modified)
+        .num_milliseconds()
+        .abs()
+        > 1000;
+    if moved && (current.width > 0 || current.height > 0) {
+        current.width = 0;
+        current.height = 0;
+        current.date_modified = new.date_modified;
+        return true;
+    }
+    false
+}
+
 fn image_item_kind(type_: &str) -> ImageItemKind {
     match type_.rsplit('.').next().unwrap_or(type_) {
         "Movie" => ImageItemKind::Movie,
@@ -21284,6 +21396,76 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    /// `ItemImageProvider.MergeImages`: a found image replaces the stored one
+    /// of its type when the paths differ, keeps it when they match (taking the
+    /// file's time and clearing dimensions it moved past), and a found
+    /// backdrop set replaces a different one; types not found stay.
+    #[test]
+    fn found_local_images_merge_as_merge_images_does() {
+        use chrono::TimeZone as _;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let at = |secs| chrono::Utc.timestamp_opt(secs, 0).unwrap();
+        let image = |image_type, path: &str, secs, size| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            date_modified: at(secs),
+            width: size,
+            height: size,
+            blur_hash: None,
+        };
+        let mut images = vec![
+            image(ImageType::Primary, "/meta/library/X/primary.png", 100, 960),
+            image(ImageType::Logo, "/root/default/L/logo.png", 100, 400),
+            image(ImageType::Thumb, "/meta/library/X/thumb.png", 100, 300),
+            image(ImageType::Backdrop, "https://remote/backdrop.jpg", 100, 0),
+        ];
+        let found = vec![
+            image(ImageType::Primary, "/root/default/L/folder.png", 500, 0),
+            image(ImageType::Logo, "/ROOT/default/L/logo.png", 900, 0),
+            image(ImageType::Backdrop, "/root/default/L/backdrop.png", 500, 0),
+        ];
+        assert!(super::merge_local_images(&mut images, &found));
+        let first = |images: &[ItemImageInfo], image_type| {
+            images
+                .iter()
+                .find(|i| i.image_type == image_type)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            first(&images, ImageType::Primary).path,
+            "/root/default/L/folder.png"
+        );
+        let logo = first(&images, ImageType::Logo);
+        assert_eq!(
+            (logo.path.as_str(), logo.width, logo.date_modified),
+            ("/root/default/L/logo.png", 0, at(900)),
+            "found again with a moved file: dimensions cleared, time taken"
+        );
+        assert!(
+            images.iter().any(|i| i.image_type == ImageType::Thumb),
+            "a type not found stays"
+        );
+        // `AddImages`: the found backdrop is appended; the stored one stays.
+        assert_eq!(
+            images
+                .iter()
+                .filter(|i| i.image_type == ImageType::Backdrop)
+                .count(),
+            2
+        );
+        // Nothing new to merge: no change, even with a sub-second drift in the
+        // stored times (the database's precision).
+        for image in &mut images {
+            image.width = 10;
+            image.date_modified += chrono::Duration::milliseconds(400);
+        }
+        let again = images.clone();
+        assert!(!super::merge_local_images(&mut images, &found));
+        assert_eq!(images, again);
+    }
+
     /// The container dates `FetchEmbeddedInfo` reads (v12.2
     /// `FFProbeVideoInfoTests`): 2016 and 2016-05-04.
     fn tagged_dates() -> super::MediaInfo {
