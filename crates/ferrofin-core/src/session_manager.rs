@@ -1134,7 +1134,7 @@ impl SessionManager for FerrofinSessionManager {
         device_id: &str,
         device_name: &str,
         remote_endpoint: &str,
-        user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         self.upsert_session(
             app_name,
@@ -1142,7 +1142,7 @@ impl SessionManager for FerrofinSessionManager {
             device_id,
             device_name,
             remote_endpoint,
-            Some(user),
+            user,
         )
         .await
     }
@@ -2478,19 +2478,19 @@ mod bus_fallback_tests {
 
         // Three sessions of the same user, one per regime.
         let direct = mgr
-            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", &user)
+            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", Some(&user))
             .await
             .expect("direct session")
             .id
             .expect("direct session id");
         let busonly = mgr
-            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", &user)
+            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", Some(&user))
             .await
             .expect("bus session")
             .id
             .expect("bus session id");
         let stale = mgr
-            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", &user)
+            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", Some(&user))
             .await
             .expect("stale session")
             .id
@@ -2632,7 +2632,7 @@ mod bus_fallback_tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user(&db, user_id).await;
         for device in ["dev-a", "dev-b", "dev-c"] {
-            mgr.log_session_activity("Web", "1.0", device, "Box", "e", &user)
+            mgr.log_session_activity("Web", "1.0", device, "Box", "e", Some(&user))
                 .await
                 .expect("session");
         }
@@ -2838,7 +2838,14 @@ mod broadcast_lock_tests {
         let user = crate::test_support::seed_user(&db, user_id).await;
 
         let stalled = mgr
-            .log_session_activity("Stalled Client", "1.0", "dev-stalled", "TV", "e", &user)
+            .log_session_activity(
+                "Stalled Client",
+                "1.0",
+                "dev-stalled",
+                "TV",
+                "e",
+                Some(&user),
+            )
             .await
             .expect("session created");
         let stalled_id = stalled.id.clone().expect("session id");
@@ -2883,7 +2890,7 @@ mod broadcast_lock_tests {
         timeout(PROGRESS_TIMEOUT, async {
             assert!(!mgr.has_active_playback().await.expect("playback probe"));
             let other = mgr
-                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", &user)
+                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", Some(&user))
                 .await
                 .expect("second session created");
             assert_ne!(other.id, stalled.id);
@@ -2924,7 +2931,7 @@ mod broadcast_lock_tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user(&db, user_id).await;
         let session = mgr
-            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", &user)
+            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", Some(&user))
             .await
             .expect("session created");
         let session_id = session.id.clone().expect("session id");
