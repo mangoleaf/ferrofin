@@ -85,10 +85,12 @@ warm-up at the same rate (different picks) that is discarded, and a window in wh
   checked non-2xx/3xx and transport failures only).
 - **Cold start** — milliseconds from the container process start (`docker inspect
   .State.StartedAt`) to the first authenticated `200` on `GET /UserViews` (the home-screen
-  query), polled every 10 ms, on a *restart* of a server that had already booted this
-  data, with host caches retained; stop completes before the poller starts, and polling
-  begins before `docker start`; stop duration and first provisioning/adoption are excluded,
-  and the median of 5 restarts is the run's number, not full-screen rendering.
+  query), polled every 10 ms with each attempt's connect abandoned after
+  `COLDSTART_ATTEMPT_TIMEOUT_MS` (the response is not cut short), on a *restart* of a
+  server that had already booted this data, with host caches retained; stop completes
+  before the poller starts, and polling begins before `docker start`; stop duration and
+  first provisioning/adoption are excluded, and the median of 5 restarts is the run's
+  number, not full-screen rendering.
 - **HLS first segment** — milliseconds from `POST PlaybackInfo` (a device profile that
   cannot direct-play the file: vp9/webm only, 2 Mbps cap on an 8 Mbps h264 source; no
   subtitle) through `master.m3u8` and the variant playlist to the last byte of the first
@@ -259,6 +261,7 @@ The limits are explicit environment tunables at the top of `run.sh`:
 | `STREAM_HTTP_TIMEOUT_S` | 120 | each streaming HTTP request |
 | `PHASE_TIMEOUT_S` | 600 | each k6 or Python measurement client invocation |
 | `CLEANUP_TIMEOUT_S` | 30 | client/sampler termination and owned container removal |
+| `COLDSTART_ATTEMPT_TIMEOUT_MS` | 100 | the connect of each cold-start readiness attempt; a connect that stalls while the port comes up is abandoned instead of waiting out TCP's 1 s SYN retransmit, and the response keeps `HTTP_TIMEOUT_S` (runs before this setting bounded the whole attempt by 1 s and do not pool with newer ones) |
 | `SAMPLE_BRACKET_INTERVALS` | 2 | maximum distance from a window boundary to its bracketing sample |
 | `SAMPLE_GAP_INTERVALS` | 5 | maximum gap within that sample span |
 
@@ -284,7 +287,7 @@ validation, not full decoding or sustained playback evidence.
 | instrument | known answer | measured |
 |---|---|---|
 | memory sampler (`mem_sample.py`) | a container that allocates and touches exactly 512 MiB | 515.2 MiB anon (interpreter overhead ≈ 3 MiB), identical across 80 samples |
-| restart timer (`coldstart.py`) | a container sleeps 3.000 s before serving authenticated-view probes | 3,162–3,168 ms over 3 restarts; polling was active 55–58 ms before process start; Python startup accounts for the additional time |
+| restart timer (`coldstart.py`) | a container sleeps 3.000 s before serving authenticated-view probes | 3,144–3,190 ms over 3 restarts, re-measured with the 100 ms connect bound; polling was active 42–57 ms before process start; Python startup accounts for the additional time |
 | cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 

@@ -19,9 +19,10 @@
 //! read it, and that port is the same open work item. A `Playlist` made
 //! through the API has the folder upstream's `CreatePlaylist` gives it
 //! (`{data}/playlists/<name>`); writing its `playlist.xml` there is that
-//! same work item. A `BoxSet` made through the API is a **pathless** DB row
-//! (`collection_manager`'s `insert_named_item` writes no `Path`), so it has
-//! no folder of its own to save into. Both keep their membership in the
+//! same work item. A `BoxSet` made through the API has the folder upstream's
+//! `CreateCollectionAsync` gives it (`{data}/collections/<name> [boxset]`;
+//! one an older Ferrofin made has none), and writing its `collection.xml`
+//! there is that same work item too. Both keep their membership in the
 //! `LinkedChildren` table, which is what Jellyfin 12 reads too.
 //!
 //! The savers are complete and tested all the same. They are deliberately
