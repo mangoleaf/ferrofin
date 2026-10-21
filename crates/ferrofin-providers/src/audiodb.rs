@@ -13,6 +13,8 @@ use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::tmdb::TmdbImage;
 
@@ -24,8 +26,10 @@ const API_BASE: &str = "https://www.theaudiodb.com/api/v1/json/195003";
 /// `strWebsite` → `HomePageUrl` is not read: Ferrofin stores no home page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioDbArtist {
-    /// The biography (English), if any.
-    pub biography: Option<String>,
+    /// Every non-blank biography TheAudioDB has, keyed by its field suffix:
+    /// `""` for the unsuffixed English `strBiography`, `"EN"`, `"DE"`, ….
+    /// [`Self::biography`] picks one for a language.
+    pub biographies: BTreeMap<String, String>,
     /// Genre, if any.
     pub genre: Option<String>,
     /// Sub-genre (`strSubGenre`), if any: the artist's second genre.
@@ -56,8 +60,9 @@ pub struct AudioDbAlbum {
     /// setting has changed nothing upstream since 26c778eb16 — while its
     /// twin `ReplaceArtistName` sets the artist's `Name`.
     pub name: Option<String>,
-    /// The album description (English), if any.
-    pub description: Option<String>,
+    /// Every non-blank description TheAudioDB has, keyed by its field suffix
+    /// as [`AudioDbArtist::biographies`]. [`Self::description`] picks one.
+    pub descriptions: BTreeMap<String, String>,
     /// Release year, if any.
     pub year: Option<i32>,
     /// Genre, if any.
@@ -87,8 +92,6 @@ struct ArtistResult {
 
 #[derive(Debug, Deserialize)]
 struct ArtistWire {
-    #[serde(rename = "strBiographyEN")]
-    biography: Option<String>,
     #[serde(rename = "strGenre")]
     genre: Option<String>,
     #[serde(rename = "strSubGenre")]
@@ -113,6 +116,9 @@ struct ArtistWire {
     fanart2: Option<String>,
     #[serde(rename = "strArtistFanart3")]
     fanart3: Option<String>,
+    /// Every other field, among them the `strBiography{…}` texts.
+    #[serde(flatten)]
+    rest: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,8 +130,6 @@ struct AlbumResult {
 struct AlbumWire {
     #[serde(rename = "strAlbum")]
     name: Option<String>,
-    #[serde(rename = "strDescriptionEN")]
-    description: Option<String>,
     #[serde(rename = "intYearReleased")]
     year: Option<String>,
     #[serde(rename = "strGenre")]
@@ -144,6 +148,9 @@ struct AlbumWire {
     thumb: Option<String>,
     #[serde(rename = "strAlbumCDart")]
     cd_art: Option<String>,
+    /// Every other field, among them the `strDescription{…}` texts.
+    #[serde(flatten)]
+    rest: BTreeMap<String, Value>,
 }
 
 /// A TheAudioDb client. Cheap to clone (wraps a [`reqwest::Client`]).
@@ -220,7 +227,7 @@ impl AudioDbClient {
         push_image(&mut images, wire.fanart2, ImageType::Backdrop);
         push_image(&mut images, wire.fanart3, ImageType::Backdrop);
         Some(AudioDbArtist {
-            biography: non_blank(wire.biography),
+            biographies: localized_texts(&wire.rest, "strBiography"),
             genre: non_blank(wire.genre),
             sub_genre: non_blank(wire.sub_genre),
             // `int.TryParse(result.intFormedYear, NumberStyles.Integer, …)`.
@@ -257,7 +264,7 @@ impl AudioDbClient {
             } else {
                 None
             },
-            description: non_blank(wire.description),
+            descriptions: localized_texts(&wire.rest, "strDescription"),
             year: wire.year.as_deref().and_then(|y| y.trim().parse().ok()),
             genre: non_blank(wire.genre),
             artist: non_blank(wire.artist),
@@ -283,6 +290,91 @@ fn push_image(out: &mut Vec<TmdbImage>, url: Option<String>, image_type: ImageTy
             language: None,
         });
     }
+}
+
+impl AudioDbArtist {
+    /// The biography for an item in `language` and its `ResultLanguage`
+    /// (`AudioDbArtistProvider.ProcessResult`/`GetBiography`): the text in the
+    /// language's subtag when TheAudioDB has it, marked with that subtag, else
+    /// the English text marked `"en"`; HTML stripped, `None` when blank.
+    #[must_use]
+    pub fn biography(&self, language: Option<&str>) -> (Option<String>, String) {
+        localized(&self.biographies, language)
+    }
+}
+
+impl AudioDbAlbum {
+    /// The description for an item in `language` and its `ResultLanguage`
+    /// (`AudioDbAlbumProvider.ProcessResult`/`GetDescription`): the text in the
+    /// language's subtag when TheAudioDB has it, marked with that subtag, else
+    /// the English text marked `"en"`; HTML stripped, `None` when blank.
+    #[must_use]
+    pub fn description(&self, language: Option<&str>) -> (Option<String>, String) {
+        localized(&self.descriptions, language)
+    }
+}
+
+/// The non-blank `{prefix}{suffix}` text fields of a TheAudioDB answer, keyed
+/// by suffix (`""` for the unsuffixed English text, `"EN"`, `"DE"`, …).
+fn localized_texts(rest: &BTreeMap<String, Value>, prefix: &str) -> BTreeMap<String, String> {
+    rest.iter()
+        .filter_map(|(key, value)| {
+            let suffix = key.strip_prefix(prefix)?;
+            let text = value.as_str().filter(|text| !text.trim().is_empty())?;
+            Some((suffix.to_owned(), text.to_owned()))
+        })
+        .collect()
+}
+
+/// v12.2 `ProcessResult` with `GetBiography`/`GetDescription`
+/// (jellyfin/jellyfin#17619): the text in the requested language's subtag
+/// when TheAudioDB has it, with that subtag as the answer's `ResultLanguage`;
+/// otherwise the English text (`…EN`, else the unsuffixed field), marked
+/// `"en"` so it does not block a provider further down the list that can serve
+/// the requested language. HTML is stripped (`StripHtml`). If the localized
+/// text strips to nothing, the answer is no overview and there is no English
+/// fallback. Upstream stores `""` in that case; `None` here has the same
+/// effect, because the merge treats both as empty (`IsNullOrEmpty`).
+fn localized(texts: &BTreeMap<String, String>, language: Option<&str>) -> (Option<String>, String) {
+    // `MetadataLanguageUtils.GetLanguageSubtag`.
+    let subtag = language
+        .filter(|language| !language.is_empty())
+        .map(|language| {
+            language
+                .split_once('-')
+                .map_or(language, |(subtag, _)| subtag)
+                .to_lowercase()
+        });
+    let suffix = match subtag.as_deref() {
+        Some("de") => Some("DE"),
+        Some("en") => Some("EN"),
+        Some("es") => Some("ES"),
+        Some("fr") => Some("FR"),
+        Some("he") => Some("IL"),
+        Some("hu") => Some("HU"),
+        Some("it") => Some("IT"),
+        Some("ja") => Some("JP"),
+        Some("nl") => Some("NL"),
+        Some("no" | "nb" | "nn") => Some("NO"),
+        Some("pl") => Some("PL"),
+        Some("pt") => Some("PT"),
+        Some("ru") => Some("RU"),
+        Some("sv") => Some("SE"),
+        Some("zh") => Some("CN"),
+        _ => None,
+    };
+    let stripped = |text: &String| {
+        Some(ferrofin_common::extensions::strip_html(text)).filter(|text| !text.is_empty())
+    };
+    if let (Some(suffix), Some(subtag)) = (suffix, subtag)
+        && let Some(text) = texts.get(suffix)
+    {
+        return (stripped(text), subtag);
+    }
+    (
+        texts.get("EN").or_else(|| texts.get("")).and_then(stripped),
+        "en".to_owned(),
+    )
 }
 
 /// `Some(s)` when `s` is non-blank, else `None`.
@@ -318,7 +410,9 @@ mod tests {
         assert_eq!(images[0].image_type, ImageType::Primary);
         assert_eq!(images[1].image_type, ImageType::Backdrop);
         assert_eq!(
-            non_blank(wire.biography).as_deref(),
+            localized_texts(&wire.rest, "strBiography")
+                .get("EN")
+                .map(String::as_str),
             Some("A jazz trumpeter.")
         );
         assert_eq!(non_blank(wire.genre).as_deref(), Some("Jazz"));
@@ -382,7 +476,7 @@ mod tests {
         let c = AudioDbClient::with_base_url(&server.base_url);
 
         let a = c.artist("mb-artist").await.expect("artist");
-        assert_eq!(a.biography.as_deref(), Some("Trumpeter."));
+        assert_eq!(a.biography(None).0.as_deref(), Some("Trumpeter."));
         assert_eq!(a.genre.as_deref(), Some("Jazz"));
         assert_eq!(a.sub_genre.as_deref(), Some("Bebop"));
         assert_eq!(a.formed_year, Some(1944));
@@ -396,7 +490,7 @@ mod tests {
 
         let al = c.album("mb-rg").await.expect("album");
         assert_eq!(al.year, Some(1959));
-        assert_eq!(al.description.as_deref(), Some("Seminal."));
+        assert_eq!(al.description(None).0.as_deref(), Some("Seminal."));
         assert_eq!(al.artist.as_deref(), Some("Miles Davis"));
         assert_eq!(al.audiodb_artist_id.as_deref(), Some("111239"));
         assert_eq!(al.audiodb_album_id.as_deref(), Some("2109614"));
@@ -420,6 +514,106 @@ mod tests {
         );
     }
 
+    /// TheAudioDB now returns its English text unsuffixed (`strBiography`,
+    /// `strDescription`); the `…EN` keys are gone (jellyfin/jellyfin#16606,
+    /// #17081). A live answer in that shape still yields the overview.
+    #[tokio::test]
+    async fn the_unsuffixed_english_text_is_the_overview() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/artist-mb.php",
+                r#"{"artists":[{"strArtist":"A","strBiography":"English bio.",
+                    "strBiographyDE":null}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/album-mb.php",
+                r#"{"album":[{"strAlbum":"B","strDescription":"English text."}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let c = AudioDbClient::with_base_url(&server.base_url);
+        let artist = c.artist("mb-artist").await.expect("artist");
+        assert_eq!(
+            artist.biography(Some("en-US")),
+            (Some("English bio.".to_owned()), "en".to_owned())
+        );
+        let album = c.album("mb-rg").await.expect("album");
+        assert_eq!(
+            album.description(None),
+            (Some("English text.".to_owned()), "en".to_owned())
+        );
+    }
+
+    /// A text per field TheAudioDB fills, the suffix as its text; `EN` and the
+    /// unsuffixed English differ so the precedence between them shows.
+    fn every_language() -> BTreeMap<String, String> {
+        [
+            "EN", "DE", "ES", "FR", "IL", "HU", "IT", "JP", "NL", "NO", "PL", "PT", "RU", "SE",
+            "CN",
+        ]
+        .into_iter()
+        .map(|suffix| (suffix.to_owned(), suffix.to_owned()))
+        .chain([(String::new(), "<p>Unsuffixed</p>".to_owned())])
+        .collect()
+    }
+
+    /// `GetBiography`'s language table (v12.2 `AudioDbArtistProvider.cs:256-275`,
+    /// `GetDescription` alike): the subtag picks the field and is the answer's
+    /// language; any other language gets the English text (`…EN` first),
+    /// marked `en`.
+    #[rstest::rstest]
+    #[case(Some("de"), "DE", "de")]
+    #[case(Some("en"), "EN", "en")]
+    #[case(Some("es"), "ES", "es")]
+    #[case(Some("fr"), "FR", "fr")]
+    #[case(Some("he"), "IL", "he")]
+    #[case(Some("hu"), "HU", "hu")]
+    #[case(Some("it"), "IT", "it")]
+    #[case(Some("ja"), "JP", "ja")]
+    #[case(Some("nl"), "NL", "nl")]
+    #[case(Some("no"), "NO", "no")]
+    #[case(Some("nb"), "NO", "nb")]
+    #[case(Some("nn"), "NO", "nn")]
+    #[case(Some("pl"), "PL", "pl")]
+    #[case(Some("pt"), "PT", "pt")]
+    #[case(Some("ru"), "RU", "ru")]
+    #[case(Some("sv"), "SE", "sv")]
+    #[case(Some("zh"), "CN", "zh")]
+    #[case(Some("de-DE"), "DE", "de")]
+    #[case(Some("ZH-cn"), "CN", "zh")]
+    #[case(Some("ko"), "EN", "en")]
+    #[case(None, "EN", "en")]
+    #[case(Some(""), "EN", "en")]
+    fn the_text_follows_the_items_language(
+        #[case] language: Option<&str>,
+        #[case] text: &str,
+        #[case] result_language: &str,
+    ) {
+        assert_eq!(
+            localized(&every_language(), language),
+            (Some(text.to_owned()), result_language.to_owned())
+        );
+    }
+
+    /// The English fallback without `…EN` is the unsuffixed text, HTML
+    /// stripped; a language TheAudioDB has no text in, `en` included, falls
+    /// back to it. A localized text that strips to nothing is no overview,
+    /// with no fallback, as upstream's `ProcessResult` (it stores `""`).
+    #[test]
+    fn without_en_the_unsuffixed_text_is_the_english_one() {
+        let mut texts = every_language();
+        texts.remove("EN");
+        texts.remove("FR");
+        texts.insert("DE".to_owned(), "<br/>".to_owned());
+        let english = (Some("Unsuffixed".to_owned()), "en".to_owned());
+        assert_eq!(localized(&texts, Some("en")), english);
+        assert_eq!(localized(&texts, Some("fr-CA")), english);
+        assert_eq!(localized(&texts, None), english);
+        assert_eq!(localized(&texts, Some("de")), (None, "de".to_owned()));
+    }
+
     #[tokio::test]
     #[ignore = "hits the live TheAudioDb API; run with --ignored"]
     async fn live_miles_davis_artist() {
@@ -428,7 +622,7 @@ mod tests {
             .artist("561d854a-6a28-4aa7-8c99-323e6ce46c2a")
             .await;
         let a = a.expect("artist");
-        assert!(a.biography.is_some());
+        assert!(a.biography(None).0.is_some());
         assert!(!a.images.is_empty());
     }
 }

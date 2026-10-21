@@ -42,7 +42,11 @@ impl SimilarItemsRepository {
     /// director +50, actor/guest-star +15 (`Peoples.PersonType`). `ItemValues`
     /// rows are deduped per `(Type, CleanValue)`, so a shared value ⇒ a shared
     /// `ItemValueId`, and people are deduped per `(Name, Type)` ⇒ a shared
-    /// `PeopleId` across credits — both join on the shared id.
+    /// `PeopleId` across credits — both join on the shared id. A person holds
+    /// one map row per credited role, so the seed's side is its distinct
+    /// people (upstream's `HashSet` of `PeopleId` per item): an actor in two
+    /// parts on the seed counts once. The candidate side keeps every row, as
+    /// upstream's candidate list does.
     ///
     /// An empty `candidate_types` matches nothing (C# has no provider for the
     /// kind, so nothing is scored).
@@ -57,62 +61,7 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let seed = guid_to_db(seed_id);
-        // `+bi."Type"`: the scored candidate set drives the join through the
-        // `Id` primary key. Without the pin the planner (no 12.0 index leads
-        // with `Id`+`Type` any more) walks every row of the candidate types
-        // and builds an automatic index over `s` — `detail:similar` went from
-        // 4.9 ms to 7.8 ms p50 on the bench corpus before the pin.
-        let mut sql = String::from(
-            r#"SELECT bi.* FROM (
-                   SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
-                       SELECT ivm2."ItemId" AS "cand",
-                              CASE iv0."Type" WHEN 2 THEN 10 WHEN 3 THEN 5 WHEN 4 THEN 5 ELSE 0 END AS "w"
-                       FROM "ItemValuesMap" ivm0
-                       JOIN "ItemValues" iv0 ON iv0."ItemValueId" = ivm0."ItemValueId"
-                       JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId"
-                       WHERE ivm0."ItemId" = ?1 AND iv0."Type" IN (2, 3, 4)
-                       UNION ALL
-                       SELECT pm2."ItemId" AS "cand",
-                              CASE p0."PersonType" WHEN 'Director' THEN 50 ELSE 15 END AS "w"
-                       FROM "PeopleBaseItemMap" pm0
-                       JOIN "Peoples" p0 ON p0."Id" = pm0."PeopleId"
-                       JOIN "PeopleBaseItemMap" pm2 ON pm2."PeopleId" = pm0."PeopleId"
-                       WHERE pm0."ItemId" = ?1
-                         AND p0."PersonType" IN ('Director', 'Actor', 'GuestStar')
-                   ) scored
-                   WHERE scored."cand" <> ?1
-                   GROUP BY scored."cand"
-               ) s
-               JOIN "BaseItems" bi ON bi."Id" = s.id
-               WHERE +bi."Type" IN ("#,
-        );
-        // Bind order: ?1 seed, then the candidate types, then the excludes,
-        // then the limit.
-        let mut next = 2;
-        for i in 0..candidate_types.len() {
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push('?');
-            sql.push_str(&(next + i).to_string());
-        }
-        sql.push(')');
-        next += candidate_types.len();
-        if !exclude_ids.is_empty() {
-            sql.push_str(r#" AND bi."Id" NOT IN ("#);
-            for i in 0..exclude_ids.len() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-                sql.push_str(&(next + i).to_string());
-            }
-            sql.push(')');
-            next += exclude_ids.len();
-        }
-        sql.push_str(r#" ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?"#);
-        sql.push_str(&next.to_string());
-
+        let sql = weighted_similar_sql(candidate_types.len(), exclude_ids.len());
         let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(&seed);
         for type_name in candidate_types {
             query = query.bind((*type_name).to_owned());
@@ -341,5 +290,107 @@ impl SimilarItemsRepository {
             }
         }
         Ok(out)
+    }
+}
+
+/// The weighted-overlap statement of [`SimilarItemsRepository::weighted_similar_items`]
+/// for `type_count` candidate types and `exclude_count` excluded ids. Binds:
+/// `?1` the seed, then the types, then the excludes, then the limit.
+fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
+    // `+bi."Type"`: the scored candidate set drives the join through the
+    // `Id` primary key. Without the pin the planner (no 12.0 index leads
+    // with `Id`+`Type` any more) walks every row of the candidate types
+    // and builds an automatic index over `s` — `detail:similar` went from
+    // 4.9 ms to 7.8 ms p50 on the bench corpus before the pin.
+    let mut sql = String::from(
+        r#"SELECT bi.* FROM (
+               SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
+                   SELECT ivm2."ItemId" AS "cand",
+                          CASE iv0."Type" WHEN 2 THEN 10 WHEN 3 THEN 5 WHEN 4 THEN 5 ELSE 0 END AS "w"
+                   FROM "ItemValuesMap" ivm0
+                   JOIN "ItemValues" iv0 ON iv0."ItemValueId" = ivm0."ItemValueId"
+                   JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId"
+                   WHERE ivm0."ItemId" = ?1 AND iv0."Type" IN (2, 3, 4)
+                   UNION ALL
+                   SELECT pm2."ItemId" AS "cand",
+                          CASE p0."PersonType" WHEN 'Director' THEN 50 ELSE 15 END AS "w"
+                   FROM (SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap"
+                         WHERE "ItemId" = ?1) pm0
+                   JOIN "Peoples" p0 ON p0."Id" = pm0."PeopleId"
+                   JOIN "PeopleBaseItemMap" pm2 ON pm2."PeopleId" = pm0."PeopleId"
+                   WHERE p0."PersonType" IN ('Director', 'Actor', 'GuestStar')
+               ) scored
+               WHERE scored."cand" <> ?1
+               GROUP BY scored."cand"
+           ) s
+           JOIN "BaseItems" bi ON bi."Id" = s.id
+           WHERE +bi."Type" IN ("#,
+    );
+    // Bind order: ?1 seed, then the candidate types, then the excludes,
+    // then the limit.
+    let mut next = 2;
+    for i in 0..type_count {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        sql.push_str(&(next + i).to_string());
+    }
+    sql.push(')');
+    next += type_count;
+    if exclude_count > 0 {
+        sql.push_str(r#" AND bi."Id" NOT IN ("#);
+        for i in 0..exclude_count {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            sql.push_str(&(next + i).to_string());
+        }
+        sql.push(')');
+        next += exclude_count;
+    }
+    sql.push_str(r#" ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?"#);
+    sql.push_str(&next.to_string());
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use ferrofin_db::Database;
+
+    /// The people arm reads the seed's distinct people straight off the
+    /// `PeopleBaseItemMap` primary key (`ItemId`, `PeopleId`, `Role`), whose
+    /// order already makes them distinct, so the `DISTINCT` adds no temp
+    /// B-tree; the candidate side still seeks by `PeopleId`. The genre arm and
+    /// the `Id`-driven `BaseItems` join are unchanged.
+    #[tokio::test]
+    async fn the_seed_people_are_read_distinct_off_the_map_key() {
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrations");
+        let explain = format!("EXPLAIN QUERY PLAN {}", super::weighted_similar_sql(1, 0));
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain))
+                .bind("seed")
+                .bind("type")
+                .bind(1_i64)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        for step in [
+            "SEARCH PeopleBaseItemMap USING COVERING INDEX sqlite_autoindex_PeopleBaseItemMap_1 (ItemId=?)",
+            "SEARCH pm2 USING COVERING INDEX IX_PeopleBaseItemMap_PeopleId_ItemId (PeopleId=?)",
+            "SEARCH ivm0 USING INDEX IX_ItemValuesMap_ItemId (ItemId=?)",
+            "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
+        ] {
+            assert!(plan.iter().any(|d| d == step), "{step} not in {plan:#?}");
+        }
+        assert!(
+            !plan.iter().any(|d| d.contains("FOR DISTINCT")),
+            "{plan:#?}"
+        );
     }
 }

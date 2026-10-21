@@ -712,8 +712,16 @@ pub async fn build_app_state(
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
             MediaEncoderConfig {
-                analyze_duration: None,
-                probe_size: None,
+                // Jellyfin's `FFmpeg:analyzeduration` / `FFmpeg:probesize`
+                // defaults, which every probe passes; without them ffprobe
+                // falls back to its own 5 s / 5 MB and can miss late streams.
+                analyze_duration: Some(
+                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION
+                        .to_owned(),
+                ),
+                probe_size: Some(
+                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
+                ),
                 threads: 0,
                 // Frame extraction (chapter images) writes here, never next to
                 // the media file — media mounts are commonly read-only. The
@@ -1548,7 +1556,10 @@ pub async fn build_app_state(
         // (`GetStaticMediaSources`' per-user filter).
         .with_users(Arc::clone(&users))
         .with_visibility(Arc::clone(&item_visibility))
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // `GetVersionInfo` maps a source's path through `PathSubstitutions`
+        // when the caller asks for it.
+        .with_configuration(Arc::clone(&config_trait)),
     );
 
     // ---- managers over library -------------------------------------------
@@ -1973,7 +1984,9 @@ pub async fn build_app_state(
         .with_virtual_paths(virtual_paths)
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // `GetMappedPath` maps `Path` and the sources through `PathSubstitutions`.
+        .with_configuration(Arc::clone(&config_trait)),
     );
     // `DtoService` finishes a Live TV channel's DTO itself (C#
     // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV

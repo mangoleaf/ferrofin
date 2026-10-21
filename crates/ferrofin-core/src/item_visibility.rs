@@ -29,6 +29,18 @@ pub struct ItemVisibility {
     localization: Arc<dyn LocalizationManager>,
     data_path: String,
     paths: crate::virtual_paths::VirtualPathExpander,
+    /// How many times the library rows were read, for the scan's
+    /// once-per-scan test.
+    #[cfg(test)]
+    library_loads: std::sync::atomic::AtomicUsize,
+}
+
+/// The library rows and each library's options that visibility and rating
+/// evaluations read, from [`ItemVisibility::rating_libraries`]. A batch job
+/// that evaluates one item at a time reads them once and passes them along.
+pub(crate) struct RatingLibraries {
+    rows: Vec<BaseItemEntity>,
+    options: HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>,
 }
 
 impl ItemVisibility {
@@ -46,7 +58,15 @@ impl ItemVisibility {
             localization,
             data_path,
             paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            #[cfg(test)]
+            library_loads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many times the library rows were read.
+    #[cfg(test)]
+    pub(crate) fn library_loads(&self) -> usize {
+        self.library_loads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Expands the portable data and metadata paths stored in adopted databases.
@@ -185,10 +205,62 @@ impl ItemVisibility {
         &self,
         items: &mut [BaseItemEntity],
     ) -> Result<(), ServiceError> {
+        self.update_rating_scores_with(items, None).await
+    }
+
+    /// [`Self::update_rating_scores`] over `libraries` read earlier with
+    /// [`Self::rating_libraries`], so a batch job that scores one item at a
+    /// time (the library scan) reads the libraries and their options once.
+    /// Each call still reads the items' own parent chain, so an ancestor saved
+    /// since `libraries` was read is seen; the library rows themselves are the
+    /// snapshot `libraries` took, as the scan's library policy is.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy.
+    pub(crate) async fn update_rating_scores_in(
+        &self,
+        items: &mut [BaseItemEntity],
+        libraries: &RatingLibraries,
+    ) -> Result<(), ServiceError> {
+        self.update_rating_scores_with(items, Some(libraries)).await
+    }
+
+    /// Reads the library rows and each library's options, which every
+    /// visibility and rating evaluation needs.
+    ///
+    /// # Errors
+    /// Returns storage errors.
+    pub(crate) async fn rating_libraries(&self) -> Result<RatingLibraries, ServiceError> {
+        let rows = repository::libraries(&self.db).await?;
+        #[cfg(test)]
+        self.library_loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut options = HashMap::new();
+        // Read the existing options without GetVirtualFolders, which also heals
+        // library rows and would turn an authorization read into a mutation.
+        for row in &rows {
+            if let Some(path) = self.paths.expand_opt(row.path.as_deref()) {
+                options.insert(
+                    row_id(row),
+                    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
+                        std::path::Path::new(&path),
+                    )
+                    .await,
+                );
+            }
+        }
+        Ok(RatingLibraries { rows, options })
+    }
+
+    async fn update_rating_scores_with(
+        &self,
+        items: &mut [BaseItemEntity],
+        libraries: Option<&RatingLibraries>,
+    ) -> Result<(), ServiceError> {
         if items.is_empty() {
             return Ok(());
         }
-        let context = self.load(items, None).await?;
+        let context = self.load_with(items, None, libraries).await?;
         for item in items {
             item.unrated_type = Some(
                 crate::kinds::unrated_item(kind(item), uuid(item.channel_id.as_deref()).is_some())
@@ -301,6 +373,16 @@ impl ItemVisibility {
         items: &[BaseItemEntity],
         user: Option<&'a UserEntity>,
     ) -> Result<Context<'a>, ServiceError> {
+        self.load_with(items, user, None).await
+    }
+
+    /// [`Self::load`] over `libraries` when the caller already read them.
+    async fn load_with<'a>(
+        &'a self,
+        items: &[BaseItemEntity],
+        user: Option<&'a UserEntity>,
+        libraries: Option<&'a RatingLibraries>,
+    ) -> Result<Context<'a>, ServiceError> {
         let (permissions, preferences) = if let Some(user) = user {
             (
                 repository::permissions(&self.db, &user.id).await?,
@@ -309,7 +391,15 @@ impl ItemVisibility {
         } else {
             (Vec::new(), Vec::new())
         };
-        let libraries = repository::libraries(&self.db).await?;
+        let (libraries, options) = if let Some(libraries) = libraries {
+            (
+                libraries.rows.clone(),
+                std::borrow::Cow::Borrowed(&libraries.options),
+            )
+        } else {
+            let libraries = self.rating_libraries().await?;
+            (libraries.rows, std::borrow::Cow::Owned(libraries.options))
+        };
         let library_ids: Vec<Uuid> = libraries.iter().map(row_id).collect();
         let mut rows: HashMap<Uuid, BaseItemEntity> = libraries
             .into_iter()
@@ -324,20 +414,6 @@ impl ItemVisibility {
             .await?;
         for row in rows.values_mut() {
             row.path = self.paths.expand_opt(row.path.as_deref());
-        }
-        let mut options = HashMap::new();
-        // Read the existing options without GetVirtualFolders, which also heals
-        // library rows and would turn an authorization read into a mutation.
-        for id in &library_ids {
-            if let Some(path) = rows[id].path.as_deref() {
-                options.insert(
-                    *id,
-                    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
-                        std::path::Path::new(path),
-                    )
-                    .await,
-                );
-            }
         }
         let mut playlists = HashMap::new();
         let playlist_ids: Vec<_> = rows
@@ -388,7 +464,7 @@ struct Context<'a> {
     rows: HashMap<Uuid, BaseItemEntity>,
     library_ids: Vec<Uuid>,
     links: HashMap<Uuid, Vec<Uuid>>,
-    options: HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>,
+    options: std::borrow::Cow<'a, HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>>,
     playlists: HashMap<Uuid, bool>,
     permissions: HashMap<i32, bool>,
     preferences: HashMap<i32, Vec<String>>,
@@ -1425,7 +1501,7 @@ mod tests {
             .load(std::slice::from_ref(&item), Some(&f.user))
             .await
             .expect("context");
-        context.options.insert(
+        context.options.to_mut().insert(
             row_id(&library),
             ferrofin_model::configuration::LibraryOptions {
                 enabled: false,

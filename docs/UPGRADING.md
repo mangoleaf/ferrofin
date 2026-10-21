@@ -8,6 +8,34 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — TheAudioDB descriptions return, in the library's language
+
+TheAudioDB stopped filling its English-suffixed description fields, and earlier versions
+read only those, so music artists and albums got no description from it. Ferrofin now reads
+the description in the item's **preferred metadata language** (its own, else the
+library's, else the server's) when TheAudioDB has one, and the English text otherwise.
+That choice is limited to the languages TheAudioDB translates (German, English, Spanish,
+French, Hebrew, Hungarian, Italian, Japanese, Dutch, Norwegian, Polish, Portuguese,
+Russian, Swedish and Chinese).
+
+Descriptions appear on the next refresh that asks the providers.
+- **Search for missing metadata** fills only items with no description.
+- **Replace all metadata** replaces an existing one, and so does a refresh that is due
+  under the library's automatic refresh interval.
+
+**Music artists with no saved choices ask TheAudioDB again**, as Jellyfin 12.2 does. This
+covers artists known only by name, and artists in a library that never saved **Music
+Artists** downloader choices. The 1.3.0 note below says the server-wide options turn
+TheAudioDB off for these artists. For metadata that no longer holds: a music artist with no
+saved choices may use every metadata downloader, whatever the server-wide
+`MetadataOptions` disable. Image fetchers and albums still follow the server-wide options,
+which ship with TheAudioDB metadata off for albums.
+
+To stop TheAudioDB for a library's artists, open **Dashboard → Libraries** and choose
+**Manage library**. Under **Music Artists**, TheAudioDB shows unticked if the library never
+saved choices (save once to keep that) and ticked if it did (untick it, then save). Artists known only by name have no library, so there
+is no setting that stops TheAudioDB for them.
+
 ## Unreleased — rows of deleted users are removed, once
 
 A long-lived Jellyfin database can still hold rows of users deleted long ago (their

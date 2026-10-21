@@ -88,7 +88,7 @@ impl FerrofinMediaSegmentManager {
         let Some(folders) = &self.virtual_folders else {
             return Ok(LibraryOptions::default());
         };
-        let folders = folders.get_virtual_folders().await?;
+        let folders = folders.library_folders().await?;
         Ok(owning_library(
             &folders,
             item.top_parent_id.as_deref(),

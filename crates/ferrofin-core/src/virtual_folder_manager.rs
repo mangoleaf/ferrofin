@@ -145,6 +145,33 @@ fn replace_ids(values: &[String], map: &[(uuid::Uuid, uuid::Uuid)]) -> Option<Ve
 /// The collection-marker file extension (`<type>.collection`).
 const COLLECTION_EXTENSION: &str = "collection";
 
+/// The library listing [`library_folders`](VirtualFolderManager::library_folders)
+/// serves, and the write generation it belongs to.
+#[derive(Default)]
+struct LibrarySnapshot {
+    /// Bumped when a write through the manager ends. A listing begun under an
+    /// older generation is not stored: the write may have changed the folders
+    /// while it ran.
+    generation: u64,
+    /// The cached listing, `None` until the first lookup after a write.
+    folders: Option<Arc<[VirtualFolderInfo]>>,
+}
+
+/// Drops the library snapshot when the write holding it ends, whether it
+/// succeeds, fails part-way or is cancelled.
+struct SnapshotInvalidation<'a>(&'a std::sync::Mutex<LibrarySnapshot>);
+
+impl Drop for SnapshotInvalidation<'_> {
+    fn drop(&mut self) {
+        let mut snapshot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.generation = snapshot.generation.wrapping_add(1);
+        snapshot.folders = None;
+    }
+}
+
 /// The concrete filesystem-backed virtual-folder manager.
 ///
 /// Owns only the user-views root path; every operation is a directory read/write
@@ -203,6 +230,11 @@ pub struct FerrofinVirtualFolderManager {
     /// (`%AppDataPath%/collections`). Identity until the composition root
     /// sets it.
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// The listing per-item and per-request lookups read, shared by every
+    /// clone. Upstream keeps each `CollectionFolder`'s options in memory and
+    /// refreshes them when they are saved; here every write through this
+    /// manager drops the snapshot and the full listing refreshes it.
+    snapshot: Arc<std::sync::Mutex<LibrarySnapshot>>,
 }
 
 impl std::fmt::Debug for FerrofinVirtualFolderManager {
@@ -246,6 +278,34 @@ impl FerrofinVirtualFolderManager {
             playlists_path: None,
             user_root: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            snapshot: Arc::default(),
+        }
+    }
+
+    /// Marks the start of a write: the library snapshot is dropped when the
+    /// returned guard is.
+    fn invalidate_on_drop(&self) -> SnapshotInvalidation<'_> {
+        SnapshotInvalidation(&self.snapshot)
+    }
+
+    /// The current write generation and the snapshot taken under it, if any.
+    fn cached_libraries(&self) -> (u64, Option<Arc<[VirtualFolderInfo]>>) {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (snapshot.generation, snapshot.folders.clone())
+    }
+
+    /// Stores `folders` as the snapshot, unless a write ended since the
+    /// listing began under `generation`.
+    fn store_libraries(&self, generation: u64, folders: Arc<[VirtualFolderInfo]>) {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.generation == generation {
+            snapshot.folders = Some(folders);
         }
     }
 
@@ -1077,9 +1137,10 @@ impl crate::library_monitor::WatchRootsSource for FerrofinVirtualFolderManager {
     }
 }
 
-#[async_trait]
-impl VirtualFolderManager for FerrofinVirtualFolderManager {
-    async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+impl FerrofinVirtualFolderManager {
+    /// Lists every library on disk and in the item store, sorted by name,
+    /// without the live refresh state.
+    async fn list_libraries(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
         let mut dir = match tokio::fs::read_dir(&self.root).await {
             Ok(dir) => dir,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1132,6 +1193,21 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 ..VirtualFolderInfo::default()
             });
         }
+        // Directory enumeration order is unspecified; a stable name sort keeps
+        // the response deterministic (Jellyfin sorts by directory listing too).
+        folders.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(folders)
+    }
+}
+
+#[async_trait]
+impl VirtualFolderManager for FerrofinVirtualFolderManager {
+    async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        let (generation, _) = self.cached_libraries();
+        let mut folders = self.list_libraries().await?;
+        // The full listing reads everything afresh, so it also refreshes the
+        // snapshot: a hand edit shows in lookups once the dashboard lists.
+        self.store_libraries(generation, folders.clone().into());
         // Capture once after all filesystem/DB awaits, so every library uses
         // the same scan generation and we build the visible map only once.
         let progress: std::collections::HashMap<_, _> = self
@@ -1161,9 +1237,16 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             folder.refresh_progress = current.map(|p| p.percent());
             folder.refresh_status = Some(status.to_owned());
         }
-        // Directory enumeration order is unspecified; a stable name sort keeps
-        // the response deterministic (Jellyfin sorts by directory listing too).
-        folders.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(folders)
+    }
+
+    async fn library_folders(&self) -> Result<Arc<[VirtualFolderInfo]>, ServiceError> {
+        let (generation, cached) = self.cached_libraries();
+        if let Some(folders) = cached {
+            return Ok(folders);
+        }
+        let folders: Arc<[VirtualFolderInfo]> = self.list_libraries().await?.into();
+        self.store_libraries(generation, Arc::clone(&folders));
         Ok(folders)
     }
 
@@ -1209,6 +1292,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         collection_type: Option<CollectionTypeOptions>,
         options: &LibraryOptions,
     ) -> Result<Option<uuid::Uuid>, ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         let name = Self::valid_filename(name);
         if name.is_empty() {
             return Err(ServiceError::invalid_input("library name cannot be empty"));
@@ -1274,6 +1358,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     }
 
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         if name.trim().is_empty() {
             return Err(ServiceError::invalid_input("name must not be empty"));
         }
@@ -1302,6 +1387,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     }
 
     async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         if name.trim().is_empty() {
             return Err(ServiceError::invalid_input("name must not be empty"));
         }
@@ -1386,6 +1472,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         if path_info.path.trim().is_empty() {
             return Err(ServiceError::invalid_input("path must not be empty"));
         }
@@ -1413,6 +1500,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         _path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let mut options = Self::load_options(&folder_path).await;
         // The pinned UpdateMediaPath synchronizes existing shortcut locations;
@@ -1429,6 +1517,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         path: &str,
     ) -> Result<(), ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         if path.trim().is_empty() {
             return Err(ServiceError::invalid_input("path must not be empty"));
         }
@@ -1448,6 +1537,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
+        let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let existing = Self::load_options(&folder_path).await;
 
@@ -2474,6 +2564,157 @@ mod tests {
                 .collect(),
             ..LibraryOptions::default()
         }
+    }
+
+    /// Sets `EnablePhotos` straight in a library's options file, as a hand edit
+    /// would, bypassing the manager.
+    fn edit_options_on_disk(tmp: &TempDir, folder: &str, enable_photos: bool) {
+        let path = tmp.path().join("default").join(folder).join(OPTIONS_FILE);
+        let mut options: LibraryOptions =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read options"))
+                .expect("parse options");
+        options.enable_photos = enable_photos;
+        std::fs::write(&path, serde_json::to_string(&options).expect("serialize"))
+            .expect("write options");
+    }
+
+    fn photos(folders: &[ferrofin_model::entities_media::VirtualFolderInfo]) -> Vec<bool> {
+        folders
+            .iter()
+            .map(|f| f.library_options.as_ref().is_some_and(|o| o.enable_photos))
+            .collect()
+    }
+
+    /// Per-item and per-request lookups read a snapshot, as upstream reads the
+    /// `CollectionFolder`'s cached options, instead of walking every library
+    /// on disk and in the database again. The full listing stays live and
+    /// refreshes the snapshot, so a hand edit shows once the dashboard lists.
+    #[tokio::test]
+    async fn library_folders_serve_a_snapshot_that_the_full_listing_refreshes() {
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "movies");
+        let options = LibraryOptions {
+            enable_photos: false,
+            ..opts_with_paths(std::slice::from_ref(&media))
+        };
+        mgr.add_virtual_folder("Movies", Some(CollectionTypeOptions::movies), &options)
+            .await
+            .unwrap();
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [false]);
+
+        edit_options_on_disk(&tmp, "Movies", true);
+        assert_eq!(
+            photos(&mgr.library_folders().await.unwrap()),
+            [false],
+            "the snapshot is not re-read from disk per lookup"
+        );
+        assert_eq!(photos(&mgr.get_virtual_folders().await.unwrap()), [true]);
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [true]);
+    }
+
+    /// Every change made through the manager is visible to the very next
+    /// snapshot read.
+    #[tokio::test]
+    async fn every_write_through_the_manager_refreshes_the_library_snapshot() {
+        let (tmp, mgr) = manager();
+        let movies = media_dir(&tmp, "movies");
+        let extra = media_dir(&tmp, "extra");
+        let mut options = LibraryOptions {
+            enable_photos: false,
+            ..opts_with_paths(std::slice::from_ref(&movies))
+        };
+        mgr.add_virtual_folder("Movies", Some(CollectionTypeOptions::movies), &options)
+            .await
+            .unwrap();
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [false]);
+        let names = |folders: &[ferrofin_model::entities_media::VirtualFolderInfo]| {
+            folders
+                .iter()
+                .map(|f| f.name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&mgr.library_folders().await.unwrap()), ["Movies"]);
+
+        options.enable_photos = true;
+        mgr.update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [true]);
+
+        mgr.add_media_path(
+            "Movies",
+            &MediaPathInfo {
+                path: extra.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut locations = mgr.library_folders().await.unwrap()[0].locations.clone();
+        locations.sort();
+        let mut expected = vec![extra.clone(), movies.clone()];
+        expected.sort();
+        assert_eq!(locations, expected);
+
+        mgr.remove_media_path("Movies", &extra).await.unwrap();
+        assert_eq!(mgr.library_folders().await.unwrap()[0].locations, [movies]);
+
+        mgr.rename_virtual_folder("Movies", "Films").await.unwrap();
+        assert_eq!(names(&mgr.library_folders().await.unwrap()), ["Films"]);
+
+        mgr.add_virtual_folder("Shows", Some(CollectionTypeOptions::tvshows), &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&mgr.library_folders().await.unwrap()),
+            ["Films", "Shows"]
+        );
+
+        mgr.remove_virtual_folder("Films").await.unwrap();
+        assert_eq!(names(&mgr.library_folders().await.unwrap()), ["Shows"]);
+    }
+
+    /// A listing that a write overtook does not become the snapshot: the
+    /// write's own result is what the next lookup reads.
+    #[tokio::test]
+    async fn a_listing_overtaken_by_a_write_is_not_stored() {
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "movies");
+        let mut options = LibraryOptions {
+            enable_photos: false,
+            ..opts_with_paths(std::slice::from_ref(&media))
+        };
+        mgr.add_virtual_folder("Movies", Some(CollectionTypeOptions::movies), &options)
+            .await
+            .unwrap();
+        let (generation, _) = mgr.cached_libraries();
+        let stale = mgr.list_libraries().await.unwrap();
+
+        options.enable_photos = true;
+        mgr.update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        mgr.store_libraries(generation, stale.into());
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [true]);
+    }
+
+    /// A write that fails part-way still drops the snapshot, since it may have
+    /// changed something before failing.
+    #[tokio::test]
+    async fn a_failed_write_still_refreshes_the_library_snapshot() {
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "movies");
+        let options = LibraryOptions {
+            enable_photos: false,
+            ..opts_with_paths(std::slice::from_ref(&media))
+        };
+        mgr.add_virtual_folder("Movies", Some(CollectionTypeOptions::movies), &options)
+            .await
+            .unwrap();
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [false]);
+
+        edit_options_on_disk(&tmp, "Movies", true);
+        assert!(mgr.remove_virtual_folder("Missing").await.is_err());
+        assert_eq!(photos(&mgr.library_folders().await.unwrap()), [true]);
     }
 
     #[tokio::test]

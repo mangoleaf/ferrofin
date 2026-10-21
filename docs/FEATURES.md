@@ -195,8 +195,9 @@ Wired and working, with a documented limitation or lighter verification:
   saves XML metadata into the library (a library whose metadata savers are unset), the
   `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
   playlist stays empty; Ferrofin always reads the entries and never that sidecar.
-  `collection.xml` is still not read or written: Ferrofin's collections are pathless database
-  rows, with membership in the `LinkedChildren` table, as Jellyfin 12 keeps it.
+  `collection.xml` is still not read or written. A collection made in Ferrofin gets
+  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before that stay
+  folderless), and its membership lives in the `LinkedChildren` table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 

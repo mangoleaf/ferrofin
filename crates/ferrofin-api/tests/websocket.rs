@@ -131,3 +131,31 @@ async fn a_socket_the_auth_service_rejects_is_refused_before_the_upgrade() {
         }
     }
 }
+
+/// A lost socket closes only when it has a session to end
+/// (`SessionWebSocketListener.KeepAliveSockets` disposes it since Jellyfin
+/// 12.0-rc3; every socket has a session there). One without a session (this
+/// fake's auth carries no token, so it resolves none) was never greeted, so it is only dropped from the
+/// watch and stays open past `WebSocketLostTimeout`. The clock is paused once
+/// the upgrade is done, so the timeout passes at once.
+#[tokio::test]
+async fn a_lost_sessionless_socket_stays_open() {
+    let addr = serve(ferrofin_api::test_support::authed_fake_state()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/socket"))
+        .await
+        .expect("upgrade");
+    tokio::time::pause();
+
+    // Read the server's prompts, never answering, well past the lost timeout.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(closed.is_err(), "a sessionless socket was closed when lost");
+}
