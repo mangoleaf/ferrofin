@@ -719,6 +719,16 @@ impl<'a> FetcherPolicy<'a> {
         ferrofin_providers::library_options::global_metadata_options(self.global?, kind)
     }
 
+    /// Whether a metadata saver will rewrite `row`'s metadata
+    /// ([`ferrofin_providers::nfo_save::saves_metadata`]), with this policy's
+    /// library and server-wide options. It reads the configuration only, not
+    /// whether this scanner was given savers: the composition root always
+    /// wires the Nfo saver, as upstream always registers it.
+    fn saves_metadata(self, row: &BaseItemEntity) -> bool {
+        let kind = row.type_.rsplit('.').next().unwrap_or_default();
+        ferrofin_providers::nfo_save::saves_metadata(row, self.options, self.global_for(kind))
+    }
+
     /// Whether the library enabled metadata fetcher `name` for `kind`.
     ///
     /// Delegates to the shared gate so the scan and the on-demand refresh in
@@ -1181,8 +1191,12 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
             ..Default::default()
         },
         // Extract embedded chapter markers so they show on the playback
-        // timeline (matching Jellyfin's `-show_chapters`).
-        extract_chapters: true,
+        // timeline (matching Jellyfin's `-show_chapters`): every video
+        // (`FFProbeVideoInfo`), and among audio only an audiobook
+        // (`AudioFileProber`: `ExtractChapters = item is AudioBook`).
+        extract_chapters: !is_audio
+            || crate::item_type_lookup::kind_from_type_name(&entity.type_)
+                == Some(BaseItemKind::AudioBook),
         media_is_audio: is_audio,
     })
 }
@@ -3643,6 +3657,13 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
+    /// The persistence's [`user_data_detach_epoch`] when the last full
+    /// user-data recovery sweep began; `None` until one has run, so the first
+    /// scan after a start always sweeps ([`recover_user_data`]).
+    ///
+    /// [`user_data_detach_epoch`]: ferrofin_traits::persistence::ItemPersistenceService::user_data_detach_epoch
+    /// [`recover_user_data`]: Self::recover_user_data
+    swept_at_epoch: std::sync::Mutex<Option<i64>>,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -3830,6 +3851,7 @@ impl LibraryScanner {
             display_specials_within_seasons: None,
             nfo_configuration: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
+            swept_at_epoch: std::sync::Mutex::new(None),
         }
     }
 
@@ -5579,6 +5601,43 @@ impl LibraryScanner {
             .collect())
     }
 
+    /// The full user-data recovery sweep after a scan
+    /// ([`reattach_all_user_data`]), when it can find something: history
+    /// whose destination no save of this scan reattached.
+    ///
+    /// Every item a scan saves reattaches its own history on the spot. What
+    /// that misses is a pair matched across time: history detached after its
+    /// destination was saved (later in this scan, or by an earlier watcher
+    /// event outside this one's scope), and a destination whose keys changed
+    /// after its save or outside a scan (music's closing pass, a series'
+    /// re-pointed children, an edit). A `ScanPasses::Library` scan (the
+    /// scheduled scan, `POST /Library/Refresh`, one library's scan) always
+    /// sweeps for them. A `ScanPasses::Touched` scan (watcher and webhook
+    /// batches, item and folder refreshes) sweeps only when history was
+    /// detached since the last sweep: otherwise it has no new history to
+    /// place, and the next library scan catches a late key change.
+    ///
+    /// [`reattach_all_user_data`]: ItemPersistenceService::reattach_all_user_data
+    async fn recover_user_data(&self, passes: ScanPasses) -> Result<(), ServiceError> {
+        let epoch = self.persistence.user_data_detach_epoch().await?;
+        let swept = *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if passes == ScanPasses::Touched && epoch.is_some() && epoch == swept {
+            tracing::debug!(
+                "user-data recovery sweep skipped: nothing detached since the last one"
+            );
+            return Ok(());
+        }
+        self.persistence.reattach_all_user_data().await?;
+        *self
+            .swept_at_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+        Ok(())
+    }
+
     /// The shared scan pipeline over an already-planned item set: probe +
     /// metadata + persistence per item, deleted-item pruning (restricted to
     /// `scope`'s roots when given), the `LibraryChanged` push, and the music
@@ -6137,10 +6196,7 @@ impl LibraryScanner {
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
         if !outcome.stopped {
-            // New destinations may have been saved before old paths were
-            // pruned, or by an earlier watcher event outside this scope.
-            // Music's closing pass must also have persisted its final keys.
-            self.persistence.reattach_all_user_data().await?;
+            self.recover_user_data(run.passes).await?;
             run.report(100.0);
         }
         // Announce what the scan changed (`LibraryChanged`) so open clients
@@ -6765,9 +6821,14 @@ impl LibraryScanner {
         // plus the external ids the file pins. It runs only when the plan
         // runs the local readers (`BaseNfoProvider.HasChanged`: the NFO is
         // newer than the last save by over a minute, or every provider runs).
-        // Identifying skips the local readers ("Do not execute local
-        // providers if we are identifying", `MetadataService.cs:802-803`).
-        let run_local = plan.local_metadata && !locked && search.is_none();
+        // Identifying skips the local readers, and so does "Replace all
+        // metadata" for an item a saver will rewrite ("Do not execute local
+        // providers if we are identifying or replacing with local metadata
+        // saving enabled", `MetadataService.cs:802-803`).
+        let run_local = plan.local_metadata
+            && !locked
+            && search.is_none()
+            && !(options.replace_all_metadata && policy.saves_metadata(&entity));
         let local = if run_local {
             self.fetch_local_nfo(&mut entity, policy).await
         } else {
@@ -7055,6 +7116,9 @@ impl LibraryScanner {
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
+        // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
+        // episode cannot end before it starts.
+        ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
         self.apply_parental_rating_score(&mut entity).await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
@@ -7397,6 +7461,8 @@ impl LibraryScanner {
             cancel,
         )
         .await?;
+        self.persist_audiobook_chapters(&entity, &rows, cancel)
+            .await?;
         // A new video needs its first item save for the trickplay FK. Finish
         // its metadata refresh stamp only after the custom provider returns;
         // ordinary custom-provider errors still complete; cancellation stops it.
@@ -8895,8 +8961,7 @@ impl LibraryScanner {
     /// collection folder first, [`Self::library_top_parents`]) the pruning
     /// weighs: those at or under `roots` and their path-less children on a
     /// path-scoped scan (`roots` given), every row of the library on a
-    /// library scan — both less the owned non-extras and the alternate
-    /// versions a library read never lists
+    /// library scan — both less the owned non-extras
     /// ([`ItemPersistenceService::library_items`]). `None` when they could
     /// not be read (logged): nothing of the library is pruned then.
     async fn prune_candidates(
@@ -8921,7 +8986,8 @@ impl LibraryScanner {
         let rows = match self.persistence.library_items(top_parents).await {
             Ok(Some(rows)) => rows,
             // A store that cannot answer: the item repository's library
-            // read, which applies the same candidate terms.
+            // read. It also hides an unowned alternate version, so such a
+            // store never weighs one.
             Ok(None) => match items
                 .get_item_list(&InternalItemsQuery {
                     top_parent_ids: top_parents.to_vec(),
@@ -15302,6 +15368,46 @@ impl LibraryScanner {
         repo.save_chapters(id, &saved).await
     }
 
+    /// Saves an audiobook's probed chapters, as Jellyfin 12's `AudioFileProber`
+    /// does after its streams: `if (audio is AudioBook && mediaInfo.Chapters is
+    /// { Length: > 0 }) _chapterManager.SaveChapters(audio, mediaInfo.Chapters)`,
+    /// keeping only chapters that start before the runtime
+    /// (`ChapterManager.SaveChapters`). Unlike the video prober it checks no
+    /// refresh mode: whenever the probe ran, its chapters are saved. A probe that
+    /// found none leaves the stored rows alone; no dummy chapters and no chapter
+    /// images, which stay a video's.
+    async fn persist_audiobook_chapters(
+        &self,
+        book: &BaseItemEntity,
+        probe: &ProbeRows,
+        cancel: &ScanCancel,
+    ) -> Result<(), ServiceError> {
+        if cancel.is_cancelled()
+            || probe.chapters.is_empty()
+            || crate::item_type_lookup::kind_from_type_name(&book.type_)
+                != Some(BaseItemKind::AudioBook)
+        {
+            return Ok(());
+        }
+        let Some(repo) = &self.chapters else {
+            return Ok(());
+        };
+        let id = Uuid::parse_str(&book.id)
+            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
+        let runtime = book.run_time_ticks.unwrap_or(0);
+        let saved = probe
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.start_position_ticks < runtime)
+            .map(|chapter| ChapterEntity {
+                item_id: book.id.clone(),
+                chapter_index: 0,
+                ..chapter.clone()
+            })
+            .collect::<Vec<_>>();
+        repo.save_chapters(id, &saved).await
+    }
+
     /// Emits the bounded per-item progress line (RULES_LOGGING volume rule);
     /// a `progress_every` of `0` disables it.
     fn log_scan_progress(&self, scanned: usize, total: usize) {
@@ -18122,6 +18228,9 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
         ("AirsBeforeSeasonNumber", n.airs_before_season_number),
         ("AirsAfterSeasonNumber", n.airs_after_season_number),
         ("AirsBeforeEpisodeNumber", n.airs_before_episode_number),
+        // The episode range end (`<episodenumberend>`, or the last of several
+        // `<episodedetails>` blocks): `IndexNumberEnd` lives in `Data`.
+        ("IndexNumberEnd", n.index_number_end),
     ] {
         fill_provider_data(entity, key, value.map(|value| serde_json::json!(value)));
     }
@@ -18697,9 +18806,6 @@ impl MergeMode {
 /// No other kind takes anything (a book's year or series never comes back
 /// from its path). The embedded MP4 episode info `Episode.BeforeMetadataRefresh`
 /// also reads is applied with the probe ([`embedded_episode_info_enabled`]).
-/// The one field upstream sets here that Ferrofin does not is an episode's
-/// `IndexNumberEnd` (open work item gl-102; see
-/// [`fill_episode_numbers_from_path`]).
 fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
@@ -18789,15 +18895,16 @@ fn names_its_own_folder(row: &BaseItemEntity) -> bool {
 
 /// `LibraryManager.FillMissingEpisodeNumbersFromPath` (`LibraryManager.cs:
 /// 3291-3413`) on a stored episode: a by-date name clears the episode
-/// number and fills an empty premiere date (UTC midnight of the date) and
-/// year; any other name fills the episode and season numbers the row lacks —
-/// or, under `ReplaceAllMetadata` (`forceRefresh`), sets them from the path
-/// even to nothing. A season number still missing then takes the season's
+/// number and range end and fills an empty premiere date (UTC midnight of
+/// the date) and year; any other name fills the episode number, range end
+/// (`IndexNumberEnd`, in `Data`) and season number the row lacks — or, under
+/// `ReplaceAllMetadata` (`forceRefresh`), sets them from the path even to
+/// nothing. A season number still missing then takes the season's
 /// (`season_index`).
 ///
-/// Resolved as the planner resolves episodes: the path alone, and no
-/// plain-folder parent (the planner creates none). `IndexNumberEnd` is not
-/// in the schema, so it is neither filled nor cleared.
+/// Resolved as the planner resolves episodes: the path below its library
+/// ([`below_library`]), and no plain-folder parent (the planner creates
+/// none).
 ///
 /// A series whose `DisplayOrder` is `absolute` resolves with
 /// `isAbsoluteNaming` (`LibraryManager.cs:3292-3298`): only the expressions
@@ -18811,19 +18918,12 @@ fn fill_episode_numbers_from_path(
     naming: EpisodeNaming<'_>,
 ) {
     use chrono::TimeZone as _;
-    // `isAbsoluteNaming`: `null` (no filter) unless the series is absolute.
-    let Some(info) = EpisodeResolver::new(&PATH_NAMING).resolve(
-        below_library(path, naming.library),
-        false,
-        None,
-        None,
-        naming.absolute.then_some(true),
-        true,
-    ) else {
+    let Some(info) = resolve_episode_path(path, naming) else {
         return;
     };
     if info.is_by_date {
         row.index_number = None;
+        set_index_number_end(row, None);
         if row.premiere_date.is_none()
             && let (Some(y), Some(m), Some(d)) = (info.year, info.month, info.day)
             && let (Ok(m), Ok(d)) = (u32::try_from(m), u32::try_from(d))
@@ -18837,6 +18937,9 @@ fn fill_episode_numbers_from_path(
         if row.index_number.is_none() || replace_all {
             row.index_number = info.episode_number.map(i64::from);
         }
+        if index_number_end(row).is_none() || replace_all {
+            set_index_number_end(row, info.ending_episode_number);
+        }
         if row.parent_index_number.is_none() || replace_all {
             row.parent_index_number = info.season_number.map(i64::from);
         }
@@ -18844,6 +18947,73 @@ fn fill_episode_numbers_from_path(
     if row.parent_index_number.is_none() {
         row.parent_index_number = season_index;
     }
+}
+
+/// `FillMissingEpisodeNumbersFromPath`'s resolve: the path below its library
+/// ([`below_library`]), with `isAbsoluteNaming` `null` (no filter) unless
+/// the series is absolute.
+fn resolve_episode_path(
+    path: &str,
+    naming: EpisodeNaming<'_>,
+) -> Option<ferrofin_naming::tv::EpisodeInfo> {
+    EpisodeResolver::new(&PATH_NAMING).resolve(
+        below_library(path, naming.library),
+        false,
+        None,
+        None,
+        naming.absolute.then_some(true),
+        true,
+    )
+}
+
+/// A NEW episode's range end from its path, where its providers (an NFO)
+/// gave none, on a pass that runs `BeforeMetadataRefresh` (as the stored
+/// row's [`before_metadata_refresh`]). Upstream's first refresh runs
+/// `FillMissingEpisodeNumbersFromPath` before the providers, whose answer
+/// then replaces the item's and is filled from it only where it has nothing
+/// (`MetadataService.cs:850, 905-917`), so an NFO's range wins and the
+/// path's fills in. The planned row cannot carry it: the providers start
+/// from that row, and `apply_nfo` only fills.
+fn fill_new_episode_range(row: &mut BaseItemEntity, naming: EpisodeNaming<'_>) {
+    if item_type_lookup::kind_from_type_name(&row.type_) != Some(BaseItemKind::Episode)
+        || index_number_end(row).is_some()
+    {
+        return;
+    }
+    let Some(info) = row
+        .path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|path| resolve_episode_path(path, naming))
+    else {
+        return;
+    };
+    if !info.is_by_date {
+        set_index_number_end(row, info.ending_episode_number);
+    }
+}
+
+/// The episode's range end, `IndexNumberEnd`, which lives in the `Data` blob.
+fn index_number_end(row: &BaseItemEntity) -> Option<i32> {
+    crate::item_data::read_data_i32(
+        &crate::item_data::parse_data(row.data.as_deref()),
+        "IndexNumberEnd",
+    )
+}
+
+/// Sets (`Some`) or removes (`None`) `Data.IndexNumberEnd`, leaving the row
+/// untouched when it already says so.
+fn set_index_number_end(row: &mut BaseItemEntity, end: Option<i32>) {
+    let mut data = crate::item_data::parse_data(row.data.as_deref());
+    let current = crate::item_data::read_data_i32(&data, "IndexNumberEnd");
+    if current == end && (end.is_some() || !data.contains_key("IndexNumberEnd")) {
+        return;
+    }
+    match end {
+        Some(end) => data.insert("IndexNumberEnd".to_owned(), serde_json::json!(end)),
+        None => data.remove("IndexNumberEnd"),
+    };
+    row.data = Some(serde_json::Value::Object(data).to_string());
 }
 
 /// `Episode.BeforeMetadataRefresh` checks the stored container for exactly mp4.
@@ -18977,6 +19147,9 @@ fn saved_row(
     } else {
         let mut row = scanned.clone();
         guesses.fill(&mut row);
+        if facts.before_refresh {
+            fill_new_episode_range(&mut row, facts.naming);
+        }
         // `Folder.AddChild` stamps a new child's unset `DateModified` with
         // the `UtcNow` of its `DateCreated`. A path-less one (a season with
         // no folder) keeps it — no save restats it, where a file's or a
@@ -19274,8 +19447,9 @@ fn is_path_less(item: &BaseItemEntity) -> bool {
 /// `RefreshedOwnedItems`, `Video.cs:690`), so a stored part keeps its own. `IsoType` is the resolver's on a
 /// new item only and never updated after. Stat-owned (`SaveInternal`):
 /// `DateModified` (a file's; a folder has none, D2) and `Size` (files).
-/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate` and the
-/// video `Width`/`Height` (a photo's come from its EXIF reader).
+/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate`, the
+/// video `Width`/`Height` (a photo's come from its EXIF reader) and a track's
+/// ReplayGain `NormalizationGain`.
 ///
 /// `row` is always a stored row's (the merge's; a new item takes the
 /// planner's row whole, [`saved_row`]).
@@ -19336,6 +19510,10 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         if measured.is_some() {
             *value = measured;
         }
+    }
+    // A ReplayGain tag the probe read (`apply_audio_metadata`).
+    if scanned.normalization_gain.is_some() {
+        row.normalization_gain = scanned.normalization_gain;
     }
     if probe_ran
         && (scanned.run_time_ticks.is_some() || scanned.media_type.as_deref() == Some("Video"))
@@ -19908,26 +20086,30 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
 
 /// Whether writing `people` would change `stored`, an item's credits as
 /// `get_people_batch` reads them back. Compared the way `update_people`
-/// writes them: deduped on (lower-cased name, type) keeping the first
-/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
-/// existing `Peoples` row keeps its casing), then type and role, in credit
-/// order.
+/// writes them: deduped on (lower-cased name, type, role) keeping the first
+/// ([`dedupe_people`]), names and roles matched case-insensitively (an
+/// existing `Peoples` row and mapping keep their casing), then type, in
+/// credit order. Incoming roles are trimmed as `update_people` stores them;
+/// stored roles are compared as read, so a padded role written before roles
+/// were trimmed differs once and is rewritten, as upstream's unchanged check
+/// does.
 ///
 /// [`dedupe_people`]: crate::people_repository::dedupe_people
 fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
-    let key = |p: &PeopleEntity| {
+    let key = |p: &PeopleEntity, trim_role: bool| {
+        let role = p.role.as_deref().unwrap_or_default();
         (
             p.name.trim().to_lowercase(),
             p.person_type.clone().unwrap_or_default(),
-            p.role.clone().unwrap_or_default(),
+            if trim_role { role.trim() } else { role }.to_lowercase(),
         )
     };
     stored
         .iter()
-        .map(key)
+        .map(|p| key(p, false))
         .ne(crate::people_repository::dedupe_people(people)
             .into_iter()
-            .map(key))
+            .map(|p| key(p, true)))
 }
 
 /// The credits `AudioFileProber.FetchDataFromTags` writes with
@@ -20018,6 +20200,11 @@ fn apply_audio_metadata(
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = info.premiere_date;
+    }
+    // `audio.NormalizationGain = value` whenever the tag parses: the tag
+    // replaces what the track had, and a track without one keeps it.
+    if tags.track_gain.is_some() {
+        entity.normalization_gain = tags.track_gain;
     }
     // No sort key here: `Audio.CreateSortName` reads the final disc/track
     // numbers (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`), which
@@ -20707,6 +20894,48 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    fn credit(name: &str, person_type: &str, role: &str) -> super::PeopleEntity {
+        super::PeopleEntity {
+            name: name.to_owned(),
+            person_type: Some(person_type.to_owned()),
+            role: Some(role.to_owned()),
+            ..super::PeopleEntity::default()
+        }
+    }
+
+    /// The skip-unchanged check compares credits the way `update_people`
+    /// writes them, so a padded role from a provider equals the trimmed
+    /// one it stored, and a rescan does not rewrite the item's credits.
+    #[test]
+    fn credits_differ_compares_roles_as_update_people_stores_them() {
+        let stored = [credit("Ann", "Actor", "Himself")];
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", " Himself ")]
+        ));
+        assert!(super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "Herself")]
+        ));
+        // A role stored padded (before roles were trimmed) is rewritten once.
+        assert!(super::credits_differ(
+            &[credit("Ann", "Actor", " Himself ")],
+            &[credit("Ann", "Actor", "Himself")]
+        ));
+        // A case-only change keeps the stored mapping, so it is no change.
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "HIMSELF")]
+        ));
+        // Two roles of one person are two credits.
+        let both = [
+            credit("Ann", "Writer", "Novel"),
+            credit("Ann", "Writer", "Screenplay"),
+        ];
+        assert!(!super::credits_differ(&both, &both));
+        assert!(super::credits_differ(&both[..1], &both));
+    }
+
     #[rstest::rstest]
     #[case::off(false, false, false, false, false, false)]
     #[case::ordinary(true, false, false, false, false, true)]
@@ -22318,6 +22547,26 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// An NFO episode range (`<episodenumberend>`, or the last of several
+    /// `<episodedetails>` blocks) is stored where `IndexNumberEnd` lives, the
+    /// `Data` blob the DTO reads it from (PR 17805). `apply_nfo` used to drop
+    /// it, so no NFO range ever reached a client.
+    #[test]
+    fn apply_nfo_stores_the_episode_range_in_the_data_blob() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Episode);
+        n.index_number = Some(1);
+        n.index_number_end = Some(2);
+
+        let mut e = BaseItemEntity::default();
+        super::apply_nfo(&mut e, &n);
+
+        let data = crate::item_data::parse_data(e.data.as_deref());
+        assert_eq!(e.index_number, Some(1));
+        assert_eq!(data.get("IndexNumberEnd"), Some(&serde_json::json!(2)));
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
@@ -25509,6 +25758,63 @@ mod tests {
         assert_eq!(row.album_artists, None, "no performers, no album artists");
     }
 
+    /// `AudioFileProber.FetchDataFromTags`' `REPLAYGAIN_TRACK_GAIN`: a trailing
+    /// `dB` in any case dropped, whitespace trimmed, only a finite float kept,
+    /// and written over what the track had.
+    #[rstest::rstest]
+    #[case::with_unit("-6.5 dB", Some(-6.5))]
+    #[case::signed_no_space("+1.2dB", Some(f64::from(1.2_f32)))]
+    #[case::upper_unit("-3.10 DB", Some(f64::from(-3.1_f32)))]
+    #[case::padded(" 2 ", Some(2.0))]
+    #[case::not_a_number("abc", None)]
+    #[case::nan("NaN", None)]
+    #[case::infinity("Infinity dB", None)]
+    #[case::blank("", None)]
+    #[case::truncated_at_nul("-6.5\0junk", Some(-6.5))]
+    #[case::multibyte_tail("5é", None)]
+    #[case::one_character("x", None)]
+    fn the_track_gain_tag_sets_the_normalization_gain(
+        #[case] tag: &str,
+        #[case] expected: Option<f64>,
+    ) {
+        let info = ferrofin_model::media_info::MediaInfo {
+            raw_audio_tags: Some(std::collections::HashMap::from([(
+                "replaygain_track_gain".to_owned(),
+                tag.to_owned(),
+            )])),
+            ..Default::default()
+        };
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::apply_audio_metadata(&mut row, &info, None);
+        assert_eq!(row.normalization_gain, expected.or(Some(-9.0)));
+    }
+
+    /// A rescan lays the probed gain over the stored row; a probe that read
+    /// none leaves the stored one.
+    #[test]
+    fn a_probed_track_gain_overlays_the_stored_row() {
+        let scanned = BaseItemEntity {
+            normalization_gain: Some(-4.0),
+            ..BaseItemEntity::default()
+        };
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::overlay_file_facts(&mut row, &scanned, true);
+        assert_eq!(row.normalization_gain, Some(-4.0));
+
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::overlay_file_facts(&mut row, &BaseItemEntity::default(), true);
+        assert_eq!(row.normalization_gain, Some(-9.0));
+    }
+
     #[test]
     fn audio_probe_applies_current_library_artist_and_delimiter_options_to_raw_tags() {
         let first_id = "11111111-1111-4111-8111-111111111111";
@@ -27979,6 +28285,60 @@ mod tests {
             Some("2024-03-01")
         );
         assert_eq!(by_date.parent_index_number, Some(4), "the season's number");
+    }
+
+    /// `FillMissingEpisodeNumbersFromPath`'s range end (v12.2
+    /// `LibraryManager.cs:3350-3356, 3391-3399`), kept in `Data` as
+    /// `IndexNumberEnd`: a multi-episode name fills one the row lacks; a
+    /// stored one (an NFO's) stays unless `ReplaceAllMetadata` re-sets it
+    /// from the path, even to nothing; a by-date name clears it. The rest of
+    /// `Data` stays.
+    #[rstest::rstest]
+    #[case::filled(
+        "Season 2/Elementary - 02x03 - 02x04 - 02x15 - Ep Name.mp4",
+        None,
+        false,
+        Some(15)
+    )]
+    #[case::filled_dash("Season 1/Show S01E01-E02.mkv", None, false, Some(2))]
+    #[case::single_episode("Season 1/Show S01E02 blah.avi", None, false, None)]
+    #[case::stored_kept("Season 1/Show S01E01-E02.mkv", Some(5), false, Some(5))]
+    #[case::stored_kept_without_range("Season 1/Show S01E03.mkv", Some(5), false, Some(5))]
+    #[case::replaced("Season 1/Show S01E01-E02.mkv", Some(5), true, Some(2))]
+    #[case::replaced_by_nothing("Season 1/Show S01E03.mkv", Some(5), true, None)]
+    #[case::by_date_clears("News 2024-03-01.mkv", Some(5), false, None)]
+    fn the_refill_takes_an_episode_range_from_its_path(
+        #[case] name: &str,
+        #[case] stored_end: Option<i64>,
+        #[case] replace_all: bool,
+        #[case] expected: Option<i64>,
+    ) {
+        let mut row = stored_row(
+            "TV.Episode",
+            &format!("/tv/Show/{name}"),
+            Some("Title"),
+            None,
+        );
+        let mut data = serde_json::json!({ "Container": "mkv" });
+        if let Some(end) = stored_end {
+            data["IndexNumberEnd"] = serde_json::json!(end);
+        }
+        row.data = Some(data.to_string());
+
+        super::before_metadata_refresh(
+            &mut row,
+            replace_all,
+            None,
+            super::EpisodeNaming::default(),
+        );
+
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        assert_eq!(
+            data.get("IndexNumberEnd")
+                .and_then(serde_json::Value::as_i64),
+            expected
+        );
+        assert_eq!(data.get("Container"), Some(&serde_json::json!("mkv")));
     }
 
     /// The refill runs only on a pass that runs `BeforeMetadataRefresh`: a
@@ -31554,19 +31914,29 @@ mod tests {
     /// returns a list, `BaseNfoParser` → `ResetPeople`) clears the stored cast
     /// only under "Replace all metadata", where `RemoveOldMetadata` skips
     /// "add existing metadata to provider result" (`:905`); every other mode
-    /// turns the empty list into null there and keeps the cast.
+    /// turns the empty list into null there and keeps the cast. That needs a
+    /// library that saves no metadata: where the Nfo saver is on (the existing
+    /// NFO turns it on), "Replace all metadata" reads no NFO at all
+    /// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`),
+    /// and with no provider answering the cast stands.
     #[rstest::rstest]
-    #[case::scan("scan", 2)]
-    #[case::missing("missing", 2)]
-    #[case::replace_all("replace", 0)]
+    #[case::scan("scan", false, 2)]
+    #[case::missing("missing", false, 2)]
+    #[case::replace_all("replace", false, 0)]
+    #[case::replace_all_with_a_saver("replace", true, 2)]
     #[tokio::test]
     async fn an_nfo_naming_no_actors_clears_the_cast_only_under_replace_all(
         #[case] choice: &str,
+        #[case] saving: bool,
         #[case] expected: usize,
     ) {
         let tmp = tempfile::tempdir().unwrap();
+        let options = LibraryOptions {
+            metadata_savers: (!saving).then(Vec::new),
+            ..LibraryOptions::default()
+        };
         let (vf, persistence, people, episode_id, items) =
-            library_with_a_stale_episode_cast(tmp.path()).await;
+            library_with_a_stale_episode_cast_in(tmp.path(), options).await;
         let nfo = tmp.path().join("tv/GoT/Season 01/GoT S01E01.nfo");
         std::fs::write(
             &nfo,
@@ -34921,6 +35291,9 @@ mod tests {
                         path_infos: vec![MediaPathInfo {
                             path: media.to_string_lossy().into_owned(),
                         }],
+                        // No saver, so "Replace all metadata" still reads
+                        // the NFO (`isSavingMetadata`, `MetadataService.cs:803`).
+                        metadata_savers: Some(Vec::new()),
                         ..Default::default()
                     },
                 )
@@ -37977,6 +38350,95 @@ mod chapter_image_refresh_tests {
             assert_eq!(std::fs::read(&target).unwrap(), b"previous frame");
         }
         assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    /// Jellyfin 12's `AudioFileProber`: an audiobook's probed chapters are saved,
+    /// cut at the runtime (`ChapterManager.SaveChapters`); a probe that found none
+    /// keeps the stored rows; a music track saves nothing; no chapter image is
+    /// ever extracted from audio. (The scan-level path is
+    /// `tests/library_scan_audiobook_chapters.rs`.)
+    #[tokio::test]
+    async fn an_audiobook_saves_its_probed_chapters_and_a_track_does_not() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let as_kind = |kind: BaseItemKind| {
+            let mut item = fixture.video.clone();
+            item.type_ = crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned();
+            item.media_type = Some("Audio".to_owned());
+            item.run_time_ticks = Some(500_000_000);
+            item
+        };
+        let book = as_kind(BaseItemKind::AudioBook);
+        let cancel = ScanCancel::new();
+        // An audio probe: its attachments are not authoritative.
+        let audio_probe = |positions: &[i64]| ProbeRows {
+            save_attachments: false,
+            ..video_probe(positions)
+        };
+        let starts = |chapters: Vec<ChapterEntity>| {
+            chapters
+                .iter()
+                .map(|chapter| chapter.start_position_ticks)
+                .collect::<Vec<_>>()
+        };
+
+        scanner
+            .persist_audiobook_chapters(
+                &book,
+                &audio_probe(&[0, 200_000_000, 600_000_000]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            starts(repo.get_chapters(id).await.unwrap()),
+            [0, 200_000_000],
+            "a chapter at or past the runtime is dropped"
+        );
+
+        for (item, probe) in [
+            (&book, audio_probe(&[])),
+            (&as_kind(BaseItemKind::Audio), audio_probe(&[100])),
+        ] {
+            scanner
+                .persist_audiobook_chapters(item, &probe, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(
+                starts(repo.get_chapters(id).await.unwrap()),
+                [0, 200_000_000],
+                "{}",
+                item.type_
+            );
+        }
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    /// `ExtractChapters`: every video probe asks for chapters
+    /// (`FFProbeVideoInfo`), and among audio only an audiobook's
+    /// (`AudioFileProber`: `ExtractChapters = item is AudioBook`).
+    #[test]
+    fn only_videos_and_audiobooks_probe_for_chapters() {
+        let fixture_item = |kind: BaseItemKind, media_type: &str| BaseItemEntity {
+            id: Uuid::new_v4().to_string(),
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned(),
+            media_type: Some(media_type.to_owned()),
+            path: Some("/media/file".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        for (kind, media_type, expected) in [
+            (BaseItemKind::Movie, "Video", true),
+            (BaseItemKind::AudioBook, "Audio", true),
+            (BaseItemKind::Audio, "Audio", false),
+        ] {
+            let request = probe_request(&fixture_item(kind, media_type)).expect("probed");
+            assert_eq!(request.extract_chapters, expected, "{kind:?}");
+        }
     }
 
     #[tokio::test]

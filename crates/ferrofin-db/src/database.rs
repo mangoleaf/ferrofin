@@ -14,6 +14,17 @@ use crate::error::Result;
 /// this crate needs no live database or `DATABASE_URL`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// The version of the last migration in this build's chain: a database
+/// migrated past it was written by a newer build, and this one cannot open it
+/// (`MIGRATOR.run` refuses applied versions it does not know).
+#[must_use]
+pub fn schema_head() -> i64 {
+    MIGRATOR
+        .iter()
+        .last()
+        .map_or(0, |migration| migration.version)
+}
+
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
 /// parent: its kind, the three ids the walk follows, the album-artist name
@@ -867,6 +878,22 @@ impl Database {
     #[must_use]
     pub fn writer(&self) -> &SqlitePool {
         &self.writer
+    }
+
+    /// Checks that a reader connection can be had and answers a query: the
+    /// `/health` and `/health/ready` probe (upstream
+    /// `DbContextFactoryHealthCheck`, which asks `CanConnectAsync`). It never
+    /// touches the writer, so a long write cannot fail it. It waits at most
+    /// the reader pool's acquire timeout, which is not set here (sqlx's
+    /// default, 30 s).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when no connection can be acquired (the pool is
+    /// closed, or saturated past its acquire timeout) or the query fails.
+    pub async fn can_connect(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
     }
 
     /// Closes every pool, waiting for checked-out connections to be returned.

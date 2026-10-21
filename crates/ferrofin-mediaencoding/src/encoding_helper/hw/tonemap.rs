@@ -74,6 +74,18 @@ pub fn is_dovi(stream: Option<&MediaStream>) -> bool {
         )
 }
 
+/// Whether a software tonemap has to reshape the stream's Dolby Vision: a
+/// profile 5 stream (`VideoRangeType::Dovi`), which has no compatible base
+/// layer. Port of
+/// `GetSwVidFilterChain`'s `requireDoviReshaping`
+/// (`VideoRangeType == VideoRangeType.DOVI`; its `doToneMap` half is the
+/// chain's own software-tonemap gate). Every other Dolby Vision stream is
+/// tonemapped from its base layer, like the HDR flavour that layer is.
+#[must_use]
+pub fn requires_dovi_reshaping(stream: Option<&MediaStream>) -> bool {
+    stream.and_then(|s| s.video_range_type) == Some(VideoRangeType::Dovi)
+}
+
 /// Whether the stream carries HDR10+ dynamic metadata. Port of `IsHdr10Plus`.
 #[must_use]
 pub fn is_hdr10_plus(stream: Option<&MediaStream>) -> bool {
@@ -263,6 +275,10 @@ pub fn hw_tonemap_filter(
 ///
 /// `upscaler=none:downscaler=none` is not "do not scale" — it tells libplacebo
 /// to use its default samplers rather than an explicitly named one.
+///
+/// An RGB or BGR `video_format` forces full range, as `force_full_range`
+/// does: libplacebo only outputs full-range RGB. A tonemap then takes range
+/// `pc`; without one, `:range=pc` is appended after `:format=`.
 #[must_use]
 pub fn libplacebo_filter(
     options: &EncodingOptions,
@@ -282,10 +298,15 @@ pub fn libplacebo_filter(
         }
         _ => String::new(),
     };
-    let format_arg = match video_format.filter(|f| !f.is_empty()) {
+    let mut format_arg = match video_format.filter(|f| !f.is_empty()) {
         Some(format) => format!(":format={format}"),
         None => String::new(),
     };
+    // libplacebo only outputs full-range RGB (Jellyfin 12.1, jellyfin#18025).
+    let requested_format = video_format.unwrap_or_default();
+    let force_full_range = force_full_range
+        || super::contains(requested_format, "rgb")
+        || super::contains(requested_format, "bgr");
 
     let mut tonemap_arg = String::new();
     if do_tonemap {
@@ -307,6 +328,8 @@ pub fn libplacebo_filter(
         if matches!(range, TonemappingRange::tv | TonemappingRange::pc) {
             let _ = write!(tonemap_arg, ":range={}", lower(&format!("{range:?}")));
         }
+    } else if force_full_range {
+        format_arg.push_str(":range=pc");
     }
 
     format!("libplacebo=upscaler=none:downscaler=none{size_arg}{format_arg}{tonemap_arg}")
@@ -393,25 +416,28 @@ mod tests {
     // ----- range classifiers -------------------------------------------------
 
     #[rstest]
-    #[case(VideoRangeType::DoviWithHdr10, true, true, false)]
-    #[case(VideoRangeType::DoviWithEl, true, true, false)]
-    #[case(VideoRangeType::DoviWithHdr10Plus, true, true, true)]
-    #[case(VideoRangeType::DoviWithElhdr10Plus, true, true, true)]
-    #[case(VideoRangeType::DoviInvalid, true, true, false)]
+    #[case(VideoRangeType::DoviWithHdr10, true, true, false, false)]
+    #[case(VideoRangeType::DoviWithEl, true, true, false, false)]
+    #[case(VideoRangeType::DoviWithHdr10Plus, true, true, true, false)]
+    #[case(VideoRangeType::DoviWithElhdr10Plus, true, true, true, false)]
+    #[case(VideoRangeType::DoviInvalid, true, true, false, false)]
     // Dolby Vision without an HDR10 base layer: still DOVI, no base layer.
-    #[case(VideoRangeType::Dovi, false, true, false)]
-    #[case(VideoRangeType::DoviWithHlg, false, true, false)]
-    #[case(VideoRangeType::DoviWithSdr, false, true, false)]
+    // Only profile 5 (`DOVI`) has no compatible base layer at all, so only
+    // it is reshaped.
+    #[case(VideoRangeType::Dovi, false, true, false, true)]
+    #[case(VideoRangeType::DoviWithHlg, false, true, false, false)]
+    #[case(VideoRangeType::DoviWithSdr, false, true, false, false)]
     // Plain HDR flavours are neither.
-    #[case(VideoRangeType::Hdr10, false, false, false)]
-    #[case(VideoRangeType::Hlg, false, false, false)]
-    #[case(VideoRangeType::Hdr10Plus, false, false, true)]
-    #[case(VideoRangeType::Sdr, false, false, false)]
+    #[case(VideoRangeType::Hdr10, false, false, false, false)]
+    #[case(VideoRangeType::Hlg, false, false, false, false)]
+    #[case(VideoRangeType::Hdr10Plus, false, false, true, false)]
+    #[case(VideoRangeType::Sdr, false, false, false, false)]
     fn the_range_classifiers_partition_the_dolby_vision_profiles(
         #[case] range_type: VideoRangeType,
         #[case] with_hdr10_bl: bool,
         #[case] dovi: bool,
         #[case] hdr10_plus: bool,
+        #[case] reshape: bool,
     ) {
         let s = hdr(range_type);
         assert_eq!(
@@ -421,6 +447,7 @@ mod tests {
         );
         assert_eq!(is_dovi(Some(&s)), dovi, "{range_type:?}");
         assert_eq!(is_hdr10_plus(Some(&s)), hdr10_plus, "{range_type:?}");
+        assert_eq!(requires_dovi_reshaping(Some(&s)), reshape, "{range_type:?}");
     }
 
     #[test]
@@ -428,6 +455,7 @@ mod tests {
         assert!(!is_dovi_with_hdr10_bl(None));
         assert!(!is_dovi(None));
         assert!(!is_hdr10_plus(None));
+        assert!(!requires_dovi_reshaping(None));
     }
 
     // ----- availability ------------------------------------------------------
@@ -867,6 +895,75 @@ mod tests {
                 false
             )
             .contains("range")
+        );
+    }
+
+    /// Jellyfin 12.1 (jellyfin#18025): libplacebo only outputs full-range RGB,
+    /// so an RGB or BGR output format forces `range=pc`, on the tonemap's
+    /// range or, without a tonemap, after the format.
+    #[rstest]
+    #[case(
+        Some("bgra"),
+        false,
+        TonemappingRange::auto,
+        false,
+        ":format=bgra:range=pc"
+    )]
+    #[case(
+        Some("BGRA"),
+        false,
+        TonemappingRange::auto,
+        false,
+        ":format=BGRA:range=pc"
+    )]
+    #[case(
+        Some("rgba"),
+        false,
+        TonemappingRange::tv,
+        false,
+        ":format=rgba:range=pc"
+    )]
+    #[case(Some("nv12"), false, TonemappingRange::auto, false, ":format=nv12")]
+    #[case(None, false, TonemappingRange::auto, true, ":range=pc")]
+    #[case(Some(""), false, TonemappingRange::auto, true, ":range=pc")]
+    #[case(
+        Some("bgra"),
+        true,
+        TonemappingRange::tv,
+        false,
+        ":format=bgra:tonemapping=bt.2390:peak_detect=0:color_primaries=bt709:\
+         color_trc=bt709:colorspace=bt709:range=pc"
+    )]
+    #[case(
+        Some("nv12"),
+        true,
+        TonemappingRange::tv,
+        false,
+        ":format=nv12:tonemapping=bt.2390:peak_detect=0:color_primaries=bt709:\
+         color_trc=bt709:colorspace=bt709:range=tv"
+    )]
+    fn libplacebo_forces_full_range_for_an_rgb_output(
+        #[case] format: Option<&str>,
+        #[case] do_tonemap: bool,
+        #[case] range: TonemappingRange,
+        #[case] force_full_range: bool,
+        #[case] expected_tail: &str,
+    ) {
+        let options = EncodingOptions {
+            tonemapping_range: range,
+            ..EncodingOptions::default()
+        };
+        assert_eq!(
+            libplacebo_filter(
+                &options,
+                format,
+                do_tonemap,
+                None,
+                None,
+                RequestedSize::default(),
+                force_full_range
+            ),
+            format!("libplacebo=upscaler=none:downscaler=none{expected_tail}")
         );
     }
 

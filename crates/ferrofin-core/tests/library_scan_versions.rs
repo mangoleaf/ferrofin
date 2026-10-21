@@ -46,6 +46,15 @@ struct Fixture {
 impl Fixture {
     /// A library of `kind` (none: untyped) holding `files`.
     async fn new(files: &[&str], kind: Option<CollectionTypeOptions>) -> Self {
+        Self::with_options(files, kind, LibraryOptions::default()).await
+    }
+
+    /// [`Fixture::new`] with the library's `options` (its path is added).
+    async fn with_options(
+        files: &[&str],
+        kind: Option<CollectionTypeOptions>,
+        options: LibraryOptions,
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
         std::fs::create_dir_all(&media).unwrap();
@@ -66,7 +75,7 @@ impl Fixture {
                 path_infos: vec![MediaPathInfo {
                     path: media.to_string_lossy().into_owned(),
                 }],
-                ..LibraryOptions::default()
+                ..options
             },
         )
         .await
@@ -1335,12 +1344,22 @@ async fn a_scoped_scan_of_a_new_root_part_regroups_its_stack() {
 /// A refresh of one local version replacing all its metadata leaves the
 /// version's primary as it was: a version's refresh never reaches the item
 /// it belongs to, which the scan only saves with what the walk resolved.
+/// The library saves no metadata, so "Replace all metadata" still reads the
+/// NFO (`isSavingMetadata`, `MetadataService.cs:803`).
 #[tokio::test]
 async fn replacing_one_versions_metadata_leaves_its_primarys() {
     use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
     const PRIMARY: &str = "Ronin (1998)/Ronin (1998) - 2160p.mkv";
     const VERSION: &str = "Ronin (1998)/Ronin (1998) - 1080p.mkv";
-    let f = Fixture::movies(&[PRIMARY, VERSION]).await;
+    let f = Fixture::with_options(
+        &[PRIMARY, VERSION],
+        Some(CollectionTypeOptions::movies),
+        LibraryOptions {
+            metadata_savers: Some(Vec::new()),
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
     std::fs::write(
         f.path("Ronin (1998)/movie.nfo"),
         "<movie><title>Ronin</title><plot>From the NFO.</plot></movie>",
@@ -2141,6 +2160,32 @@ async fn merge_onto(f: &Fixture, relative: &str, onto: &str) {
     .execute(f.db.writer())
     .await
     .unwrap();
+}
+
+/// A version merged by hand (unowned, `PrimaryVersionId` at a primary of the
+/// same library) is weighed like any child, as Jellyfin 12.1's
+/// `Folder.GetChildrenForValidation` (`IncludeAlternateVersions = true`)
+/// does: kept while its file exists, and once it is gone pruned with its
+/// merge row, the primary untouched.
+#[tokio::test]
+async fn a_hand_merged_version_whose_file_is_gone_is_pruned() {
+    const ORIGINAL: &str = "A (2001)/A (2001).mkv";
+    const SECOND: &str = "A Second (2001)/A Second (2001).mkv";
+    let f = Fixture::movies(&[ORIGINAL, SECOND]).await;
+    f.scanner.scan_all().await.unwrap();
+    merge_onto(&f, SECOND, ORIGINAL).await;
+    let (primary, version) = (f.row(ORIGINAL).await.id, f.row(SECOND).await.id);
+
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.rows_at(SECOND).await, 1, "kept while its file exists");
+    assert_eq!(f.links(&primary).await, vec![(version.clone(), 3)]);
+
+    std::fs::remove_dir_all(f.media.join("A Second (2001)")).unwrap();
+    let report = f.scanner.scan_all().await.unwrap();
+    assert_eq!(report.removed, 1, "{report:?}");
+    assert_eq!(f.rows_at(SECOND).await, 0, "the version is pruned");
+    assert!(f.links(&primary).await.is_empty(), "its merge row goes too");
+    assert_eq!(f.rows_at(ORIGINAL).await, 1, "the primary stays");
 }
 
 /// Stores the row at `relative` as no version at all: unowned, pointing at

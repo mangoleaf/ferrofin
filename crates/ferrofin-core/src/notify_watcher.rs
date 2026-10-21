@@ -36,9 +36,9 @@ use crate::resolvers::{FileSystemWatcher, should_ignore_path};
 /// non-ignored changed path under the watched roots.
 pub struct NotifyFileSystemWatcher {
     /// The OS watcher. `notify`'s watch/unwatch take `&mut`, so it lives behind
-    /// a `std::sync::Mutex` — safe here because the guard never spans an
-    /// `.await` (both calls are synchronous).
-    inner: Mutex<RecommendedWatcher>,
+    /// a `std::sync::Mutex`, taken only inside the blocking-pool jobs that make
+    /// those calls (it never spans an `.await`).
+    inner: Arc<Mutex<RecommendedWatcher>>,
     /// Roots currently watched (without a trailing slash), for
     /// `unwatch_all` — and for the event callback, which drops a
     /// metadata-only change of a root itself.
@@ -127,7 +127,7 @@ impl NotifyFileSystemWatcher {
         .map_err(|e| ServiceError::backend(format!("failed to create filesystem watcher: {e}")))?;
         Ok((
             Self {
-                inner: Mutex::new(watcher),
+                inner: Arc::new(Mutex::new(watcher)),
                 watched: root_set,
             },
             rx,
@@ -138,15 +138,31 @@ impl NotifyFileSystemWatcher {
 #[async_trait]
 impl FileSystemWatcher for NotifyFileSystemWatcher {
     async fn watch(&self, path: &str) -> Result<(), ServiceError> {
-        self.inner
-            .lock()
-            .expect("watcher lock not poisoned")
-            .watch(Path::new(path), RecursiveMode::Recursive)
-            .map_err(|e| ServiceError::backend(format!("failed to watch {path}: {e}")))?;
-        self.watched
-            .lock()
-            .expect("watched set not poisoned")
-            .insert(root_key(path));
+        // A recursive watch walks the whole tree to add one inotify watch per
+        // directory, and `watch` blocks until notify's thread has done it:
+        // seconds on a large or network-mounted library. So it runs on the
+        // blocking pool, never on a runtime worker (upstream starts each
+        // watch on a thread-pool task, `LibraryMonitor.StartWatchingPath`).
+        //
+        // The root joins the watched set in the same job, under the watcher's
+        // lock, once the watch exists: a job runs on even when this future is
+        // dropped, and the set must still name every watch `unwatch_all` has
+        // to remove.
+        let inner = Arc::clone(&self.inner);
+        let watched = Arc::clone(&self.watched);
+        let root = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut os_watcher = inner.lock().expect("watcher lock not poisoned");
+            os_watcher.watch(Path::new(&root), RecursiveMode::Recursive)?;
+            watched
+                .lock()
+                .expect("watched set not poisoned")
+                .insert(root_key(&root));
+            Ok::<_, notify::Error>(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("watch task for {path} did not finish: {e}")))?
+        .map_err(|e| ServiceError::backend(format!("failed to watch {path}: {e}")))?;
         tracing::info!(path, "watching library root for changes");
         Ok(())
     }
@@ -154,18 +170,28 @@ impl FileSystemWatcher for NotifyFileSystemWatcher {
     async fn unwatch(&self, path: &str) -> Result<(), ServiceError> {
         // Unwatch of a root the OS never watched (e.g. it failed to start) is
         // fine to treat as done — the goal state "not watched" already holds.
-        if let Err(e) = self
-            .inner
-            .lock()
-            .expect("watcher lock not poisoned")
-            .unwatch(Path::new(path))
-        {
+        // Removing a recursive watch drops one inotify watch per directory,
+        // so it runs on the blocking pool as `watch` does.
+        // The root leaves the watched set in the same job, as in `watch`.
+        let inner = Arc::clone(&self.inner);
+        let watched = Arc::clone(&self.watched);
+        let root = path.to_owned();
+        let unwatched = tokio::task::spawn_blocking(move || {
+            let mut os_watcher = inner.lock().expect("watcher lock not poisoned");
+            let unwatched = os_watcher.unwatch(Path::new(&root));
+            watched
+                .lock()
+                .expect("watched set not poisoned")
+                .remove(&root_key(&root));
+            unwatched
+        })
+        .await
+        .map_err(|e| {
+            ServiceError::backend(format!("unwatch task for {path} did not finish: {e}"))
+        })?;
+        if let Err(e) = unwatched {
             tracing::debug!(path, error = %e, "unwatch skipped");
         }
-        self.watched
-            .lock()
-            .expect("watched set not poisoned")
-            .remove(&root_key(path));
         Ok(())
     }
 
@@ -209,6 +235,54 @@ mod tests {
                 _ => return seen,
             }
         }
+    }
+
+    /// Registering a recursive watch (notify walks the whole tree, one
+    /// inotify watch per directory, and blocks until it is done) runs on the
+    /// blocking pool, never inline on a runtime worker: with the pool's only
+    /// thread held busy, the watch cannot complete.
+    #[test]
+    fn watching_a_root_goes_through_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(dir.path().join("Show/Season 1")).expect("tree");
+            let (watcher, mut rx) = NotifyFileSystemWatcher::new().expect("watcher");
+            let watcher = Arc::new(watcher);
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let root = dir.path().to_string_lossy().into_owned();
+            let mut watch = tokio::spawn({
+                let watcher = Arc::clone(&watcher);
+                async move { watcher.watch(&root).await }
+            });
+            let starved = tokio::time::timeout(Duration::from_millis(250), &mut watch).await;
+            assert!(
+                starved.is_err(),
+                "the watch registered with the blocking pool starved, so inline on the runtime"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            watch.await.unwrap().expect("watch");
+            // The watch is live once registered.
+            let file = dir.path().join("Show/Season 1/e1.mkv");
+            std::fs::write(&file, b"x").expect("write");
+            let target = file.to_string_lossy().into_owned();
+            let seen = recv_until(&mut rx, |p| p == target).await;
+            assert!(seen.contains(&target), "{seen:?}");
+        });
     }
 
     #[tokio::test]

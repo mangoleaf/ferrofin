@@ -714,6 +714,105 @@ async fn open_socket(
     }
 }
 
+/// Reads frames until one of `message_type` arrives (10 s cap), skipping the
+/// greeting and any other stream's frames.
+async fn next_message_of(socket: &mut ClientSocket, message_type: &str) -> serde_json::Value {
+    use futures_util::StreamExt as _;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .expect("a frame")
+                .expect("a readable frame");
+            let Ok(text) = frame.to_text() else { continue };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if json["MessageType"] == message_type {
+                return json;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {message_type} frame in time"))
+}
+
+/// `SessionWebSocketListener.ProcessWebSocketConnectedAsync` →
+/// `RequestHelpers.GetSession`: a socket authenticated with an API key gets a
+/// session with no user (`LogSessionActivity(..., user: null)`), so it is
+/// greeted with `ForceKeepAlive` and its `SessionsStart` subscription is armed.
+/// An API key sees every session (`SessionInfoWebSocketListener` filters only a
+/// non-admin user), its own user-less one among them.
+#[tokio::test]
+async fn an_api_key_socket_gets_a_user_less_session() {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let authed = step_authenticate(&router).await;
+    let auth_header = client_auth_with_token(&authed.access_token);
+    let mint = Request::builder()
+        .method("POST")
+        .uri("/Auth/Keys?app=socket-probe")
+        .header(header::AUTHORIZATION, &auth_header)
+        .body(Body::empty())
+        .unwrap();
+    assert!(
+        router
+            .clone()
+            .oneshot(mint)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let list = Request::builder()
+        .uri("/Auth/Keys")
+        .header(header::AUTHORIZATION, &auth_header)
+        .body(Body::empty())
+        .unwrap();
+    let keys = body_json(router.clone().oneshot(list).await.unwrap()).await;
+    let key = keys["Items"][0]["AccessToken"]
+        .as_str()
+        .expect("minted key")
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let mut socket = open_socket(addr, &format!("?ApiKey={key}"), None)
+        .await
+        .expect("an API-key socket upgrades");
+    next_message_of(&mut socket, "ForceKeepAlive").await;
+    socket
+        .send(Message::Text(
+            r#"{"MessageType":"SessionsStart","Data":"0,1000"}"#.into(),
+        ))
+        .await
+        .expect("subscribe");
+    let sessions = next_message_of(&mut socket, "Sessions").await;
+    let sessions = sessions["Data"].as_array().expect("a session list");
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s["UserId"] == "00000000000000000000000000000000"),
+        "the API key's own user-less session is listed: {sessions:#?}"
+    );
+    let admin = authed.user_id.replace('-', "").to_lowercase();
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s["UserId"].as_str() == Some(admin.as_str())),
+        "an API key sees other users' sessions too: {sessions:#?}"
+    );
+}
+
 /// The session WebSocket authenticates as every request does (C#
 /// `WebSocketManager.WebSocketRequestHandler` → `AuthService.Authenticate`), so
 /// `EnableLegacyAuthorization` decides the Emby-era forms on it too, and a

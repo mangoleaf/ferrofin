@@ -191,8 +191,11 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item exactly once by the "Plugin media analysis" dashboard
-task. Why a host-driven pass instead of each plugin polling `query-items` with its own
+offered each new matching item once by the "Plugin media analysis" dashboard
+task. When the plugin's circuit breaker stops a pass, the items it did not reach are
+offered after the restart, and an item sharing the cut-off item's creation time (or, on
+a first pass, an undated one) can be offered again, so analysis must be idempotent.
+Why a host-driven pass instead of each plugin polling `query-items` with its own
 cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
 `host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
 could be rewound to re-burn the shared decode budget), disabled plugins are centrally
@@ -396,8 +399,8 @@ planned improvement.)
 plugin's declared `web-transforms` rewrite served jellyfin-web files for all
 users — a strictly larger grant than settings pages (admin-only) or plugin
 routes (opt-in fetches). It is the single strongest reason to install only
-plugins you trust; a disabled plugin's transforms are not applied
-(restart-required, like everything decided at boot).
+plugins you trust; a disabled or uninstalled plugin's transforms stop
+applying at once, and enabling a plugin starts them, with no restart.
 
 **Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
 executes in the **admin's browser with the admin's session** — the same trust
@@ -482,9 +485,8 @@ Two things to know:
 - **The opt-out is per plugin, by disabling it** (or removing the repository). Upstream
   honours an `AutoUpdate` flag in each installed plugin's manifest; Ferrofin's WASM
   artifacts carry no such manifest, so a disabled plugin is what the task skips. Disabling
-  takes effect live for tasks, providers and analysis, and keeps the plugin installed and
-  inert; a plugin's **web transforms** are wired at boot, so disarming those needs a
-  restart.
+  takes effect live for tasks, providers, analysis and the plugin's **web transforms**,
+  and keeps the plugin installed and inert.
 
 ## Roadmap
 
