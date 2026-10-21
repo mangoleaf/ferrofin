@@ -630,19 +630,32 @@ fn apply_end(
 /// Parses an XMLTV timestamp: `YYYYMMDDHHMMSS` optionally followed by a
 /// ` ±HHMM` offset. A missing offset is treated as UTC.
 ///
+/// The XMLTV DTD lets a feed give "some initial substring" of the time
+/// (`200007281733 +0100`). A whole-unit prefix (year, then month, day, hour,
+/// minute) is completed from `20000101000000`, so each missing unit takes its
+/// first value; a prefix that cuts a unit in half is no time. Only numeric
+/// offsets are read: a named zone (`BST`) makes the whole time unreadable.
+///
 /// The declared offset is preserved rather than normalised away — see
 /// [`XmltvProgramme::start`] for why the programme's item GUID depends on it.
 #[must_use]
 pub fn parse_xmltv_time(raw: &str) -> Option<DateTime<FixedOffset>> {
+    const COMPLETION: &str = "20000101000000";
     let raw = raw.trim();
     let (datetime, offset) = match raw.split_once(' ') {
         Some((dt, off)) => (dt, Some(off.trim())),
         None => (raw, None),
     };
-    if datetime.len() < 14 || !datetime.as_bytes()[..14].iter().all(u8::is_ascii_digit) {
+    let digits = datetime.bytes().take_while(u8::is_ascii_digit).count();
+    let given = if digits >= 14 {
+        14
+    } else if digits >= 4 && digits % 2 == 0 && digits == datetime.len() {
+        digits
+    } else {
         return None;
-    }
-    let naive = chrono::NaiveDateTime::parse_from_str(&datetime[..14], "%Y%m%d%H%M%S").ok()?;
+    };
+    let full = format!("{}{}", &datetime[..given], &COMPLETION[given..]);
+    let naive = chrono::NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%S").ok()?;
     let fixed = match offset.filter(|o| !o.is_empty()) {
         Some(o) => parse_offset(o)?,
         None => FixedOffset::east_opt(0)?,
@@ -653,7 +666,12 @@ pub fn parse_xmltv_time(raw: &str) -> Option<DateTime<FixedOffset>> {
 /// Parses a `±HHMM` numeric timezone offset into a [`FixedOffset`].
 fn parse_offset(o: &str) -> Option<FixedOffset> {
     let bytes = o.as_bytes();
-    if bytes.len() != 5 || (bytes[0] != b'+' && bytes[0] != b'-') {
+    // Every byte after the sign must be an ASCII digit before the string is
+    // sliced: a multi-byte character there would split at a non-boundary.
+    if bytes.len() != 5
+        || (bytes[0] != b'+' && bytes[0] != b'-')
+        || !bytes[1..].iter().all(u8::is_ascii_digit)
+    {
         return None;
     }
     let hours: i32 = o[1..3].parse().ok()?;
@@ -871,7 +889,35 @@ mod tests {
         let t = parse_xmltv_time("20260101120000").unwrap();
         assert_eq!(t.to_rfc3339(), "2026-01-01T12:00:00+00:00");
         assert!(parse_xmltv_time("garbage").is_none());
-        assert!(parse_xmltv_time("2026").is_none());
+    }
+
+    /// The XMLTV DTD: a time is `YYYYMMDDhhmmss`, of which "some initial
+    /// substring" may be given, the missing units taking their first value. A
+    /// unit is never cut in half, and an offset is `+hhmm`/`-hhmm`; anything
+    /// else is no time, never a panic.
+    #[rstest::rstest]
+    #[case("200007281733 +0100", Some("2000-07-28T17:33:00+01:00"))]
+    #[case("2000072817", Some("2000-07-28T17:00:00+00:00"))]
+    #[case("20000728", Some("2000-07-28T00:00:00+00:00"))]
+    #[case("200007", Some("2000-07-01T00:00:00+00:00"))]
+    #[case("2026", Some("2026-01-01T00:00:00+00:00"))]
+    #[case("20000728173", None)]
+    #[case("200", None)]
+    #[case("20260725060000 -0530", Some("2026-07-25T06:00:00-05:30"))]
+    #[case("20260725060000 +0é0", None)]
+    #[case("20260725060000 +01é", None)]
+    #[case("20260725060000 +01x0", None)]
+    // Unchanged: 14 digits with an attached tail read the 14, as UTC.
+    #[case("20260725060000+0100", Some("2026-07-25T06:00:00+00:00"))]
+    #[case("2026072506000", None)]
+    #[case("202607281733xyz", None)]
+    #[case("200007281733 BST", None)]
+    fn time_parser_follows_the_dtd(#[case] raw: &str, #[case] expected: Option<&str>) {
+        assert_eq!(
+            parse_xmltv_time(raw).map(|t| t.to_rfc3339()).as_deref(),
+            expected,
+            "{raw}"
+        );
     }
 
     /// Jellyfin.XmlTv `SetChannelNumber`: `-` and `_` become `.`, and the
