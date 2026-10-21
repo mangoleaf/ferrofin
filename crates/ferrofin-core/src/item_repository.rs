@@ -2005,19 +2005,13 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
             .push_bind(tag.to_owned())
             .push(")");
         }
-        if let Some(airing) = filter.is_airing {
-            let now = datetime_to_db(chrono::Utc::now());
-            if airing {
-                qb.push(r#" AND ci."StartDate" <= "#)
-                    .push_bind(now.clone())
-                    .push(r#" AND ci."EndDate" >= "#)
-                    .push_bind(now);
-            } else {
-                qb.push(r#" AND ci."StartDate" > "#)
-                    .push_bind(now.clone())
-                    .push(r#" AND ci."EndDate" < "#)
-                    .push_bind(now);
-            }
+        if let Some(is_airing) = filter.is_airing {
+            crate::translate_query::push_is_airing(
+                qb,
+                "ci",
+                is_airing,
+                &datetime_to_db(chrono::Utc::now()),
+            );
         }
     } else {
         if !filter.exclude_item_ids.is_empty() {
@@ -12893,3 +12887,7 @@ pub(crate) async fn by_name_ids_by_clean_name(
 #[cfg(test)]
 #[path = "item_repository/played_state_tests.rs"]
 mod played_state_tests;
+
+#[cfg(test)]
+#[path = "item_repository/is_airing_tests.rs"]
+mod is_airing_tests;

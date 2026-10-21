@@ -4707,10 +4707,8 @@ fn push_program_filters(
                 .push_bind(now_db)
                 .push(")");
         } else {
-            // Accepted divergence: upstream writes `StartDate > now && EndDate
-            // < now`, a contradiction that can never match a programme, so
-            // `isAiring=false` upstream returns nothing at all. Ferrofin reads
-            // it as the negation that was plainly meant.
+            // Not on now: `StartDate > now || EndDate < now`, as v12.2's
+            // `TranslateQuery` has it since jellyfin/jellyfin#17588.
             qb.push(r#"(p."StartDate" > "#)
                 .push_bind(now_db.clone())
                 .push(r#" OR p."EndDate" < "#)
@@ -8010,8 +8008,8 @@ mod tests {
         };
         assert_eq!(titles(&mgr, &airing).await, ["Now Playing", "Two Now"]);
 
-        // Accepted divergence: upstream's `isAiring=false` predicate is a
-        // contradiction that matches nothing; Ferrofin reads it as "not on now".
+        // Not on now: `StartDate > now || EndDate < now`, as v12.2's
+        // `TranslateQuery` has it since jellyfin/jellyfin#17588.
         let not_airing = InternalItemsQuery {
             is_airing: Some(false),
             ..InternalItemsQuery::default()

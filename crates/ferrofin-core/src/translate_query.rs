@@ -1285,6 +1285,31 @@ fn append_type_filters(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuer
     }
 }
 
+/// The `IsAiring` predicate on the item table aliased `alias` (v12.2
+/// `TranslateQuery.cs:433-443`): `true` keeps what is on at `now`
+/// (`StartDate <= now && EndDate >= now`), `false` what is not
+/// (`StartDate > now || EndDate < now`, the negation jellyfin/jellyfin#17588
+/// fixed in v12.0-rc5). `now` is already in the stored date format.
+pub(crate) fn push_is_airing(
+    qb: &mut QueryBuilder<Sqlite>,
+    alias: &str,
+    is_airing: bool,
+    now: &str,
+) {
+    if is_airing {
+        qb.push(format_args!(r#" AND {alias}."StartDate" <= "#))
+            .push_bind(now.to_owned())
+            .push(format_args!(r#" AND {alias}."EndDate" >= "#))
+            .push_bind(now.to_owned());
+    } else {
+        qb.push(format_args!(r#" AND ({alias}."StartDate" > "#))
+            .push_bind(now.to_owned())
+            .push(format_args!(r#" OR {alias}."EndDate" < "#))
+            .push_bind(now.to_owned())
+            .push(")");
+    }
+}
+
 /// Appends the date-range predicates, including the `HasAired` sugar that maps to
 /// an end-date bound relative to now.
 fn append_date_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
@@ -1332,16 +1357,8 @@ fn append_date_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQ
             .push_bind(datetime_to_db(d))
             .push(")");
     }
-    if filter.is_airing == Some(true) {
-        qb.push(r#" AND bi."StartDate" <= "#)
-            .push_bind(datetime_to_db(now))
-            .push(r#" AND bi."EndDate" >= "#)
-            .push_bind(datetime_to_db(now));
-    } else if filter.is_airing == Some(false) {
-        qb.push(r#" AND bi."StartDate" > "#)
-            .push_bind(datetime_to_db(now))
-            .push(r#" AND bi."EndDate" < "#)
-            .push_bind(datetime_to_db(now));
+    if let Some(is_airing) = filter.is_airing {
+        push_is_airing(qb, "bi", is_airing, &datetime_to_db(now));
     }
     if filter.is_unaired == Some(true) {
         qb.push(r#" AND bi."PremiereDate" >= "#)
