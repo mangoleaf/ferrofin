@@ -923,6 +923,7 @@ pub async fn build_app_state(
             .with_item_store(Arc::clone(&item_persistence_service))
             .with_items(Arc::clone(&item_repository))
             .with_physical_root(db.clone(), root_folder_ids.aggregate)
+            .with_user_preferences(db.clone(), Arc::clone(&auth_cache))
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone())
             .with_user_root(user_root_store.clone())
