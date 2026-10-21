@@ -40,7 +40,7 @@ pub(crate) async fn current_session(
             // passing "" would blank the value the login recorded, because
             // `upsert_session` writes this field unconditionally.
             auth.remote_endpoint.as_deref().unwrap_or_default(),
-            &user,
+            Some(&user),
         )
         .await?;
     Ok(session)

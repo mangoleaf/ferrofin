@@ -1545,6 +1545,7 @@ dependencies = [
  "ferrofin-util",
  "if-addrs",
  "libc",
+ "percent-encoding",
  "rstest",
  "serde",
  "serde_json",
