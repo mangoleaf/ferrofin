@@ -558,9 +558,12 @@ impl LibraryScanner {
     /// it keeps what made it due, so the next scan tries it again. After the
     /// albums, every album's artist credits are checked in batches
     /// ([`Self::set_album_people`]), a sweep that does not serve the lane.
+    /// An album in `album_gains` (its tracks' `REPLAYGAIN_ALBUM_GAIN`, read
+    /// by this scan's probes) is due, and takes the gain if it has none.
     pub(super) async fn refresh_music(
         &self,
         work: &[MusicRefresh<'_>],
+        album_gains: &HashMap<Uuid, f64>,
         run: ScanRun<'_>,
         served: &mut Served,
     ) {
@@ -570,8 +573,10 @@ impl LibraryScanner {
         let mut skipped = super::SkippedItems::default();
         for kind in [MusicKind::Artist, MusicKind::Album, MusicKind::ByNameArtist] {
             for item in work.iter().filter(|w| w.kind == kind) {
+                let album_gain = album_gains.get(&item.id).copied();
                 let due = item.aggregate
                     || item.owns_stamp
+                    || album_gain.is_some()
                     || self
                         .music_fetch(item.kind, &item.plan, item.policy, false)
                         .any();
@@ -592,7 +597,8 @@ impl LibraryScanner {
                 // items after it still refresh, and it keeps what made it
                 // due for the next scan.
                 if let Err(err) =
-                    Box::pin(self.refresh_music_item(item, run.cancel, &mut skipped)).await
+                    Box::pin(self.refresh_music_item(item, album_gain, run.cancel, &mut skipped))
+                        .await
                 {
                     skipped.note(item.id, &err);
                 }
@@ -730,7 +736,7 @@ impl LibraryScanner {
                 owns_save: true,
             };
             if let Err(err) =
-                Box::pin(self.refresh_music_item(&work, run.cancel, &mut skipped)).await
+                Box::pin(self.refresh_music_item(&work, None, run.cancel, &mut skipped)).await
             {
                 skipped.note(id, &err);
             }
@@ -800,7 +806,7 @@ impl LibraryScanner {
             owns_save: true,
         };
         let mut skipped = super::SkippedItems::default();
-        let saved = Box::pin(self.refresh_music_item(&work, run.cancel, &mut skipped)).await;
+        let saved = Box::pin(self.refresh_music_item(&work, None, run.cancel, &mut skipped)).await;
         skipped.report("artist refresh");
         let saved = saved?;
         Ok(match saved {
@@ -823,9 +829,11 @@ impl LibraryScanner {
     /// (`BeforeSave` → `UpdateMetadataFromChildren`), the remote metadata
     /// providers merged by the request's mode (`RefreshWithProviders`), the
     /// remote image providers, then the `DateLastRefreshed` stamp and the
-    /// save — only of what changed. Returns whether the item was written;
-    /// `None` when `cancel` stopped it before it was (nothing of it is then
-    /// written).
+    /// save — only of what changed. An album with no `NormalizationGain`
+    /// takes `album_gain`, its tracks' `REPLAYGAIN_ALBUM_GAIN` this scan
+    /// read (`AudioFileProber.FetchDataFromTags`). Returns whether the item
+    /// was written; `None` when `cancel` stopped it before it was (nothing of
+    /// it is then written).
     ///
     /// # Errors
     ///
@@ -835,6 +843,7 @@ impl LibraryScanner {
     async fn refresh_music_item(
         &self,
         work: &MusicRefresh<'_>,
+        album_gain: Option<f64>,
         cancel: &ScanCancel,
         skipped: &mut super::SkippedItems,
     ) -> Result<Option<bool>, ServiceError> {
@@ -1014,6 +1023,11 @@ impl LibraryScanner {
         // directory, which has none (D2).
         row.date_modified = None;
         settle_sort_name(&mut row);
+        // The prober sets it on the album entity whatever the album's lock
+        // (only the track's own lock gates `FetchDataFromTags`).
+        if row.normalization_gain.is_none() {
+            row.normalization_gain = album_gain;
+        }
 
         // The remote image providers, keyed by the ids just settled.
         let (mut images, mut image_failures) = if fetch.any_images() {
@@ -1867,8 +1881,13 @@ impl LibraryScanner {
                 owns_save: kind == MusicKind::ByNameArtist,
             })
             .collect();
-        self.refresh_music(&work, ScanRun::defaults(), &mut Served::new())
-            .await;
+        self.refresh_music(
+            &work,
+            &HashMap::new(),
+            ScanRun::defaults(),
+            &mut Served::new(),
+        )
+        .await;
     }
 }
 

@@ -92,7 +92,10 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     let Some(video) = state.video_stream.as_ref() else {
         return HdrMetadataRemoval::None;
     };
-    if video.video_range != Some(VideoRange::Hdr) {
+    let range_type = video.video_range_type();
+    // An out-of-spec Dolby Vision stream on an SDR base layer still needs its
+    // plan: a Dolby Vision client may not play it (jellyfin#17806).
+    if video.video_range() != VideoRange::Hdr && range_type != VideoRangeType::DoviInvalid {
         return HdrMetadataRemoval::None;
     }
     let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
@@ -109,23 +112,22 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     let has_dovi = wants(VideoRangeType::Dovi);
     let has_dovi_with_el = wants(VideoRangeType::DoviWithEl);
     let has_dovi_with_el_hdr10plus = wants(VideoRangeType::DoviWithElhdr10Plus);
-    let range_type = video.video_range_type;
 
     let mut remove_hdr10plus = false;
     // Case 1: the client plays HDR10 but not an enhancement layer, and this
     // file has one.
     let mut remove_dovi =
-        !has_dovi_with_el && has_hdr10 && range_type == Some(VideoRangeType::DoviWithEl);
+        !has_dovi_with_el && has_hdr10 && range_type == VideoRangeType::DoviWithEl;
 
     // Case 2: a Dolby Vision player refuses a broken DOVI configuration. A
     // client that never claimed DOVI is deliberately left alone — an HDR10
     // player ignores metadata it does not understand rather than crashing, so
     // copying the bad data through is safe and cheaper.
-    remove_dovi = remove_dovi || (has_dovi && range_type == Some(VideoRangeType::DoviInvalid));
+    remove_dovi = remove_dovi || (has_dovi && range_type == VideoRangeType::DoviInvalid);
 
     // Both an enhancement layer and HDR10+ in one file. A client that handles
     // EL but not the combination loses HDR10+; anything else loses DOVI.
-    if range_type == Some(VideoRangeType::DoviWithElhdr10Plus) {
+    if range_type == VideoRangeType::DoviWithElhdr10Plus {
         remove_hdr10plus = has_dovi_with_el && !has_dovi_with_el_hdr10plus;
         remove_dovi = remove_dovi || !remove_hdr10plus;
     }
@@ -136,7 +138,7 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
 
     // A Dolby Vision player is confused by coexisting HDR10+ metadata.
     remove_hdr10plus =
-        remove_hdr10plus || (has_dovi && range_type == Some(VideoRangeType::DoviWithHdr10Plus));
+        remove_hdr10plus || (has_dovi && range_type == VideoRangeType::DoviWithHdr10Plus);
     if remove_hdr10plus {
         HdrMetadataRemoval::RemoveHdr10Plus
     } else {
@@ -353,6 +355,7 @@ pub fn audio_bit_stream_arguments(
 mod tests {
     use super::*;
     use crate::encoding_helper::hw::capabilities::FfmpegCapabilities;
+    use crate::encoding_helper::test_streams::{invalid_dovi, with_range};
     use ferrofin_model::entities::MediaStreamType;
     use rstest::rstest;
 
@@ -360,14 +363,14 @@ mod tests {
     // transliteration written without reference to this file.
 
     fn video(codec: &str, range_type: VideoRangeType) -> MediaStream {
-        MediaStream {
-            codec: Some(codec.to_owned()),
-            index: 0,
-            stream_type: MediaStreamType::Video,
-            video_range: Some(VideoRange::Hdr),
-            video_range_type: Some(range_type),
-            ..MediaStream::default()
-        }
+        with_range(
+            MediaStream {
+                codec: Some(codec.to_owned()),
+                index: 0,
+                ..MediaStream::default()
+            },
+            range_type,
+        )
     }
 
     /// A job carrying `streams`, with nothing else set that matters here.
@@ -508,14 +511,92 @@ mod tests {
     }
 
     #[test]
-    fn an_sdr_stream_never_reaches_the_decision_at_all() {
-        // The range check comes first, before the client's list is even read.
-        let mut stream = video("hevc", VideoRangeType::DoviWithElhdr10Plus);
-        stream.video_range = Some(VideoRange::Sdr);
-        let state = state_with(stream, &["HDR10"]);
+    fn an_sdr_dolby_vision_stream_is_left_alone() {
+        // Dolby Vision on an SDR base layer needs nothing removed. The early
+        // range check only short-cuts it: no SDR range type meets a removal
+        // rule here.
+        let state = state_with(video("hevc", VideoRangeType::DoviWithSdr), &["HDR10"]);
         assert_eq!(
             should_remove_dynamic_hdr_metadata(&state),
             HdrMetadataRemoval::None
+        );
+    }
+
+    // Transliterated from upstream's `EncodingHelperDoviTests` (v12.2,
+    // `tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs`).
+    // Its `CanStreamCopyVideo_InvalidDovi_RequiresRemovalSupportOnlyForDoviClients`
+    // is not ported here: it needs `CanStreamCopyVideo`'s range block (gl-737).
+
+    /// Upstream's `CreateState`: a copy of [`invalid_dovi`].
+    fn invalid_dovi_state(codec: &str, transfer: Option<&str>) -> EncodingJobInfo {
+        let mut state = job(vec![invalid_dovi(codec, transfer)]);
+        state.output_video_codec = Some("copy".to_owned());
+        state
+    }
+
+    /// Only a client that asked for DOVI gets an invalid stream's Dolby
+    /// Vision stripped, whatever its base layer: an SDR base no longer
+    /// skips the decision.
+    #[rstest]
+    #[case("hevc", None, "hevc_metadata=remove_dovi=1")]
+    #[case("hevc", Some("bt709"), "hevc_metadata=remove_dovi=1")]
+    #[case("hevc", Some("smpte2084"), "hevc_metadata=remove_dovi=1")]
+    #[case("hevc", Some("arib-std-b67"), "hevc_metadata=remove_dovi=1")]
+    #[case("av1", None, "av1_metadata=remove_dovi=1")]
+    #[case("av1", Some("bt709"), "av1_metadata=remove_dovi=1")]
+    #[case("av1", Some("smpte2084"), "av1_metadata=remove_dovi=1")]
+    #[case("av1", Some("arib-std-b67"), "av1_metadata=remove_dovi=1")]
+    fn get_bit_stream_args_invalid_dovi_preserves_client_dependent_removal(
+        #[case] codec: &str,
+        #[case] transfer: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let mut state = invalid_dovi_state(codec, transfer);
+        let removal = all_bsf();
+        let no_removal = caps_with(&[]);
+        for (requested, remove_dovi) in [
+            (None, false),
+            (Some("SDR"), false),
+            (Some("HDR10"), false),
+            (Some("DOVIWithEL"), false),
+            (Some("DOVI"), true),
+            (Some("SDR,DOVI"), true),
+        ] {
+            state.base_request.video_range_type = requested.map(str::to_owned);
+            assert_eq!(
+                is_dovi_removed(&removal, &state),
+                remove_dovi,
+                "{requested:?}"
+            );
+            let args = bit_stream_args(&removal, &state, MediaStreamType::Video);
+            if remove_dovi {
+                assert!(
+                    args.as_deref().is_some_and(|a| a.contains(expected)),
+                    "{requested:?}: {args:?}"
+                );
+            } else {
+                assert_eq!(
+                    args.as_deref(),
+                    (codec == "hevc").then_some("-bsf:v hevc_mp4toannexb"),
+                    "{requested:?}"
+                );
+            }
+            assert!(!is_dovi_removed(&no_removal, &state), "{requested:?}");
+        }
+    }
+
+    #[test]
+    fn get_bit_stream_args_valid_dovi_preserves_metadata() {
+        let mut state = invalid_dovi_state("hevc", Some("smpte2084"));
+        let video = state.video_stream.as_mut().unwrap();
+        video.color_space = Some("bt2020nc".to_owned());
+        video.color_primaries = Some("bt2020".to_owned());
+        state.base_request.video_range_type = Some("DOVIWithEL".to_owned());
+        let caps = all_bsf();
+        assert!(!is_dovi_removed(&caps, &state));
+        assert_eq!(
+            bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
+            Some("-bsf:v hevc_mp4toannexb")
         );
     }
 

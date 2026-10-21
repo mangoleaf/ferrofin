@@ -852,3 +852,30 @@ impl ImageProcessor for FakeImages {
         Ok(())
     }
 }
+
+/// A real configuration manager under `dir` whose `PathSubstitutions` hold one
+/// `from` → `to` rule.
+pub async fn configuration_with_path_substitution(
+    dir: &std::path::Path,
+    from: &str,
+    to: &str,
+) -> std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> {
+    use ferrofin_traits::configuration::ServerConfigurationManager as _;
+    let paths = std::sync::Arc::new(crate::FerrofinServerApplicationPaths::new(
+        dir,
+        dir.join("log"),
+        dir.join("config"),
+        dir.join("cache"),
+        dir.join("web"),
+    ));
+    let config = crate::configuration_manager::FerrofinServerConfigurationManager::load(paths)
+        .await
+        .expect("config");
+    let mut settings = (*config.configuration().await.expect("read")).clone();
+    settings.path_substitutions = vec![ferrofin_model::configuration::PathSubstitution {
+        from: from.to_owned(),
+        to: to.to_owned(),
+    }];
+    config.update_configuration(&settings).await.expect("save");
+    std::sync::Arc::new(config)
+}

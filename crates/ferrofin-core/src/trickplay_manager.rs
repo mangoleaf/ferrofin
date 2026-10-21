@@ -458,6 +458,7 @@ impl FerrofinTrickplayManager {
                 max_width: actual_width,
                 qscale: options.qscale,
                 threads: options.process_threads,
+                priority: options.process_priority,
                 output_dir: &frames_dir.to_string_lossy(),
                 allow_hw_accel: options.enable_hw_acceleration,
                 enable_hw_encoding: options.enable_hw_encoding,
@@ -1595,6 +1596,8 @@ mod tests {
         frame_height: u32,
         calls: AtomicUsize,
         last_request: Mutex<Option<(i32, i32)>>,
+        /// The priority the last request carried.
+        last_priority: Mutex<Option<ferrofin_model::configuration::ProcessPriorityClass>>,
         /// The video stream the last request carried, which is what decides
         /// whether the extractor can take the hardware path at all.
         last_stream: Mutex<Option<MediaStream>>,
@@ -1611,6 +1614,7 @@ mod tests {
                 frame_height,
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
+                last_priority: Mutex::new(None),
                 last_stream: Mutex::new(None),
                 last_streams: Mutex::new(Vec::new()),
                 last_output: Mutex::new(None),
@@ -1642,6 +1646,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_request.lock().expect("lock") =
                 Some((request.interval_ms, request.max_width));
+            *self.last_priority.lock().expect("lock") = Some(request.priority);
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
             *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
             let output_dir = request.output_dir;
@@ -1983,6 +1988,30 @@ mod tests {
             "the caught per-width missing-video error never encodes"
         );
         assert!(r.extractor.last_stream().is_none());
+    }
+
+    /// The dashboard's "FFmpeg process priority" (`TrickplayOptions.ProcessPriority`)
+    /// reaches the extraction.
+    #[tokio::test]
+    async fn the_configured_ffmpeg_priority_reaches_the_extraction() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let options = TrickplayOptions {
+            process_priority: ferrofin_model::configuration::ProcessPriorityClass::Idle,
+            ..options_2x2(&[320])
+        };
+        let r = rig(&db, options, FakeExtractor::new(6, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            *r.extractor.last_priority.lock().expect("lock"),
+            Some(ferrofin_model::configuration::ProcessPriorityClass::Idle)
+        );
     }
 
     #[tokio::test]

@@ -425,7 +425,7 @@ pub fn build_accelerated_trickplay_args(
             Some(stream),
         ),
         source_codec: stream.codec.as_deref(),
-        is_dovi: hw::tonemap::is_dovi(Some(stream)),
+        requires_dovi_reshaping: hw::tonemap::requires_dovi_reshaping(Some(stream)),
         is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(Some(stream)),
         subtitle: hw::sw_chain::SubtitleOverlay::None,
     };
@@ -679,7 +679,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
         let plan = self
             .plan(request, &output_pattern, pts_frame_rate, map_index)
             .await;
-        let first = self.run(&plan).await?;
+        let first = self.run(&plan, request.priority).await?;
         if let Some(frames) = Self::frames_of(dir, &first)? {
             return Ok(frames);
         }
@@ -710,7 +710,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
                     map_index,
                 )
                 .await;
-            let second = self.run(&retry).await?;
+            let second = self.run(&retry, request.priority).await?;
             if let Some(frames) = Self::frames_of(dir, &second)? {
                 return Ok(frames);
             }
@@ -852,6 +852,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     async fn run(
         &self,
         plan: &ExtractionPlan,
+        priority: ferrofin_model::configuration::ProcessPriorityClass,
     ) -> Result<crate::encoder::ProcessOutput, ServiceError> {
         // The same convention the transcode manager follows: at debug, the
         // exact argument line. Whether a job took the hardware path is
@@ -868,7 +869,13 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             .await
             .map_err(ServiceError::backend_source)?;
         self.transcoder
-            .get_process_output(&self.ffmpeg_path, &plan.args, true, None, &plan.env)
+            .get_process_output_at_priority(
+                &self.ffmpeg_path,
+                &plan.args,
+                true,
+                &plan.env,
+                priority,
+            )
             .await
             .map_err(|e| MediaEncodingError::process(e).into())
     }
@@ -897,6 +904,8 @@ mod tests {
     struct RecordingTranscoder {
         args: Mutex<Vec<String>>,
         env: Mutex<Vec<Vec<(String, String)>>>,
+        /// The priority each run was asked for.
+        priorities: Mutex<Vec<ferrofin_model::configuration::ProcessPriorityClass>>,
         frames_to_write: usize,
         stderr: String,
         /// Whether the fake ffmpeg exits `0`. Independent of how many frames
@@ -910,6 +919,7 @@ mod tests {
             Self {
                 args: Mutex::new(Vec::new()),
                 env: Mutex::new(Vec::new()),
+                priorities: Mutex::new(Vec::new()),
                 frames_to_write,
                 stderr: stderr.to_owned(),
                 exit_ok: true,
@@ -962,6 +972,22 @@ mod tests {
                 output: self.stderr.clone(),
                 success: self.exit_ok,
             })
+        }
+
+        async fn get_process_output_at_priority(
+            &self,
+            path: &str,
+            arguments: &str,
+            read_stderr: bool,
+            env: &[(String, String)],
+            priority: ferrofin_model::configuration::ProcessPriorityClass,
+        ) -> Result<ProcessOutput, String> {
+            self.priorities
+                .lock()
+                .expect("priorities lock")
+                .push(priority);
+            self.get_process_output(path, arguments, read_stderr, None, env)
+                .await
         }
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
@@ -1052,11 +1078,35 @@ mod tests {
             max_width: 320,
             qscale: 4,
             threads: 1,
+            priority: ferrofin_model::configuration::ProcessPriorityClass::BelowNormal,
             output_dir,
             allow_hw_accel: false,
             enable_hw_encoding: false,
             keyframe_only: false,
         }
+    }
+
+    /// `TrickplayOptions.ProcessPriority` reaches the ffmpeg run
+    /// (`ExtractVideoImagesOnIntervalInternal`'s `priority`).
+    #[tokio::test]
+    async fn the_configured_priority_reaches_the_ffmpeg_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let out_dir = out.to_string_lossy();
+        let req = ferrofin_traits::media_encoding::TrickplayExtraction {
+            priority: ferrofin_model::configuration::ProcessPriorityClass::Idle,
+            ..request("/m/v.mkv", &out_dir)
+        };
+        extractor
+            .extract_trickplay_frames(&req)
+            .await
+            .expect("frames");
+        assert_eq!(
+            *transcoder.priorities.lock().expect("priorities lock"),
+            [ferrofin_model::configuration::ProcessPriorityClass::Idle]
+        );
     }
 
     #[tokio::test]
@@ -1529,13 +1579,23 @@ mod tests {
         let extractor = hardware_extractor(Arc::clone(&transcoder));
         let stream = h264_stream();
 
+        let out_dir = out.to_string_lossy();
+        let req = ferrofin_traits::media_encoding::TrickplayExtraction {
+            priority: ferrofin_model::configuration::ProcessPriorityClass::Idle,
+            ..hardware_request(&stream, &out_dir)
+        };
         let err = extractor
-            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .extract_trickplay_frames(&req)
             .await
             .expect_err("both runs produce nothing");
 
         let recorded = transcoder.recorded();
         assert_eq!(recorded.len(), 2, "the retry ran: {recorded:?}");
+        // The retry runs at the configured priority too.
+        assert_eq!(
+            *transcoder.priorities.lock().expect("priorities lock"),
+            [ferrofin_model::configuration::ProcessPriorityClass::Idle; 2]
+        );
         assert!(recorded[0].contains("-skip_frame nokey"), "{}", recorded[0]);
         assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
         // The retry stays on hardware. Upstream passes the same input, filter
