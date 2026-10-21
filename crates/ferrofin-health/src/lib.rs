@@ -8,9 +8,10 @@
 //!   probing a single dependency: [`check`](HealthChecker::check) +
 //!   [`name`](HealthChecker::name).
 //! - [`FnChecker`] — a helper wrapping an `async` closure as a checker.
-//! - [`health_router`] — an [`axum::Router`] mounting `GET /health/live`
-//!   (process-only `200`) and `GET /health/ready` (runs all checkers; `200` when
-//!   all pass, `503` with the failing names otherwise).
+//! - [`health_router`] — an [`axum::Router`] mounting Jellyfin's `/health`
+//!   (runs all checkers; plain-text `Healthy` / `Unhealthy`, `200` / `503`),
+//!   `GET /health/live` (process-only `200`) and `GET /health/ready` (runs all
+//!   checkers; `200` when all pass, `503` with the failing names otherwise).
 //! - [`HealthApi`] — a [`utoipa::OpenApi`] document for the probe endpoints and
 //!   their response schemas.
 //!
@@ -53,16 +54,30 @@ use utoipa::OpenApi;
 
 /// OpenAPI document for the health probe endpoints.
 ///
-/// Merge this into a service's own [`utoipa::OpenApi`] so `/health/live` and
-/// `/health/ready` appear in the published spec alongside the service's own
-/// paths.
+/// Merge this into a service's own [`utoipa::OpenApi`] so `/health`,
+/// `/health/live` and `/health/ready` appear in the published spec alongside
+/// the service's own paths.
 #[derive(OpenApi)]
 #[openapi(
-    paths(live_doc, ready_doc),
+    paths(health_doc, live_doc, ready_doc),
     components(schemas(LiveResponse, ReadyResponse)),
     tags((name = "health", description = "Liveness and readiness probes")),
 )]
 pub struct HealthApi;
+
+/// OpenAPI stub documenting `GET /health` (the handler itself lives in
+/// [`health_router`]).
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Every check passed", body = String, content_type = "text/plain", example = "Healthy"),
+        (status = 503, description = "A check failed", body = String, content_type = "text/plain", example = "Unhealthy"),
+    ),
+)]
+#[allow(dead_code)]
+fn health_doc() {}
 
 /// OpenAPI stub documenting `GET /health/live` (the handler itself lives in
 /// [`health_router`]).

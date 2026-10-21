@@ -179,7 +179,7 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 4
 
-# -- Readiness probe. Ferrofin serves GET /health/ready (runs dependency checks).
+# -- Readiness probe. Ferrofin serves GET /health/ready (503 when the database does not answer).
 readinessProbe:
   httpGet:
     path: /health/ready
