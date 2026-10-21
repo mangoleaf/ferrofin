@@ -9,6 +9,7 @@
 //! sources, matching Jellyfin's two actions.
 
 use axum::extract::{Path, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,9 +19,12 @@ use ferrofin_model::dlna::{
     DeviceProfile, DlnaProfileType, MediaOptions, StreamBuilder, TranscoderSupport,
 };
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::media_info::{LiveStreamRequest, LiveStreamResponse, PlaybackInfoResponse};
+use ferrofin_model::media_info::{
+    LiveStreamRequest, LiveStreamResponse, MediaProtocol, PlaybackInfoResponse,
+};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::PlayMethod;
+use ferrofin_traits::net::RequestContext;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -211,6 +215,111 @@ async fn resolve_playback_media_sources(
     Ok(sources)
 }
 
+/// The route Live TV serves a shared stream's buffer under.
+const LIVE_STREAM_FILES_ROUTE: &str = "/LiveTv/LiveStreamFiles/";
+
+/// `MediaInfoHelper.RewritePublishedLiveStreamPath`: points an opened live
+/// stream's buffer URL, built on the loopback address for the server's own
+/// ffmpeg and recorder, at the URL this request reached the server by. Only
+/// the response copy changes: the stream the media-source manager holds keeps
+/// its local path. A smart URL that cannot be resolved leaves the path as it
+/// is rather than failing an open that already holds a tuner.
+async fn publish_live_stream_path(
+    state: &AppState,
+    client: &RequestContext,
+    source: &mut MediaSourceInfo,
+) {
+    // Opened live streams always carry a LiveStreamId; this excludes pre-open
+    // and plugin/remote sources.
+    if non_blank(source.live_stream_id.as_deref()).is_none() {
+        return;
+    }
+    let smart_api_url = match state.app_host.get_smart_api_url(client).await {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::warn!(%err, "could not resolve the request's API URL; the live stream path is left as it is");
+            return;
+        }
+    };
+    let base_url = state.app_host.base_url();
+    match published_live_stream_path(
+        &smart_api_url,
+        source.path.as_deref(),
+        source.protocol,
+        &base_url,
+    ) {
+        Some(published) => source.path = Some(published),
+        None if source.path.as_deref().is_some_and(|path| {
+            path.to_ascii_lowercase()
+                .contains(&LIVE_STREAM_FILES_ROUTE.to_ascii_lowercase())
+        }) =>
+        {
+            tracing::debug!(
+                media_source_id = ?source.id,
+                "not rewriting the live stream path: it did not resolve under the request's \
+                 smart API URL and base URL"
+            );
+        }
+        None => {}
+    }
+}
+
+/// `MediaInfoHelper.GetPublishedLiveStreamPath`: `local_path` re-based on
+/// `smart_api_url`, or `None` when it is not a server-hosted HTTP
+/// `[base_url]/LiveTv/LiveStreamFiles/…` URL. The query is kept and a fragment
+/// dropped; `base_url` is appended to the smart URL unless its path already
+/// ends with it.
+fn published_live_stream_path(
+    smart_api_url: &str,
+    local_path: Option<&str>,
+    protocol: MediaProtocol,
+    base_url: &str,
+) -> Option<String> {
+    if protocol != MediaProtocol::Http {
+        return None;
+    }
+    // `Uri.TryCreate(.., Absolute)`; `PathAndQuery` never carries a fragment.
+    let local: axum::http::Uri = local_path?.split('#').next()?.parse().ok()?;
+    local.scheme()?;
+    let mut relative = local.path_and_query()?.as_str();
+    if !base_url.is_empty() {
+        let prefix = format!("{base_url}/");
+        if !relative
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        {
+            return None;
+        }
+        relative = &relative[base_url.len()..];
+    }
+    if !relative
+        .get(..LIVE_STREAM_FILES_ROUTE.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(LIVE_STREAM_FILES_ROUTE))
+    {
+        return None;
+    }
+    let mut published = smart_api_url.trim_end_matches('/').to_owned();
+    if !base_url.is_empty() {
+        let includes_base_url = published
+            .parse::<axum::http::Uri>()
+            .ok()
+            .filter(|uri| uri.scheme().is_some())
+            .is_some_and(|uri| {
+                let path = percent_encoding::percent_decode_str(uri.path()).decode_utf8_lossy();
+                let path = path.trim_end_matches('/');
+                path.len()
+                    .checked_sub(base_url.len())
+                    .and_then(|at| path.get(at..))
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+            });
+        if !includes_base_url {
+            published.push_str(base_url);
+        }
+    }
+    published.push_str(relative);
+    Some(published)
+}
+
 /// `MediaInfoHelper.SortMediaSources` (the v12 form): the queried item's own
 /// source first (it carries the user's resume state for that version), then
 /// direct-playable files, direct-playable or -streamable sources, files, and
@@ -220,7 +329,6 @@ fn sort_media_sources(
     max_bitrate: Option<i32>,
     preferred_item_id: Uuid,
 ) {
-    use ferrofin_model::media_info::MediaProtocol;
     let preferred_id =
         (!preferred_item_id.is_nil()).then(|| preferred_item_id.simple().to_string());
     sources.sort_by_key(|s| {
@@ -251,6 +359,7 @@ fn sort_media_sources(
 async fn playback_info(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
+    client: &RequestContext,
     item_id: Uuid,
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
@@ -274,6 +383,10 @@ async fn playback_info(
             play_session_id: None,
             error_code: Some(ferrofin_model::dlna::PlaybackErrorCode::NoCompatibleStream),
         });
+    }
+    // `GetPlaybackInfo` rewrites its clones before any device-specific data.
+    for source in &mut media_sources {
+        publish_live_stream_path(state, client, source).await;
     }
 
     // Stamp `HasSegments` from the media-segment store (upstream
@@ -377,8 +490,10 @@ async fn playback_info(
                     .always_burn_in_subtitle_when_transcoding,
                 direct_play_protocols: vec![ferrofin_model::media_info::MediaProtocol::Http],
             };
-            // The same open as `POST /LiveStreams/Open`.
-            media_sources = vec![state.media_sources.open_live_stream(&open).await?];
+            // The same open as `POST /LiveStreams/Open`, published the same way.
+            let mut opened = state.media_sources.open_live_stream(&open).await?;
+            publish_live_stream_path(state, client, &mut opened).await;
+            media_sources = vec![opened];
         }
     }
 
@@ -1080,6 +1195,7 @@ async fn get_playback_info(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
+    parts: Parts,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
     // The GET form carries no device profile, so every source keeps its static
     // (direct-play) shape.
@@ -1088,7 +1204,10 @@ async fn get_playback_info(
         flags: flags_from(&query, None),
         ..PlaybackRequest::default()
     };
-    Ok(Json(playback_info(&state, &auth, item_id, request).await?))
+    let client = super::system::context_from_parts(&state, &parts);
+    Ok(Json(
+        playback_info(&state, &auth, &client, item_id, request).await?,
+    ))
 }
 
 /// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
@@ -1187,6 +1306,7 @@ async fn post_playback_info(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
+    parts: Parts,
     body: Option<JsonBody<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
     let mut body = body.map(|JsonBody(b)| b).unwrap_or_default();
@@ -1227,7 +1347,10 @@ async fn post_playback_info(
         },
         flags: flags_from(&query, Some(&body)),
     };
-    Ok(Json(playback_info(&state, &auth, item_id, request).await?))
+    let client = super::system::context_from_parts(&state, &parts);
+    Ok(Json(
+        playback_info(&state, &auth, &client, item_id, request).await?,
+    ))
 }
 
 /// Query parameters for `POST /LiveStreams/Open`.
@@ -1350,6 +1473,7 @@ async fn open_live_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<OpenLiveStreamQuery>,
+    parts: Parts,
     body: Option<JsonBody<OpenLiveStreamDto>>,
 ) -> Result<Json<LiveStreamResponse>, ApiError> {
     let dto = body.map(|JsonBody(dto)| dto).unwrap_or_default();
@@ -1360,7 +1484,9 @@ async fn open_live_stream(
     // stream — and a tuner — under another account's identity.
     let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
     let request = live_stream_request(query, dto, effective);
-    let media_source = state.media_sources.open_live_stream(&request).await?;
+    let mut media_source = state.media_sources.open_live_stream(&request).await?;
+    let client = super::system::context_from_parts(&state, &parts);
+    publish_live_stream_path(&state, &client, &mut media_source).await;
     Ok(Json(LiveStreamResponse::new(media_source)))
 }
 
@@ -1501,6 +1627,74 @@ crate::query::query_parameters! {
     OpenLiveStreamQuery {} => [("post", "/LiveStreams/Open")];
     CloseLiveStreamQuery {} => [("post", "/LiveStreams/Close")];
     BitrateTestQuery {} => [("get", "/Playback/BitrateTest")];
+}
+
+#[cfg(test)]
+mod published_live_stream_path_tests {
+    use super::published_live_stream_path;
+    use ferrofin_model::media_info::MediaProtocol;
+
+    /// `MediaInfoHelperTests.LiveStreamFilesPath`.
+    const LIVE: &str = "/LiveTv/LiveStreamFiles/abc/stream.ts";
+
+    /// `MediaInfoHelperTests.GetPublishedLiveStreamPath_VariousInputs_ReturnsExpected`
+    /// (v12.2), row for row.
+    #[rstest::rstest]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com/", &format!("http://172.19.0.3:8096{LIVE}?token=1"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}?token=1")))]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096{LIVE}#fragment"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com", &format!("https://172.19.0.3:8920{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com", &format!("http://192.168.1.10:8096{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com:8920", &format!("http://172.19.0.3:8096{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com:8920{LIVE}")))]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://media.example.com/jellyfin{LIVE}")))]
+    #[case("https://jellyfin", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://jellyfin/jellyfin{LIVE}")))]
+    #[case("https://media.example.com/jellyfin", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://media.example.com/jellyfin{LIVE}")))]
+    #[case("https://media.example.com/jellyfin/", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://media.example.com/jellyfin{LIVE}")))]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096/jellyfin2{LIVE}"), MediaProtocol::Http, "/jellyfin", None)]
+    #[case(
+        "https://media.example.com",
+        "/media/livetv/buffer/abc/stream.ts",
+        MediaProtocol::File,
+        "",
+        None
+    )]
+    #[case(
+        "https://media.example.com",
+        "not a uri",
+        MediaProtocol::Http,
+        "",
+        None
+    )]
+    fn get_published_live_stream_path_various_inputs_returns_expected(
+        #[case] smart_api_url: &str,
+        #[case] local_path: &str,
+        #[case] protocol: MediaProtocol,
+        #[case] base_url: &str,
+        #[case] expected: Option<String>,
+    ) {
+        assert_eq!(
+            published_live_stream_path(smart_api_url, Some(local_path), protocol, base_url),
+            expected
+        );
+    }
+
+    /// `OpenMediaSource_NotAPublishableLiveStreamFilesPath_PathUnchanged`: a
+    /// tuner's own URL, a file, another server route and a library `.strm`
+    /// are never rewritten.
+    #[rstest::rstest]
+    #[case(MediaProtocol::Http, "http://192.168.1.50:5004/live/channel1.ts")]
+    #[case(MediaProtocol::File, "/media/livetv/buffer/abc/stream.ts")]
+    #[case(MediaProtocol::Http, "http://172.19.0.3:8096/Videos/abc/stream.ts")]
+    #[case(MediaProtocol::Http, "http://172.19.0.3:8096/library/movie.strm")]
+    fn a_path_outside_the_live_stream_buffer_is_left_alone(
+        #[case] protocol: MediaProtocol,
+        #[case] path: &str,
+    ) {
+        assert_eq!(
+            published_live_stream_path("https://media.example.com", Some(path), protocol, ""),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
