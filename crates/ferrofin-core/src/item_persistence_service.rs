@@ -124,6 +124,139 @@ fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     }
 }
 
+/// Replaces `item_id`'s `ItemValues` links with `values`, inside `tx`: the
+/// body of [`ItemPersistenceService::save_item_values`], shared with its
+/// batched form.
+async fn write_item_values(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    item_id: Uuid,
+    values: &[(i32, String)],
+) -> Result<(), ServiceError> {
+    let id = guid_to_db(item_id);
+    // Whether this item's genres are *music* genres, which get their own
+    // by-name row (see `music_genre_row`). One `SELECT` on the primary key,
+    // on a write path that already runs several statements per item.
+    let owner_type: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Type" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    let owner_is_music = owner_type.is_some_and(|t| MUSIC_GENRE_TYPES.contains(&t.as_str()));
+    // Rewrite this item's links; the shared ItemValues rows are kept.
+    sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
+        .bind(&id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    for (type_, value) in values {
+        if value.is_empty() {
+            continue;
+        }
+        let clean = crate::text_util::get_clean_value(value);
+        // Get-or-create the (Type, Value) row (unique index on Type+Value).
+        let new_id = guid_to_db(Uuid::new_v4());
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+               VALUES (?1,?2,?3,?4)"#,
+        )
+        .bind(&new_id)
+        .bind(&clean)
+        .bind(type_)
+        .bind(value)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        let value_id: String = sqlx::query_scalar(
+            r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1 AND "Value" = ?2"#,
+        )
+        .bind(type_)
+        .bind(value)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO "ItemValuesMap" ("ItemValueId","ItemId") VALUES (?1,?2)"#,
+        )
+        .bind(&value_id)
+        .bind(&id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        // Materialize the browsable by-name item (genre/studio) sharing the
+        // ItemValueId as its id, so the Genres/Studios tabs list it, the
+        // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
+        // (which resolves the id → BaseItems.CleanName) matches. Faithful to
+        // Jellyfin, where genres/studios are BaseItems; here their id is the
+        // shared value id, and the DTO's genre/studio links find the row by
+        // type and name (`item_repository::by_name_ids_by_clean_name`).
+        // A music item's genre materializes ONLY as a `MusicGenre` row.
+        // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
+        // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
+        // `Ambient` as a MusicGenre and nothing else; writing a `Genre` row
+        // too returns the name twice from `/Search/Hints` and lists a
+        // phantom entry on the Genres tab.
+        let music_genre =
+            owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre);
+        if let (false, Some(type_name)) = (music_genre, by_name_type_name(*type_)) {
+            sqlx::query(
+                // `SortName` persisted, not derived on read — see
+                // `people_repository`. Without it the Genres/Studios tabs
+                // (which sort on it) come back unsorted and
+                // `nameStartsWith` matches nothing.
+                // `PresentationUniqueKey` too: a by-name row's key is
+                // `{Type}-{Name}` (see `kinds::presentation_unique_key`),
+                // and this insert bypasses `upsert_item`, so without it
+                // the column stays NULL where Jellyfin writes
+                // `Genre-Action` — 23,186 such rows on a real library.
+                // The existence guard is by **type and name**, not by id
+                // (`OR IGNORE` keys on the PRIMARY KEY, which is the
+                // `ItemValueId` — a fresh guid every first write). A
+                // `MusicArtist` the scanner resolved from an artist
+                // DIRECTORY already carries that CleanName under its
+                // path-derived id, and `item_repository::push_by_name_join`
+                // joins `agg.cval = bi."CleanName"`, so a second row here
+                // would list every artist TWICE on /Artists. Same shape as
+                // `music_genre_row`, and the same reason an adopted
+                // Jellyfin database (whose by-name rows carry Jellyfin's
+                // ids) must not get a duplicate laid beside each row.
+                // `IsFolder` is 0, as in `ensure_by_name_item`: the row has
+                // no parent, so even a `MusicArtist` is `IsAccessedByName`
+                // (`MusicArtist.cs:30-33`, `IsFolder => !IsAccessedByName`).
+                r#"INSERT INTO "BaseItems"
+                   ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+                    "IsFolder","IsInMixedFolder",
+                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+                   SELECT ?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
+            )
+            .bind(&value_id)
+            .bind(type_name)
+            .bind(value)
+            .bind(&clean)
+            .bind(ferrofin_util::sort_name::create_sort_name(value))
+            .bind(by_name_kind(*type_).map(|kind| {
+                crate::kinds::presentation_unique_key(
+                    kind,
+                    Uuid::parse_str(&value_id).unwrap_or_default(),
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                )
+            }))
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+        }
+        if music_genre {
+            music_genre_row(tx, value, &clean).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Materializes the browsable `MusicGenre` row for a genre carried by a music
 /// item, if the database does not already have one under that name.
 ///
@@ -2428,128 +2561,18 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         values: &[(i32, String)],
     ) -> Result<(), ServiceError> {
-        let id = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        // Whether this item's genres are *music* genres, which get their own
-        // by-name row (see `music_genre_row`). One `SELECT` on the primary key,
-        // on a write path that already runs several statements per item.
-        let owner_type: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Type" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        let owner_is_music = owner_type.is_some_and(|t| MUSIC_GENRE_TYPES.contains(&t.as_str()));
-        // Rewrite this item's links; the shared ItemValues rows are kept.
-        sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        for (type_, value) in values {
-            if value.is_empty() {
-                continue;
-            }
-            let clean = crate::text_util::get_clean_value(value);
-            // Get-or-create the (Type, Value) row (unique index on Type+Value).
-            let new_id = guid_to_db(Uuid::new_v4());
-            sqlx::query(
-                r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
-                   VALUES (?1,?2,?3,?4)"#,
-            )
-            .bind(&new_id)
-            .bind(&clean)
-            .bind(type_)
-            .bind(value)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            let value_id: String = sqlx::query_scalar(
-                r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1 AND "Value" = ?2"#,
-            )
-            .bind(type_)
-            .bind(value)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            sqlx::query(
-                r#"INSERT OR IGNORE INTO "ItemValuesMap" ("ItemValueId","ItemId") VALUES (?1,?2)"#,
-            )
-            .bind(&value_id)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            // Materialize the browsable by-name item (genre/studio) sharing the
-            // ItemValueId as its id, so the Genres/Studios tabs list it, the
-            // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
-            // (which resolves the id → BaseItems.CleanName) matches. Faithful to
-            // Jellyfin, where genres/studios are BaseItems; here their id is the
-            // shared value id, and the DTO's genre/studio links find the row by
-            // type and name (`item_repository::by_name_ids_by_clean_name`).
-            // A music item's genre materializes ONLY as a `MusicGenre` row.
-            // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
-            // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
-            // `Ambient` as a MusicGenre and nothing else; writing a `Genre` row
-            // too returns the name twice from `/Search/Hints` and lists a
-            // phantom entry on the Genres tab.
-            let music_genre =
-                owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre);
-            if let (false, Some(type_name)) = (music_genre, by_name_type_name(*type_)) {
-                sqlx::query(
-                    // `SortName` persisted, not derived on read — see
-                    // `people_repository`. Without it the Genres/Studios tabs
-                    // (which sort on it) come back unsorted and
-                    // `nameStartsWith` matches nothing.
-                    // `PresentationUniqueKey` too: a by-name row's key is
-                    // `{Type}-{Name}` (see `kinds::presentation_unique_key`),
-                    // and this insert bypasses `upsert_item`, so without it
-                    // the column stays NULL where Jellyfin writes
-                    // `Genre-Action` — 23,186 such rows on a real library.
-                    // The existence guard is by **type and name**, not by id
-                    // (`OR IGNORE` keys on the PRIMARY KEY, which is the
-                    // `ItemValueId` — a fresh guid every first write). A
-                    // `MusicArtist` the scanner resolved from an artist
-                    // DIRECTORY already carries that CleanName under its
-                    // path-derived id, and `item_repository::push_by_name_join`
-                    // joins `agg.cval = bi."CleanName"`, so a second row here
-                    // would list every artist TWICE on /Artists. Same shape as
-                    // `music_genre_row`, and the same reason an adopted
-                    // Jellyfin database (whose by-name rows carry Jellyfin's
-                    // ids) must not get a duplicate laid beside each row.
-                    // `IsFolder` is 0, as in `ensure_by_name_item`: the row has
-                    // no parent, so even a `MusicArtist` is `IsAccessedByName`
-                    // (`MusicArtist.cs:30-33`, `IsFolder => !IsAccessedByName`).
-                    r#"INSERT INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
-                        "IsFolder","IsInMixedFolder",
-                        "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       SELECT ?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0
-                       WHERE NOT EXISTS (
-                           SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
-                )
-                .bind(&value_id)
-                .bind(type_name)
-                .bind(value)
-                .bind(&clean)
-                .bind(ferrofin_util::sort_name::create_sort_name(value))
-                .bind(by_name_kind(*type_).map(|kind| {
-                    crate::kinds::presentation_unique_key(
-                        kind,
-                        Uuid::parse_str(&value_id).unwrap_or_default(),
-                        Some(value),
-                        None,
-                        None,
-                        None,
-                    )
-                }))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            }
-            if music_genre {
-                music_genre_row(&mut tx, value, &clean).await?;
-            }
+        write_item_values(&mut tx, item_id, values).await?;
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn save_item_values_for_items(
+        &self,
+        items: &[(Uuid, Vec<(i32, String)>)],
+    ) -> Result<(), ServiceError> {
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for (item_id, values) in items {
+            write_item_values(&mut tx, *item_id, values).await?;
         }
         tx.commit().await.map_err(db_err)
     }
@@ -8172,6 +8195,84 @@ mod tests {
         .await
         .expect("count links");
         assert_eq!(linked, 1);
+    }
+
+    /// Every `ItemValues` link and by-name row, by value rather than by the
+    /// random `ItemValueId`, so two databases written the same way compare equal.
+    async fn item_value_state(db: &ferrofin_db::Database) -> Vec<String> {
+        let links: Vec<(String, i32, String)> = sqlx::query_as(
+            r#"SELECT m."ItemId", v."Type", v."Value" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("links");
+        let by_name: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "Type", "Name" FROM "BaseItems" WHERE "Path" IS NULL AND "Name" IS NOT NULL"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("by-name rows");
+        let mut state: Vec<String> = links
+            .into_iter()
+            .map(|(item, type_, value)| format!("link {item} {type_} {value}"))
+            .chain(
+                by_name
+                    .into_iter()
+                    .map(|(type_, name)| format!("row {type_} {name}")),
+            )
+            .collect();
+        state.sort();
+        state
+    }
+
+    /// The batched write leaves exactly what one `save_item_values` per item
+    /// leaves: the links replaced (an empty list clears them), the by-name
+    /// rows materialized once, and a music item's genre kept a `MusicGenre`.
+    #[tokio::test]
+    async fn save_item_values_for_items_matches_one_write_per_item() {
+        let movie = Uuid::new_v4();
+        let track = Uuid::new_v4();
+        let cleared = Uuid::new_v4();
+        let items = vec![
+            (movie, vec![(2, "News".to_owned()), (3, "A24".to_owned())]),
+            (track, vec![(2, "News".to_owned())]),
+            (cleared, Vec::new()),
+        ];
+        let mut states = Vec::new();
+        for batched in [false, true] {
+            let db = test_db().await;
+            seed_item(&db, movie, BaseItemKind::Movie).await;
+            seed_item(&db, track, BaseItemKind::Audio).await;
+            seed_item(&db, cleared, BaseItemKind::Movie).await;
+            let svc = FerrofinItemPersistenceService::new(db.clone());
+            svc.save_item_values(cleared, &[(2, "Drama".to_owned())])
+                .await
+                .expect("an earlier link");
+            if batched {
+                svc.save_item_values_for_items(&items)
+                    .await
+                    .expect("batched write");
+            } else {
+                for (id, values) in &items {
+                    svc.save_item_values(*id, values).await.expect("one write");
+                }
+            }
+            states.push(item_value_state(&db).await);
+        }
+        assert_eq!(states[0], states[1]);
+        let cleared_links = states[1]
+            .iter()
+            .filter(|line| line.starts_with(&format!("link {}", guid_to_db(cleared))))
+            .count();
+        assert_eq!(cleared_links, 0, "an empty list clears the item's links");
+        assert!(
+            states[1]
+                .iter()
+                .any(|line| line.ends_with("MusicGenre News")),
+            "{:?}",
+            states[1]
+        );
     }
 
     // The library scan rebuilds entities from disk with no merge link and a
