@@ -108,6 +108,9 @@ struct ArtworkCache {
     resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
     track_albums: HashMap<Uuid, Uuid>,
+    /// Album → the first `REPLAYGAIN_ALBUM_GAIN` its unlocked tracks' probes
+    /// read this scan, for the music pass to store on an album that has none.
+    album_gains: HashMap<Uuid, f64>,
     /// Album → immutable shared cover, including dimensions and blurhash.
     album_covers: HashMap<Uuid, ItemImageInfo>,
     /// Albums containing tracks scanned before a usable cover was found.
@@ -6515,7 +6518,8 @@ impl LibraryScanner {
             return false;
         }
         let mut served = work.served.clone();
-        self.refresh_music(&work.music, run, &mut served).await;
+        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+            .await;
         self.finish_album_artwork(art_cache, run).await;
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
@@ -6793,6 +6797,17 @@ impl LibraryScanner {
             entity.parent_index_number = guesses.parent_index_number;
         }
         let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
+        // `if (audio.AlbumEntity is not null && !audio.AlbumEntity.
+        // NormalizationGain.HasValue)` in `FetchDataFromTags`, which runs for
+        // an unlocked track only: the first tagged track names its album's
+        // gain, which the music pass stores ([`refresh_music`]).
+        if !locked
+            && probe.is_audio
+            && let Some(gain) = probe.info.as_ref().and_then(crate::audio_tags::album_gain)
+            && let Some(album) = state.art_cache.track_albums.get(&item.id).copied()
+        {
+            state.art_cache.album_gains.entry(album).or_insert(gain);
+        }
         Self::apply_shortcut(&mut entity, plan.probe).await;
         // "Identify → Apply" (`POST /Items/RemoteSearch/Apply`): the chosen
         // result rides on the options of the items the refresh covers.
@@ -8112,7 +8127,8 @@ impl LibraryScanner {
         let mut served = work.served.clone();
         let started = std::time::Instant::now();
         // Music: each album's and artist's providers as the walk decided.
-        self.refresh_music(&work.music, run, &mut served).await;
+        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+            .await;
         timings.music = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
