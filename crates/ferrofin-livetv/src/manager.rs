@@ -2093,19 +2093,35 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // `Limit` must reach the query). The rows then project through the DTO
         // service exactly like `LiveTvManager.GetPrograms`: `RemoveFields` on
         // the list path, then the programme/recording post-passes.
-        // `SeriesTimerId` scopes the guide to one series timer's airings by the
-        // timer's `SeriesId`. Ferrofin's stored `SeriesTimerInfoDto` carries no
-        // series id, so the scope can never be built — and upstream is explicit
-        // about that case: "Better to return nothing than every program in the
-        // database" (`LiveTvManager.GetPrograms`), which is exactly what
-        // returning the unscoped guide would do.
-        if query
+        //
+        // `SeriesTimerId` scopes the guide to one series timer's airings: the
+        // timer whose internal id matches, ignoring case (stored ids are the
+        // lower-case `N` form), sets `ExternalSeriesId` to its `SeriesId`. An
+        // unknown timer, or one with no series id, answers nothing: "Better to
+        // return nothing than every program in the database".
+        let scoped;
+        let query = match query
             .series_timer_id
             .as_deref()
-            .is_some_and(|id| !id.trim().is_empty())
+            .filter(|id| !id.trim().is_empty())
         {
-            return Ok(QueryResult::default());
-        }
+            Some(id) => {
+                let series_id = self
+                    .stored_series_timer(&id.to_ascii_lowercase())
+                    .await?
+                    .and_then(|timer| timer.series_id)
+                    .filter(|series_id| !series_id.trim().is_empty());
+                let Some(series_id) = series_id else {
+                    return Ok(QueryResult::default());
+                };
+                scoped = InternalItemsQuery {
+                    external_series_id: Some(series_id),
+                    ..query.clone()
+                };
+                &scoped
+            }
+            None => query,
+        };
 
         // One clock for both the row query and the count query: an
         // `isAiring`/`hasAired` request must not see a programme flip state
@@ -8214,25 +8230,7 @@ mod tests {
 
     /// A manager whose guide holds [`series_guide`] over the two [`M3U`] channels.
     async fn manager_with_series_guide() -> FerrofinLiveTvManager {
-        let mut sources = HashMap::new();
-        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), series_guide());
-        let mgr = manager_with(FakeFetcher(sources)).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            type_: Some("m3u".to_owned()),
-            url: Some("http://tuner/playlist.m3u".to_owned()),
-            ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
-        mgr.save_listing_provider(ListingsProviderInfo {
-            path: Some("http://guide/xmltv.xml".to_owned()),
-            ..ListingsProviderInfo::default()
-        })
-        .await
-        .expect("provider");
-        mgr.refresh_guide().await.expect("refresh");
-        mgr
+        manager_with_guide(series_guide()).await
     }
 
     /// The guide rows on the first channel whose title matches, start-date ascending.
@@ -9653,41 +9651,90 @@ mod tests {
         );
     }
 
-    /// `seriesTimerId` cannot be scoped (Ferrofin's series timers carry no
-    /// series id), so upstream's "better to return nothing than every program
-    /// in the database" branch applies — but a blank value must NOT blank the
-    /// guide, or an empty `?seriesTimerId=` query param would.
+    /// `LiveTvManager.GetPrograms`' `SeriesTimerId`: the series timer whose
+    /// internal id matches (ignoring case) scopes the guide to its `SeriesId`,
+    /// the listings series id its programme carried. An unknown timer, or one
+    /// with no series id, answers nothing ("Better to return nothing than
+    /// every program in the database"), and a blank value scopes nothing.
     #[tokio::test]
-    async fn series_timer_scope_returns_nothing_and_ignores_a_blank_value() {
-        let mgr = manager_with_relative_guide().await;
-        let scoped = mgr
-            .get_programs(
-                &InternalItemsQuery {
-                    series_timer_id: Some("st-x".to_owned()),
-                    ..InternalItemsQuery::default()
-                },
-                &DtoOptions::default(),
-            )
+    async fn series_timer_id_scopes_the_guide_to_the_timers_series() {
+        use std::fmt::Write as _;
+        let now = Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        // "Recurring" carries episode numbers, so its listings have a series
+        // id; "Movie Night" carries none.
+        for (channel, from, to, title, episode) in [
+            ("one.tv", 60, 120, "Recurring", Some("0.0.")),
+            ("one.tv", 1500, 1560, "Recurring", Some("0.1.")),
+            ("two.tv", 90, 150, "Recurring", Some("0.2.")),
+            ("one.tv", 200, 260, "Something Else", Some("0.0.")),
+            ("one.tv", 300, 400, "Movie Night", None),
+        ] {
+            let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
+            let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
+            let episode = episode.map_or_else(String::new, |e| {
+                format!("<episode-num system=\"xmltv_ns\">{e}</episode-num>")
+            });
+            let _ = write!(
+                xml,
+                "<programme start=\"{start} +0000\" stop=\"{stop} +0000\" channel=\"{channel}\">\
+                 <title>{title}</title>{episode}</programme>"
+            );
+        }
+        xml.push_str("</tv>");
+        let mgr = manager_with_guide(xml).await;
+        let titles = |query: InternalItemsQuery| {
+            let mgr = &mgr;
+            async move {
+                let mut names: Vec<String> = mgr
+                    .get_programs(&query, &DtoOptions::default())
+                    .await
+                    .expect("programs")
+                    .items
+                    .into_iter()
+                    .filter_map(|p| p.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        let scoped = |id: &str| InternalItemsQuery {
+            series_timer_id: Some(id.to_owned()),
+            ..InternalItemsQuery::default()
+        };
+
+        let first = airings_of(&mgr, "Recurring").await;
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, &first[0]).await)
             .await
-            .expect("scoped");
-        assert!(scoped.items.is_empty());
-        assert_eq!(scoped.total_record_count, 0);
-        assert_eq!(scoped.start_index, 0);
+            .expect("create st");
+        for id in [st_id.clone(), st_id.to_uppercase()] {
+            assert_eq!(
+                titles(scoped(&id)).await,
+                ["Recurring", "Recurring", "Recurring"],
+                "{id}"
+            );
+        }
+        assert!(
+            titles(scoped("not-a-timer")).await.is_empty(),
+            "unknown timer"
+        );
+
+        // A series timer whose programme carried no series id scopes nothing.
+        let movie = airings_of(&mgr, "Movie Night").await;
+        let movie_st = mgr
+            .create_series_timer(defaults_for(&mgr, &movie[0]).await)
+            .await
+            .expect("create movie st");
+        assert!(titles(scoped(&movie_st)).await.is_empty(), "no series id");
 
         for blank in ["", "   "] {
-            let unscoped = mgr
-                .get_programs(
-                    &InternalItemsQuery {
-                        series_timer_id: Some(blank.to_owned()),
-                        ..InternalItemsQuery::default()
-                    },
-                    &DtoOptions::default(),
-                )
-                .await
-                .expect("blank");
             assert_eq!(
-                unscoped.items.len(),
-                4,
+                titles(scoped(blank)).await.len(),
+                5,
                 "a blank seriesTimerId must not blank the guide ({blank:?})"
             );
         }
