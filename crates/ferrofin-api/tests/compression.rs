@@ -31,7 +31,7 @@ use ferrofin_api::test_support::{
 use ferrofin_model::system::{PublicSystemInfo, SystemInfo};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
-use ferrofin_traits::system::{ServerApplicationHost, SystemManager};
+use ferrofin_traits::system::{LocalApiAccess, ServerApplicationHost, SystemManager};
 use tower::ServiceExt;
 
 /// The public system-info route: unauthenticated, `application/json`, and — with
@@ -88,6 +88,13 @@ impl SystemManager for StubSystem {
 
 /// A minimal [`ServerApplicationHost`] with neutral getters.
 struct StubHost;
+
+#[async_trait]
+impl LocalApiAccess for StubHost {
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        unimplemented!("not routed by these tests")
+    }
+}
 
 #[async_trait]
 impl ServerApplicationHost for StubHost {
