@@ -233,6 +233,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- An episode, season or music track stored without a sort name, which the startup repair
+  fills, now sorts by its numbers, as Jellyfin's own sort names do. Before, the repair gave
+  it an alphabetical key, which put episodes out of order and could break "next episode"
 
 ## [1.0.0] - 2026-09-05
 

@@ -1661,20 +1661,10 @@ fn written_columns(item: &BaseItemEntity) -> Vec<(&'static str, Column)> {
     // => false` and keeps its name — or its forced sort name — verbatim.
     // Deriving the generic key for a `Person` here lower-cased rows the
     // people repository had written correctly.
-    let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
-    let sort_name = item.sort_name.clone().or_else(|| {
-        let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
-        match forced {
-            Some(f) => Some(match sort_kind {
-                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                None => ferrofin_util::sort_name::forced_sort_key(f),
-            }),
-            None => item.name.as_deref().map(|n| match sort_kind {
-                Some(kind) => crate::kinds::sort_name_for(kind, n),
-                None => ferrofin_util::sort_name::create_sort_name(n),
-            }),
-        }
-    });
+    let sort_name = item
+        .sort_name
+        .clone()
+        .or_else(|| crate::kinds::fallback_sort_name(item));
     columns_of(item, clean_name, presentation_unique_key, sort_name)
 }
 
@@ -5529,8 +5519,17 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
 /// # Errors
 /// Returns [`ServiceError`] if the read or the write fails.
 pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, ServiceError> {
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        r#"SELECT "Id", "Name", "ForcedSortName", "Type" FROM "BaseItems"
+    type Unsorted = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<i64>,
+    );
+    let rows: Vec<Unsorted> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "ForcedSortName", "Type", "IndexNumber", "ParentIndexNumber"
+           FROM "BaseItems"
            WHERE "SortName" IS NULL AND "Name" IS NOT NULL AND "Name" <> ''
              AND "Type" <> 'PLACEHOLDER'"#,
     )
@@ -5542,22 +5541,22 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for (id, name, forced, type_name) in &rows {
-        // `Type` is selected so the per-kind `GetSortName` branch applies to
-        // both the derived and the forced key: a `Person` keeps its name
-        // verbatim (`EnableAlphaNumericSorting => false`). Backfilling the
-        // generic key here wrote the WRONG value into exactly the rows this
-        // function exists to repair.
-        let kind = crate::item_type_lookup::kind_from_type_name(type_name);
-        let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
-            Some(f) => match kind {
-                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                None => ferrofin_util::sort_name::forced_sort_key(f),
-            },
-            None => match kind {
-                Some(kind) => crate::kinds::sort_name_for(kind, name),
-                None => ferrofin_util::sort_name::create_sort_name(name),
-            },
+    for (id, name, forced, type_name, index_number, parent_index_number) in &rows {
+        // `Type` and the numbers are selected so the per-kind rules apply
+        // to both the derived and the forced key: a `Person` keeps its name
+        // verbatim (`EnableAlphaNumericSorting => false`), and an episode,
+        // season or track sorts by its numbers (`CreateSortName`).
+        // Backfilling the generic key here wrote the WRONG value into
+        // exactly the rows this function exists to repair.
+        let Some(sort_name) = crate::kinds::fallback_sort_name(&BaseItemEntity {
+            name: Some(name.clone()),
+            forced_sort_name: forced.clone(),
+            type_: type_name.clone(),
+            index_number: *index_number,
+            parent_index_number: *parent_index_number,
+            ..BaseItemEntity::default()
+        }) else {
+            continue;
         };
         sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
             .bind(sort_name)
@@ -7942,6 +7941,50 @@ mod tests {
             Some("rock"),
             "every other kind still gets the alphanumeric key"
         );
+    }
+
+    /// A row saved without a sort name, and one the boot backfill repairs,
+    /// gets its kind's `CreateSortName` as the writers settle it: an episode,
+    /// season or track sorts by its numbers, never by its title.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Episode, Some(1), Some(4), "Pilot", "001 - 0004 - Pilot")]
+    #[case(BaseItemKind::Season, None, Some(3), "Season 3", "0003")]
+    #[case(BaseItemKind::Audio, Some(2), Some(5), "Song", "0002 - 0005 - Song")]
+    #[tokio::test]
+    async fn a_missing_sort_name_takes_the_kinds_create_sort_name(
+        #[case] kind: BaseItemKind,
+        #[case] parent_index_number: Option<i64>,
+        #[case] index_number: Option<i64>,
+        #[case] name: &str,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: stored_type_name(kind).expect("type").to_owned(),
+            parent_index_number,
+            index_number,
+            ..named(name)
+        };
+        assert_eq!(
+            persisted_sort_name(&db, entity.clone()).await.as_deref(),
+            Some(expected),
+            "save_items"
+        );
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" = ?1"#)
+            .bind(&entity.id)
+            .execute(db.writer())
+            .await
+            .expect("null it out");
+        super::backfill_missing_sort_names(&db)
+            .await
+            .expect("backfill");
+        let repaired: Option<String> =
+            sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&entity.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("query");
+        assert_eq!(repaired.as_deref(), Some(expected), "backfill");
     }
 
     // A caller-supplied sort name wins: that is what carries the per-kind

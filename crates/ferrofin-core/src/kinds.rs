@@ -289,11 +289,11 @@ pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
 /// EnableAlphaNumericSorting, config)` (`BaseItem.cs:945`) including its
 /// [`enable_alpha_numeric_sorting`] branch.
 ///
-/// One home for the rule, because three separate write paths
-/// (`upsert_item`'s fallback, `backfill_missing_sort_names`, and the people
-/// repository's inserts) each have to answer the same question, and a `Person`
-/// row that any one of them lower-cases stops matching where Jellyfin sorts and
-/// filters it.
+/// One home for the rule, because several write paths (the people
+/// repository's inserts, [`saved_sort_name`], and through
+/// `metadata_merge::derived_sort_name` [`fallback_sort_name`]) each have to
+/// answer the same question, and a `Person` row that any one of them
+/// lower-cases stops matching where Jellyfin sorts and filters it.
 #[must_use]
 pub fn sort_name_for(kind: BaseItemKind, name: &str) -> String {
     ferrofin_util::sort_name::get_sort_name(name, enable_alpha_numeric_sorting(kind))
@@ -326,6 +326,30 @@ pub fn saved_sort_name(kind: BaseItemKind, name: &str, forced: Option<&str>) -> 
     match forced.filter(|forced| !forced.is_empty()) {
         Some(forced) => forced_sort_name_for(kind, forced),
         None => sort_name_for(kind, name),
+    }
+}
+
+/// The `SortName` of a row that has none stored, as upstream's
+/// `BaseItem.SortName` getter derives it: the forced sort title's key
+/// ([`forced_sort_name_for`]; a `Person`'s verbatim), else the row kind's own
+/// `CreateSortName` of its name, the derivation every writer settles with
+/// ([`ferrofin_providers::metadata_merge::derived_sort_name`]), which puts
+/// an episode, season or track in number order. `None` with neither.
+#[must_use]
+pub fn fallback_sort_name(
+    row: &ferrofin_db::entities::base_items::BaseItemEntity,
+) -> Option<String> {
+    match row.forced_sort_name.as_deref().filter(|f| !f.is_empty()) {
+        Some(forced) => Some(
+            match crate::item_type_lookup::kind_from_type_name(&row.type_) {
+                Some(kind) => forced_sort_name_for(kind, forced),
+                None => ferrofin_util::sort_name::forced_sort_key(forced),
+            },
+        ),
+        None => row
+            .name
+            .as_deref()
+            .map(|name| ferrofin_providers::metadata_merge::derived_sort_name(row, name)),
     }
 }
 
