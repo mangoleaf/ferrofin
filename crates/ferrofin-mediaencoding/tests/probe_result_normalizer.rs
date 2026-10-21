@@ -528,6 +528,40 @@ fn get_media_stream_mjpeg_with_a_real_codec_tag_is_video() {
     assert_eq!(junk.stream_type, MediaStreamType::EmbeddedImage);
 }
 
+/// `ProbeResultNormalizer` (v12.2 `:967`): the video stream whose first frame
+/// (`-show_frames -only_first_vframe`) carries `HDR Dynamic Metadata
+/// SMPTE2094-40 (HDR10+)` side data is flagged HDR10+; a stream with no such
+/// frame is not.
+#[test]
+fn a_first_frame_with_hdr10_plus_side_data_flags_the_stream() {
+    let json = r#"{"streams":[
+        {"index":0,"codec_name":"hevc","codec_type":"video","width":3840,"height":2160,
+         "pix_fmt":"yuv420p10le","color_transfer":"smpte2084","color_primaries":"bt2020"},
+        {"index":1,"codec_name":"hevc","codec_type":"video","width":1920,"height":1080}
+    ],"format":{},
+    "frames":[{"media_type":"video","stream_index":0,"side_data_list":[
+        {"side_data_type":"Mastering display metadata"},
+        {"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}
+    ]}]}"#;
+    let parsed: InternalMediaInfoResult = serde_json::from_str(json).expect("probe json parses");
+    let res = normalizer().get_media_info(
+        parsed,
+        Some(VideoType::VideoFile),
+        false,
+        "Test Data/Probing/hdr10plus.mkv",
+        MediaProtocol::File,
+    );
+
+    assert_eq!(
+        res.media_source.media_streams[0].hdr10_plus_present_flag,
+        Some(true)
+    );
+    assert_eq!(
+        res.media_source.media_streams[1].hdr10_plus_present_flag,
+        None
+    );
+}
+
 /// A text subtitle has no ffprobe `width`/`height`/`level`/`is_avc`, so on
 /// upstream master — where all four fields are nullable
 /// (`MediaStreamInfo.cs:93/107/170/233`) — the wire carries null, not the

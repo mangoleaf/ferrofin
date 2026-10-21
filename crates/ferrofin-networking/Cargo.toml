@@ -17,6 +17,7 @@ ferrofin-util.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 fancy-regex.workspace = true
+percent-encoding.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
