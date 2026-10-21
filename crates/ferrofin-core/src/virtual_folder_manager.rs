@@ -98,6 +98,50 @@ fn child_path(parent: &Path, name: &str) -> Option<PathBuf> {
     Some(parent.join(name))
 }
 
+/// A library rename, as users' preferences see it.
+struct LibraryRename {
+    old_id: uuid::Uuid,
+    new_id: uuid::Uuid,
+    old_name: String,
+    new_name: String,
+    /// The library's view type (`movies`), empty for none.
+    view_type: &'static str,
+}
+
+/// C# `LibraryStructureController.ReplaceIds`: maps each GUID in `values`
+/// through `map` (a later pair wins, as a later dictionary write does), keeping
+/// the value's spelling (`D` when it has a dash, `N` otherwise) and dropping a
+/// repeat of an id already kept. A value that is not a GUID is left alone.
+/// `None` when nothing changed.
+fn replace_ids(values: &[String], map: &[(uuid::Uuid, uuid::Uuid)]) -> Option<Vec<String>> {
+    let mut rewritten = Vec::with_capacity(values.len());
+    let mut seen = std::collections::HashSet::new();
+    let mut touched = false;
+    for value in values {
+        let Ok(parsed) = uuid::Uuid::parse_str(value) else {
+            rewritten.push(value.clone());
+            continue;
+        };
+        let replacement = map
+            .iter()
+            .rev()
+            .find(|(old, _)| *old == parsed)
+            .map(|(_, new)| *new)
+            .filter(|new| *new != parsed);
+        touched |= replacement.is_some();
+        if !seen.insert(replacement.unwrap_or(parsed)) {
+            touched = true;
+            continue;
+        }
+        rewritten.push(match replacement {
+            Some(new) if value.contains('-') => new.hyphenated().to_string(),
+            Some(new) => new.simple().to_string(),
+            None => value.clone(),
+        });
+    }
+    touched.then_some(rewritten)
+}
+
 /// The collection-marker file extension (`<type>.collection`).
 const COLLECTION_EXTENSION: &str = "collection";
 
@@ -120,6 +164,11 @@ pub struct FerrofinVirtualFolderManager {
     persistence: Option<Arc<dyn ItemPersistenceService>>,
     /// Storage and physical root for preserving pre-D1 library children.
     physical_root: Option<(ferrofin_db::Database, uuid::Uuid)>,
+    /// Where a rename remaps every user's library preferences, and the auth
+    /// cache to clear after (see
+    /// [`with_user_preferences`](Self::with_user_preferences)). `None` in unit
+    /// tests that do not need it.
+    user_preferences: Option<(ferrofin_db::Database, Arc<crate::auth_cache::AuthCache>)>,
     /// The item *reader*, set by the composition root alongside
     /// [`persistence`](Self::persistence). Only the orphan prune needs it: it has
     /// to enumerate the `UserRootFolder`'s existing `CollectionFolder` children to
@@ -190,6 +239,7 @@ impl FerrofinVirtualFolderManager {
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence: None,
             physical_root: None,
+            user_preferences: None,
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -216,6 +266,19 @@ impl FerrofinVirtualFolderManager {
     #[must_use]
     pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
         self.persistence = Some(persistence);
+        self
+    }
+
+    /// Lets a library rename remap every user's preferences that name the
+    /// library from its old id to its new one, as Jellyfin 12.2 does, and clear
+    /// `auth_cache` afterwards (it caches users' assembled preferences).
+    #[must_use]
+    pub fn with_user_preferences(
+        mut self,
+        db: ferrofin_db::Database,
+        auth_cache: Arc<crate::auth_cache::AuthCache>,
+    ) -> Self {
+        self.user_preferences = Some((db, auth_cache));
         self
     }
 
@@ -291,6 +354,131 @@ impl FerrofinVirtualFolderManager {
             BaseItemKind::CollectionFolder,
             &folder_path.to_string_lossy(),
         )
+    }
+
+    /// What a rename of the library at `current` to `target` changes in users'
+    /// preferences, captured before the directory moves. Port of the prelude of
+    /// C# `RenameVirtualFolder`: the old id is the stored row's when there is
+    /// one, because the id derivation's case handling may have changed since
+    /// the library was created, and the derived one otherwise.
+    async fn library_rename(
+        &self,
+        current: &Path,
+        target: &Path,
+    ) -> Result<Option<LibraryRename>, ServiceError> {
+        let Some((db, _)) = &self.user_preferences else {
+            return Ok(None);
+        };
+        let stored =
+            crate::library_preference_repository::library_at(db, &current.to_string_lossy())
+                .await?;
+        let file_name = |path: &Path| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let (Some(old_id), Some(new_id)) = (
+            stored
+                .as_ref()
+                .map(|(id, _)| *id)
+                .or_else(|| self.collection_folder_id(current)),
+            self.collection_folder_id(target),
+        ) else {
+            return Ok(None);
+        };
+        // `CollectionFolder.CollectionType` parses the `<type>.collection`
+        // marker into the `CollectionType` enum, which has no `mixed`. Upstream
+        // takes it from the stored library only, so a library with no row maps
+        // its views with no type; the marker on disk is the same value, and is
+        // read here even without a row.
+        let view_type = Self::read_collection_type(current)
+            .await
+            .map(Self::collection_type_marker)
+            .filter(|marker| *marker != "mixed")
+            .unwrap_or_default();
+        Ok(Some(LibraryRename {
+            old_id,
+            new_id,
+            old_name: stored
+                .and_then(|(_, name)| name)
+                .unwrap_or_else(|| file_name(current)),
+            new_name: file_name(target),
+            view_type,
+        }))
+    }
+
+    /// Rewrites every user's library preferences from the renamed library's old
+    /// ids to its new ones. Port of C# `ReplaceLibraryIdInUserPreferencesAsync`:
+    /// seven list preferences map the library id; `MyMediaExcludes` and
+    /// `OrderedViews`, which hold what "My Media" shows, also map the library's
+    /// shadow view and the user's own view of it. Nothing is written when
+    /// neither the library id nor the shadow view id changed.
+    async fn remap_user_preferences(&self, rename: &LibraryRename) -> Result<(), ServiceError> {
+        use ferrofin_db::enums::PreferenceKind;
+        const LIBRARY_PREFERENCES: [PreferenceKind; 7] = [
+            PreferenceKind::EnabledFolders,
+            PreferenceKind::BlockedMediaFolders,
+            PreferenceKind::EnableContentDeletionFromFolders,
+            PreferenceKind::LatestItemExcludes,
+            PreferenceKind::MyMediaExcludes,
+            PreferenceKind::GroupedFolders,
+            PreferenceKind::OrderedViews,
+        ];
+        let Some((db, auth_cache)) = &self.user_preferences else {
+            return Ok(());
+        };
+        let derivation = &self.id_derivation;
+        let LibraryRename {
+            old_id,
+            new_id,
+            old_name,
+            new_name,
+            view_type,
+        } = rename;
+        let shadow = (
+            crate::user_view_manager::shadow_view_id(derivation, old_name, *old_id, view_type),
+            crate::user_view_manager::shadow_view_id(derivation, new_name, *new_id, view_type),
+        );
+        if old_id == new_id && shadow.0 == shadow.1 {
+            return Ok(());
+        }
+        let rewritten = crate::library_preference_repository::rewrite_preferences(
+            db,
+            &LIBRARY_PREFERENCES,
+            |user, kind, values| {
+                let mut map = vec![(*old_id, *new_id)];
+                if matches!(
+                    kind,
+                    PreferenceKind::MyMediaExcludes | PreferenceKind::OrderedViews
+                ) {
+                    let user_view = (
+                        crate::user_view_manager::named_view_id(
+                            derivation, user, *old_id, view_type,
+                        ),
+                        crate::user_view_manager::named_view_id(
+                            derivation, user, *new_id, view_type,
+                        ),
+                    );
+                    for pair in [shadow, user_view] {
+                        if let (Some(old), Some(new)) = pair {
+                            map.push((old, new));
+                        }
+                    }
+                }
+                replace_ids(values, &map)
+            },
+        )
+        .await?;
+        if rewritten > 0 {
+            auth_cache.clear();
+            tracing::info!(
+                users = rewritten,
+                %old_id,
+                %new_id,
+                "moved users' library preferences to the renamed library"
+            );
+        }
+        Ok(())
     }
 
     /// The `UserRootFolder` provisioner — the parent every `CollectionFolder`
@@ -1143,6 +1331,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // case-only hop reassigns `current` to a temporary uuid directory, whose
         // id is not the one to delete.
         let vacated = self.collection_folder_id(&current);
+        let preferences = self.library_rename(&current, &target).await?;
         if let Some(id) = vacated {
             self.preserve_legacy_children(id).await?;
         }
@@ -1162,6 +1351,14 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 .await
                 .map_err(|e| Self::io_err("rename virtual folder", &e))?;
         }
+        // Jellyfin 12.2: once the directory has moved, the library's users
+        // follow it to its new id. A failure is returned after the row cleanup
+        // below, which the moved directory needs either way (upstream's
+        // `finally` still runs `OnCollectionFolderChange`).
+        let remapped = match &preferences {
+            Some(rename) => self.remap_user_preferences(rename).await,
+            None => Ok(()),
+        };
 
         // The directory the old row pointed at is gone, so the row is now an
         // orphan: `get_virtual_folders` will mint a SECOND row for the new path on
@@ -1181,7 +1378,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // also converges a root that drifted for some other reason.
         self.prune_orphan_collection_folders().await?;
 
-        Ok(())
+        remapped
     }
 
     async fn add_media_path(
@@ -1432,6 +1629,299 @@ mod tests {
         let rows = root_libraries(&mgr).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, "MOVIES");
+    }
+
+    /// A user's stored preferences, by kind.
+    async fn preference(
+        db: &Database,
+        user: &str,
+        kind: ferrofin_db::enums::PreferenceKind,
+    ) -> Vec<String> {
+        crate::user_entity_ext::get_preference(db.pool(), user, kind)
+            .await
+            .expect("preference")
+    }
+
+    /// Jellyfin 12.2 `LibraryStructureControllerTests.
+    /// RenameLibrary_UserHasLibraryPreferences_RemapsLibraryId`: a rename moves
+    /// every library preference to the new id, the views built from the
+    /// library with it, keeps each value's spelling and drops a repeat.
+    #[tokio::test]
+    async fn rename_remaps_users_library_preferences() {
+        use crate::user_view_manager::{named_view_id, shadow_view_id};
+        use ferrofin_db::enums::PreferenceKind;
+
+        let (tmp, db, mgr) = manager_with_store().await;
+        let auth_cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let mgr = mgr.with_user_preferences(db.clone(), Arc::clone(&auth_cache));
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "rename-prefs-old",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .expect("add");
+        mgr.get_virtual_folders().await.expect("get");
+
+        let derivation = &mgr.id_derivation;
+        let old_id = mgr
+            .collection_folder_id(&mgr.root.join("rename-prefs-old"))
+            .expect("old id");
+        let new_id = mgr
+            .collection_folder_id(&mgr.root.join("rename-prefs-new"))
+            .expect("new id");
+        assert_ne!(old_id, new_id);
+        let user = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x403)).await;
+        let user_id = uuid::Uuid::parse_str(&user.id).expect("user id");
+        let other = uuid::Uuid::from_u128(0xABC);
+        let old_shadow =
+            shadow_view_id(derivation, "rename-prefs-old", old_id, "movies").expect("shadow");
+        let old_user_view =
+            named_view_id(derivation, user_id, old_id, "movies").expect("user view");
+        let d = |id: uuid::Uuid| id.hyphenated().to_string();
+        let n = |id: uuid::Uuid| id.simple().to_string();
+        for (kind, values) in [
+            (
+                PreferenceKind::EnabledFolders,
+                vec![d(other), d(old_id), d(new_id)],
+            ),
+            (PreferenceKind::BlockedMediaFolders, vec![d(old_id)]),
+            (
+                PreferenceKind::EnableContentDeletionFromFolders,
+                vec![d(old_id), d(other)],
+            ),
+            (PreferenceKind::LatestItemExcludes, vec![d(old_id)]),
+            (
+                PreferenceKind::MyMediaExcludes,
+                vec![d(other), d(old_id), n(old_shadow)],
+            ),
+            (PreferenceKind::GroupedFolders, vec![d(old_id)]),
+            (
+                PreferenceKind::OrderedViews,
+                vec![d(other), d(old_user_view), d(old_shadow), d(old_id)],
+            ),
+            (PreferenceKind::BlockedTags, vec!["keep".to_owned()]),
+        ] {
+            crate::user_entity_ext::set_preference(db.writer(), &user.id, kind, &values)
+                .await
+                .expect("seed preference");
+        }
+        let generation = auth_cache.generation();
+
+        mgr.rename_virtual_folder("rename-prefs-old", "rename-prefs-new")
+            .await
+            .expect("rename");
+
+        let new_shadow =
+            shadow_view_id(derivation, "rename-prefs-new", new_id, "movies").expect("shadow");
+        let new_user_view =
+            named_view_id(derivation, user_id, new_id, "movies").expect("user view");
+        assert_ne!(old_shadow, new_shadow);
+        assert_ne!(old_user_view, new_user_view);
+        for (kind, expected) in [
+            (PreferenceKind::EnabledFolders, vec![d(other), d(new_id)]),
+            (PreferenceKind::BlockedMediaFolders, vec![d(new_id)]),
+            (
+                PreferenceKind::EnableContentDeletionFromFolders,
+                vec![d(new_id), d(other)],
+            ),
+            (PreferenceKind::LatestItemExcludes, vec![d(new_id)]),
+            (
+                PreferenceKind::MyMediaExcludes,
+                vec![d(other), d(new_id), n(new_shadow)],
+            ),
+            (PreferenceKind::GroupedFolders, vec![d(new_id)]),
+            (
+                PreferenceKind::OrderedViews,
+                vec![d(other), d(new_user_view), d(new_shadow), d(new_id)],
+            ),
+            (PreferenceKind::BlockedTags, vec!["keep".to_owned()]),
+        ] {
+            assert_eq!(preference(&db, &user.id, kind).await, expected, "{kind:?}");
+        }
+        assert_ne!(
+            auth_cache.generation(),
+            generation,
+            "cached users must not keep the old preferences"
+        );
+    }
+
+    /// Jellyfin 12.2 `RenameLibrary_CapitalizationOnly_LeavesPreferencesAlone`:
+    /// under case-sensitive ids (the Jellyfin derivation) a case-only rename
+    /// derives a new library id and shadow view, and the preferences follow.
+    #[tokio::test]
+    async fn case_only_rename_remaps_to_the_new_spelling() {
+        use crate::user_view_manager::shadow_view_id;
+        use ferrofin_db::enums::PreferenceKind;
+
+        let (tmp, db, mgr) = manager_with_store().await;
+        let mgr = mgr
+            .with_user_preferences(
+                db.clone(),
+                Arc::new(crate::auth_cache::AuthCache::default()),
+            )
+            .with_id_derivation(crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            });
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder("rename-case-test", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        mgr.get_virtual_folders().await.expect("get");
+        let derivation = &mgr.id_derivation;
+        let old_id = mgr
+            .collection_folder_id(&mgr.root.join("rename-case-test"))
+            .expect("old id");
+        let new_id = mgr
+            .collection_folder_id(&mgr.root.join("RENAME-CASE-TEST"))
+            .expect("new id");
+        assert_ne!(old_id, new_id, "case-sensitive ids");
+        let old_shadow = shadow_view_id(derivation, "rename-case-test", old_id, "").expect("old");
+        let new_shadow = shadow_view_id(derivation, "RENAME-CASE-TEST", new_id, "").expect("new");
+        let user = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x404)).await;
+        for (kind, id) in [
+            (PreferenceKind::EnabledFolders, old_id),
+            (PreferenceKind::MyMediaExcludes, old_shadow),
+        ] {
+            crate::user_entity_ext::set_preference(
+                db.writer(),
+                &user.id,
+                kind,
+                &[id.hyphenated().to_string()],
+            )
+            .await
+            .expect("seed preference");
+        }
+
+        mgr.rename_virtual_folder("rename-case-test", "RENAME-CASE-TEST")
+            .await
+            .expect("rename");
+
+        assert_eq!(
+            preference(&db, &user.id, PreferenceKind::EnabledFolders).await,
+            [new_id.hyphenated().to_string()]
+        );
+        assert_eq!(
+            preference(&db, &user.id, PreferenceKind::MyMediaExcludes).await,
+            [new_shadow.hyphenated().to_string()]
+        );
+    }
+
+    /// C# `RenameVirtualFolder` takes the old id from the stored library, not a
+    /// fresh derivation, "because the case sensitivity setting may have
+    /// changed since the library was created". Here the library is created
+    /// under case-sensitive ids and renamed under lowercased ones.
+    #[tokio::test]
+    async fn rename_maps_from_the_stored_library_id() {
+        use ferrofin_db::enums::PreferenceKind;
+
+        let (tmp, db, mgr) = manager_with_store().await;
+        let mgr = mgr
+            .with_user_preferences(
+                db.clone(),
+                Arc::new(crate::auth_cache::AuthCache::default()),
+            )
+            .with_id_derivation(crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            });
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder("Movies", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        let stored = mgr.get_virtual_folders().await.expect("get")[0]
+            .item_id
+            .clone()
+            .expect("ItemId");
+        let stored = uuid::Uuid::parse_str(&stored).expect("stored id");
+        let mgr = mgr.with_id_derivation(crate::item_type_lookup::IdDerivation::LegacyLowercase);
+        assert_ne!(
+            mgr.collection_folder_id(&mgr.root.join("Movies")),
+            Some(stored),
+            "the derivation changed"
+        );
+        let new_id = mgr
+            .collection_folder_id(&mgr.root.join("Films"))
+            .expect("new id");
+        let user = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x405)).await;
+        crate::user_entity_ext::set_preference(
+            db.writer(),
+            &user.id,
+            PreferenceKind::EnabledFolders,
+            &[stored.hyphenated().to_string()],
+        )
+        .await
+        .expect("seed preference");
+
+        mgr.rename_virtual_folder("Movies", "Films")
+            .await
+            .expect("rename");
+
+        assert_eq!(
+            preference(&db, &user.id, PreferenceKind::EnabledFolders).await,
+            [new_id.hyphenated().to_string()]
+        );
+    }
+
+    /// Under lowercased ids a case-only rename changes neither the library id
+    /// nor its shadow view, so nothing is written and the auth cache is kept.
+    #[tokio::test]
+    async fn a_rename_that_moves_no_id_writes_nothing() {
+        use ferrofin_db::enums::PreferenceKind;
+
+        let (tmp, db, mgr) = manager_with_store().await;
+        let auth_cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let mgr = mgr
+            .with_user_preferences(db.clone(), Arc::clone(&auth_cache))
+            .with_id_derivation(crate::item_type_lookup::IdDerivation::LegacyLowercase);
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder("movies", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        mgr.get_virtual_folders().await.expect("get");
+        let id = mgr
+            .collection_folder_id(&mgr.root.join("movies"))
+            .expect("id");
+        assert_eq!(mgr.collection_folder_id(&mgr.root.join("MOVIES")), Some(id));
+        let user = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x406)).await;
+        // A duplicate the remap would drop if it ran.
+        let values = [id.hyphenated().to_string(), id.simple().to_string()];
+        crate::user_entity_ext::set_preference(
+            db.writer(),
+            &user.id,
+            PreferenceKind::EnabledFolders,
+            &values,
+        )
+        .await
+        .expect("seed preference");
+        let generation = auth_cache.generation();
+
+        mgr.rename_virtual_folder("movies", "MOVIES")
+            .await
+            .expect("rename");
+
+        assert_eq!(
+            preference(&db, &user.id, PreferenceKind::EnabledFolders).await,
+            values
+        );
+        assert_eq!(auth_cache.generation(), generation);
+    }
+
+    /// `ReplaceIds` leaves a value that is not a GUID alone, keeps the `N`
+    /// spelling, and reports no change when nothing moved.
+    #[test]
+    fn replace_ids_keeps_spelling_and_foreign_values() {
+        let old = uuid::Uuid::from_u128(1);
+        let new = uuid::Uuid::from_u128(2);
+        let map = [(old, new)];
+        assert_eq!(
+            super::replace_ids(&["junk".to_owned(), old.simple().to_string()], &map),
+            Some(vec!["junk".to_owned(), new.simple().to_string()])
+        );
+        assert_eq!(
+            super::replace_ids(&[new.hyphenated().to_string()], &map),
+            None
+        );
     }
 
     /// A library directory removed behind the API's back converges on the next
