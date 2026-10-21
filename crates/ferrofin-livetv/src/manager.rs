@@ -323,7 +323,6 @@ pub struct LiveTvPaths {
 #[derive(Clone)]
 pub struct FerrofinLiveTvManager {
     db: Database,
-    fetcher: Arc<dyn SourceFetcher>,
     server_id: String,
     /// The user manager, for `LiveTvInfo.EnabledUsers` (C# `IUserManager.Users`
     /// filtered by the `EnableLiveTvAccess` permission). Absent in unit tests
@@ -397,6 +396,9 @@ pub struct FerrofinLiveTvManager {
     /// The account-less Schedules Direct surface (country list), sharing the
     /// fetcher and caching under the application cache directory.
     schedules_direct: SchedulesDirect,
+    /// The XMLTV document cache every guide reader goes through
+    /// (`XmlTvListingsProvider.GetXml`).
+    xmltv: crate::xmltv_cache::XmlTvCache,
     /// The `BaseItems` seam the guide refresh mirrors the channel lineup
     /// through, and the Live TV `UserView` the rows parent to.
     ///
@@ -625,7 +627,8 @@ impl FerrofinLiveTvManager {
         server_id: String,
         cache_dir: impl Into<ferrofin_util::directory_path::DirectoryPath>,
     ) -> Self {
-        let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
+        let cache_dir: ferrofin_util::directory_path::DirectoryPath = cache_dir.into();
+        let xmltv = crate::xmltv_cache::XmlTvCache::new(Arc::clone(&fetcher), cache_dir.clone());
         // The same two hosts, in the same order, that
         // `LiveTvServiceCollectionExtensions.AddLiveTvServices` registers
         // (v10.11.8 LiveTvServiceCollectionExtensions.cs:41-42): HDHomeRun
@@ -636,9 +639,9 @@ impl FerrofinLiveTvManager {
             Arc::new(crate::hdhomerun::HdHomerunHost::new(Arc::clone(&fetcher))),
             Arc::new(crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))),
         ];
+        let schedules_direct = SchedulesDirect::new(fetcher, cache_dir);
         Self {
             db,
-            fetcher,
             hosts,
             users: None,
             server_id,
@@ -657,6 +660,7 @@ impl FerrofinLiveTvManager {
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             schedules_direct,
+            xmltv,
         }
     }
 
@@ -1003,6 +1007,86 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
+    /// Port of `DefaultLiveTvService.RefreshTimers` (v12.2
+    /// `DefaultLiveTvService.cs:88-117`), run at the end of every guide
+    /// refresh, over every timer but the `Completed` ones (`GetTimersAsync`):
+    ///
+    /// - one that has ended and is not recording is deleted;
+    /// - one that names no programme or no channel is left as it is;
+    /// - one whose programme has left the guide is deleted;
+    /// - the rest take the refreshed programme's facts
+    ///   (`CopyProgramInfoToTimerInfo`), are saved and re-armed
+    ///   (`TimerManager.Update`).
+    async fn refresh_timers(&self) -> Result<(), ServiceError> {
+        for timer in self.all_timers().await? {
+            if timer.status == RecordingStatus::Completed {
+                continue;
+            }
+            let Some(id) = timer.base.id.filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            // One timer's failure does not leave the rest stale, as in
+            // `refresh_series_timers`.
+            if let Err(e) = self.refresh_timer(&id).await {
+                tracing::warn!(
+                    timer_id = %id,
+                    error = %e,
+                    "live tv: could not refresh a recording timer"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One timer's turn of [`refresh_timers`](Self::refresh_timers), decided
+    /// on the row as it is now: the timer may have fired, or its capture
+    /// settled, since the list was taken, and a timer that has become
+    /// `Completed` is not touched.
+    ///
+    /// Upstream's service-level `TimerInfo.ProgramId` is the listings
+    /// provider's id (`GetProgramInfoFromCache` maps it to the item); the wire
+    /// DTO carries it as `external_program_id` beside the item's own
+    /// `program_id`, so a timer names no programme only when both are blank.
+    async fn refresh_timer(&self, id: &str) -> Result<(), ServiceError> {
+        let Some(mut timer) = self.get_timer(id).await? else {
+            return Ok(());
+        };
+        if timer.status == RecordingStatus::Completed {
+            return Ok(());
+        }
+        if Utc::now() > timer.base.end_date && !self.active_recordings_lock().contains_key(id) {
+            tracing::info!(
+                timer_id = id,
+                reason = "ended",
+                "live tv: recording timer removed"
+            );
+            self.disarm_timer(id);
+            return self.delete_by_id(DELETE_TIMER_SQL, id).await;
+        }
+        let names_program = [&timer.base.program_id, &timer.base.external_program_id]
+            .into_iter()
+            .any(|program| program.as_deref().is_some_and(|p| !p.trim().is_empty()));
+        if !names_program || timer.base.channel_id.is_nil() {
+            return Ok(());
+        }
+        let Some(program) = self.program_row_for_timer(&timer.base).await? else {
+            tracing::info!(
+                timer_id = id,
+                reason = "programme left the guide",
+                "live tv: recording timer removed"
+            );
+            self.disarm_timer(id);
+            return self.delete_by_id(DELETE_TIMER_SQL, id).await;
+        };
+        let before = timer.clone();
+        copy_program_into_timer(&program, &mut timer);
+        if timer != before {
+            self.persist_timer(&timer).await?;
+            self.arm_timer(&timer);
+        }
+        Ok(())
+    }
+
     /// The wired DTO service, or the honest error when the composition root
     /// (or a test) never attached one.
     fn dto_service(&self) -> Result<&Arc<dyn DtoService>, ServiceError> {
@@ -1122,28 +1206,27 @@ impl FerrofinLiveTvManager {
     /// A listings provider's own channel list.
     ///
     /// Port of `XmlTvListingsProvider.GetChannels`: the guide document's
-    /// `<channel>` elements, with the number falling back to the id when the
-    /// document carries none (Ferrofin's XMLTV reader parses no channel number,
-    /// so that fallback always applies) — the fallback matters because it is
-    /// what feeds the by-number arm of the match ladder.
+    /// `<channel>` elements, numbered from their display-names and falling
+    /// back to the id when none is numeric ([`crate::xmltv::XmltvChannel::listings_number`]).
+    /// The number feeds the by-number arm of the match ladder.
     async fn provider_channels(
         &self,
         info: &ListingsProviderInfo,
     ) -> Result<Vec<EpgChannel>, ServiceError> {
         Self::listings_provider_name(info.type_.as_deref())?;
-        let path = info.path.clone().unwrap_or_default();
-        let body = self.fetcher.fetch(&path).await?;
+        let body = self.xmltv.get_xml(info).await?;
         let guide = parse_xmltv(&body);
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
+            let path = info.path.as_deref().unwrap_or_default();
             return Err(ServiceError::Backend(format!("{path}: {e}")));
         }
         Ok(guide
             .channels
             .into_iter()
             .map(|c| EpgChannel {
-                number: c.id.clone(),
+                number: c.listings_number().to_owned(),
                 id: c.id,
                 name: c.display_name,
             })
@@ -1287,7 +1370,7 @@ impl FerrofinLiveTvManager {
             .channels
             .iter()
             .map(|c| EpgChannel {
-                number: c.id.clone(),
+                number: c.listings_number().to_owned(),
                 id: c.id.clone(),
                 name: c.display_name.clone(),
             })
@@ -1719,6 +1802,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
+        // keep serving the old document; `Validate` drops the path's download
+        // backoff, since a save is an explicit retry.
+        self.xmltv.forget_failure(&path);
+        self.xmltv.invalidate(&id).await;
         Ok(info)
     }
 
@@ -1731,6 +1819,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        self.xmltv.invalidate(id).await;
         Ok(())
     }
 
@@ -2176,11 +2265,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 clean_database = false;
                 continue;
             };
-            match self.fetcher.fetch(path).await {
+            match self.xmltv.get_xml(&provider).await {
                 // Jellyfin 12.1's `hasErrors` (`cleanDatabase &= !hasErrors`): an
-                // empty or unreadable document is a listings error like a failed
-                // fetch. The provider writes nothing, so `clean_programs` cannot
-                // replace its channels' airings with a partial read either.
+                // unreadable document is a listings error like a failed fetch. The
+                // provider writes nothing, so `clean_programs` cannot replace its
+                // channels' airings with a partial read either. For a saved provider
+                // an empty download never gets here: `get_xml` treats it as a failed
+                // download and answers with the cached copy, if there is one, or the
+                // `Err` below.
                 Ok(body) => {
                     let guide = parse_xmltv(&body);
                     if let Some(e) = &guide.error {
@@ -2241,9 +2333,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // upstream's `newProgramIdList` across all services — the set its
         // `CleanDatabase(newProgramIdList, [LiveTvProgram])` is taken over.
         self.sync_program_items().await?;
-        // `RefreshGuide`'s tail: `coreService.RefreshSeriesTimers(ct)` (v10.11.8
-        // src/Jellyfin.LiveTv/Guide/GuideManager.cs:150-156).
+        // `RefreshGuide`'s tail: `RefreshSeriesTimers` then `RefreshTimers`
+        // (v12.2 src/Jellyfin.LiveTv/Guide/GuideManager.cs:163-164).
         self.refresh_series_timers().await?;
+        self.refresh_timers().await?;
         Ok(())
     }
 
@@ -8061,6 +8154,176 @@ mod tests {
         );
     }
 
+    /// A future airing of the series guide, and a timer factory on its channel.
+    async fn refresh_test_airing(mgr: &FerrofinLiveTvManager) -> GuideProgramRow {
+        airings_of(mgr, "Recurring")
+            .await
+            .into_iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing")
+    }
+
+    /// A one-hour stored timer on the airing's channel, with its id.
+    fn refresh_test_timer(
+        airing: &GuideProgramRow,
+        name: &str,
+        status: RecordingStatus,
+        program: Option<String>,
+        start: chrono::DateTime<Utc>,
+    ) -> (String, ferrofin_model::live_tv::TimerInfoDto) {
+        use ferrofin_model::live_tv::{BaseTimerInfoDto, TimerInfoDto};
+        let id = Uuid::new_v4().simple().to_string();
+        let dto = TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some(id.clone()),
+                channel_id: Uuid::parse_str(&airing.channel_id).expect("channel"),
+                program_id: program,
+                name: Some(name.to_owned()),
+                start_date: start,
+                end_date: start + chrono::Duration::hours(1),
+                ..BaseTimerInfoDto::default()
+            },
+            status,
+            ..TimerInfoDto::default()
+        };
+        (id, dto)
+    }
+
+    /// Every stored timer by id.
+    async fn timers_by_id(
+        mgr: &FerrofinLiveTvManager,
+    ) -> HashMap<String, ferrofin_model::live_tv::TimerInfoDto> {
+        mgr.all_timers()
+            .await
+            .expect("timers")
+            .into_iter()
+            .filter_map(|t| t.base.id.clone().map(|id| (id, t)))
+            .collect()
+    }
+
+    /// `RefreshGuide` ends with `RefreshTimers` (v12.2 `GuideManager.cs:164`,
+    /// `DefaultLiveTvService.cs:88-117`): over every timer but the `Completed`
+    /// ones, one that has ended (and is not recording) is deleted, one whose
+    /// programme has left the guide is deleted, one with no programme is left
+    /// alone, and the rest take the refreshed programme's facts.
+    #[tokio::test]
+    async fn a_guide_refresh_tidies_and_refreshes_the_timers() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let past = Utc::now() - chrono::Duration::hours(3);
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let gone_program = Some(Uuid::new_v4().to_string());
+        let (ended, ended_dto) =
+            refresh_test_timer(&airing, "ended", RecordingStatus::Cancelled, None, past);
+        let (gone, gone_dto) =
+            refresh_test_timer(&airing, "gone", RecordingStatus::New, gone_program, future);
+        let (stale, stale_dto) = refresh_test_timer(
+            &airing,
+            "stale name",
+            RecordingStatus::New,
+            Some(airing.id.clone()),
+            future,
+        );
+        let (unlinked, unlinked_dto) =
+            refresh_test_timer(&airing, "unlinked", RecordingStatus::New, None, future);
+        for dto in [&ended_dto, &gone_dto, &stale_dto, &unlinked_dto] {
+            mgr.persist_timer(dto).await.expect("seed timer");
+        }
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let after = timers_by_id(&mgr).await;
+        assert!(!after.contains_key(&ended), "an ended timer is deleted");
+        assert!(
+            !after.contains_key(&gone),
+            "a timer whose programme left is deleted"
+        );
+        assert_eq!(
+            after[&unlinked].base.name.as_deref(),
+            Some("unlinked"),
+            "a timer with no programme is left alone"
+        );
+        assert_eq!(
+            after[&stale].base.name.as_deref(),
+            Some(airing.title.as_str()),
+            "a live timer takes the refreshed programme's name"
+        );
+        assert!(
+            mgr.armed_timers_lock().contains_key(&stale),
+            "and is re-armed"
+        );
+    }
+
+    /// What `RefreshTimers` must leave alone: `Completed` rows (recordings
+    /// reference them; `GetTimersAsync` excludes them), an ended timer whose
+    /// capture is still running (`GetActiveRecordingPath`), and a showing
+    /// cancelled by hand, which stays cancelled and unarmed.
+    #[tokio::test]
+    async fn a_guide_refresh_keeps_completed_recording_and_cancelled_timers() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let past = Utc::now() - chrono::Duration::hours(3);
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (completed, completed_dto) =
+            refresh_test_timer(&airing, "completed", RecordingStatus::Completed, None, past);
+        let (completed_gone, completed_gone_dto) = refresh_test_timer(
+            &airing,
+            "completed, programme gone",
+            RecordingStatus::Completed,
+            Some(Uuid::new_v4().to_string()),
+            future,
+        );
+        let (recording, recording_dto) = refresh_test_timer(
+            &airing,
+            "recording",
+            RecordingStatus::InProgress,
+            None,
+            past,
+        );
+        let (cancelled, cancelled_dto) = refresh_test_timer(
+            &airing,
+            "cancelled",
+            RecordingStatus::Cancelled,
+            Some(airing.id.clone()),
+            future,
+        );
+        for dto in [
+            &completed_dto,
+            &completed_gone_dto,
+            &recording_dto,
+            &cancelled_dto,
+        ] {
+            mgr.persist_timer(dto).await.expect("seed timer");
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        mgr.active_recordings_lock().insert(
+            recording.clone(),
+            crate::dvr::ActiveRecording::new(
+                recording.clone(),
+                Uuid::new_v4(),
+                dir.path().join("recording.ts"),
+            ),
+        );
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let after = timers_by_id(&mgr).await;
+        assert!(after.contains_key(&completed), "a completed timer is kept");
+        assert!(
+            after.contains_key(&completed_gone),
+            "a completed timer is never refreshed"
+        );
+        assert!(
+            after.contains_key(&recording),
+            "an ended timer that is still recording is kept"
+        );
+        assert_eq!(after[&cancelled].status, RecordingStatus::Cancelled);
+        assert!(
+            !mgr.armed_timers_lock().contains_key(&cancelled),
+            "a hand-cancelled showing is not armed"
+        );
+    }
+
     /// A guide refresh RE-EXPANDS every series timer over the airings it just
     /// ingested.
     ///
@@ -9621,6 +9884,146 @@ mod tests {
         ));
     }
 
+    /// A [`SourceFetcher`] that counts its fetches and fails while no body is
+    /// set — a remote guide host that can go down.
+    #[derive(Default)]
+    struct CountingFetcher {
+        body: std::sync::Mutex<Option<String>>,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingFetcher {
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for CountingFetcher {
+        async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.body
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| ServiceError::Backend(format!("{url} is down")))
+        }
+    }
+
+    /// A manager over `fetcher` with one saved remote XMLTV provider.
+    async fn cached_guide_manager(
+        fetcher: &Arc<CountingFetcher>,
+    ) -> (FerrofinLiveTvManager, ListingsProviderInfo) {
+        let mgr = manager_with_fetcher(Arc::clone(fetcher) as Arc<dyn SourceFetcher>).await;
+        let provider = mgr
+            .save_listing_provider(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            })
+            .await
+            .expect("provider");
+        (mgr, provider)
+    }
+
+    /// `XmlTvListingsProvider.GetXml`: within `_maxCacheAge` every reader —
+    /// lineups, the mapping dialog, the guide refresh — shares one download.
+    #[tokio::test]
+    async fn guide_readers_share_one_download_within_the_cache_age() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        let id = provider.id.clone().expect("id");
+
+        for _ in 0..3 {
+            let lineups = mgr
+                .get_lineups(Some(&id), Some("xmltv"), None, None)
+                .await
+                .expect("lineups");
+            assert_eq!(lineups.len(), 1);
+        }
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(fetcher.fetches(), 1);
+
+        // `SaveListingProvider` → `InvalidateListingsProviderCache`: the next
+        // read downloads again, so a changed Path never serves the old guide.
+        mgr.save_listing_provider(provider).await.expect("resave");
+        mgr.get_lineups(Some(&id), Some("xmltv"), None, None)
+            .await
+            .expect("lineups after save");
+        assert_eq!(fetcher.fetches(), 2);
+    }
+
+    /// A failed download falls back to the previous document, and a remote
+    /// path that failed is not retried within `_maxCacheAge`.
+    #[tokio::test]
+    async fn a_failed_download_falls_back_and_is_not_retried() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        mgr.xmltv.get_xml(&provider).await.expect("first download");
+
+        // Age the cached file past `_maxCacheAge`, then take the host down.
+        let cache_file = mgr
+            .xmltv
+            .cache_file_for_test(provider.id.as_deref().expect("id"));
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_hours(2);
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("cache file")
+            .set_modified(stale)
+            .expect("age");
+        *fetcher.body.lock().unwrap() = None;
+
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("backoff"), XMLTV);
+        assert_eq!(fetcher.fetches(), 2, "the failed path is not retried");
+
+        // With no cached copy the recent failure is an error, still unfetched.
+        std::fs::remove_file(&cache_file).expect("remove");
+        assert!(matches!(
+            mgr.xmltv.get_xml(&provider).await,
+            Err(ServiceError::Backend(_))
+        ));
+        assert_eq!(fetcher.fetches(), 2);
+
+        // Saving the provider is an explicit retry (`Validate`).
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let provider = mgr.save_listing_provider(provider).await.expect("resave");
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("retried"), XMLTV);
+        assert_eq!(fetcher.fetches(), 3);
+    }
+
+    /// `UnzipIfNeededAndCopy` throws on an empty document: it never replaces
+    /// the cached copy, and it counts as a failed download.
+    #[tokio::test]
+    async fn an_empty_download_keeps_the_previous_document() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        mgr.xmltv.get_xml(&provider).await.expect("first download");
+        let cache_file = mgr
+            .xmltv
+            .cache_file_for_test(provider.id.as_deref().expect("id"));
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("cache file")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("age");
+
+        *fetcher.body.lock().unwrap() = Some(String::new());
+        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
+        assert_eq!(std::fs::read_to_string(&cache_file).expect("kept"), XMLTV);
+        mgr.xmltv.get_xml(&provider).await.expect("backoff");
+        assert_eq!(
+            fetcher.fetches(),
+            2,
+            "the empty download counts as a failure"
+        );
+    }
+
     #[tokio::test]
     async fn lineups_are_the_guide_channels_and_need_a_resolvable_provider() {
         let (mgr, _tuner_id, provider_id) = mapping_manager().await;
@@ -9787,7 +10190,8 @@ mod tests {
     /// `cleanDatabase &= !hasErrors`): a guide body that is empty or not a
     /// readable XMLTV document is a listings error, so the stored airings stay
     /// and the provider writes nothing. A well-formed guide with no programmes
-    /// is not an error and still prunes.
+    /// is not an error and still prunes. With no cached copy left, an empty
+    /// body fails as a download (`UnzipIfNeededAndCopy`) before it is parsed.
     #[rstest::rstest]
     #[case::empty("", 1)]
     #[case::whitespace("  \n", 1)]
@@ -9844,6 +10248,9 @@ mod tests {
             .lock()
             .unwrap()
             .insert("http://guide/xmltv.xml".to_owned(), body.to_owned());
+        // The first refresh cached the document for `MAX_CACHE_AGE`; drop it, as
+        // saving the provider does, so the second refresh downloads the new body.
+        mgr.xmltv.invalidate(&provider_id).await;
         mgr.refresh_guide().await.expect("refresh2");
         assert_eq!(count().await, programs_after);
         assert_eq!(
@@ -9860,6 +10267,52 @@ mod tests {
         assert_eq!(
             mgr.get_channel_mapping_options(&provider_id).await.is_err(),
             unreadable
+        );
+    }
+
+    /// `ListingsManager.GetEpgChannelFromTunerChannel`'s number arm: a tuner
+    /// channel numbered `4.1` binds to the guide channel whose display-names
+    /// carry `4.1`, though its id (`I4.1.12345.zap2it.com`) and name differ.
+    #[tokio::test]
+    async fn a_tuner_channel_binds_to_the_guide_by_display_name_number() {
+        let mut sources = HashMap::new();
+        sources.insert(
+            "http://tuner/playlist.m3u".to_owned(),
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"nomatch\" tvg-chno=\"4.1\",WNBC-HD\nhttp://tuner/wnbc\n"
+                .to_owned(),
+        );
+        sources.insert(
+            "http://guide/xmltv.xml".to_owned(),
+            dated(
+                "<tv><channel id=\"I4.1.12345.zap2it.com\">\
+                 <display-name>4.1 WNBC</display-name><display-name>4.1</display-name>\
+                 <display-name>WNBC</display-name></channel>\
+                 <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" \
+                 channel=\"I4.1.12345.zap2it.com\"><title>Today</title></programme></tv>",
+            ),
+        );
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1,
+            "the airing binds to the tuner channel by number"
         );
     }
 

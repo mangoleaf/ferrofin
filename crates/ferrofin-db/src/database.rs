@@ -14,6 +14,17 @@ use crate::error::Result;
 /// this crate needs no live database or `DATABASE_URL`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// The version of the last migration in this build's chain: a database
+/// migrated past it was written by a newer build, and this one cannot open it
+/// (`MIGRATOR.run` refuses applied versions it does not know).
+#[must_use]
+pub fn schema_head() -> i64 {
+    MIGRATOR
+        .iter()
+        .last()
+        .map_or(0, |migration| migration.version)
+}
+
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
 /// parent: its kind, the three ids the walk follows, the album-artist name
@@ -49,7 +60,8 @@ pub struct ImageParentRow {
 
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
-/// single-connection **writer** pool ([`Database::writer`]).
+/// single-connection **writer** pool ([`Database::writer`]), plus a private
+/// one-connection pool for [`Database::snapshot_to`].
 ///
 /// SQLite under WAL serves many concurrent readers but exactly one writer at a
 /// time. Funnelling every write through a 1-connection pool turns would-be
@@ -64,6 +76,10 @@ pub struct ImageParentRow {
 pub struct Database {
     pool: SqlitePool,
     writer: SqlitePool,
+    /// One connection, opened on first use, for [`Database::snapshot_to`], so
+    /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
+    /// [`Database::close`] still waits for it.
+    snapshotter: SqlitePool,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -174,14 +190,17 @@ impl Database {
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
         let writer = pool.clone();
+        let snapshotter = pool.clone();
         Ok(Self {
             pool,
             writer,
+            snapshotter,
             file_path: None,
         })
     }
 
-    /// Builds the reader + writer pools from fully-formed connect options.
+    /// Builds the reader, writer and snapshot pools from fully-formed connect
+    /// options.
     ///
     /// `pool_size` `None` selects [`default_pool_size`] for the reader pool;
     /// the writer pool is always exactly one connection (SQLite allows one
@@ -195,6 +214,9 @@ impl Database {
         file_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let max_connections = pool_size.unwrap_or_else(default_pool_size);
+        let snapshotter = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(read_options.clone());
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(read_options)
@@ -214,6 +236,7 @@ impl Database {
         Ok(Self {
             pool,
             writer,
+            snapshotter,
             file_path,
         })
     }
@@ -857,7 +880,7 @@ impl Database {
         &self.writer
     }
 
-    /// Closes both pools, waiting for checked-out connections to be returned.
+    /// Closes every pool, waiting for checked-out connections to be returned.
     ///
     /// The composition root calls this when a server lifetime ends so that an
     /// in-process restart reopens the file with NO connection from the previous
@@ -866,6 +889,7 @@ impl Database {
     pub async fn close(&self) {
         self.pool.close().await;
         self.writer.close().await;
+        self.snapshotter.close().await;
     }
 
     /// Whether [`Database::close`] has run.
@@ -880,13 +904,20 @@ impl Database {
     /// WAL-mode database, which a checkpoint can tear mid-read. `dest` must not
     /// exist.
     ///
+    /// It runs on the snapshot pool's one connection. `VACUUM INTO` needs only
+    /// a read transaction, and holding a writer or reader connection for the
+    /// whole copy would queue every write behind it (the writer pool has one
+    /// connection) or, on a one-connection reader pool, every read. The cost
+    /// is a WAL that cannot be checkpointed back to empty until the snapshot's
+    /// read transaction ends.
+    ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the statement fails
     /// (including when `dest` already exists).
     pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
         let dest = dest.to_string_lossy().replace('\'', "''");
         sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
-            .execute(&self.writer)
+            .execute(&self.snapshotter)
             .await?;
         Ok(())
     }

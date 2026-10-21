@@ -990,7 +990,6 @@ pub const VERIFIED: &[Verified] = &[
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
             VERSION_RESUME_DATA_DIVERGENCE,
-            USER_DATA_RETIRED_KEYS_DIVERGENCE,
         ],
         refs: &[],
     },
@@ -1227,6 +1226,47 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Users/AuthenticateWithQuickConnect",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "AuthenticateWithQuickConnect",
+        ferrofin: "handlers/users.rs authenticate_with_quick_connect, authentication_result → \
+               ferrofin-core quick_connect_manager.rs get_authorized_request (the result \
+               authorize_request stored)",
+        date: "2026-10-20",
+        divergences: &[
+            "The User member is built at the exchange, from the user as it is then, where \
+         upstream returns the UserDto it snapshotted when the code was authorized, up to \
+         10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
+         session, token and ServerId are the stored ones on both. Jellyfin bug not \
+         ported.",
+            "The 401 (Quick Connect disabled) and 404 (unknown or expired secret) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/QuickConnect/Initiate",
+        upstream_file: "Jellyfin.Api/Controllers/QuickConnectController.cs",
+        upstream_method: "InitiateQuickConnect",
+        ferrofin: "handlers/quick_connect.rs initiate → ferrofin-core quick_connect_manager.rs \
+               try_connect (make_room, draw_free_code)",
+        date: "2026-10-20",
+        divergences: &[
+            "A drawn code that a pending request already holds is drawn again; upstream \
+         TryConnect's `_currentRequests[code] = result` overwrites the other device's \
+         request, so authorizing that code would pair the wrong device. Jellyfin bug not \
+         ported. Once all 900,000 codes are pending, Initiate fails with 500 instead.",
+            "Each remote IP holds at most FERROFIN_QUICK_CONNECT_PENDING_PER_IP (default 10) \
+         unauthorized requests, and the next Initiate from that IP drops its oldest, whose \
+         poll then gets 404 as an expired one does; authorized requests are exempt. \
+         Upstream has no cap, so the anonymous endpoint can grow the map toward the whole \
+         code space.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
@@ -1292,11 +1332,13 @@ const RESUME_DIVERGENCES: &[&str] = &[
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
     VERSION_RESUME_DATA_DIVERGENCE,
-    USER_DATA_RETIRED_KEYS_DIVERGENCE,
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
      count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
+    "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
+     ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
+     until they are played again; new plays no longer save one. Fix path: gl-717.",
 ];
 
 /// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
@@ -1305,12 +1347,6 @@ const VERSION_RESUME_DATA_DIVERGENCE: &str = "VersionResumeData.ApplyTo is not p
      is its own row, where v12 takes Played, LastPlayedDate and the resume position from \
      the most recently played version of its group. The write-side propagate_played_state \
      covers finishing a version through playback. Fix path: gl-47.";
-
-/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
-const USER_DATA_RETIRED_KEYS_DIVERGENCE: &str = "v12.2 SaveUserData also rewrites the \
-     user's rows under keys the item no longer reports; Ferrofin writes the current keys \
-     only, so a stale-key row can keep an item played or in progress here. Fix path: \
-     gl-398.";
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

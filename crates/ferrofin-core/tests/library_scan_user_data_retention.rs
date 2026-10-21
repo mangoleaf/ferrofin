@@ -39,6 +39,8 @@ struct Fixture {
     media: PathBuf,
     db: Database,
     store: Arc<FerrofinItemPersistenceService>,
+    vf: Arc<dyn VirtualFolderManager>,
+    repo: Arc<FerrofinItemRepository>,
     scanner: LibraryScanner,
 }
 
@@ -75,15 +77,34 @@ impl Fixture {
             db.clone(),
             Arc::new(ItemTypeLookup::new()),
         ));
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), store.clone())
-            .with_items(repo);
+        let scanner = Self::scanner_over(&vf, &store, &repo);
         Self {
             _tmp: tmp,
             media,
             db,
             store,
+            vf,
+            repo,
             scanner,
         }
+    }
+
+    fn scanner_over(
+        vf: &Arc<dyn VirtualFolderManager>,
+        store: &Arc<FerrofinItemPersistenceService>,
+        repo: &Arc<FerrofinItemRepository>,
+    ) -> LibraryScanner {
+        LibraryScanner::new(
+            Arc::clone(vf),
+            Arc::new(FerrofinFileSystem::new()),
+            store.clone(),
+        )
+        .with_items(repo.clone())
+    }
+
+    /// The scanner a restarted server builds over the same database.
+    fn restarted_scanner(&self) -> LibraryScanner {
+        Self::scanner_over(&self.vf, &self.store, &self.repo)
     }
 
     fn path(&self, relative: &str) -> String {
@@ -352,4 +373,130 @@ async fn a_released_version_keeps_its_history_attached() {
 
     f.scanner.scan_all().await.unwrap();
     assert_eq!(shape(f.user_data(user).await), expected);
+}
+
+/// `user`'s history rows on item `id`: (key, play count), sorted.
+async fn history_on(f: &Fixture, id: &str, user: Uuid) -> Vec<(String, i64)> {
+    f.user_data(user)
+        .await
+        .into_iter()
+        .filter(|(item, ..)| item == id)
+        .map(|(_, key, count, ..)| (key, count))
+        .collect()
+}
+
+/// The full recovery sweep after a scan exists for pairs the scan's own
+/// saves could not match. A watcher or item scan that detached nothing
+/// since the last sweep has none to find, so it skips the sweep: a
+/// destination whose keys changed outside a scan meanwhile is recovered by
+/// the next library validation, which always sweeps.
+#[tokio::test]
+async fn a_touched_scan_detaching_nothing_leaves_recovery_to_the_next_full_scan() {
+    let f = Fixture::movies(&["A/Alpha.mkv", "B/Beta.mkv", "C/Gamma.mkv"]).await;
+    f.scanner.scan_all().await.unwrap();
+    let alpha = f.row("A/Alpha.mkv").await;
+    let alpha_id = Uuid::parse_str(&alpha.id).unwrap();
+    f.store
+        .save_provider_id(alpha_id, "Tmdb", "603")
+        .await
+        .unwrap();
+    let user = seed_user(&f.db).await;
+    play(&f.db, alpha_id, user, 3, 33, "2026-03-01").await;
+
+    // The file goes: a watcher scan prunes it and detaches its history,
+    // with no destination for it yet.
+    std::fs::remove_file(f.path("A/Alpha.mkv")).unwrap();
+    f.scanner.scan_paths(&[f.path("A")]).await.unwrap();
+    assert_eq!(f.snapshots_of(alpha_id).await, 1, "detached for recovery");
+
+    // Another film takes its TMDB id outside any scan (an edit, no save
+    // through the scan's reattach).
+    let beta = f.row("B/Beta.mkv").await;
+    let beta_id = Uuid::parse_str(&beta.id).unwrap();
+    f.store
+        .save_provider_id(beta_id, "Tmdb", "603")
+        .await
+        .unwrap();
+
+    // An unrelated watcher scan that detaches nothing does not sweep.
+    f.scanner.scan_paths(&[f.path("C")]).await.unwrap();
+    assert_eq!(history_on(&f, &beta.id, user).await, Vec::new());
+    assert_eq!(f.snapshots_of(alpha_id).await, 1, "still retained");
+
+    // The next library validation sweeps, and recovers it.
+    f.scanner.scan_all().await.unwrap();
+    let recovered = history_on(&f, &beta.id, user).await;
+    assert!(
+        !recovered.is_empty() && recovered.iter().all(|(_, count)| *count == 3),
+        "{recovered:?}"
+    );
+    assert_eq!(
+        f.snapshots_of(alpha_id).await,
+        0,
+        "the snapshot is consumed"
+    );
+}
+
+/// A watcher scan that does detach history still sweeps, so a destination an
+/// earlier event saved (outside this scan's scope) gets it at once.
+#[tokio::test]
+async fn a_touched_scan_that_detached_history_recovers_it_onto_an_earlier_destination() {
+    let f = Fixture::movies(&["A/Alpha.mkv", "B/Beta.mkv"]).await;
+    f.scanner.scan_all().await.unwrap();
+    let alpha = f.row("A/Alpha.mkv").await;
+    let alpha_id = Uuid::parse_str(&alpha.id).unwrap();
+    let beta = f.row("B/Beta.mkv").await;
+    let beta_id = Uuid::parse_str(&beta.id).unwrap();
+    for id in [alpha_id, beta_id] {
+        f.store.save_provider_id(id, "Tmdb", "603").await.unwrap();
+    }
+    let user = seed_user(&f.db).await;
+    play(&f.db, alpha_id, user, 3, 33, "2026-03-01").await;
+
+    std::fs::remove_file(f.path("A/Alpha.mkv")).unwrap();
+    f.scanner.scan_paths(&[f.path("A")]).await.unwrap();
+    let recovered = history_on(&f, &beta.id, user).await;
+    assert!(
+        !recovered.is_empty() && recovered.iter().all(|(_, count)| *count == 3),
+        "{recovered:?}"
+    );
+    assert_eq!(
+        f.snapshots_of(alpha_id).await,
+        0,
+        "the snapshot is consumed"
+    );
+}
+
+/// The first scan after a start always sweeps, whatever its passes: the
+/// process does not know what was detached before it started.
+#[tokio::test]
+async fn the_first_touched_scan_after_a_restart_sweeps() {
+    let f = Fixture::movies(&["A/Alpha.mkv", "B/Beta.mkv", "C/Gamma.mkv"]).await;
+    f.scanner.scan_all().await.unwrap();
+    let alpha = f.row("A/Alpha.mkv").await;
+    let alpha_id = Uuid::parse_str(&alpha.id).unwrap();
+    f.store
+        .save_provider_id(alpha_id, "Tmdb", "603")
+        .await
+        .unwrap();
+    let user = seed_user(&f.db).await;
+    play(&f.db, alpha_id, user, 3, 33, "2026-03-01").await;
+    std::fs::remove_file(f.path("A/Alpha.mkv")).unwrap();
+    f.scanner.scan_paths(&[f.path("A")]).await.unwrap();
+    let beta = f.row("B/Beta.mkv").await;
+    let beta_id = Uuid::parse_str(&beta.id).unwrap();
+    f.store
+        .save_provider_id(beta_id, "Tmdb", "603")
+        .await
+        .unwrap();
+
+    f.restarted_scanner()
+        .scan_paths(&[f.path("C")])
+        .await
+        .unwrap();
+    let recovered = history_on(&f, &beta.id, user).await;
+    assert!(
+        !recovered.is_empty() && recovered.iter().all(|(_, count)| *count == 3),
+        "{recovered:?}"
+    );
 }

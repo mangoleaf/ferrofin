@@ -268,6 +268,11 @@ pub struct TrickplayExtraction<'a> {
     /// The source video stream, or `None` when the item has none recorded —
     /// which forces the software path.
     pub video_stream: Option<&'a MediaStream>,
+    /// Every stream of the source, in stream order (`mediaSource.MediaStreams`).
+    /// The extractor finds `video_stream`'s ffmpeg index among them
+    /// (`EncodingHelper.FindIndex`) and maps it explicitly, so ffmpeg cannot
+    /// pick a cover image or another video track instead.
+    pub media_streams: &'a [MediaStream],
     /// Milliseconds between thumbnails.
     pub interval_ms: i32,
     /// The thumbnail width bound in pixels, forced even, aspect preserved.
@@ -567,6 +572,10 @@ pub struct HlsStreamRequest {
     /// The negotiated subtitle delivery method name (`subtitleMethod`:
     /// `Encode`/`Embed`/`External`/`Hls`/`Drop`).
     pub subtitle_method: Option<String>,
+    /// The subtitle codecs an `Embed` delivery may write (`subtitleCodec`), a
+    /// comma list. `StreamingHelpers` splits it into `SupportedSubtitleCodecs`,
+    /// whose first entry names the embedded track's codec.
+    pub subtitle_codec: Option<String>,
     /// Burn the selected subtitle into any video that is not stream-copied,
     /// whatever its delivery method (`alwaysBurnInSubtitleWhenTranscoding`,
     /// default `false`). Only the video HLS routes bind it upstream.
@@ -661,6 +670,7 @@ impl Default for HlsStreamRequest {
             min_segments: None,
             subtitle_stream_index: None,
             subtitle_method: None,
+            subtitle_codec: None,
             always_burn_in_subtitle_when_transcoding: false,
             transcode_reasons: None,
             // The master-playlist DTO defaults (`GetMasterHlsVideoPlaylist`):

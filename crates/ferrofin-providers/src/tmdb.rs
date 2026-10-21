@@ -560,6 +560,10 @@ struct DetailsResponse {
     poster_path: Option<String>,
     #[serde(default)]
     credits: Option<CreditsResponse>,
+    /// Series only: the whole run's cast, each member once with every role
+    /// it played (`TvShowMethods.CreditsAggregate`).
+    #[serde(default)]
+    aggregate_credits: Option<AggregateCreditsResponse>,
     #[serde(default)]
     release_dates: Option<ReleaseDatesResults>,
     #[serde(default)]
@@ -605,7 +609,10 @@ fn episode_people_from(
                 tmdb_id: c.id,
                 name: c.name,
                 person_type: person_type.to_owned(),
-                role: c.character.filter(|r| !r.is_empty()),
+                role: c
+                    .character
+                    .map(|r| r.trim().to_owned())
+                    .filter(|r| !r.is_empty()),
                 // `SortOrder = actor.Order` / `guest.Order`
                 // (`TmdbEpisodeProvider.cs:233,264`).
                 sort_order: Some(c.order),
@@ -729,6 +736,38 @@ struct CastEntry {
     order: i32,
 }
 
+/// A series' `aggregate_credits` (TMDbLib's `CreditsAggregate`).
+#[derive(Debug, Deserialize)]
+struct AggregateCreditsResponse {
+    #[serde(default)]
+    cast: Vec<AggregateCastEntry>,
+}
+
+/// One member of a series' whole-run cast (TMDbLib's `CastAggregate`).
+#[derive(Debug, Deserialize)]
+struct AggregateCastEntry {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    profile_path: Option<String>,
+    #[serde(default)]
+    order: i32,
+    /// Every character the member played over the run.
+    #[serde(default)]
+    roles: Vec<CastRole>,
+}
+
+/// One character of an [`AggregateCastEntry`] (TMDbLib's `CastRole`).
+#[derive(Debug, Deserialize)]
+struct CastRole {
+    #[serde(default)]
+    character: Option<String>,
+    #[serde(default)]
+    episode_count: i32,
+}
+
 /// `castQuery.OrderBy(a => a.Order)` after the settings page's
 /// `HideMissingCastMembers` filter, then `.Take(MaxCastMembers)`
 /// (`TmdbMovieProvider.cs:280-286`, `TmdbEpisodeProvider.cs:217-219,248-250`):
@@ -787,11 +826,8 @@ struct ContentRatingCountry {
 }
 
 /// Maps a title's `credits` block to [`TmdbPerson`]s under the TMDb settings
-/// page's cast/crew caps and profile filters.
-///
-/// Shared by the movie and series arms of [`TmdbClient::details`], which are one
-/// request here and two providers upstream (`TmdbMovieProvider.GetMetadata` /
-/// `TmdbSeriesProvider.GetPersons`) running the identical LINQ.
+/// page's cast/crew caps and profile filters (`TmdbMovieProvider.GetMetadata`;
+/// a season's details use it too). A series' people are [`series_people`]'s.
 fn credits_to_people(
     credits: Option<CreditsResponse>,
     cfg: &crate::plugin_config::TmdbConfig,
@@ -814,7 +850,10 @@ fn credits_to_people(
                 tmdb_id: c.id,
                 name: c.name,
                 person_type: "Actor".to_owned(),
-                role: c.character.filter(|r| !r.is_empty()),
+                role: c
+                    .character
+                    .map(|r| r.trim().to_owned())
+                    .filter(|r| !r.is_empty()),
                 sort_order: Some(c.order),
                 profile_url: c
                     .profile_path
@@ -822,40 +861,169 @@ fn credits_to_people(
                     .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
             });
         }
-        // Crew: only the roles Jellyfin surfaces on the detail page, then
-        // the settings page's `HideMissingCrewMembers` filter and
-        // `MaxCrewMembers` cap. Upstream applies both AFTER the
-        // wanted-kind filter, so the cap counts kept crew, not raw credits.
-        for c in credits
-            .crew
-            .into_iter()
-            .filter(|c| crew_person_type(c.job.as_deref()).is_some())
-            .filter(|c| {
-                !cfg.hide_missing_crew_members
-                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-            })
-            .take(cfg.max_crew_members)
-        {
-            let Some(person_type) = crew_person_type(c.job.as_deref()) else {
-                continue;
-            };
-            if c.name.is_empty() {
-                continue;
-            }
-            people.push(TmdbPerson {
-                tmdb_id: c.id,
-                name: c.name,
-                person_type: person_type.to_owned(),
-                role: c.job.filter(|r| !r.is_empty()),
-                sort_order: None,
-                profile_url: c
+        people.extend(crew_people(credits.crew, cfg));
+    }
+    people
+}
+
+/// The crew half of a title's credits, shared by movies and series: only the
+/// roles Jellyfin surfaces on the detail page, then the settings page's
+/// `HideMissingCrewMembers` filter and `MaxCrewMembers` cap. Upstream applies
+/// both AFTER the wanted-kind filter, so the cap counts kept crew, not raw
+/// credits.
+fn crew_people(crew: Vec<CrewEntry>, cfg: &crate::plugin_config::TmdbConfig) -> Vec<TmdbPerson> {
+    let mut people = Vec::new();
+    for c in crew
+        .into_iter()
+        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| {
+            !cfg.hide_missing_crew_members
+                || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+        })
+        .take(cfg.max_crew_members)
+    {
+        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+            continue;
+        };
+        if c.name.is_empty() {
+            continue;
+        }
+        people.push(TmdbPerson {
+            tmdb_id: c.id,
+            name: c.name,
+            person_type: person_type.to_owned(),
+            role: c.job.filter(|r| !r.is_empty()),
+            sort_order: None,
+            profile_url: c
+                .profile_path
+                .filter(|p| !p.is_empty())
+                .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+        });
+    }
+    people
+}
+
+/// `TmdbSeriesProvider.GetPersons` (v12.2, jellyfin/jellyfin#17716): the
+/// whole run's cast from `aggregate_credits` when TMDB has one
+/// ([`map_aggregate_cast`]), otherwise the latest season's flat
+/// `credits.cast` ([`map_cast`]); the crew always from the flat credits.
+fn series_people(
+    aggregate: Option<AggregateCreditsResponse>,
+    credits: Option<CreditsResponse>,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> Vec<TmdbPerson> {
+    let aggregate = aggregate.map(|a| a.cast).unwrap_or_default();
+    let (cast, crew) = credits.map_or_else(Default::default, |c| (c.cast, c.crew));
+    let mut people = if aggregate.is_empty() {
+        map_cast(cast, cfg)
+    } else {
+        map_aggregate_cast(aggregate, cfg)
+    };
+    people.extend(crew_people(crew, cfg));
+    people
+}
+
+/// `TmdbUtils.MapAggregateCast` (v12.2): members with a blank name, and those
+/// without a profile under `HideMissingCastMembers`, dropped; the rest in
+/// billing order up to `MaxCastMembers`. An actor who played several
+/// characters over the run gets one credit per character, the one played the
+/// longest first; one with none still gets a credit with no role.
+fn map_aggregate_cast(
+    cast: Vec<AggregateCastEntry>,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> Vec<TmdbPerson> {
+    let mut billed: Vec<AggregateCastEntry> = cast
+        .into_iter()
+        .filter(|member| !member.name.trim().is_empty())
+        .filter(|member| {
+            !cfg.hide_missing_cast_members
+                || member
                     .profile_path
-                    .filter(|p| !p.is_empty())
-                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
-            });
+                    .as_deref()
+                    .is_some_and(|p| !p.is_empty())
+        })
+        .collect();
+    billed.sort_by_key(|member| member.order);
+    billed.truncate(cfg.max_cast_members);
+    let mut people = Vec::new();
+    for mut member in billed {
+        member.roles.retain(|role| {
+            role.character
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
+        });
+        member
+            .roles
+            .sort_by_key(|role| std::cmp::Reverse(role.episode_count));
+        let mut characters: Vec<String> = member
+            .roles
+            .into_iter()
+            .filter_map(|role| role.character)
+            .map(|character| character.trim().to_owned())
+            .collect();
+        if characters.is_empty() {
+            characters.push(String::new());
+        }
+        for character in characters {
+            people.push(cast_credit(
+                &member.name,
+                member.id,
+                member.profile_path.as_deref(),
+                member.order,
+                &character,
+                cfg,
+            ));
         }
     }
     people
+}
+
+/// `TmdbUtils.MapCast` (v12.2): a flat cast list, one credit per entry, with
+/// blank names dropped BEFORE the `MaxCastMembers` cap.
+fn map_cast(cast: Vec<CastEntry>, cfg: &crate::plugin_config::TmdbConfig) -> Vec<TmdbPerson> {
+    let named = cast
+        .into_iter()
+        .filter(|entry| !entry.name.trim().is_empty())
+        .collect();
+    billed_cast(named, cfg.hide_missing_cast_members, cfg.max_cast_members)
+        .into_iter()
+        .map(|entry| {
+            cast_credit(
+                &entry.name,
+                entry.id,
+                entry.profile_path.as_deref(),
+                entry.order,
+                entry
+                    .character
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default(),
+                cfg,
+            )
+        })
+        .collect()
+}
+
+/// `TmdbUtils.CreateCredit`: an Actor credit with its billing order as its
+/// sort order; an empty `role` is none.
+fn cast_credit(
+    name: &str,
+    id: i64,
+    profile_path: Option<&str>,
+    order: i32,
+    role: &str,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> TmdbPerson {
+    TmdbPerson {
+        tmdb_id: id,
+        name: name.trim().to_owned(),
+        person_type: "Actor".to_owned(),
+        role: Some(role.to_owned()).filter(|r| !r.is_empty()),
+        sort_order: Some(order),
+        profile_url: profile_path
+            .filter(|p| !p.is_empty())
+            .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, p)),
+    }
 }
 
 /// Maps a TMDB crew `job` to the Jellyfin person type Ferrofin surfaces, or `None`
@@ -976,7 +1144,7 @@ fn season_details_from(
             .filter(|id| *id > 0)
             .map(|id| id.to_string()),
         // `TmdbSeasonProvider` runs the same cast and crew LINQ as the movie
-        // and series providers (`:84-155`): billed cast under
+        // provider (`:84-155`; a series' people are `series_people`'s): billed cast under
         // `HideMissingCastMembers`/`MaxCastMembers`, then the wanted crew
         // under `HideMissingCrewMembers`/`MaxCrewMembers`.
         people: credits_to_people(resp.credits, cfg),
@@ -1093,7 +1261,7 @@ pub fn image_languages_param(language: Option<&str>, country_code: Option<&str>)
     languages.join(",")
 }
 
-/// One page of `/movie|tv/{id}/similar`.
+/// One page of `/movie|tv/{id}/recommendations`.
 #[derive(Debug, Deserialize)]
 struct SimilarResponse {
     #[serde(default)]
@@ -1702,14 +1870,21 @@ impl TmdbClient {
             .collect()
     }
 
-    /// One page of TMDB's "similar titles" for a movie or series
-    /// (`/movie|tv/{id}/similar`) — port of
-    /// `TmdbClientManager.GetMovieSimilarPageAsync`/its TV twin.
+    /// One page of TMDB's recommendations for a movie or series
+    /// (`/movie|tv/{id}/recommendations`) — port of
+    /// `TmdbClientManager.GetMovieRecommendationsPageAsync`/its TV twin, with
+    /// the `language` the similar providers hand it
+    /// (`TmdbUtils.GetImageLanguagesParam(string.Empty)`, so `null,en`).
     ///
     /// Returns the page's TMDB ids and the reported total page count, so the
     /// caller can walk the pages the way the C# provider does. Empty on any
     /// error.
-    pub async fn similar_page(&self, kind: TmdbKind, tmdb_id: i64, page: i32) -> (Vec<i64>, i32) {
+    pub async fn recommendations_page(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+        page: i32,
+    ) -> (Vec<i64>, i32) {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -1721,8 +1896,15 @@ impl TmdbClient {
         };
         let Ok(resp) = self
             .http
-            .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
-            .query(&[("api_key", key), ("page", &page.max(1).to_string())])
+            .get(format!(
+                "{}/{path}/{tmdb_id}/recommendations",
+                self.base_url
+            ))
+            .query(&[
+                ("api_key", key),
+                ("page", &page.max(1).to_string()),
+                ("language", &image_languages_param(None, None)),
+            ])
             .send_limited(&self.limiter)
             .await
         else {
@@ -2092,7 +2274,7 @@ impl TmdbClient {
             TmdbKind::Movie => ("movie", "credits,release_dates,images,videos,keywords"),
             TmdbKind::Series => (
                 "tv",
-                "credits,images,content_ratings,videos,external_ids,keywords",
+                "credits,aggregate_credits,images,content_ratings,videos,external_ids,keywords",
             ),
         };
         let req = self
@@ -2126,7 +2308,11 @@ impl TmdbClient {
             .release_date
             .or(d.first_air_date)
             .filter(|s| !s.is_empty());
-        let people = credits_to_people(d.credits, cfg);
+        let people = if kind == TmdbKind::Series {
+            series_people(d.aggregate_credits, d.credits, cfg)
+        } else {
+            credits_to_people(d.credits, cfg)
+        };
 
         let trailers = youtube_trailers(d.videos);
 
@@ -2862,6 +3048,15 @@ mod tests {
                         .any(|method| method == "images"),
                     "{path}: {query:?}"
                 );
+                // Only a series asks for its whole run's cast
+                // (`TvShowMethods.CreditsAggregate`).
+                assert_eq!(
+                    query["append_to_response"]
+                        .split(',')
+                        .any(|method| method == "aggregate_credits"),
+                    expected_path == "/tv/1",
+                    "{path}: {query:?}"
+                );
             }
         }
     }
@@ -3050,25 +3245,47 @@ mod tests {
         assert!(client.search_collection("  ", None).await.is_empty());
     }
 
+    /// Jellyfin 12 reads TMDB's recommendations, not its "similar" list
+    /// (`GetMovieRecommendationsPageAsync` / `GetSeriesRecommendationsPageAsync`).
     #[tokio::test]
-    async fn similar_pages_yield_their_ids_and_page_count() {
+    async fn recommendation_pages_yield_their_ids_and_page_count() {
         let body = r#"{"page":1,"total_pages":3,"results":[{"id":603},{"id":604}]}"#;
-        let server = crate::mock_http::MockServer::start(vec![("/similar", body.to_owned())]).await;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/27205/recommendations?", body.to_owned()),
+            ("/tv/1396/recommendations?", body.to_owned()),
+        ])
+        .await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
-        let (ids, total) = client.similar_page(TmdbKind::Movie, 27205, 1).await;
+        let (ids, total) = client.recommendations_page(TmdbKind::Movie, 27205, 1).await;
         assert_eq!(ids, [603, 604]);
         assert_eq!(total, 3);
         // The TV path is the same shape.
-        let (ids, _) = client.similar_page(TmdbKind::Series, 1396, 1).await;
+        let (ids, _) = client.recommendations_page(TmdbKind::Series, 1396, 1).await;
         assert_eq!(ids, [603, 604]);
     }
 
+    /// The similar providers pass `TmdbUtils.GetImageLanguagesParam(string.Empty)`
+    /// as the request's language: `null,en` (form-encoded by the client), with
+    /// the page asked for.
     #[tokio::test]
-    async fn a_failed_similar_request_yields_no_ids() {
+    async fn recommendation_pages_ask_in_the_providers_language() {
+        let body = r#"{"page":2,"total_pages":2,"results":[{"id":603}]}"#;
+        let server = crate::mock_http::MockServer::start(vec![(
+            "&page=2&language=null%2Cen",
+            body.to_owned(),
+        )])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (ids, _) = client.recommendations_page(TmdbKind::Movie, 27205, 2).await;
+        assert_eq!(ids, [603]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_recommendations_request_yields_no_ids() {
         // Nothing listening: the client must degrade, not error.
         let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
         assert_eq!(
-            client.similar_page(TmdbKind::Movie, 1, 1).await,
+            client.recommendations_page(TmdbKind::Movie, 1, 1).await,
             (vec![], 0)
         );
         assert!(client.collection(1, None).await.is_none());
@@ -3134,6 +3351,194 @@ mod tests {
                 ("Billed First", Some(510)),
                 ("Billed Second", Some(520)),
                 ("Billed Third", Some(530)),
+            ]
+        );
+    }
+
+    fn aggregate(name: &str, id: i64, order: i32, roles: &[(&str, i32)]) -> AggregateCastEntry {
+        AggregateCastEntry {
+            id,
+            name: name.to_owned(),
+            profile_path: None,
+            order,
+            roles: roles
+                .iter()
+                .map(|&(character, episode_count)| CastRole {
+                    character: Some(character.to_owned()),
+                    episode_count,
+                })
+                .collect(),
+        }
+    }
+
+    fn cast_config(max_cast_members: usize) -> crate::plugin_config::TmdbConfig {
+        crate::plugin_config::TmdbConfig {
+            max_cast_members,
+            ..crate::plugin_config::TmdbConfig::default()
+        }
+    }
+
+    // v12.2 `tests/Jellyfin.Providers.Tests/Tmdb/TmdbUtilsCastTests.cs`.
+
+    #[test]
+    fn map_aggregate_cast_member_with_several_roles_yields_one_credit_per_role() {
+        let cast = vec![aggregate(
+            "Megumi Toyoguchi",
+            1,
+            0,
+            &[("Tabby (voice)", 3), ("Mimiru (voice)", 12)],
+        )];
+        let people = map_aggregate_cast(cast, &cast_config(10));
+        // The character they played the longest comes first.
+        let roles: Vec<_> = people.iter().map(|p| p.role.as_deref()).collect();
+        assert_eq!(roles, [Some("Mimiru (voice)"), Some("Tabby (voice)")]);
+        assert!(
+            people.iter().all(|p| p.name == "Megumi Toyoguchi"
+                && p.person_type == "Actor"
+                && p.tmdb_id == 1)
+        );
+    }
+
+    #[test]
+    fn map_aggregate_cast_member_without_a_role_is_still_credited() {
+        let people = map_aggregate_cast(
+            vec![aggregate("Uncredited Actor", 2, 0, &[])],
+            &cast_config(10),
+        );
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].role, None, "an empty role");
+    }
+
+    #[test]
+    fn map_aggregate_cast_more_than_configured_keeps_the_top_billed() {
+        let cast = (0..5)
+            .map(|i| {
+                let name = format!("Actor {}", 4 - i);
+                let role = format!("Role {}", 4 - i);
+                aggregate(&name, i64::from(i + 1), 4 - i, &[(role.as_str(), 1)])
+            })
+            .collect();
+        let names: Vec<_> = map_aggregate_cast(cast, &cast_config(2))
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["Actor 0", "Actor 1"]);
+    }
+
+    #[test]
+    fn map_aggregate_cast_hide_missing_cast_members_drops_the_ones_without_a_profile() {
+        let mut with_profile = aggregate("Has Profile", 1, 0, &[("Hero", 1)]);
+        with_profile.profile_path = Some("/profile.jpg".to_owned());
+        let cfg = crate::plugin_config::TmdbConfig {
+            hide_missing_cast_members: true,
+            ..cast_config(10)
+        };
+        let names: Vec<_> = map_aggregate_cast(
+            vec![
+                with_profile,
+                aggregate("No Profile", 2, 1, &[("Villain", 1)]),
+            ],
+            &cfg,
+        )
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+        assert_eq!(names, ["Has Profile"]);
+    }
+
+    #[test]
+    fn map_cast_flat_credits_yield_one_credit_each() {
+        let cast: Vec<CastEntry> = serde_json::from_str(
+            r#"[{"name": "Kevin Conroy", "id": 1, "order": 0, "character": " Batman (voice) "},
+                {"name": "  ", "id": 2, "order": 1, "character": "Nobody"}]"#,
+        )
+        .expect("cast");
+        let people = map_cast(cast, &cast_config(10));
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].name, "Kevin Conroy");
+        assert_eq!(people[0].role.as_deref(), Some("Batman (voice)"));
+    }
+
+    #[test]
+    fn map_cast_no_cast_yields_nothing() {
+        assert!(map_aggregate_cast(Vec::new(), &cast_config(10)).is_empty());
+        assert!(map_cast(Vec::new(), &cast_config(10)).is_empty());
+    }
+
+    /// `TmdbSeriesProvider.GetPersons` (v12.2): the whole run's cast from
+    /// `aggregate_credits` when TMDB has one, else the flat `credits.cast`;
+    /// crew from the flat credits either way. Movies keep the flat cast.
+    #[test]
+    fn a_series_takes_its_cast_from_aggregate_credits() {
+        let json = |aggregate: &str| {
+            format!(
+                r#"{{"name": "Show",
+                    "credits": {{"cast": [{{"id": 9, "name": "Latest Season", "character": "Now", "order": 0}}],
+                                "crew": [{{"id": 7, "name": "Showrunner", "job": "Director"}}]}},
+                    "aggregate_credits": {{"cast": {aggregate}}}}}"#
+            )
+        };
+        let people = |kind, aggregate: &str| -> Vec<(String, Option<String>)> {
+            let d: DetailsResponse = serde_json::from_str(&json(aggregate)).expect("details");
+            TmdbClient::details_from_response(d, kind, &cast_config(10), None)
+                .people
+                .into_iter()
+                .map(|p| (p.name, p.role))
+                .collect()
+        };
+        let whole_run = r#"[{"id": 1, "name": "First Season", "order": 0,
+                             "roles": [{"character": "Then", "episode_count": 10}]}]"#;
+        assert_eq!(
+            people(TmdbKind::Series, whole_run),
+            [
+                ("First Season".to_owned(), Some("Then".to_owned())),
+                ("Showrunner".to_owned(), Some("Director".to_owned())),
+            ]
+        );
+        assert_eq!(
+            people(TmdbKind::Series, "[]"),
+            [
+                ("Latest Season".to_owned(), Some("Now".to_owned())),
+                ("Showrunner".to_owned(), Some("Director".to_owned())),
+            ],
+            "no aggregate cast: the flat one"
+        );
+        assert_eq!(
+            people(TmdbKind::Movie, whole_run)[0].0,
+            "Latest Season",
+            "a movie has no aggregate cast"
+        );
+    }
+
+    /// `Role = actor.Character?.Trim() ?? string.Empty` (v12.2
+    /// `TmdbMovieProvider.cs:297`, `TmdbEpisodeProvider.cs:231,262`): a
+    /// padded character is trimmed, and a blank one is no role.
+    #[test]
+    fn cast_characters_are_trimmed() {
+        let json = r#"{
+          "cast": [
+            {"id": 1, "name": "Kevin Conroy", "character": " Batman (voice) ", "order": 0},
+            {"id": 2, "name": "Extra", "character": "   ", "order": 1}
+          ],
+          "guest_stars": [{"id": 3, "name": "Guest", "character": " Villain ", "order": 2}]
+        }"#;
+        let cfg = crate::plugin_config::TmdbConfig::default();
+        let roles = |people: Vec<TmdbPerson>| -> Vec<Option<String>> {
+            people.into_iter().map(|p| p.role).collect()
+        };
+        assert_eq!(
+            roles(credits_to_people(serde_json::from_str(json).ok(), &cfg)),
+            [Some("Batman (voice)".to_owned()), None]
+        );
+        assert_eq!(
+            roles(episode_people_from(
+                serde_json::from_str(json).expect("credits"),
+                &cfg
+            )),
+            [
+                Some("Batman (voice)".to_owned()),
+                None,
+                Some("Villain".to_owned())
             ]
         );
     }

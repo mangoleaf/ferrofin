@@ -130,6 +130,36 @@ struct SessionInfo {
 }
 
 impl SessionInfo {
+    /// Records what a start or progress report says is playing (C#
+    /// `SessionManager.UpdateNowPlayingItem`, which both `OnPlaybackStart` and
+    /// `OnPlaybackProgress` call). A session recreated mid-playback gets its
+    /// now-playing item back from the first progress report, since clients
+    /// never resend the start. `now_playing` is the reported item when the
+    /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
+    /// item it cannot resolve).
+    fn update_now_playing(
+        &mut self,
+        now_playing: Option<Uuid>,
+        position_ticks: Option<i64>,
+        is_paused: bool,
+        update_check_in: bool,
+    ) {
+        let now = Utc::now();
+        self.now_playing_item_id = now_playing;
+        self.last_activity_date = now;
+        if update_check_in {
+            self.last_playback_check_in = now;
+        }
+        // The date the pause began: kept across paused reports.
+        if !is_paused {
+            self.last_paused_date = None;
+        } else if self.last_paused_date.is_none() {
+            self.last_paused_date = Some(now);
+        }
+        self.now_playing_is_paused = is_paused;
+        self.now_playing_position_ticks = position_ticks;
+    }
+
     /// Whether the session references `user_id` as its primary or an additional
     /// user (C# `SessionInfo.ContainsUser`).
     fn contains_user(&self, user_id: Uuid) -> bool {
@@ -1150,24 +1180,28 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
-        // Record the now-playing item + mark automatic progress started.
-        {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.now_playing_item_id = (!info.item_id.is_nil()).then_some(info.item_id);
-                s.now_playing_position_ticks = info.position_ticks;
-                s.now_playing_is_paused = info.is_paused;
-                s.is_playing = true;
-                s.last_playback_check_in = Utc::now();
-            }
-        }
-
-        // Resolve the library item (best-effort) for the event payload.
+        // Resolve the library item (best-effort): it names the now-playing
+        // item and the event payload.
         let item = if info.item_id.is_nil() {
             None
         } else {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
+
+        // Record the now-playing item + mark automatic progress started.
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
+                s.update_now_playing(
+                    item.as_ref().map(|_| info.item_id),
+                    info.position_ticks,
+                    info.is_paused,
+                    true,
+                );
+                s.is_playing = true;
+            }
+        }
+
         if item.is_some() {
             info!(
                 user = ?session.user_name,
@@ -1200,7 +1234,7 @@ impl SessionManager for FerrofinSessionManager {
     async fn on_playback_progress(
         &self,
         info: &PlaybackProgressInfo,
-        _is_automated: bool,
+        is_automated: bool,
     ) -> Result<(), ServiceError> {
         let session_id = info
             .session_id
@@ -1219,18 +1253,27 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
+        // C# `GetNowPlayingItem`: the item the session already plays is not
+        // looked up again, so a steady stream of reports costs no query.
+        let now_playing = if info.item_id.is_nil() {
+            None
+        } else if session.now_playing_item_id == Some(info.item_id) {
+            Some(info.item_id)
+        } else {
+            self.library_manager
+                .get_item_by_id(info.item_id)
+                .await?
+                .map(|_| info.item_id)
+        };
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.last_activity_date = Utc::now();
-                s.last_playback_check_in = Utc::now();
-                s.now_playing_position_ticks = info.position_ticks;
-                s.now_playing_is_paused = info.is_paused;
-                if info.is_paused {
-                    s.last_paused_date = Some(Utc::now());
-                } else {
-                    s.last_paused_date = None;
-                }
+                s.update_now_playing(
+                    now_playing,
+                    info.position_ticks,
+                    info.is_paused,
+                    !is_automated,
+                );
             }
         }
 

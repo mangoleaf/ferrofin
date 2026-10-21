@@ -365,6 +365,7 @@ mod tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 6,
             wait_for_path: None,
             segment_container: Some("ts".to_owned()),

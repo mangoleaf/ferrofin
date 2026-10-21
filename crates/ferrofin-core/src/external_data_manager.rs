@@ -127,23 +127,34 @@ impl FerrofinExternalDataManager {
 
     /// Removes every extracted-data folder for an item, logging and skipping
     /// failures (C# `DeleteExternalItemFiles`).
-    fn delete_files(&self, item_id: Uuid, media: MediaLocation<'_>) {
-        for path in self.path_manager.extracted_data_paths(item_id, media) {
-            // Never the root, an empty path or a relative one — a trickplay
-            // folder computed for a path with no folder would otherwise be
-            // `X.trickplay` against the server's working directory.
-            if !crate::item_deletion::is_deletable_path(std::path::Path::new(&path)) {
-                if !path.is_empty() {
-                    tracing::warn!(item_id = %item_id, path, "refusing to delete extracted data at a root or relative path");
+    ///
+    /// The checks and removals (a series' trickplay tiles, subtitle and
+    /// attachment caches and chapter images, item by item) run on the
+    /// blocking pool, never on a runtime worker.
+    async fn delete_files(&self, item_id: Uuid, media: MediaLocation<'_>) {
+        let paths = self.path_manager.extracted_data_paths(item_id, media);
+        let remover = Arc::clone(&self.directory_remover);
+        let removal = tokio::task::spawn_blocking(move || {
+            for path in paths {
+                // Never the root, an empty path or a relative one — a trickplay
+                // folder computed for a path with no folder would otherwise be
+                // `X.trickplay` against the server's working directory.
+                if !crate::item_deletion::is_deletable_path(std::path::Path::new(&path)) {
+                    if !path.is_empty() {
+                        tracing::warn!(item_id = %item_id, path, "refusing to delete extracted data at a root or relative path");
+                    }
+                    continue;
                 }
-                continue;
+                if !remover.exists(&path) {
+                    continue;
+                }
+                if let Err(err) = remover.remove_dir_all(&path) {
+                    tracing::warn!(%path, %err, "unable to prune external item data");
+                }
             }
-            if !self.directory_remover.exists(&path) {
-                continue;
-            }
-            if let Err(err) = self.directory_remover.remove_dir_all(&path) {
-                tracing::warn!(%path, %err, "unable to prune external item data");
-            }
+        });
+        if let Err(err) = removal.await {
+            tracing::warn!(item_id = %item_id, %err, "pruning external item data did not finish");
         }
     }
 }
@@ -156,7 +167,7 @@ impl ExternalDataManager for FerrofinExternalDataManager {
         media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
         // Filesystem first, then the four DB-side deletions (C# ordering).
-        self.delete_files(item_id, media);
+        self.delete_files(item_id, media).await;
         self.keyframe_repository
             .delete_keyframe_data(item_id)
             .await?;
@@ -173,7 +184,7 @@ impl ExternalDataManager for FerrofinExternalDataManager {
         item_id: Uuid,
         media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
-        self.delete_files(item_id, media);
+        self.delete_files(item_id, media).await;
         Ok(())
     }
 }
@@ -462,6 +473,64 @@ mod tests {
 
         assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/a"]);
         assert!(deletes.keyframe.lock().unwrap().is_empty());
+    }
+
+    /// Removing the extracted-data folders (`is_dir`, `remove_dir_all` over a
+    /// series' trickplay tiles, caches and chapter images) runs on the
+    /// blocking pool, never inline on a runtime worker. With the pool's only
+    /// thread held busy the removal cannot happen, which an inline removal
+    /// would ignore.
+    #[test]
+    fn removing_extracted_data_goes_through_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let remover = Arc::new(RecordingRemover {
+                existing: vec!["/x/a".to_owned()],
+                ..Default::default()
+            });
+            let deletes = Arc::new(RecordingDeletes::default());
+            let mgr = Arc::new(FerrofinExternalDataManager::with_remover(
+                Arc::new(StubPathManager {
+                    paths: vec!["/x/a".to_owned()],
+                }),
+                Arc::clone(&deletes) as Arc<dyn KeyframeRepository>,
+                Arc::clone(&deletes) as Arc<dyn MediaSegmentManager>,
+                Arc::clone(&deletes) as Arc<dyn TrickplayManager>,
+                Arc::clone(&deletes) as Arc<dyn ChapterManager>,
+                Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
+            ));
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let mut delete = tokio::spawn(async move {
+                mgr.delete_external_item_files(
+                    Uuid::new_v4(),
+                    MediaLocation::of_file("/media/x.mkv"),
+                )
+                .await
+            });
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut delete).await;
+            assert!(
+                starved.is_err() && remover.removed.lock().unwrap().is_empty(),
+                "the folders were removed with the blocking pool starved, so inline on the runtime"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            delete.await.unwrap().expect("delete files");
+            assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/a"]);
+        });
     }
 
     /// The root guard: a root, empty or relative extracted-data path is

@@ -37,6 +37,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `100` | Smallest period, in milliseconds, between pushes of a dashboard WebSocket stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). A client names the period in its `*Start` subscription; Ferrofin drives these streams on a timer (each tick recomputes and resends the full snapshot), so the client's period is clamped up to this floor to stop a tiny period becoming back-to-back `get_sessions`/activity work. Well-behaved clients ask for 1500 ms and are unaffected. The `config.toml` key is `websocket_min_stream_period_ms`. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax. |
+| `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` | `10` | How many unauthorized Quick Connect requests one client IP may hold at once. `POST /QuickConnect/Initiate` needs no sign-in, so past this cap the IP's oldest pending request is dropped and its code stops working. Jellyfin has no cap. Behind a reverse proxy that is not in **Known proxies**, every client shares the proxy's IP, so the cap then counts all clients together. The cap is per address, so an IPv6 client can spread requests across its prefix. `0` means the default. The `config.toml` key is `quick_connect_pending_per_ip`. |
 
 ## Admin seeding (fresh database only)
 
@@ -115,7 +116,7 @@ Limits for sandboxed WASM plugins loaded from `{data_dir}/plugins/*.wasm`
 |---|---|
 | `FERROFIN_WASM_CALL_TIMEOUT_SECS` | Per-guest-call deadline in seconds (default 30). A plugin call past the deadline is interrupted; repeated failures sideline the plugin until restart. Exception: time spent inside a host media extraction (`extract-audio`/`extract-frames`) is bounded by the extraction's own 1-minute wall-clock budget instead — the deadline clock does not tick during host calls, so a call using extraction can legitimately outlive this setting by up to that budget. |
 | `FERROFIN_WASM_MEMORY_LIMIT_MB` | Per-plugin linear-memory cap in MiB (default 128). A `memory.grow` ceiling, never a reservation — small plugins use a few MiB. Also caps `http-fetch` response bodies. |
-| `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` | Per-plugin event queue depth (default 256). A full queue drops events for that plugin only. |
+| `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` | Per-plugin event queue depth (default 256). A full queue drops events for that plugin only. Requests to a plugin's own URL space (`/Plugins/{id}/web/…`) may hold at most half of it, queued or running; past that, or when the queue is full, they get `503` at once instead of waiting. |
 | `FERROFIN_WASM_STATE_LIMIT_MB` | Per-plugin key/value state cap in MiB (default 8). Settings and cursors fit easily; raise for stats-heavy plugins (e.g. playback reporting). |
 | `FERROFIN_WASM_IMAGE_DOWNLOAD_MB` | Cap on one plugin-artwork download in MiB (default 20). Posters/backdrops are single-digit MiB; anything larger is not artwork. |
 | `FERROFIN_WASM_IMAGE_TIMEOUT_SECS` | Wall-clock bound on one plugin-artwork download in seconds (default 30). A CDN GET, not a transfer job. |

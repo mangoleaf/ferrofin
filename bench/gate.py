@@ -15,8 +15,13 @@
     gate.py scan PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the same interleaved pairs, each run `scan.py` (library-scan and adoption-migration
         wall time and peak anon memory, B7/B8) instead of run.sh; every cell gates (D6)
+    gate.py soak PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
+        the one-hour memory soak (`run.sh --only soak`, Ferrofin only) back to back, default one
+        pair: the anon-memory slope in MiB/h per run, regressed when the candidate's exceeds the
+        gate.toml `[soak]` limit and the previous release's does not (soak.py has the rule)
     gate.py render SESSION_DIR
-        rewrite a finished session's report.md and report.html from its run dirs
+        rewrite a finished session's report.md and report.html from its run dirs (an A/B
+        also rewrites each candidate run's ab-verdicts.json and report.html)
 
 Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
 latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
@@ -34,7 +39,8 @@ candidate's runs exceeds the median of the previous release's by more than BOTH 
 of its row (relative and absolute) AND the candidate is slower in at least 2 of the 3
 adjacent pairs; improved is the mirror image; anything else is within noise. Only the
 unloaded and loaded levels gate, and an endpoint cell gates only when a median is 1 ms or
-more (B5); the rest is reported.
+more (B5); the rest is reported. The ramp ceiling is the same rule with higher being better,
+and the soak slope has its own limit rule (both described above).
 """
 
 import html
@@ -50,10 +56,11 @@ from datetime import datetime, timezone
 import oracle
 import ramp
 import report
+import soak
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 TAG = "ferrofin:bench"
-PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": "ramp"}
+PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": "ramp", "soak": "soak"}
 #: The levels whose cells can block a release; `stress` is reported, never gated (B5).
 GATED_LEVELS = ("unloaded", "loaded")
 #: An endpoint cell whose medians are both under this many ms is reported, never gated (B5).
@@ -220,6 +227,20 @@ def blocking(rows):
     return sorted(k for k, r in rows.items() if r["gated"] and r["verdict"] in ("regressed", "not comparable"))
 
 
+def viewer_cells(rows):
+    """The gated cells in the shape the benchmark viewer reads from a run's `ab-verdicts.json`
+    (`report.load_verdicts`); a `not comparable` cell has no numbers, only its reason."""
+    out = []
+    for key, r in rows.items():
+        if r["gated"]:
+            cell = {"cell": key, "verdict": r["verdict"], "baseline": r.get("a_median"), "candidate": r.get("b_median"),
+                    "unit": r["unit"], "delta_pct": r.get("pct")}
+            if "reason" in r:
+                cell["reason"] = r["reason"]
+            out.append(cell)
+    return out
+
+
 # ── the driver ──────────────────────────────────────────────────────────────
 def schedule(mode, images, count):
     """`(run dir name, role, image)` in run order. A/A: one image `count` times; A/B: the
@@ -313,13 +334,33 @@ def models(session, plan):
     return {role: report.build(runs) for role, runs in by_role.items()}, by_role
 
 
+def soak_session(session, plan, gate):
+    """The soak A/B's result: its cell, and each run's `soak.json` by role."""
+    soaks = {role: [report.load(os.path.join(d, "ferrofin", "soak.json")) for d in dirs]
+             for role, dirs in run_dirs(session, plan).items()}
+    rows = soak.session_rows(soaks["a"], soaks["b"], gate)
+    return {"verdicts": rows, "soaks": soaks, "blocking": soak.blocking(rows)}
+
+
 def render(session):
     """Compute the session's tables, write report.md, report.html and the machine-readable
-    noise.json (A/A) or verdict.json (A/B); returns the blocking cells."""
+    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B also gives
+    every candidate run the gated verdicts as `ab-verdicts.json` and rewrites its
+    report.html, which is how they reach the viewer (`report.py --serve`)."""
     plan = report.load(os.path.join(session, "gate.json"))
     if not plan:
         raise ValueError(f"{session} has no gate.json")
     gate = report.load_gate()
+    if plan["mode"] == "soak":
+        result = soak_session(session, plan, gate)
+        with open(os.path.join(session, "verdict.json"), "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        md = soak.render_md(header(plan), result)
+        with open(os.path.join(session, "report.md"), "w") as f:
+            f.write(md)
+        with open(os.path.join(session, "report.html"), "w") as f:
+            f.write(soak.render_html(header(plan), result, report.CSS))
+        return md, result["blocking"]
     if plan["mode"] == "ramp":
         docs = {role: [report.load(os.path.join(d, "ferrofin", "ramp.json")) for d in dirs]
                 for role, dirs in run_dirs(session, plan).items()}
@@ -345,7 +386,7 @@ def render(session):
         result["kinds"] = kind_summary(result["noise"], gate)
         name, block = "noise.json", []
     else:
-        built, _ = models(session, plan)
+        built, by_role = models(session, plan)
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
@@ -356,6 +397,12 @@ def render(session):
         f.write(md)
     with open(os.path.join(session, "report.html"), "w") as f:
         f.write(render_html(plan, result))
+    if plan["mode"] == "ab":
+        cells = {"cells": viewer_cells(result["verdicts"])}
+        for run in by_role["b"]:
+            with open(os.path.join(run, "ab-verdicts.json"), "w") as f:
+                json.dump(cells, f, indent=2)
+            report.write_html(run)
     return md, block
 
 
@@ -498,7 +545,7 @@ def render_html(plan, result):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "scan", "render"):
+    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "scan", "soak", "render"):
         sys.exit(__doc__)
     mode, args = argv[0], argv[1:]
     if mode == "render":
@@ -507,7 +554,8 @@ def main(argv):
         md, block = render(os.path.abspath(args[0]))
         print(md)
         return 1 if block else 0
-    opts = {"--runs": "6", "--pairs": "3", "--testdata": None, "--out": None}
+    # One soak pair: each is an hour long (D7 of the "Benchmark coverage" milestone).
+    opts = {"--runs": "6", "--pairs": "1" if mode == "soak" else "3", "--testdata": None, "--out": None}
     flags, positional = {"--dry-run"} & set(args), []
     rest = [a for a in args if a != "--dry-run"]
     while rest:
