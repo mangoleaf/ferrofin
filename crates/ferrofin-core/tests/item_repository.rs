@@ -1959,3 +1959,221 @@ async fn item_value_sorts_order_by_the_first_value_of_the_type() {
         "no artist first, then by name (ties by SortName)"
     );
 }
+
+/// Four series in one library, each keyed `series-<name>`, with one episode
+/// each. The user finished Bravo's episode last (March) and Alpha's before it
+/// (January), is part-way through Charlie's, played most recently (May) but
+/// not finished, and never played Delta's. Another user finished Charlie's in
+/// June. `ProductionYear` runs the other way, to show it is not what orders
+/// them.
+async fn series_play_fixture(db: &Database) -> ferrofin_db::entities::users::UserEntity {
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let library = Uuid::from_u128(0x8300);
+    let mut rows = vec![{
+        let mut row = item(library, BaseItemKind::CollectionFolder, "Shows");
+        row.id = row.id.to_uppercase();
+        row
+    }];
+    let user = seed_user_who_sees_everything(db, Uuid::from_u128(0x83FF)).await;
+    let other = Uuid::from_u128(0x83FE).to_string().to_uppercase();
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'ann', 'ANN')"#,
+    )
+    .bind(&other)
+    .execute(db.writer())
+    .await
+    .expect("seed the other user");
+    let mut episodes = Vec::new();
+    for (n, (name, year)) in [
+        ("Alpha", 2004),
+        ("Bravo", 2003),
+        ("Charlie", 2002),
+        ("Delta", 2001),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = format!("series-{}", name.to_lowercase());
+        let base = 0x8310 + 0x10 * u128::try_from(n).unwrap();
+        let mut series = item(Uuid::from_u128(base), BaseItemKind::Series, name);
+        series.id = series.id.to_uppercase();
+        series.top_parent_id = Some(library.to_string().to_uppercase());
+        series.presentation_unique_key = Some(key.clone());
+        series.production_year = Some(year);
+        let mut episode = item(Uuid::from_u128(base + 1), BaseItemKind::Episode, "Pilot");
+        episode.id = episode.id.to_uppercase();
+        episode.top_parent_id = Some(library.to_string().to_uppercase());
+        episode.series_presentation_unique_key = Some(key);
+        episodes.push(episode.id.clone());
+        rows.extend([series, episode]);
+    }
+    persist.save_items(&rows).await.expect("save");
+    for (episode, who, played, last_played) in [
+        (0, &user.id, true, "2026-01-10 00:00:00.0000000"),
+        (1, &user.id, true, "2026-03-10 00:00:00.0000000"),
+        (2, &user.id, false, "2026-05-10 00:00:00.0000000"),
+        (2, &other, true, "2026-06-10 00:00:00.0000000"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId","UserId","CustomDataKey","IsFavorite","LastPlayedDate",
+                "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1,?2,?1,0,?3,1,?4,?5)"#,
+        )
+        .bind(&episodes[episode])
+        .bind(who)
+        .bind(last_played)
+        .bind(if played { 0_i64 } else { 5_000_i64 })
+        .bind(played)
+        .execute(db.writer())
+        .await
+        .expect("user data");
+    }
+    user
+}
+
+/// `SeriesDatePlayed` orders series by the newest finished episode the user
+/// played (`ApplySeriesDatePlayedOrder`, v12.2 QueryBuilding.cs:386-420): the
+/// played rows grouped by `SeriesPresentationUniqueKey` and matched on the
+/// series' `PresentationUniqueKey`. An unfinished episode does not count, a
+/// series never finished sorts as `NULL` (last descending, first ascending),
+/// and `SortName` breaks ties ascending in either direction. Without a search
+/// the key replaces the whole ordering, so a `ProductionYear` key beside it
+/// orders nothing. Without a user, every user's plays count
+/// (`OrderMapper.cs:84-87`). With a search, the date is one key among the
+/// caller's, after the relevance rank (`OrderMapper.cs:78-83`).
+#[tokio::test]
+async fn series_date_played_orders_series_by_their_newest_finished_episode() {
+    let db = fresh_db().await;
+    let user = series_play_fixture(&db).await;
+    let order = |user: Option<ferrofin_db::entities::users::UserEntity>,
+                 search_term: Option<&str>,
+                 order_by: Vec<(ItemSortBy, SortOrder)>| {
+        let db = db.clone();
+        let search_term = search_term.map(str::to_owned);
+        async move {
+            repo(&db)
+                .get_item_list(&InternalItemsQuery {
+                    user,
+                    search_term,
+                    include_item_types: vec![BaseItemKind::Series],
+                    order_by,
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+                .into_iter()
+                .filter_map(|r| r.name)
+                .collect::<Vec<_>>()
+        }
+    };
+    let me = Some(user.clone());
+    // jellyfin-web's TV Shows "Date played" sort.
+    assert_eq!(
+        order(
+            me.clone(),
+            None,
+            vec![
+                (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Ascending),
+            ]
+        )
+        .await,
+        ["Bravo", "Alpha", "Charlie", "Delta"]
+    );
+    assert_eq!(
+        order(
+            me.clone(),
+            None,
+            vec![(ItemSortBy::SeriesDatePlayed, SortOrder::Ascending)]
+        )
+        .await,
+        ["Charlie", "Delta", "Alpha", "Bravo"]
+    );
+    assert_eq!(
+        order(
+            me.clone(),
+            None,
+            vec![
+                (ItemSortBy::ProductionYear, SortOrder::Ascending),
+                (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+            ]
+        )
+        .await,
+        ["Bravo", "Alpha", "Charlie", "Delta"],
+        "the other keys are dropped, as upstream"
+    );
+    // No user: the other user's June finish puts Charlie first.
+    assert_eq!(
+        order(
+            None,
+            None,
+            vec![(ItemSortBy::SeriesDatePlayed, SortOrder::Descending)]
+        )
+        .await,
+        ["Charlie", "Bravo", "Alpha", "Delta"]
+    );
+    // A search keeps the caller's keys: Alpha, Charlie and Delta all contain
+    // the term alike, so the date leads and `SortName` follows it.
+    assert_eq!(
+        order(
+            me,
+            Some("l"),
+            vec![
+                (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Descending),
+            ]
+        )
+        .await,
+        ["Alpha", "Delta", "Charlie"]
+    );
+}
+
+/// The series dates come from one pass over the user's played rows, grouped
+/// once and looked up per series through an index SQLite builds on the
+/// grouped result, as upstream's pre-aggregated join is: never a walk of the
+/// user's `UserData` per series row.
+#[tokio::test]
+async fn series_date_played_plan_groups_the_users_plays_once() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = series_play_fixture(&db).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Series],
+        order_by: vec![
+            (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+            (ItemSortBy::SortName, SortOrder::Ascending),
+        ],
+        limit: Some(100),
+        ..Default::default()
+    };
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+    let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(plan.contains("MATERIALIZE series_plays"), "{plan}");
+    assert!(
+        plan.contains("SEARCH series_plays USING AUTOMATIC"),
+        "looked up per series by key: {plan}"
+    );
+}

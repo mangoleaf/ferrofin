@@ -2606,10 +2606,14 @@ fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery)
 /// `bi."SortName"` column (rather than a correlated sub-select or another
 /// column).
 fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bool {
-    // The `ItemValues`-correlated keys are sub-selects of their own.
+    // The `ItemValues`-correlated keys are sub-selects of their own, and so
+    // is `SeriesDatePlayed`, with or without a user.
     if matches!(
         by,
-        ItemSortBy::Artist | ItemSortBy::AlbumArtist | ItemSortBy::Studio
+        ItemSortBy::Artist
+            | ItemSortBy::AlbumArtist
+            | ItemSortBy::Studio
+            | ItemSortBy::SeriesDatePlayed
     ) {
         return false;
     }
@@ -2619,7 +2623,6 @@ fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bo
         && matches!(
             by,
             ItemSortBy::DatePlayed
-                | ItemSortBy::SeriesDatePlayed
                 | ItemSortBy::PlayCount
                 | ItemSortBy::IsPlayed
                 | ItemSortBy::IsUnplayed
@@ -2710,6 +2713,23 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         return;
     }
 
+    // C# `ApplyOrder`: with no search, any `SeriesDatePlayed` key hands the
+    // whole ordering to `ApplySeriesDatePlayedOrder`, which orders by the
+    // series' played date in that key's direction, then `SortName` ascending,
+    // and drops every other key (`QueryBuilding.cs:314-316, 415-419`).
+    if let Some((_, order)) = ordered
+        .iter()
+        .find(|(by, _)| *by == ItemSortBy::SeriesDatePlayed)
+    {
+        push_series_date_played(qb, filter);
+        qb.push(match order {
+            SortOrder::Ascending => " ASC",
+            SortOrder::Descending | SortOrder::Unrecognized(_) => " DESC",
+        });
+        qb.push(r#", bi."SortName" ASC"#);
+        return;
+    }
+
     // Only the leading term can be satisfied by an index, so it is the only one
     // that ever carries the plan pin.
     let pin_leading_term = pins_sort_plan(ordered[0].0, ordered[0].1, filter);
@@ -2772,6 +2792,41 @@ fn push_caller_keys(
     }
 }
 
+/// Pushes the `SeriesDatePlayed` key: the newest `LastPlayedDate` among the
+/// played rows of the items whose `SeriesPresentationUniqueKey` is the row's
+/// `PresentationUniqueKey` — the requesting user's rows, or everyone's when
+/// there is no user. `NULL` for a series none of whose items was finished.
+///
+/// The shape is upstream's `ApplySeriesDatePlayedOrder` (v12.2
+/// `QueryBuilding.cs:392-413`): the played rows are grouped by series key in
+/// ONE pass and the result joined on the key, not a `MAX()` walked per series
+/// row. Here the grouped set is a non-correlated `MATERIALIZED` CTE
+/// (`series_plays`) that SQLite builds once per statement and searches per
+/// row through an automatic index on the key (a plain sub-select ran as a
+/// co-routine inside the correlated look-up); the `EXPLAIN QUERY PLAN` test in
+/// `tests/item_repository.rs` holds that plan. The series key columns lead
+/// with `Type` in every index, so a per-series lookup could not seek them.
+fn push_series_date_played(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    qb.push(
+        r#"(WITH series_plays AS MATERIALIZED (
+            SELECT ep."SeriesPresentationUniqueKey" AS "SeriesKey",
+                   MAX(ud."LastPlayedDate") AS "LastPlayed"
+            FROM "UserData" ud
+                CROSS JOIN "BaseItems" ep ON ep."Id" = ud."ItemId"
+            WHERE ud."Played" = 1"#,
+    );
+    if let Some(user_id) = filter.user_id() {
+        qb.push(r#" AND ud."UserId" = "#)
+            .push_bind(guid_to_db(user_id));
+    }
+    qb.push(
+        r#" AND ep."SeriesPresentationUniqueKey" IS NOT NULL
+            GROUP BY ep."SeriesPresentationUniqueKey")
+        SELECT series_plays."LastPlayed" FROM series_plays
+        WHERE series_plays."SeriesKey" = bi."PresentationUniqueKey")"#,
+    );
+}
+
 /// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
 /// keys (`DatePlayed`, `PlayCount`, favorite state) are correlated
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
@@ -2782,6 +2837,12 @@ fn push_order_expression(
     by: ItemSortBy,
     filter: &InternalItemsQuery,
 ) {
+    // `SeriesDatePlayed` keys on every user's plays when there is no user
+    // (`OrderMapper.cs:84-87`), so it is not one of the keys below.
+    if by == ItemSortBy::SeriesDatePlayed {
+        push_series_date_played(qb, filter);
+        return;
+    }
     // The user-data-correlated keys need the requesting user; without one they
     // fall through to SortName (matching the C# `(key, null)` arms).
     if let Some(user_id) = filter.user_id() {
@@ -2802,13 +2863,7 @@ fn push_order_expression(
             // by the alternate's id. `CROSS JOIN` pins that order: left to
             // itself the planner re-drives the arm from `IX_UserData_UserId`
             // and walks the user's rows per candidate again (300 ms).
-            //
-            // `SeriesDatePlayed` shares the arm: v12 orders it through a
-            // pre-aggregated join (`ApplySeriesDatePlayedOrder`) that is not
-            // ported here, and its correlated fallback (`OrderMapper.cs:75-84`)
-            // keys on `SeriesPresentationUniqueKey`, which is an open work
-            // item for the series-sorted browses.
-            ItemSortBy::DatePlayed | ItemSortBy::SeriesDatePlayed => {
+            ItemSortBy::DatePlayed => {
                 qb.push(
                     r#"(SELECT MAX(d."LastPlayedDate") FROM (
                         SELECT oud."LastPlayedDate" FROM "UserData" oud
