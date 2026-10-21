@@ -79,13 +79,29 @@ pub trait SystemManager: Send + Sync {
 
 fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}
 
+/// The URL this server's own processes reach its API at.
+///
+/// The one `IServerApplicationHost` member the Live TV stream buffer, the DVR
+/// and the File Transformation callbacks need, split out so they depend on
+/// nothing else of the host.
+#[async_trait]
+pub trait LocalApiAccess: Send + Sync {
+    /// C# `GetApiUrlForLocalAccess()`: the server's own bind address
+    /// (`NetworkManager.GetBindAddress(null)`), its listen scheme and port and
+    /// the base URL, computed per call from the live network state. It never
+    /// consults the published server URL.
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError>;
+}
+
+fn _assert_object_safe_local_api_access(_: &dyn LocalApiAccess) {}
+
 /// Exposes host-level networking facts and URL construction.
 ///
 /// Port of `IServerApplicationHost` (the server-relevant subset of its
 /// `IApplicationHost` base). URL builders are fallible `async fn` (they consult
 /// live network state); the simple facts are synchronous getters.
 #[async_trait]
-pub trait ServerApplicationHost: Send + Sync {
+pub trait ServerApplicationHost: LocalApiAccess + Send + Sync {
     /// Whether core startup has finished.
     fn core_startup_has_completed(&self) -> bool;
 

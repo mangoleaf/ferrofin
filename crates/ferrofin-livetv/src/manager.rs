@@ -40,6 +40,7 @@ use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
+use ferrofin_traits::system::LocalApiAccess;
 use serde::de::DeserializeOwned;
 
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
@@ -345,11 +346,13 @@ pub struct FerrofinLiveTvManager {
     paths: LiveTvPaths,
     /// The tuner HTTP seam the live-stream engine opens channels through.
     tuner_source: Arc<dyn TunerStreamSource>,
-    /// The API base URL a live stream's buffered file is served from — C#
-    /// `IServerApplicationHost.GetApiUrlForLocalAccess()`. An `Arc<OnceLock<_>>`
-    /// because the composition root builds the application host *after* this
-    /// manager, and every clone must see the value once it lands.
-    local_api_url: Arc<OnceLock<String>>,
+    /// Where a live stream's buffered file and an in-progress recording are
+    /// served from — C# `IServerApplicationHost.GetApiUrlForLocalAccess()`,
+    /// asked per stream as upstream does, so it follows the bound listener and
+    /// the live network settings. An `Arc<OnceLock<_>>` because the composition
+    /// root builds the application host *after* this manager, and every clone
+    /// must see it once it lands.
+    local_api: Arc<OnceLock<Arc<dyn LocalApiAccess>>>,
     /// The open live streams, keyed by `LiveStreamId` (C#
     /// `MediaSourceManager._openStreams`, whose values are the tuner-side
     /// `ILiveStream`s). Guarded by a `std::sync::Mutex`: the guard is always
@@ -651,7 +654,7 @@ impl FerrofinLiveTvManager {
             dto: OnceLock::new(),
             paths: LiveTvPaths::default(),
             tuner_source: Arc::new(crate::stream::ReqwestTunerSource::new()),
-            local_api_url: Arc::new(OnceLock::new()),
+            local_api: Arc::new(OnceLock::new()),
             live_streams: Arc::new(Mutex::new(HashMap::new())),
             active_recordings: Arc::new(Mutex::new(HashMap::new())),
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -688,13 +691,14 @@ impl FerrofinLiveTvManager {
         self
     }
 
-    /// Publishes the API base URL a live stream's buffered file is served from
-    /// (C# `GetApiUrlForLocalAccess()`), e.g. `http://127.0.0.1:8096`.
+    /// Attaches the host that answers where this server's API is reached
+    /// locally (C# `GetApiUrlForLocalAccess()`), which the live stream buffer
+    /// and in-progress recordings are served from.
     ///
     /// The composition root calls this once the application host exists; a
     /// second call is ignored.
-    pub fn set_local_api_url(&self, url: impl Into<String>) {
-        let _ = self.local_api_url.set(url.into());
+    pub fn set_local_api_access(&self, access: Arc<dyn LocalApiAccess>) {
+        let _ = self.local_api.set(access);
     }
 
     /// Attaches the user manager so `GET /LiveTv/Info` can list the users who may
@@ -3145,7 +3149,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             // Port of `MediaSourceManager.GetRecordingStreamMediaSources`: the
             // growing file is the path, and `EncoderPath` is how a transcode
             // reads it — progressively, back through this server.
-            let base_url = self.local_api_url()?;
+            let base_url = self.local_api_url().await?;
             return Ok(vec![MediaSourceInfo {
                 id: Some(active.timer_id.clone()),
                 encoder_path: Some(format!(
@@ -4353,17 +4357,21 @@ impl FerrofinLiveTvManager {
         ),
         ServiceError,
     > {
+        // A buffered stream is served from the local API URL, resolved before
+        // the buffer opens so a failure leaves no buffer running unregistered.
         let opened = match kind {
             crate::tuner_host::ChannelStreamKind::LegacyUdp(plan) => {
+                let base_url = self.local_api_url().await?;
                 let transcode_dir = self.transcode_dir()?;
-                Some(
+                Some((
                     crate::hdhomerun::udp_stream::open_legacy_udp_stream(
                         plan,
                         &transcode_dir,
                         rand_lockkey(),
                     )
                     .await?,
-                )
+                    base_url,
+                ))
             }
             crate::tuner_host::ChannelStreamKind::Http => {
                 let share = tuner.allow_stream_sharing
@@ -4371,8 +4379,9 @@ impl FerrofinLiveTvManager {
                     && !source.requires_looping
                     && self.can_share_stream(path, source).await;
                 if share {
+                    let base_url = self.local_api_url().await?;
                     let transcode_dir = self.transcode_dir()?;
-                    Some(
+                    Some((
                         crate::stream::open_shared_http_stream(
                             self.tuner_source.as_ref(),
                             path,
@@ -4380,14 +4389,15 @@ impl FerrofinLiveTvManager {
                             &transcode_dir,
                         )
                         .await?,
-                    )
+                        base_url,
+                    ))
                 } else {
                     None
                 }
             }
         };
 
-        let Some(opened) = opened else {
+        let Some((opened, base_url)) = opened else {
             // The pass-through stream: nothing is buffered and the media source
             // keeps the tuner URL (C# bare `LiveStream`).
             return Ok((
@@ -4400,7 +4410,6 @@ impl FerrofinLiveTvManager {
 
         // Every consumer now reads the one buffered copy, not the tuner
         // (C# `SharedHttpStream.Open`).
-        let base_url = self.local_api_url()?;
         source.path = Some(format!(
             "{base_url}/LiveTv/LiveStreamFiles/{}/stream.{LIVE_STREAM_BUFFER_CONTAINER}",
             opened.unique_id
@@ -4511,11 +4520,12 @@ impl FerrofinLiveTvManager {
     }
 
     /// The API base URL a live stream's buffered file is served from.
-    fn local_api_url(&self) -> Result<&str, ServiceError> {
-        self.local_api_url
+    async fn local_api_url(&self) -> Result<String, ServiceError> {
+        self.local_api
             .get()
-            .map(String::as_str)
-            .ok_or_else(|| ServiceError::Backend("live tv local api url not wired".to_owned()))
+            .ok_or_else(|| ServiceError::Backend("live tv local api url not wired".to_owned()))?
+            .get_api_url_for_local_access()
+            .await
     }
 
     /// Reads a JSON `Data` column across all rows of `sql`, deserializing each.
@@ -5320,6 +5330,17 @@ mod tests {
     use ferrofin_model::live_tv::{
         BaseTimerInfoDto, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
     };
+
+    /// The local API URL the tests' live streams and recordings are served
+    /// from.
+    struct LoopbackApi;
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::system::LocalApiAccess for LoopbackApi {
+        async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            Ok("http://127.0.0.1:8096".to_owned())
+        }
+    }
 
     use ferrofin_db::Database;
     use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
@@ -6931,7 +6952,7 @@ mod tests {
                 transcode_dir: transcode_dir.to_path_buf().into(),
                 ..LiveTvPaths::default()
             });
-        mgr.set_local_api_url("http://127.0.0.1:8096");
+        mgr.set_local_api_access(Arc::new(LoopbackApi));
         mgr
     }
 
@@ -7223,7 +7244,7 @@ mod tests {
                 data_dir: root.join("data"),
                 options_file: root.join("named").join("livetv.json"),
             });
-        mgr.set_local_api_url("http://127.0.0.1:8096");
+        mgr.set_local_api_access(Arc::new(LoopbackApi));
         mgr
     }
 
