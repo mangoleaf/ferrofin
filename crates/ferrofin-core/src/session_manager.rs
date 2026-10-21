@@ -1336,6 +1336,26 @@ impl SessionManager for FerrofinSessionManager {
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
         let session = self.get_session_snapshot(session_id).await?;
 
+        // C# `OnPlaybackStopped` refuses a negative position (stalled clients
+        // report one), and releases the live stream first so that no tuner
+        // leaks. Only the session's automatic progress has stopped by then
+        // (`StopAutomaticProgress`): its now-playing item stays.
+        if info.position_ticks.is_some_and(|ticks| ticks < 0) {
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
+                    s.is_playing = false;
+                }
+            }
+            if let Some(live_stream_id) = info.live_stream_id.as_deref() {
+                self.close_live_stream_if_needed(live_stream_id, session_id)
+                    .await?;
+            }
+            return Err(ServiceError::invalid_input(
+                "The PlaybackStopInfo's PositionTicks was negative.",
+            ));
+        }
+
         // C# `GetNowPlayingItem`: an id the library no longer has (a channel a
         // guide refresh dropped mid-play, an item deleted while it played) is
         // no library item, and nothing is saved for it. Always looked up, not
