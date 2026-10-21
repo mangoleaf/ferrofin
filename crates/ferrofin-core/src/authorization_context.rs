@@ -636,6 +636,7 @@ mod tests {
     use ferrofin_db::Database;
     use ferrofin_model::configuration::ServerConfiguration;
     use ferrofin_traits::net::RequestContext as HostRequestContext;
+    use ferrofin_traits::system::LocalApiAccess;
     use ferrofin_traits::system::ServerApplicationPaths;
 
     /// A minimal [`ServerConfigurationManager`] returning a fixed configuration;
@@ -700,6 +701,13 @@ mod tests {
     }
 
     #[async_trait]
+    impl LocalApiAccess for FakeHost {
+        async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
     impl ServerApplicationHost for FakeHost {
         fn core_startup_has_completed(&self) -> bool {
             true
@@ -718,6 +726,9 @@ mod tests {
         }
         fn friendly_name(&self) -> String {
             self.name.clone()
+        }
+        fn base_url(&self) -> String {
+            String::new()
         }
         async fn get_smart_api_url(
             &self,

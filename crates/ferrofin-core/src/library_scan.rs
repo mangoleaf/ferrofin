@@ -7112,6 +7112,9 @@ impl LibraryScanner {
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
+        // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
+        // episode cannot end before it starts.
+        ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
         self.apply_parental_rating_score(&mut entity).await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
@@ -8952,8 +8955,7 @@ impl LibraryScanner {
     /// collection folder first, [`Self::library_top_parents`]) the pruning
     /// weighs: those at or under `roots` and their path-less children on a
     /// path-scoped scan (`roots` given), every row of the library on a
-    /// library scan — both less the owned non-extras and the alternate
-    /// versions a library read never lists
+    /// library scan — both less the owned non-extras
     /// ([`ItemPersistenceService::library_items`]). `None` when they could
     /// not be read (logged): nothing of the library is pruned then.
     async fn prune_candidates(
@@ -8978,7 +8980,8 @@ impl LibraryScanner {
         let rows = match self.persistence.library_items(top_parents).await {
             Ok(Some(rows)) => rows,
             // A store that cannot answer: the item repository's library
-            // read, which applies the same candidate terms.
+            // read. It also hides an unowned alternate version, so such a
+            // store never weighs one.
             Ok(None) => match items
                 .get_item_list(&InternalItemsQuery {
                     top_parent_ids: top_parents.to_vec(),
@@ -18179,6 +18182,9 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
         ("AirsBeforeSeasonNumber", n.airs_before_season_number),
         ("AirsAfterSeasonNumber", n.airs_after_season_number),
         ("AirsBeforeEpisodeNumber", n.airs_before_episode_number),
+        // The episode range end (`<episodenumberend>`, or the last of several
+        // `<episodedetails>` blocks): `IndexNumberEnd` lives in `Data`.
+        ("IndexNumberEnd", n.index_number_end),
     ] {
         fill_provider_data(entity, key, value.map(|value| serde_json::json!(value)));
     }
@@ -18754,9 +18760,6 @@ impl MergeMode {
 /// No other kind takes anything (a book's year or series never comes back
 /// from its path). The embedded MP4 episode info `Episode.BeforeMetadataRefresh`
 /// also reads is applied with the probe ([`embedded_episode_info_enabled`]).
-/// The one field upstream sets here that Ferrofin does not is an episode's
-/// `IndexNumberEnd` (open work item gl-102; see
-/// [`fill_episode_numbers_from_path`]).
 fn before_metadata_refresh(
     row: &mut BaseItemEntity,
     replace_all: bool,
@@ -18846,15 +18849,16 @@ fn names_its_own_folder(row: &BaseItemEntity) -> bool {
 
 /// `LibraryManager.FillMissingEpisodeNumbersFromPath` (`LibraryManager.cs:
 /// 3291-3413`) on a stored episode: a by-date name clears the episode
-/// number and fills an empty premiere date (UTC midnight of the date) and
-/// year; any other name fills the episode and season numbers the row lacks —
-/// or, under `ReplaceAllMetadata` (`forceRefresh`), sets them from the path
-/// even to nothing. A season number still missing then takes the season's
+/// number and range end and fills an empty premiere date (UTC midnight of
+/// the date) and year; any other name fills the episode number, range end
+/// (`IndexNumberEnd`, in `Data`) and season number the row lacks — or, under
+/// `ReplaceAllMetadata` (`forceRefresh`), sets them from the path even to
+/// nothing. A season number still missing then takes the season's
 /// (`season_index`).
 ///
-/// Resolved as the planner resolves episodes: the path alone, and no
-/// plain-folder parent (the planner creates none). `IndexNumberEnd` is not
-/// in the schema, so it is neither filled nor cleared.
+/// Resolved as the planner resolves episodes: the path below its library
+/// ([`below_library`]), and no plain-folder parent (the planner creates
+/// none).
 ///
 /// A series whose `DisplayOrder` is `absolute` resolves with
 /// `isAbsoluteNaming` (`LibraryManager.cs:3292-3298`): only the expressions
@@ -18868,19 +18872,12 @@ fn fill_episode_numbers_from_path(
     naming: EpisodeNaming<'_>,
 ) {
     use chrono::TimeZone as _;
-    // `isAbsoluteNaming`: `null` (no filter) unless the series is absolute.
-    let Some(info) = EpisodeResolver::new(&PATH_NAMING).resolve(
-        below_library(path, naming.library),
-        false,
-        None,
-        None,
-        naming.absolute.then_some(true),
-        true,
-    ) else {
+    let Some(info) = resolve_episode_path(path, naming) else {
         return;
     };
     if info.is_by_date {
         row.index_number = None;
+        set_index_number_end(row, None);
         if row.premiere_date.is_none()
             && let (Some(y), Some(m), Some(d)) = (info.year, info.month, info.day)
             && let (Ok(m), Ok(d)) = (u32::try_from(m), u32::try_from(d))
@@ -18894,6 +18891,9 @@ fn fill_episode_numbers_from_path(
         if row.index_number.is_none() || replace_all {
             row.index_number = info.episode_number.map(i64::from);
         }
+        if index_number_end(row).is_none() || replace_all {
+            set_index_number_end(row, info.ending_episode_number);
+        }
         if row.parent_index_number.is_none() || replace_all {
             row.parent_index_number = info.season_number.map(i64::from);
         }
@@ -18901,6 +18901,73 @@ fn fill_episode_numbers_from_path(
     if row.parent_index_number.is_none() {
         row.parent_index_number = season_index;
     }
+}
+
+/// `FillMissingEpisodeNumbersFromPath`'s resolve: the path below its library
+/// ([`below_library`]), with `isAbsoluteNaming` `null` (no filter) unless
+/// the series is absolute.
+fn resolve_episode_path(
+    path: &str,
+    naming: EpisodeNaming<'_>,
+) -> Option<ferrofin_naming::tv::EpisodeInfo> {
+    EpisodeResolver::new(&PATH_NAMING).resolve(
+        below_library(path, naming.library),
+        false,
+        None,
+        None,
+        naming.absolute.then_some(true),
+        true,
+    )
+}
+
+/// A NEW episode's range end from its path, where its providers (an NFO)
+/// gave none, on a pass that runs `BeforeMetadataRefresh` (as the stored
+/// row's [`before_metadata_refresh`]). Upstream's first refresh runs
+/// `FillMissingEpisodeNumbersFromPath` before the providers, whose answer
+/// then replaces the item's and is filled from it only where it has nothing
+/// (`MetadataService.cs:850, 905-917`), so an NFO's range wins and the
+/// path's fills in. The planned row cannot carry it: the providers start
+/// from that row, and `apply_nfo` only fills.
+fn fill_new_episode_range(row: &mut BaseItemEntity, naming: EpisodeNaming<'_>) {
+    if item_type_lookup::kind_from_type_name(&row.type_) != Some(BaseItemKind::Episode)
+        || index_number_end(row).is_some()
+    {
+        return;
+    }
+    let Some(info) = row
+        .path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|path| resolve_episode_path(path, naming))
+    else {
+        return;
+    };
+    if !info.is_by_date {
+        set_index_number_end(row, info.ending_episode_number);
+    }
+}
+
+/// The episode's range end, `IndexNumberEnd`, which lives in the `Data` blob.
+fn index_number_end(row: &BaseItemEntity) -> Option<i32> {
+    crate::item_data::read_data_i32(
+        &crate::item_data::parse_data(row.data.as_deref()),
+        "IndexNumberEnd",
+    )
+}
+
+/// Sets (`Some`) or removes (`None`) `Data.IndexNumberEnd`, leaving the row
+/// untouched when it already says so.
+fn set_index_number_end(row: &mut BaseItemEntity, end: Option<i32>) {
+    let mut data = crate::item_data::parse_data(row.data.as_deref());
+    let current = crate::item_data::read_data_i32(&data, "IndexNumberEnd");
+    if current == end && (end.is_some() || !data.contains_key("IndexNumberEnd")) {
+        return;
+    }
+    match end {
+        Some(end) => data.insert("IndexNumberEnd".to_owned(), serde_json::json!(end)),
+        None => data.remove("IndexNumberEnd"),
+    };
+    row.data = Some(serde_json::Value::Object(data).to_string());
 }
 
 /// `Episode.BeforeMetadataRefresh` checks the stored container for exactly mp4.
@@ -19034,6 +19101,9 @@ fn saved_row(
     } else {
         let mut row = scanned.clone();
         guesses.fill(&mut row);
+        if facts.before_refresh {
+            fill_new_episode_range(&mut row, facts.naming);
+        }
         // `Folder.AddChild` stamps a new child's unset `DateModified` with
         // the `UtcNow` of its `DateCreated`. A path-less one (a season with
         // no folder) keeps it — no save restats it, where a file's or a
@@ -19331,8 +19401,9 @@ fn is_path_less(item: &BaseItemEntity) -> bool {
 /// `RefreshedOwnedItems`, `Video.cs:690`), so a stored part keeps its own. `IsoType` is the resolver's on a
 /// new item only and never updated after. Stat-owned (`SaveInternal`):
 /// `DateModified` (a file's; a folder has none, D2) and `Size` (files).
-/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate` and the
-/// video `Width`/`Height` (a photo's come from its EXIF reader).
+/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate`, the
+/// video `Width`/`Height` (a photo's come from its EXIF reader) and a track's
+/// ReplayGain `NormalizationGain`.
 ///
 /// `row` is always a stored row's (the merge's; a new item takes the
 /// planner's row whole, [`saved_row`]).
@@ -19393,6 +19464,10 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         if measured.is_some() {
             *value = measured;
         }
+    }
+    // A ReplayGain tag the probe read (`apply_audio_metadata`).
+    if scanned.normalization_gain.is_some() {
+        row.normalization_gain = scanned.normalization_gain;
     }
     if probe_ran
         && (scanned.run_time_ticks.is_some() || scanned.media_type.as_deref() == Some("Video"))
@@ -19965,26 +20040,30 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
 
 /// Whether writing `people` would change `stored`, an item's credits as
 /// `get_people_batch` reads them back. Compared the way `update_people`
-/// writes them: deduped on (lower-cased name, type) keeping the first
-/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
-/// existing `Peoples` row keeps its casing), then type and role, in credit
-/// order.
+/// writes them: deduped on (lower-cased name, type, role) keeping the first
+/// ([`dedupe_people`]), names and roles matched case-insensitively (an
+/// existing `Peoples` row and mapping keep their casing), then type, in
+/// credit order. Incoming roles are trimmed as `update_people` stores them;
+/// stored roles are compared as read, so a padded role written before roles
+/// were trimmed differs once and is rewritten, as upstream's unchanged check
+/// does.
 ///
 /// [`dedupe_people`]: crate::people_repository::dedupe_people
 fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
-    let key = |p: &PeopleEntity| {
+    let key = |p: &PeopleEntity, trim_role: bool| {
+        let role = p.role.as_deref().unwrap_or_default();
         (
             p.name.trim().to_lowercase(),
             p.person_type.clone().unwrap_or_default(),
-            p.role.clone().unwrap_or_default(),
+            if trim_role { role.trim() } else { role }.to_lowercase(),
         )
     };
     stored
         .iter()
-        .map(key)
+        .map(|p| key(p, false))
         .ne(crate::people_repository::dedupe_people(people)
             .into_iter()
-            .map(key))
+            .map(|p| key(p, true)))
 }
 
 /// The credits `AudioFileProber.FetchDataFromTags` writes with
@@ -20075,6 +20154,11 @@ fn apply_audio_metadata(
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = info.premiere_date;
+    }
+    // `audio.NormalizationGain = value` whenever the tag parses: the tag
+    // replaces what the track had, and a track without one keeps it.
+    if tags.track_gain.is_some() {
+        entity.normalization_gain = tags.track_gain;
     }
     // No sort key here: `Audio.CreateSortName` reads the final disc/track
     // numbers (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`), which
@@ -20764,6 +20848,48 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    fn credit(name: &str, person_type: &str, role: &str) -> super::PeopleEntity {
+        super::PeopleEntity {
+            name: name.to_owned(),
+            person_type: Some(person_type.to_owned()),
+            role: Some(role.to_owned()),
+            ..super::PeopleEntity::default()
+        }
+    }
+
+    /// The skip-unchanged check compares credits the way `update_people`
+    /// writes them, so a padded role from a provider equals the trimmed
+    /// one it stored, and a rescan does not rewrite the item's credits.
+    #[test]
+    fn credits_differ_compares_roles_as_update_people_stores_them() {
+        let stored = [credit("Ann", "Actor", "Himself")];
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", " Himself ")]
+        ));
+        assert!(super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "Herself")]
+        ));
+        // A role stored padded (before roles were trimmed) is rewritten once.
+        assert!(super::credits_differ(
+            &[credit("Ann", "Actor", " Himself ")],
+            &[credit("Ann", "Actor", "Himself")]
+        ));
+        // A case-only change keeps the stored mapping, so it is no change.
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "HIMSELF")]
+        ));
+        // Two roles of one person are two credits.
+        let both = [
+            credit("Ann", "Writer", "Novel"),
+            credit("Ann", "Writer", "Screenplay"),
+        ];
+        assert!(!super::credits_differ(&both, &both));
+        assert!(super::credits_differ(&both[..1], &both));
+    }
+
     #[rstest::rstest]
     #[case::off(false, false, false, false, false, false)]
     #[case::ordinary(true, false, false, false, false, true)]
@@ -22375,6 +22501,26 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// An NFO episode range (`<episodenumberend>`, or the last of several
+    /// `<episodedetails>` blocks) is stored where `IndexNumberEnd` lives, the
+    /// `Data` blob the DTO reads it from (PR 17805). `apply_nfo` used to drop
+    /// it, so no NFO range ever reached a client.
+    #[test]
+    fn apply_nfo_stores_the_episode_range_in_the_data_blob() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Episode);
+        n.index_number = Some(1);
+        n.index_number_end = Some(2);
+
+        let mut e = BaseItemEntity::default();
+        super::apply_nfo(&mut e, &n);
+
+        let data = crate::item_data::parse_data(e.data.as_deref());
+        assert_eq!(e.index_number, Some(1));
+        assert_eq!(data.get("IndexNumberEnd"), Some(&serde_json::json!(2)));
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
@@ -25566,6 +25712,63 @@ mod tests {
         assert_eq!(row.album_artists, None, "no performers, no album artists");
     }
 
+    /// `AudioFileProber.FetchDataFromTags`' `REPLAYGAIN_TRACK_GAIN`: a trailing
+    /// `dB` in any case dropped, whitespace trimmed, only a finite float kept,
+    /// and written over what the track had.
+    #[rstest::rstest]
+    #[case::with_unit("-6.5 dB", Some(-6.5))]
+    #[case::signed_no_space("+1.2dB", Some(f64::from(1.2_f32)))]
+    #[case::upper_unit("-3.10 DB", Some(f64::from(-3.1_f32)))]
+    #[case::padded(" 2 ", Some(2.0))]
+    #[case::not_a_number("abc", None)]
+    #[case::nan("NaN", None)]
+    #[case::infinity("Infinity dB", None)]
+    #[case::blank("", None)]
+    #[case::truncated_at_nul("-6.5\0junk", Some(-6.5))]
+    #[case::multibyte_tail("5é", None)]
+    #[case::one_character("x", None)]
+    fn the_track_gain_tag_sets_the_normalization_gain(
+        #[case] tag: &str,
+        #[case] expected: Option<f64>,
+    ) {
+        let info = ferrofin_model::media_info::MediaInfo {
+            raw_audio_tags: Some(std::collections::HashMap::from([(
+                "replaygain_track_gain".to_owned(),
+                tag.to_owned(),
+            )])),
+            ..Default::default()
+        };
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::apply_audio_metadata(&mut row, &info, None);
+        assert_eq!(row.normalization_gain, expected.or(Some(-9.0)));
+    }
+
+    /// A rescan lays the probed gain over the stored row; a probe that read
+    /// none leaves the stored one.
+    #[test]
+    fn a_probed_track_gain_overlays_the_stored_row() {
+        let scanned = BaseItemEntity {
+            normalization_gain: Some(-4.0),
+            ..BaseItemEntity::default()
+        };
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::overlay_file_facts(&mut row, &scanned, true);
+        assert_eq!(row.normalization_gain, Some(-4.0));
+
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::overlay_file_facts(&mut row, &BaseItemEntity::default(), true);
+        assert_eq!(row.normalization_gain, Some(-9.0));
+    }
+
     #[test]
     fn audio_probe_applies_current_library_artist_and_delimiter_options_to_raw_tags() {
         let first_id = "11111111-1111-4111-8111-111111111111";
@@ -28036,6 +28239,60 @@ mod tests {
             Some("2024-03-01")
         );
         assert_eq!(by_date.parent_index_number, Some(4), "the season's number");
+    }
+
+    /// `FillMissingEpisodeNumbersFromPath`'s range end (v12.2
+    /// `LibraryManager.cs:3350-3356, 3391-3399`), kept in `Data` as
+    /// `IndexNumberEnd`: a multi-episode name fills one the row lacks; a
+    /// stored one (an NFO's) stays unless `ReplaceAllMetadata` re-sets it
+    /// from the path, even to nothing; a by-date name clears it. The rest of
+    /// `Data` stays.
+    #[rstest::rstest]
+    #[case::filled(
+        "Season 2/Elementary - 02x03 - 02x04 - 02x15 - Ep Name.mp4",
+        None,
+        false,
+        Some(15)
+    )]
+    #[case::filled_dash("Season 1/Show S01E01-E02.mkv", None, false, Some(2))]
+    #[case::single_episode("Season 1/Show S01E02 blah.avi", None, false, None)]
+    #[case::stored_kept("Season 1/Show S01E01-E02.mkv", Some(5), false, Some(5))]
+    #[case::stored_kept_without_range("Season 1/Show S01E03.mkv", Some(5), false, Some(5))]
+    #[case::replaced("Season 1/Show S01E01-E02.mkv", Some(5), true, Some(2))]
+    #[case::replaced_by_nothing("Season 1/Show S01E03.mkv", Some(5), true, None)]
+    #[case::by_date_clears("News 2024-03-01.mkv", Some(5), false, None)]
+    fn the_refill_takes_an_episode_range_from_its_path(
+        #[case] name: &str,
+        #[case] stored_end: Option<i64>,
+        #[case] replace_all: bool,
+        #[case] expected: Option<i64>,
+    ) {
+        let mut row = stored_row(
+            "TV.Episode",
+            &format!("/tv/Show/{name}"),
+            Some("Title"),
+            None,
+        );
+        let mut data = serde_json::json!({ "Container": "mkv" });
+        if let Some(end) = stored_end {
+            data["IndexNumberEnd"] = serde_json::json!(end);
+        }
+        row.data = Some(data.to_string());
+
+        super::before_metadata_refresh(
+            &mut row,
+            replace_all,
+            None,
+            super::EpisodeNaming::default(),
+        );
+
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        assert_eq!(
+            data.get("IndexNumberEnd")
+                .and_then(serde_json::Value::as_i64),
+            expected
+        );
+        assert_eq!(data.get("Container"), Some(&serde_json::json!("mkv")));
     }
 
     /// The refill runs only on a pass that runs `BeforeMetadataRefresh`: a
