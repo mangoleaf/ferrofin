@@ -633,7 +633,8 @@ Adoption remains one-way: Jellyfin is never started against an adopted copy.
 The synthetic harness regression tests run through `bats adoption/tests`, along
 with the original metadata and watch-history tests. The PR CI does not encode or scan these
 fixtures. The live matrix runs in the `Adoption` workflow (`.github/workflows/adoption.yml`)
-on every push to a `release/**` branch, or by hand on any branch: it builds the image from
+on every push to a `release/**` branch, or by hand on any branch (one run per branch at a time:
+a newer push replaces the run still waiting, never the one running): it builds the image from
 the commit, restores the fixtures from a cache keyed on the recipe, `smoke.sh`,
 `build-fixtures.sh` and the Jellyfin image digests (building them on a miss; GitHub scopes
 the cache to the branch, so each new release branch builds once), and runs
