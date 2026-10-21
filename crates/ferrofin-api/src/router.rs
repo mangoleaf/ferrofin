@@ -48,6 +48,7 @@ fn stub_for(method: &str) -> Option<MethodRouter<AppState>> {
 /// both are contract/programming errors caught by the crate's tests, never by
 /// runtime input.
 pub fn create_router(state: AppState) -> Router {
+    let health_checkers = state.health_checkers.clone();
     let mut api: Router<AppState> = Router::new();
     for (method, path) in axum_routes() {
         // Skip the shared `501` stub for any `(method, path)` a real handler
@@ -83,7 +84,7 @@ pub fn create_router(state: AppState) -> Router {
         crate::request_culture::request_culture_layer,
     ))
     .with_state(state)
-    .merge(ferrofin_health::health_router(Vec::new()))
+    .merge(ferrofin_health::health_router(health_checkers))
     .merge(spec_router())
     // Route-templated per-request span (traces group by endpoint, not raw URL);
     // a sampled request's `trace_id` is stamped on for log↔trace correlation.

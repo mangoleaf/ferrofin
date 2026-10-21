@@ -209,6 +209,10 @@ pub struct Inner {
     /// composition root injects the watcher-backed `FerrofinLibraryMonitor` via
     /// [`AppState::with_library_monitor`].
     pub library_monitor: Arc<dyn LibraryMonitor>,
+    /// The dependency checks behind `/health` and `/health/ready`. Empty by
+    /// default (both always healthy); the composition root injects the
+    /// database check via [`AppState::with_health_checkers`].
+    pub health_checkers: Vec<Arc<dyn ferrofin_health::HealthChecker>>,
     /// The Intro Skipper's per-season analyzer actions
     /// (`/Intros/AnalyzerActions/*`). Defaults to a process-local store; the
     /// composition root injects the database-backed one via
@@ -437,6 +441,7 @@ impl AppState {
             // Default to the no-op library monitor; the composition root overrides
             // it via `with_library_monitor` once the filesystem watcher is wired.
             library_monitor: Arc::new(NoopLibraryMonitor),
+            health_checkers: Vec::new(),
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
@@ -566,6 +571,23 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_library_monitor must be called before the state is shared");
         inner.library_monitor = library_monitor;
+        self
+    }
+
+    /// Replaces the dependency checks run by `/health` and `/health/ready`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_health_checkers(
+        mut self,
+        checkers: Vec<Arc<dyn ferrofin_health::HealthChecker>>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_health_checkers must be called before the state is shared");
+        inner.health_checkers = checkers;
         self
     }
 
