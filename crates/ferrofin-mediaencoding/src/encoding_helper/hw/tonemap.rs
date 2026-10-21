@@ -96,7 +96,7 @@ pub fn is_dovi(stream: Option<&MediaStream>) -> bool {
 /// tonemapped from its base layer, like the HDR flavour that layer is.
 #[must_use]
 pub fn requires_dovi_reshaping(stream: Option<&MediaStream>) -> bool {
-    stream.and_then(|s| s.video_range_type) == Some(VideoRangeType::Dovi)
+    stream.is_some_and(|s| s.video_range_type() == VideoRangeType::Dovi)
 }
 
 /// Whether the stream carries HDR10+ dynamic metadata. Port of `IsHdr10Plus`.
@@ -481,6 +481,9 @@ mod tests {
         // A cached value that disagrees with the metadata is not read either.
         stream.video_range_type = Some(VideoRangeType::Sdr);
         assert!(is_dovi(Some(&stream)));
+        let mut profile5 = with_range(MediaStream::default(), VideoRangeType::Dovi);
+        profile5.video_range_type = Some(VideoRangeType::Sdr);
+        assert!(requires_dovi_reshaping(Some(&profile5)));
     }
 
     /// Upstream's `EncodingHelperDoviTests.CreateState` stream, in HEVC.
