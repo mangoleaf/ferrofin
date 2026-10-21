@@ -1438,6 +1438,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",
+ "flate2",
  "icu_collator",
  "quick-xml",
  "reqwest",
