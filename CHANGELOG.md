@@ -172,6 +172,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Stop playback a client abandoned, as Jellyfin does: a session playing without a progress
+  report for five minutes is stopped at the client's last position, and with
+  `InactiveSessionThreshold` set, a session paused past it is told to stop. A client that
+  vanished mid-playback no longer stays "playing" and no longer makes transcode cleanup and
+  database optimization skip every run
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

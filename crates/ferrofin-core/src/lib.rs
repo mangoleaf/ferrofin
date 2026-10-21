@@ -108,8 +108,8 @@
 //!   and broadcasts server → client messages as pre-serialized JSON to each
 //!   session's attached WebSocket connections. Sibling managers (user/device/
 //!   user-data/library/DTO) plus the [`EventManager`](ferrofin_traits::events::EventManager)
-//!   are injected; idle timers, instant-mix, and live-stream reference-counting
-//!   are documented deferrals.
+//!   are injected. It also runs the idle-playback and inactive-session checks
+//!   (`StartCheckTimers`) and counts live-stream consumers per session.
 //! - [`event_manager`] — [`FerrofinEventManager`]
 //!   ([`ferrofin_traits::events::EventManager`]), the in-process publish seam: a
 //!   name-keyed [`EventConsumer`] registry replacing the C# DI-scoped
