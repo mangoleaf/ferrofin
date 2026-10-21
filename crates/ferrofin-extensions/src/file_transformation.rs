@@ -31,6 +31,7 @@ use ferrofin_core::{PluginConfigPage, ScheduledTask};
 use ferrofin_traits::plugins::{
     FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
 };
+use ferrofin_traits::system::LocalApiAccess;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -219,22 +220,22 @@ struct ServiceConfig {
 pub struct WebFileTransformationService {
     registrations: RwLock<Vec<Registration>>,
     plugins: Arc<dyn PluginManager>,
-    /// The server's own base URL (e.g. `http://127.0.0.1:8096`), for resolving
-    /// relative HTTP-callback endpoints — upstream resolves them against the
-    /// server's published URL.
-    base_url: String,
+    /// Where this server's API is reached locally (`GetApiUrlForLocalAccess()`),
+    /// for resolving relative HTTP-callback endpoints.
+    local_api: Arc<dyn LocalApiAccess>,
     http: reqwest::Client,
 }
 
 impl WebFileTransformationService {
     /// Builds the service over the plugin manager (for the enabled gate and
-    /// the admin-defined transformations) and the server's own base URL.
+    /// the admin-defined transformations) and the host that says where this
+    /// server's API is reached locally.
     #[must_use]
-    pub fn new(plugins: Arc<dyn PluginManager>, base_url: String) -> Self {
+    pub fn new(plugins: Arc<dyn PluginManager>, local_api: Arc<dyn LocalApiAccess>) -> Self {
         Self {
             registrations: RwLock::new(Vec::new()),
             plugins,
-            base_url,
+            local_api,
             http: reqwest::Client::new(),
         }
     }
@@ -280,11 +281,23 @@ impl WebFileTransformationService {
     /// response body, or `None` (leaving the contents unchanged) on any
     /// failure. Port of the endpoint branch of
     /// `TransformationHelper.ApplyTransformation`.
+    ///
+    /// A relative endpoint is a path on this server. The plugin sends it to
+    /// `http://localhost:{HttpPort}`; Ferrofin resolves it against the local
+    /// access URL instead, which carries the base URL (without it the request
+    /// is redirected to the web client) and reaches a listener pinned to one
+    /// address.
     async fn call_endpoint(&self, endpoint: &str, contents: &str) -> Option<String> {
         let url = if endpoint.starts_with("http") {
             endpoint.to_owned()
         } else {
-            format!("{}/{}", self.base_url, endpoint.trim_start_matches('/'))
+            match self.local_api.get_api_url_for_local_access().await {
+                Ok(base) => format!("{base}/{}", endpoint.trim_start_matches('/')),
+                Err(e) => {
+                    tracing::warn!(endpoint, error = %e, "transformation endpoint has no local api url");
+                    return None;
+                }
+            }
         };
         let response = self
             .http
@@ -293,6 +306,16 @@ impl WebFileTransformationService {
             .send()
             .await;
         match response {
+            // `if (!response.IsSuccessStatusCode) return;`: an error answer's
+            // body never replaces the file.
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::warn!(
+                    url,
+                    status = resp.status().as_u16(),
+                    "transformation endpoint answered an error"
+                );
+                None
+            }
             Ok(resp) => match resp.text().await {
                 Ok(text) => Some(text),
                 Err(e) => {
@@ -650,14 +673,33 @@ mod tests {
         }
     }
 
+    /// A host whose local API URL is fixed.
+    struct LocalApi(String);
+
+    #[async_trait]
+    impl LocalApiAccess for LocalApi {
+        async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn service_with(ft_config: &str, enabled: bool) -> WebFileTransformationService {
+        service_at(ft_config, enabled, "http://127.0.0.1:0")
+    }
+
+    /// [`service_with`] on a server reached locally at `local_api_url`.
+    fn service_at(
+        ft_config: &str,
+        enabled: bool,
+        local_api_url: &str,
+    ) -> WebFileTransformationService {
         WebFileTransformationService::new(
             Arc::new(FakePlugins {
                 ft_config: ft_config.as_bytes().to_vec(),
                 is_config: b"{}".to_vec(),
                 enabled,
             }),
-            "http://127.0.0.1:0".to_owned(),
+            Arc::new(LocalApi(local_api_url.to_owned())),
         )
     }
 
@@ -807,6 +849,84 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(v["DebugLoggingState"], "Disabled");
         assert!(v["Transformations"].as_array().expect("array").is_empty());
+    }
+
+    /// A callback endpoint answering each request with `status` and `body`,
+    /// recording each request's head and body.
+    fn spawn_callback(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                log.lock()
+                    .expect("lock")
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A callback that answers with an error status leaves the file as it was
+    /// (`TransformationHelper`: `if (!response.IsSuccessStatusCode) return;`):
+    /// its error body never replaces a served web file.
+    #[tokio::test]
+    async fn an_endpoint_error_leaves_the_contents_unchanged() {
+        let (base, seen) = spawn_callback("500 Internal Server Error", "oops");
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+            .await;
+
+        let out = svc
+            .run_transformation("main.js", "original".to_owned())
+            .await;
+
+        assert_eq!(out, "original");
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            1,
+            "the endpoint was called"
+        );
+    }
+
+    /// A relative endpoint is a path on this server, called through its local
+    /// access URL — base URL included — and its answer replaces the file.
+    #[tokio::test]
+    async fn a_relative_endpoint_is_called_through_the_local_api_url() {
+        let (base, seen) = spawn_callback("200 OK", "patched");
+        let svc = service_at("{}", true, &format!("{base}/jellyfin"));
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", "/Plugin/Transform")
+            .await;
+
+        let out = svc
+            .run_transformation("main.js", "original".to_owned())
+            .await;
+
+        assert_eq!(out, "patched");
+        let seen = seen.lock().expect("lock");
+        assert!(
+            seen[0].starts_with("POST /jellyfin/Plugin/Transform HTTP/1.1"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains(r#"{"contents":"original"}"#),
+            "{}",
+            seen[0]
+        );
     }
 
     /// The registry's length in a test (the field is private to this module).

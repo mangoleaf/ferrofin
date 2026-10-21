@@ -9002,8 +9002,7 @@ impl LibraryScanner {
     /// collection folder first, [`Self::library_top_parents`]) the pruning
     /// weighs: those at or under `roots` and their path-less children on a
     /// path-scoped scan (`roots` given), every row of the library on a
-    /// library scan — both less the owned non-extras and the alternate
-    /// versions a library read never lists
+    /// library scan — both less the owned non-extras
     /// ([`ItemPersistenceService::library_items`]). `None` when they could
     /// not be read (logged): nothing of the library is pruned then.
     async fn prune_candidates(
@@ -9028,7 +9027,8 @@ impl LibraryScanner {
         let rows = match self.persistence.library_items(top_parents).await {
             Ok(Some(rows)) => rows,
             // A store that cannot answer: the item repository's library
-            // read, which applies the same candidate terms.
+            // read. It also hides an unowned alternate version, so such a
+            // store never weighs one.
             Ok(None) => match items
                 .get_item_list(&InternalItemsQuery {
                     top_parent_ids: top_parents.to_vec(),
@@ -20252,26 +20252,30 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
 
 /// Whether writing `people` would change `stored`, an item's credits as
 /// `get_people_batch` reads them back. Compared the way `update_people`
-/// writes them: deduped on (lower-cased name, type) keeping the first
-/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
-/// existing `Peoples` row keeps its casing), then type and role, in credit
-/// order.
+/// writes them: deduped on (lower-cased name, type, role) keeping the first
+/// ([`dedupe_people`]), names and roles matched case-insensitively (an
+/// existing `Peoples` row and mapping keep their casing), then type, in
+/// credit order. Incoming roles are trimmed as `update_people` stores them;
+/// stored roles are compared as read, so a padded role written before roles
+/// were trimmed differs once and is rewritten, as upstream's unchanged check
+/// does.
 ///
 /// [`dedupe_people`]: crate::people_repository::dedupe_people
 fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
-    let key = |p: &PeopleEntity| {
+    let key = |p: &PeopleEntity, trim_role: bool| {
+        let role = p.role.as_deref().unwrap_or_default();
         (
             p.name.trim().to_lowercase(),
             p.person_type.clone().unwrap_or_default(),
-            p.role.clone().unwrap_or_default(),
+            if trim_role { role.trim() } else { role }.to_lowercase(),
         )
     };
     stored
         .iter()
-        .map(key)
+        .map(|p| key(p, false))
         .ne(crate::people_repository::dedupe_people(people)
             .into_iter()
-            .map(key))
+            .map(|p| key(p, true)))
 }
 
 /// The credits `AudioFileProber.FetchDataFromTags` writes with
@@ -21227,6 +21231,48 @@ mod tests {
         assert_eq!(video.album.as_deref(), Some("Live"));
         assert_eq!(video.artists.as_deref(), Some("Band|Guest"));
         assert_eq!(video.production_year, Some(2019));
+    }
+
+    fn credit(name: &str, person_type: &str, role: &str) -> super::PeopleEntity {
+        super::PeopleEntity {
+            name: name.to_owned(),
+            person_type: Some(person_type.to_owned()),
+            role: Some(role.to_owned()),
+            ..super::PeopleEntity::default()
+        }
+    }
+
+    /// The skip-unchanged check compares credits the way `update_people`
+    /// writes them, so a padded role from a provider equals the trimmed
+    /// one it stored, and a rescan does not rewrite the item's credits.
+    #[test]
+    fn credits_differ_compares_roles_as_update_people_stores_them() {
+        let stored = [credit("Ann", "Actor", "Himself")];
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", " Himself ")]
+        ));
+        assert!(super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "Herself")]
+        ));
+        // A role stored padded (before roles were trimmed) is rewritten once.
+        assert!(super::credits_differ(
+            &[credit("Ann", "Actor", " Himself ")],
+            &[credit("Ann", "Actor", "Himself")]
+        ));
+        // A case-only change keeps the stored mapping, so it is no change.
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "HIMSELF")]
+        ));
+        // Two roles of one person are two credits.
+        let both = [
+            credit("Ann", "Writer", "Novel"),
+            credit("Ann", "Writer", "Screenplay"),
+        ];
+        assert!(!super::credits_differ(&both, &both));
+        assert!(super::credits_differ(&both[..1], &both));
     }
 
     #[rstest::rstest]
