@@ -1078,7 +1078,7 @@ async fn translate_parent_item(
         return Ok(Some(item.clone()));
     }
     // Candidate group 1: the `CollectionFolder` views.
-    let folders = state.virtual_folders.get_virtual_folders().await?;
+    let folders = state.virtual_folders.library_folders().await?;
     let Some(view_id) = folders
         .iter()
         .find(|vf| vf.locations.iter().any(|loc| loc == path))
@@ -1715,21 +1715,22 @@ async fn redirect_container_browse(
     }
     // A browse of the boxsets/playlists library itself keeps plain parent
     // scoping (C# `itemCollectionType != targetCollectionType`).
-    let parent_collection_type = state
-        .virtual_folders
-        .get_virtual_folders()
-        .await
-        .ok()
-        .and_then(|folders| {
-            folders
-                .into_iter()
-                .find(|vf| {
-                    vf.item_id
-                        .as_deref()
-                        .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
-                })
-                .and_then(|vf| vf.collection_type)
-        });
+    let parent_collection_type =
+        state
+            .virtual_folders
+            .library_folders()
+            .await
+            .ok()
+            .and_then(|folders| {
+                folders
+                    .iter()
+                    .find(|vf| {
+                        vf.item_id
+                            .as_deref()
+                            .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
+                    })
+                    .and_then(|vf| vf.collection_type)
+            });
     if target_collection_type.is_some() && parent_collection_type == target_collection_type {
         return;
     }
