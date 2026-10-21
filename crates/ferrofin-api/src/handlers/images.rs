@@ -62,28 +62,40 @@ use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
-/// Parses the `{imageType}` path segment into an [`ImageType`].
-///
-/// Jellyfin serializes the enum by its variant name (case-insensitive over the
-/// wire in practice); an unknown value is a `400`.
+/// Binds a `{imageType}` path segment: `[FromRoute, Required] ImageType`, which
+/// MVC hands to `EnumTypeModelBinder` as it does the route `{format}`
+/// ([`parse_image_format`]). A member name in any case, a defined number
+/// (`0` is `Primary`) or a comma list (ORed: `Primary,Art` is `Art`) binds;
+/// an unparseable value or one no member has is a `400`.
 fn parse_image_type(raw: &str) -> Result<ImageType, ApiError> {
-    let parsed = match raw.to_ascii_lowercase().as_str() {
-        "primary" => ImageType::Primary,
-        "art" => ImageType::Art,
-        "backdrop" => ImageType::Backdrop,
-        "banner" => ImageType::Banner,
-        "logo" => ImageType::Logo,
-        "thumb" => ImageType::Thumb,
-        "disc" => ImageType::Disc,
-        "box" => ImageType::Box,
-        "screenshot" => ImageType::Screenshot,
-        "menu" => ImageType::Menu,
-        "chapter" => ImageType::Chapter,
-        "boxrear" => ImageType::BoxRear,
-        "profile" => ImageType::Profile,
-        other => return Err(ApiError::BadRequest(format!("unknown image type {other}"))),
+    use ferrofin_model::json::enums::JsonEnum as _;
+    let member = |name: &str| {
+        ImageType::members()
+            .iter()
+            .find(|(member, _)| member.eq_ignore_ascii_case(name))
+            .map(|&(_, value)| value)
     };
-    Ok(parsed)
+    match dotnet_enum_parse(raw, member).map(ImageType::from_json_value) {
+        Some(ImageType::Unrecognized(_)) | None => {
+            Err(ApiError::BadRequest(format!("unknown image type {raw}")))
+        }
+        Some(image_type) => Ok(image_type),
+    }
+}
+
+/// Port of .NET `Enum.Parse(type, value, ignoreCase: true)` for an `int`-backed
+/// enum, whose member names `member` maps to their C# values: each
+/// comma-separated part, trimmed, is a member name in any case or an integer,
+/// and the parts are bitwise-ORed (see [`bind_image_format`], where every rule
+/// was measured). `None` when a part is neither, which is a parse failure;
+/// the result may name no member, which the caller decides about.
+fn dotnet_enum_parse(text: &str, member: impl Fn(&str) -> Option<i32>) -> Option<i32> {
+    let mut combined: i32 = 0;
+    for part in text.split(',') {
+        let part = part.trim();
+        combined |= member(part).or_else(|| part.parse::<i32>().ok())?;
+    }
+    Some(combined)
 }
 
 /// The query parameters accepted by every image-serving route.
@@ -300,17 +312,11 @@ enum ImageFormatBinding {
 /// * a value that overflows the enum's `Int32` backing store throws inside
 ///   `Enum.Parse`, i.e. it is a *parse failure*, not an undefined value.
 fn bind_image_format(format: &str) -> ImageFormatBinding {
-    let mut combined: i32 = 0;
-    for part in format.split(',') {
-        let part = part.trim();
-        let Some(value) = image_format_member(part).map_or_else(
-            || part.parse::<i32>().ok(),
-            |member| Some(image_format_ordinal(member)),
-        ) else {
-            return ImageFormatBinding::Unparseable;
-        };
-        combined |= value;
-    }
+    let Some(combined) = dotnet_enum_parse(format, |part| {
+        image_format_member(part).map(image_format_ordinal)
+    }) else {
+        return ImageFormatBinding::Unparseable;
+    };
     ImageFormat::try_from(combined)
         .map_or(ImageFormatBinding::Undefined, ImageFormatBinding::Defined)
 }
@@ -1168,15 +1174,18 @@ async fn delete_user_image(
 /// Upstream keeps these `/Users/{userId}/Images/…` forms `[Obsolete]` and
 /// hidden from the OpenAPI doc but still serves them, and jellyfin-web's
 /// bundled `jellyfin-apiclient` still requests avatars this way. Users only
-/// carry a single profile image, so the path's image type/index are accepted
-/// and ignored, as upstream does.
+/// carry a single profile image, so the path's image type and index are bound
+/// (an invalid type or a non-integer index is a `400`) and then ignored, as
+/// upstream does.
 async fn get_user_image_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     get_user_image(state, auth, Query(query), request).await
 }
@@ -1186,10 +1195,12 @@ async fn get_user_image_legacy(
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((user_id, _image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((user_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     query.image_index = Some(image_index);
     get_user_image(state, auth, Query(query), request).await
@@ -1200,11 +1211,13 @@ async fn get_user_image_by_index_legacy(
 async fn post_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     post_user_image(state, auth, Query(query), headers, body).await
 }
@@ -1214,9 +1227,11 @@ async fn post_user_image_legacy(
 async fn delete_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     delete_user_image(state, auth, Query(query)).await
 }
@@ -1224,17 +1239,19 @@ async fn delete_user_image_legacy(
 /// `POST /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed path-scoped
 /// form of `POST /UserImage` (`PostUserImageByIndexLegacy`).
 ///
-/// The image type and index are ignored, as upstream does, but the index must
-/// still be an integer: upstream binds it as an `int`, so anything else fails
-/// model binding with a `400`.
+/// The image type and index are ignored, as upstream does, but both must still
+/// bind: upstream binds the type as an `ImageType` ([`parse_image_type`]) and
+/// the index as an `int`, so anything else fails model binding with a `400`.
 async fn post_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, _image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     post_user_image(state, auth, Query(query), headers, body).await
 }
@@ -1246,9 +1263,11 @@ async fn post_user_image_by_index_legacy(
 async fn delete_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, _image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     delete_user_image(state, auth, Query(query)).await
 }
@@ -1702,6 +1721,30 @@ mod tests {
         assert_eq!(parse_image_format("Jpg,Png,Webp"), None); // 7 is undefined
         assert_eq!(parse_image_format("Png,bogus"), None);
         assert_eq!(parse_image_format("99999999999999999999"), None); // Int32 overflow
+    }
+
+    /// `{imageType}` goes through the same `EnumTypeModelBinder` as the route
+    /// `{format}` above, so the same `Enum.Parse` rules bind it (gl-691).
+    #[test]
+    fn image_type_binds_like_the_route_format() {
+        let bind = |raw: &str| parse_image_type(raw).ok();
+        assert_eq!(bind("Primary"), Some(ImageType::Primary));
+        assert_eq!(bind("boxrear"), Some(ImageType::BoxRear));
+        assert_eq!(bind("PROFILE"), Some(ImageType::Profile));
+        assert_eq!(bind("0"), Some(ImageType::Primary));
+        assert_eq!(bind("12"), Some(ImageType::Profile));
+        assert_eq!(bind(" Primary "), Some(ImageType::Primary));
+        assert_eq!(bind("+1"), Some(ImageType::Art));
+        assert_eq!(bind("01"), Some(ImageType::Art));
+        assert_eq!(bind("Box,Art"), Some(ImageType::Box)); // 7 | 1
+        // Unparseable, or a value no member has: the route 400s.
+        assert_eq!(bind("NotAType"), None);
+        assert_eq!(bind(""), None);
+        assert_eq!(bind("Primary,"), None);
+        assert_eq!(bind("13"), None);
+        assert_eq!(bind("-1"), None);
+        assert_eq!(bind("Disc,Menu"), None); // 6 | 9 == 15
+        assert_eq!(bind("99999999999"), None); // Int32 overflow
     }
 
     /// The QUERY arm is a *nullable* enum, so it skips the undefined-value check
