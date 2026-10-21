@@ -104,6 +104,9 @@ struct ArtworkCache {
     series_names: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
+    /// The libraries and their options the parental-score resolver reads,
+    /// once per scan rather than once per scanned item.
+    rating_libraries: Option<crate::item_visibility::RatingLibraries>,
     /// Lookup locales already resolved by this pass's metadata providers.
     resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
@@ -4119,6 +4122,7 @@ impl LibraryScanner {
     async fn apply_parental_rating_score(
         &self,
         entity: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
     ) -> Result<(), ServiceError> {
         let kind = crate::item_type_lookup::kind_from_type_name(&entity.type_)
             .unwrap_or(BaseItemKind::Folder);
@@ -4133,9 +4137,15 @@ impl LibraryScanner {
                 .into_owned(),
         );
         if let Some(resolver) = &self.rating_resolver {
-            return resolver
-                .update_rating_scores(std::slice::from_mut(entity))
+            let libraries = match cache.rating_libraries.take() {
+                Some(libraries) => libraries,
+                None => resolver.rating_libraries().await?,
+            };
+            let scored = resolver
+                .update_rating_scores_in(std::slice::from_mut(entity), &libraries)
                 .await;
+            cache.rating_libraries = Some(libraries);
+            return scored;
         }
         if let Some(localization) = &self.localization {
             let score = entity
@@ -7055,7 +7065,8 @@ impl LibraryScanner {
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
-        self.apply_parental_rating_score(&mut entity).await?;
+        self.apply_parental_rating_score(&mut entity, state.art_cache)
+            .await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
             let before = state
@@ -20814,6 +20825,117 @@ mod tests {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+    /// The parental-score resolver reads the libraries and their options once
+    /// per scan, not once per scanned item; each item still reads its own
+    /// parent chain, so an ancestor saved earlier in the pass is seen.
+    #[tokio::test]
+    async fn a_scan_reads_the_rating_libraries_once() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, derive_item_id};
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        use ferrofin_traits::persistence::ItemRepository;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        let shows = tmp.path().join("shows");
+        // A rated series whose episode has no rating of its own inherits the
+        // series' score through the parent chain read for it in the pass.
+        let season = shows.join("Show (2001)/Season 01");
+        std::fs::create_dir_all(&season).expect("mkdir");
+        std::fs::write(
+            shows.join("Show (2001)/tvshow.nfo"),
+            "<tvshow><title>Show</title><mpaa>TV-MA</mpaa></tvshow>",
+        )
+        .expect("nfo");
+        let episode = season.join("Show S01E01.mkv");
+        std::fs::write(&episode, b"").expect("write");
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            let folder = movies.join(format!("{name} (2001)"));
+            std::fs::create_dir_all(&folder).expect("mkdir");
+            std::fs::write(folder.join(format!("{name} (2001).mkv")), b"").expect("write");
+            std::fs::write(
+                folder.join("movie.nfo"),
+                format!("<movie><title>{name}</title><mpaa>PG-13</mpaa></movie>"),
+            )
+            .expect("nfo");
+        }
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: movies.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("library");
+        vf.add_virtual_folder(
+            "Shows",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: shows.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("library");
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&items),
+            Arc::new(crate::LocalizationManager::new("US")),
+            tmp.path().join("data").to_string_lossy().into_owned(),
+        ));
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(Arc::clone(&items))
+                .with_rating_resolver(Arc::clone(&visibility));
+        scanner.scan_all().await.expect("scan");
+
+        assert_eq!(visibility.library_loads(), 1, "once for the whole scan");
+        let score = |rating: &str| {
+            crate::LocalizationManager::new("US")
+                .get_rating_score(rating, None)
+                .map(|score| i64::from(score.score))
+        };
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            let path = movies.join(format!("{name} (2001)/{name} (2001).mkv"));
+            let id = derive_item_id(BaseItemKind::Movie, &path.to_string_lossy()).expect("id");
+            let row = items.retrieve_item(id).await.expect("read").expect("movie");
+            assert_eq!(row.official_rating.as_deref(), Some("PG-13"), "{name}");
+            assert_eq!(
+                row.inherited_parental_rating_value,
+                score("PG-13"),
+                "{name}"
+            );
+        }
+        let id = derive_item_id(BaseItemKind::Episode, &episode.to_string_lossy()).expect("id");
+        let row = items
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("episode");
+        assert!(score("TV-MA").is_some());
+        assert_eq!(row.inherited_parental_rating_value, score("TV-MA"));
+    }
 
     #[rstest::rstest]
     #[case("ς", "σ", true)]
