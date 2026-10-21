@@ -674,18 +674,36 @@ async fn serve_until_drained(
         let mut stop = stop_rx.clone();
         let app = app.clone();
         servers.spawn(async move {
-            axum::serve(
-                listener,
-                // `with_connect_info` so handlers can read the client's socket address
-                // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
-                axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                    SocketAddr,
-                >(app),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = stop.wait_for(|stopped| *stopped).await;
-            })
-            .await
+            // Each connection's peer (`ConnectInfo`, which handlers read, e.g.
+            // `GET /System/Endpoint`) and the address it was accepted on, which
+            // the IP gate compares with it (C# `IsLocal()`).
+            let make_service = tower::service_fn(
+                move |stream: axum::serve::IncomingStream<'_, listen::Listener>| {
+                    let peer = *stream.remote_addr();
+                    let local = stream.io().local_addr().ok();
+                    let app = app.clone();
+                    async move {
+                        let service = tower::ServiceBuilder::new()
+                            .map_request(move |mut request: axum::extract::Request| {
+                                let extensions = request.extensions_mut();
+                                extensions.insert(axum::extract::ConnectInfo(peer));
+                                if let Some(local) = local {
+                                    extensions.insert(
+                                        ferrofin_api::ip_access::ConnectionLocalAddr(local),
+                                    );
+                                }
+                                request
+                            })
+                            .service(app);
+                        Ok::<_, std::convert::Infallible>(service)
+                    }
+                },
+            );
+            axum::serve(listener, make_service)
+                .with_graceful_shutdown(async move {
+                    let _ = stop.wait_for(|stopped| *stopped).await;
+                })
+                .await
         });
     }
     tokio::spawn(async move {
@@ -1090,11 +1108,65 @@ async fn redirect_bare_web(req: Request, next: Next) -> Response {
 mod tests {
     use super::mount_web;
     use axum::Router;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use ferrofin_traits::plugins::FileTransformationService;
     use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    /// Every connection carries its peer (`ConnectInfo`, which handlers read)
+    /// and the address it was accepted on (`ConnectionLocalAddr`, which the IP
+    /// gate compares with it — C# `IsLocal()`).
+    #[tokio::test]
+    async fn each_connection_carries_its_peer_and_local_address() {
+        use axum::extract::ConnectInfo;
+        use ferrofin_api::ip_access::ConnectionLocalAddr;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = super::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
+        let address = axum::serve::Listener::local_addr(&listener).expect("local address");
+        let router = Router::new().route(
+            "/probe",
+            axum::routing::get(
+                |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+                 axum::Extension(ConnectionLocalAddr(local)): axum::Extension<
+                    ConnectionLocalAddr,
+                >| async move { format!("peer={} local={local}", peer.ip()) },
+            ),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(super::serve_until_drained(
+            vec![listener],
+            router,
+            async move {
+                let _ = stopped.await;
+            },
+            1,
+            "",
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        stream
+            .write_all(b"GET /probe HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("response");
+        let _ = stop.send(());
+        server.await.expect("join").expect("serve");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.ends_with(&format!("peer=127.0.0.1 local={address}")),
+            "{response}"
+        );
+    }
 
     #[test]
     fn disabled_encoder_retains_only_a_successfully_validated_ffmpeg_display() {
@@ -1157,6 +1229,18 @@ mod tests {
         }
     }
 
+    /// A host reached locally at an address nothing listens on: these tests
+    /// register no relative endpoint.
+    struct NoLocalApi;
+    #[async_trait::async_trait]
+    impl ferrofin_traits::system::LocalApiAccess for NoLocalApi {
+        async fn get_api_url_for_local_access(
+            &self,
+        ) -> Result<String, ferrofin_traits::error::ServiceError> {
+            Ok("http://127.0.0.1:0".to_owned())
+        }
+    }
+
     /// A transformation service over the extension registry with the File
     /// Transformation plugin registered (and thus enabled by default).
     fn transformations(plugins_dir: &std::path::Path) -> Arc<dyn FileTransformationService> {
@@ -1168,7 +1252,7 @@ mod tests {
         Arc::new(
             ferrofin_extensions::file_transformation::WebFileTransformationService::new(
                 plugins,
-                "http://127.0.0.1:0".to_owned(),
+                Arc::new(NoLocalApi),
             ),
         )
     }

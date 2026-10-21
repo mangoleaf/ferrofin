@@ -532,7 +532,7 @@ impl SessionManager for RecordingSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         Ok(current_session_dto(self.with_guest))
     }

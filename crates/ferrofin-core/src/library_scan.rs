@@ -8955,8 +8955,7 @@ impl LibraryScanner {
     /// collection folder first, [`Self::library_top_parents`]) the pruning
     /// weighs: those at or under `roots` and their path-less children on a
     /// path-scoped scan (`roots` given), every row of the library on a
-    /// library scan — both less the owned non-extras and the alternate
-    /// versions a library read never lists
+    /// library scan — both less the owned non-extras
     /// ([`ItemPersistenceService::library_items`]). `None` when they could
     /// not be read (logged): nothing of the library is pruned then.
     async fn prune_candidates(
@@ -8981,7 +8980,8 @@ impl LibraryScanner {
         let rows = match self.persistence.library_items(top_parents).await {
             Ok(Some(rows)) => rows,
             // A store that cannot answer: the item repository's library
-            // read, which applies the same candidate terms.
+            // read. It also hides an unowned alternate version, so such a
+            // store never weighs one.
             Ok(None) => match items
                 .get_item_list(&InternalItemsQuery {
                     top_parent_ids: top_parents.to_vec(),
@@ -19401,8 +19401,9 @@ fn is_path_less(item: &BaseItemEntity) -> bool {
 /// `RefreshedOwnedItems`, `Video.cs:690`), so a stored part keeps its own. `IsoType` is the resolver's on a
 /// new item only and never updated after. Stat-owned (`SaveInternal`):
 /// `DateModified` (a file's; a folder has none, D2) and `Size` (files).
-/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate` and the
-/// video `Width`/`Height` (a photo's come from its EXIF reader).
+/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate`, the
+/// video `Width`/`Height` (a photo's come from its EXIF reader) and a track's
+/// ReplayGain `NormalizationGain`.
 ///
 /// `row` is always a stored row's (the merge's; a new item takes the
 /// planner's row whole, [`saved_row`]).
@@ -19463,6 +19464,10 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         if measured.is_some() {
             *value = measured;
         }
+    }
+    // A ReplayGain tag the probe read (`apply_audio_metadata`).
+    if scanned.normalization_gain.is_some() {
+        row.normalization_gain = scanned.normalization_gain;
     }
     if probe_ran
         && (scanned.run_time_ticks.is_some() || scanned.media_type.as_deref() == Some("Video"))
@@ -20035,26 +20040,30 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
 
 /// Whether writing `people` would change `stored`, an item's credits as
 /// `get_people_batch` reads them back. Compared the way `update_people`
-/// writes them: deduped on (lower-cased name, type) keeping the first
-/// ([`dedupe_people`]), names trimmed and matched case-insensitively (an
-/// existing `Peoples` row keeps its casing), then type and role, in credit
-/// order.
+/// writes them: deduped on (lower-cased name, type, role) keeping the first
+/// ([`dedupe_people`]), names and roles matched case-insensitively (an
+/// existing `Peoples` row and mapping keep their casing), then type, in
+/// credit order. Incoming roles are trimmed as `update_people` stores them;
+/// stored roles are compared as read, so a padded role written before roles
+/// were trimmed differs once and is rewritten, as upstream's unchanged check
+/// does.
 ///
 /// [`dedupe_people`]: crate::people_repository::dedupe_people
 fn credits_differ(stored: &[PeopleEntity], people: &[PeopleEntity]) -> bool {
-    let key = |p: &PeopleEntity| {
+    let key = |p: &PeopleEntity, trim_role: bool| {
+        let role = p.role.as_deref().unwrap_or_default();
         (
             p.name.trim().to_lowercase(),
             p.person_type.clone().unwrap_or_default(),
-            p.role.clone().unwrap_or_default(),
+            if trim_role { role.trim() } else { role }.to_lowercase(),
         )
     };
     stored
         .iter()
-        .map(key)
+        .map(|p| key(p, false))
         .ne(crate::people_repository::dedupe_people(people)
             .into_iter()
-            .map(key))
+            .map(|p| key(p, true)))
 }
 
 /// The credits `AudioFileProber.FetchDataFromTags` writes with
@@ -20145,6 +20154,11 @@ fn apply_audio_metadata(
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = info.premiere_date;
+    }
+    // `audio.NormalizationGain = value` whenever the tag parses: the tag
+    // replaces what the track had, and a track without one keeps it.
+    if tags.track_gain.is_some() {
+        entity.normalization_gain = tags.track_gain;
     }
     // No sort key here: `Audio.CreateSortName` reads the final disc/track
     // numbers (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`), which
@@ -20834,6 +20848,48 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    fn credit(name: &str, person_type: &str, role: &str) -> super::PeopleEntity {
+        super::PeopleEntity {
+            name: name.to_owned(),
+            person_type: Some(person_type.to_owned()),
+            role: Some(role.to_owned()),
+            ..super::PeopleEntity::default()
+        }
+    }
+
+    /// The skip-unchanged check compares credits the way `update_people`
+    /// writes them, so a padded role from a provider equals the trimmed
+    /// one it stored, and a rescan does not rewrite the item's credits.
+    #[test]
+    fn credits_differ_compares_roles_as_update_people_stores_them() {
+        let stored = [credit("Ann", "Actor", "Himself")];
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", " Himself ")]
+        ));
+        assert!(super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "Herself")]
+        ));
+        // A role stored padded (before roles were trimmed) is rewritten once.
+        assert!(super::credits_differ(
+            &[credit("Ann", "Actor", " Himself ")],
+            &[credit("Ann", "Actor", "Himself")]
+        ));
+        // A case-only change keeps the stored mapping, so it is no change.
+        assert!(!super::credits_differ(
+            &stored,
+            &[credit("Ann", "Actor", "HIMSELF")]
+        ));
+        // Two roles of one person are two credits.
+        let both = [
+            credit("Ann", "Writer", "Novel"),
+            credit("Ann", "Writer", "Screenplay"),
+        ];
+        assert!(!super::credits_differ(&both, &both));
+        assert!(super::credits_differ(&both[..1], &both));
+    }
+
     #[rstest::rstest]
     #[case::off(false, false, false, false, false, false)]
     #[case::ordinary(true, false, false, false, false, true)]
@@ -25654,6 +25710,63 @@ mod tests {
         let mut row = BaseItemEntity::default();
         super::apply_audio_metadata(&mut row, &MediaInfo::default(), None);
         assert_eq!(row.album_artists, None, "no performers, no album artists");
+    }
+
+    /// `AudioFileProber.FetchDataFromTags`' `REPLAYGAIN_TRACK_GAIN`: a trailing
+    /// `dB` in any case dropped, whitespace trimmed, only a finite float kept,
+    /// and written over what the track had.
+    #[rstest::rstest]
+    #[case::with_unit("-6.5 dB", Some(-6.5))]
+    #[case::signed_no_space("+1.2dB", Some(f64::from(1.2_f32)))]
+    #[case::upper_unit("-3.10 DB", Some(f64::from(-3.1_f32)))]
+    #[case::padded(" 2 ", Some(2.0))]
+    #[case::not_a_number("abc", None)]
+    #[case::nan("NaN", None)]
+    #[case::infinity("Infinity dB", None)]
+    #[case::blank("", None)]
+    #[case::truncated_at_nul("-6.5\0junk", Some(-6.5))]
+    #[case::multibyte_tail("5é", None)]
+    #[case::one_character("x", None)]
+    fn the_track_gain_tag_sets_the_normalization_gain(
+        #[case] tag: &str,
+        #[case] expected: Option<f64>,
+    ) {
+        let info = ferrofin_model::media_info::MediaInfo {
+            raw_audio_tags: Some(std::collections::HashMap::from([(
+                "replaygain_track_gain".to_owned(),
+                tag.to_owned(),
+            )])),
+            ..Default::default()
+        };
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::apply_audio_metadata(&mut row, &info, None);
+        assert_eq!(row.normalization_gain, expected.or(Some(-9.0)));
+    }
+
+    /// A rescan lays the probed gain over the stored row; a probe that read
+    /// none leaves the stored one.
+    #[test]
+    fn a_probed_track_gain_overlays_the_stored_row() {
+        let scanned = BaseItemEntity {
+            normalization_gain: Some(-4.0),
+            ..BaseItemEntity::default()
+        };
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::overlay_file_facts(&mut row, &scanned, true);
+        assert_eq!(row.normalization_gain, Some(-4.0));
+
+        let mut row = BaseItemEntity {
+            normalization_gain: Some(-9.0),
+            ..BaseItemEntity::default()
+        };
+        super::overlay_file_facts(&mut row, &BaseItemEntity::default(), true);
+        assert_eq!(row.normalization_gain, Some(-9.0));
     }
 
     #[test]
