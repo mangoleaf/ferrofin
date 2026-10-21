@@ -1891,6 +1891,19 @@ pub async fn build_app_state(
             Arc::clone(&lyrics),
             Arc::clone(&media_stream_repository),
         )));
+        // Its interval is the TMDb settings page's, read here and again on
+        // every run (the page's save takes effect by the next run).
+        let tmdb_upcoming = Arc::new(lib_tasks::TmdbUpcomingEpisodesTask::new(
+            Arc::clone(&tmdb_client),
+            Arc::clone(&library),
+        ));
+        tmdb_upcoming.set_interval_days(
+            tmdb_client
+                .missing_episode_settings()
+                .await
+                .refresh_interval_days,
+        );
+        task_manager.register(tmdb_upcoming);
         task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),

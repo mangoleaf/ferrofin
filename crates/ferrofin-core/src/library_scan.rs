@@ -312,6 +312,20 @@ fn own_language(value: Option<&str>) -> Option<String> {
         .map(str::to_lowercase)
 }
 
+/// The TMDb language `row`'s providers ask in: its preferred metadata
+/// language and country (`GetPreferredMetadataLanguage`/`CountryCode`), as
+/// an episode's season lookup takes them, so the series' season requests and
+/// its episodes' share the scan's cache.
+fn tmdb_locale(row: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<String> {
+    let country = own_language(row.preferred_metadata_country_code.as_deref())
+        .unwrap_or_else(|| policy.country_code())
+        .to_ascii_uppercase();
+    ferrofin_providers::tmdb::normalize_language(
+        Some(&preferred_language(row, policy)),
+        Some(&country),
+    )
+}
+
 /// The language `row`'s providers are judged by
 /// (`GetPreferredMetadataLanguage`): its own, else the resolved ancestor,
 /// library and server locale carried by the request's policy.
@@ -3371,9 +3385,25 @@ struct ScanWork<'r> {
     /// each one's refresh ends removing its obsolete virtual episodes
     /// ([`obsolete_episodes`]), once the walk saved every row.
     series: Vec<Uuid>,
+    /// The series the walk refreshed with their custom providers running
+    /// (neither locked nor under metadata mode `None`), with the locale it
+    /// refreshed them in: the TMDb missing/unaired episode provider runs for
+    /// those of them [`series`](Self::series) holds ([`missing_episodes`]).
+    missing_episodes: Vec<missing_episodes::MissingEpisodeSeries>,
 }
 
 impl ScanWork<'_> {
+    /// The series the TMDb missing/unaired episode provider runs for: those
+    /// the walk refreshed with their custom providers that the scan
+    /// refreshes rather than carries for context.
+    fn missing_episodes_to_refresh(&self) -> Vec<missing_episodes::MissingEpisodeSeries> {
+        self.missing_episodes
+            .iter()
+            .filter(|s| self.series.contains(&s.id))
+            .cloned()
+            .collect()
+    }
+
     /// Records the ids a lane refresh touched that the walk already decided
     /// (an album or artist it queued a music refresh for). The closing
     /// passes leave such an item to that refresh when it went at least as
@@ -5885,6 +5915,7 @@ impl LibraryScanner {
             outside: refresh.outside,
             generated_images: Vec::new(),
             series: refreshed_series,
+            missing_episodes: Vec::new(),
         };
         // The versions the walk took out of a local group, by the primary
         // that owned them ([`released_from`]). A stop still unlinks them: the
@@ -6110,6 +6141,23 @@ impl LibraryScanner {
             {
                 work.generated_images
                     .push((item.id, plan.run_all_providers));
+            }
+            // `TmdbMissingEpisodeProvider`, a series' custom provider (and an
+            // `IHasItemChangeMonitor`, so it runs on every refresh of a series
+            // with a TMDb id): run in the closing passes, once the walk saved
+            // the series' episodes.
+            if !locked
+                && !matches!(saved, ItemSaved::Cancelled)
+                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
+                && item_type_lookup::kind_from_type_name(&item.entity.type_)
+                    == Some(BaseItemKind::Series)
+            {
+                work.missing_episodes
+                    .push(missing_episodes::MissingEpisodeSeries {
+                        id: item.id,
+                        library: item.ancestors.first().copied(),
+                        language: tmdb_locale(&item.entity, policy),
+                    });
             }
             match saved {
                 ItemSaved::Unchanged => outcome.unchanged += 1,
@@ -6544,6 +6592,14 @@ impl LibraryScanner {
         self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
             .await;
         self.finish_album_artwork(art_cache, run).await;
+        // The TMDb missing/unaired episodes of each series it refreshed (a
+        // series' own refresh is a touched scan).
+        if let Err(err) = self
+            .refresh_missing_episodes(&work.missing_episodes_to_refresh(), art_cache, run)
+            .await
+        {
+            tracing::warn!(%err, "missing episode pass failed");
+        }
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
         }
@@ -8245,6 +8301,12 @@ impl LibraryScanner {
         // cumulative runtime (albums, artists) and last media added
         // (series).
         let started = std::time::Instant::now();
+        if let Err(err) = self
+            .refresh_missing_episodes(&work.missing_episodes_to_refresh(), art_cache, run)
+            .await
+        {
+            tracing::warn!(%err, "missing episode pass failed");
+        }
         if let Err(err) = self.remove_obsolete_episodes(&work.series, run).await {
             tracing::warn!(%err, "obsolete episode pass failed");
         }
@@ -21292,6 +21354,7 @@ fn discover_local_images<D: ferrofin_providers::DirectoryService>(
 mod artwork;
 mod collections;
 mod fanout;
+mod missing_episodes;
 mod music;
 mod obsolete_episodes;
 mod playlists;
