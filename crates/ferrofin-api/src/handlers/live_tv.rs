@@ -1230,7 +1230,7 @@ async fn get_live_recording_stream(
         Some(path) => Ok(progressive_response(
             std::path::PathBuf::from(&path),
             0,
-            &path,
+            ferrofin_model::net::mime_types::get_mime_type(&path),
         )),
         None => Err(ApiError::NotFound("recording".into())),
     }
@@ -1304,7 +1304,9 @@ fn progressive_file_body(path: std::path::PathBuf, start_at: u64) -> Body {
         loop {
             match file.read(&mut buffer).await {
                 Ok(0) => {
-                    if idle_ms >= PROGRESSIVE_TIMEOUT_MS {
+                    // A client that hung up (or a `HEAD`, whose body is never
+                    // read) frees the file now, not after the idle timeout.
+                    if idle_ms >= PROGRESSIVE_TIMEOUT_MS || tx.is_closed() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(PROGRESSIVE_POLL_MS)).await;
@@ -1345,9 +1347,12 @@ async fn live_stream_start_offset(file: &ferrofin_traits::stubs::LiveStreamFile)
     length.saturating_sub(tail)
 }
 
-/// Builds the `200` progressive response for `path`, typed by its container.
-fn progressive_response(path: std::path::PathBuf, start_at: u64, file_name: &str) -> Response {
-    let content_type = ferrofin_model::net::mime_types::get_mime_type(file_name);
+/// Builds the `200` progressive response for `path`, of `content_type`.
+pub(crate) fn progressive_response(
+    path: std::path::PathBuf,
+    start_at: u64,
+    content_type: &str,
+) -> Response {
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, content_type)
         // The body is generated as the file grows: nothing here is cacheable
@@ -1410,7 +1415,11 @@ pub(crate) async fn live_stream_buffer(
         return Err(ApiError::NotFound("live stream file".into()));
     };
     let start_at = live_stream_start_offset(&file).await;
-    Ok(progressive_response(file.path.clone(), start_at, file_name))
+    Ok(progressive_response(
+        file.path.clone(),
+        start_at,
+        ferrofin_model::net::mime_types::get_mime_type(file_name),
+    ))
 }
 
 /// The `POST /LiveTv/ChannelMappings` request body.
@@ -2456,12 +2465,14 @@ mod tests {
             protocol: ferrofin_model::media_info::MediaProtocol::Http,
             video_type: None,
             is_live_stream: true,
+            is_infinite_stream: false,
             user_agent: None,
         };
 
         let response = serve_static_source(
             &state,
             source("uid-1"),
+            None,
             axum::extract::Request::new(Body::empty()),
         )
         .await
@@ -2478,6 +2489,7 @@ mod tests {
         let closed = serve_static_source(
             &state,
             source("uid-2"),
+            None,
             axum::extract::Request::new(Body::empty()),
         )
         .await
