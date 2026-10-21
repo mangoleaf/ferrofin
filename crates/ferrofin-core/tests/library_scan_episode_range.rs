@@ -176,11 +176,14 @@ async fn an_inverted_file_name_range_is_no_range() {
     assert_eq!((index, end), (Some(5), None));
 }
 
-/// "Replace all metadata" on a stored episode: the path re-sets the range
-/// (here to nothing, the name has none) before the providers run, and the
-/// NFO's range then replaces it, as upstream's merge does.
+/// "Replace all metadata" on a stored episode whose NFO exists: the path
+/// re-sets the range (here to nothing, the name has none) before the
+/// providers run, the stored range goes with it, and the NFO is not read,
+/// because a metadata saver will rewrite it. Upstream
+/// `MetadataService.RefreshWithProviders`: "Do not execute local providers
+/// if we are identifying or replacing with local metadata saving enabled".
 #[tokio::test]
-async fn replace_all_takes_the_nfos_range_over_the_stored_and_the_names() {
+async fn replace_all_takes_the_names_range_not_the_stored_or_the_nfos() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let nfo = "<episodedetails><title>T</title><episode>3</episode>\
                <episodenumberend>4</episodenumberend></episodedetails>";
@@ -209,5 +212,5 @@ async fn replace_all_takes_the_nfos_range_over_the_stored_and_the_names() {
         .expect("replace all");
 
     let (_, index, end) = episode(&db).await;
-    assert_eq!((index, end), (Some(3), Some(4)));
+    assert_eq!((index, end), (Some(3), None));
 }
