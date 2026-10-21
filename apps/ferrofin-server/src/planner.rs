@@ -1686,6 +1686,7 @@ impl FerrofinStreamStatePlanner {
             hw_graph = hw::sw_chain::video_processing_filter_args(
                 vendor_chain,
                 self.encoding_helper.framerate_param(state).map(f64::from),
+                state.is_deinterlace_available(),
                 pads,
                 burn_sub,
                 burn_text,
@@ -6060,6 +6061,31 @@ mod tests {
                 "[0:0]yadif=0:-1:0,scale=1280:720,fps=24[base];[base][0:2]overlay[v]"
             );
         }
+    }
+
+    /// A frame-rate cap on a deinterlaced GPU chain goes behind the
+    /// deinterlacer, which needs the neighbouring frames
+    /// (`GetVideoProcessingFilterParam`, PR 17058); before it, a field-rate
+    /// deinterlacer would also double the capped rate.
+    #[tokio::test]
+    async fn a_capped_interlaced_gpu_transcode_deinterlaces_before_the_cap() {
+        let mut video = nvdec_decodable_video_stream();
+        video.is_interlaced = true;
+        video.average_frame_rate = Some(50.0);
+        let p = nvenc_planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_framerate = Some(24.0);
+        let args = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        let deinterlace = args.find("yadif_cuda=").expect("deinterlaced");
+        let cap = args.find("fps=24").expect("capped");
+        assert!(deinterlace < cap, "{args}");
     }
 
     #[tokio::test]

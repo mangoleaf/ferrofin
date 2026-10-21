@@ -464,15 +464,28 @@ pub fn fixed_sw_scale_filter(
 /// `-filter_complex` with named pads, because the subtitle and the video are
 /// two separate streams that have to meet. A **text** subtitle skips the input
 /// pad entirely — `alphasrc` generates its own source rather than reading one.
+///
+/// `framerate` (`GetFramerateParam`) becomes an `fps=` filter: at the end of
+/// the main chain when `deinterlace` (`IsDeinterlaceAvailable`), since a
+/// deinterlacer needs the neighbouring frames the cap would drop (and a
+/// field-rate one would double the capped rate); at its head otherwise.
 #[must_use]
 pub fn video_processing_filter_param(
     chain: FilterChain,
     framerate: Option<f64>,
+    deinterlace: bool,
     pads: StreamPads,
     has_subtitle: bool,
     subtitle_is_text: bool,
 ) -> String {
-    match video_processing_filter_args(chain, framerate, pads, has_subtitle, subtitle_is_text) {
+    match video_processing_filter_args(
+        chain,
+        framerate,
+        deinterlace,
+        pads,
+        has_subtitle,
+        subtitle_is_text,
+    ) {
         Some((flag, graph)) => format!(" {flag} \"{graph}\""),
         None => String::new(),
     }
@@ -490,6 +503,7 @@ pub fn video_processing_filter_param(
 pub fn video_processing_filter_args(
     mut chain: FilterChain,
     framerate: Option<f64>,
+    deinterlace: bool,
     pads: StreamPads,
     has_subtitle: bool,
     subtitle_is_text: bool,
@@ -497,7 +511,12 @@ pub fn video_processing_filter_args(
     chain.prune();
 
     if let Some(framerate) = framerate {
-        chain.main.insert(0, format!("fps={framerate}"));
+        let fps = format!("fps={framerate}");
+        if deinterlace {
+            chain.main.push(fps);
+        } else {
+            chain.main.insert(0, fps);
+        }
     }
 
     let main = chain.main.join(",");
@@ -1022,7 +1041,7 @@ scale=1280:trunc(1280/dar/2)*2"
             ..FilterChain::default()
         };
         assert_eq!(
-            video_processing_filter_param(chain, None, pads(), false, false),
+            video_processing_filter_param(chain, None, false, pads(), false, false),
             " -vf \"format=yuv420p,scale=1280:720\""
         );
     }
@@ -1036,7 +1055,7 @@ scale=1280:trunc(1280/dar/2)*2"
             ..FilterChain::default()
         };
         assert_eq!(
-            video_processing_filter_param(chain, None, pads(), false, false),
+            video_processing_filter_param(chain, None, false, pads(), false, false),
             " -vf \"format=yuv420p\""
         );
         // A chain that prunes to nothing produces no argument at all.
@@ -1045,7 +1064,7 @@ scale=1280:trunc(1280/dar/2)*2"
             ..FilterChain::default()
         };
         assert_eq!(
-            video_processing_filter_param(empty, None, pads(), false, false),
+            video_processing_filter_param(empty, None, false, pads(), false, false),
             ""
         );
     }
@@ -1062,7 +1081,7 @@ scale=1280:trunc(1280/dar/2)*2"
             overlay: vec!["overlay=eof_action=pass:repeatlast=0".to_owned()],
         };
         assert_eq!(
-            video_processing_filter_param(empty_sub, None, pads(), true, false),
+            video_processing_filter_param(empty_sub, None, false, pads(), true, false),
             ""
         );
 
@@ -1073,7 +1092,7 @@ scale=1280:trunc(1280/dar/2)*2"
             overlay: vec![String::new()],
         };
         assert_eq!(
-            video_processing_filter_param(empty_overlay, None, pads(), true, false),
+            video_processing_filter_param(empty_overlay, None, false, pads(), true, false),
             " -vf \"format=yuv420p\""
         );
 
@@ -1085,9 +1104,23 @@ scale=1280:trunc(1280/dar/2)*2"
             overlay: vec![String::new(), "overlay".to_owned()],
         };
         assert_eq!(
-            video_processing_filter_param(all_three, None, pads(), true, false),
+            video_processing_filter_param(all_three, None, false, pads(), true, false),
             " -filter_complex \"[0:2]scale=1280:720[sub];[0:0]format=yuv420p[main];\
 [main][sub]overlay\""
+        );
+    }
+
+    /// Behind a deinterlacer the cap goes last (PR 17058): the deinterlacer
+    /// needs the neighbouring frames the cap would drop.
+    #[test]
+    fn a_framerate_follows_a_deinterlacer() {
+        let chain = FilterChain {
+            main: vec!["yadif=0:-1:0".to_owned(), "format=yuv420p".to_owned()],
+            ..FilterChain::default()
+        };
+        assert_eq!(
+            video_processing_filter_param(chain, Some(23.976), true, pads(), false, false),
+            " -vf \"yadif=0:-1:0,format=yuv420p,fps=23.976\""
         );
     }
 
@@ -1098,7 +1131,7 @@ scale=1280:trunc(1280/dar/2)*2"
             ..FilterChain::default()
         };
         assert_eq!(
-            video_processing_filter_param(chain, Some(23.976), pads(), false, false),
+            video_processing_filter_param(chain, Some(23.976), false, pads(), false, false),
             " -vf \"fps=23.976,format=yuv420p\""
         );
     }
@@ -1111,7 +1144,7 @@ scale=1280:trunc(1280/dar/2)*2"
             overlay: vec!["overlay=eof_action=pass:repeatlast=0".to_owned()],
         };
         assert_eq!(
-            video_processing_filter_param(chain, None, pads(), true, false),
+            video_processing_filter_param(chain, None, false, pads(), true, false),
             " -filter_complex \"[0:2]scale=1280:720[sub];[0:0]format=yuv420p[main];\
              [main][sub]overlay=eof_action=pass:repeatlast=0\""
         );
@@ -1129,7 +1162,7 @@ scale=1280:trunc(1280/dar/2)*2"
             subtitle_index: 0,
             video_index: 0,
         };
-        let args = video_processing_filter_param(chain, None, external, true, false);
+        let args = video_processing_filter_param(chain, None, false, external, true, false);
         assert!(args.contains("[1:0]scale=1280:720[sub]"), "{args}");
     }
 
@@ -1140,7 +1173,7 @@ scale=1280:trunc(1280/dar/2)*2"
             sub: vec!["alphasrc=s=1280x720:r=25:start='0'".to_owned()],
             overlay: vec!["overlay_cuda".to_owned()],
         };
-        let args = video_processing_filter_param(chain, None, pads(), true, true);
+        let args = video_processing_filter_param(chain, None, false, pads(), true, true);
         assert_eq!(
             args,
             " -filter_complex \"alphasrc=s=1280x720:r=25:start='0'[sub];\
@@ -1157,7 +1190,7 @@ scale=1280:trunc(1280/dar/2)*2"
             overlay: vec!["overlay".to_owned()],
         };
         assert_eq!(
-            video_processing_filter_param(chain, None, pads(), true, false),
+            video_processing_filter_param(chain, None, false, pads(), true, false),
             " -filter_complex \"[0:2]scale=1280:720[sub];[0:0][sub]overlay\""
         );
     }
@@ -1172,7 +1205,7 @@ scale=1280:trunc(1280/dar/2)*2"
             overlay: vec!["overlay".to_owned()],
         };
         assert_eq!(
-            video_processing_filter_param(chain.clone(), None, pads(), true, false),
+            video_processing_filter_param(chain.clone(), None, false, pads(), true, false),
             ""
         );
         // ...and the same when the job has no subtitle stream at all.
@@ -1181,7 +1214,7 @@ scale=1280:trunc(1280/dar/2)*2"
             ..chain
         };
         assert_eq!(
-            video_processing_filter_param(with_sub, None, pads(), false, false),
+            video_processing_filter_param(with_sub, None, false, pads(), false, false),
             ""
         );
     }
