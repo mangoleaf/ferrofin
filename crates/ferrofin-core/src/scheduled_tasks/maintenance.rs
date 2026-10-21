@@ -87,6 +87,35 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Port of `TranscodeManager.DeleteEncodedMediaCache`
+/// (`TranscodeManager.cs:718-736`), which the upstream constructor runs at
+/// startup: deletes every file under the transcode directory, whatever its
+/// age, so the segments and outputs a crash left behind do not outlive the
+/// restart. Directories stay. The `.jellyfin-transcode` marker goes with the
+/// rest, as upstream, and the next `prepare_transcode_path` recreates it. A
+/// directory that cannot be prepared (a conflicting marker says it is not
+/// ours) is left alone. Per-file failures are logged and skipped.
+///
+/// Run it before any transcode job can start. Returns how many files were
+/// deleted.
+pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
+    let dir = match paths.prepare_transcode_path() {
+        Ok(dir) => PathBuf::from(dir),
+        Err(error) => {
+            tracing::error!(%error, "cannot clear the transcode cache");
+            return 0;
+        }
+    };
+    let mut deleted = 0;
+    for file in files_under(&dir) {
+        match std::fs::remove_file(&file) {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
+        }
+    }
+    deleted
+}
+
 /// Deletes every file under `dir` last modified before `cutoff`, then prunes
 /// empty subdirectories (the root is kept). Returns how many files were
 /// deleted. Per-file failures are logged and skipped (the C# helper's
@@ -693,7 +722,7 @@ mod tests {
             device_id: &str,
             device_name: &str,
             remote_endpoint: &str,
-            user: &UserEntity,
+            user: Option<&UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
@@ -1099,6 +1128,29 @@ mod tests {
 
         assert!(!old.exists(), "day-old transcode file should be deleted");
         assert!(fresh.exists(), "in-flight transcode file should remain");
+    }
+
+    /// The boot purge deletes every file whatever its age and keeps the
+    /// directories; a transcode directory carrying another directory's marker
+    /// is not ours, so nothing in it is touched.
+    #[test]
+    fn delete_encoded_media_cache_clears_only_its_own_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FakeConfig::over(dir.path(), |_| {});
+        let paths = config.application_paths();
+        let transcodes = std::path::PathBuf::from(paths.transcode_path());
+        let fresh = touch(&transcodes, "abc/segment0.ts");
+        let playlist = touch(&transcodes, "abc.m3u8");
+
+        // The two files and the `.jellyfin-transcode` marker, as upstream.
+        assert_eq!(delete_encoded_media_cache(&*paths), 3);
+        assert!(!fresh.exists() && !playlist.exists());
+        assert!(transcodes.join("abc").is_dir(), "directories stay");
+
+        let kept = touch(&transcodes, "abc/segment1.ts");
+        let foreign = touch(&transcodes, "media/.jellyfin-data");
+        assert_eq!(delete_encoded_media_cache(&*paths), 0);
+        assert!(kept.exists() && foreign.exists());
     }
 
     // -- Optimize database -------------------------------------------------

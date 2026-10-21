@@ -153,8 +153,13 @@ async fn websocket_upgrade(
 #[derive(Clone)]
 struct SocketCaller {
     session_id: String,
+    /// Nil for an API-key socket, whose session has no user.
     user_id: uuid::Uuid,
     is_admin: bool,
+    /// The socket authenticated with an API key: its session has no user and
+    /// it sees every session (`SessionInfoWebSocketListener` applies no user
+    /// filter to an API key).
+    is_api_key: bool,
 }
 
 /// Why an authenticated socket carries no session — kept distinct so the logs
@@ -162,8 +167,8 @@ struct SocketCaller {
 /// server bug that would silently drop SyncPlay/push delivery).
 #[derive(Clone, Copy)]
 enum SessionlessReason {
-    /// The socket authenticated with an API key, which has no device row.
-    ApiKey,
+    /// An API-key socket's session could not be opened.
+    ApiKeySessionFailed,
     /// A token was presented but the session manager could not resolve it.
     TokenUnresolved,
     /// The token resolved to a session that carries no session id.
@@ -174,7 +179,7 @@ impl SessionlessReason {
     /// The value logged in the `reason` field.
     fn as_str(self) -> &'static str {
         match self {
-            Self::ApiKey => "api-key",
+            Self::ApiKeySessionFailed => "api-key-session-failed",
             Self::TokenUnresolved => "token-unresolved",
             Self::SessionWithoutId => "session-without-id",
         }
@@ -190,17 +195,46 @@ impl SessionlessReason {
 /// client, and with the caller's address, which upstream's `GetSession` records
 /// on every connect (`GetNormalizedRemoteIP`).
 ///
+/// An API key has no device row, so its socket gets the session upstream's
+/// `RequestHelpers.GetSession` logs for it instead: one with no user
+/// (`LogSessionActivity(client, version, deviceId, device, remoteIp, null)`),
+/// keyed by the client and device the auth layer filled in for the key.
+/// The key is upstream's `{appName}{deviceId}`, so a key whose name and
+/// supplied `DeviceId` equal a signed-in client's would share that client's
+/// session (and clear its user), exactly as upstream; without a supplied
+/// `DeviceId` the key's device is the server's system id, which no user
+/// session carries.
+///
 /// [`get_session_by_authentication_token`]: ferrofin_traits::session::SessionManager::get_session_by_authentication_token
 async fn resolve_caller(
     state: &AppState,
     info: &AuthorizationInfo,
 ) -> Result<SocketCaller, SessionlessReason> {
-    // TODO: upstream `RequestHelpers.GetSession` gives an API-key socket a
-    // session with no user (`LogSessionActivity(..., user: null)`), so it is
-    // greeted and can subscribe. Porting it needs
-    // `SessionManager::log_session_activity` to take an optional user.
     if info.is_api_key {
-        return Err(SessionlessReason::ApiKey);
+        let session = state
+            .sessions
+            .log_session_activity(
+                info.client.as_deref().unwrap_or_default(),
+                info.version.as_deref().unwrap_or_default(),
+                info.device_id.as_deref().unwrap_or_default(),
+                info.device.as_deref().unwrap_or_default(),
+                info.remote_endpoint.as_deref().unwrap_or_default(),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "websocket API-key session could not be opened");
+                SessionlessReason::ApiKeySessionFailed
+            })?;
+        let session_id = session.id.ok_or(SessionlessReason::SessionWithoutId)?;
+        // An API key is elevated (`is_administrator_identity`), so it may
+        // subscribe to the activity log as upstream's listener allows.
+        return Ok(SocketCaller {
+            session_id,
+            user_id: session.user_id,
+            is_admin: true,
+            is_api_key: true,
+        });
     }
     let token = info
         .token
@@ -230,6 +264,7 @@ async fn resolve_caller(
         session_id,
         user_id: session.user_id,
         is_admin,
+        is_api_key: false,
     })
 }
 
@@ -618,7 +653,7 @@ async fn handle_socket(
                 }
                 () = tick(&mut streams.sessions) => {
                     if let Some(c) = caller.as_ref()
-                        && let Some(msg) = sessions_message(&state, c.user_id).await
+                        && let Some(msg) = sessions_message(&state, c.user_id, c.is_api_key).await
                         && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
                     {
                         break;
@@ -860,11 +895,16 @@ fn envelope(message_type: &str, data: &serde_json::Value) -> String {
 }
 
 /// The `Sessions` stream payload: the session list as the subscribing user
-/// sees it (the session manager applies the caller's visibility).
-async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<String> {
+/// sees it (the session manager applies the caller's visibility; an API key
+/// sees every session).
+async fn sessions_message(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    is_api_key: bool,
+) -> Option<String> {
     let sessions = state
         .sessions
-        .get_sessions(user_id, None, None, None, false)
+        .get_sessions(user_id, None, None, None, is_api_key)
         .await
         .ok()?;
     Some(envelope("Sessions", &serde_json::to_value(sessions).ok()?))
@@ -1163,6 +1203,7 @@ mod tests {
             session_id: "s".to_owned(),
             user_id: uuid::Uuid::nil(),
             is_admin,
+            is_api_key: false,
         };
         let period = std::time::Duration::from_secs(1);
         assert!(!may_subscribe(
@@ -1180,6 +1221,13 @@ mod tests {
                 assert!(may_subscribe(&caller(false), inbound), "{inbound:?}");
             }
         }
+        // An API key is elevated, so `ActivityLogWebSocketListener` admits it.
+        let api_key = SocketCaller {
+            is_admin: true,
+            is_api_key: true,
+            ..caller(true)
+        };
+        assert!(may_subscribe(&api_key, Inbound::ActivityStart(period)));
     }
 
     #[test]
