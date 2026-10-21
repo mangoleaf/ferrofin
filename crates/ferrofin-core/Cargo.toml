@@ -34,6 +34,8 @@ chrono.workspace = true
 # Root linguistic comparison for UserViewBuilder literal name filters.
 icu_collator.workspace = true
 unicode-normalization.workspace = true
+# The C# `ValidUsernameRegex` word class (`\p{Mn}`, `\p{Pc}`).
+regex.workspace = true
 tracing.workspace = true
 # Deep-internal scan metrics (docs/conventions/METRICS.md rule 8): the OTel API
 # only; the pipeline lives in ferrofin-metrics.
