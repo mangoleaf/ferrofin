@@ -214,6 +214,7 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "Lists/playlist.xml",
         "Lists/y.mp3",
         "Artist A/Album 1/Best Of [playlist]/z.mp3",
+        "Rock/Artist C/albums/Album 3/01 - Three.mp3",
     ] {
         touch(&music, rel);
     }
@@ -477,6 +478,9 @@ async fn plan_paths_matches_the_filtered_full_plan() {
         "music/Artist A/Album 1/Best Of [playlist]/z.mp3",
         "books/Reading [playlist]/novel.epub",
         "music/Lists/y.mp3",
+        "music/Rock",
+        "music/Rock/Artist C/albums",
+        "music/Rock/Artist C/albums/Album 3",
         "tv/Mixtape [playlist]/a.mkv",
         "tv/Firefly (2002)/Season 01/Gag Reel [playlist]/a.mkv",
         "tv/Flat Show/bonus/deeper [playlist]/b.mkv",
@@ -558,7 +562,8 @@ async fn playlists_resolve_before_every_other_resolver() {
             at("music/Artist A/Album 1").id,
         ),
         // Music files: in an album, a disc folder, an artist (`Compilations`
-        // holds an album), a folder that is neither, the root.
+        // holds an album), a folder that is neither (a `Folder` of its own),
+        // the root.
         (
             "music/Artist A/Album 1/Album 1.m3u",
             at("music/Artist A/Album 1").id,
@@ -573,7 +578,7 @@ async fn playlists_resolve_before_every_other_resolver() {
         ),
         ("music/Artist A/artist mix.m3u8", at("music/Artist A").id),
         ("music/Compilations/top.zpl", at("music/Compilations").id),
-        ("music/Mixtapes/side.m3u", library(3)),
+        ("music/Mixtapes/side.m3u", at("music/Mixtapes").id),
         ("music/root list.m3u", library(3)),
         // Books, home videos (inside a photo album), untyped.
         ("books/Reading [playlist]", library(4)),
