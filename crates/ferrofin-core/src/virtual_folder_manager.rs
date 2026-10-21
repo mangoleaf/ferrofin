@@ -235,6 +235,11 @@ pub struct FerrofinVirtualFolderManager {
     /// refreshes them when they are saved; here every write through this
     /// manager drops the snapshot and the full listing refreshes it.
     snapshot: Arc<std::sync::Mutex<LibrarySnapshot>>,
+    /// The server configuration whose folder content-type overrides a new
+    /// library location drops ([`Self::remove_content_type_overrides`]). Set by
+    /// the composition root; `None` in unit tests leaves the overrides alone.
+    server_configuration:
+        Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinVirtualFolderManager {
@@ -279,7 +284,39 @@ impl FerrofinVirtualFolderManager {
             user_root: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             snapshot: Arc::default(),
+            server_configuration: None,
         }
+    }
+
+    /// Lets a new library location drop the folder content-type overrides at
+    /// or below it, as `LibraryManager.CreateShortcut` does. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_server_configuration(
+        mut self,
+        configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.server_configuration = Some(configuration);
+        self
+    }
+
+    /// `LibraryManager.RemoveContentTypeOverrides(path)`, which upstream's
+    /// `CreateShortcut` runs for every new library location (a new library, an
+    /// added media path, a path a library-options update adds): the overrides
+    /// at or below it (and any without a name) are dropped, and the
+    /// configuration is saved when one was.
+    async fn remove_content_type_overrides(&self, path: &str) -> Result<(), ServiceError> {
+        let Some(config) = &self.server_configuration else {
+            return Ok(());
+        };
+        let mut configuration = (*config.configuration().await?).clone();
+        if ferrofin_model::content_type_overrides::remove_content_type_overrides(
+            &mut configuration.content_types,
+            path,
+        ) {
+            config.update_configuration(&configuration).await?;
+        }
+        Ok(())
     }
 
     /// Marks the start of a write: the library snapshot is dropped when the
@@ -1346,6 +1383,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
 
         for path_info in &options.path_infos {
             Self::create_shortcut(&folder_path, path_info).await?;
+            self.remove_content_type_overrides(&path_info.path).await?;
         }
 
         // Create the library's CollectionFolder item so it appears in /UserViews
@@ -1485,6 +1523,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         let folder_path = self.require_folder(virtual_folder_name).await?;
 
         Self::create_shortcut(&folder_path, path_info).await?;
+        self.remove_content_type_overrides(&path_info.path).await?;
 
         let mut options = Self::load_options(&folder_path).await;
         options.path_infos.push(path_info.clone());
@@ -1547,6 +1586,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             let already = existing.path_infos.iter().any(|i| i.path == path_info.path);
             if !already {
                 Self::create_shortcut(&folder_path, path_info).await?;
+                self.remove_content_type_overrides(&path_info.path).await?;
             }
         }
 
@@ -3425,5 +3465,117 @@ mod tests {
         // The second read is the JSON one and agrees.
         let again = mgr.get_virtual_folders().await.expect("folders again");
         assert_eq!(again[0].library_options, folders[0].library_options);
+    }
+
+    /// A configuration holding one `ServerConfiguration`, counting its saves.
+    #[derive(Default)]
+    struct OverrideConfig {
+        configuration: std::sync::Mutex<ferrofin_model::configuration::ServerConfiguration>,
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::configuration::ServerConfigurationManager for OverrideConfig {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not needed")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.configuration.lock().unwrap().clone()))
+        }
+        async fn update_configuration(
+            &self,
+            value: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            value.clone_into(&mut self.configuration.lock().unwrap());
+            self.saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            unreachable!("not needed")
+        }
+        async fn update_branding(
+            &self,
+            _: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not needed")
+        }
+    }
+
+    /// `CreateShortcut` → `RemoveContentTypeOverrides`: a new library location
+    /// (a new library, an added media path, a path an options update adds)
+    /// drops the overrides at and below it, and keeps the rest unsaved when
+    /// nothing went.
+    #[tokio::test]
+    async fn a_new_location_drops_the_content_type_overrides_at_and_below_it() {
+        use ferrofin_model::dto::NameValuePair;
+        let (tmp, mgr) = manager();
+        let (one, two, three) = (
+            media_dir(&tmp, "one"),
+            media_dir(&tmp, "two"),
+            media_dir(&tmp, "three"),
+        );
+        let config = Arc::new(OverrideConfig::default());
+        let pair = |name: String| NameValuePair {
+            name: Some(name),
+            value: Some("movies".to_owned()),
+        };
+        config.configuration.lock().unwrap().content_types = vec![
+            pair(one.clone()),
+            pair(format!("{two}/Show")),
+            pair(format!("{three}/Film")),
+            pair(format!("{one}x")),
+        ];
+        let mgr = mgr.with_server_configuration(Arc::clone(&config) as _);
+        let names = || -> Vec<String> {
+            config
+                .configuration
+                .lock()
+                .unwrap()
+                .content_types
+                .iter()
+                .filter_map(|pair| pair.name.clone())
+                .collect()
+        };
+
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&one)))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(),
+            vec![
+                format!("{two}/Show"),
+                format!("{three}/Film"),
+                format!("{one}x")
+            ]
+        );
+        mgr.add_media_path("Lib", &MediaPathInfo { path: two.clone() })
+            .await
+            .unwrap();
+        assert_eq!(names(), vec![format!("{three}/Film"), format!("{one}x")]);
+        let sibling = format!("{one}x");
+        mgr.update_library_options("Lib", &opts_with_paths(&[one, two, three]))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(),
+            vec![sibling],
+            "a sibling is not below the location"
+        );
+        assert_eq!(config.saves.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+        let other = media_dir(&tmp, "other");
+        mgr.add_media_path("Lib", &MediaPathInfo { path: other })
+            .await
+            .unwrap();
+        assert_eq!(
+            config.saves.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "nothing dropped, nothing saved"
+        );
     }
 }

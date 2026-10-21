@@ -32,7 +32,7 @@ use ferrofin_model::configuration::LibraryOptions as LibraryOptionsModel;
 
 use crate::item_persistence_service::series_key_scope;
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::dto::{MediaSourceInfo, NameValuePair};
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType, MetadataField, VideoType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
@@ -2980,6 +2980,9 @@ struct PlanCtx<'a> {
     /// for the readers after the pass; `None` lists through the scanner's
     /// filesystem alone.
     dirs: Option<Arc<DirectoryCache>>,
+    /// The folder content-type overrides the pass resolves folders by
+    /// (`ServerConfiguration.ContentTypes`).
+    content_types: &'a [NameValuePair],
 }
 
 impl<'a> PlanCtx<'a> {
@@ -3019,7 +3022,14 @@ impl<'a> PlanCtx<'a> {
             fanout: None,
             cancel: None,
             dirs: None,
+            content_types: &[],
         }
+    }
+
+    /// This pass resolving folders by the content-type overrides `entries`.
+    fn with_content_types(mut self, entries: &'a [NameValuePair]) -> Self {
+        self.content_types = entries;
+        self
     }
 
     /// This pass dating what it resolves by `rule`.
@@ -3522,6 +3532,10 @@ pub struct LibraryScanner {
     /// The saved NFO options (`ReleaseDateFormat`, `UserId`), read per sidecar.
     nfo_configuration:
         Option<Arc<dyn Fn() -> ferrofin_providers::xbmc::config::NfoConfiguration + Send + Sync>>,
+    /// Reads the folder content-type overrides (`ServerConfiguration.ContentTypes`)
+    /// each plan pass resolves folders by
+    /// ([`with_content_types`](Self::with_content_types)); none without a reader.
+    content_types: Option<Arc<dyn Fn() -> Vec<NameValuePair> + Send + Sync>>,
     /// The bounds of each run's directory listings.
     directory_cache_limits: DirectoryCacheLimits,
     chapter_image_extractor:
@@ -3853,6 +3867,7 @@ impl LibraryScanner {
             dummy_chapter_duration: None,
             display_specials_within_seasons: None,
             nfo_configuration: None,
+            content_types: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
             swept_at_epoch: std::sync::Mutex::new(None),
         }
@@ -3887,6 +3902,18 @@ impl LibraryScanner {
         downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) {
         let _ = self.subtitle_downloader.set(downloader);
+    }
+
+    /// Reads the folder content-type overrides (`ServerConfiguration.ContentTypes`)
+    /// once per plan pass, so an override set in the metadata editor applies
+    /// from the next scan of its folder, as upstream's does.
+    #[must_use]
+    pub fn with_content_types(
+        mut self,
+        read: impl Fn() -> Vec<NameValuePair> + Send + Sync + 'static,
+    ) -> Self {
+        self.content_types = Some(Arc::new(read));
+        self
     }
 
     /// Reads the saved NFO options (`ReleaseDateFormat`, `UserId`) for every
@@ -12956,10 +12983,16 @@ impl LibraryScanner {
         dirs: Option<&Arc<DirectoryCache>>,
     ) -> PlanOutput {
         let naming = NamingOptions::new();
+        let content_types = self
+            .content_types
+            .as_ref()
+            .map(|read| read())
+            .unwrap_or_default();
         let mut ctx = PlanCtx::new(&naming, scope)
             .with_locations(plan_folders)
             .with_key_folders(key_folders)
-            .with_date_added(date_added);
+            .with_date_added(date_added)
+            .with_content_types(&content_types);
         ctx.fanout.clone_from(&self.scan_fanout);
         ctx.cancel = cancel.cloned();
         ctx.dirs = dirs.cloned();
@@ -13027,6 +13060,7 @@ impl LibraryScanner {
                         let walk = MovieWalk {
                             kind,
                             collection_type: folder.collection_type,
+                            library: folder.collection_type,
                             photos,
                             album: None,
                             folder: None,
@@ -13505,7 +13539,6 @@ impl LibraryScanner {
         movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
     ) {
         let naming = ctx.naming;
-        let kind = walk.kind;
         let extras_folder = is_extras_folder_below_top(dir, root, naming);
         let entries = self.list(dir, ctx);
         // `PlaylistResolver` (priority First) answers before every other
@@ -13521,6 +13554,28 @@ impl LibraryScanner {
             self.plan_playlist(dir, Some(name), cf, (parent, ancestors), ctx, out);
             return;
         }
+        // `ResolvePath`: a folder an untyped walk reaches resolves with the
+        // folder content-type override set for it or for a folder above it.
+        let walk = if dir != root
+            && !extras_folder
+            && !walk.under_title
+            && !ctx.content_types.is_empty()
+            && matches!(
+                walk.collection_type,
+                None | Some(CollectionTypeOptions::mixed)
+            ) {
+            match retype(walk, resolved_content_type(ctx.content_types, dir)) {
+                Retype::Same => walk,
+                Retype::Walk(typed) => typed,
+                Retype::Shows => {
+                    self.plan_shows_from_walk(dir, cf, walk.parent(cf, ctx), ctx, out);
+                    return;
+                }
+            }
+        } else {
+            walk
+        };
+        let kind = walk.kind;
         // Without a collection type a folder `SeriesResolver` takes (priority
         // Second, before `MovieResolver`) is a series, planned as a tvshows
         // library's is.
@@ -13574,6 +13629,12 @@ impl LibraryScanner {
         .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
         .flatten();
         let own_folder = movie.is_some();
+        // The movie takes its folder in whole (`FindMovie`): what an older
+        // scan resolved the folder itself as, a series before a content-type
+        // override made it a movie's, is stale.
+        if own_folder && !ctx.content_types.is_empty() && ctx.scope.keeps(dir) {
+            ctx.superseded.borrow_mut().push(dir.to_owned());
+        }
         // ResolveMultiple consumes the directory's file list when it finds
         // any regular movie, and drops sample filenames from that list. If it
         // finds none, individual-file resolution can still accept a title
@@ -13620,6 +13681,51 @@ impl LibraryScanner {
             );
             return;
         }
+        // `Folder.GetNonCachedChildren`: what a plain folder holds, and what a
+        // location holds, resolves with `GetContentType(folder)`, which a
+        // folder content-type override can change ([`children_content_type`]).
+        // The checks above resolve the folder itself, with its parent's type;
+        // this one only applies once it is known to be a plain folder.
+        let children = if (dir == root || (plain_folder && album.is_none() && !walk.under_title))
+            && !ctx.content_types.is_empty()
+        {
+            retype(
+                walk,
+                children_content_type(ctx.content_types, dir, walk.library),
+            )
+        } else {
+            Retype::Same
+        };
+        let (walk, untyped, per_file, has_movie_files, videos) = match children {
+            Retype::Same => (walk, untyped, per_file, has_movie_files, videos),
+            Retype::Walk(typed) => {
+                let untyped = matches!(
+                    typed.collection_type,
+                    None | Some(CollectionTypeOptions::mixed)
+                );
+                let per_file = untyped && holds_tv_nfo(&entries);
+                let videos = if extras_folder || per_file {
+                    Vec::new()
+                } else {
+                    folder_videos(&entries, extras_root, naming, typed)
+                };
+                let has_movie_files =
+                    !per_file && self::has_movie_files(&entries, naming, extras_root);
+                (typed, untyped, per_file, has_movie_files, videos)
+            }
+            Retype::Shows => {
+                // Each subfolder is a series or a folder of shows, as at a TV
+                // library's top level.
+                let parent = if dir == root {
+                    (cf, vec![cf])
+                } else {
+                    self.plan_folder(dir, cf, walk, ctx, out).parent(cf, ctx)
+                };
+                self.plan_shows_from_walk_in(dir, cf, &parent, ctx, out);
+                return;
+            }
+        };
+        let kind = walk.kind;
         // A directory no resolver claims is a `Folder` (`FolderResolver.cs:
         // 24-27`, the last-priority resolver for any directory) and the parent
         // of what is in it (`Folder.GetNonCachedChildren`: `ResolvePaths(
@@ -14081,18 +14187,35 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) -> MovieWalk {
-        let Some(name) = folder_name(dir) else {
-            return walk;
-        };
-        let (parent, ancestors) = walk.parent(cf, ctx);
-        let Some((id, entity)) =
-            self.base_item(ctx, BaseItemKind::Folder, cf, parent, name, dir, true)
-        else {
-            return walk;
-        };
+        match self.plan_plain_folder(dir, cf, walk.parent(cf, ctx), ctx, out) {
+            Some((id, _)) => MovieWalk {
+                album: None,
+                folder: Some(id),
+                ..walk
+            },
+            None => walk,
+        }
+    }
+
+    /// Plans `dir` as a plain `Folder` hanging off `parent` (its id) with
+    /// `ancestors`, and returns what hangs off the folder: its id and the
+    /// ancestors of what is in it. `None` when no row is planned for it.
+    fn plan_plain_folder(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        (parent, ancestors): (Uuid, Vec<Uuid>),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) -> Option<(Uuid, Vec<Uuid>)> {
+        let name = folder_name(dir)?;
+        let (id, entity) =
+            self.base_item(ctx, BaseItemKind::Folder, cf, parent, name, dir, true)?;
         ctx.folder_ancestors
             .borrow_mut()
             .insert(id, ancestors.clone());
+        let mut below = ancestors.clone();
+        below.push(id);
         ctx.emit(
             out,
             Planned {
@@ -14101,11 +14224,7 @@ impl LibraryScanner {
                 ancestors,
             },
         );
-        MovieWalk {
-            album: None,
-            folder: Some(id),
-            ..walk
-        }
+        Some((id, below))
     }
 
     /// The row for the video at `path` in `folder`, of the folder walk's
@@ -14601,7 +14720,9 @@ impl LibraryScanner {
     }
 
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
-    /// are `Season`s and the videos beneath them `Episode`s.
+    /// are `Season`s and the videos beneath them `Episode`s. A folder whose own
+    /// content-type override is `tvshows` is a folder of shows instead
+    /// ([`Self::plan_tv_folder`]).
     ///
     /// The series keys read `ctx.key_folders`, every configured library, not
     /// just the one being planned: a series' presentation key names EVERY
@@ -14610,23 +14731,57 @@ impl LibraryScanner {
     /// by two libraries lists once.
     fn plan_tv(&self, location: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
         ctx.tv_library.set(true);
-        self.plan_tv_location(ctx.key_folders, location, cf, ctx, out);
+        self.plan_shows_in(location, cf, &(cf, vec![cf]), ctx, out);
         ctx.tv_library.set(false);
     }
 
-    /// [`Self::plan_tv`]'s walk of one location.
-    fn plan_tv_location(
+    /// The folder `dir` of a movie walk, which resolves as in a tvshows
+    /// library ([`retype`]): a series, or a folder of shows, hanging off
+    /// `parent`.
+    fn plan_shows_from_walk(
         &self,
-        folders: &[VirtualFolderInfo],
-        location: &str,
+        dir: &str,
         cf: Uuid,
+        parent: (Uuid, Vec<Uuid>),
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        // Loose files directly under a tvshows root are skipped; each series
-        // folder resolves independently, up to the library fanout limit at
-        // once, its rows taken back in listing order.
-        let entries = self.list(location, ctx);
+        let tv_library = ctx.tv_library.replace(true);
+        self.plan_tv_folder(dir, cf, parent, ctx, out);
+        ctx.tv_library.set(tv_library);
+    }
+
+    /// The subfolders of `dir`, a folder of a movie walk whose children
+    /// resolve as in a tvshows library ([`retype`]), hanging off `parent`
+    /// ([`Self::plan_shows_in`]).
+    fn plan_shows_from_walk_in(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        parent: &(Uuid, Vec<Uuid>),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        let tv_library = ctx.tv_library.replace(true);
+        self.plan_shows_in(dir, cf, parent, ctx, out);
+        ctx.tv_library.set(tv_library);
+    }
+
+    /// What a folder holds where its children resolve as in a tvshows library:
+    /// each subfolder a series or a folder of shows ([`Self::plan_tv_folder`]),
+    /// hanging off `parent`, resolved independently, up to the library fanout
+    /// limit at once, its rows taken back in listing order.
+    ///
+    /// Loose files are skipped, as directly under a tvshows root.
+    fn plan_shows_in(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        parent: &(Uuid, Vec<Uuid>),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        let entries = self.list(dir, ctx);
         let dirs: Vec<_> = entries
             .iter()
             .filter(|entry| {
@@ -14635,64 +14790,79 @@ impl LibraryScanner {
             .collect();
         for rows in fanout::map(&dirs, ctx, |entry, ctx| {
             let mut rows = Vec::new();
-            self.plan_series_folder(folders, entry, cf, ctx, &mut rows);
+            self.plan_tv_folder(&entry.path, cf, parent.clone(), ctx, &mut rows);
             rows
         }) {
             out.extend(rows);
         }
     }
 
-    /// One series folder of a TV location: the `Series` and what it holds.
-    fn plan_series_folder(
+    /// A folder resolved as in a tvshows library, hanging off `parent`
+    /// (`SeriesResolver.cs:66-77`): a `Series` and what it holds, unless the
+    /// folder's own content-type override is `tvshows`, which makes it a plain
+    /// `Folder` whose subfolders are shows.
+    fn plan_tv_folder(
         &self,
-        folders: &[VirtualFolderInfo],
-        entry: &FileSystemEntryInfo,
+        dir: &str,
         cf: Uuid,
+        (parent, ancestors): (Uuid, Vec<Uuid>),
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
         // `PlaylistResolver` (priority First) answers before `SeriesResolver`.
-        let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
-        if self.plan_playlist_folder(&entry.path, holds_xml, cf, (cf, vec![cf]), ctx, out) {
+        let holds_xml = || playlists::holds_playlist_xml(&self.prelist(dir, ctx));
+        if self.plan_playlist_folder(dir, holds_xml, cf, (parent, ancestors.clone()), ctx, out) {
             return;
         }
+        if ferrofin_model::content_type_overrides::content_type_override(
+            ctx.content_types,
+            dir,
+            false,
+        ) == Some(ferrofin_model::data::CollectionType::tvshows)
         {
-            let info = series_resolver::resolve(ctx.naming, &entry.path);
-            let name = info.name.unwrap_or_else(|| entry.name.clone());
-            let series_name = name.clone();
-            let Some((series_id, mut series)) =
-                self.base_item(ctx, BaseItemKind::Series, cf, cf, name, &entry.path, true)
-            else {
-                return;
-            };
-            series.production_year = info.year.map(i64::from);
-            // The series' presentation key groups its seasons/episodes: the
-            // `/Shows/{id}/{Seasons,Episodes}` queries filter on
-            // `SeriesPresentationUniqueKey`. Planned under 12.0's rule
-            // (`Series.CreatePresentationUniqueKey`) from what is known before
-            // any provider ran — no provider ids yet, so with grouping on this
-            // is the `series-{name}` fallback; the refresh recomputes it once
-            // the ids are settled (`sync_series_key`) and re-points the
-            // children, exactly as `SeriesMetadataService` does.
-            let series_key = self.series_key_for(folders, &series, &[], &[]);
-            series.presentation_unique_key = Some(series_key.clone());
-            ctx.emit(
-                out,
-                Planned {
-                    id: series_id,
-                    entity: series,
-                    ancestors: vec![cf],
-                },
-            );
-            self.plan_series(
-                &entry.path,
-                cf,
-                series_id,
-                &series_name,
-                &series_key,
-                ctx,
-                out,
-            );
+            if let Some(shows) = self.plan_plain_folder(dir, cf, (parent, ancestors), ctx, out) {
+                self.plan_shows_in(dir, cf, &shows, ctx, out);
+            }
+            return;
+        }
+        let info = series_resolver::resolve(ctx.naming, dir);
+        let name = info
+            .name
+            .unwrap_or_else(|| folder_name(dir).unwrap_or_else(|| file_stem(dir)));
+        let series_name = name.clone();
+        let Some((series_id, mut series)) =
+            self.base_item(ctx, BaseItemKind::Series, cf, parent, name, dir, true)
+        else {
+            return;
+        };
+        series.production_year = info.year.map(i64::from);
+        // The series' presentation key groups its seasons/episodes: the
+        // `/Shows/{id}/{Seasons,Episodes}` queries filter on
+        // `SeriesPresentationUniqueKey`. Planned under 12.0's rule
+        // (`Series.CreatePresentationUniqueKey`) from what is known before
+        // any provider ran — no provider ids yet, so with grouping on this
+        // is the `series-{name}` fallback; the refresh recomputes it once
+        // the ids are settled (`sync_series_key`) and re-points the
+        // children, exactly as `SeriesMetadataService` does.
+        let series_key = self.series_key_for(ctx.key_folders, &series, &[], &[]);
+        series.presentation_unique_key = Some(series_key.clone());
+        let first = out.len();
+        ctx.emit(
+            out,
+            Planned {
+                id: series_id,
+                entity: series,
+                ancestors: ancestors.clone(),
+            },
+        );
+        self.plan_series(dir, cf, series_id, &series_name, &series_key, ctx, out);
+        // What the series holds sits below the folders above it too.
+        for item in &mut out[first..] {
+            for ancestor in &ancestors {
+                if !item.ancestors.contains(ancestor) {
+                    item.ancestors.push(*ancestor);
+                }
+            }
         }
     }
 
@@ -17271,13 +17441,17 @@ fn place_under_location(items: &mut [Planned], cf: Uuid, location_folder: Uuid, 
 }
 
 /// What the movie walk resolves in a library: the item kind of a video,
-/// and the library's collection type.
+/// and the collection type it resolves with.
 #[derive(Debug, Clone, Copy)]
 struct MovieWalk {
     /// `Movie`, `MusicVideo` or (home videos) `Video`.
     kind: BaseItemKind,
-    /// The library's collection type (`None` for an untyped library).
+    /// The collection type the walk resolves with (`None` untyped): the
+    /// library's, or a folder content-type override's ([`retype`]).
     collection_type: Option<CollectionTypeOptions>,
+    /// The library's own collection type, what a folder without an override
+    /// passes to its children ([`children_content_type`]).
+    library: Option<CollectionTypeOptions>,
     /// Whether the library resolves photos (a home-video library with
     /// `EnablePhotos`), which makes a folder holding some a `PhotoAlbum`.
     photos: bool,
@@ -17315,6 +17489,96 @@ impl MovieWalk {
             None => (cf, vec![cf]),
         }
     }
+}
+
+/// What a folder content-type override makes of the movie walk.
+#[derive(Debug, Clone, Copy)]
+enum Retype {
+    /// The walk goes on as it is.
+    Same,
+    /// The walk goes on resolving with another collection type.
+    Walk(MovieWalk),
+    /// The folder resolves as in a tvshows library
+    /// ([`LibraryScanner::plan_tv_folder`]).
+    Shows,
+}
+
+/// What resolving with `content_type` makes of `walk`
+/// (`LibraryManager.ResolvePath`'s collection type, `Folder.GetNonCachedChildren`).
+///
+/// The movie walk takes the video types it resolves itself: `movies` and
+/// `musicvideos`, and no type, where it resolves as in an untyped library.
+/// `tvshows` goes to the TV walk.
+///
+/// TODO(parity, open work item gl-764): the other types are not followed yet.
+/// `homevideos` and `photos` need the photo walk, `music` and `books` their
+/// own walks. The walk then goes on with its type, as before overrides were
+/// read. A home-video library that resolves photos keeps its walk, because
+/// its photo walk has already run over the folder. The un-defer path:
+/// retype into [`LibraryScanner::plan_photos`], `plan_music` and
+/// `plan_books` from here.
+fn retype(walk: MovieWalk, content_type: Option<ferrofin_model::data::CollectionType>) -> Retype {
+    use ferrofin_model::data::CollectionType;
+    if walk.photos
+        || content_type
+            == walk
+                .collection_type
+                .and_then(crate::kinds::collection_type_of)
+    {
+        return Retype::Same;
+    }
+    let typed = |kind, collection_type| {
+        Retype::Walk(MovieWalk {
+            kind,
+            collection_type,
+            per_file: false,
+            ..walk
+        })
+    };
+    match content_type {
+        None => typed(BaseItemKind::Movie, walk.library),
+        Some(CollectionType::movies) => {
+            typed(BaseItemKind::Movie, Some(CollectionTypeOptions::movies))
+        }
+        Some(CollectionType::musicvideos) => typed(
+            BaseItemKind::MusicVideo,
+            Some(CollectionTypeOptions::musicvideos),
+        ),
+        Some(CollectionType::tvshows) => Retype::Shows,
+        Some(_) => Retype::Same,
+    }
+}
+
+/// The collection type the children of the folder at `dir` resolve with,
+/// `LibraryManager.GetContentType(folder)` as `Folder.GetNonCachedChildren`
+/// passes it: the folder's own override, else one set for a folder above it
+/// (the first such entry in the list), else its library's type. `None` in an
+/// untyped library, where each child then takes its own override
+/// ([`resolved_content_type`]).
+///
+/// Of `GetInheritedContentType`'s fallback only the library's type is taken:
+/// a folder above `dir` with an override of its own has already matched,
+/// unless an earlier entry matching `dir` holds a value that does not parse,
+/// which upstream lets fall through to that folder.
+fn children_content_type(
+    content_types: &[NameValuePair],
+    dir: &str,
+    library: Option<CollectionTypeOptions>,
+) -> Option<ferrofin_model::data::CollectionType> {
+    use ferrofin_model::content_type_overrides::content_type_override;
+    content_type_override(content_types, dir, false)
+        .or_else(|| content_type_override(content_types, dir, true))
+        .or_else(|| library.and_then(crate::kinds::collection_type_of))
+}
+
+/// The collection type a folder of an untyped walk resolves with:
+/// `ResolvePath` gives a path without one the override set for it or for a
+/// folder above it (`LibraryManager.cs:938-941`).
+fn resolved_content_type(
+    content_types: &[NameValuePair],
+    dir: &str,
+) -> Option<ferrofin_model::data::CollectionType> {
+    ferrofin_model::content_type_overrides::content_type_override(content_types, dir, true)
 }
 
 /// How `MovieResolver.ResolveMultipleInternal` resolves a folder's files in

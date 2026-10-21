@@ -290,6 +290,50 @@ pub trait LibraryManager: Send + Sync {
         Ok(Some(item))
     }
 
+    /// `BaseItem.ContainingFolderPath`: the folder a folder content-type
+    /// override for `item` is keyed on. That is the item's own path for a
+    /// folder, a disc rip that is no placeholder and a by-name item, a
+    /// playlist file's directory, and the directory of its file (of the first
+    /// part, for a stack) otherwise. `None` for an item without a path.
+    ///
+    /// The default knows only folders and files.
+    async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
+        let path = item.path.as_deref()?;
+        if item.is_folder {
+            return Some(path.to_owned());
+        }
+        std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .map(str::to_owned)
+    }
+
+    /// `LibraryManager.GetInheritedContentType(item)`: the collection type of
+    /// the library `item`'s top folder belongs to, else the configured type
+    /// ([`Self::get_configured_content_type`]) of the parent farthest from
+    /// `item` that has one.
+    ///
+    /// The default finds none, for a seam without libraries.
+    async fn get_inherited_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(None)
+    }
+
+    /// `LibraryManager.GetConfiguredContentType(item)`: a library's own
+    /// collection type for its `CollectionFolder`, else the folder
+    /// content-type override (`ServerConfiguration.ContentTypes`) naming
+    /// `item`'s [`containing folder`](Self::containing_folder_path) exactly.
+    ///
+    /// The default finds none, for a seam without a configuration.
+    async fn get_configured_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(None)
+    }
+
     /// The [`InternalPeopleQuery::access_filter`] for `user`: `None` when
     /// nothing is hidden from them (`PersonsController.BuildAccessFilter`).
     /// Managers must supply policy evaluation; the default fails closed.
