@@ -1272,6 +1272,14 @@ impl PlaylistManager for FerrofinPlaylistManager {
             }
             return Err(err);
         }
+        // `await playlist.RefreshMetadata(new MetadataRefreshOptions(..) {
+        // ForceSave = true })`: the first refresh runs before the create
+        // returns, and a failure fails it, as upstream's exception does.
+        if let Some(providers) = self.providers.as_deref() {
+            providers
+                .refresh_single_item(id, &force_save_refresh())
+                .await?;
+        }
         if !entries.is_empty() {
             self.update_rating_to_items(id).await?;
             // `AddToPlaylistInternal`'s refresh, reached from `CreatePlaylist`.
@@ -4588,20 +4596,39 @@ mod tests {
         );
     }
 
-    /// A [`ProviderManager`] recording `queue_refresh` calls; nothing else on
-    /// these paths reaches it.
+    /// The refreshes a [`QueuedRefreshes`] saw, as `(item, options)`.
+    type RefreshLog =
+        std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshOptions)>>;
+
+    /// A [`ProviderManager`] recording `queue_refresh` and
+    /// `refresh_single_item` calls; nothing else on these paths reaches it.
     #[derive(Default)]
-    struct QueuedRefreshes(
-        std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshOptions)>>,
-    );
+    struct QueuedRefreshes {
+        queued: RefreshLog,
+        awaited: RefreshLog,
+    }
+
+    /// A log's `(item, mode, force_save)` triples, emptied.
+    fn drain(
+        log: &RefreshLog,
+    ) -> Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshMode, bool)> {
+        std::mem::take(&mut *log.lock().unwrap())
+            .into_iter()
+            .map(|(id, options)| (id, options.metadata_refresh_mode, options.force_save))
+            .collect()
+    }
 
     impl QueuedRefreshes {
-        /// The queued `(item, mode, force_save)` triples, emptied.
+        /// The queued refreshes, emptied.
         fn take(&self) -> Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshMode, bool)> {
-            std::mem::take(&mut *self.0.lock().unwrap())
-                .into_iter()
-                .map(|(id, options)| (id, options.metadata_refresh_mode, options.force_save))
-                .collect()
+            drain(&self.queued)
+        }
+
+        /// The awaited (`refresh_single_item`) refreshes, emptied.
+        fn take_awaited(
+            &self,
+        ) -> Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshMode, bool)> {
+            drain(&self.awaited)
         }
     }
 
@@ -4614,7 +4641,7 @@ mod tests {
             priority: ferrofin_traits::providers::RefreshPriority,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
             assert_eq!(priority, ferrofin_traits::providers::RefreshPriority::High);
-            self.0.lock().unwrap().push((item_id, options.clone()));
+            self.queued.lock().unwrap().push((item_id, options.clone()));
             Ok(())
         }
         async fn refresh_full_item(
@@ -4626,11 +4653,15 @@ mod tests {
         }
         async fn refresh_single_item(
             &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+            item_id: Uuid,
+            options: &ferrofin_traits::providers::MetadataRefreshOptions,
         ) -> Result<ferrofin_traits::providers::ItemUpdateType, ferrofin_traits::error::ServiceError>
         {
-            unreachable!("not on these paths")
+            self.awaited
+                .lock()
+                .unwrap()
+                .push((item_id, options.clone()));
+            Ok(ferrofin_traits::providers::ItemUpdateType::default())
         }
         async fn save_image_from_url(
             &self,
@@ -4820,5 +4851,46 @@ mod tests {
             .await
             .expect("remove");
         assert_eq!(queued.take(), vec![(mix, Default, true)]);
+    }
+
+    /// `PlaylistManager.CreatePlaylist` awaits the new playlist's first
+    /// `ForceSave` refresh (`await playlist.RefreshMetadata(...)`) before it
+    /// adds entries or returns, empty or not; a create with items then queues
+    /// `AddToPlaylistInternal`'s refresh as well.
+    #[tokio::test]
+    async fn creating_a_playlist_awaits_its_first_refresh() {
+        use ferrofin_traits::providers::MetadataRefreshMode::Default;
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let refreshes = Arc::new(QueuedRefreshes::default());
+        let (mgr, _root) = playlist_manager(&db);
+        let mgr = mgr.with_providers(Arc::clone(&refreshes) as Arc<_>);
+        let owner = Uuid::new_v4();
+
+        let empty = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Empty".to_owned()),
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create empty");
+        let empty = Uuid::parse_str(&empty.id).expect("uuid");
+        assert_eq!(refreshes.take_awaited(), vec![(empty, Default, true)]);
+        assert_eq!(refreshes.take(), Vec::new());
+
+        let mix = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![track],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create with items");
+        let mix = Uuid::parse_str(&mix.id).expect("uuid");
+        assert_eq!(refreshes.take_awaited(), vec![(mix, Default, true)]);
+        assert_eq!(refreshes.take(), vec![(mix, Default, true)]);
     }
 }

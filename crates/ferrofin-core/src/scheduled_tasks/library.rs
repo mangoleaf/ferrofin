@@ -223,17 +223,39 @@ pub struct TokioFfmpegRunner;
 #[async_trait]
 impl FfmpegRunner for TokioFfmpegRunner {
     async fn run_stderr(&self, program: &str, args: &[String]) -> Result<String, ServiceError> {
-        let output = tokio::process::Command::new(program)
+        let child = tokio::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             // Task cancel = future drop; the child must not outlive it.
             .kill_on_drop(true)
-            .output()
-            .await
+            .spawn()
             .map_err(|e| ServiceError::backend(format!("failed to start {program}: {e}")))?;
+        lower_normalization_priority(&child, program);
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| ServiceError::backend(format!("failed to run {program}: {e}")))?;
         Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// `AudioNormalizationTask` runs its ffmpeg at `BelowNormal`. Upstream warns
+/// on every failure; here the first failure warns and the rest go to debug,
+/// so the log volume does not grow with the library (LOGGING.md).
+fn lower_normalization_priority(child: &tokio::process::Child, program: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Err(error) = ferrofin_util::process_priority::set_process_priority(
+        child,
+        ferrofin_util::process_priority::ProcessPriority::BelowNormal,
+    ) else {
+        return;
+    };
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(path = program, %error, "error setting ffmpeg process priority");
+    } else {
+        tracing::warn!(path = program, %error, "error setting ffmpeg process priority");
     }
 }
 
@@ -1429,6 +1451,40 @@ mod tests {
     use super::*;
     use crate::db_error::media_stream_type_disc;
     use crate::test_support::{library_manager_over, seed_item, seed_named_item, test_db};
+
+    /// Audio normalization's ffmpeg runs below normal priority, as upstream's
+    /// `AudioNormalizationTask` sets it — unless this host refuses it (raising
+    /// a priority past `RLIMIT_NICE`), when it keeps the one it started with.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_normalization_ffmpeg_runs_below_normal_priority() {
+        use super::FfmpegRunner as _;
+        let own: i32 = String::from_utf8_lossy(
+            &std::process::Command::new("nice")
+                .output()
+                .expect("run nice")
+                .stdout,
+        )
+        .trim()
+        .parse()
+        .expect("a number");
+        let probe = tokio::process::Command::new("sleep")
+            .arg("5")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let below_normal = ferrofin_util::process_priority::ProcessPriority::BelowNormal;
+        let expected =
+            match ferrofin_util::process_priority::set_process_priority(&probe, below_normal) {
+                Ok(()) => below_normal.nice(),
+                Err(_) => own,
+            };
+        let stderr = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), "sleep 0.3; nice >&2".to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(stderr.trim().parse::<i32>().expect("a number"), expected);
+    }
 
     // -- pure helpers -------------------------------------------------------
 

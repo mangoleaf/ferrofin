@@ -97,6 +97,18 @@ adoption_check_tables() {
     "${3:+; all in $3}"
 }
 
+# adoption_check_scale <jellyfin.db> <baseline.json>: one reason per line for each table that lost rows
+# of a cloned item since the baseline (scale.py counts). A checker that cannot run is a reason too.
+adoption_check_scale() {
+  local out rc=0
+  out=$(python3 "$(dirname "${BASH_SOURCE[0]}")/scale.py" check "$1" "$2" 2>&1) || rc=$?
+  case $rc in
+    0) ;;
+    1) printf '%s\n' "$out" | sed 's/^/scale: /';;
+    *) echo "scale: the checker failed: $(printf '%s' "$out" | head -n 1)";;
+  esac
+}
+
 # adoption_second_boot_repairs <log-since-restart>: the first repair line a second boot logged,
 # or nothing. Ignore a repair only when all its numeric counters are zero;
 # alternate-version repairs can promote items even when "repaired" is zero.

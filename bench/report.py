@@ -667,7 +667,8 @@ CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
               "testdata_counts", "user_isolation", "actors", "background_policy", "scan_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
               "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
-              "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s")
+              "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s",
+              "coldstart_attempt_timeout_ms")
 
 
 def image_id(d):

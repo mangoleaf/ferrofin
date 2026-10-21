@@ -167,9 +167,11 @@ impl XmlTvCache {
         self.failures.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Downloads `path` within [`DOWNLOAD_TIMEOUT`].
+    /// Downloads `path` within [`DOWNLOAD_TIMEOUT`], decompressing a gzipped
+    /// guide ([`SourceFetcher::fetch_listings`]), so the cache holds the
+    /// document `UnzipIfNeededAndCopy` would have written.
     async fn download(&self, path: &str) -> Result<String, ServiceError> {
-        tokio::time::timeout(DOWNLOAD_TIMEOUT, self.fetcher.fetch(path))
+        tokio::time::timeout(DOWNLOAD_TIMEOUT, self.fetcher.fetch_listings(path))
             .await
             .map_err(|_| {
                 ServiceError::Backend(format!("Timed out downloading the XMLTV file from {path}"))
@@ -264,5 +266,34 @@ mod tests {
             Err(ServiceError::Backend(message)) if message.starts_with("Skipping")
         ));
         assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// `GetXml` → `UnzipIfNeededAndCopy`: a gzipped guide is decompressed on
+    /// download, so readers get the XML and the cached copy is the XML too,
+    /// never the compressed bytes.
+    #[tokio::test]
+    async fn a_gzipped_guide_is_cached_decompressed() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guide = dir.path().join("guide.xml.gz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"<tv></tv>").expect("compress");
+        std::fs::write(&guide, gz.finish().expect("finish")).expect("write guide");
+        let cache = XmlTvCache::new(
+            Arc::new(crate::fetch::ReqwestFetcher::new()) as Arc<dyn SourceFetcher>,
+            dir.path().join("cache"),
+        );
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let info = ListingsProviderInfo {
+            id: Some(id.clone()),
+            path: Some(guide.to_str().expect("utf-8 path").to_owned()),
+            ..ListingsProviderInfo::default()
+        };
+
+        assert_eq!(cache.get_xml(&info).await.expect("guide"), "<tv></tv>");
+        assert_eq!(
+            std::fs::read(cache.cache_file_for_test(&id)).expect("cached copy"),
+            b"<tv></tv>"
+        );
     }
 }

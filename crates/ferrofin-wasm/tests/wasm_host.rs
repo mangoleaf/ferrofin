@@ -1164,6 +1164,195 @@ async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_
     assert!(count.contains('2'), "{count}");
 }
 
+/// The analysis collaborators over `library`, every other seam stubbed.
+fn analysis_collaborators(
+    library: Arc<dyn ferrofin_traits::library::LibraryManager>,
+) -> ferrofin_wasm::capabilities::Collaborators {
+    ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library,
+        media_segments: Arc::new(common::RecordingSegments::default()),
+        plugins: Arc::new(common::EnabledStub(b"{}".to_vec())),
+        lyrics: Arc::new(common::StubLyrics::default()),
+        subtitles: Arc::new(common::StubSubtitles::default()),
+        collections: Arc::new(common::StubCollections::default()),
+        media_streams: Arc::new(common::StubStreams),
+        extractor: Arc::new(common::StubExtractor::default()),
+        analysis: Arc::new(tokio::sync::Semaphore::new(1)),
+        users: Arc::new(common::StubUsers),
+        user_data: Arc::new(common::StubUserData),
+        tv: Arc::new(common::StubTv),
+    }
+}
+
+/// `wat` with its `count` task reporting the offer count in three digits.
+fn count_in_three_digits(wat: &str) -> String {
+    let one_digit = concat!(
+        "(i32.store8 (i32.const 300)\n",
+        "            (i32.add (i32.const 48) (global.get $events)))\n",
+        "          (i32.store (i32.const 768) (i32.const 1))\n",
+        "          (i32.store (i32.const 772) (i32.const 300))\n",
+        "          (i32.store (i32.const 776) (i32.const 1))",
+    );
+    assert!(wat.contains(one_digit), "the fixture's count task changed");
+    wat.replace(
+        one_digit,
+        "(i32.store8 (i32.const 300) (i32.add (i32.const 48) (i32.div_u (global.get $events) (i32.const 100)))) \
+         (i32.store8 (i32.const 301) (i32.add (i32.const 48) (i32.rem_u (i32.div_u (global.get $events) (i32.const 10)) (i32.const 10)))) \
+         (i32.store8 (i32.const 302) (i32.add (i32.const 48) (i32.rem_u (global.get $events) (i32.const 10)))) \
+         (i32.store (i32.const 768) (i32.const 1)) \
+         (i32.store (i32.const 772) (i32.const 300)) \
+         (i32.store (i32.const 776) (i32.const 3))",
+    )
+}
+
+/// A breaker trip mid-pass must not burn the items the pass never reached:
+/// they are offered after the restart (gl-70). Items are saved newest first,
+/// so only a pass ordered by DateCreated offers the three oldest before the
+/// breaker trips, and the dated cases offer those three only once.
+/// - 250 items span three pages.
+/// - An undated item the pass never reached keeps the first pass unfiltered,
+///   so it still gets its one offer, and the three that trapped are offered
+///   again.
+#[rstest::rstest]
+#[case::dated(vec![Some(50), Some(40), Some(30), Some(20), Some(10)], Some(&b"30"[..]), 2, b"50")]
+#[case::over_three_pages((1..=250).rev().map(Some).collect(), Some(&b"3"[..]), 247, b"250")]
+#[case::undated_not_reached(vec![Some(10), None, None, None, None], None, 5, b"10")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart(
+    #[case] dates: Vec<Option<i64>>,
+    #[case] watermark_after_the_trip: Option<&[u8]>,
+    #[case] offered_after_the_restart: u32,
+    #[case] final_watermark: &[u8],
+) {
+    use ferrofin_traits::library::LibraryManager;
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    let scan_media = "(func (export \"scan-media\") (param i32) (result i32)";
+    // Every offer traps, so the third one trips the breaker.
+    write_fixture(
+        dir.path(),
+        "analyzer",
+        &FIXTURE_WAT.replace(scan_media, &format!("{scan_media} unreachable")),
+    );
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let persistence = Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+        db.clone(),
+    ));
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+    let library: Arc<dyn LibraryManager> = Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        persistence.clone(),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db)),
+    ));
+    let movies: Vec<_> = dates
+        .iter()
+        .enumerate()
+        .map(
+            |(index, date)| ferrofin_db::entities::base_items::BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
+                type_: ferrofin_core::item_type_lookup::stored_type_name(
+                    ferrofin_model::data::BaseItemKind::Movie,
+                )
+                .unwrap()
+                .to_owned(),
+                path: Some(
+                    dir.path()
+                        .join(format!("{index}.mkv"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                date_created: date.and_then(chrono::DateTime::from_timestamp_micros),
+                ..Default::default()
+            },
+        )
+        .collect();
+    persistence.save_items(&movies).await.unwrap();
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin_id = host.plugins()[0].descriptor.id;
+    host.set_runtime_collaborators(analysis_collaborators(library.clone()));
+    let progress = ferrofin_core::TaskProgress::default();
+    let task = host.analysis_task(&plugins).unwrap();
+    task.execute(&progress)
+        .await
+        .expect("a dead plugin never fails the task");
+    let state = dir.path().join(format!("{plugin_id}.state.json"));
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").as_deref(),
+        watermark_after_the_trip,
+        "the watermark stops below the first item the dead plugin never saw"
+    );
+    // Another pass before the restart leaves the watermark where it is.
+    task.execute(&progress).await.unwrap();
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").as_deref(),
+        watermark_after_the_trip
+    );
+    drop(task);
+    drop(host);
+
+    // The restart: the same plugin, now healthy and counting its offers.
+    // Each offer copies the item, temp-dir path included, into the fixture's
+    // one-page memory, whose bump allocator never frees. So every offer
+    // starts again at the allocator's first address. Otherwise a few hundred
+    // offers fill the page (fewer under a long TMPDIR), and the trap
+    // restarts the guest and its count.
+    assert!(
+        FIXTURE_WAT.contains("(global $bump (mut i32) (i32.const 4096))"),
+        "the fixture's allocator start moved"
+    );
+    write_fixture(
+        dir.path(),
+        "analyzer",
+        &count_in_three_digits(&FIXTURE_WAT.replace(
+            scan_media,
+            &format!(
+                "{scan_media} (global.set $bump (i32.const 4096)) \
+                 (global.set $events (i32.add (global.get $events) (i32.const 1)))"
+            ),
+        )),
+    );
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    host.set_runtime_collaborators(analysis_collaborators(library));
+    host.analysis_task(&plugins)
+        .unwrap()
+        .execute(&progress)
+        .await
+        .unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        count.parse::<u32>().unwrap(),
+        offered_after_the_restart,
+        "offers after the restart"
+    );
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").unwrap(),
+        final_watermark
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn persisted_task_producer_registration_is_restored_only_for_a_loaded_guest() {
     use ferrofin_traits::media_segments::MediaSegmentProvider;
