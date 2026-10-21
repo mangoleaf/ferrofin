@@ -122,7 +122,7 @@ pub(crate) struct ImageQuery {
     fill_width: Option<i32>,
     #[serde(default)]
     fill_height: Option<i32>,
-    /// JPEG/WebP quality (1–100); the encoder default is used when omitted.
+    /// JPEG/WebP quality (1–100); 100 when omitted, as `GetImageInternal`.
     #[serde(default)]
     quality: Option<i32>,
     /// Gaussian blur radius.
@@ -137,11 +137,12 @@ pub(crate) struct ImageQuery {
 
 impl ImageQuery {
     /// A query naming only a cache `tag` and an output `format`, as the
-    /// splashscreen route accepts.
+    /// splashscreen route accepts. Its quality is `GetSplashscreen`'s fixed 90.
     pub(crate) fn tagged(tag: Option<String>, format: Option<String>) -> Self {
         Self {
             format,
             tag,
+            quality: Some(90),
             ..Self::default()
         }
     }
@@ -440,7 +441,7 @@ pub(crate) async fn serve_image_file(
             fill_width: query.fill_width,
             fill_height: query.fill_height,
             blur: query.blur,
-            quality: query.quality.unwrap_or(90),
+            quality: query.quality.unwrap_or(100),
             // C# `GetOutputFormats(format)`: an explicit `format` wins outright,
             // otherwise the list is derived from what the *client* advertised.
             supported_output_formats: bind_query_image_format(query.format.as_deref())?
