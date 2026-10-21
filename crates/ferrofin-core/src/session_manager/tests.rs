@@ -1143,18 +1143,19 @@ async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
             subtitle_stream_index: subtitle,
             ..PlaybackProgressInfo::default()
         };
+    // The remembered tracks as playback reads them back
+    // (`GetUserData(user, item)`'s `AudioStreamIndex`/`SubtitleStreamIndex`).
     let remembered = || {
         let db = db.clone();
         async move {
-            sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
-                r#"SELECT "AudioStreamIndex", "SubtitleStreamIndex" FROM "UserData"
-                   WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
-            )
-            .bind(guid_to_db(item_id))
-            .bind(guid_to_db(user_id))
-            .fetch_one(db.pool())
-            .await
-            .expect("user data row")
+            use ferrofin_traits::library::UserDataManager as _;
+            let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+                config: default_server_configuration(),
+            });
+            FerrofinUserDataManager::new(db, config)
+                .get_stream_default_data(item_id, user_id)
+                .await
+                .expect("remembered tracks")
         }
     };
     let set_remember = |audio: bool, subtitles: bool| {
