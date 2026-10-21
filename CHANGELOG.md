@@ -175,6 +175,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - The startup wizard's "Allow remote connections" choice applies at once, as in Jellyfin:
   `POST /Startup/RemoteAccess` now saves the network configuration the way the dashboard
   does, so the live remote-access policy takes it without a restart
+- Serve HTTPS from the dashboard's Networking settings, as Jellyfin does: with **Enable
+  HTTPS** and a PKCS#12 certificate that loads, the server also listens on
+  `FERROFIN_HTTPS_PORT` (8920) and publishes `https://` addresses; **Require HTTPS**
+  redirects plain HTTP there with a `307`; a new certificate path flags a restart, and a
+  missing one is answered `404`. `X-Forwarded-Proto` now counts only from known proxies,
+  also for addresses published from each request; see [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
