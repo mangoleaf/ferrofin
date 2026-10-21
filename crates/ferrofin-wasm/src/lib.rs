@@ -326,6 +326,10 @@ pub struct WasmPluginHost {
     /// The resolved host settings — kept for host-side work done outside a
     /// guest store (the artwork download cap/timeout).
     settings: WasmSettings,
+    /// The shared guest HTTP clients, for host-side downloads made on a
+    /// plugin's behalf (artwork) as well as every `HostState`. `None` only
+    /// for [`WasmPluginHost::empty`], which has no plugin to download for.
+    http: Option<Arc<capabilities::GuestHttp>>,
 }
 
 impl WasmPluginHost {
@@ -444,6 +448,7 @@ impl WasmPluginHost {
             plugins,
             collaborators,
             settings: settings.clone(),
+            http: Some(http),
         })
     }
 
@@ -454,6 +459,7 @@ impl WasmPluginHost {
             plugins: Vec::new(),
             collaborators: Arc::new(std::sync::OnceLock::new()),
             settings: WasmSettings::default(),
+            http: None,
         }
     }
 
@@ -470,11 +476,16 @@ impl WasmPluginHost {
     pub fn metadata_providers(
         &self,
     ) -> Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>> {
+        // Only the empty host has no clients, and it has no plugins either.
+        let Some(http) = &self.http else {
+            return Vec::new();
+        };
         self.plugins
             .iter()
             .map(|plugin| {
                 Arc::new(WasmMetadataProvider {
                     plugin: Arc::clone(plugin),
+                    http: Arc::clone(http),
                     collaborators: Arc::clone(&self.collaborators),
                     gate_cache: std::sync::Mutex::new(None),
                     image_download_cap: self.settings.image_download_mb as usize * 1024 * 1024,
@@ -703,7 +714,7 @@ fn load_one(
     linker: &Arc<Linker<HostState>>,
     path: &Path,
     settings: &WasmSettings,
-    http: &Arc<reqwest::blocking::Client>,
+    http: &Arc<capabilities::GuestHttp>,
     collaborators: &Arc<std::sync::OnceLock<capabilities::Collaborators>>,
 ) -> Result<LoadedPlugin, wasmtime::Error> {
     let component = Component::from_file(engine, path)?;
@@ -883,24 +894,18 @@ fn build_runtime_parts(
     Ok((engine, linker))
 }
 
-/// The guest HTTP client: call-timeout bound, redirects off. MUST be built
-/// on a blocking thread — `reqwest::blocking::Client` construction (and
+/// The shared guest HTTP clients ([`capabilities::GuestHttp`]): call-timeout
+/// bound, redirects off, private destinations vetted at connect time. MUST be
+/// built on a blocking thread — `reqwest::blocking::Client` construction (and
 /// drop) panics inside an async runtime context.
 fn build_guest_http_client(
     settings: &WasmSettings,
-) -> Result<Arc<reqwest::blocking::Client>, ServiceError> {
-    Ok(Arc::new(
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(u64::from(
-                settings.call_timeout_secs,
-            )))
-            // No transparent redirects: any destination policy would be
-            // bypassed by a 302 — a guest can follow Location itself.
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
-    ))
+) -> Result<Arc<capabilities::GuestHttp>, ServiceError> {
+    capabilities::GuestHttp::new(std::time::Duration::from_secs(u64::from(
+        settings.call_timeout_secs,
+    )))
+    .map(Arc::new)
+    .map_err(|e| ServiceError::backend(format!("wasm http client init: {e}")))
 }
 
 /// Projects a plugin's authored settings pages into the shared registry
@@ -1048,7 +1053,7 @@ pub struct WasmArtifactValidator {
     /// Built lazily on the first validation's blocking thread —
     /// `reqwest::blocking::Client` construction panics in async contexts,
     /// and `new()` is called from the (async) composition root.
-    http: Arc<std::sync::OnceLock<Arc<reqwest::blocking::Client>>>,
+    http: Arc<std::sync::OnceLock<Arc<capabilities::GuestHttp>>>,
     settings: WasmSettings,
 }
 
@@ -1169,6 +1174,8 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
 /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
 struct WasmMetadataProvider {
     plugin: Arc<LoadedPlugin>,
+    /// The shared guest HTTP clients the artwork downloads go through.
+    http: Arc<capabilities::GuestHttp>,
     collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
     /// Short-lived (enabled, config) snapshot so a 100k-item scan does one
     /// flag/config read per interval instead of two per item. The TTL only
@@ -1331,10 +1338,12 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 continue;
             };
             let plugin = Arc::clone(&self.plugin);
+            let http = Arc::clone(&self.http);
             let url = candidate.url.clone();
             let (cap, timeout) = (self.image_download_cap, self.image_download_timeout);
             let downloaded = tokio::task::spawn_blocking(move || {
                 capabilities::download_image(
+                    &http,
                     &plugin.descriptor.name,
                     plugin.private_http_allowed,
                     &plugin.egress,
