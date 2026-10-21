@@ -1493,28 +1493,16 @@ impl FerrofinLiveTvManager {
         let data = serde_json::to_string(&info)
             .map_err(|e| LiveTvError::serialize("serialize listing provider", e))?;
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        if let Some(stored) = stored.as_deref().filter(|stored| *stored != id) {
-            sqlx::query(r#"UPDATE "FerrofinLiveTvListingProviders" SET "Id" = ?1 WHERE "Id" = ?2"#)
-                .bind(&id)
-                .bind(stored)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        }
-        sqlx::query(
-            r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
-               ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
+        crate::guide_repository::store_listing_provider(
+            &self.db,
+            stored.as_deref(),
+            &id,
+            info.type_.as_deref().unwrap_or("xmltv"),
+            // A Schedules Direct provider has no path.
+            info.path.as_deref().unwrap_or_default(),
+            &data,
         )
-        .bind(&id)
-        .bind(info.type_.as_deref().unwrap_or("xmltv"))
-        // A Schedules Direct provider has no path.
-        .bind(info.path.as_deref().unwrap_or_default())
-        .bind(&data)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        .await?;
 
         // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
         // keep serving the old document.

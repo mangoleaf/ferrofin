@@ -57,7 +57,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/user_entity_ext.rs", 11),
     ("crates/ferrofin-core/src/user_manager.rs", 21),
     ("crates/ferrofin-core/src/virtual_folder_manager.rs", 4),
-    ("crates/ferrofin-livetv/src/manager.rs", 9),
+    ("crates/ferrofin-livetv/src/manager.rs", 8),
 ];
 
 /// Collects every `.rs` file under `dir`, recursively.
