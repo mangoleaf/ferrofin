@@ -450,6 +450,38 @@ pub fn video_format(data: Option<&str>) -> VideoFormat {
     }
 }
 
+/// A video's `IHasAspectRatio.AspectRatio` and `ISupportsPlaceHolders.
+/// IsPlaceHolder`, which `BaseItemMapper` keeps in `Data`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoDisplay {
+    /// `Video.AspectRatio`, as stored.
+    pub aspect_ratio: Option<String>,
+    /// `Video.IsPlaceHolder`: an offline disc stub (`.disc`).
+    pub is_place_holder: bool,
+}
+
+/// The [`VideoDisplay`] `data` stores. The text is read first: a blob naming
+/// neither field — nearly every video's — is not parsed.
+#[must_use]
+pub fn video_display(data: Option<&str>) -> VideoDisplay {
+    let Some(text) =
+        data.filter(|t| t.contains("\"AspectRatio\"") || t.contains("\"IsPlaceHolder\""))
+    else {
+        return VideoDisplay::default();
+    };
+    let data = parse_data(Some(text));
+    VideoDisplay {
+        aspect_ratio: data
+            .get("AspectRatio")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        is_place_holder: data
+            .get("IsPlaceHolder")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
 /// Whether a video's `Data` makes its path a disc rip's folder: a DVD or
 /// Blu-ray `VideoType` on a video that is no placeholder (`.disc` stub) —
 /// the case `Video.ContainingFolderPath` (`Video.cs:201-219`) and

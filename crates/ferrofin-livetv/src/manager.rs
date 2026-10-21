@@ -1007,6 +1007,86 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
+    /// Port of `DefaultLiveTvService.RefreshTimers` (v12.2
+    /// `DefaultLiveTvService.cs:88-117`), run at the end of every guide
+    /// refresh, over every timer but the `Completed` ones (`GetTimersAsync`):
+    ///
+    /// - one that has ended and is not recording is deleted;
+    /// - one that names no programme or no channel is left as it is;
+    /// - one whose programme has left the guide is deleted;
+    /// - the rest take the refreshed programme's facts
+    ///   (`CopyProgramInfoToTimerInfo`), are saved and re-armed
+    ///   (`TimerManager.Update`).
+    async fn refresh_timers(&self) -> Result<(), ServiceError> {
+        for timer in self.all_timers().await? {
+            if timer.status == RecordingStatus::Completed {
+                continue;
+            }
+            let Some(id) = timer.base.id.filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            // One timer's failure does not leave the rest stale, as in
+            // `refresh_series_timers`.
+            if let Err(e) = self.refresh_timer(&id).await {
+                tracing::warn!(
+                    timer_id = %id,
+                    error = %e,
+                    "live tv: could not refresh a recording timer"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One timer's turn of [`refresh_timers`](Self::refresh_timers), decided
+    /// on the row as it is now: the timer may have fired, or its capture
+    /// settled, since the list was taken, and a timer that has become
+    /// `Completed` is not touched.
+    ///
+    /// Upstream's service-level `TimerInfo.ProgramId` is the listings
+    /// provider's id (`GetProgramInfoFromCache` maps it to the item); the wire
+    /// DTO carries it as `external_program_id` beside the item's own
+    /// `program_id`, so a timer names no programme only when both are blank.
+    async fn refresh_timer(&self, id: &str) -> Result<(), ServiceError> {
+        let Some(mut timer) = self.get_timer(id).await? else {
+            return Ok(());
+        };
+        if timer.status == RecordingStatus::Completed {
+            return Ok(());
+        }
+        if Utc::now() > timer.base.end_date && !self.active_recordings_lock().contains_key(id) {
+            tracing::info!(
+                timer_id = id,
+                reason = "ended",
+                "live tv: recording timer removed"
+            );
+            self.disarm_timer(id);
+            return self.delete_by_id(DELETE_TIMER_SQL, id).await;
+        }
+        let names_program = [&timer.base.program_id, &timer.base.external_program_id]
+            .into_iter()
+            .any(|program| program.as_deref().is_some_and(|p| !p.trim().is_empty()));
+        if !names_program || timer.base.channel_id.is_nil() {
+            return Ok(());
+        }
+        let Some(program) = self.program_row_for_timer(&timer.base).await? else {
+            tracing::info!(
+                timer_id = id,
+                reason = "programme left the guide",
+                "live tv: recording timer removed"
+            );
+            self.disarm_timer(id);
+            return self.delete_by_id(DELETE_TIMER_SQL, id).await;
+        };
+        let before = timer.clone();
+        copy_program_into_timer(&program, &mut timer);
+        if timer != before {
+            self.persist_timer(&timer).await?;
+            self.arm_timer(&timer);
+        }
+        Ok(())
+    }
+
     /// The wired DTO service, or the honest error when the composition root
     /// (or a test) never attached one.
     fn dto_service(&self) -> Result<&Arc<dyn DtoService>, ServiceError> {
@@ -2253,9 +2333,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // upstream's `newProgramIdList` across all services — the set its
         // `CleanDatabase(newProgramIdList, [LiveTvProgram])` is taken over.
         self.sync_program_items().await?;
-        // `RefreshGuide`'s tail: `coreService.RefreshSeriesTimers(ct)` (v10.11.8
-        // src/Jellyfin.LiveTv/Guide/GuideManager.cs:150-156).
+        // `RefreshGuide`'s tail: `RefreshSeriesTimers` then `RefreshTimers`
+        // (v12.2 src/Jellyfin.LiveTv/Guide/GuideManager.cs:163-164).
         self.refresh_series_timers().await?;
+        self.refresh_timers().await?;
         Ok(())
     }
 
@@ -8119,6 +8200,176 @@ mod tests {
             statuses(mgr.get_timers().await.expect("timers")),
             [RecordingStatus::New; 3],
             "clearing it again brings the swept showings back"
+        );
+    }
+
+    /// A future airing of the series guide, and a timer factory on its channel.
+    async fn refresh_test_airing(mgr: &FerrofinLiveTvManager) -> GuideProgramRow {
+        airings_of(mgr, "Recurring")
+            .await
+            .into_iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing")
+    }
+
+    /// A one-hour stored timer on the airing's channel, with its id.
+    fn refresh_test_timer(
+        airing: &GuideProgramRow,
+        name: &str,
+        status: RecordingStatus,
+        program: Option<String>,
+        start: chrono::DateTime<Utc>,
+    ) -> (String, ferrofin_model::live_tv::TimerInfoDto) {
+        use ferrofin_model::live_tv::{BaseTimerInfoDto, TimerInfoDto};
+        let id = Uuid::new_v4().simple().to_string();
+        let dto = TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some(id.clone()),
+                channel_id: Uuid::parse_str(&airing.channel_id).expect("channel"),
+                program_id: program,
+                name: Some(name.to_owned()),
+                start_date: start,
+                end_date: start + chrono::Duration::hours(1),
+                ..BaseTimerInfoDto::default()
+            },
+            status,
+            ..TimerInfoDto::default()
+        };
+        (id, dto)
+    }
+
+    /// Every stored timer by id.
+    async fn timers_by_id(
+        mgr: &FerrofinLiveTvManager,
+    ) -> HashMap<String, ferrofin_model::live_tv::TimerInfoDto> {
+        mgr.all_timers()
+            .await
+            .expect("timers")
+            .into_iter()
+            .filter_map(|t| t.base.id.clone().map(|id| (id, t)))
+            .collect()
+    }
+
+    /// `RefreshGuide` ends with `RefreshTimers` (v12.2 `GuideManager.cs:164`,
+    /// `DefaultLiveTvService.cs:88-117`): over every timer but the `Completed`
+    /// ones, one that has ended (and is not recording) is deleted, one whose
+    /// programme has left the guide is deleted, one with no programme is left
+    /// alone, and the rest take the refreshed programme's facts.
+    #[tokio::test]
+    async fn a_guide_refresh_tidies_and_refreshes_the_timers() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let past = Utc::now() - chrono::Duration::hours(3);
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let gone_program = Some(Uuid::new_v4().to_string());
+        let (ended, ended_dto) =
+            refresh_test_timer(&airing, "ended", RecordingStatus::Cancelled, None, past);
+        let (gone, gone_dto) =
+            refresh_test_timer(&airing, "gone", RecordingStatus::New, gone_program, future);
+        let (stale, stale_dto) = refresh_test_timer(
+            &airing,
+            "stale name",
+            RecordingStatus::New,
+            Some(airing.id.clone()),
+            future,
+        );
+        let (unlinked, unlinked_dto) =
+            refresh_test_timer(&airing, "unlinked", RecordingStatus::New, None, future);
+        for dto in [&ended_dto, &gone_dto, &stale_dto, &unlinked_dto] {
+            mgr.persist_timer(dto).await.expect("seed timer");
+        }
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let after = timers_by_id(&mgr).await;
+        assert!(!after.contains_key(&ended), "an ended timer is deleted");
+        assert!(
+            !after.contains_key(&gone),
+            "a timer whose programme left is deleted"
+        );
+        assert_eq!(
+            after[&unlinked].base.name.as_deref(),
+            Some("unlinked"),
+            "a timer with no programme is left alone"
+        );
+        assert_eq!(
+            after[&stale].base.name.as_deref(),
+            Some(airing.title.as_str()),
+            "a live timer takes the refreshed programme's name"
+        );
+        assert!(
+            mgr.armed_timers_lock().contains_key(&stale),
+            "and is re-armed"
+        );
+    }
+
+    /// What `RefreshTimers` must leave alone: `Completed` rows (recordings
+    /// reference them; `GetTimersAsync` excludes them), an ended timer whose
+    /// capture is still running (`GetActiveRecordingPath`), and a showing
+    /// cancelled by hand, which stays cancelled and unarmed.
+    #[tokio::test]
+    async fn a_guide_refresh_keeps_completed_recording_and_cancelled_timers() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let past = Utc::now() - chrono::Duration::hours(3);
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (completed, completed_dto) =
+            refresh_test_timer(&airing, "completed", RecordingStatus::Completed, None, past);
+        let (completed_gone, completed_gone_dto) = refresh_test_timer(
+            &airing,
+            "completed, programme gone",
+            RecordingStatus::Completed,
+            Some(Uuid::new_v4().to_string()),
+            future,
+        );
+        let (recording, recording_dto) = refresh_test_timer(
+            &airing,
+            "recording",
+            RecordingStatus::InProgress,
+            None,
+            past,
+        );
+        let (cancelled, cancelled_dto) = refresh_test_timer(
+            &airing,
+            "cancelled",
+            RecordingStatus::Cancelled,
+            Some(airing.id.clone()),
+            future,
+        );
+        for dto in [
+            &completed_dto,
+            &completed_gone_dto,
+            &recording_dto,
+            &cancelled_dto,
+        ] {
+            mgr.persist_timer(dto).await.expect("seed timer");
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        mgr.active_recordings_lock().insert(
+            recording.clone(),
+            crate::dvr::ActiveRecording::new(
+                recording.clone(),
+                Uuid::new_v4(),
+                dir.path().join("recording.ts"),
+            ),
+        );
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let after = timers_by_id(&mgr).await;
+        assert!(after.contains_key(&completed), "a completed timer is kept");
+        assert!(
+            after.contains_key(&completed_gone),
+            "a completed timer is never refreshed"
+        );
+        assert!(
+            after.contains_key(&recording),
+            "an ended timer that is still recording is kept"
+        );
+        assert_eq!(after[&cancelled].status, RecordingStatus::Cancelled);
+        assert!(
+            !mgr.armed_timers_lock().contains_key(&cancelled),
+            "a hand-cancelled showing is not armed"
         );
     }
 
