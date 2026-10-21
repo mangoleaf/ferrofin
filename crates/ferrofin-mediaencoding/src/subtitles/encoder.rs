@@ -13,6 +13,7 @@
 //! - `AsyncKeyedLock` around `ConvertSubtitles` determinism is preserved via the
 //!   same keyed-lock helper.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
@@ -27,13 +28,13 @@ use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Subtitle, TimeCode};
 use super::parser::{SubtitleEditParser, SubtitleParser};
-use super::{json_writer, srt, ssa, vtt};
+use super::{json_writer, srt, ssa, ttml, vtt};
 
 /// The output format a [`GetWriter`](write)-selected writer emits.
 ///
 /// Port of the `TryGetWriter` switch in the C# encoder, restricted to the
 /// formats the writers support (`ass`, `ssa`, `srt`/`subrip`, `vtt`/`webvtt`,
-/// `json`).
+/// `json`, `ttml`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Writer {
     /// Advanced SubStation Alpha writer.
@@ -46,7 +47,31 @@ enum Writer {
     WebVtt,
     /// Jellyfin JSON writer.
     Json,
+    /// TTML (`TimedText10`) writer.
+    Ttml,
 }
+
+/// `subtitle` without the SSA/ASS `Comment:` events its loader keeps.
+///
+/// Deliberate divergence: libse loads a script's comments as cues flagged
+/// `IsComment`, and only its SSA and ASS writers check the flag, so Jellyfin 12 shows
+/// comments as ordinary subtitle lines in WebVTT, SubRip, TTML and JSON. That is a
+/// Jellyfin bug (a script's comments are never displayed), so those writers get the
+/// cues without them; the SSA/ASS loaders number the cues as if the comments were
+/// absent. The SSA and ASS writers still write them back as `Comment:` lines.
+fn without_comment_events(subtitle: &Subtitle) -> Cow<'_, Subtitle> {
+    if subtitle.paragraphs.iter().any(|p| p.is_comment) {
+        let mut kept = subtitle.clone();
+        kept.paragraphs.retain(|p| !p.is_comment);
+        Cow::Owned(kept)
+    } else {
+        Cow::Borrowed(subtitle)
+    }
+}
+
+/// The title `SubtitleEncoder.ConvertSubtitles` passes to every writer
+/// (`formatter.ToText(subtitle, "untitled")`).
+const WRITER_TITLE: &str = "untitled";
 
 impl Writer {
     /// Resolves the writer for `format`, if supported.
@@ -67,6 +92,8 @@ impl Writer {
             || format.eq_ignore_ascii_case(subtitle_format::WEBVTT)
         {
             Some(Self::WebVtt)
+        } else if format.eq_ignore_ascii_case(subtitle_format::TTML) {
+            Some(Self::Ttml)
         } else {
             None
         }
@@ -75,11 +102,12 @@ impl Writer {
     /// Writes `subtitle` in this writer's format.
     fn write(self, subtitle: &Subtitle) -> String {
         match self {
-            Self::Ass => ssa::to_text_ass(subtitle),
-            Self::Ssa => ssa::to_text_ssa(subtitle),
-            Self::SubRip => srt::to_text(subtitle),
-            Self::WebVtt => vtt::to_text(subtitle),
-            Self::Json => json_writer::to_text(subtitle),
+            Self::Ass => ssa::to_text_ass(subtitle, WRITER_TITLE),
+            Self::Ssa => ssa::to_text_ssa(subtitle, WRITER_TITLE),
+            Self::SubRip => srt::to_text(&without_comment_events(subtitle)),
+            Self::WebVtt => vtt::to_text(&without_comment_events(subtitle)),
+            Self::Json => json_writer::to_text(&without_comment_events(subtitle)),
+            Self::Ttml => ttml::to_text(&without_comment_events(subtitle), WRITER_TITLE),
         }
     }
 }
@@ -899,8 +927,9 @@ pub fn filter_events(
     preserve_timestamps: bool,
 ) {
     track.paragraphs.retain(|p| {
-        !((p.start_time.ticks() - start_position_ticks) < 0
-            && (p.end_time.ticks() - start_position_ticks) < 0)
+        // C#'s `long` arithmetic is unchecked; the offset comes from the request.
+        !(p.start_time.ticks().wrapping_sub(start_position_ticks) < 0
+            && p.end_time.ticks().wrapping_sub(start_position_ticks) < 0)
     });
 
     if end_time_ticks > 0 {
@@ -911,9 +940,14 @@ pub fn filter_events(
 
     if !preserve_timestamps {
         for p in &mut track.paragraphs {
-            p.start_time =
-                TimeCode::from_ticks((p.start_time.ticks() - start_position_ticks).max(0));
-            p.end_time = TimeCode::from_ticks((p.end_time.ticks() - start_position_ticks).max(0));
+            p.start_time = TimeCode::from_ticks(
+                p.start_time
+                    .ticks()
+                    .wrapping_sub(start_position_ticks)
+                    .max(0),
+            );
+            p.end_time =
+                TimeCode::from_ticks(p.end_time.ticks().wrapping_sub(start_position_ticks).max(0));
         }
     }
 }

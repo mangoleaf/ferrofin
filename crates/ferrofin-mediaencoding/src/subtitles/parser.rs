@@ -100,7 +100,8 @@ impl SubtitleParser for SubtitleEditParser {
 
         let errors = match format {
             Format::SubRip => srt::load(&mut subtitle, &lines),
-            Format::Ssa | Format::Ass => ssa::load(&mut subtitle, &lines),
+            Format::Ssa => ssa::load_ssa(&mut subtitle, &lines),
+            Format::Ass => ssa::load_ass(&mut subtitle, &lines),
         };
 
         let _ = errors;
@@ -120,13 +121,15 @@ impl SubtitleParser for SubtitleEditParser {
 /// Projects a parsed [`Subtitle`] onto the wire [`SubtitleTrackInfo`] DTO.
 ///
 /// Convenience for callers (and tests) that want the ported cues as
-/// [`SubtitleTrackEvent`]s directly.
+/// [`SubtitleTrackEvent`]s directly. SSA/ASS `Comment:` events are left out, as the
+/// encoder leaves them out of every non-SSA/ASS format.
 #[must_use]
 pub fn to_track_info(subtitle: &Subtitle) -> SubtitleTrackInfo {
     SubtitleTrackInfo {
         track_events: subtitle
             .paragraphs
             .iter()
+            .filter(|p| !p.is_comment)
             .map(|p| SubtitleTrackEvent {
                 id: p.number.to_string(),
                 text: p.text.clone(),

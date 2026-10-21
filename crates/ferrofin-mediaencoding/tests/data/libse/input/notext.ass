@@ -1,0 +1,7 @@
+[Script Info]
+ScriptType: v4.00+
+
+[Events]
+Format: Layer, Start, End, Style, Name
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,Alice,extra,fields here
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,more

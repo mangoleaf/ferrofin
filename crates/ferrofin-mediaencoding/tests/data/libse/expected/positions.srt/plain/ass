@@ -1,0 +1,22 @@
+[Script Info]
+; This is an Advanced Sub Station Alpha v4+ script.
+Title: untitled
+ScriptType: v4.00+
+PlayDepth: 0
+ScaledBorderAndShadow: Yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:01.90,Default,,0,0,0,,{\an1}Position 1
+Dialogue: 0,0:00:02.00,0:00:02.90,Default,,0,0,0,,{\an2}Position 2
+Dialogue: 0,0:00:03.00,0:00:03.90,Default,,0,0,0,,{\an3}Position 3
+Dialogue: 0,0:00:04.00,0:00:04.90,Default,,0,0,0,,{\an4}Position 4
+Dialogue: 0,0:00:05.00,0:00:05.90,Default,,0,0,0,,{\an5}Position 5
+Dialogue: 0,0:00:06.00,0:00:06.90,Default,,0,0,0,,{\an6}Position 6
+Dialogue: 0,0:00:07.00,0:00:07.90,Default,,0,0,0,,{\an7}Position 7
+Dialogue: 0,0:00:08.00,0:00:08.90,Default,,0,0,0,,{\an8}Position 8
+Dialogue: 0,0:00:09.00,0:00:09.90,Default,,0,0,0,,{\an9}Position 9

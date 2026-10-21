@@ -172,6 +172,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Convert subtitles with Jellyfin 12's writers (SubtitleEdit's libse 4.0.12), byte for byte:
+  converted WebVTT, SubRip, SSA and ASS lose the byte-order mark, and WebVTT loses the fixed
+  region block and `line:90%` on every cue. An `{\anN}` sign is placed where it asks to be
+  (`{\an8}` at the top), other SSA/ASS override tags are removed instead of shown as text,
+  and `<font color>` becomes a WebVTT colour class. An ASS script converted to SSA keeps its
+  styles and comments. `Stream.ttml` now serves TTML (`application/ttml+xml`; it was a 500).
+  An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
+  Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
