@@ -730,6 +730,10 @@ pub async fn build_app_state(
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);
             move || config_mgr.snapshot_shared().chapter_image_resolution
+        })
+        .with_image_extraction_timeout({
+            let config_mgr = Arc::clone(&config_mgr);
+            move || config_mgr.snapshot_shared().image_extraction_timeout_ms
         }),
     );
 
@@ -845,6 +849,10 @@ pub async fn build_app_state(
                     ffmpeg.capabilities.ffmpeg_version(),
                 )
                 .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+                .with_image_extraction_timeout({
+                    let config_mgr = Arc::clone(&config_mgr);
+                    move || config_mgr.snapshot_shared().image_extraction_timeout_ms
+                })
                 // Trickplay decodes a whole file to produce a handful of frames,
                 // which is what a GPU is for and what makes a library-wide pass
                 // take hours in software. Gated by the dashboard's trickplay
