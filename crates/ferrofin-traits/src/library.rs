@@ -2204,6 +2204,22 @@ pub trait VirtualFolderManager: Send + Sync {
     /// folder has not yet been materialized as an item).
     async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError>;
 
+    /// The configured libraries' names, item ids, locations, collection types
+    /// and options, for per-item and per-request lookups.
+    ///
+    /// Upstream reads these from memory: `LibraryManager.GetLibraryOptions(item)`
+    /// returns the `CollectionFolder`'s cached options, refreshed when they are
+    /// saved, and `CollectionFolder.CollectionType` is an item property. An
+    /// implementation may therefore serve a snapshot, as long as every change
+    /// made through this manager is visible to the next call. The refresh
+    /// state fields are not meaningful here; use
+    /// [`get_virtual_folders`](Self::get_virtual_folders) for the dashboard.
+    ///
+    /// The default lists the folders afresh.
+    async fn library_folders(&self) -> Result<std::sync::Arc<[VirtualFolderInfo]>, ServiceError> {
+        Ok(self.get_virtual_folders().await?.into())
+    }
+
     /// Adds a virtual folder with the given name, optional collection type,
     /// media paths, and library options.
     ///

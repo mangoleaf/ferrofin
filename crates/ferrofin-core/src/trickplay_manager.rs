@@ -210,7 +210,7 @@ impl FerrofinTrickplayManager {
         let Some(folders) = self.virtual_folders.get() else {
             return Ok(None);
         };
-        let folders = folders.get_virtual_folders().await?;
+        let folders = folders.library_folders().await?;
         Ok(ferrofin_model::entities_media::owning_library(
             &folders,
             entity.top_parent_id.as_deref(),
@@ -1186,8 +1186,9 @@ impl TrickplayManager for FerrofinTrickplayManager {
         width: i32,
         index: i32,
     ) -> Result<Option<String>, ServiceError> {
-        // Resolve the library live, so toggling the option affects HTTP tile
-        // reads immediately. Existing data is moved by the migration task.
+        // Resolve the library on every read, from the snapshot each options
+        // save refreshes, so toggling the option affects HTTP tile reads
+        // immediately. Existing data is moved by the migration task.
         let resolutions = self.resolutions_for(item_id).await?;
         let Some(info) = resolutions.get(&width) else {
             return Ok(None);
