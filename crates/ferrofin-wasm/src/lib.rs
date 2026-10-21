@@ -1369,8 +1369,11 @@ const MAX_TRANSFORMS_PER_PLUGIN: usize = 16;
 /// Max bytes for one transform's search or replace text.
 const MAX_TRANSFORM_TEXT: usize = 256 * 1024;
 
-/// A declared literal search/replace applied to served `/web` files.
+/// A declared literal search/replace applied to served `/web` files while
+/// its plugin is enabled.
 struct LiteralTransform {
+    plugin: Uuid,
+    plugins: Arc<dyn PluginManager>,
     search: String,
     replace: String,
 }
@@ -1378,16 +1381,28 @@ struct LiteralTransform {
 #[async_trait]
 impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
     async fn transform(&self, _path: &str, contents: String) -> String {
+        // Checked per serve, like the host's other surfaces: Disable or
+        // uninstall stops the injection at once, and Enable starts it.
+        let enabled = self
+            .plugins
+            .get_plugin(self.plugin)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|d| d.enabled);
+        if !enabled {
+            return contents;
+        }
         contents.replace(&self.search, &self.replace)
     }
 }
 
 impl WasmPluginHost {
-    /// Registers every ENABLED plugin's declared web transforms into the
-    /// server's transformation pipeline (capped; see the WIT trust note —
-    /// this is client-side script injection, the largest grant a plugin
-    /// has). A disabled plugin's transforms are not registered; toggling
-    /// takes effect on the next restart, like everything decided at boot.
+    /// Registers every plugin's declared web transforms into the server's
+    /// transformation pipeline (capped; see the WIT trust note — this is
+    /// client-side script injection, the largest grant a plugin has). Each
+    /// one applies only while its plugin is enabled, checked per serve, so
+    /// Disable, Enable and uninstall take effect without a restart.
     pub async fn register_web_transforms(
         &self,
         service: &Arc<dyn ferrofin_traits::plugins::FileTransformationService>,
@@ -1395,15 +1410,6 @@ impl WasmPluginHost {
     ) {
         for plugin in &self.plugins {
             if plugin.web_transforms.is_empty() {
-                continue;
-            }
-            let enabled = plugin_manager
-                .get_plugin(plugin.descriptor.id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|d| d.enabled);
-            if !enabled {
                 continue;
             }
             for transform in plugin.web_transforms.iter().take(MAX_TRANSFORMS_PER_PLUGIN) {
@@ -1427,6 +1433,8 @@ impl WasmPluginHost {
                         plugin.descriptor.id,
                         &transform.path_pattern,
                         Arc::new(LiteralTransform {
+                            plugin: plugin.descriptor.id,
+                            plugins: Arc::clone(plugin_manager),
                             search: transform.search.clone(),
                             replace: transform.replace.clone(),
                         }),
@@ -1852,6 +1860,50 @@ impl ScheduledTask for WasmTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_web_transform_applies_only_while_its_plugin_is_enabled() {
+        use ferrofin_traits::plugins::FileTransformer as _;
+        let dir = tempfile::tempdir().unwrap();
+        let id = descriptor().id;
+        let plugins: Arc<dyn PluginManager> =
+            Arc::new(ferrofin_core::plugin_manager::FerrofinPluginManager::new(
+                vec![ferrofin_core::plugin_manager::RegisteredPlugin::new(
+                    descriptor(),
+                    None,
+                )],
+                dir.path().to_path_buf(),
+            ));
+        let transform = |plugin| LiteralTransform {
+            plugin,
+            plugins: Arc::clone(&plugins),
+            search: "</head>".to_owned(),
+            replace: "<script></script></head>".to_owned(),
+        };
+        let injected = "<script></script></head>";
+        let ours = transform(id);
+        assert_eq!(
+            ours.transform("index.html", "</head>".into()).await,
+            injected
+        );
+        plugins.disable_plugin(id).await.unwrap();
+        assert_eq!(
+            ours.transform("index.html", "</head>".into()).await,
+            "</head>",
+            "disabled: served unchanged"
+        );
+        plugins.enable_plugin(id).await.unwrap();
+        assert_eq!(
+            ours.transform("index.html", "</head>".into()).await,
+            injected
+        );
+        let gone = transform(Uuid::from_u128(8));
+        assert_eq!(
+            gone.transform("index.html", "</head>".into()).await,
+            "</head>",
+            "uninstalled (unknown to the manager): served unchanged"
+        );
+    }
 
     fn descriptor() -> PluginDescriptor {
         PluginDescriptor {

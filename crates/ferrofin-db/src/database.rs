@@ -14,6 +14,17 @@ use crate::error::Result;
 /// this crate needs no live database or `DATABASE_URL`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// The version of the last migration in this build's chain: a database
+/// migrated past it was written by a newer build, and this one cannot open it
+/// (`MIGRATOR.run` refuses applied versions it does not know).
+#[must_use]
+pub fn schema_head() -> i64 {
+    MIGRATOR
+        .iter()
+        .last()
+        .map_or(0, |migration| migration.version)
+}
+
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
 /// parent: its kind, the three ids the walk follows, the album-artist name

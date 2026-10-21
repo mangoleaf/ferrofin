@@ -129,8 +129,19 @@ pub struct Xmltv {
 /// error, with [`Xmltv::error`] saying what went wrong, so a caller can tell a
 /// partial read from a complete guide.
 #[must_use]
-#[allow(clippy::too_many_lines)] // one pull-parser state machine
 pub fn parse_xmltv(xml: &str) -> Xmltv {
+    parse_xmltv_where(xml, |_| true)
+}
+
+/// [`parse_xmltv`], keeping only the programmes `keep` accepts. Each one is
+/// judged as its element closes and dropped there, so a reader that wants a
+/// few channels' airings over a window never holds the rest of a large
+/// guide. Channels and [`Xmltv::error`] are reported in full, so
+/// `parse_xmltv_where(xml, |_| false)` reads just the channel list and whether
+/// the document is readable.
+#[must_use]
+#[allow(clippy::too_many_lines)] // one pull-parser state machine
+pub fn parse_xmltv_where(xml: &str, mut keep: impl FnMut(&XmltvProgramme) -> bool) -> Xmltv {
     if xml.trim().is_empty() {
         // `XmlTvListingsProvider.UnzipIfNeededAndCopy`: "Downloaded XMLTV file
         // is empty".
@@ -251,7 +262,9 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                         }
                     }
                     b"programme" => {
-                        if let Some(p) = programme.take() {
+                        if let Some(p) = programme.take()
+                            && keep(&p.programme)
+                        {
                             out.programmes.push(p.programme);
                         }
                     }
@@ -760,6 +773,58 @@ mod tests {
         assert_eq!(p.icon.as_deref(), Some("http://x/prog.png"));
         assert!(p.is_new);
         assert_eq!(p.rating.as_deref(), Some("TV-PG"));
+    }
+
+    /// A guide whose `<channel>` elements come after its programmes (XMLTV
+    /// does not fix the order), with airings on two channels.
+    const CHANNELS_LAST: &str = r#"<tv>
+  <programme start="20260725060000 +0000" channel="a"><title>A1</title></programme>
+  <programme start="20260725060000 +0000" channel="b"><title>B1</title></programme>
+  <programme start="20260725070000 +0000" channel="a"><title>A2</title><category>News</category></programme>
+  <channel id="a"><display-name>Channel A</display-name></channel>
+  <channel id="b"><display-name>Channel B</display-name></channel>
+</tv>"#;
+
+    /// `keep` sees every programme once, whole, in document order, and only the
+    /// ones it accepts are stored; the channels are read whatever it decides.
+    #[test]
+    fn parse_where_keeps_only_the_programmes_it_accepts() {
+        let mut seen = Vec::new();
+        let g = parse_xmltv_where(CHANNELS_LAST, |p| {
+            seen.push((p.title.clone(), p.categories.clone()));
+            p.channel_id == "a"
+        });
+        assert_eq!(
+            seen,
+            vec![
+                ("A1".to_owned(), Vec::<String>::new()),
+                ("B1".to_owned(), Vec::new()),
+                ("A2".to_owned(), vec!["News".to_owned()]),
+            ]
+        );
+        let titles: Vec<&str> = g.programmes.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["A1", "A2"]);
+        let ids: Vec<&str> = g.channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(g.error, None);
+    }
+
+    /// Rejecting every programme reads the channel list and the document's
+    /// readability exactly as the full parse does.
+    #[test]
+    fn parse_where_rejecting_everything_still_reports_channels_and_errors() {
+        let all = parse_xmltv(SAMPLE);
+        let none = parse_xmltv_where(SAMPLE, |_| false);
+        assert!(none.programmes.is_empty());
+        assert_eq!(none.channels, all.channels);
+        assert_eq!(none.error, None);
+
+        let truncated = &SAMPLE[..SAMPLE.len() - "</tv>".len()];
+        assert_eq!(
+            parse_xmltv_where(truncated, |_| false).error,
+            parse_xmltv(truncated).error
+        );
+        assert!(parse_xmltv(truncated).error.is_some());
     }
 
     #[test]
