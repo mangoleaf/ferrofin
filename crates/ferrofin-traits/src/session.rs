@@ -97,6 +97,10 @@ pub struct AuthenticationRequest {
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Records session activity for a client, returning the session DTO.
+    ///
+    /// `user` is `None` for an API-key caller, which upstream's
+    /// `RequestHelpers.GetSession` logs as a session with no user
+    /// (`LogSessionActivity(..., user: null)`).
     async fn log_session_activity(
         &self,
         app_name: &str,
@@ -104,7 +108,7 @@ pub trait SessionManager: Send + Sync {
         device_id: &str,
         device_name: &str,
         remote_endpoint: &str,
-        user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError>;
 
     /// Updates the reported device name of a session.
