@@ -1286,7 +1286,7 @@ impl ScheduledTask for TrickplayImagesTask {
                 if !crate::trickplay_manager::is_library_video(item) {
                     continue;
                 }
-                let folders = self.folders.get_virtual_folders().await?;
+                let folders = self.folders.library_folders().await?;
                 let options = ferrofin_model::entities_media::owning_library(
                     &folders,
                     item.top_parent_id.as_deref(),

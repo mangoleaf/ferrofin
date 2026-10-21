@@ -131,7 +131,7 @@ impl ChapterImageExtractor {
         }
         let item_id = Uuid::parse_str(&video.id)
             .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
-        let folders = self.folders.get_virtual_folders().await?;
+        let folders = self.folders.library_folders().await?;
         let enabled = owning_library(
             &folders,
             video.top_parent_id.as_deref(),

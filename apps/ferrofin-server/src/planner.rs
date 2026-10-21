@@ -276,6 +276,25 @@ fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
     )
 }
 
+/// `GetVideoProcessingFilterParam`'s placement of the frame-rate cap in the
+/// main chain: behind a deinterlacer, which needs the neighbouring frames, at
+/// the end (PR 17058); otherwise at the head, so the rest of the chain filters
+/// only the frames kept.
+fn with_frame_rate_cap(
+    mut main: Vec<String>,
+    fps: Option<&str>,
+    deinterlaced: bool,
+) -> Vec<String> {
+    if let Some(fps) = fps {
+        if deinterlaced {
+            main.push(fps.to_owned());
+        } else {
+            main.insert(0, fps.to_owned());
+        }
+    }
+    main
+}
+
 /// Says once, loudly, that a configured accelerator will not be used.
 ///
 /// Without this the operator picks AMF in the dashboard, gets a working but
@@ -1366,12 +1385,24 @@ impl FerrofinStreamStatePlanner {
         let burn_text = burns_text_subtitle(state);
         let burn_sub = burn_graphical || burn_text;
 
-        // The software re-encode's video filters (order matters): the bounded
-        // downscale first (tonemap/burn-in then run on fewer pixels), then the
-        // HDR→SDR tonemap chain — or a bare 8-bit down-convert for 10-bit SDR
-        // sources (libx264 would otherwise emit High10, undecodable in browser
-        // MSE). This is the software path only — a job the hardware matrix
-        // claimed builds its whole graph above.
+        // The software re-encode's video filters, in `GetSwVidFilterChain`'s
+        // order: the HDR `setparams` (upstream also tags SDR frames; this list
+        // does only for tonemapx), the deinterlacer, the bounded downscale
+        // (tonemap/burn-in then run on fewer pixels), then the HDR→SDR tonemap
+        // chain — or a bare 8-bit down-convert for 10-bit SDR sources (libx264
+        // would otherwise emit High10, undecodable in browser MSE). This is the
+        // software path only — a job the hardware matrix claimed builds its
+        // whole graph above.
+        let sw_deinterlace = !copying_video && !hw_filters && state.is_deinterlace_available();
+        // `GetVideoProcessingFilterParam`'s frame-rate cap on the software
+        // chain, placed by [`with_frame_rate_cap`] where each graph below is
+        // assembled (a burned-in text subtitle goes between the two). Printed
+        // as upstream does: its `float` widened to the `double?` that
+        // `GetFramerateParam` returns.
+        let sw_fps = (!copying_video && !hw_filters)
+            .then(|| self.encoding_helper.framerate_param(state))
+            .flatten()
+            .map(|rate| format!("fps={}", f64::from(rate)));
         let sw_filters: Vec<String> = if !copying_video && !hw_filters {
             let mut filters = Vec::new();
             let tonemap =
@@ -1391,6 +1422,17 @@ impl FerrofinStreamStatePlanner {
                     )
                     .to_owned(),
                 );
+            }
+            // `GetSwDeinterlaceFilter` whenever `IsDeinterlaceAvailable`: an
+            // interlaced source is deinterlaced before anything resizes it.
+            if sw_deinterlace {
+                filters.push(hw::filters::sw_deinterlace_filter(
+                    options,
+                    state
+                        .video_stream
+                        .as_ref()
+                        .and_then(MediaStream::reference_frame_rate),
+                ));
             }
             if let Some(scale) = ferrofin_mediaencoding::encoding_helper::helper::scale_filter(
                 state.video_stream.as_ref(),
@@ -1468,11 +1510,19 @@ impl FerrofinStreamStatePlanner {
             tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
             vec![hwaccel_input.args.clone()]
         }));
-        // GetInputArgument yields the full `-i file:"…"` fragment.
+        // `GetInputModifier`'s `GetFfmpegAnalyzeDurationArg` (the source's own
+        // `AnalyzeDurationMs`, the 3 s a Live TV source carries, else the
+        // `FFmpeg:analyzeduration` default) and `GetFfmpegProbesizeArg`;
+        // GetInputArgument then yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
-        args.push("200M".to_owned());
+        args.push(
+            ferrofin_mediaencoding::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+        );
         push_split(&mut args, "-probesize");
-        args.push("1G".to_owned());
+        args.push(ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned());
         // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
         // source (a tuner, a playlist channel) requires, as the probe sends
         // them. Each value is one argv element, never parsed as options.
@@ -1595,11 +1645,7 @@ impl FerrofinStreamStatePlanner {
                 // the seek would put it in a time range the video never
                 // reaches, and nothing would be drawn at all.
                 start_time_ticks: 0,
-                // `doDeintH264 || doDeintHevc` — upstream asks under each
-                // spelling of the two codecs it deinterlaces.
-                deinterlace: ["h264", "avc", "h265", "hevc"]
-                    .iter()
-                    .any(|c| state.deinterlace(Some(c), true)),
+                deinterlace: state.is_deinterlace_available(),
                 // Computed, not assumed: the vendor chain falls back to the
                 // software chain on a build without the vendor's tonemap
                 // filter, and that fallback is the only tonemap an HDR source
@@ -1649,6 +1695,7 @@ impl FerrofinStreamStatePlanner {
             hw_graph = hw::sw_chain::video_processing_filter_args(
                 vendor_chain,
                 self.encoding_helper.framerate_param(state).map(f64::from),
+                state.is_deinterlace_available(),
                 pads,
                 burn_sub,
                 burn_text,
@@ -1802,9 +1849,10 @@ impl FerrofinStreamStatePlanner {
             // The plain software filter chain (downscale/tonemap/8-bit); the
             // burn-in branches below fold `sw_filters` into their own graphs
             // instead (two `-vf`s would override each other).
-            if !burn_sub && !sw_filters.is_empty() {
+            let main = with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace);
+            if !burn_sub && !main.is_empty() {
                 args.push("-vf".to_owned());
-                args.push(sw_filters.join(","));
+                args.push(main.join(","));
             }
         }
         // `GetVideoArguments`' "TODO why was this not enabled for VOD?": an
@@ -1922,17 +1970,13 @@ impl FerrofinStreamStatePlanner {
             && !hw_filters
             && let Some(sub) = state.subtitle_stream.as_ref()
         {
-            use std::fmt::Write as _;
-            let mut chain = String::new();
             // Downscale/tonemap ahead of the subtitle render, so the text is
             // drawn at output resolution in SDR.
-            for filter in &sw_filters {
-                let _ = write!(chain, "{filter},");
-            }
+            let mut chain = sw_filters.clone();
             let offset_secs = segment_id
                 .filter(|&id| id > 0)
                 .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
-            chain.push_str(&Self::text_subtitle_filter(
+            chain.push(Self::text_subtitle_filter(
                 state,
                 sub,
                 media_path,
@@ -1941,7 +1985,7 @@ impl FerrofinStreamStatePlanner {
                 offset_secs,
             ));
             args.push("-vf".to_owned());
-            args.push(chain);
+            args.push(with_frame_rate_cap(chain, sw_fps.as_deref(), sw_deinterlace).join(","));
         }
 
         // ---- graphical subtitle burn-in --------------------------------------
@@ -1958,14 +2002,15 @@ impl FerrofinStreamStatePlanner {
             // the matrix did not claim the job, so the frames are in system
             // memory and the software chain above has already set the format.
             push_split(&mut args, "-filter_complex");
-            if sw_filters.is_empty() {
+            let base = with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace);
+            if base.is_empty() {
                 args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay[v]"));
             } else {
                 // Downscale/tonemap the base video before compositing, so the
                 // bitmap subtitle is overlaid in SDR at output resolution.
                 args.push(format!(
                     "[0:{vid_idx}]{}[base];[base][0:{sub_idx}]overlay[v]",
-                    sw_filters.join(",")
+                    base.join(",")
                 ));
             }
         }
@@ -3006,6 +3051,30 @@ mod tests {
         let args = plan.arguments.join(" ");
         assert!(args.contains("-c:a flac"), "{args}");
         assert!(!args.contains("-b:a"), "{args}");
+    }
+
+    /// `GetInputModifier` → `GetFfmpegAnalyzeDurationArg` (v12.2
+    /// `EncodingHelper.cs:7330-7348`): a source's own `AnalyzeDurationMs` (the
+    /// 3 s every Live TV source carries) is passed in microseconds; any other
+    /// source takes the `FFmpeg:analyzeduration` default, `200M`. `-probesize`
+    /// is the `FFmpeg:probesize` default, `1G`, either way.
+    #[tokio::test]
+    async fn analyzeduration_prefers_the_sources_own_value() {
+        let mut live = source("live", vec![video_stream("h264"), audio_stream("aac")]);
+        live.analyze_duration_ms = Some(3000);
+        let file = source("file", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![live, file]);
+        for (id, analyze) in [("live", "3000000"), ("file", "200M")] {
+            let plan = p
+                .plan(&request(id), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains(&format!("-analyzeduration {analyze} -probesize 1G")),
+                "{id}: {args}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5917,6 +5986,192 @@ mod tests {
         // Segment 0 needs no shift at all.
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert!(!plan.arguments.join(" ").contains("setpts"));
+    }
+
+    /// A 1080i H.264 source at `rate` fps, re-encoded under `options` with a
+    /// 1280-wide bound (so the software chain also scales) and, when given, a
+    /// frame-rate cap: the joined ffmpeg arguments.
+    async fn software_args(
+        interlaced: bool,
+        rate: f32,
+        options: EncodingOptions,
+        max_framerate: Option<f32>,
+    ) -> String {
+        let mut video = video_stream("h264");
+        video.is_interlaced = interlaced;
+        video.width = Some(1920);
+        video.height = Some(1080);
+        video.average_frame_rate = Some(rate);
+        video.real_frame_rate = Some(rate);
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            options,
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        req.max_framerate = max_framerate;
+        p.plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ")
+    }
+
+    /// With no accelerator (the default) an interlaced source is deinterlaced
+    /// in software, as upstream's `GetSwVidFilterChain` does whenever
+    /// `IsDeinterlaceAvailable`: `yadif` or `bwdif` per "Deinterlacing
+    /// method", at field rate (`=1`) with "Double the frame rate when
+    /// deinterlacing" on and a source of 30 fps or less, ahead of the scale.
+    #[rstest]
+    #[case::yadif(
+        ferrofin_model::entities::DeinterlaceMethod::yadif,
+        false,
+        25.0,
+        "-vf yadif=0:-1:0,scale="
+    )]
+    #[case::bwdif(
+        ferrofin_model::entities::DeinterlaceMethod::bwdif,
+        false,
+        25.0,
+        "-vf bwdif=0:-1:0,scale="
+    )]
+    #[case::double_rate(
+        ferrofin_model::entities::DeinterlaceMethod::yadif,
+        true,
+        25.0,
+        "-vf yadif=1:-1:0,scale="
+    )]
+    #[case::double_rate_above_30_fps(
+        ferrofin_model::entities::DeinterlaceMethod::yadif,
+        true,
+        59.94,
+        "-vf yadif=0:-1:0,scale="
+    )]
+    #[tokio::test]
+    async fn an_interlaced_source_deinterlaces_in_software(
+        #[case] method: ferrofin_model::entities::DeinterlaceMethod,
+        #[case] double_rate: bool,
+        #[case] rate: f32,
+        #[case] expected: &str,
+    ) {
+        let options = EncodingOptions {
+            deinterlace_method: method,
+            deinterlace_double_rate: double_rate,
+            ..EncodingOptions::default()
+        };
+        let args = software_args(true, rate, options, None).await;
+        assert!(args.contains(expected), "{args}");
+    }
+
+    /// A progressive source is not deinterlaced.
+    #[tokio::test]
+    async fn a_progressive_source_is_not_deinterlaced_in_software() {
+        let args = software_args(false, 25.0, EncodingOptions::default(), None).await;
+        assert!(!args.contains("yadif") && !args.contains("bwdif"), "{args}");
+    }
+
+    /// `GetVideoProcessingFilterParam` adds the requested frame rate to the
+    /// software chain too: at the end behind a deinterlacer, which needs the
+    /// neighbouring frames (PR 17058), else at the head, so the rest of the
+    /// chain filters only the frames kept. The rate prints as upstream's: the
+    /// request's `float` widened to the `double?` `GetFramerateParam` returns.
+    #[rstest]
+    #[case::interlaced(true, 24.0, "-vf yadif=0:-1:0,scale=1280:720,fps=24 ")]
+    #[case::progressive(false, 24.0, "-vf fps=24,scale=1280:720 ")]
+    #[case::fractional(false, 23.976, "-vf fps=23.97599983215332,scale=1280:720 ")]
+    #[tokio::test]
+    async fn a_frame_rate_cap_joins_the_software_chain(
+        #[case] interlaced: bool,
+        #[case] cap: f32,
+        #[case] expected: &str,
+    ) {
+        let args = software_args(interlaced, 50.0, EncodingOptions::default(), Some(cap)).await;
+        assert!(args.contains(expected), "{args}");
+        assert_eq!(args.matches("fps=").count(), 1, "{args}");
+    }
+
+    /// The burn-in graphs keep upstream's main-chain order: a text subtitle is
+    /// drawn before the cap that ends a deinterlaced chain
+    /// (`…,subtitles=…,fps=`), and a graphical one is overlaid on the base
+    /// chain that carries it.
+    #[rstest]
+    #[case::text("subrip", "-vf")]
+    #[case::graphical("pgssub", "-filter_complex")]
+    #[tokio::test]
+    async fn a_deinterlaced_burn_in_keeps_the_frame_rate_cap_last(
+        #[case] codec: &str,
+        #[case] flag: &str,
+    ) {
+        let mut video = video_stream("h264");
+        video.is_interlaced = true;
+        video.width = Some(1920);
+        video.height = Some(1080);
+        video.average_frame_rate = Some(50.0);
+        let p = planner(vec![source(
+            "abc",
+            vec![video, audio_stream("aac"), subtitle_stream(codec, 2)],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        req.max_framerate = Some(24.0);
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let arguments = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments;
+        let graph = arguments
+            .iter()
+            .position(|arg| arg == flag)
+            .and_then(|at| arguments.get(at + 1))
+            .unwrap_or_else(|| panic!("no {flag}: {arguments:?}"));
+        if flag == "-vf" {
+            assert!(
+                graph.starts_with("yadif=0:-1:0,scale=1280:720,subtitles=")
+                    && graph.ends_with(",fps=24"),
+                "{graph}"
+            );
+        } else {
+            assert_eq!(
+                graph,
+                "[0:0]yadif=0:-1:0,scale=1280:720,fps=24[base];[base][0:2]overlay[v]"
+            );
+        }
+    }
+
+    /// A frame-rate cap on a deinterlaced GPU chain goes behind the
+    /// deinterlacer, which needs the neighbouring frames
+    /// (`GetVideoProcessingFilterParam`, PR 17058); before it, a field-rate
+    /// deinterlacer would also double the capped rate.
+    #[tokio::test]
+    async fn a_capped_interlaced_gpu_transcode_deinterlaces_before_the_cap() {
+        let mut video = nvdec_decodable_video_stream();
+        video.is_interlaced = true;
+        video.average_frame_rate = Some(50.0);
+        let p = nvenc_planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_framerate = Some(24.0);
+        let args = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        let deinterlace = args.find("yadif_cuda=").expect("deinterlaced");
+        let cap = args.find("fps=24").expect("capped");
+        assert!(deinterlace < cap, "{args}");
     }
 
     #[tokio::test]
