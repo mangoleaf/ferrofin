@@ -2544,8 +2544,9 @@ pub async fn build_app_state(
         Arc::clone(&plugins),
     )
     .await;
-    // Runtime (WASM) plugins' declared web transforms — enabled plugins
-    // only; the WIT trust note applies (client-side injection).
+    // Runtime (WASM) plugins' declared web transforms, each applied only
+    // while its plugin is enabled; the WIT trust note applies (client-side
+    // injection).
     wasm_host
         .register_web_transforms(&file_transformations, &plugins)
         .await;
