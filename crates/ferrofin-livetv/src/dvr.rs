@@ -540,16 +540,18 @@ async fn create_target_dir(target: &Path) -> Result<(), ServiceError> {
 
 /// Sanitizes one path segment.
 ///
-/// Port of `IFileSystem.GetValidFilename`: trims, then strips the characters
-/// that are illegal in a path segment (separators and the Windows-reserved set).
+/// `IFileSystem.GetValidFilename(name).Trim()`, as `RecordingsManager` builds
+/// each recording folder and file name: every invalid path character, control
+/// characters included, becomes a space, then the result is trimmed.
 #[must_use]
 pub fn valid_filename(name: &str) -> String {
-    const INVALID: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'];
-    let cleaned = name.trim().replace(INVALID, "");
+    let cleaned = ferrofin_util::path_helper::get_valid_filename(name)
+        .trim()
+        .to_owned();
     // Guide text comes from whatever M3U/XMLTV the user pointed at, so a
-    // programme really can be called `..`. Upstream's `GetInvalidFileNameChars`
-    // strips only the separators on Linux and would happily build
-    // `{root}/../{file}`; a segment that is nothing but dots is never a name.
+    // programme really can be called `..`. `GetValidFilename` keeps dots, so
+    // upstream would build `{root}/../{file}`; a segment that is nothing but
+    // dots is never a name here.
     if !cleaned.is_empty() && cleaned.chars().all(|c| c == '.') {
         return String::new();
     }
@@ -904,7 +906,10 @@ mod tests {
             "a hostile programme name must stay inside the recordings root: {}",
             path.display()
         );
-        assert_eq!(valid_filename("  a/b:c  "), "abc");
+        // `GetValidFilename(name).Trim()`: invalid characters, control
+        // characters included, become spaces.
+        assert_eq!(valid_filename("  a/b:c  "), "a b c");
+        assert_eq!(valid_filename("Law & Order: SVU\n"), "Law & Order  SVU");
 
         // A name that is nothing but dots must not become a `..` segment.
         assert_eq!(valid_filename(".."), "");
