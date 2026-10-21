@@ -4745,11 +4745,12 @@ fn push_program_filters(
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
-        // Upstream compares against the item's CleanName; the guide cache has
-        // no cleaned column, so this is a case-insensitive title match.
+        // Upstream compares the item's CleanName with `GetCleanValue(name)`
+        // (`TranslateQuery.cs:476-477`); the guide cache has no cleaned
+        // column, so the title is cleaned here.
         push_separator(qb, &mut first);
-        qb.push(r#"LOWER(p."Title") = "#)
-            .push_bind(name.to_lowercase());
+        qb.push(r#"ferrofin_clean_value(p."Title") = "#)
+            .push_bind(ferrofin_util::string_extensions::get_clean_value(name));
     }
 
     for (column, wanted) in [
@@ -4767,12 +4768,15 @@ fn push_program_filters(
 
     if !query.genres.is_empty() {
         // `Genres` holds the XMLTV `<category>` list as a JSON array; upstream
-        // matches any one of the requested genres.
+        // matches any one of the requested genres by clean value
+        // (`TranslateQuery.cs:658-662`).
         push_separator(qb, &mut first);
-        qb.push(r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE LOWER("value") IN ("#);
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE ferrofin_clean_value("value") IN ("#,
+        );
         let mut list = qb.separated(",");
         for genre in &query.genres {
-            list.push_bind(genre.to_lowercase());
+            list.push_bind(ferrofin_util::string_extensions::get_clean_value(genre));
         }
         qb.push("))");
     }
@@ -6481,13 +6485,7 @@ mod tests {
     /// so the airing/has-aired filters can be asserted without freezing the
     /// clock. Offsets are in minutes relative to the current instant.
     fn relative_guide() -> String {
-        use std::fmt::Write as _;
-        let now = chrono::Utc::now();
-        let mut xml = String::from(
-            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
-             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
-        );
-        for (channel, from, to, title, genre) in [
+        guide_of(&[
             // Already over, but inside the refresh's one-hour lead-in — an
             // airing that ended more than an hour ago is not in the guide
             // window at all, so upstream would not have it either and neither
@@ -6496,7 +6494,19 @@ mod tests {
             ("one.tv", -30, 30, "Now Playing", "Drama"),
             ("one.tv", 120, 180, "Later", "Comedy"),
             ("two.tv", -10, 50, "Two Now", "News"),
-        ] {
+        ])
+    }
+
+    /// A guide over the two [`M3U`] channels with `airings` as
+    /// `(channel, from, to, title, genre)`, offsets in minutes from now.
+    fn guide_of(airings: &[(&str, i64, i64, &str, &str)]) -> String {
+        use std::fmt::Write as _;
+        let now = chrono::Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        for &(channel, from, to, title, genre) in airings {
             let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
             let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
             let _ = write!(
@@ -6512,9 +6522,14 @@ mod tests {
     /// A manager whose guide holds [`relative_guide`] over the two [`M3U`]
     /// channels.
     async fn manager_with_relative_guide() -> FerrofinLiveTvManager {
+        manager_with_guide(relative_guide()).await
+    }
+
+    /// A manager whose guide is `guide` over the two [`M3U`] channels.
+    async fn manager_with_guide(guide: String) -> FerrofinLiveTvManager {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), relative_guide());
+        sources.insert("http://guide/xmltv.xml".to_owned(), guide);
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
             type_: Some("m3u".to_owned()),
@@ -8103,6 +8118,40 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         assert_eq!(titles(&mgr, &named).await, ["Two Now"]);
+    }
+
+    /// Name and genre filters compare clean values on both sides, as upstream
+    /// matches `CleanName == GetCleanValue(name)` and genre `CleanValue`s
+    /// (`BaseItemRepository.TranslateQuery.cs:476-477,658-662`). SQLite's own
+    /// `LOWER()` folds ASCII only, so a Cyrillic or accented title never
+    /// matched, and punctuation still told titles apart.
+    #[tokio::test]
+    async fn program_name_and_genre_filters_match_clean_values() {
+        let mgr = manager_with_guide(guide_of(&[
+            ("one.tv", -10, 50, "Новости", "Новости"),
+            ("one.tv", 60, 120, "Élan vital", "Émission"),
+            ("two.tv", -10, 50, "Bob's Burgers", "Animation"),
+        ]))
+        .await;
+        for (name, expected) in [
+            ("Новости", "Новости"),
+            ("ÉLAN VITAL", "Élan vital"),
+            ("Bob\u{2019}s Burgers", "Bob's Burgers"),
+        ] {
+            let named = InternalItemsQuery {
+                name: Some(name.to_owned()),
+                ..InternalItemsQuery::default()
+            };
+            assert_eq!(titles(&mgr, &named).await, [expected], "name {name}");
+        }
+        for (genre, expected) in [("Новости", "Новости"), ("émission", "Élan vital")]
+        {
+            let genres = InternalItemsQuery {
+                genres: vec![genre.to_owned()],
+                ..InternalItemsQuery::default()
+            };
+            assert_eq!(titles(&mgr, &genres).await, [expected], "genre {genre}");
+        }
     }
 
     #[tokio::test]
