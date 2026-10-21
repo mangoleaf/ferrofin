@@ -437,6 +437,20 @@ pub struct PathSubstitution {
     pub to: String,
 }
 
+/// Port of `LibraryManager.GetPathAfterNetworkSubstitution`: `path` rewritten
+/// by the first substitution whose `from` is a leading sub path of it
+/// ([`try_replace_sub_path`](ferrofin_util::path_extensions::try_replace_sub_path)),
+/// else unchanged.
+#[must_use]
+pub fn path_after_network_substitution(path: &str, substitutions: &[PathSubstitution]) -> String {
+    substitutions
+        .iter()
+        .find_map(|map| {
+            ferrofin_util::path_extensions::try_replace_sub_path(path, &map.from, &map.to)
+        })
+        .unwrap_or_else(|| path.to_owned())
+}
+
 /// A metadata plugin (name plus type).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

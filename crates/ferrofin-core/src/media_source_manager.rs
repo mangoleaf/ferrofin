@@ -16,6 +16,7 @@
 //! by dependency injection, never constructed here — they land at the Wave 8
 //! composition root.
 
+use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -71,6 +72,10 @@ pub struct FerrofinMediaSourceManager {
     /// runs ([`Self::visible_versions`]). With a resolved user and none
     /// configured the filter fails closed, as the library's lookups do.
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
+    /// The server configuration whose `PathSubstitutions` a source's path
+    /// goes through when the caller asks for path substitution
+    /// (`BaseItem.GetMappedPath`). Without it, paths are served as stored.
+    configuration: Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// Localization for the `MediaStream.Localized*` labels re-stamped on
     /// every read (the C# `MediaStreamRepository.Map` does the same — they are
     /// not persisted). `None` (unit tests) leaves them unset.
@@ -122,6 +127,7 @@ impl FerrofinMediaSourceManager {
             users: None,
             visibility: None,
             localization: None,
+            configuration: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
             probe_cache: Arc::new(Mutex::new(HashMap::new())),
             remote_probe: None,
@@ -243,6 +249,31 @@ impl FerrofinMediaSourceManager {
                 .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
                 .collect(),
         ))
+    }
+
+    /// Sets the server configuration whose `PathSubstitutions` map a source's
+    /// path when path substitution is asked for.
+    #[must_use]
+    pub fn with_configuration(
+        mut self,
+        configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.configuration = Some(configuration);
+        self
+    }
+
+    /// `BaseItem.GetMappedPath` over each source, the `enablePathSubstitution`
+    /// arm of `GetVersionInfo`. Without a configuration installed, nothing is
+    /// mapped.
+    async fn substitute_paths(&self, sources: &mut [MediaSourceInfo]) -> Result<(), ServiceError> {
+        let Some(configuration) = &self.configuration else {
+            return Ok(());
+        };
+        let configuration = configuration.configuration().await?;
+        for source in sources {
+            map_source_path(source, &configuration.path_substitutions);
+        }
+        Ok(())
     }
 
     /// Sets the localization the read-back `Localized*` stream labels come from.
@@ -879,6 +910,18 @@ fn derive_stream_getters(streams: &mut [MediaStream]) {
     for stream in streams {
         stream.display_title = stream.display_title();
         stream.populate_computed_fields();
+    }
+}
+
+/// Port of `BaseItem.GetMappedPath` for a source: a path on the file protocol
+/// after the configured `PathSubstitutions`
+/// (`LibraryManager.GetPathAfterNetworkSubstitution`); a remote source keeps
+/// its URL.
+pub(crate) fn map_source_path(source: &mut MediaSourceInfo, substitutions: &[PathSubstitution]) {
+    if source.protocol == MediaProtocol::File
+        && let Some(path) = source.path.as_mut()
+    {
+        *path = path_after_network_substitution(path, substitutions);
     }
 }
 
@@ -1540,7 +1583,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
     async fn get_static_media_sources(
         &self,
         item_id: Uuid,
-        _enable_path_substitution: bool,
+        enable_path_substitution: bool,
         user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let stored = self.items.retrieve_item(item_id).await?;
@@ -1581,6 +1624,9 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             // `EnablePlaybackRemuxing`.
             self.apply_playback_permissions(&mut sources, item_id, None, user_id)
                 .await?;
+            if enable_path_substitution {
+                self.substitute_paths(&mut sources).await?;
+            }
             return Ok(sources);
         }
         let Some(item) = stored else {
@@ -1660,6 +1706,9 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             crate::video_versions::put_resumed_version_first(&item, &mut sources, |id| {
                 data.get(&id)
             });
+        }
+        if enable_path_substitution {
+            self.substitute_paths(&mut sources).await?;
         }
         Ok(sources)
     }
@@ -2360,6 +2409,51 @@ mod tests {
         entity.data = Some(data.to_owned());
         entity.media_type = Some("Video".to_owned());
         crate::test_support::save_item(db, &entity).await;
+    }
+
+    /// `GetVersionInfo`'s `Path = enablePathSubstitution ? GetMappedPath(...)`
+    /// (`BaseItem.cs:1211`, `:2736`): with substitution asked for, a file
+    /// source's path goes through `PathSubstitutions`; a remote source and a
+    /// request without substitution keep the stored path.
+    #[tokio::test]
+    async fn path_substitution_maps_file_sources_only_when_asked() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mgr = manager(&db).with_configuration(
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/lib",
+                "//nas/lib",
+            )
+            .await,
+        );
+        let file = Uuid::from_u128(0x301);
+        let remote = Uuid::from_u128(0x302);
+        seed_strm(&db, file, "/lib/d.mkv", "{}").await;
+        seed_strm(
+            &db,
+            remote,
+            "/lib/a.strm",
+            r#"{"IsShortcut":true,"ShortcutPath":"https://origin/a.mp4"}"#,
+        )
+        .await;
+        let path = |id, substitute| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_static_media_sources(id, substitute, None)
+                    .await
+                    .expect("sources")
+                    .remove(0)
+                    .path
+            }
+        };
+
+        assert_eq!(path(file, true).await.as_deref(), Some("//nas/lib/d.mkv"));
+        assert_eq!(path(file, false).await.as_deref(), Some("/lib/d.mkv"));
+        assert_eq!(
+            path(remote, true).await.as_deref(),
+            Some("https://origin/a.mp4")
+        );
     }
 
     /// `BaseItem.GetVersionInfo`'s shortcut arm: a `.strm` whose `ShortcutPath`

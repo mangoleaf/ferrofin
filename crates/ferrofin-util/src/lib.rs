@@ -13,6 +13,7 @@ pub mod error;
 pub mod file_helper;
 pub mod formatting_stream_writer;
 pub mod guid_extensions;
+pub mod path_extensions;
 pub mod path_helper;
 pub mod read_only_list_extension;
 pub mod shuffle_extensions;
