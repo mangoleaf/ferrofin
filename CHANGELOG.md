@@ -229,6 +229,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- The Playlists folder is created with Jellyfin's dates: created and modified from its
+  directory, and saved now. Before, it had no modified or saved date. A one-off startup
+  repair fills the dates missing from the Playlists folder and the Collections library
+  that earlier versions created, and leaves every other library alone
 
 ## [1.0.0] - 2026-09-05
 

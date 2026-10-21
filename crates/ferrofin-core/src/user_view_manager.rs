@@ -564,7 +564,9 @@ impl FerrofinUserViewManager {
         tokio::fs::create_dir_all(playlists_path)
             .await
             .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
-        let entity = crate::aggregate_folder::playlists_folder_row(id, playlists_path, parent);
+        let dir = tokio::fs::metadata(playlists_path).await.ok();
+        let entity =
+            crate::aggregate_folder::playlists_folder_row(id, playlists_path, parent, dir.as_ref());
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;

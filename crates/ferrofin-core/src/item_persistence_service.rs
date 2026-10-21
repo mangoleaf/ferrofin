@@ -1268,6 +1268,85 @@ impl FerrofinItemPersistenceService {
         Ok(repaired)
     }
 
+    /// One-shot startup pass: dates the container rows older builds created
+    /// with dates missing, which [`Self::repair_named_item_rows`] does not
+    /// select: the `PlaylistsFolder` (provisioned with `DateCreated` only)
+    /// and the Collections `CollectionFolder` at `collections_path`. A library
+    /// is never selected: every library is a `CollectionFolder`, so the type
+    /// alone would take them all.
+    ///
+    /// Only NULL dates are filled, so a row Jellyfin wrote keeps its own.
+    /// `DateCreated` and `DateModified` come from the row's directory, as
+    /// `CreateRootFolder` dates a folder it creates, or are now when it cannot
+    /// be read; `DateLastSaved` is now.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under `container_dates_v1`.
+    /// Returns the number of rows repaired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the read or the transaction fails. The
+    /// marker is written inside the transaction, so a failure retries on the
+    /// next boot.
+    pub async fn repair_container_dates(
+        &self,
+        collections_path: &str,
+    ) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "container_dates_v1";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let type_name = |kind: BaseItemKind| {
+            stored_type_name(kind)
+                .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))
+        };
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "Id", "Path" FROM "BaseItems"
+               WHERE ("Type" = ?1 OR ("Type" = ?2 AND "Path" = ?3))
+                 AND ("DateCreated" IS NULL OR "DateModified" IS NULL
+                      OR "DateLastSaved" IS NULL)"#,
+        )
+        .bind(type_name(BaseItemKind::PlaylistsFolder)?)
+        .bind(type_name(BaseItemKind::CollectionFolder)?)
+        .bind(collections_path)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let now = chrono::Utc::now();
+        let mut dated = Vec::with_capacity(rows.len());
+        for (id, path) in rows {
+            let dir = match path {
+                Some(path) => tokio::fs::metadata(path).await.ok(),
+                None => None,
+            };
+            let (created, modified) = dir
+                .as_ref()
+                .map_or((now, now), crate::library_scan::created_and_modified);
+            dated.push((id, created, modified));
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut repaired: u64 = 0;
+        for (id, created, modified) in &dated {
+            let written = sqlx::query(
+                r#"UPDATE "BaseItems" SET "DateCreated" = COALESCE("DateCreated", ?2),
+                       "DateModified" = COALESCE("DateModified", ?3),
+                       "DateLastSaved" = COALESCE("DateLastSaved", ?4)
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .bind(datetime_to_db(*created))
+            .bind(datetime_to_db(*modified))
+            .bind(datetime_to_db(now))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            repaired += written.rows_affected();
+        }
+        Self::mark_repair_done_in(&mut tx, META_KEY).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(repaired)
+    }
+
     /// One-shot startup pass: recomputes `InheritedParentalRatingValue` /
     /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
     /// — Jellyfin's `MigrateRatingLevels` routine, as 12.2 re-dated it
@@ -10741,6 +10820,142 @@ mod tests {
                 .await
                 .date_created
                 .is_none()
+        );
+    }
+
+    /// The Playlists folder and the Collections library an older build
+    /// created get their missing dates from their directories, a stored date
+    /// is kept, a user library is left alone, and the pass runs once.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn the_container_date_repair_fills_only_missing_container_dates_once() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("date")
+                .with_timezone(&chrono::Utc)
+        };
+        // A directory written at `written` (and changed now), so its .NET
+        // creation time is the older of the two: `written`.
+        let dir = |name: &str, written: chrono::DateTime<chrono::Utc>| {
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(&path).expect("dir");
+            std::fs::File::open(&path)
+                .expect("open dir")
+                .set_modified(written.into())
+                .expect("set mtime");
+            path.to_string_lossy().into_owned()
+        };
+        let (playlists, collections, library) = (
+            Uuid::from_u128(0xD0A1),
+            Uuid::from_u128(0xD0A2),
+            Uuid::from_u128(0xD0A3),
+        );
+        let playlists_written = at("2020-01-02T03:04:05Z");
+        let collections_written = at("2021-06-07T08:09:10Z");
+        let collections_path = dir("collections", collections_written);
+        let movies_path = dir("movies", collections_written);
+        let playlists_path = dir("playlists", playlists_written);
+        // Playlists: the boot provisioning stored `DateCreated` only.
+        // Collections: `ensure_container` stored no date at all. Movies: a
+        // user library, undated, the same type and not the repair's to touch.
+        for (id, kind, name, path, created) in [
+            (
+                playlists,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                &playlists_path,
+                Some("2026-05-05 00:00:00.0000000"),
+            ),
+            (
+                collections,
+                BaseItemKind::CollectionFolder,
+                "Collections",
+                &collections_path,
+                None,
+            ),
+            (
+                library,
+                BaseItemKind::CollectionFolder,
+                "Movies",
+                &movies_path,
+                None,
+            ),
+        ] {
+            super::insert_named_item(&db, id, kind, name, true, None)
+                .await
+                .expect("row");
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "Path" = ?2, "DateCreated" = ?3,
+                       "DateModified" = NULL, "DateLastSaved" = NULL
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(path)
+            .bind(created)
+            .execute(db.writer())
+            .await
+            .expect("undated");
+        }
+
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let before = chrono::Utc::now();
+        assert_eq!(
+            service
+                .repair_container_dates(&collections_path)
+                .await
+                .expect("repair"),
+            2
+        );
+        let after = chrono::Utc::now();
+
+        let row = crate::test_support::fetch_item(&db, playlists).await;
+        assert_eq!(
+            row.date_created.map(|d| d.to_rfc3339()).as_deref(),
+            Some("2026-05-05T00:00:00+00:00"),
+            "a stored date is kept"
+        );
+        assert_eq!(row.date_modified, Some(playlists_written));
+        let saved = row.date_last_saved.expect("saved");
+        assert!((before..=after).contains(&saved), "{saved}");
+        let row = crate::test_support::fetch_item(&db, collections).await;
+        assert_eq!(row.date_created, Some(collections_written));
+        assert_eq!(row.date_modified, Some(collections_written));
+        let saved = row.date_last_saved.expect("saved");
+        assert!((before..=after).contains(&saved), "{saved}");
+        let row = crate::test_support::fetch_item(&db, library).await;
+        assert_eq!(
+            (row.date_created, row.date_modified, row.date_last_saved),
+            (None, None, None)
+        );
+
+        // Second boot: the marker skips the pass.
+        sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(collections))
+            .execute(db.writer())
+            .await
+            .expect("undated again");
+        assert_eq!(
+            service
+                .repair_container_dates(&collections_path)
+                .await
+                .expect("repair"),
+            0
+        );
+        assert_eq!(
+            db.meta_get("container_dates_v1")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
+        assert!(
+            crate::test_support::fetch_item(&db, collections)
+                .await
+                .date_last_saved
+                .is_none(),
+            "the marker kept the pass from writing"
         );
     }
 

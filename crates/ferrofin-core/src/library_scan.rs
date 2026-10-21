@@ -18274,6 +18274,15 @@ fn creation_time_from(times: &FileTimes) -> std::time::SystemTime {
     times.birth.unwrap_or_else(|| times.ctime.min(times.mtime))
 }
 
+/// `CreationTimeUtc` and `LastWriteTimeUtc` of a directory's metadata, the
+/// dates `CreateRootFolder` gives a folder it creates.
+pub(crate) fn created_and_modified(
+    meta: &std::fs::Metadata,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    let times = FileTimes::of(meta);
+    (creation_time_from(&times).into(), times.mtime.into())
+}
+
 /// The final path component, extension included — upstream's
 /// `FileSystemMetadata.Name`, which resolvers match entry names against.
 fn entry_name(path: &str) -> &str {

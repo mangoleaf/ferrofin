@@ -397,6 +397,23 @@ pub async fn build_app_state(
             tracing::warn!(%err, "box set and playlist repair failed; a renamed playlist may not be found by its new name until the next boot retries it");
         }
     }
+    // One-shot: the Playlists folder and the Collections library an older
+    // build created were left without some of their dates.
+    match item_persistence_impl
+        .repair_container_dates(&format!("{}/collections", paths.data_path()))
+        .await
+    {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "backfilled dates of the playlists folder and the collections library"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "container date repair failed; the playlists folder or the collections library stays undated until the next boot retries it");
+        }
+    }
     // One-shot: fold every localized `UserView` (id derived from its translated
     // name, the 10.11 rule) onto the name-independent id Jellyfin 12.0 derives
     // from the view type, moving children, ancestors and per-user settings.
