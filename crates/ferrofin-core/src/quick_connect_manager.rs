@@ -507,7 +507,7 @@ mod tests {
             _device_id: &str,
             _device_name: &str,
             _remote_endpoint: &str,
-            _user: &ferrofin_db::entities::users::UserEntity,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
             unimplemented!()
         }

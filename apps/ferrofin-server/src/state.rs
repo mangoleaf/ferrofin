@@ -2269,6 +2269,7 @@ pub async fn build_app_state(
         ),
     );
     config_mgr.add_configuration_listener(app_host.configuration_listener());
+    app_host.warn_if_published_url_base_path_differs();
     app_host
         .refresh_server_name()
         .await
@@ -2446,6 +2447,17 @@ pub async fn build_app_state(
     // Image serving runs through the real `image`-crate processor so
     // `maxWidth`/`format`/… requests resize/convert instead of serving the original.
     let state = state.with_image_processor(Arc::clone(&image_processor));
+
+    // `/health` and `/health/ready` check the database, as upstream's
+    // `DbContextFactoryHealthCheck` does.
+    let health_db = db.clone();
+    let state = state.with_health_checkers(vec![Arc::new(ferrofin_health::FnChecker::new(
+        "database",
+        move || {
+            let db = health_db.clone();
+            async move { db.can_connect().await.map_err(|e| e.to_string()) }
+        },
+    ))]);
 
     // Replace the `NoopLibraryMonitor` default with the webhook-driven monitor
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
@@ -3049,6 +3061,62 @@ mod tests {
             https_port: 8920,
             ..Config::test_stub(root)
         }
+    }
+
+    /// `/health` and `/health/ready` run a real database check (upstream
+    /// `DbContextFactoryHealthCheck`): healthy while the database answers,
+    /// 503 once it cannot.
+    #[tokio::test]
+    async fn health_probes_check_the_database() {
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        let config = test_config(tmp.path());
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory db opens");
+        db.run_migrations().await.expect("migrations apply");
+        let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+            chromaprint_muxer: false,
+        };
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
+            .await
+            .expect("app state wires");
+        let router = ferrofin_api::create_router(wired.state.clone());
+        let status = |path: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("infallible router")
+                    .status()
+            }
+        };
+
+        assert_eq!(status("/health").await, axum::http::StatusCode::OK);
+        assert_eq!(status("/health/ready").await, axum::http::StatusCode::OK);
+
+        db.close().await;
+        assert_eq!(
+            status("/health").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status("/health/ready").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

@@ -97,7 +97,10 @@ impl PluginManager for EnabledStub {
 }
 
 /// Library stub: records the query, returns one canned movie row. Only
-/// `get_item_list` is reachable from `query-items`; everything else panics.
+/// `get_item_list` (from `query-items` and the analysis pass) and
+/// `get_item_ids` (the analysis pass) are reachable; everything else
+/// panics. `seen` holds the last filter query: a lookup by id, the analysis
+/// pass loading a page, does not replace it.
 pub struct OneMovieLibrary {
     pub seen: Mutex<Option<InternalItemsQuery>>,
 }
@@ -130,14 +133,21 @@ impl LibraryManager for OneMovieLibrary {
     ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
         unimplemented!("stub")
     }
-    async fn get_item_ids(&self, _query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!("stub")
+    async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        *self.seen.lock().unwrap() = Some(query.clone());
+        Ok(vec![
+            Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01").unwrap(),
+        ])
     }
     async fn get_item_list(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        *self.seen.lock().unwrap() = Some(query.clone());
+        // A lookup by id is the analysis pass loading a page of the ids it
+        // queried: `seen` keeps that query.
+        if query.item_ids.is_empty() {
+            *self.seen.lock().unwrap() = Some(query.clone());
+        }
         let entity = BaseItemEntity {
             id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEFF01".to_owned(),
             name: Some("Big Buck Bunny".to_owned()),
