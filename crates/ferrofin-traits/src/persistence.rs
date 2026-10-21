@@ -1559,6 +1559,20 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The ids of the unlocked `MusicArtist` rows accessed by name (no
+    /// `ParentId`) whose `CleanName` no artist or album-artist value an item
+    /// still maps to carries, in id order: the by-name artists the library
+    /// no longer credits (upstream `ArtistsValidator`'s dead artists).
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn dead_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
     /// Stamps `DateLastRefreshed = at` on existing rows, with the
     /// `DateLastSaved = at` of the save that records it, and nothing else —
     /// the record of a completed refresh of an item whose refresh wrote
