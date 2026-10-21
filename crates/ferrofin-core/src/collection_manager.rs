@@ -57,7 +57,7 @@ use ferrofin_traits::collections::{
     PlaylistManager,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, UserManager};
+use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, UserManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
 use ferrofin_traits::providers::{
@@ -533,6 +533,9 @@ pub struct FerrofinCollectionManager {
     /// Queues the box set's refresh after a membership change
     /// ([`queue_refresh`]). `None` in unit tests: nothing is queued.
     providers: Option<Arc<dyn ProviderManager>>,
+    /// Brackets the folder a new box set is made in, as `CollectionManager.CreateCollectionAsync` does
+    /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -558,7 +561,17 @@ impl FerrofinCollectionManager {
             paths,
             visibility: None,
             providers: None,
+            self_writes: None,
         }
+    }
+
+    /// Brackets each new box set's folder on `guard`, so the library monitor
+    /// takes it for the server's own write. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Queues a box set's provider refresh after it is created or its members
@@ -619,6 +632,8 @@ impl CollectionManager for FerrofinCollectionManager {
         let collections = format!("{}/collections", self.paths.data_path());
         let (path, id) =
             new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
+        // `ReportFileSystemChangeBeginning(path)` around the whole create.
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), &path);
         // The row and its path commit together, so no box set is ever
         // stored without the folder it was made with.
         let written = async {
@@ -906,6 +921,9 @@ pub struct FerrofinPlaylistManager {
     /// Queues the playlist's refresh after its entries change
     /// ([`queue_refresh`]). `None` in unit tests: nothing is queued.
     providers: Option<Arc<dyn ProviderManager>>,
+    /// Brackets the folder a new playlist is made in, as `PlaylistManager.CreatePlaylist` does
+    /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -932,7 +950,17 @@ impl FerrofinPlaylistManager {
             visibility: None,
             entry_edits: Arc::default(),
             providers: None,
+            self_writes: None,
         }
+    }
+
+    /// Brackets each new playlist's folder on `guard`, so the library monitor
+    /// takes it for the server's own write. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Queues a playlist's provider refresh after entries are added or
@@ -1285,6 +1313,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // for.
         let playlists = format!("{}/playlists", self.paths.data_path());
         let (path, id) = new_playlist_folder_and_id(&self.db, &mode, &playlists, &name).await?;
+        // `ReportFileSystemChangeBeginning(path)` around the whole create.
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), &path);
         // One writer transaction: a playlist row committed without its owner
         // row would open to every caller as its owner (`decide_access`), and
         // no boot import could repair it.

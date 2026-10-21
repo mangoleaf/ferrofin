@@ -1387,6 +1387,7 @@ fn extract_embedded_lyrics(
     probed: &mut MediaInfo,
     replace_all: bool,
     save_with_media: bool,
+    self_writes: Option<&Arc<dyn ferrofin_traits::library::SelfWriteGuard>>,
 ) -> Result<(), ServiceError> {
     let try_extract = !probed
         .media_source
@@ -1418,7 +1419,8 @@ fn extract_embedded_lyrics(
         internal.as_deref().map(std::path::Path::new),
         "lrc",
     );
-    let Some(saved) = crate::lyric_manager::try_save_to_files(&targets, &lyrics)? else {
+    let Some(saved) = crate::lyric_manager::try_save_to_files(&targets, &lyrics, self_writes)?
+    else {
         return Ok(());
     };
     tracing::debug!(path = %saved.display(), "saved embedded lyrics");
@@ -3596,6 +3598,10 @@ pub struct LibraryScanner {
     /// materialized itself — Jellyfin's carry one and the DTO emits it
     /// unconditionally. Absent → those rows keep a `NULL` `Path`.
     by_name: Option<crate::by_name_store::ByNameStore>,
+    /// Brackets the files the scan writes beside the media (embedded lyrics
+    /// saved as `.lrc`), as upstream's `LyricManager` does. `None` in unit
+    /// tests.
+    self_writes: Option<Arc<dyn ferrofin_traits::library::SelfWriteGuard>>,
     /// Studio artwork-repository client for the post-scan studio-thumb pass.
     /// Absent → Studio rows keep whatever images they already have.
     studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
@@ -3833,6 +3839,7 @@ impl LibraryScanner {
             item_repository: None,
             years: None,
             by_name: None,
+            self_writes: None,
             studios_client: None,
             metadata_dir: None,
             people: None,
@@ -4077,6 +4084,18 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
         self.years = Some(years);
+        self
+    }
+
+    /// Brackets the files the scan writes beside the media (embedded lyrics
+    /// saved as `.lrc`) on `guard`, so the library monitor takes them for the
+    /// server's own writes. Called once by the composition root.
+    #[must_use]
+    pub fn with_self_writes(
+        mut self,
+        guard: Arc<dyn ferrofin_traits::library::SelfWriteGuard>,
+    ) -> Self {
+        self.self_writes = Some(guard);
         self
     }
 
@@ -6733,6 +6752,7 @@ impl LibraryScanner {
                 info,
                 options.replace_all_metadata,
                 policy.options.is_some_and(|o| o.save_lyrics_with_media),
+                self.self_writes.as_ref(),
             )
             .err()
         } else {
