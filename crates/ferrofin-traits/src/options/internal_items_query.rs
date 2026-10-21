@@ -395,7 +395,9 @@ pub struct InternalItemsQuery {
     pub force_direct: bool,
     /// Provider ids to exclude (name → value).
     pub exclude_provider_ids: Option<HashMap<String, String>>,
-    /// Whether results are grouped by metadata key.
+    /// Whether the caller de-duplicates the rows by metadata key itself: the
+    /// list queries then read 4 rows past `limit` for it to drop
+    /// (`BaseItemRepository.PrepareFilterQuery`).
     pub enable_group_by_metadata_key: bool,
     /// Restrict to items with chapter images.
     pub has_chapter_images: Option<bool>,
