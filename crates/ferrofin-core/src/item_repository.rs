@@ -3410,6 +3410,34 @@ impl ItemRepository for FerrofinItemRepository {
             .collect())
     }
 
+    async fn get_image_infos_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map: std::collections::HashMap<Uuid, Vec<ItemImageInfo>> =
+            std::collections::HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
+                images_of_items_sql(&placeholders),
+            ));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(item_id)
+                        .or_default()
+                        .push(image_info_from_row(row, &self.virtual_paths));
+                }
+            }
+        }
+        Ok(map)
+    }
+
     async fn swap_item_images(
         &self,
         item_id: Uuid,
