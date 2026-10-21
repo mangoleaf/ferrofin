@@ -3670,6 +3670,23 @@ impl ItemRepository for FerrofinItemRepository {
         self.distinct_years(scoped.as_ref().unwrap_or(filter)).await
     }
 
+    async fn get_tag_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        // `BaseItemRepository.GetTagNames` (v12.2 `ByName.cs:121-147`) takes the
+        // `Tags` values of the items `TranslateQuery` matches, grouped by
+        // `CleanValue`, `MIN(Value)` per group, ordered by that value: the
+        // legacy facet's own statement. `LibraryManager.GetTagNames` applies
+        // `AddUserToQuery` and `SetTopParentOrAncestorIds` first; the view
+        // resolution here applies the user's libraries as the other facets
+        // do. TODO(gl-807): it does not rewrite an all-view/library ancestor
+        // scope to `TopParentIds` as `SetTopParentOrAncestorIds` does.
+        let scoped = self.resolve_views(filter).await?;
+        self.distinct_item_values(scoped.as_ref().unwrap_or(filter), ItemValueType::Tags)
+            .await
+    }
+
     async fn get_is_played(
         &self,
         user: &UserEntity,
@@ -3851,31 +3868,42 @@ impl FerrofinItemRepository {
         // One entry per CLEANED value (upstream GetQueryFiltersLegacy groups by
         // CleanValue and keeps MIN(Value)), so "Sci-Fi"/"Sci-fi" case variants
         // collapse instead of doubling the filter dialog's list.
-        //
-        // `CROSS JOIN` pins the join order to iv → ivm → bi: the values of the
-        // type, their map rows by the map's primary key, the item by its own.
-        // Left to itself the planner — with no `sqlite_stat1` to tell it the
-        // user-scope `TopParentId IN (…)` matches every item there is — pairs
-        // every value with every item under the user's libraries and probes
-        // the map for each pair: 38 genres × 21k items ≈ 800k probes, 820 ms
-        // for the genre facet of `/Items/Filters` on the bench library; pinned,
-        // it is one probe per map row of the type.
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
-               CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
-               CROSS JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
-               WHERE iv."Type" = "#,
-        );
-        qb.push_bind(i64::from(i32::from(value_type)));
-        qb.push(r#" AND bi."Id" <> "#);
-        qb.push_bind(PLACEHOLDER_ID);
-        append_predicates(&mut qb, filter);
-        qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
-        qb.build_query_scalar()
+        item_values_statement(filter, value_type)
+            .build_query_scalar()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
     }
+}
+
+/// The statement [`FerrofinItemRepository::distinct_item_values`] runs: one
+/// `MIN("Value")` per `CleanValue` of `value_type`, over the items `filter`
+/// matches, ordered by that value.
+///
+/// `CROSS JOIN` pins the join order to iv → ivm → bi: the values of the type,
+/// their map rows by the map's primary key, the item by its own. Left to
+/// itself the planner — with no `sqlite_stat1` to tell it the user-scope
+/// `TopParentId IN (…)` matches every item there is — pairs every value with
+/// every item under the user's libraries and probes the map for each pair:
+/// 38 genres × 21k items ≈ 800k probes, 820 ms for the genre facet of
+/// `/Items/Filters` on the bench library; pinned, it is one probe per map row
+/// of the type. `item_values_statement_walks_values_then_map_then_items` pins it.
+fn item_values_statement(
+    filter: &InternalItemsQuery,
+    value_type: ItemValueType,
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
+           CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+           CROSS JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
+           WHERE iv."Type" = "#,
+    );
+    qb.push_bind(i64::from(i32::from(value_type)));
+    qb.push(r#" AND bi."Id" <> "#);
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
+    qb
 }
 
 /// Builds a `?, ?, …` placeholder list of length `n` (at least one).
@@ -8133,6 +8161,190 @@ mod tests {
             "a box set's linked member is not its child"
         );
         assert!(audio(set).await.is_empty());
+    }
+
+    /// Upstream's `BaseItemRepositoryItemValueTests.GetTagNames_GroupsAndFiltersItemValues`
+    /// (Jellyfin 12.1, `ca06ccfa13`), the oracle for `/Items/Filters2`'s tags:
+    /// one name per clean value (its smallest spelling), only `Tags` (not
+    /// `InheritedTags` or a genre), only from the requested kinds.
+    #[tokio::test]
+    async fn tag_names_group_by_clean_value_and_keep_only_tags_of_the_kinds() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xA3D0)).await;
+        let ids: Vec<_> = (0xA3D1..0xA3D4).map(Uuid::from_u128).collect();
+        let (movie, other_movie, audio) = (ids[0], ids[1], ids[2]);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_named_item(&db, other_movie, BaseItemKind::Movie, "Other Movie").await;
+        seed_named_item(&db, audio, BaseItemKind::Audio, "Excluded Audio").await;
+        seed_library_over(&db, &ids).await;
+        for (item, value_type, value) in [
+            (movie, ItemValueType::Tags, "Alpha"),
+            (movie, ItemValueType::Tags, "alpha"),
+            (other_movie, ItemValueType::Tags, "Beta"),
+            (movie, ItemValueType::InheritedTags, "Inherited"),
+            (movie, ItemValueType::Genre, "Genre Leak"),
+            (audio, ItemValueType::Tags, "Excluded Tag"),
+        ] {
+            seed_item_value(&db, item, value_type, value).await;
+        }
+
+        let tags = repository
+            .get_tag_names(&InternalItemsQuery {
+                user: Some(user),
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("tag names");
+        assert_eq!(tags, ["Alpha", "Beta"]);
+    }
+
+    /// The tag facet honours the scope `/Items/Filters2` hands it: a parent's
+    /// descendants (`AncestorIds`) or its direct children (a strict parent),
+    /// and an unscoped query is confined to the libraries the user may open.
+    #[tokio::test]
+    async fn tag_names_follow_the_facet_scope() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let ids: Vec<_> = (0xA5D1..0xA5D8).map(Uuid::from_u128).collect();
+        let (folder, sub, child, grandchild, elsewhere) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        let (hidden_library, hidden) = (ids[5], ids[6]);
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Kids", None).await;
+        seed_folder_item(&db, sub, BaseItemKind::Folder, "Classics", Some(folder)).await;
+        seed_child_item(&db, child, BaseItemKind::Movie, "Film A", folder).await;
+        seed_child_item(&db, grandchild, BaseItemKind::Movie, "Film B", sub).await;
+        seed_named_item(&db, elsewhere, BaseItemKind::Movie, "Other Film").await;
+        let library = seed_library_over(&db, &ids[..5]).await;
+        seed_named_item(
+            &db,
+            hidden_library,
+            BaseItemKind::CollectionFolder,
+            "Hidden",
+        )
+        .await;
+        seed_top_parented_item(
+            &db,
+            hidden,
+            BaseItemKind::Movie,
+            "Hidden Film",
+            hidden_library,
+        )
+        .await;
+        for (item, ancestor) in [
+            (sub, folder),
+            (child, folder),
+            (grandchild, sub),
+            (grandchild, folder),
+        ] {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?, ?)"#)
+                .bind(guid_to_db(item))
+                .bind(guid_to_db(ancestor))
+                .execute(db.writer())
+                .await
+                .expect("ancestor row");
+        }
+        for (item, tag) in [
+            (child, "Near"),
+            (grandchild, "Deep"),
+            (elsewhere, "Far"),
+            (hidden, "Hidden"),
+        ] {
+            seed_item_value(&db, item, ItemValueType::Tags, tag).await;
+        }
+        let user_id = Uuid::from_u128(0xA5D0);
+        let user = seed_user_with_defaults(&db, user_id).await;
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::EnableAllFolders,
+            false,
+        )
+        .await
+        .expect("restrict the user");
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[library]).await;
+
+        let base = InternalItemsQuery {
+            user: Some(user),
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        };
+        let tags = |query: InternalItemsQuery| {
+            let repository = &repository;
+            async move { repository.get_tag_names(&query).await.expect("tag names") }
+        };
+        assert_eq!(tags(base.clone()).await, ["Deep", "Far", "Near"]);
+        assert_eq!(
+            tags(InternalItemsQuery {
+                ancestor_ids: vec![folder],
+                ..base.clone()
+            })
+            .await,
+            ["Deep", "Near"]
+        );
+        assert_eq!(
+            tags(InternalItemsQuery {
+                parent_id: folder,
+                physical_children_only: true,
+                ..base
+            })
+            .await,
+            ["Near"]
+        );
+    }
+
+    /// Plan pin for the tag facet (`/Items/Filters2`; the legacy facet set's
+    /// genres and tags run the same statement): the `CROSS JOIN` order holds,
+    /// the type's values first, then their map rows, then each item by a point
+    /// probe on its `Id` (the primary key, or under a user scope
+    /// `IX_BaseItems_Type_TopParentId_Id` ending in `Id=?`).
+    #[tokio::test]
+    async fn item_values_statement_walks_values_then_map_then_items() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let libraries = [Uuid::from_u128(0xA4D1), Uuid::from_u128(0xA4D2)];
+        // Unscoped, under a strict parent, and a user-scoped statement
+        // (`TopParentId IN (…)`) with an ancestor scope.
+        for (parent, top_parent_ids, ancestor_ids) in [
+            (Uuid::nil(), vec![], vec![]),
+            (Uuid::from_u128(0xA4D0), vec![], vec![]),
+            (Uuid::nil(), libraries.to_vec(), vec![libraries[0]]),
+        ] {
+            let filter = InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                parent_id: parent,
+                physical_children_only: !parent.is_nil(),
+                top_parent_ids,
+                ancestor_ids,
+                ..InternalItemsQuery::default()
+            };
+            let mut qb = item_values_statement(&filter, ItemValueType::Tags);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            let at = |prefix: &str| {
+                plan.iter()
+                    .position(|d| d.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("no {prefix}: {plan:#?}"))
+            };
+            let (iv, ivm, bi) = (at("SEARCH iv "), at("SEARCH ivm "), at("SEARCH bi "));
+            assert!(iv < ivm && ivm < bi, "{plan:#?}");
+            // A point probe by the map row's item: the primary key, or under a
+            // user scope `IX_BaseItems_Type_TopParentId_Id` ending in `Id=?` (a
+            // `TopParentId=?` range of the library's items would not do).
+            assert!(
+                plan[bi].ends_with("(Id=?)") || plan[bi].ends_with(" AND Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(!plan.iter().any(|d| d.starts_with("SCAN ")), "{plan:#?}");
+        }
     }
 
     /// Plan pin for the by-name semijoin under a parent (`/Items/Filters2?recursive=false`

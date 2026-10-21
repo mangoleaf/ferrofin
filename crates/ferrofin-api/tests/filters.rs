@@ -352,6 +352,10 @@ struct StubLibrary {
     /// An extra item [`LibraryManager::get_item_by_id`] knows, stored as the
     /// given kind: the `parentId` a test passes.
     parent: Option<(Uuid, BaseItemKind)>,
+    /// The last query passed to [`LibraryManager::get_query_filters_legacy`],
+    /// which the trait's default `get_tag_names` (the Filters2 tag facet)
+    /// reads.
+    last_legacy_query: Mutex<Option<InternalItemsQuery>>,
 }
 
 #[async_trait]
@@ -428,8 +432,9 @@ impl LibraryManager for StubLibrary {
     }
     async fn get_query_filters_legacy(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
+        *self.last_legacy_query.lock().expect("legacy query lock") = Some(query.clone());
         Ok(QueryFiltersLegacy {
             genres: vec!["Action".to_owned()],
             tags: vec!["Cult".to_owned()],
@@ -1049,25 +1054,56 @@ async fn items_filters2_music_type_uses_music_genres() {
 }
 
 #[tokio::test]
-async fn items_filters2_leaves_tags_empty() {
-    // Pins today's behaviour, which is Jellyfin 10.11/12.0's: `GetQueryFilters`
-    // assigned only `filters.Genres`, so `Tags` stayed at the `QueryFilters`
-    // constructor's `Array.Empty<string>()`. TODO(12.1 parity): v12.1+ fills it
-    // with `GetTagNames(tagQuery)` (v12.2 `FilterController.cs:240`); porting
-    // that replaces this test.
-    let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
+async fn items_filters2_fills_tags_from_the_tag_names() {
+    // Jellyfin 12.1+ `filters.Tags = _libraryManager.GetTagNames(tagQuery)`
+    // (v12.2 `FilterController.cs:240`). The stub answers tags only through its
+    // legacy facet set, which the trait's default `get_tag_names` reads.
+    // It runs for every type set: music, and a lone Trailer, included.
+    for types in ["Movie", "Audio", "Trailer"] {
+        let (status, body) = get(&format!("/Items/Filters2?includeItemTypes={types}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
+        assert_eq!(filters.tags, vec!["Cult".to_owned()], "{types}");
+    }
+}
+
+#[tokio::test]
+async fn items_filters2_tag_query_is_the_genre_querys_twin() {
+    // `tagQuery` (v12.2 `FilterController.cs:181-196`) takes the genre query's
+    // user, types and live-TV flags, and the same parent scope (`:198-210`):
+    // unlike the stream-language query it neither includes owned items nor
+    // widens a show set to its episodes.
+    let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Folder)),
+        ..StubLibrary::default()
+    });
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!(
+            "/Items/Filters2?userId={USER_ID}&includeItemTypes=Series&parentId={parent}\
+             &isSeries=true&recursive=false"
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
-    assert!(
-        filters.tags.is_empty(),
-        "Filters2 must not invent a tag facet Jellyfin never populates: {:?}",
-        filters.tags
-    );
-    // ...while the legacy route does carry tags, so the assertion above is a real
-    // constraint on Filters2 and not just an empty stub bleeding through.
-    let (_, legacy_body) = get("/Items/Filters?includeItemTypes=Movie").await;
-    let legacy: QueryFiltersLegacy = serde_json::from_slice(&legacy_body).expect("legacy filters");
-    assert_eq!(legacy.tags, vec!["Cult".to_owned()]);
+    let tag = library
+        .last_legacy_query
+        .lock()
+        .expect("tag query lock")
+        .clone()
+        .expect("tag names read");
+    let genre = library
+        .last_genre_query
+        .lock()
+        .expect("genre query lock")
+        .clone()
+        .expect("get_genres called");
+    assert_eq!(tag, genre);
+    assert_eq!(tag.include_item_types, vec![BaseItemKind::Series]);
+    assert!(!tag.include_owned_items);
+    assert_eq!(tag.parent_id, parent);
+    assert_eq!(tag.user_id(), Some(USER_ID));
 }
 
 /// Runs `/Items/Filters2` over a parent of `kind` (or an unknown parent when

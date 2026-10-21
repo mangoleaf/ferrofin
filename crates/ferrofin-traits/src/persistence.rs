@@ -617,6 +617,21 @@ pub trait ItemRepository: Send + Sync {
         Ok(self.get_query_filters_legacy(filter).await?.years)
     }
 
+    /// Gets the tag names of the matching items, one per clean value, in value
+    /// order — the one facet `/Items/Filters2` needs from the legacy set. See
+    /// [`LibraryManager::get_tag_names`].
+    ///
+    /// The default reads the whole legacy filter aggregate; an implementation
+    /// that can answer the tags alone should override this.
+    ///
+    /// [`LibraryManager::get_tag_names`]: crate::library::LibraryManager::get_tag_names
+    async fn get_tag_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(filter).await?.tags)
+    }
+
     /// Reports whether all children of `id` are played for the given user.
     async fn get_is_played(
         &self,

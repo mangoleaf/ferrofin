@@ -5,13 +5,9 @@
 //! - `GET /Items/Filters`  — the legacy flat-string facets ([`QueryFiltersLegacy`]:
 //!   genres, tags, official ratings, years) aggregated over a parent's items.
 //! - `GET /Items/Filters2` — the richer facets ([`QueryFilters`]: genre
-//!   name/id pairs, and since Jellyfin 12 the audio and subtitle stream
-//!   languages as `{Name, Value}` pairs for movie and TV type sets). Its `Tags`
-//!   array is still always empty, as `FilterController.GetQueryFilters` left it
-//!   through 12.0. TODO(12.1 parity): v12.1+ fills it with
-//!   `_libraryManager.GetTagNames(tagQuery)` (v12.2 `FilterController.cs:240`,
-//!   upstream ca06ccfa13) — port it with the same parent scope as the genre
-//!   query. Only the legacy `/Items/Filters` facet set carries tags today.
+//!   name/id pairs, the tag names (Jellyfin 12.1+), and since Jellyfin 12 the
+//!   audio and subtitle stream languages as `{Name, Value}` pairs for movie and
+//!   TV type sets).
 //!
 //! Both endpoints scope to an optional parent and honor the `includeItemTypes`
 //! restriction (a lone `Trailer`/`Program` type skips the parent lookup, exactly
@@ -274,11 +270,13 @@ fn language_pairs(
     pairs
 }
 
-/// `GET /Items/Filters2` — the genre and stream-language filter facets.
+/// `GET /Items/Filters2` — the genre, tag and stream-language filter facets.
 ///
 /// Port of `FilterController.GetQueryFilters` (v12.2). The genre facet routes
-/// to the music-genre aggregate for a music-only type set. `Tags` is left
-/// empty — see the module doc.
+/// to the music-genre aggregate for a music-only type set. The tag facet
+/// (Jellyfin 12.1+, `FilterController.cs:240`) runs for every type set, over
+/// the genre query's user, types, live-TV flags and parent scope
+/// (`tagQuery`, `:181-196`).
 ///
 /// The audio and subtitle language facets (Jellyfin 12+) are filled only for
 /// a type set naming `Movie`, `Series`, `Season` or `Episode`
@@ -368,6 +366,10 @@ async fn get_query_filters(
             })
         })
         .collect();
+
+    // `filters.Tags = _libraryManager.GetTagNames(tagQuery)`: `tagQuery` is the
+    // genre query's twin, with no owned items and no episode widening.
+    filters.tags = state.library.get_tag_names(&base).await?;
 
     if language_facets {
         let stream_query = InternalItemsQuery {
