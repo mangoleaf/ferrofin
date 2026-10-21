@@ -246,7 +246,8 @@ impl SimilarItemsRepository {
     }
 
     /// Distinct names of the people of `person_types` credited on any of
-    /// `item_ids` (C# `GetPeopleNames`), used to seed the director/actor categories.
+    /// `item_ids`, in billing order (C# `GetPeopleNamesByItems` +
+    /// `GetPeopleNames`), used to seed the director/actor categories.
     pub(crate) async fn people_names_of(
         &self,
         item_ids: &[Uuid],
@@ -256,7 +257,7 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            r#"SELECT DISTINCT p."Name" FROM "PeopleBaseItemMap" pm
+            r#"SELECT pm."ItemId", p."Name", pm."ListOrder" FROM "PeopleBaseItemMap" pm
                JOIN "Peoples" p ON p."Id" = pm."PeopleId" WHERE pm."ItemId" IN ("#,
         );
         for i in 0..item_ids.len() {
@@ -274,13 +275,71 @@ impl SimilarItemsRepository {
         }
         sql.push(')');
 
-        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
-        for id in item_ids {
-            query = query.bind(guid_to_db(*id));
+        let db_ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
+        let mut query =
+            sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(sqlx::AssertSqlSafe(sql));
+        for id in &db_ids {
+            query = query.bind(id);
         }
         for t in person_types {
             query = query.bind((*t).to_owned());
         }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        let mut rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+
+        // `GetPeopleNamesByItems`: credits in billing (`ListOrder`) order,
+        // grouped per item in first-appearance order. Upstream leaves equal
+        // `ListOrder`s across items in whatever order the database returns;
+        // the caller's item order (most recently played first) breaks them
+        // here, so the answer is stable.
+        let rank = |item: &str| db_ids.iter().position(|id| id == item);
+        rows.sort_by_key(|(item, _, list_order)| (*list_order, rank(item)));
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for (item, name, _) in rows {
+            let index = if let Some(index) = groups.iter().position(|(id, _)| *id == item) {
+                index
+            } else {
+                groups.push((item, Vec::new()));
+                groups.len() - 1
+            };
+            if let Some(name) = name.filter(|n| !n.is_empty()) {
+                groups[index].1.push(name);
+            }
+        }
+        // `GetPeopleNames`: flatten, keeping each name's first appearance.
+        let mut seen = std::collections::HashSet::new();
+        Ok(groups
+            .into_iter()
+            .flat_map(|(_, names)| names)
+            .filter(|name| seen.insert(name.clone()))
+            .collect())
+    }
+
+    /// The IMDb ids of `item_ids`, for the person-recommendation de-dup
+    /// (`DistinctBy(i => i.GetProviderId(MetadataProvider.Imdb) ?? …)`).
+    pub(crate) async fn imdb_ids_of(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, ServiceError> {
+        let mut out = std::collections::HashMap::new();
+        // The client's `ItemLimit` is unbounded, so the ids are chunked like
+        // every other bound list in this file.
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                r#"SELECT "ItemId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ProviderId" = 'Imdb' AND "ItemId" IN ({placeholders})"#
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (item, value) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                // `GetProviderId` treats an empty value as absent.
+                if let (Ok(id), false) = (Uuid::parse_str(&item), value.is_empty()) {
+                    out.insert(id, value);
+                }
+            }
+        }
+        Ok(out)
     }
 }

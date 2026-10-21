@@ -1,5 +1,6 @@
 //! HLS `CODECS` attribute strings — port of
-//! `Jellyfin.Api/Helpers/HlsCodecStringHelpers.cs` (10.11.8).
+//! `Jellyfin.Api/Helpers/HlsCodecStringHelpers.cs` (10.11.8), plus Jellyfin
+//! 12's `GetDoviString` (jellyfin#16362).
 //!
 //! Helpers to generate HLS codec strings according to
 //! [RFC 6381 section 3.3](https://datatracker.ietf.org/doc/html/rfc6381#section-3.3)
@@ -204,10 +205,39 @@ pub fn av1_string(profile: Option<&str>, level: i32, tier_flag: bool, bit_depth:
     format!("av01{profile_part}.{level:02}{tier}.{bit_depth:02}")
 }
 
+/// Gets a Dolby Vision codec string for a stream with no compatible base
+/// layer. Port of `GetDoviString(dvProfile, dvLevel, codec)` (Jellyfin 12,
+/// jellyfin#16362): `dav1` for AV1, else `dvh1` (out-of-band parameter sets,
+/// Apple HLS spec rule 1.10), then `.{profile:02}.{level:02}`.
+#[must_use]
+pub fn dovi_string(dv_profile: i32, dv_level: i32, codec: &str) -> String {
+    let four_cc = if codec.eq_ignore_ascii_case("av1") {
+        "dav1"
+    } else {
+        "dvh1"
+    };
+    format!("{four_cc}.{dv_profile:02}.{dv_level:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    // `GetDoviString` has no upstream test either (v12.2); derived from the C#.
+    #[rstest]
+    #[case(5, 6, "hevc", "dvh1.05.06")]
+    #[case(10, 9, "av1", "dav1.10.09")]
+    #[case(10, 13, "AV1", "dav1.10.13")]
+    #[case(5, 6, "h265", "dvh1.05.06")]
+    fn dovi(
+        #[case] dv_profile: i32,
+        #[case] dv_level: i32,
+        #[case] codec: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(dovi_string(dv_profile, dv_level, codec), expected);
+    }
 
     // No upstream xUnit file exists for `HlsCodecStringHelpers` in 10.11.8; the
     // cases below are derived directly from its tables.

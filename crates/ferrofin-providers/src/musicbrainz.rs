@@ -252,8 +252,9 @@ pub struct AlbumDetails {
     pub premiere_date: Option<PartialDate>,
     /// That date's year.
     pub production_year: Option<i32>,
-    /// The credited artist names (`release?.ArtistCredit ??
-    /// releaseGroup?.ArtistCredit`): the album artists.
+    /// The credited artists (`release?.ArtistCredit ??
+    /// releaseGroup?.ArtistCredit`), each by its own MusicBrainz name, else
+    /// the name printed on the credit: the album artists.
     pub album_artists: Vec<String>,
     /// `releaseGroup?.Genres ?? release?.Genres`, most votes first.
     pub genres: Vec<String>,
@@ -793,9 +794,18 @@ impl MusicBrainzClient {
             release_group_id,
             premiere_date: date,
             production_year: date.map(|d| d.year),
+            // `credit.Artist?.Name ?? credit.Name` (v12.2): the credited
+            // artist's own name, the printed spelling only when it is absent.
             album_artists: credit
                 .iter()
-                .filter_map(|c| non_empty(c.name.clone()))
+                .filter_map(|c| {
+                    non_empty(
+                        c.artist
+                            .as_ref()
+                            .and_then(|artist| artist.name.clone())
+                            .or_else(|| c.name.clone()),
+                    )
+                })
                 .collect(),
             genres: voted(
                 group.as_ref().and_then(|g| g.genres.as_ref()),
@@ -1169,7 +1179,9 @@ mod tests {
             (
                 "/ws/2/release/",
                 r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","date":"1997-03-25","release-group":{"id":"b1f1a1b0-0000-4000-8000-000000000002"},
-                    "artist-credit":[{"name":"Miles Davis","artist":{"id":"a"}},{"name":""}],
+                    "artist-credit":[{"name":"Miles Davis","artist":{"id":"a"}},{"name":""},
+                                     {"name":"Beethoven","artist":{"id":"b","name":"Ludwig van Beethoven"}},
+                                     {"name":"Printed","artist":{"id":"c","name":" "}}],
                     "label-info":[{"label":{"name":"Columbia"}},{"label":{"name":"columbia"}},{"label":null},
                                   {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}}],
                     "genres":[{"name":"release genre","count":50}],
@@ -1204,9 +1216,12 @@ mod tests {
                 day: 17
             })
         );
+        // `credit.Artist?.Name ?? credit.Name` (v12.2): the credited artist's
+        // own name, the printed one only when the artist or its name is
+        // absent; a blank artist name is dropped, not replaced.
         assert_eq!(
             details.album_artists,
-            ["Miles Davis"],
+            ["Miles Davis", "Ludwig van Beethoven"],
             "the release's credits"
         );
         assert_eq!(

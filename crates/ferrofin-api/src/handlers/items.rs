@@ -473,8 +473,10 @@ where
 /// Port of `ItemsController.GetItems` (v12 ItemsController.cs:83-350). The
 /// wide query is mapped onto [`InternalItemsQuery`] and every persistable
 /// filter is honoured by `translate_query`; the controller-side branches
-/// live here: the `UserRootFolder` children answer for a non-recursive,
-/// id-less request (`user_root_children`), the BoxSet/Playlist re-rooting
+/// live here: the `UserRootFolder` children answer for an unfiltered,
+/// non-recursive, id-less request (`user_root_children`) while a filtered one
+/// runs recursively (Jellyfin 12's `HasFilters` dispatch), the library browse
+/// defaults ([`apply_library_browse_defaults`]), the BoxSet/Playlist re-rooting
 /// (`redirect_container_browse`), `ApplyFilters`, `LocationTypes` →
 /// `IsVirtualItem`, the `AllowedTags` ⇒ `Tags` field rule, and
 /// `AddAdditionalDtoOptions`. A non-recursive `parentId` browse of a box-set
@@ -537,16 +539,30 @@ async fn get_items(
     // linked-child-ancestor constraint instead (C# ItemsController's
     // `linkedChildAncestorIds` redirect). Without this, the library's
     // Collections tab can never list anything.
+    let mut library = None;
     let (parent_type, folder_policy) =
-        check_parent_visibility(&state, &auth, &mut internal).await?;
+        check_parent_visibility(&state, &auth, &mut internal, &mut library).await?;
     internal.parent_type = parent_type;
     // Reuse the already-loaded parent for SourceType and UserView dispatch;
     // only source consumers that call Folder's policy inherit global flags.
     internal.apply_folder_display_options = folder_policy;
     redirect_container_browse(&state, &mut internal).await;
     // After the re-root, as upstream: it decides on the requested types and
-    // this rewrite on the folder that results.
+    // these rewrites on the folder that results.
     list_playlists_folder_as_playlists(&mut internal);
+    apply_library_browse_defaults(&mut internal, library, query.recursive);
+    // `|| query.HasFilters` (v12.2 ItemsController.cs:592) with
+    // `UserRootFolder.GetItemsInternal` (UserRootFolder.cs:77): at the user
+    // root only an unfiltered request is the plain listing of the user's
+    // libraries; a filtered one runs recursively.
+    if internal.item_ids.is_empty()
+        && (internal.parent_id.is_nil()
+            || internal.parent_type == Some(BaseItemKind::UserRootFolder))
+        && internal.has_filters()
+    {
+        internal.recursive = true;
+        internal.user_root_children = false;
+    }
     if !internal.item_ids.is_empty() {
         // ItemsController clears query.Parent immediately before GetItems.
         // Keep any linked-child ancestor constraint established by the
@@ -613,6 +629,33 @@ fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
         if internal.user.is_some() {
             reroot_to_user_root(internal);
         }
+    }
+}
+
+/// A library (`ICollectionFolder`) parent's defaults (v12.2
+/// ItemsController.cs:326-340): a `boxsets` library browsed with no item
+/// types lists box sets, and an item-typed browse that did not choose
+/// `recursive` lists the library's contents recursively rather than just its
+/// immediate children. `library` is `Some(is_boxsets)` only when the requested
+/// parent is itself a library ([`library_is_boxsets`]); a view that delegates
+/// to one is not, and a re-rooted browse no longer has a library parent.
+fn apply_library_browse_defaults(
+    internal: &mut InternalItemsQuery,
+    library: Option<bool>,
+    requested_recursive: Option<bool>,
+) {
+    let Some(is_boxsets) = library else {
+        return;
+    };
+    if internal.parent_id.is_nil() {
+        return;
+    }
+    if internal.include_item_types.is_empty() && is_boxsets {
+        internal.include_item_types = vec![BaseItemKind::BoxSet];
+    }
+    if !internal.include_item_types.is_empty() && requested_recursive.is_none() {
+        internal.recursive = true;
+        internal.user_root_children = false;
     }
 }
 
@@ -1484,10 +1527,13 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
 /// ItemsController uses IsVisible on its explicit parent, not standalone
 /// lookup. It returns 401 for a hidden parent, and API keys bypass this gate.
 /// Container-only browses re-root to UserRootFolder before the upstream check.
+/// Whether the parent is itself a library, and a `boxsets` one, is left in
+/// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
 async fn check_parent_visibility(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
+    library: &mut Option<bool>,
 ) -> Result<(Option<BaseItemKind>, bool), ApiError> {
     use ferrofin_model::data::CollectionType;
 
@@ -1538,6 +1584,7 @@ async fn check_parent_visibility(
                 .is_some_and(|id| !id.is_nil())
     };
     if kind != "UserView" {
+        *library = library_is_boxsets(&parent);
         return Ok((kind_from(&parent), !is_channel(&parent)));
     }
 
@@ -1632,6 +1679,24 @@ fn user_view_browse_context(
                 .filter(|id| !id.is_nil())
         });
     (view_type, parent_id)
+}
+
+/// When the requested parent is itself a library (`ICollectionFolder`),
+/// whether it is a `boxsets` one, from its `Data.CollectionType` read
+/// case-insensitively as the other readers do; `None` for any other row.
+fn library_is_boxsets(parent: &BaseItemEntity) -> Option<bool> {
+    (parent.type_.rsplit('.').next() == Some("CollectionFolder")).then(|| {
+        parent
+            .data
+            .as_deref()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .and_then(|data| {
+                data.get("CollectionType")?
+                    .as_str()
+                    .map(|kind| kind.eq_ignore_ascii_case("boxsets"))
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// These UserView builders use direct item selection rather than Folder policy.

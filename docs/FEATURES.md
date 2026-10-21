@@ -141,7 +141,7 @@ Wired and working, with a documented limitation or lighter verification:
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
-  providers (TMDB similar titles, ListenBrainz similar artists) run only for a library
+  providers (TMDB recommendations, ListenBrainz similar artists) run only for a library
   that ticked them under "Similarity providers", and resolve against items already in the
   library. The local scorer is a single query rather than upstream's six per-kind
   providers, which are identical in behaviour.
@@ -293,6 +293,13 @@ and Episode downloader off: a new episode appears about `LibraryMonitorDelay` se
 its file lands (5.1 s with a 5 s delay), and the scan itself takes about 50 ms. Provider
 requests come on top: the new episode's first refresh asks every checked downloader, and
 the season's folder change asks the season providers.
+
+### Accepted divergences (fixes, not gaps)
+
+- **An episode's season and episode numbers are read only from its path below the library
+  folder.** Jellyfin reads the whole path, so a folder above the library named like
+  `media-v12-2` or `disk1-2` puts an episode whose own name has no numbers (a bonus video,
+  say) into season 12 or 1. In Ferrofin that episode stays in the unnumbered season.
 
 ### Known limits
 
