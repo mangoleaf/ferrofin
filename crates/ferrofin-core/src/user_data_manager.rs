@@ -1013,6 +1013,7 @@ fn key_source<'a>(
             .filter(|a| !a.is_empty()),
         extra_type: item.extra_type.and_then(extra_type_name),
         run_time_ticks: item.run_time_ticks,
+        channel_name_key: crate::user_data_keys::live_tv_channel_name_key_enabled(),
     }
 }
 
