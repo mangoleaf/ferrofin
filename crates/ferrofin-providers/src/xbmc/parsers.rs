@@ -176,19 +176,22 @@ impl EpisodeNfoParser {
             // No closing tag: let the reader deal with whatever is there.
             blocks.push(remaining);
         }
+        // C# reads inside `catch (XmlException)`: one block keeps what it read
+        // before a malformed spot, and with several a malformed block ends the
+        // read before anything is merged into the item.
         if let [only] = blocks.as_slice() {
             self.read_details(base, result, only);
             return;
         }
 
-        let mut episodes: Vec<(&str, MetadataResult<NfoBaseItem>)> = blocks
-            .into_iter()
-            .map(|block| {
-                let mut episode = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Episode));
-                self.read_details(base, &mut episode, block);
-                (block, episode)
-            })
-            .collect();
+        let mut episodes: Vec<(&str, MetadataResult<NfoBaseItem>)> = Vec::new();
+        for block in blocks {
+            let mut episode = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Episode));
+            if !self.read_details(base, &mut episode, block) {
+                return;
+            }
+            episodes.push((block, episode));
+        }
         // Stable, as LINQ's `OrderBy` is.
         episodes.sort_by_key(|(_, episode)| episode.item.index_number.unwrap_or(i32::MAX));
 
@@ -232,16 +235,15 @@ impl EpisodeNfoParser {
         result.item.overview = Some(overview);
     }
 
-    /// Streams one `<episodedetails>` block through the element switch.
+    /// Streams one `<episodedetails>` block through the element switch, up to
+    /// its first malformed spot. Returns whether the block was well-formed.
     fn read_details(
         self,
         base: &BaseNfoParser<'_>,
         result: &mut MetadataResult<NfoBaseItem>,
         xml: &str,
-    ) {
-        let Ok(mut reader) = XmlCursor::new(xml) else {
-            return;
-        };
+    ) -> bool {
+        let (mut reader, clean) = XmlCursor::up_to_error(xml);
         reader.move_to_content();
         reader.read();
         while !reader.eof() {
@@ -251,6 +253,7 @@ impl EpisodeNfoParser {
                 reader.read();
             }
         }
+        clean
     }
 }
 
