@@ -2029,8 +2029,8 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
-    // The versions a played-state change propagates to are announced to the
-    // user's sessions (`UserDataChanged`), as each save is upstream.
+    // Every user-data save but a progress report reaches the user's sessions
+    // as a batched `UserDataChanged` (upstream's `UserDataChangeNotifier`).
     user_data_impl.set_user_data_changed_sink(Arc::new(
         ferrofin_core::user_data_manager::SessionUserDataSink(Arc::downgrade(&sessions)),
     ));
