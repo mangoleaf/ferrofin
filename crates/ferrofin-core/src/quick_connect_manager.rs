@@ -18,6 +18,14 @@
 //!
 //! Expiry uses the same [`REQUEST_TIMEOUT_MINUTES`] window as C# (`Timeout = 10`);
 //! stale requests and secrets are swept lazily on each state-changing call.
+//!
+//! Two accepted divergences harden the anonymous `POST /QuickConnect/Initiate`.
+//! First, a drawn code that a pending request already holds is drawn again,
+//! where C# `_currentRequests[code] = result` overwrites the other device's
+//! request. Second, each remote IP keeps at most a configured number of
+//! unauthorized requests (`FERROFIN_QUICK_CONNECT_PENDING_PER_IP`), and the
+//! next Initiate drops that IP's oldest one. C# has no cap, so a flood grows the
+//! map toward the whole code space.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -44,6 +52,60 @@ const CODE_LENGTH: u32 = 6;
 /// Byte length of the opaque request secret (C# `GenerateSecureRandom(32)`).
 const SECRET_BYTES: usize = 32;
 
+/// Unauthorized requests one remote IP may hold at once when the server config
+/// sets no `quick_connect_pending_per_ip` (a Ferrofin setting; C# has no cap).
+pub const DEFAULT_PENDING_PER_IP: usize = 10;
+
+/// A pending request plus the remote IP that initiated it, for the per-IP cap.
+/// The IP stays out of [`QuickConnectResult`], which is the wire DTO.
+struct PendingRequest {
+    result: QuickConnectResult,
+    remote_ip: Option<String>,
+}
+
+/// How many distinct `CODE_LENGTH`-digit codes [`FerrofinQuickConnect::generate_code`] draws from.
+const CODE_SPACE: usize = 10usize.pow(CODE_LENGTH) - 10usize.pow(CODE_LENGTH - 1);
+
+/// A code from `draw` that no pending request holds, drawing again on a
+/// collision. `None` once every code is taken.
+fn draw_free_code(
+    requests: &HashMap<String, PendingRequest>,
+    mut draw: impl FnMut() -> String,
+) -> Option<String> {
+    if requests.len() >= CODE_SPACE {
+        return None;
+    }
+    loop {
+        let code = draw();
+        if !requests.contains_key(&code) {
+            return Some(code);
+        }
+    }
+}
+
+/// Drops `remote_ip`'s oldest unauthorized requests until it holds fewer than
+/// `limit`, so the request about to be added stays within it. Authorized
+/// requests are kept: their device is still collecting its session.
+// ponytail: O(n) scan per Initiate, the same ceiling as the status poll; index by IP if n grows.
+fn make_room(
+    requests: &mut HashMap<String, PendingRequest>,
+    remote_ip: Option<&str>,
+    limit: usize,
+) {
+    let mut own: Vec<_> = requests
+        .iter()
+        .filter(|(_, p)| !p.result.authenticated && p.remote_ip.as_deref() == remote_ip)
+        .map(|(code, p)| (p.result.date_added, code.clone()))
+        .collect();
+    if own.len() < limit {
+        return;
+    }
+    own.sort_unstable();
+    for (_, code) in &own[..=own.len() - limit] {
+        requests.remove(code);
+    }
+}
+
 /// An authorized secret's authentication result plus the time it was authorized
 /// (for expiry), mirroring the C# `(DateTime, AuthenticationResult)` tuple.
 struct AuthorizedSecret {
@@ -56,9 +118,11 @@ pub struct FerrofinQuickConnect {
     configuration_manager: Arc<dyn ServerConfigurationManager>,
     session_manager: Arc<dyn SessionManager>,
     /// Pending requests keyed by their user-facing code.
-    current_requests: Mutex<HashMap<String, QuickConnectResult>>,
+    current_requests: Mutex<HashMap<String, PendingRequest>>,
     /// Authorized sessions keyed by request secret.
     authorized_secrets: Mutex<HashMap<String, AuthorizedSecret>>,
+    /// Unauthorized requests one remote IP may hold at once.
+    pending_per_ip: usize,
 }
 
 impl std::fmt::Debug for FerrofinQuickConnect {
@@ -69,17 +133,34 @@ impl std::fmt::Debug for FerrofinQuickConnect {
 }
 
 impl FerrofinQuickConnect {
-    /// Creates a Quick Connect manager from its injected collaborators.
+    /// Creates a Quick Connect manager from its injected collaborators, with
+    /// the [`DEFAULT_PENDING_PER_IP`] cap.
     #[must_use]
     pub fn new(
         configuration_manager: Arc<dyn ServerConfigurationManager>,
         session_manager: Arc<dyn SessionManager>,
+    ) -> Self {
+        Self::with_pending_per_ip(configuration_manager, session_manager, 0)
+    }
+
+    /// Like [`Self::new`], with each remote IP holding at most
+    /// `pending_per_ip` unauthorized requests (`0` = [`DEFAULT_PENDING_PER_IP`]).
+    #[must_use]
+    pub fn with_pending_per_ip(
+        configuration_manager: Arc<dyn ServerConfigurationManager>,
+        session_manager: Arc<dyn SessionManager>,
+        pending_per_ip: usize,
     ) -> Self {
         Self {
             configuration_manager,
             session_manager,
             current_requests: Mutex::new(HashMap::new()),
             authorized_secrets: Mutex::new(HashMap::new()),
+            pending_per_ip: if pending_per_ip == 0 {
+                DEFAULT_PENDING_PER_IP
+            } else {
+                pending_per_ip
+            },
         }
     }
 
@@ -109,9 +190,8 @@ impl FerrofinQuickConnect {
     /// good CSPRNG source here and avoids adding a `rand` dependency).
     fn generate_code() -> String {
         let n = u128::from_be_bytes(*Uuid::new_v4().as_bytes());
-        let modulo = 10u128.pow(CODE_LENGTH);
         let min = 10u128.pow(CODE_LENGTH - 1);
-        let value = min + (n % (modulo - min));
+        let value = min + (n % CODE_SPACE as u128);
         value.to_string()
     }
 
@@ -132,7 +212,7 @@ impl FerrofinQuickConnect {
     fn expire_stale(&self) {
         let cutoff = Utc::now() - Duration::minutes(REQUEST_TIMEOUT_MINUTES);
         if let Ok(mut requests) = self.current_requests.lock() {
-            requests.retain(|_, r| r.date_added >= cutoff);
+            requests.retain(|_, p| p.result.date_added >= cutoff);
         }
         if let Ok(mut secrets) = self.authorized_secrets.lock() {
             secrets.retain(|_, s| s.authorized_at >= cutoff);
@@ -175,21 +255,32 @@ impl QuickConnect for FerrofinQuickConnect {
         self.assert_active().await?;
         self.expire_stale();
 
+        let remote_ip = authorization_info.remote_endpoint.clone();
+        let mut requests = self
+            .current_requests
+            .lock()
+            .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
+        make_room(&mut requests, remote_ip.as_deref(), self.pending_per_ip);
+        let code = draw_free_code(&requests, Self::generate_code)
+            .ok_or_else(|| ServiceError::backend("every quick connect code is in use"))?;
+
         let result = QuickConnectResult {
             authenticated: false,
             secret: Self::generate_secret().into(),
-            code: Self::generate_code(),
+            code,
             device_id,
             device_name: device,
             app_name: client,
             app_version: version,
             date_added: Utc::now(),
         };
-
-        self.current_requests
-            .lock()
-            .map_err(|_| ServiceError::backend("quick connect state poisoned"))?
-            .insert(result.code.clone(), result.clone());
+        requests.insert(
+            result.code.clone(),
+            PendingRequest {
+                result: result.clone(),
+                remote_ip,
+            },
+        );
         Ok(result)
     }
 
@@ -201,10 +292,12 @@ impl QuickConnect for FerrofinQuickConnect {
             .current_requests
             .lock()
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
+        // ponytail: O(n) secret scan under the lock, bounded per IP by the pending cap;
+        // add a secret→code index if the map ever grows large.
         requests
             .values()
-            .find(|r| r.secret.expose() == secret)
-            .cloned()
+            .find(|p| p.result.secret.expose() == secret)
+            .map(|p| p.result.clone())
             .ok_or_else(|| ServiceError::not_found("unable to find request with provided secret"))
     }
 
@@ -223,9 +316,10 @@ impl QuickConnect for FerrofinQuickConnect {
                 .current_requests
                 .lock()
                 .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
-            let pending = requests
+            let pending = &mut requests
                 .get_mut(code)
-                .ok_or_else(|| ServiceError::not_found("unable to find request"))?;
+                .ok_or_else(|| ServiceError::not_found("unable to find request"))?
+                .result;
             if pending.authenticated {
                 return Err(ServiceError::invalid_input("request is already authorized"));
             }
@@ -254,7 +348,7 @@ impl QuickConnect for FerrofinQuickConnect {
                 if let Ok(mut requests) = self.current_requests.lock()
                     && let Some(pending) = requests.get_mut(code)
                 {
-                    pending.authenticated = false;
+                    pending.result.authenticated = false;
                 }
                 return Err(err);
             }
@@ -279,8 +373,8 @@ impl QuickConnect for FerrofinQuickConnect {
             .lock()
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
         if let Some(pending) = requests.get_mut(code) {
-            pending.authenticated = true;
-            pending.date_added = Utc::now() + Duration::minutes(1);
+            pending.result.authenticated = true;
+            pending.result.date_added = Utc::now() + Duration::minutes(1);
         }
         Ok(true)
     }
@@ -326,7 +420,11 @@ mod tests {
 
     use crate::configuration_manager::default_server_configuration;
 
-    use super::FerrofinQuickConnect;
+    use std::collections::HashMap;
+
+    use ferrofin_model::quick_connect::QuickConnectResult;
+
+    use super::{DEFAULT_PENDING_PER_IP, FerrofinQuickConnect, PendingRequest, draw_free_code};
 
     struct FixedConfig {
         enabled: bool,
@@ -796,5 +894,86 @@ mod tests {
             mgr.get_authorized_request("nope").await.expect_err("auth"),
             ServiceError::NotFound(_)
         ));
+    }
+
+    fn auth_from(ip: &str) -> AuthorizationInfo {
+        AuthorizationInfo {
+            remote_endpoint: Some(ip.to_owned()),
+            ..auth_info()
+        }
+    }
+
+    async fn is_pending(mgr: &FerrofinQuickConnect, request: &QuickConnectResult) -> bool {
+        mgr.check_request_status(request.secret.expose())
+            .await
+            .is_ok()
+    }
+
+    /// A drawn code that another pending request already holds is drawn again,
+    /// never written over that request (upstream's `_currentRequests[code] =`
+    /// overwrite would hand the other device's code to this one).
+    #[test]
+    fn a_taken_code_is_drawn_again() {
+        let mut requests = HashMap::new();
+        let taken = QuickConnectResult {
+            code: "123456".to_owned(),
+            ..QuickConnectResult::default()
+        };
+        requests.insert(
+            taken.code.clone(),
+            PendingRequest {
+                result: taken,
+                remote_ip: None,
+            },
+        );
+        let mut draws = ["123456", "123456", "654321"].into_iter();
+        let code = draw_free_code(&requests, || draws.next().expect("draw").to_owned());
+        assert_eq!(code.as_deref(), Some("654321"));
+        assert_eq!(draws.next(), None, "redrew until free, then stopped");
+    }
+
+    /// One remote IP holds at most the configured number of unauthorized
+    /// requests; the next Initiate drops that IP's oldest, and no other IP's
+    /// request or an authorized one is touched.
+    #[tokio::test]
+    async fn an_ip_over_its_pending_limit_loses_its_oldest_request() {
+        let mgr = FerrofinQuickConnect::with_pending_per_ip(
+            Arc::new(FixedConfig { enabled: true }),
+            Arc::new(FakeSessionManager::default()),
+            2,
+        );
+        let authorized = mgr.try_connect(&auth_from("10.0.0.1")).await.expect("a0");
+        mgr.authorize_request(Uuid::new_v4(), &authorized.code)
+            .await
+            .expect("authorize");
+        let other_ip = mgr.try_connect(&auth_from("10.0.0.2")).await.expect("b");
+        let first = mgr.try_connect(&auth_from("10.0.0.1")).await.expect("a1");
+        let second = mgr.try_connect(&auth_from("10.0.0.1")).await.expect("a2");
+        let third = mgr.try_connect(&auth_from("10.0.0.1")).await.expect("a3");
+
+        assert!(!is_pending(&mgr, &first).await, "oldest evicted");
+        assert!(is_pending(&mgr, &second).await);
+        assert!(is_pending(&mgr, &third).await);
+        assert!(is_pending(&mgr, &other_ip).await, "other IP untouched");
+        assert!(is_pending(&mgr, &authorized).await, "authorized untouched");
+    }
+
+    #[tokio::test]
+    async fn the_default_pending_limit_applies_when_none_is_configured() {
+        let mgr = FerrofinQuickConnect::with_pending_per_ip(
+            Arc::new(FixedConfig { enabled: true }),
+            Arc::new(FakeSessionManager::default()),
+            0,
+        );
+        let mut sent = Vec::new();
+        for _ in 0..=DEFAULT_PENDING_PER_IP {
+            sent.push(
+                mgr.try_connect(&auth_from("10.0.0.1"))
+                    .await
+                    .expect("connect"),
+            );
+        }
+        assert!(!is_pending(&mgr, &sent[0]).await);
+        assert!(is_pending(&mgr, &sent[1]).await);
     }
 }
