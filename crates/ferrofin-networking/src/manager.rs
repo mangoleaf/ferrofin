@@ -60,6 +60,71 @@ impl StartupConfig {
     }
 }
 
+/// The published server overrides among `overrides` that are full URLs whose
+/// public path does not end with `base_url`: the test inside
+/// `NetworkManager.WarnIfPublishedUrlBasePathDiffers`. Returns each one's
+/// `host:port` (the scheme's default port when it names none), once per
+/// override ignoring case, never its user info, query or fragment. Bare host
+/// or IP overrides are exempt, since the base URL is appended when the API URL
+/// is built from them; an empty `base_url` leaves nothing to compare.
+#[must_use]
+pub fn published_urls_missing_base_url<'a>(
+    overrides: impl IntoIterator<Item = &'a str>,
+    base_url: &str,
+) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if base_url.is_empty() {
+        return hosts;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for uri in overrides {
+        let lowered = uri.to_ascii_lowercase();
+        let (scheme_len, default_port) = if lowered.starts_with("http://") {
+            ("http://".len(), 80)
+        } else if lowered.starts_with("https://") {
+            ("https://".len(), 443)
+        } else {
+            continue;
+        };
+        if !seen.insert(lowered) {
+            continue;
+        }
+        let rest = uri[scheme_len..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
+        let (authority, path) = rest.find('/').map_or((rest, "/"), |at| rest.split_at(at));
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        // `Uri.TryCreate` rejects an override without a host.
+        if host.is_empty() {
+            continue;
+        }
+        let path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+        let path = path.trim_end_matches('/');
+        if path
+            .len()
+            .checked_sub(base_url.len())
+            .and_then(|at| path.get(at..))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+        {
+            continue;
+        }
+        // `GetComponents(HostAndPort)`: the explicit port, else the default.
+        let has_port = !host.ends_with(']')
+            && host.rsplit_once(':').is_some_and(|(_, port)| {
+                !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+            });
+        hosts.push(if has_port {
+            host.to_owned()
+        } else {
+            format!("{host}:{default_port}")
+        });
+    }
+    hosts
+}
+
 /// Network interface manager — port of `NetworkManager` (`INetworkManager`).
 pub struct NetworkManager {
     logger: Arc<dyn Logger>,
@@ -181,6 +246,13 @@ impl NetworkManager {
     #[must_use]
     pub fn auto_discovery(&self) -> bool {
         self.config.auto_discovery
+    }
+
+    /// Whether smart URLs echo the request's own host
+    /// (`EnablePublishedServerUriByRequest`).
+    #[must_use]
+    pub fn enable_published_server_uri_by_request(&self) -> bool {
+        self.config.enable_published_server_uri_by_request
     }
 
     /// Whether IPv4 is enabled (`IsIPv4Enabled`).
