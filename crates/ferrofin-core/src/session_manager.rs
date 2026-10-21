@@ -711,6 +711,32 @@ impl FerrofinSessionManager {
             .unwrap_or(item_id))
     }
 
+    /// The final play-state save of a stop, per session user (C#
+    /// `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`), each
+    /// change pushed to the user's other devices.
+    async fn save_stopped_play_state(
+        &self,
+        session: &SessionInfo,
+        info: &PlaybackStopInfo,
+    ) -> Result<(), ServiceError> {
+        let progress_item = self
+            .progress_item(info.item_id, info.media_source_id.as_deref())
+            .await?;
+        for user in self.users_for(session).await? {
+            let user_id = parse_user_id(&user.id)?;
+            self.user_data_manager
+                .update_play_state_with_reason(
+                    user_id,
+                    progress_item,
+                    info.position_ticks,
+                    ferrofin_model::entities::UserDataSaveReason::PlaybackFinished,
+                )
+                .await?;
+            self.push_user_data_changed(user_id, progress_item).await;
+        }
+        Ok(())
+    }
+
     /// Pushes the user's refreshed play-state for `item_id` to every session
     /// belonging to that user (`UserDataChanged`), so their other signed-in
     /// devices update resume position / played flags live instead of showing
@@ -1212,8 +1238,9 @@ impl SessionManager for FerrofinSessionManager {
 
         // Record the start on every session user's data (C# OnPlaybackStart:
         // PlayCount++ and the LastPlayedDate stamp Next Up filters on), then
-        // push the change to the user's other devices.
-        if !info.item_id.is_nil() {
+        // push the change to the user's other devices. Only for a library
+        // item: C# `if (libraryItem is not null)`.
+        if item.is_some() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
@@ -1279,8 +1306,9 @@ impl SessionManager for FerrofinSessionManager {
 
         // Persist play-state for every user on the session (C#
         // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`), then
-        // push the change to the user's other devices.
-        if !info.item_id.is_nil() {
+        // push the change to the user's other devices. Only for a library
+        // item: C# `if (libraryItem is not null …)`.
+        if now_playing.is_some() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
@@ -1308,6 +1336,17 @@ impl SessionManager for FerrofinSessionManager {
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
         let session = self.get_session_snapshot(session_id).await?;
 
+        // C# `GetNowPlayingItem`: an id the library no longer has (a channel a
+        // guide refresh dropped mid-play, an item deleted while it played) is
+        // no library item, and nothing is saved for it. Always looked up, not
+        // taken from the session's now-playing item as C# can: a row deleted
+        // mid-play is then no item, where C#'s cached one makes the save throw.
+        let library_item = if info.item_id.is_nil() {
+            Ok(None)
+        } else {
+            self.library_manager.get_item_by_id(info.item_id).await
+        };
+
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
@@ -1319,41 +1358,33 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        // Final play-state update per user unless playback failed (C#
-        // `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`),
-        // then push the change to the user's other devices.
-        if !info.item_id.is_nil() && !info.failed {
-            let progress_item = self
-                .progress_item(info.item_id, info.media_source_id.as_deref())
-                .await?;
-            for user in self.users_for(&session).await? {
-                let user_id = parse_user_id(&user.id)?;
-                self.user_data_manager
-                    .update_play_state_with_reason(
-                        user_id,
-                        progress_item,
-                        info.position_ticks,
-                        ferrofin_model::entities::UserDataSaveReason::PlaybackFinished,
-                    )
-                    .await?;
-                self.push_user_data_changed(user_id, progress_item).await;
-            }
-        }
+        // The save's outcome is kept, not returned at once: the live stream is
+        // released and the stop published whatever it was. Upstream skips the
+        // release when the save throws; releasing anyway closes that leak.
+        let saved = match library_item {
+            Ok(Some(_)) if !info.failed => self.save_stopped_play_state(&session, info).await,
+            // No library item, or the playback failed: nothing to save.
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
 
         // C# `OnPlaybackStopped`: the live stream the client was playing is
         // closed here, not only by an explicit `/LiveStreams/Close`. A client that
         // stops playback and never calls Close otherwise leaks its open stream.
-        if let Some(live_stream_id) = info.live_stream_id.as_deref() {
-            self.close_live_stream_if_needed(live_stream_id, session_id)
-                .await?;
-        }
+        let released = match info.live_stream_id.as_deref() {
+            Some(live_stream_id) => {
+                self.close_live_stream_if_needed(live_stream_id, session_id)
+                    .await
+            }
+            None => Ok(()),
+        };
 
         let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
         let _ = self
             .event_manager
             .publish("PlaybackStopped", &payload)
             .await;
-        Ok(())
+        saved.and(released)
     }
 
     async fn report_session_ended(&self, session_id: &str) -> Result<(), ServiceError> {
