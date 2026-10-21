@@ -987,7 +987,7 @@ mod tests {
             vpp_tonemap_available: false,
             vulkan_tonemap_available: false,
             source_codec: Some("h264"),
-            is_dovi: false,
+            requires_dovi_reshaping: false,
             is_hevc_rext: false,
             subtitle: SubtitleOverlay::None,
         }

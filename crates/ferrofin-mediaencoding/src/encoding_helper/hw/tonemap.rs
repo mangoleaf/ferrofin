@@ -74,6 +74,18 @@ pub fn is_dovi(stream: Option<&MediaStream>) -> bool {
         )
 }
 
+/// Whether a software tonemap has to reshape the stream's Dolby Vision: a
+/// profile 5 stream (`VideoRangeType::Dovi`), which has no compatible base
+/// layer. Port of
+/// `GetSwVidFilterChain`'s `requireDoviReshaping`
+/// (`VideoRangeType == VideoRangeType.DOVI`; its `doToneMap` half is the
+/// chain's own software-tonemap gate). Every other Dolby Vision stream is
+/// tonemapped from its base layer, like the HDR flavour that layer is.
+#[must_use]
+pub fn requires_dovi_reshaping(stream: Option<&MediaStream>) -> bool {
+    stream.and_then(|s| s.video_range_type) == Some(VideoRangeType::Dovi)
+}
+
 /// Whether the stream carries HDR10+ dynamic metadata. Port of `IsHdr10Plus`.
 #[must_use]
 pub fn is_hdr10_plus(stream: Option<&MediaStream>) -> bool {
@@ -404,25 +416,28 @@ mod tests {
     // ----- range classifiers -------------------------------------------------
 
     #[rstest]
-    #[case(VideoRangeType::DoviWithHdr10, true, true, false)]
-    #[case(VideoRangeType::DoviWithEl, true, true, false)]
-    #[case(VideoRangeType::DoviWithHdr10Plus, true, true, true)]
-    #[case(VideoRangeType::DoviWithElhdr10Plus, true, true, true)]
-    #[case(VideoRangeType::DoviInvalid, true, true, false)]
+    #[case(VideoRangeType::DoviWithHdr10, true, true, false, false)]
+    #[case(VideoRangeType::DoviWithEl, true, true, false, false)]
+    #[case(VideoRangeType::DoviWithHdr10Plus, true, true, true, false)]
+    #[case(VideoRangeType::DoviWithElhdr10Plus, true, true, true, false)]
+    #[case(VideoRangeType::DoviInvalid, true, true, false, false)]
     // Dolby Vision without an HDR10 base layer: still DOVI, no base layer.
-    #[case(VideoRangeType::Dovi, false, true, false)]
-    #[case(VideoRangeType::DoviWithHlg, false, true, false)]
-    #[case(VideoRangeType::DoviWithSdr, false, true, false)]
+    // Only profile 5 (`DOVI`) has no compatible base layer at all, so only
+    // it is reshaped.
+    #[case(VideoRangeType::Dovi, false, true, false, true)]
+    #[case(VideoRangeType::DoviWithHlg, false, true, false, false)]
+    #[case(VideoRangeType::DoviWithSdr, false, true, false, false)]
     // Plain HDR flavours are neither.
-    #[case(VideoRangeType::Hdr10, false, false, false)]
-    #[case(VideoRangeType::Hlg, false, false, false)]
-    #[case(VideoRangeType::Hdr10Plus, false, false, true)]
-    #[case(VideoRangeType::Sdr, false, false, false)]
+    #[case(VideoRangeType::Hdr10, false, false, false, false)]
+    #[case(VideoRangeType::Hlg, false, false, false, false)]
+    #[case(VideoRangeType::Hdr10Plus, false, false, true, false)]
+    #[case(VideoRangeType::Sdr, false, false, false, false)]
     fn the_range_classifiers_partition_the_dolby_vision_profiles(
         #[case] range_type: VideoRangeType,
         #[case] with_hdr10_bl: bool,
         #[case] dovi: bool,
         #[case] hdr10_plus: bool,
+        #[case] reshape: bool,
     ) {
         let s = hdr(range_type);
         assert_eq!(
@@ -432,6 +447,7 @@ mod tests {
         );
         assert_eq!(is_dovi(Some(&s)), dovi, "{range_type:?}");
         assert_eq!(is_hdr10_plus(Some(&s)), hdr10_plus, "{range_type:?}");
+        assert_eq!(requires_dovi_reshaping(Some(&s)), reshape, "{range_type:?}");
     }
 
     #[test]
@@ -439,6 +455,7 @@ mod tests {
         assert!(!is_dovi_with_hdr10_bl(None));
         assert!(!is_dovi(None));
         assert!(!is_hdr10_plus(None));
+        assert!(!requires_dovi_reshaping(None));
     }
 
     // ----- availability ------------------------------------------------------
