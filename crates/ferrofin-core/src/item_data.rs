@@ -423,6 +423,15 @@ pub struct VideoFormat {
     pub video3d_format: Option<ferrofin_model::entities::Video3DFormat>,
 }
 
+/// `BaseItem.Container`: the container a probe stored in `data`
+/// (`FFProbeVideoInfo`/`AudioFileProber`), if any. The text is read first: a
+/// blob with no `"Container"` key is not parsed.
+#[must_use]
+pub fn stored_container(data: Option<&str>) -> Option<String> {
+    let text = data.filter(|text| text.contains("\"Container\""))?;
+    read_data_string(&parse_data(Some(text)), "Container").filter(|c| !c.is_empty())
+}
+
 /// The [`VideoFormat`] `data` stores. The text is read first: a blob naming
 /// no disc, image or 3D format — nearly every video's — is not parsed.
 #[must_use]
