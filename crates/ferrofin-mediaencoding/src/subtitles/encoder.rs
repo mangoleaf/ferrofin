@@ -199,6 +199,38 @@ pub trait SubtitleIo: Send + Sync {
     fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
         std::fs::write(path, content).map_err(|e| format!("write {path}: {e}"))
     }
+
+    /// The size in bytes and the last-write time, in .NET ticks (100 ns
+    /// intervals since 0001-01-01 UTC), of the file at `path`, or `None` when
+    /// it does not exist: the `FileInfo.Length`/`LastWriteTimeUtc.Ticks` pair a
+    /// subtitle cache's `.meta` sidecar records, so a sidecar Jellyfin 12 wrote
+    /// still matches.
+    fn file_stamp(&self, path: &str) -> Option<(u64, i64)> {
+        let metadata = std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        let since_epoch = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let ticks = i64::try_from(since_epoch.as_nanos() / 100).ok()?;
+        Some((metadata.len(), UNIX_EPOCH_TICKS + ticks))
+    }
+}
+
+/// .NET ticks (100 ns intervals since 0001-01-01 UTC) at the Unix epoch.
+const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+
+/// `SubtitleEncoder.GetCacheMetaPath`: the sidecar recording which revision
+/// of its source a subtitle cache file was built from.
+fn cache_meta_path(cache_path: &str) -> String {
+    format!("{cache_path}.meta")
+}
+
+/// `SubtitleEncoder.FormatCacheMeta`: `{size}:{ticks}`, as Jellyfin 12 writes it.
+fn format_cache_meta((size, ticks): (u64, i64)) -> String {
+    format!("{size}:{ticks}")
 }
 
 /// Resolved information about a readable subtitle file.
@@ -352,6 +384,44 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         } else {
             let bytes = self.io.read_file(&file_info.path).await?;
             Ok(SubtitleStream::new(bytes, false))
+        }
+    }
+
+    /// `SubtitleEncoder.IsCachedSubtitleFresh`: whether the cache file at
+    /// `cache_path` can be served for `source_path`. A missing or empty cache
+    /// is stale and a missing source keeps the cache. Otherwise the cache's
+    /// `.meta` sidecar must record the source's current size and last-write
+    /// time, so a cache from before the sidecar existed is rebuilt once.
+    async fn is_cached_subtitle_fresh(&self, cache_path: &str, source_path: &str) -> bool {
+        if !self.io.file_exists(cache_path) || self.io.file_size(cache_path) == Some(0) {
+            return false;
+        }
+        let Some(stamp) = Some(source_path)
+            .filter(|path| !path.is_empty())
+            .and_then(|path| self.io.file_stamp(path))
+        else {
+            return true;
+        };
+        self.io
+            .read_file(&cache_meta_path(cache_path))
+            .await
+            .is_ok_and(|recorded| recorded == format_cache_meta(stamp).as_bytes())
+    }
+
+    /// `SubtitleEncoder.WriteCacheMeta`: records `source_path`'s current size
+    /// and last-write time beside the cache file built from it.
+    fn write_cache_meta(&self, cache_path: &str, source_path: &str) {
+        let Some(stamp) = Some(source_path)
+            .filter(|path| !path.is_empty())
+            .and_then(|path| self.io.file_stamp(path))
+        else {
+            return;
+        };
+        if let Err(err) = self.io.write_file(
+            &cache_meta_path(cache_path),
+            format_cache_meta(stamp).as_bytes(),
+        ) {
+            tracing::warn!(cache_path, %err, "failed to record subtitle cache metadata");
         }
     }
 
@@ -542,16 +612,35 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             else {
                 continue;
             };
-            let Some(stream_index) = find_index(&media_source.media_streams, stream) else {
+            // `GetSubtitleStreamIndexForFfmpeg`: the track's place among the
+            // video file's own streams, not among every stream of the source
+            // (a sidecar listed first would shift it past the end of the file).
+            let stream_index = helper::get_subtitle_stream_index_for_ffmpeg(media_source, stream);
+            if stream_index == -1 {
+                tracing::error!(
+                    path = %source_path,
+                    index = stream.index,
+                    "cannot find subtitle stream index, skipping this stream"
+                );
                 continue;
-            };
-            // Lock the output path, then skip a cache hit — the C# `File.Exists`
-            // skip. Without it every subtitle request re-runs the full-file
-            // ffmpeg extraction (seconds per request) instead of serving the
-            // already-extracted cache. Taking the lock first also means a
-            // concurrent extraction of the same path completes before the check.
+            }
+            // Lock the output path, then skip a fresh cache
+            // (`IsCachedSubtitleFresh` against the stream's own file, else the
+            // media file). Without it every subtitle request re-runs the
+            // full-file ffmpeg extraction (seconds per request), and a media
+            // file replaced in place keeps serving the old extraction. Taking
+            // the lock first also means a concurrent extraction of the same
+            // path completes before the check.
             let guard = self.locks.get(&output_path).lock_owned().await;
-            if self.io.file_exists(&output_path) {
+            let cache_source = if stream_path.is_empty() {
+                source_path.as_str()
+            } else {
+                stream_path.as_str()
+            };
+            if self
+                .is_cached_subtitle_fresh(&output_path, cache_source)
+                .await
+            {
                 continue;
             }
             held.push(guard);
@@ -576,8 +665,14 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
 
         if !output_paths.is_empty() {
             let result = self.io.extract(&args, &output_paths).await;
+            let extracted = result.is_ok();
             self.validate_extraction(&source_path, &output_paths, result)
                 .await;
+            if extracted {
+                for output_path in &output_paths {
+                    self.write_cache_meta(output_path, &source_path);
+                }
+            }
         }
         drop(held);
 
@@ -634,7 +729,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                     continue;
                 }
                 let guard = self.locks.get(&output_path).lock_owned().await;
-                if self.io.file_exists(&output_path) {
+                if self.is_cached_subtitle_fresh(&output_path, file).await {
                     continue;
                 }
                 held.push(guard);
@@ -660,7 +755,13 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                 continue;
             }
             let result = self.io.extract(&args, &output_paths).await;
+            let extracted = result.is_ok();
             self.validate_extraction(file, &output_paths, result).await;
+            if extracted {
+                for output_path in &output_paths {
+                    self.write_cache_meta(output_path, file);
+                }
+            }
             drop(held);
         }
     }
@@ -733,6 +834,14 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let _held = guard.lock().await;
 
         let input_path = subtitle_stream.path.clone().unwrap_or_default();
+        // `ConvertTextSubtitleToSrt`: a conversion of this revision of the
+        // sidecar is reused instead of running ffmpeg on every request.
+        if self
+            .is_cached_subtitle_fresh(output_path, &input_path)
+            .await
+        {
+            return Ok(());
+        }
         if input_path.is_empty() {
             return Err("inputPath is empty".to_owned());
         }
@@ -767,7 +876,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         // per-output check in `ExtractSubtitlesForFile`, also reached via
         // `ExtractTextSubtitleInternal`).
         match self.io.file_size(output_path) {
-            Some(size) if size > 0 => Ok(()),
+            Some(size) if size > 0 => {
+                self.write_cache_meta(output_path, &input_path);
+                Ok(())
+            }
             _ => {
                 let _ = self.io.delete_file(output_path);
                 Err(format!(
@@ -1064,17 +1176,6 @@ fn is_codec_copyable(codec: &str) -> bool {
         || codec.eq_ignore_ascii_case("subrip")
         || codec.eq_ignore_ascii_case("pgssub")
         || MediaStream::is_vob_sub_format(Some(codec))
-}
-
-/// Finds the ordinal index of `stream` within `streams` by identity/index.
-///
-/// Port of `EncodingHelper.FindIndex(mediaStreams, stream)`, matched on the
-/// stream `index` (its stable identity in a media source).
-fn find_index(streams: &[MediaStream], stream: &MediaStream) -> Option<i32> {
-    streams
-        .iter()
-        .position(|s| s.index == stream.index)
-        .and_then(|p| i32::try_from(p).ok())
 }
 
 /// Returns the lowercased file extension of `path` (without the dot), if any.
