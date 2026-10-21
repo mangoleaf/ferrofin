@@ -8089,22 +8089,22 @@ mod tests {
     #[tokio::test]
     async fn a_parent_cycle_ends_the_walk() {
         let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
         let first = content_row(BaseItemKind::Folder, Some("/m/a"), None);
         let second = content_row(BaseItemKind::Folder, Some("/m/a/b"), Some(&first));
-        FerrofinItemPersistenceService::new(db.clone())
+        store
             .save_items(&[first.clone(), second.clone()])
             .await
             .expect("rows");
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?1 WHERE "Id" = ?2"#)
-            .bind(&second.id)
-            .bind(&first.id)
-            .execute(db.pool())
-            .await
-            .expect("the cycle");
+        // Re-saved once its parent row exists, so the parent key holds.
         let first = BaseItemEntity {
             parent_id: Some(second.id.clone()),
             ..first
         };
+        store
+            .save_items(std::slice::from_ref(&first))
+            .await
+            .expect("the cycle");
         let parents = manager(&db).parents_of(&first).await.unwrap();
         assert_eq!(parents.len(), 1, "the second row, then back to the first");
     }
