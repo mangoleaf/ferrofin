@@ -230,6 +230,10 @@ EOS
 
 # --- run.sh command line -----------------------------------------------------------
 
+bin_first() { # the fake binaries in $TMP/bin win over the real ones (a function: shellcheck reads a @test body as a subshell)
+  PATH="$TMP/bin:$PATH"
+}
+
 fake_docker() { # a docker on PATH that has every image and no containers
   mkdir -p bin; cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
@@ -632,7 +636,7 @@ case "$1" in
 esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
-  chmod +x bin/docker; PATH="$TMP/bin:$PATH"
+  chmod +x bin/docker; bin_first
   start=$SECONDS
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
   [ "$status" -eq 1 ]
@@ -703,7 +707,7 @@ case "$1" in
 esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
-  chmod +x bin/docker; PATH="$TMP/bin:$PATH"
+  chmod +x bin/docker; bin_first
   start=$SECONDS
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
   [ "$status" -eq 1 ]
@@ -726,7 +730,7 @@ case "$1" in
 esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
-  chmod +x bin/docker; PATH="$TMP/bin:$PATH"
+  chmod +x bin/docker; bin_first
   start=$SECONDS
   ADOPTION_SCALE_TIMEOUT=1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
   [ "$status" -eq 1 ]
