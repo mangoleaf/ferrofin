@@ -333,6 +333,61 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     );
 }
 
+/// The grouped browse picks one row per `PresentationUniqueKey` in a subquery
+/// (`ApplyGroupingFilter`). Its plan is pinned: the filtered rows come off the
+/// type index, the representatives are computed once as a list (never per
+/// outer row), and the outer query fetches each one by its primary key.
+#[tokio::test]
+async fn grouped_browse_plan_computes_representatives_once() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        recursive: true,
+        include_item_types: vec![BaseItemKind::Movie],
+        limit: Some(100),
+        order_by: vec![(ItemSortBy::DateCreated, SortOrder::Descending)],
+        ..Default::default()
+    };
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+    let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        plan.starts_with(
+            "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?) | LIST SUBQUERY"
+        ),
+        "the outer query probes the representatives by id: {plan}"
+    );
+    assert!(
+        !plan.contains("CORRELATED LIST SUBQUERY"),
+        "the representatives are computed once: {plan}"
+    );
+    let grouping = plan
+        .split("CO-ROUTINE")
+        .nth(1)
+        .expect("the grouping runs as a co-routine");
+    assert!(
+        grouping.contains("SEARCH bi USING INDEX IX_BaseItems_Type_TopParentId_StartDate (Type=?)"),
+        "{plan}"
+    );
+    assert!(
+        !grouping.contains("SCAN bi"),
+        "must not scan the library: {plan}"
+    );
+}
+
 /// `Person` + `PersonTypes` (movie recommendations' "directed by") stays a
 /// correlated lookup: the credit is found through the item's own map rows
 /// and the `Peoples` primary key, never by scanning `Peoples` for the type.
