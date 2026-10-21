@@ -115,7 +115,7 @@ pub fn graphical_sub_canvas_size(
         return String::new();
     };
     if !should_encode_subtitle
-        || sub.is_text_subtitle_stream.unwrap_or(false)
+        || sub.is_text_subtitle_stream()
         || sub.codec.as_deref().is_some_and(|c| eq(c, DVBSUB_CODEC))
     {
         return String::new();
@@ -1095,7 +1095,7 @@ mod tests {
     fn a_bitmap_subtitle_gets_a_canvas_sized_to_itself() {
         let sub = MediaStream {
             codec: Some("PGSSUB".to_owned()),
-            is_text_subtitle_stream: Some(false),
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
             width: Some(1920),
             height: Some(1080),
             ..MediaStream::default()
@@ -1115,7 +1115,7 @@ mod tests {
         // itself.
         let text = MediaStream {
             codec: Some("subrip".to_owned()),
-            is_text_subtitle_stream: Some(true),
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
             width: Some(1920),
             height: Some(1080),
             ..MediaStream::default()
@@ -1125,7 +1125,7 @@ mod tests {
         // DVBSUB is always 720x576 and carries no dimensions of its own.
         let dvb = MediaStream {
             codec: Some("DVBSUB".to_owned()),
-            is_text_subtitle_stream: Some(false),
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
             width: Some(720),
             height: Some(576),
             ..MediaStream::default()
@@ -1135,9 +1135,38 @@ mod tests {
         // A bitmap subtitle with no usable size gets nothing either.
         let sizeless = MediaStream {
             codec: Some("PGSSUB".to_owned()),
-            is_text_subtitle_stream: Some(false),
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
             ..MediaStream::default()
         };
         assert_eq!(graphical_sub_canvas_size(Some(&sizeless), true), "");
+    }
+
+    /// Text or bitmap is the stream's codec, as upstream's computed
+    /// `IsTextSubtitleStream` says (`MediaStream.cs:610`), not the cached
+    /// flag only `populate_computed_fields` fills (gl-756).
+    #[test]
+    fn text_or_bitmap_is_read_from_the_codec_not_the_cached_flag() {
+        let sub = |codec: &str, cached: Option<bool>| MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
+            codec: Some(codec.to_owned()),
+            is_text_subtitle_stream: cached,
+            width: Some(1920),
+            height: Some(1080),
+            ..MediaStream::default()
+        };
+        // A text stream nobody populated, or populated wrongly: no canvas.
+        assert_eq!(
+            graphical_sub_canvas_size(Some(&sub("subrip", None)), true),
+            ""
+        );
+        assert_eq!(
+            graphical_sub_canvas_size(Some(&sub("ass", Some(false))), true),
+            ""
+        );
+        // A bitmap stream whose cache says text still gets its canvas.
+        assert_eq!(
+            graphical_sub_canvas_size(Some(&sub("PGSSUB", Some(true))), true),
+            " -canvas_size 1920x1080"
+        );
     }
 }
