@@ -867,6 +867,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             max_framerate: request.max_framerate,
             allow_video_stream_copy: request.allow_video_stream_copy,
             allow_audio_stream_copy: request.allow_audio_stream_copy,
+            enable_audio_vbr_encoding: request.enable_audio_vbr_encoding,
             // The profile/level/framerate/size requests feed the master
             // playlist's CODECS/RESOLUTION/FRAME-RATE fields (and the level
             // clamp) exactly as `BaseEncodingJobOptions` does upstream.
@@ -1897,8 +1898,25 @@ impl FerrofinStreamStatePlanner {
                     .output_audio_bitrate
                     .filter(|_| !is_lossless_audio_codec(&audio_encoder))
                 {
-                    push_split(&mut args, "-b:a");
-                    args.push(bitrate.to_string());
+                    // `EnableAudioVbr && state.EnableAudioVbrEncoding`: the VBR
+                    // quality `GetAudioVbrModeParam` picks for the encoder,
+                    // else `-ab`.
+                    let vbr = (options.enable_audio_vbr
+                        && state.base_request.enable_audio_vbr_encoding)
+                        .then(|| {
+                            ferrofin_mediaencoding::encoding_helper::helper::audio_vbr_mode_param(
+                                &audio_encoder,
+                                bitrate,
+                                state.output_audio_channels.unwrap_or(2),
+                            )
+                        })
+                        .flatten();
+                    if let Some(vbr) = vbr {
+                        push_split(&mut args, &vbr);
+                    } else {
+                        push_split(&mut args, "-b:a");
+                        args.push(bitrate.to_string());
+                    }
                 }
                 // Suppress `-ac` when the downmix algorithm filter is active:
                 // the `pan=stereo|…` filter already sets the output to stereo,
@@ -3000,6 +3018,70 @@ mod tests {
         assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
         assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
         assert_ne!(limited.playlist_path, audio_limited.playlist_path);
+    }
+
+    /// With "Enable VBR audio encoding" on (`EncodingOptions.EnableAudioVbr`)
+    /// and the request allowing it (`EnableAudioVbrEncoding`, true by
+    /// default), the audio is encoded at the VBR quality
+    /// `GetAudioVbrModeParam` picks for the encoder and the bitrate per
+    /// channel, in progressive and HLS output alike.
+    #[tokio::test]
+    async fn vbr_audio_encodes_at_the_encoders_quality_for_the_bitrate() {
+        let mut flac = audio_stream("flac");
+        flac.channels = Some(2);
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![flac])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            EncodingOptions {
+                enable_audio_vbr: true,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.audio_bitrate = Some(128_000);
+        for kind in [PlaylistKind::Progressive, PlaylistKind::Vod] {
+            let args = p
+                .plan(&req, true, None, kind)
+                .await
+                .unwrap()
+                .arguments
+                .join(" ");
+            assert!(args.contains("-c:a libmp3lame"), "{args}");
+            // 64 kbit/s per channel.
+            assert!(args.contains("-qscale:a 4"), "{args}");
+            assert!(!args.contains("-b:a"), "{args}");
+        }
+
+        // The request refusing it (`enableAudioVbrEncoding=false`) keeps the
+        // constant bitrate.
+        req.enable_audio_vbr_encoding = false;
+        let args = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        assert!(args.contains("-b:a 128000"), "{args}");
+        assert!(!args.contains("-qscale:a"), "{args}");
+
+        // So does an encoder without a VBR mode: opus.
+        req.enable_audio_vbr_encoding = true;
+        req.output_container = Some("ogg".to_owned());
+        req.audio_codec = Some("opus".to_owned());
+        let args = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        assert!(args.contains("-c:a libopus"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
     }
 
     /// `GetProgressiveAudioFullCommandLine` emits `-ab state.OutputAudioBitrate`:

@@ -542,6 +542,9 @@ pub struct HlsStreamRequest {
     pub allow_video_stream_copy: bool,
     /// Whether `-c:a copy` is permitted (`allowAudioStreamCopy`; default true).
     pub allow_audio_stream_copy: bool,
+    /// Whether the audio may be encoded VBR when the server's encoding options
+    /// enable it (`enableAudioVbrEncoding`; default true).
+    pub enable_audio_vbr_encoding: bool,
     /// Whether the client asked for a static (direct) stream (`static`).
     pub is_static: bool,
     /// The resume offset in ticks (`startTimeTicks`), when the client is resuming.
@@ -663,6 +666,7 @@ impl Default for HlsStreamRequest {
             // (the C# request DTO defaults both to true).
             allow_video_stream_copy: true,
             allow_audio_stream_copy: true,
+            enable_audio_vbr_encoding: true,
             is_static: false,
             start_time_ticks: None,
             profile: None,
