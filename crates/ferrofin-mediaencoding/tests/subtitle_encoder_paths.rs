@@ -973,3 +973,59 @@ fn the_file_stamp_is_the_size_and_dotnet_ticks_of_the_last_write() {
     );
     assert_eq!(NoopSubtitleIo.file_stamp("/no/such/file"), None);
 }
+
+// -- ffmpeg stream index: `GetSubtitleStreamIndexForFfmpeg` (v12.2) -------
+
+/// An embedded track is mapped by its position among the video file's own
+/// streams (`EncodingHelper.FindIndex`), so a subtitle sidecar listed first
+/// does not shift it past the end of the file.
+#[tokio::test]
+async fn an_embedded_track_is_mapped_past_a_subtitle_sidecar() {
+    let sidecar = sub_stream(0, "subrip", Some("/media/movie.en.srt"), true);
+    let video = MediaStream {
+        index: 1,
+        codec: Some("h264".to_owned()),
+        stream_type: MediaStreamType::Video,
+        ..MediaStream::default()
+    };
+    let embedded = sub_stream(2, "subrip", None, false);
+    let source = source_with("guid14", "/media/movie.mkv", vec![sidecar, video, embedded]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].0.contains("-map 0:1 -an -vn"), "{}", calls[0].0);
+    assert_eq!(calls[0].1, ["/cache/guid14/2.srt"]);
+}
+
+/// On a Blu-ray source, the TrueHD and Atmos audio streams before the track,
+/// which ffprobe hides but ffmpeg counts, shift its index.
+#[tokio::test]
+async fn a_blu_ray_track_counts_the_hidden_truehd_streams_before_it() {
+    let video = MediaStream {
+        index: 0,
+        codec: Some("h264".to_owned()),
+        stream_type: MediaStreamType::Video,
+        ..MediaStream::default()
+    };
+    let truehd = MediaStream {
+        index: 1,
+        codec: Some("truehd".to_owned()),
+        stream_type: MediaStreamType::Audio,
+        ..MediaStream::default()
+    };
+    let subtitle = sub_stream(2, "subrip", None, false);
+    let mut source = source_with("guid15", "/media/disc", vec![video, truehd, subtitle]);
+    source.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].0.contains("-map 0:3 -an -vn"), "{}", calls[0].0);
+}

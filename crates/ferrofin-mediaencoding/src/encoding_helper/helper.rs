@@ -26,7 +26,8 @@ use std::fmt::Write as _;
 use ferrofin_model::configuration::{EncodingOptions, HlsAudioSeekStrategy};
 use ferrofin_model::data::VideoRangeType;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
-use ferrofin_model::entities::EncoderPreset;
+use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::entities::{EncoderPreset, MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
@@ -1292,6 +1293,38 @@ pub fn find_index(media_streams: &[MediaStream], stream_to_find: &MediaStream) -
         }
     }
     -1
+}
+
+/// The ffmpeg stream index of a subtitle track: [`find_index`], plus, for an
+/// embedded track of a Blu-ray source, the TrueHD and Atmos audio streams
+/// before it, which ffprobe does not list but ffmpeg counts. Port of
+/// `EncodingHelper.GetSubtitleStreamIndexForFfmpeg`; `-1` when the track is
+/// not among the source's streams.
+#[must_use]
+pub fn get_subtitle_stream_index_for_ffmpeg(
+    media_source: &MediaSourceInfo,
+    subtitle_stream: &MediaStream,
+) -> i32 {
+    let index = find_index(&media_source.media_streams, subtitle_stream);
+    if index == -1
+        || subtitle_stream.is_external
+        || media_source.video_type != Some(VideoType::BluRay)
+    {
+        return index;
+    }
+    let hidden_before = media_source
+        .media_streams
+        .iter()
+        .filter(|stream| {
+            stream.stream_type == MediaStreamType::Audio
+                && !stream.is_external
+                && stream.codec.as_deref().is_some_and(|codec| {
+                    codec.eq_ignore_ascii_case("truehd") || codec.eq_ignore_ascii_case("atmos")
+                })
+                && stream.index < subtitle_stream.index
+        })
+        .count();
+    index.saturating_add(i32::try_from(hidden_before).unwrap_or(i32::MAX))
 }
 
 /// Whether the encoded output would embed a burnt-in subtitle. Port of

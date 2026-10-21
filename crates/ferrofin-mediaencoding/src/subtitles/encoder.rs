@@ -612,9 +612,18 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             else {
                 continue;
             };
-            let Some(stream_index) = find_index(&media_source.media_streams, stream) else {
+            // `GetSubtitleStreamIndexForFfmpeg`: the track's place among the
+            // video file's own streams, not among every stream of the source
+            // (a sidecar listed first would shift it past the end of the file).
+            let stream_index = helper::get_subtitle_stream_index_for_ffmpeg(media_source, stream);
+            if stream_index == -1 {
+                tracing::error!(
+                    path = %source_path,
+                    index = stream.index,
+                    "cannot find subtitle stream index, skipping this stream"
+                );
                 continue;
-            };
+            }
             // Lock the output path, then skip a fresh cache
             // (`IsCachedSubtitleFresh` against the stream's own file, else the
             // media file). Without it every subtitle request re-runs the
@@ -1167,17 +1176,6 @@ fn is_codec_copyable(codec: &str) -> bool {
         || codec.eq_ignore_ascii_case("subrip")
         || codec.eq_ignore_ascii_case("pgssub")
         || MediaStream::is_vob_sub_format(Some(codec))
-}
-
-/// Finds the ordinal index of `stream` within `streams` by identity/index.
-///
-/// Port of `EncodingHelper.FindIndex(mediaStreams, stream)`, matched on the
-/// stream `index` (its stable identity in a media source).
-fn find_index(streams: &[MediaStream], stream: &MediaStream) -> Option<i32> {
-    streams
-        .iter()
-        .position(|s| s.index == stream.index)
-        .and_then(|p| i32::try_from(p).ok())
 }
 
 /// Returns the lowercased file extension of `path` (without the dot), if any.
