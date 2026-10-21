@@ -108,6 +108,9 @@ struct ArtworkCache {
     resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
     track_albums: HashMap<Uuid, Uuid>,
+    /// Album → the first `REPLAYGAIN_ALBUM_GAIN` its unlocked tracks' probes
+    /// read this scan, for the music pass to store on an album that has none.
+    album_gains: HashMap<Uuid, f64>,
     /// Album → immutable shared cover, including dimensions and blurhash.
     album_covers: HashMap<Uuid, ItemImageInfo>,
     /// Albums containing tracks scanned before a usable cover was found.
@@ -1191,8 +1194,12 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
             ..Default::default()
         },
         // Extract embedded chapter markers so they show on the playback
-        // timeline (matching Jellyfin's `-show_chapters`).
-        extract_chapters: true,
+        // timeline (matching Jellyfin's `-show_chapters`): every video
+        // (`FFProbeVideoInfo`), and among audio only an audiobook
+        // (`AudioFileProber`: `ExtractChapters = item is AudioBook`).
+        extract_chapters: !is_audio
+            || crate::item_type_lookup::kind_from_type_name(&entity.type_)
+                == Some(BaseItemKind::AudioBook),
         media_is_audio: is_audio,
     })
 }
@@ -6511,7 +6518,8 @@ impl LibraryScanner {
             return false;
         }
         let mut served = work.served.clone();
-        self.refresh_music(&work.music, run, &mut served).await;
+        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+            .await;
         self.finish_album_artwork(art_cache, run).await;
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
@@ -6747,6 +6755,22 @@ impl LibraryScanner {
         } else {
             None
         };
+        // `FetchEmbeddedInfo` writes the item before the providers run: a
+        // stored item's pre-merge row, which the merge then treats as the
+        // item; a new item's row is upstream's `temp`, so its tags go on a
+        // copy that fills what the readers and providers leave
+        // ([`fill_embedded_info`]).
+        let mut new_item_tags = None;
+        if let Some(info) = video_info {
+            let replace_data = options.replace_all_metadata;
+            if let Some(base) = video_base.as_mut() {
+                fetch_embedded_info(base, info, locked, locked_fields, replace_data);
+            } else {
+                let mut tagged = entity.clone();
+                fetch_embedded_info(&mut tagged, info, locked, locked_fields, replace_data);
+                new_item_tags = Some(tagged);
+            }
+        }
         // `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`: on a
         // full refresh (`isFullRefresh`) of an unlocked season, `BeforeSave`
         // takes its premiere date and year from its episodes before the
@@ -6789,6 +6813,17 @@ impl LibraryScanner {
             entity.parent_index_number = guesses.parent_index_number;
         }
         let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
+        // `if (audio.AlbumEntity is not null && !audio.AlbumEntity.
+        // NormalizationGain.HasValue)` in `FetchDataFromTags`, which runs for
+        // an unlocked track only: the first tagged track names its album's
+        // gain, which the music pass stores ([`refresh_music`]).
+        if !locked
+            && probe.is_audio
+            && let Some(gain) = probe.info.as_ref().and_then(crate::audio_tags::album_gain)
+            && let Some(album) = state.art_cache.track_albums.get(&item.id).copied()
+        {
+            state.art_cache.album_gains.entry(album).or_insert(gain);
+        }
         Self::apply_shortcut(&mut entity, plan.probe).await;
         // "Identify → Apply" (`POST /Items/RemoteSearch/Apply`): the chosen
         // result rides on the options of the items the refresh covers.
@@ -7024,6 +7059,26 @@ impl LibraryScanner {
         // with the tags' (`FetchDataFromTags`, only for an unlocked item): they
         // stand unless a provider's answer replaces them in turn.
         let credits = credits.or_else(|| rows.people.clone().filter(|_| !locked));
+        // `FetchPeople`: the video prober writes the tagged people before the
+        // providers, for an unlocked item whose cast is unlocked, under
+        // "Replace all metadata" or when it has none yet; like the audio
+        // prober's, they stand unless a provider's credits replace them.
+        let credits = match credits {
+            Some(credits) => Some(credits),
+            None => match video_info {
+                Some(info)
+                    if !locked
+                        && !locked_fields.contains(&MetadataField::Cast)
+                        && !info.people.is_empty()
+                        && (options.replace_all_metadata
+                            || stored_row.is_none()
+                            || self.stored_cast_is_empty(item.id).await) =>
+                {
+                    Some(embedded_video_people(info))
+                }
+                _ => None,
+            },
+        };
         // `BeforeSaveInternal`: a stored file that changed on disk is
         // re-dated under "Use file creation date" (`RefreshContext::redated`).
         let redated = stored_row.and_then(|row| state.refresh.redated(row, item));
@@ -7092,6 +7147,17 @@ impl LibraryScanner {
             }
             None => saved_row(metadata_stored, &guesses, &entity, facts),
         };
+        if metadata_stored.is_none()
+            && let Some(tagged) = &new_item_tags
+        {
+            let forced_sort_name = entity.forced_sort_name.clone();
+            fill_embedded_info(&mut entity, tagged);
+            // `saved_row` settled the sort key already; a tagged forced sort
+            // name moves it.
+            if entity.forced_sort_name != forced_sort_name {
+                settle_sort_name(&mut entity);
+            }
+        }
         keep_unplanned_version_owner(
             item.id,
             &mut entity,
@@ -7457,6 +7523,8 @@ impl LibraryScanner {
             cancel,
         )
         .await?;
+        self.persist_audiobook_chapters(&entity, &rows, cancel)
+            .await?;
         // A new video needs its first item save for the trickplay FK. Finish
         // its metadata refresh stamp only after the custom provider returns;
         // ordinary custom-provider errors still complete; cancellation stops it.
@@ -8106,7 +8174,8 @@ impl LibraryScanner {
         let mut served = work.served.clone();
         let started = std::time::Instant::now();
         // Music: each album's and artist's providers as the walk decided.
-        self.refresh_music(&work.music, run, &mut served).await;
+        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+            .await;
         timings.music = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
@@ -9578,7 +9647,10 @@ impl LibraryScanner {
                 xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
         };
-        if parsed.is_err() {
+        if let Err(error) = parsed {
+            // A malformed season/album/artist NFO: upstream's plain `Fetch`
+            // lets the `XmlException` fail the local provider, which is logged.
+            tracing::warn!(path = %nfo_path, ?error, "local NFO not read");
             return LocalNfo::default();
         }
         apply_nfo(entity, &result.item);
@@ -11951,9 +12023,12 @@ impl LibraryScanner {
             let Some(cf) = collection_folder_id(folder) else {
                 continue;
             };
-            let out_dir = meta_root.join(guid_to_db(cf));
+            let out_dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), cf);
             let out = out_dir.join("primary.png");
-            if !Self::library_tile_due(items, cf, &out, force).await? {
+            if !self
+                .library_tile_due(items, &meta_root.resolve(), cf, force)
+                .await?
+            {
                 continue;
             }
             // Random content sample; over-fetch since not every row has art.
@@ -12044,24 +12119,22 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Whether `library`'s tile at `out` is drawn this pass. Never for a
-    /// locked library: `RefreshWithProviders` returns before its custom
-    /// providers (`MetadataService.cs:785-788`). When missing or older than 7
-    /// days (upstream's `HasChangedByDate` window), as the scan has always
-    /// drawn it. A fresh tile only when `force`d (`runAllProviders`), and,
-    /// as `FetchAsync`, not over a Primary this pass did not draw (a remote
-    /// one, or a file outside the library's art folder).
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence; gl-591): a
-    /// missing or stale tile is drawn over such a Primary too, and Jellyfin's
-    /// `{metadata}/library/{xx}/{id}` folder is not taken for the library's
-    /// own. Un-defer path: drop image rows whose file is gone
-    /// (`ValidateImages`), then apply the `FetchAsync` rule before the date
-    /// gate, accepting both folder layouts as `remove_item_images` does.
+    /// Whether `library`'s tile is drawn this pass
+    /// (`BaseDynamicImageProvider.HasChanged` / `FetchAsync`):
+    /// - never for a locked library: `RefreshWithProviders` returns before its
+    ///   custom providers (`MetadataService.cs:785-788`);
+    /// - never over a Primary that is not the library's own, a remote one or a
+    ///   file outside its art folders (Ferrofin's or the one Jellyfin drew
+    ///   into, [`internal_metadata_dirs`](crate::dynamic_images::internal_metadata_dirs)),
+    ///   after `ValidateImages` has dropped a Primary whose file is gone;
+    /// - otherwise when there is none, when it is older than 7 days by its
+    ///   row's date (`CollectionFolderImageProvider.HasChangedByDate`), or when
+    ///   `force`d (`runAllProviders`).
     async fn library_tile_due(
+        &self,
         items: &Arc<dyn ItemRepository>,
+        meta_root: &Path,
         library: Uuid,
-        out: &Path,
         force: bool,
     ) -> Result<bool, ServiceError> {
         if items
@@ -12071,23 +12144,25 @@ impl LibraryScanner {
         {
             return Ok(false);
         }
-        let fresh = std::fs::metadata(out)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
-        if !fresh || !force {
-            return Ok(!fresh);
+        let mut images = items.get_image_infos(library).await?;
+        if crate::dynamic_images::drop_missing_images(&mut images)
+            && let Err(err) = self.persistence.save_item_images(library, &images).await
+        {
+            // The pass goes on with the rows that are left, as the draw
+            // below does when its save fails.
+            tracing::warn!(%err, library = %library, "failed to drop the library's missing images");
         }
-        let art_dir = out.parent().unwrap_or(out);
-        Ok(items
-            .get_image_infos(library)
-            .await?
-            .iter()
-            .find(|i| i.image_type == ImageType::Primary)
-            .is_none_or(|primary| {
-                primary.is_local_file() && Path::new(&primary.path).starts_with(art_dir)
-            }))
+        // `HasChanged`: no Primary at all is a change.
+        let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) else {
+            return Ok(true);
+        };
+        if !crate::dynamic_images::is_own_image(meta_root, library, primary) {
+            return Ok(false);
+        }
+        // `CollectionFolderImageProvider.HasChangedByDate`: the row's date,
+        // `age.TotalDays > 7`.
+        let stale = Utc::now() - primary.date_modified > chrono::TimeDelta::days(7);
+        Ok(stale || force)
     }
 
     /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
@@ -12153,11 +12228,10 @@ impl LibraryScanner {
         let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
             return;
         };
-        let mut folders = vec![meta_root.join(&entity.id)];
-        if let Ok(id) = Uuid::parse_str(&entity.id) {
-            let simple = id.simple().to_string();
-            folders.push(meta_root.join(&simple[..2]).join(&simple));
-        }
+        let folders = Uuid::parse_str(&entity.id).map_or_else(
+            |_| vec![meta_root.join(&entity.id)],
+            |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
+        );
         let mut seen: Vec<ImageType> = Vec::new();
         for image in stored {
             let singular = matches!(
@@ -15357,6 +15431,46 @@ impl LibraryScanner {
                 name: chapter.name,
                 image_path: chapter.image_path,
                 image_date_modified: Some(chapter.image_date_modified),
+            })
+            .collect::<Vec<_>>();
+        repo.save_chapters(id, &saved).await
+    }
+
+    /// Saves an audiobook's probed chapters, as Jellyfin 12's `AudioFileProber`
+    /// does after its streams: `if (audio is AudioBook && mediaInfo.Chapters is
+    /// { Length: > 0 }) _chapterManager.SaveChapters(audio, mediaInfo.Chapters)`,
+    /// keeping only chapters that start before the runtime
+    /// (`ChapterManager.SaveChapters`). Unlike the video prober it checks no
+    /// refresh mode: whenever the probe ran, its chapters are saved. A probe that
+    /// found none leaves the stored rows alone; no dummy chapters and no chapter
+    /// images, which stay a video's.
+    async fn persist_audiobook_chapters(
+        &self,
+        book: &BaseItemEntity,
+        probe: &ProbeRows,
+        cancel: &ScanCancel,
+    ) -> Result<(), ServiceError> {
+        if cancel.is_cancelled()
+            || probe.chapters.is_empty()
+            || crate::item_type_lookup::kind_from_type_name(&book.type_)
+                != Some(BaseItemKind::AudioBook)
+        {
+            return Ok(());
+        }
+        let Some(repo) = &self.chapters else {
+            return Ok(());
+        };
+        let id = Uuid::parse_str(&book.id)
+            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
+        let runtime = book.run_time_ticks.unwrap_or(0);
+        let saved = probe
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.start_position_ticks < runtime)
+            .map(|chapter| ChapterEntity {
+                item_id: book.id.clone(),
+                chapter_index: 0,
+                ..chapter.clone()
             })
             .collect::<Vec<_>>();
         repo.save_chapters(id, &saved).await
@@ -19053,6 +19167,171 @@ fn apply_video_metadata(
     }
 }
 
+/// The tagged values `FFProbeVideoInfo.FetchEmbeddedInfo` (v12.2,
+/// `FFProbeVideoInfo.cs:389-499`) writes onto a probed video, each kept when
+/// the item already has one unless "Replace all metadata" (`replace_data`) is
+/// on: the official rating, genres and studios (each lockable), a music
+/// video's album and artists, the production year and premiere date (not for
+/// an extra, which takes its owner's), the forced sort name (behind the Name
+/// lock), a year from the premiere date, and the overview. The episode numbers
+/// and the embedded title are [`apply_video_metadata`]'s.
+///
+/// Departure: under "Replace all metadata" upstream assigns the tag even when
+/// the file has none, erasing the overview, rating, genres, studios, album and
+/// artists before the merge. Its merge keeps the stored values when every
+/// remote provider failed ("erasing the old values is only safe when a remote
+/// provider returned something to replace them with",
+/// `MetadataService.cs:897-906`), and the prober's erasure defeats exactly
+/// that, so here a tag replaces only when the file carries one. When a
+/// provider does answer, the merge still replaces as upstream's does.
+fn fetch_embedded_info(
+    item: &mut BaseItemEntity,
+    info: &MediaInfo,
+    locked: bool,
+    fields: &[MetadataField],
+    replace_data: bool,
+) {
+    use chrono::Datelike as _;
+    let unlocked = |field: MetadataField| !locked && !fields.contains(&field);
+    let blank = |value: &Option<String>| value.as_deref().is_none_or(|v| v.trim().is_empty());
+    // Fill an empty field; replace a set one under "Replace all metadata"
+    // only with a tag the file carries (see the departure above).
+    let take = |stored: &Option<String>, tag: &Option<String>| {
+        blank(stored) || (replace_data && !blank(tag))
+    };
+    if unlocked(MetadataField::OfficialRating) && take(&item.official_rating, &info.official_rating)
+    {
+        item.official_rating.clone_from(&info.official_rating);
+    }
+    // `Genres = []`, then `AddGenre` for each trimmed tag.
+    let genres = distinct_trimmed(&info.genres);
+    if unlocked(MetadataField::Genres) && take(&item.genres, &genres) {
+        item.genres = genres;
+    }
+    // `SetStudios`: trimmed, distinct.
+    let studios = distinct_trimmed(&info.studios);
+    if unlocked(MetadataField::Studios) && take(&item.studios, &studios) {
+        item.studios = studios;
+    }
+    if !locked
+        && item_type_lookup::kind_from_type_name(&item.type_) == Some(BaseItemKind::MusicVideo)
+    {
+        if take(&item.album, &info.album) {
+            item.album.clone_from(&info.album);
+        }
+        let artists = (!info.artists.is_empty()).then(|| info.artists.join("|"));
+        if take(&item.artists, &artists) {
+            item.artists = artists;
+        }
+    }
+    // Extras have no release date of their own; they take their owner's.
+    let use_container_dates = item.extra_type.is_none();
+    if use_container_dates
+        && let Some(year) = info.production_year
+        && (item.production_year.is_none() || replace_data)
+    {
+        item.production_year = Some(i64::from(year));
+    }
+    if use_container_dates
+        && let Some(date) = info.premiere_date
+        && (item.premiere_date.is_none() || replace_data)
+    {
+        item.premiere_date = Some(date);
+    }
+    if unlocked(MetadataField::Name)
+        && let Some(sort) = info
+            .forced_sort_name
+            .as_deref()
+            .filter(|sort| !sort.trim().is_empty())
+    {
+        item.forced_sort_name = Some(sort.to_owned());
+    }
+    // `video.PremiereDate.Value.ToLocalTime().Year`.
+    if use_container_dates
+        && item.production_year.is_none()
+        && let Some(date) = item.premiere_date
+    {
+        item.production_year = Some(i64::from(date.with_timezone(&chrono::Local).year()));
+    }
+    if unlocked(MetadataField::Overview) && take(&item.overview, &info.overview) {
+        item.overview.clone_from(&info.overview);
+    }
+}
+
+/// `values` trimmed, blank ones dropped and the rest de-duplicated
+/// case-insensitively, pipe-joined as the multi-valued columns store them;
+/// `None` when nothing is left.
+fn distinct_trimmed(values: &[String]) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    for value in values.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        if !kept
+            .iter()
+            .any(|k| ferrofin_util::string_extensions::equals_ordinal_ignore_case(k, value))
+        {
+            kept.push(value);
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join("|"))
+}
+
+/// Fills a NEW item's saved row from the copy [`fetch_embedded_info`] wrote,
+/// where its readers and providers left a field empty. Upstream writes the
+/// tags onto the item before the providers run and merges their answer over
+/// it, so an answer wins and a tag fills what none gave; a new item's row is
+/// upstream's `temp`, which the providers only fill, so the tags go last.
+fn fill_embedded_info(row: &mut BaseItemEntity, tagged: &BaseItemEntity) {
+    for (value, tag) in [
+        (&mut row.official_rating, &tagged.official_rating),
+        (&mut row.genres, &tagged.genres),
+        (&mut row.studios, &tagged.studios),
+        (&mut row.album, &tagged.album),
+        (&mut row.artists, &tagged.artists),
+        (&mut row.forced_sort_name, &tagged.forced_sort_name),
+        (&mut row.overview, &tagged.overview),
+    ] {
+        if value.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            value.clone_from(tag);
+        }
+    }
+    if row.production_year.is_none() {
+        row.production_year = tagged.production_year;
+    }
+    if row.premiere_date.is_none() {
+        row.premiere_date = tagged.premiere_date;
+    }
+}
+
+/// The people `FFProbeVideoInfo.FetchPeople` writes for a probed video: each
+/// named one with its kind and trimmed role (`update_people` de-duplicates
+/// them as `PeopleHelper.AddPerson` does).
+fn embedded_video_people(info: &MediaInfo) -> Vec<PeopleEntity> {
+    info.people
+        .iter()
+        .filter_map(|person| {
+            let name = person
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())?;
+            Some(PeopleEntity {
+                id: guid_to_db(Uuid::new_v4()),
+                name: name.to_owned(),
+                // `PersonInfo.Type.ToString()`, as [`person_to_entity`] keys it.
+                person_type: Some(person.type_.json_name().into_owned()),
+                role: person
+                    .role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_owned),
+                primary_image_url: None,
+                provider_id: None,
+                sort_order: None,
+            })
+        })
+        .collect()
+}
+
 /// The naming rules [`before_metadata_refresh`] reads a path by.
 static PATH_NAMING: std::sync::LazyLock<NamingOptions> =
     std::sync::LazyLock::new(NamingOptions::new);
@@ -20848,6 +21127,179 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The container dates `FetchEmbeddedInfo` reads (v12.2
+    /// `FFProbeVideoInfoTests`): 2016 and 2016-05-04.
+    fn tagged_dates() -> super::MediaInfo {
+        use chrono::TimeZone as _;
+        super::MediaInfo {
+            production_year: Some(2016),
+            premiere_date: Some(chrono::Utc.with_ymd_and_hms(2016, 5, 4, 0, 0, 0).unwrap()),
+            ..super::MediaInfo::default()
+        }
+    }
+
+    /// `FetchEmbeddedInfo_NoExtra_AppliesContainerDates`.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn fetch_embedded_info_no_extra_applies_container_dates(#[case] replace_all: bool) {
+        use chrono::TimeZone as _;
+        let mut video = super::BaseItemEntity::default();
+        super::fetch_embedded_info(&mut video, &tagged_dates(), false, &[], replace_all);
+        assert_eq!(video.production_year, Some(2016));
+        assert_eq!(
+            video.premiere_date,
+            Some(chrono::Utc.with_ymd_and_hms(2016, 5, 4, 0, 0, 0).unwrap())
+        );
+    }
+
+    /// `FetchEmbeddedInfo_Extra_IgnoresContainerDates`: an extra keeps the
+    /// dates it took from its owner.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn fetch_embedded_info_extra_ignores_container_dates(#[case] replace_all: bool) {
+        use chrono::TimeZone as _;
+        let owner_date = chrono::Utc.with_ymd_and_hms(1982, 6, 25, 0, 0, 0).unwrap();
+        let mut video = super::BaseItemEntity {
+            // `ExtraType.Trailer`.
+            extra_type: Some(2),
+            production_year: Some(1982),
+            premiere_date: Some(owner_date),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &tagged_dates(), false, &[], replace_all);
+        assert_eq!(video.production_year, Some(1982));
+        assert_eq!(video.premiere_date, Some(owner_date));
+    }
+
+    /// `FetchEmbeddedInfo_ExtraWithoutDates_StaysWithoutDates`.
+    #[test]
+    fn fetch_embedded_info_extra_without_dates_stays_without_dates() {
+        let mut video = super::BaseItemEntity {
+            // `ExtraType.Trailer`.
+            extra_type: Some(2),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &tagged_dates(), false, &[], false);
+        assert_eq!(video.production_year, None);
+        assert_eq!(video.premiere_date, None);
+    }
+
+    /// Each tag fills an empty field and replaces only under "Replace all
+    /// metadata"; a field's own lock keeps it, the forced sort name follows
+    /// the Name lock, and a locked item takes none of it.
+    #[rstest::rstest]
+    #[case::fills(false, false, &[], "PG|Drama|ACME|tagged|Tag Sort")]
+    #[case::keeps_without_replace(true, false, &[], "R|Comedy|Stored Co|stored|Tag Sort")]
+    #[case::replaces(true, true, &[], "PG|Drama|ACME|tagged|Tag Sort")]
+    #[case::name_locked(true, true, &[ferrofin_model::entities::MetadataField::Name], "PG|Drama|ACME|tagged|stored sort")]
+    #[case::field_locks_keep(
+        true,
+        true,
+        &[
+            ferrofin_model::entities::MetadataField::OfficialRating,
+            ferrofin_model::entities::MetadataField::Genres,
+            ferrofin_model::entities::MetadataField::Studios,
+            ferrofin_model::entities::MetadataField::Overview,
+        ],
+        "R|Comedy|Stored Co|stored|Tag Sort"
+    )]
+    fn fetch_embedded_info_fills_replaces_and_respects_locks(
+        #[case] stored: bool,
+        #[case] replace_all: bool,
+        #[case] fields: &[ferrofin_model::entities::MetadataField],
+        #[case] expected: &str,
+    ) {
+        let info = super::MediaInfo {
+            official_rating: Some("PG".to_owned()),
+            genres: vec![" Drama".to_owned(), "drama".to_owned(), String::new()],
+            studios: vec!["ACME".to_owned()],
+            overview: Some("tagged".to_owned()),
+            forced_sort_name: Some("Tag Sort".to_owned()),
+            ..super::MediaInfo::default()
+        };
+        let mut video = if stored {
+            super::BaseItemEntity {
+                official_rating: Some("R".to_owned()),
+                genres: Some("Comedy".to_owned()),
+                studios: Some("Stored Co".to_owned()),
+                overview: Some("stored".to_owned()),
+                forced_sort_name: Some("stored sort".to_owned()),
+                ..super::BaseItemEntity::default()
+            }
+        } else {
+            super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &info, false, fields, replace_all);
+        let got = [
+            &video.official_rating,
+            &video.genres,
+            &video.studios,
+            &video.overview,
+            &video.forced_sort_name,
+        ]
+        .iter()
+        .map(|v| v.as_deref().unwrap_or("-"))
+        .collect::<Vec<_>>()
+        .join("|");
+        assert_eq!(got, expected);
+        // Replacing with a file that carries no tags keeps the stored values
+        // (the departure in `fetch_embedded_info`'s docs).
+        let mut untagged_replace = super::BaseItemEntity {
+            official_rating: Some("R".to_owned()),
+            genres: Some("Comedy".to_owned()),
+            overview: Some("stored".to_owned()),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(
+            &mut untagged_replace,
+            &super::MediaInfo::default(),
+            false,
+            &[],
+            true,
+        );
+        assert_eq!(
+            (
+                untagged_replace.official_rating.as_deref(),
+                untagged_replace.genres.as_deref(),
+                untagged_replace.overview.as_deref()
+            ),
+            (Some("R"), Some("Comedy"), Some("stored"))
+        );
+        let mut locked = super::BaseItemEntity::default();
+        super::fetch_embedded_info(&mut locked, &info, true, &[], true);
+        assert_eq!(
+            (
+                locked.official_rating,
+                locked.overview,
+                locked.forced_sort_name
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// A music video takes its album and artists from the tags; a year comes
+    /// from the premiere date when none was tagged.
+    #[test]
+    fn fetch_embedded_info_fills_a_music_videos_album_and_a_year_from_its_date() {
+        use chrono::TimeZone as _;
+        let info = super::MediaInfo {
+            album: Some("Live".to_owned()),
+            artists: vec!["Band".to_owned(), "Guest".to_owned()],
+            premiere_date: Some(chrono::Utc.with_ymd_and_hms(2019, 7, 1, 12, 0, 0).unwrap()),
+            ..super::MediaInfo::default()
+        };
+        let mut video = super::BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.MusicVideo".to_owned(),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &info, false, &[], false);
+        assert_eq!(video.album.as_deref(), Some("Live"));
+        assert_eq!(video.artists.as_deref(), Some("Band|Guest"));
+        assert_eq!(video.production_year, Some(2019));
+    }
+
     fn credit(name: &str, person_type: &str, role: &str) -> super::PeopleEntity {
         super::PeopleEntity {
             name: name.to_owned(),
@@ -23745,8 +24197,9 @@ mod tests {
         // The library's saved MusicAlbum list is the whole answer…
         assert!(own.metadata_enabled("MusicAlbum", AUDIODB));
         assert!(!own.metadata_enabled("MusicAlbum", MUSICBRAINZ));
-        // …and a kind it saved none for falls back to the server.
-        assert!(!own.metadata_enabled("MusicArtist", AUDIODB));
+        // …and a MusicArtist it saved none for may use every provider
+        // (`CanRefreshMetadata`), whatever the server's defaults disable.
+        assert!(own.metadata_enabled("MusicArtist", AUDIODB));
         assert!(own.metadata_enabled("MusicArtist", MUSICBRAINZ));
         // An item whose library is not configured takes the server's alone.
         let elsewhere =
@@ -25038,10 +25491,10 @@ mod tests {
                         .audiodb
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if line.contains("/album-mb.php") {
-                        r#"{"album":[{"strAlbum":"AudioDb Album","strDescriptionEN":"Album text."}]}"#
+                        r#"{"album":[{"strAlbum":"AudioDb Album","strDescription":"Album text."}]}"#
                             .to_owned()
                     } else {
-                        r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#
+                        r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#
                             .to_owned()
                     }
                 };
@@ -38304,6 +38757,95 @@ mod chapter_image_refresh_tests {
             assert_eq!(std::fs::read(&target).unwrap(), b"previous frame");
         }
         assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    /// Jellyfin 12's `AudioFileProber`: an audiobook's probed chapters are saved,
+    /// cut at the runtime (`ChapterManager.SaveChapters`); a probe that found none
+    /// keeps the stored rows; a music track saves nothing; no chapter image is
+    /// ever extracted from audio. (The scan-level path is
+    /// `tests/library_scan_audiobook_chapters.rs`.)
+    #[tokio::test]
+    async fn an_audiobook_saves_its_probed_chapters_and_a_track_does_not() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let as_kind = |kind: BaseItemKind| {
+            let mut item = fixture.video.clone();
+            item.type_ = crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned();
+            item.media_type = Some("Audio".to_owned());
+            item.run_time_ticks = Some(500_000_000);
+            item
+        };
+        let book = as_kind(BaseItemKind::AudioBook);
+        let cancel = ScanCancel::new();
+        // An audio probe: its attachments are not authoritative.
+        let audio_probe = |positions: &[i64]| ProbeRows {
+            save_attachments: false,
+            ..video_probe(positions)
+        };
+        let starts = |chapters: Vec<ChapterEntity>| {
+            chapters
+                .iter()
+                .map(|chapter| chapter.start_position_ticks)
+                .collect::<Vec<_>>()
+        };
+
+        scanner
+            .persist_audiobook_chapters(
+                &book,
+                &audio_probe(&[0, 200_000_000, 600_000_000]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            starts(repo.get_chapters(id).await.unwrap()),
+            [0, 200_000_000],
+            "a chapter at or past the runtime is dropped"
+        );
+
+        for (item, probe) in [
+            (&book, audio_probe(&[])),
+            (&as_kind(BaseItemKind::Audio), audio_probe(&[100])),
+        ] {
+            scanner
+                .persist_audiobook_chapters(item, &probe, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(
+                starts(repo.get_chapters(id).await.unwrap()),
+                [0, 200_000_000],
+                "{}",
+                item.type_
+            );
+        }
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    /// `ExtractChapters`: every video probe asks for chapters
+    /// (`FFProbeVideoInfo`), and among audio only an audiobook's
+    /// (`AudioFileProber`: `ExtractChapters = item is AudioBook`).
+    #[test]
+    fn only_videos_and_audiobooks_probe_for_chapters() {
+        let fixture_item = |kind: BaseItemKind, media_type: &str| BaseItemEntity {
+            id: Uuid::new_v4().to_string(),
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned(),
+            media_type: Some(media_type.to_owned()),
+            path: Some("/media/file".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        for (kind, media_type, expected) in [
+            (BaseItemKind::Movie, "Video", true),
+            (BaseItemKind::AudioBook, "Audio", true),
+            (BaseItemKind::Audio, "Audio", false),
+        ] {
+            let request = probe_request(&fixture_item(kind, media_type)).expect("probed");
+            assert_eq!(request.extract_chapters, expected, "{kind:?}");
+        }
     }
 
     #[tokio::test]

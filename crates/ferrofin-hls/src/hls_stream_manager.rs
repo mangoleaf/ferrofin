@@ -806,9 +806,13 @@ where
         }
     }
 
-    /// The transcode cache directory (`GetTranscodePath`).
-    fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
-        Ok(PathBuf::from(self.paths.prepare_transcode_path()?))
+    /// The transcode cache directory (`GetTranscodePath`), prepared on the
+    /// blocking pool: the preparation walks the whole transcode tree.
+    async fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
+        Ok(PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(Arc::clone(&self.paths))
+                .await?,
+        ))
     }
 
     /// Resolves `file_name` inside the transcode cache, guarding traversal.
@@ -816,12 +820,12 @@ where
     /// Port of `HlsSegmentController.ValidateTranscodePath`: the resolved path must
     /// stay inside the transcode folder. `require_m3u8` additionally requires a
     /// `.m3u8` extension (the legacy playlist route).
-    fn resolve_in_transcode_dir(
+    async fn resolve_in_transcode_dir(
         &self,
         file_name: &str,
         require_m3u8: bool,
     ) -> Result<PathBuf, ServiceError> {
-        let dir = self.transcode_dir()?;
+        let dir = self.transcode_dir().await?;
         let candidate = dir.join(file_name);
         // Reject any name that escapes the transcode dir (`..`, absolute, etc.).
         let escapes = Path::new(file_name).components().any(|c| {
@@ -1022,7 +1026,9 @@ where
         file_name: &str,
         require_m3u8: bool,
     ) -> Result<ServedFile, ServiceError> {
-        let path = self.resolve_in_transcode_dir(file_name, require_m3u8)?;
+        let path = self
+            .resolve_in_transcode_dir(file_name, require_m3u8)
+            .await?;
         if !path.exists() {
             return Err(ServiceError::invalid_input("invalid segment"));
         }
@@ -2149,6 +2155,47 @@ mod tests {
         let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
         assert!(served.path.ends_with("abc0.ts"));
         assert_eq!(served.content_type, "video/mp2t");
+    }
+
+    /// Serving a segment prepares the transcode directory, a walk of the whole
+    /// tree, on the blocking pool and never inline on a runtime worker: with
+    /// the pool's only thread held busy the request cannot finish, which an
+    /// inline walk would ignore.
+    #[test]
+    fn serving_a_segment_prepares_the_directory_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("abc0.ts"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                mgr.resolve_transcode_file("abc0.ts", false),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "the segment was served with the blocking pool starved, so the walk ran inline"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
+            assert!(served.path.ends_with("abc0.ts"));
+        });
     }
 
     /// Upstream `HlsSegmentController.GetFileResult` refreshes the owning

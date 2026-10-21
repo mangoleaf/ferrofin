@@ -163,6 +163,15 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
     }
 }
 
+/// The `REPLAYGAIN_ALBUM_GAIN` tag, in dB, read as the track tag is
+/// ([`replay_gain`]): what the prober gives the track's album
+/// (`audio.AlbumEntity.NormalizationGain`).
+pub(super) fn album_gain(info: &MediaInfo) -> Option<f64> {
+    let raw = info.raw_audio_tags.as_ref()?;
+    let path = info.media_source.path.as_deref().unwrap_or_default();
+    replay_gain(raw, "replaygain_album_gain", path)
+}
+
 /// A ReplayGain tag's value in dB, as `AudioFileProber.FetchDataFromTags`
 /// reads it: a trailing `dB` in any case dropped and the rest trimmed, then
 /// `float.TryParse(NumberStyles.Float, InvariantCulture)`, kept only when

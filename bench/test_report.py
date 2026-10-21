@@ -350,6 +350,11 @@ class ReportTests(unittest.TestCase):
         self.edit(self.a / 'ferrofin/coldstart.json', lambda x: x.update(runs=x['runs'][:1]))
         self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
 
+    def test_cold_start_attempt_bound_separates_run_sets(self):
+        self.assertFalse(report.incompatible([str(self.a), str(self.b)]))
+        self.edit(self.a / 'run.json', lambda x: x.update(coldstart_attempt_timeout_ms=100))
+        self.assertIn('coldstart_attempt_timeout_ms', report.incompatible([str(self.a), str(self.b)]))
+
     def test_swapped_counts_between_request_keys_fail(self):
         for server, counts in [('jellyfin', [1, 2]), ('ferrofin', [2, 1])]:
             self.shapes(self.a / server, [{'shape': 'movies:items', 'url': f'http://{server}/Items?page={i}',
@@ -1110,6 +1115,34 @@ class InstrumentTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 coldstart.restart('owned','http://localhost',{},.01)
         self.assertTrue(finished.is_set())
+
+    def test_only_the_readiness_connect_is_bounded_by_the_attempt_timeout(self):
+        # A stalled connect must not hold the next attempt back for the whole TCP retransmit,
+        # but a slow first response is still the server's first response.
+        import threading
+        connects, reads, paths = [], [], []
+        class Conn:
+            def __init__(self, host, port, timeout):
+                connects.append(timeout)
+                self.sock = Mock(settimeout=reads.append)
+            def connect(self):
+                if len(connects) == 1:
+                    raise TimeoutError('stalled SYN')
+            def request(self, method, path, headers): paths.append(path)
+            def getresponse(self): return Mock(status=200)
+            def close(self): pass
+        with patch.dict(os.environ, {'COLDSTART_ATTEMPT_TIMEOUT_MS': '100', 'HTTP_TIMEOUT_S': '10'}), \
+             patch.object(coldstart.http.client, 'HTTPConnection', Conn):
+            self.assertIsNotNone(coldstart.poll('http://localhost:1/UserViews?userId=u', {}, 300, .001,
+                                                threading.Event(), threading.Event()))
+        self.assertEqual(connects, [.1, .1])
+        self.assertEqual(reads, [10.0])
+        self.assertEqual(paths, ['/UserViews?userId=u'])
+        connects.clear(); reads.clear()
+        with patch.dict(os.environ, {'COLDSTART_ATTEMPT_TIMEOUT_MS': '100', 'HTTP_TIMEOUT_S': '10'}), \
+             patch.object(coldstart.http.client, 'HTTPConnection', Conn):
+            coldstart.poll('http://localhost:1/UserViews?userId=u', {}, .05, .001, threading.Event(), threading.Event())
+        self.assertEqual((connects, reads), ([.05, .05], [.05]))  # neither bound outlasts the deadline
 
     def test_restart_poller_is_running_before_start_and_joined(self):
         import threading

@@ -76,6 +76,7 @@ fn extraction<'a>(
         max_width: 64,
         qscale: 4,
         threads: 1,
+        priority: ferrofin_model::configuration::ProcessPriorityClass::BelowNormal,
         output_dir,
         allow_hw_accel: false,
         enable_hw_encoding: false,

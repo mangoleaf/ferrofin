@@ -12,21 +12,27 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 /// A single channel parsed from an M3U tuner playlist.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct M3uChannel {
     /// Stable channel id — the `tvg-id`/`channel-id`/`CUID` attribute when
-    /// present, otherwise derived from the name. Also the key the XMLTV guide
+    /// present, otherwise the `#EXTINF` display text after the comma (as
+    /// written, before the SatIP prefix is stripped from [`name`](Self::name)). Also the key the XMLTV guide
     /// matches its `channel id` against.
     pub id: String,
-    /// The display name (the text after the comma on the `#EXTINF` line, or
-    /// `tvg-name` when that is empty).
+    /// The display name (`M3uParser.GetChannelName`): the text after the comma
+    /// on the `#EXTINF` line without a SatIP `NN.` prefix, else `tvg-name`,
+    /// else `tvg-id`.
     pub name: String,
-    /// The channel number (`tvg-chno`/`channel-number`), or a leading `N.N`
-    /// parsed from the name, when present.
+    /// The channel number (`M3uParser.GetChannelNumber`): a numeric
+    /// `tvg-chno`, a numeric `tvg-id` (or `channel-id` next to a `tvg-id`), a
+    /// SatIP `NN.` name prefix, or a numeric stream file name.
     pub number: Option<String>,
-    /// Logo/artwork URL (`tvg-logo`), when present.
+    /// Logo/artwork URL (`tvg-logo`, else `logo`), when present.
     pub logo: Option<String>,
     /// The `group-title` category, when present.
     pub group: Option<String>,
@@ -45,7 +51,9 @@ pub struct M3uChannel {
 #[must_use]
 pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
     let mut channels = Vec::new();
-    let mut pending: Option<M3uChannel> = None;
+    // The `#EXTINF` text awaiting its URL line: the number can come from the
+    // URL, so the entry is parsed once both are known.
+    let mut pending: Option<&str> = None;
     let mut skipped = 0usize;
 
     for raw in content.lines() {
@@ -53,11 +61,16 @@ pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
         if line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            pending = Some(parse_extinf(rest));
+        if let Some(rest) = line
+            .get(..EXTINF.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(EXTINF))
+            .map(|_| line[EXTINF.len()..].trim())
+        {
+            // `string.IsNullOrWhiteSpace(extInf)`: an empty header waits for none.
+            pending = Some(rest).filter(|rest| !rest.is_empty());
         } else if line.starts_with('#') {
             // #EXTM3U / #EXTVLCOPT / #EXTGRP / other directives — ignored.
-        } else if let Some(mut channel) = pending.take() {
+        } else if let Some(extinf) = pending.take() {
             // `M3uParser.GetChannelsAsync` drops the entry and clears the
             // pending `#EXTINF` (`take` already did). Upstream warns per entry;
             // that volume scales with the playlist, so one count is warned below.
@@ -69,8 +82,7 @@ pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
                 skipped += 1;
                 continue;
             }
-            line.clone_into(&mut channel.url);
-            channels.push(channel);
+            channels.push(parse_extinf(extinf, line));
         }
         // A bare URL with no preceding #EXTINF is ignored (no metadata).
     }
@@ -83,6 +95,9 @@ pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
     }
     channels
 }
+
+/// `M3uParser.ExtInfPrefix`, matched case-insensitively.
+const EXTINF: &str = "#EXTINF:";
 
 /// Whether an M3U entry's URL line is one a channel may play from.
 ///
@@ -109,97 +124,118 @@ pub fn is_valid_channel_url(url: &str) -> bool {
         && reqwest::Url::parse(url).is_ok()
 }
 
-/// Parses the portion of an `#EXTINF:` line after the `#EXTINF:` prefix: the
-/// duration + attributes, a comma, then the display name.
-fn parse_extinf(rest: &str) -> M3uChannel {
-    // Split into "<duration> <attrs>" and "<name>" on the first comma.
-    let (head, name) = match rest.split_once(',') {
-        Some((head, name)) => (head, name.trim().to_owned()),
-        None => (rest, String::new()),
-    };
-    let attrs = parse_attributes(head);
+/// `M3uParser.KeyValueRegex`: one `key="value"` attribute, matched
+/// case-insensitively.
+static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)([a-z0-9\-_]+)="([^"]+)""#).expect("KeyValueRegex pattern is valid")
+});
 
-    let name = if name.is_empty() {
-        attrs.get("tvg-name").cloned().unwrap_or_default()
-    } else {
-        name
-    };
-
-    let number = attrs
-        .get("tvg-chno")
-        .or_else(|| attrs.get("channel-number"))
-        .cloned()
-        .or_else(|| leading_channel_number(&name));
-
-    let id = attrs
-        .get("tvg-id")
-        .or_else(|| attrs.get("channel-id"))
-        .or_else(|| attrs.get("cuid"))
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .unwrap_or_else(|| name.clone());
-
+/// Port of `M3uParser.GetChannelInfo` over the text after `#EXTINF:` and the
+/// entry's stream URL.
+///
+/// The display text is what follows the first comma once the attributes are
+/// removed, read only when the header has more than one non-empty comma part
+/// (`nameParts.Length > 1`), with surrounding commas trimmed. Upstream keeps
+/// only the last comma-separated part, which cuts a name such as
+/// "Movies, Series HD" down to "Series HD"; that is not ported.
+/// The id is not upstream's either: it stays the `tvg-id`, `channel-id` or
+/// `CUID`, else the display text, so the guide keys and mappings existing
+/// tuners carry keep matching.
+fn parse_extinf(extinf: &str, url: &str) -> M3uChannel {
+    let (attrs, remaining) = parse_attributes(extinf);
+    let after_comma = remaining.split_once(',').map(|(_, text)| text.trim());
+    let display = after_comma
+        .filter(|_| remaining.split(',').filter(|part| !part.is_empty()).count() > 1)
+        .map(|text| text.trim_matches(|c: char| c == ',' || c.is_whitespace()))
+        .filter(|text| !text.is_empty());
+    let attr = |key: &str| attrs.get(key).filter(|v| !v.trim().is_empty()).cloned();
     M3uChannel {
-        id,
-        name,
-        number,
-        logo: attrs.get("tvg-logo").filter(|v| !v.is_empty()).cloned(),
-        group: attrs.get("group-title").filter(|v| !v.is_empty()).cloned(),
+        id: attr("tvg-id")
+            .or_else(|| attr("channel-id"))
+            .or_else(|| attr("cuid"))
+            .or_else(|| after_comma.filter(|t| !t.is_empty()).map(str::to_owned))
+            .or_else(|| attr("tvg-name"))
+            .unwrap_or_default(),
+        name: display
+            .map(|text| satip_split(text).map_or(text, |(_, name)| name))
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| attr("tvg-name"))
+            .or_else(|| attr("tvg-id"))
+            .unwrap_or_default(),
+        number: channel_number(display, &attrs, url),
+        logo: attr("tvg-logo").or_else(|| attr("logo")),
+        group: attr("group-title"),
         is_radio: attrs
             .get("radio")
             .is_some_and(|v| v.eq_ignore_ascii_case("true")),
-        url: String::new(),
+        url: url.to_owned(),
     }
 }
 
-/// Extracts `key="value"` attribute pairs from an `#EXTINF` head. Keys are
-/// lower-cased so lookups are case-insensitive (playlists vary on casing).
-fn parse_attributes(head: &str) -> HashMap<String, String> {
+/// Port of `M3uParser.ParseExtInf`: the attributes by lower-cased key (C#'s
+/// `OrdinalIgnoreCase` dictionary, a later key winning) and the line with
+/// every matched `key="value"` removed.
+fn parse_attributes(line: &str) -> (HashMap<String, String>, String) {
     let mut attrs = HashMap::new();
-    let bytes = head.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Find the next `key=`.
-        if bytes[i] == b'=' {
-            // Walk back to the start of the key (letters, digits, '-').
-            let key_end = i;
-            let mut key_start = i;
-            while key_start > 0 {
-                let c = bytes[key_start - 1];
-                if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
-                    key_start -= 1;
-                } else {
-                    break;
-                }
-            }
-            let key = head[key_start..key_end].to_ascii_lowercase();
-            // Expect a quoted value.
-            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                let val_start = i + 2;
-                if let Some(rel_end) = head[val_start..].find('"') {
-                    let value = head[val_start..val_start + rel_end].to_owned();
-                    if !key.is_empty() {
-                        attrs.insert(key, value);
-                    }
-                    i = val_start + rel_end + 1;
-                    continue;
-                }
-            }
-        }
-        i += 1;
+    let mut remaining = line.to_owned();
+    for found in KEY_VALUE.captures_iter(line) {
+        attrs.insert(found[1].to_ascii_lowercase(), found[2].to_owned());
+        remaining = remaining.replace(&found[0], "");
     }
-    attrs
+    (attrs, remaining)
 }
 
-/// Pulls a leading `N` or `N.N` channel number off the front of a display name
-/// (e.g. `"2.1 - KCTS HD"` → `"2.1"`), matching Jellyfin's fallback numbering.
-fn leading_channel_number(name: &str) -> Option<String> {
-    let token = name.split_whitespace().next()?;
-    let trimmed = token.trim_end_matches(['.', '-', ':']);
-    let ok = !trimmed.is_empty()
-        && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.')
-        && trimmed.chars().any(|c| c.is_ascii_digit());
-    ok.then(|| trimmed.to_owned())
+/// Port of `M3uParser.GetChannelNumber`. The nesting is upstream's: a
+/// `channel-id` is read only next to a non-numeric `tvg-id`, and the SatIP
+/// prefix only when nothing has been found yet.
+fn channel_number(
+    display: Option<&str>,
+    attrs: &HashMap<String, String>,
+    url: &str,
+) -> Option<String> {
+    let numeric = |key: &str| attrs.get(key).filter(|v| is_double(v)).cloned();
+    let mut number = numeric("tvg-chno");
+    if !number.as_deref().is_some_and(is_valid_channel_number) {
+        if attrs.contains_key("tvg-id")
+            && let Some(id) = numeric("tvg-id").or_else(|| numeric("channel-id"))
+        {
+            number = Some(id);
+        }
+        if number.as_deref().is_none_or(|n| n.trim().is_empty()) {
+            number = display.and_then(satip_split).map(|(n, _)| n.to_owned());
+        }
+    }
+    if let Some(number) = number.filter(|n| is_valid_channel_number(n)) {
+        return Some(number.trim().to_owned());
+    }
+    // `Path.GetFileNameWithoutExtension(mediaUrl.RightPart('/'))`.
+    let file = url.rsplit('/').next().unwrap_or(url);
+    let stem = file.rfind('.').map_or(file, |dot| &file[..dot]);
+    is_valid_channel_number(stem).then(|| stem.to_owned())
+}
+
+/// The SatIP form `GetChannelName` and `GetChannelNumber` both read
+/// (`#EXTINF:0,84. VOX Schweiz`, `#EXTINF:0,84.0 - VOX Schweiz`): text before
+/// the first space that, with `.` trimmed, is a number, then the name with
+/// ` ` and `-` trimmed.
+fn satip_split(text: &str) -> Option<(&str, &str)> {
+    let space = text.find(' ').filter(|&at| at > 0)?;
+    let number = text[..space].trim_matches([' ', '.']);
+    is_double(number).then(|| (number, text[space + 1..].trim_matches([' ', '-'])))
+}
+
+/// `double.TryParse(value, CultureInfo.InvariantCulture, out _)`, through
+/// Rust's float parser. They agree on channel numbers; at the edges Rust also
+/// reads `inf`/`infinity`/`nan` in any case where .NET reads `Infinity` and
+/// `NaN`, and Rust rejects .NET's thousands separators.
+fn is_double(value: &str) -> bool {
+    value.trim().parse::<f64>().is_ok()
+}
+
+/// Port of `M3uParser.IsValidChannelNumber`: a number that is not `-1` or `0`.
+fn is_valid_channel_number(value: &str) -> bool {
+    !value.trim().is_empty() && value != "-1" && value != "0" && is_double(value)
 }
 
 #[cfg(test)]
@@ -228,8 +264,168 @@ mod tests {
         let m3u = "#EXTINF:-1,2.1 - KCTS HD\nhttp://tuner/kcts\n";
         let channels = parse_m3u(m3u);
         assert_eq!(channels.len(), 1);
+        // The id stays the playlist's display text, so guide keys and
+        // mappings made before the SatIP rule was ported keep matching.
         assert_eq!(channels[0].id, "2.1 - KCTS HD");
+        assert_eq!(channels[0].name, "KCTS HD");
         assert_eq!(channels[0].number.as_deref(), Some("2.1"));
+    }
+
+    /// `M3uParser.GetChannelInfo` / `GetChannelName` / `GetChannelNumber` /
+    /// `ParseExtInf`: the attributes are matched and removed before the name
+    /// is read, `#EXTINF` is case-insensitive, `logo` backs up `tvg-logo`, a
+    /// SatIP `NN. Name` gives both the number and the name, and the number
+    /// falls back from a numeric `tvg-chno` to a numeric `tvg-id` (or, with a
+    /// `tvg-id`, `channel-id`), the name's prefix, then the URL's file name.
+    /// Columns: the `#EXTINF` line, the URL, then name, number, group, logo.
+    #[rstest::rstest]
+    #[case::comma_in_an_attribute(
+        r#"#EXTINF:-1 tvg-id="cnn.us" group-title="News, Politics",CNN"#,
+        "http://tuner/cnn",
+        "CNN",
+        None,
+        Some("News, Politics"),
+        None
+    )]
+    #[case::lower_case_extinf("#extinf:-1,Arte", "http://tuner/arte", "Arte", None, None, None)]
+    #[case::logo_without_tvg_logo(
+        r#"#EXTINF:-1 logo="http://x/l.png",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        None,
+        None,
+        Some("http://x/l.png")
+    )]
+    #[case::satip_name(
+        "#EXTINF:0,84. VOX Schweiz",
+        "http://tuner/vox",
+        "VOX Schweiz",
+        Some("84"),
+        None,
+        None
+    )]
+    #[case::satip_dash_name(
+        "#EXTINF:0,84.0 - VOX Schweiz",
+        "http://tuner/vox",
+        "VOX Schweiz",
+        Some("84.0"),
+        None,
+        None
+    )]
+    #[case::numeric_tvg_id(
+        r#"#EXTINF:-1 tvg-id="105",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        Some("105"),
+        None,
+        None
+    )]
+    #[case::numeric_channel_id_behind_a_tvg_id(
+        r#"#EXTINF:-1 tvg-id="arte.fr" channel-id="7",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        Some("7"),
+        None,
+        None
+    )]
+    #[case::non_numeric_tvg_chno(
+        r#"#EXTINF:-1 tvg-chno="abc",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        None,
+        None,
+        None
+    )]
+    #[case::zero_tvg_chno_falls_to_the_url(
+        r#"#EXTINF:-1 tvg-chno="0",Arte"#,
+        "http://tuner/live/42.ts",
+        "Arte",
+        Some("42"),
+        None,
+        None
+    )]
+    #[case::number_from_the_url(
+        "#EXTINF:-1,Arte",
+        "http://tuner/live/42.ts",
+        "Arte",
+        Some("42"),
+        None,
+        None
+    )]
+    #[case::no_channel_number_key(
+        r#"#EXTINF:-1 channel-number="9",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        None,
+        None,
+        None
+    )]
+    #[case::name_from_tvg_id(
+        r#"#EXTINF:-1 tvg-id="bbc1.uk","#,
+        "http://tuner/bbc",
+        "bbc1.uk",
+        None,
+        None,
+        None
+    )]
+    #[case::no_duration_before_the_comma(
+        r#"#EXTINF:tvg-name="Arte HD",Arte"#,
+        "http://tuner/arte",
+        "Arte HD",
+        None,
+        None,
+        None
+    )]
+    #[case::trailing_comma("#EXTINF:-1,Arte,", "http://tuner/arte", "Arte", None, None, None)]
+    #[case::minus_one_tvg_chno(
+        r#"#EXTINF:-1 tvg-chno="-1",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        None,
+        None,
+        None
+    )]
+    #[case::number_from_a_url_with_a_query(
+        "#EXTINF:-1,Arte",
+        "http://tuner/live/42.ts?token=abc",
+        "Arte",
+        Some("42"),
+        None,
+        None
+    )]
+    #[case::url_ending_in_a_slash(
+        "#EXTINF:-1,Arte",
+        "http://tuner/live/42/",
+        "Arte",
+        None,
+        None,
+        None
+    )]
+    // Not ported: upstream keeps only the last comma-separated part, cutting
+    // "Movies, Series HD" down to "Series HD".
+    #[case::comma_in_the_name(
+        "#EXTINF:-1,Movies, Series HD",
+        "http://tuner/movies",
+        "Movies, Series HD",
+        None,
+        None,
+        None
+    )]
+    fn extinf_fields_match_the_upstream_parser(
+        #[case] extinf: &str,
+        #[case] url: &str,
+        #[case] name: &str,
+        #[case] number: Option<&str>,
+        #[case] group: Option<&str>,
+        #[case] logo: Option<&str>,
+    ) {
+        let channels = parse_m3u(&format!("#EXTM3U\n{extinf}\n{url}\n"));
+        assert_eq!(channels.len(), 1, "{extinf}");
+        let c = &channels[0];
+        assert_eq!(c.name, name, "{extinf}");
+        assert_eq!(c.number.as_deref(), number, "{extinf}");
+        assert_eq!(c.group.as_deref(), group, "{extinf}");
+        assert_eq!(c.logo.as_deref(), logo, "{extinf}");
     }
 
     #[test]
