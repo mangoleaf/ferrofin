@@ -1129,6 +1129,10 @@ pub struct LocalProviderManager {
     /// to. Present enables the `save_image`/`delete_image` write paths.
     image_store: Option<Arc<dyn ItemPersistenceService>>,
     metadata_dir: Option<DirectoryPath>,
+    /// Where [`ProviderManager::cached_remote_image`] keeps remote images:
+    /// one folder per URL, named by its MD5, under the cache directory, so
+    /// the "Clean Cache Directory" task expires them.
+    remote_image_cache: Option<DirectoryPath>,
     /// The TMDB client + item store used by the remote-image ("Choose Image")
     /// methods to resolve an item and list/download its TMDB artwork.
     tmdb: Option<Arc<TmdbClient>>,
@@ -1202,6 +1206,18 @@ pub struct LocalProviderManager {
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
 }
 
+/// The file a remote image's cache folder holds, when it holds one.
+async fn cached_file(folder: &std::path::Path) -> Option<String> {
+    let mut entries = tokio::fs::read_dir(folder).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("image.") {
+            return Some(entry.path().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 impl std::fmt::Debug for LocalProviderManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalProviderManager")
@@ -1230,6 +1246,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_image_saver", &self.image_saver.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
+            .field("remote_image_cache", &self.remote_image_cache)
             .field("has_tmdb", &self.tmdb.is_some())
             .field("has_items", &self.items.is_some())
             .field("has_studios", &self.studios.is_some())
@@ -1306,6 +1323,7 @@ impl LocalProviderManager {
             remote_search_providers: Vec::new(),
             image_store: None,
             metadata_dir: None,
+            remote_image_cache: None,
             tmdb: None,
             items: None,
             studios: None,
@@ -1543,6 +1561,14 @@ impl LocalProviderManager {
     ) -> Self {
         self.image_store = Some(image_store);
         self.metadata_dir = Some(metadata_dir.into());
+        self
+    }
+
+    /// Attaches the directory remote image rows are cached in, enabling
+    /// [`ProviderManager::cached_remote_image`].
+    #[must_use]
+    pub fn with_remote_image_cache(mut self, dir: impl Into<DirectoryPath>) -> Self {
+        self.remote_image_cache = Some(dir.into());
         self
     }
 
@@ -4492,6 +4518,55 @@ impl ProviderManager for LocalProviderManager {
         // the right `Content-Type` — the URL suffix is not consulted.
         self.save_image(item_id, &bytes, &mime, image_type, image_index)
             .await
+    }
+
+    async fn cached_remote_image(&self, path: &str) -> Result<String, ServiceError> {
+        let Some(root) = &self.remote_image_cache else {
+            return Err(Self::unwired("cached_remote_image"));
+        };
+        let root = root.resolve();
+        for url in path.split('|') {
+            let folder = root.join(
+                ferrofin_common::extensions::get_md5(url)
+                    .simple()
+                    .to_string(),
+            );
+            if let Some(file) = cached_file(&folder).await {
+                return Ok(file);
+            }
+            // Upstream moves on to the next URL only on a 404 or 403 and
+            // throws on anything else; any failed URL moves on here.
+            let Some((bytes, mime)) = crate::image_download::download_image(&self.http, url).await
+            else {
+                continue;
+            };
+            if crate::image_download::non_image_reason(&mime).is_some() {
+                continue;
+            }
+            let ext = mime_types::to_extension(&mime).unwrap_or(".jpg");
+            let file = folder.join(format!("image{ext}"));
+            // Written beside, then renamed: two requests for one URL each
+            // write their own temporary file, and the reader never sees half
+            // a file.
+            let partial = folder.join(format!(".{}.partial", Uuid::new_v4().simple()));
+            let written = async {
+                tokio::fs::create_dir_all(&folder).await?;
+                tokio::fs::write(&partial, &bytes).await?;
+                tokio::fs::rename(&partial, &file).await
+            }
+            .await;
+            if let Err(err) = written {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(ServiceError::backend(format!(
+                    "could not cache a remote image in {}: {err}",
+                    folder.display()
+                )));
+            }
+            return Ok(file.to_string_lossy().into_owned());
+        }
+        Err(ServiceError::backend(
+            "no URL of the remote image could be downloaded as an image",
+        ))
     }
 
     async fn save_image(
@@ -9038,6 +9113,53 @@ mod tests {
         );
     }
     // ── the artwork writer believes the RESPONSE, not the URL ───────────────
+
+    /// The download half of `LibraryManager.ConvertImageToLocal`: each
+    /// `|`-separated URL in turn, the first image kept in a cache folder named
+    /// by its URL and served from there afterwards; the row is left alone.
+    #[tokio::test]
+    async fn a_remote_image_is_cached_once_by_its_url() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_typed(vec![
+            ("/logo.png", "image/png", b"png".to_vec()),
+            ("/page", "text/html", b"<html/>".to_vec()),
+        ])
+        .await;
+        let base = server.base_url.clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = LocalProviderManager::default().with_remote_image_cache(dir.path().to_path_buf());
+
+        // The first URL is missing (404), so the second one is kept.
+        let logo = format!("{base}/logo.png");
+        let path = format!("{base}/gone.png|{logo}");
+        let cached = mgr.cached_remote_image(&path).await.expect("cached");
+        let folder = dir.path().join(
+            ferrofin_common::extensions::get_md5(&logo)
+                .simple()
+                .to_string(),
+        );
+        assert_eq!(std::path::Path::new(&cached), folder.join("image.png"));
+        assert_eq!(std::fs::read(&cached).expect("file"), b"png");
+
+        // Served from the cache once the remote is gone.
+        drop(server);
+        assert_eq!(
+            mgr.cached_remote_image(&path).await.expect("cached"),
+            cached
+        );
+
+        // A page that is not an image is not cached, and no cache is no copy.
+        let server =
+            MockServer::start_typed(vec![("/page", "text/html", b"<html/>".to_vec())]).await;
+        let page = format!("{}/page", server.base_url);
+        assert!(mgr.cached_remote_image(&page).await.is_err());
+        assert!(
+            LocalProviderManager::default()
+                .cached_remote_image(&page)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn a_downloaded_image_is_typed_from_the_response_and_a_non_image_is_refused() {

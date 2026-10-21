@@ -86,6 +86,13 @@ pub struct XmltvProgramme {
     /// `width` or `height` (`Icons.FirstOrDefault()?.Source`), when it has one.
     /// Icons inside `<rating>` and `<star-rating>` belong to those.
     pub icon: Option<String>,
+    /// The text of the programme's first own `<image>` of type `still`
+    /// (`Images.FirstOrDefault(m => m.Type == ImageType.Still)?.Path`), which
+    /// `XmlTvListingsProvider.GetProgramInfo` makes its `ThumbImageUrl`.
+    pub still_image: Option<String>,
+    /// The text of the programme's first own `<image>` of type `backdrop`,
+    /// its `BackdropImageUrl`.
+    pub backdrop_image: Option<String>,
     /// Production year from `<date>` (first four digits), when present.
     pub year: Option<i32>,
     /// The text of the last `<episode-num>` whose `system` the reader understands
@@ -356,6 +363,7 @@ impl OpenChannel {
 }
 
 /// A `<programme>` being read.
+#[allow(clippy::struct_excessive_bools)] // one first-seen flag per kind of child
 struct OpenProgramme {
     programme: XmltvProgramme,
     /// The depth of the programme's own children.
@@ -366,6 +374,12 @@ struct OpenProgramme {
     rating_read: bool,
     /// The `<rating>` being read, if one is open.
     rating: Option<OpenRating>,
+    /// The type of the `<image>` being read, if one is open.
+    image_type: Option<i64>,
+    /// Whether its first `still` `<image>` has been read.
+    still_read: bool,
+    /// Whether its first `backdrop` `<image>` has been read.
+    backdrop_read: bool,
 }
 
 impl OpenProgramme {
@@ -376,6 +390,9 @@ impl OpenProgramme {
             icon_read: false,
             rating_read: false,
             rating: None,
+            image_type: None,
+            still_read: false,
+            backdrop_read: false,
         }
     }
 }
@@ -403,6 +420,30 @@ fn populated_icon(e: &BytesStart<'_>) -> Option<PopulatedIcon> {
     let src = attr(e, b"src").filter(|s| !s.is_empty());
     let sized = |name: &[u8]| attr(e, name).is_some_and(|v| v.trim().parse::<i32>().is_ok());
     (src.is_some() || sized(b"width") || sized(b"height")).then_some(PopulatedIcon { src })
+}
+
+/// `Jellyfin.XmlTv` `ImageType.Backdrop`.
+const IMAGE_TYPE_BACKDROP: i64 = 1;
+/// `Jellyfin.XmlTv` `ImageType.Still`.
+const IMAGE_TYPE_STILL: i64 = 2;
+
+/// The `type` of an `<image>` as `XmlTvReader.ProcessImageNode` reads it:
+/// `Enum.TryParse<ImageType>(type, ignoreCase: true)`, which takes a member
+/// name in any case or an integer, around white space. Anything else leaves
+/// the default, `Poster` (`0`). A comma-separated list of names, which .NET
+/// would OR together, is not a real guide's spelling and reads as `Poster`.
+fn image_type(value: Option<&str>) -> i64 {
+    const NAMES: [&str; 5] = ["poster", "backdrop", "still", "person", "character"];
+    let Some(value) = value.map(str::trim) else {
+        return 0;
+    };
+    NAMES
+        .iter()
+        .zip(0..)
+        .find(|(name, _)| value.eq_ignore_ascii_case(name))
+        .map(|(_, n)| n)
+        .or_else(|| value.parse().ok())
+        .unwrap_or(0)
 }
 
 /// A programme child's name as `GetProgramme` matches it
@@ -455,6 +496,7 @@ fn apply_start(
                 }
             }
             b"rating" => p.rating = Some(OpenRating::default()),
+            b"image" => p.image_type = Some(image_type(attr(e, b"type").as_deref())),
             _ => {}
         }
     } else if let Some(c) = channel
@@ -621,6 +663,24 @@ fn apply_end(
             {
                 open.rating_read = true;
                 p.rating = rating.value;
+            }
+        }
+        // `ProcessImageNode` keeps an image with a type or a path (its size,
+        // orientation and system are not read here), and `GetProgramInfo`
+        // takes the first of each type, so a `still` with no path still hides
+        // a later one.
+        b"image" => {
+            let path = (!text.is_empty()).then(|| text.to_owned());
+            match open.image_type.take() {
+                Some(IMAGE_TYPE_STILL) if !open.still_read => {
+                    open.still_read = true;
+                    p.still_image = path;
+                }
+                Some(IMAGE_TYPE_BACKDROP) if !open.backdrop_read => {
+                    open.backdrop_read = true;
+                    p.backdrop_image = path;
+                }
+                _ => {}
             }
         }
         _ => {}
@@ -1201,6 +1261,28 @@ mod programme_child_tests {
         // one.
         let p = programme("<rating>\n  <value>A</value>\n  <value>B</value>\n</rating>");
         assert_eq!(p.rating.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn a_programmes_still_and_backdrop_are_its_first_own_images_of_each_type() {
+        let p = programme(
+            "<image type=\"poster\">http://x/poster.jpg</image>\
+             <image type=\"Still\">http://x/still.jpg</image>\
+             <image type=\" BACKDROP \">http://x/back.jpg</image>\
+             <image type=\"still\">http://x/later.jpg</image>\
+             <credits><actor><image type=\"backdrop\">http://x/actor.jpg</image></actor></credits>",
+        );
+        assert_eq!(p.still_image.as_deref(), Some("http://x/still.jpg"));
+        assert_eq!(p.backdrop_image.as_deref(), Some("http://x/back.jpg"));
+        // An untyped or unknown type is a poster; an integer is its member.
+        let p = programme(
+            "<image>http://x/a.jpg</image><image type=\"wide\">http://x/b.jpg</image><image type=\"2\">http://x/c.jpg</image>",
+        );
+        assert_eq!(p.still_image.as_deref(), Some("http://x/c.jpg"));
+        assert_eq!(p.backdrop_image, None);
+        // The first still decides even with no path.
+        let p = programme("<image type=\"still\"/><image type=\"still\">http://x/s.jpg</image>");
+        assert_eq!(p.still_image, None);
     }
 
     #[test]

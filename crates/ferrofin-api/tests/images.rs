@@ -647,6 +647,10 @@ struct StubProviders {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
     /// The `ImageUpdate` repository saves requested through `update_to_repository`.
     updates: Arc<Mutex<Vec<Uuid>>>,
+    /// The local copy `cached_remote_image` hands back, and the paths it was
+    /// asked for. `None` → no copy can be made.
+    remote_copy: Option<String>,
+    remote_asked: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -681,6 +685,15 @@ impl ProviderManager for StubProviders {
         _image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
         Ok(())
+    }
+    async fn cached_remote_image(&self, path: &str) -> Result<String, ServiceError> {
+        self.remote_asked
+            .lock()
+            .expect("lock")
+            .push(path.to_owned());
+        self.remote_copy
+            .clone()
+            .ok_or_else(|| ServiceError::backend("unreachable"))
     }
     async fn save_image(
         &self,
@@ -798,6 +811,8 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             saved: Arc::new(Mutex::new(Vec::new())),
             deleted: Arc::new(Mutex::new(Vec::new())),
             updates: Arc::new(Mutex::new(Vec::new())),
+            remote_copy: None,
+            remote_asked: Arc::new(Mutex::new(Vec::new())),
         }),
         elevated: false,
         restricted: false,
@@ -1114,12 +1129,43 @@ async fn by_name_image_miss_does_not_re_read_the_item() {
     );
 }
 
+/// `ImageController`: a remote row is served from its local copy
+/// (`ConvertImageToLocal`), fetched on request.
 #[tokio::test]
-async fn remote_image_backdrop_is_404_no_local_file() {
+async fn remote_image_backdrop_is_served_from_its_local_copy() {
+    let img = TempImage::new(b"X");
+    let copy = TempImage::new(b"REMOTE");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let s = Stubs {
+        providers: Arc::new(StubProviders {
+            saved: Arc::new(Mutex::new(Vec::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+            updates: Arc::new(Mutex::new(Vec::new())),
+            remote_copy: Some(copy.path()),
+            remote_asked: Arc::clone(&asked),
+        }),
+        ..stubs(img.path(), String::new())
+    };
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"REMOTE");
+    assert_eq!(
+        *asked.lock().expect("lock"),
+        ["https://remote.example/backdrop.jpg"]
+    );
+}
+
+#[tokio::test]
+async fn remote_image_backdrop_is_404_without_a_local_copy() {
     let img = TempImage::new(b"X");
     let s = stubs(img.path(), String::new());
-    // The Backdrop image is a remote URL; with no image processor it cannot be
-    // served locally → 404.
+    // The Backdrop image is a remote URL that cannot be fetched → 404.
     let (status, _) = send(
         &s,
         "GET",

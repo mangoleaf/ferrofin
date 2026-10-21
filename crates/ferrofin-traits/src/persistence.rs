@@ -492,6 +492,30 @@ pub trait ItemRepository: Send + Sync {
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
+    /// [`Self::get_image_infos`] for each of `item_ids`, keyed by item; an
+    /// item with no images is absent.
+    ///
+    /// The default asks one item at a time; the real repository reads them in
+    /// a few chunked queries, for callers that compare many items' images at
+    /// once (a guide refresh's programmes).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn get_image_infos_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut out = std::collections::HashMap::new();
+        for id in item_ids {
+            let images = self.get_image_infos(*id).await?;
+            if !images.is_empty() {
+                out.insert(*id, images);
+            }
+        }
+        Ok(out)
+    }
+
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///
@@ -1016,6 +1040,24 @@ pub trait ItemPersistenceService: Send + Sync {
         images: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
         let _ = (item_id, images);
+        Ok(())
+    }
+
+    /// [`Self::save_item_images`] for many items, each with its own image
+    /// list. The real service writes a chunk of items per transaction, for a
+    /// caller that writes thousands at once (a guide refresh's programmes);
+    /// the default writes them one at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn save_items_images(
+        &self,
+        items: &[(Uuid, Vec<ItemImageInfo>)],
+    ) -> Result<(), ServiceError> {
+        for (item_id, images) in items {
+            self.save_item_images(*item_id, images).await?;
+        }
         Ok(())
     }
 
