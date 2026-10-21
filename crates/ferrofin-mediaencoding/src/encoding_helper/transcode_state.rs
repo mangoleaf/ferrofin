@@ -464,6 +464,17 @@ impl EncodingJobInfo {
         force_if_interlaced
     }
 
+    /// Whether the video filter chain deinterlaces: `doDeintH264 ||
+    /// doDeintHevc`, the source deinterlaced under either spelling of each
+    /// codec with an interlaced source forcing it. Port of
+    /// `EncodingHelper.IsDeinterlaceAvailable`.
+    #[must_use]
+    pub fn is_deinterlace_available(&self) -> bool {
+        ["h264", "avc", "h265", "hevc"]
+            .iter()
+            .any(|codec| self.deinterlace(Some(codec), true))
+    }
+
     /// The client-requested video profiles for `codec`. Port of
     /// `GetRequestedProfiles`.
     #[must_use]
