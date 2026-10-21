@@ -6888,13 +6888,25 @@ impl LibraryScanner {
         if nfo_locked {
             entity.is_locked = true;
         }
-        // Sidecar ids first, then any this row already carries: both are
-        // `info.GetProviderId`, which the fetchers resolve by before they
-        // ever search by title.
+        // A new item's resolver read the ids its name carries
+        // (`SetProviderIdsFromPath`): the item's own before any provider
+        // runs.
+        let resolved_ids = if matches!(stored, Stored::New) {
+            crate::resolvers::path_provider_ids(&item.entity)
+        } else {
+            Vec::new()
+        };
+        // Sidecar ids first, then any this row already carries, then a new
+        // item's own: all are `info.GetProviderId`, which the fetchers
+        // resolve by before they ever search by title. (A scan's pass
+        // replaces ids, so the sidecar's lead the settled set too.)
         let known_ids = match search {
             Some(_) if series_child => Vec::new(),
             Some(result) => search_result_ids(result),
-            None => known_provider_ids(&nfo_ids, state.art_cache, &entity.id),
+            None => merge_provider_ids(
+                known_provider_ids(&nfo_ids, state.art_cache, &entity.id),
+                resolved_ids.clone(),
+            ),
         };
         // The identified item itself — the one at the refresh's own path —
         // takes the chosen ids as its own (the controller's
@@ -7213,6 +7225,7 @@ impl LibraryScanner {
         let mut settled_ids = settle_provider_ids(
             state.art_cache,
             &entity.id,
+            &resolved_ids,
             replaced_ids,
             filled_ids,
             &tag_provider_ids,
@@ -20122,7 +20135,8 @@ struct IdSettle {
 }
 
 /// The item's provider ids after this pass, from the ids the scan pre-read
-/// for it:
+/// for it — or, for an item with none recorded, the ids its resolver read
+/// from its name (`resolved`, the new item's own):
 ///
 /// 1. the probe's tag ids first — `AudioFileProber`, a pre-refresh custom
 ///    provider, sets each MusicBrainz id only when the item has none of that
@@ -20144,13 +20158,14 @@ struct IdSettle {
 fn settle_provider_ids(
     art_cache: &mut ArtworkCache,
     entity_id: &str,
+    resolved: &[(String, String)],
     pass_ids: &[(String, String)],
     fill_ids: &[(String, String)],
     tag_ids: &[(String, String)],
     rule: IdSettle,
 ) -> SettledProviderIds {
     let stored = art_cache.item_provider_ids.get(entity_id);
-    let mut ids: Vec<(String, String)> = stored.cloned().unwrap_or_default();
+    let mut ids: Vec<(String, String)> = stored.cloned().unwrap_or_else(|| resolved.to_vec());
     for (key, value) in tag_ids {
         let has = ids
             .iter()
@@ -29411,6 +29426,7 @@ mod tests {
         let settled = super::settle_provider_ids(
             &mut cache,
             "ID",
+            &[],
             &pairs(pass),
             &[],
             &pairs(tags),
@@ -29444,6 +29460,7 @@ mod tests {
             super::settle_provider_ids(
                 cache,
                 "ID",
+                &[],
                 pass,
                 &[],
                 &[],
