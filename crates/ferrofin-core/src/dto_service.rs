@@ -4355,12 +4355,38 @@ impl FerrofinDtoService {
                     person_ids.push(id);
                 }
             }
-            let by_name: HashMap<String, Uuid> = slot_by_name
+            let mut by_name: HashMap<String, Uuid> = slot_by_name
                 .into_iter()
                 .filter_map(|(name, slot)| {
                     id_by_slot.get(slot).copied().flatten().map(|id| (name, id))
                 })
                 .collect();
+            // C# `.Where(i => user is null || i!.IsVisible(user))`: a person the
+            // user may not see leaves the credits. `Person.IsVisible` is the
+            // parental check with the allowed tags skipped.
+            if let Some(user) = user
+                && !person_ids.is_empty()
+            {
+                // A failed check leaves the credits out, as a failed lookup
+                // does above: failing open would show persons the user may
+                // not see.
+                let allowed: std::collections::HashSet<Uuid> = match self
+                    .library
+                    .get_parentally_allowed_item_ids(&person_ids, user, true)
+                    .await
+                {
+                    Ok(allowed) => allowed.into_iter().collect(),
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "person visibility check failed; leaving the page's credits out"
+                        );
+                        std::collections::HashSet::new()
+                    }
+                };
+                person_ids.retain(|id| allowed.contains(id));
+                by_name.retain(|_, id| allowed.contains(id));
+            }
             (person_ids, by_name)
         } else {
             (Vec::new(), HashMap::new())
@@ -5034,6 +5060,33 @@ mod tests {
     impl LibraryManager for FakeLibrary {
         async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             Ok(None)
+        }
+        /// A named item tagged `Hidden` fails the parental check; one tagged
+        /// `Fail` makes the check itself fail.
+        async fn get_parentally_allowed_item_ids(
+            &self,
+            ids: &[Uuid],
+            _user: &UserEntity,
+            _skip_allowed_tags: bool,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            if self
+                .named_items
+                .iter()
+                .any(|row| row.tags.as_deref() == Some("Fail"))
+            {
+                return Err(ServiceError::backend("visibility unavailable"));
+            }
+            let hidden: Vec<Uuid> = self
+                .named_items
+                .iter()
+                .filter(|row| row.tags.as_deref() == Some("Hidden"))
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            Ok(ids
+                .iter()
+                .copied()
+                .filter(|id| !hidden.contains(id))
+                .collect())
         }
         async fn get_item_images(
             &self,
@@ -10599,6 +10652,77 @@ mod tests {
                 .all(|p| !matches!(p.name.as_deref(), Some("Nobody At All" | "Also Nobody"))),
             "unresolved credits are dropped"
         );
+    }
+
+    /// C# `AttachPeople` keeps only the persons the user may see
+    /// (`.Where(i => user is null || i!.IsVisible(user))`): with a user, a
+    /// person the parental check rejects leaves the credits; with none, every
+    /// resolved credit stays.
+    #[tokio::test]
+    async fn a_person_the_user_may_not_see_leaves_the_credits() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let user = crate::test_support::seed_user(&db, Uuid::new_v4()).await;
+        let mut named = person_rows(&db, &["Seen", "Unseen"]).await;
+        named[1].tags = Some("Hidden".into());
+        let credit = |name: &str| PeopleEntity {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            person_type: Some("Actor".into()),
+            ..Default::default()
+        };
+        let library = Arc::new(FakeLibrary {
+            people: vec![credit("Seen"), credit("Unseen")],
+            named_items: named,
+        });
+        let svc = service_with(db, library);
+        let credited = |dto: BaseItemDto| -> Vec<String> {
+            dto.people
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.name)
+                .collect()
+        };
+
+        let for_user = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(credited(for_user), ["Seen"]);
+        let for_nobody = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(credited(for_nobody), ["Seen", "Unseen"]);
+    }
+
+    /// A visibility check that fails leaves the page's credits out rather
+    /// than showing persons the user may not see.
+    #[tokio::test]
+    async fn a_failed_visibility_check_leaves_the_credits_out() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let user = crate::test_support::seed_user(&db, Uuid::new_v4()).await;
+        let mut named = person_rows(&db, &["Anyone"]).await;
+        named[0].tags = Some("Fail".into());
+        let library = Arc::new(FakeLibrary {
+            people: vec![PeopleEntity {
+                id: Uuid::new_v4().to_string(),
+                name: "Anyone".into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            }],
+            named_items: named,
+        });
+        let dto = service_with(db, library)
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.people, Some(Vec::new()));
     }
 
     /// C# `AttachPeople` tags a person's primary image with

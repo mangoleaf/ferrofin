@@ -358,6 +358,23 @@ pub trait LibraryManager: Send + Sync {
         Ok(visible)
     }
 
+    /// The ids of `ids` that pass the parental check for `user`, in input
+    /// order: C# `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)`, the
+    /// rating, unrated and tag rules with no folder or library access check.
+    /// The DTO service filters a page's cast through it, as `AttachPeople`
+    /// does with `Person.IsVisible(user)`. The default applies the stricter
+    /// standalone check ([`Self::get_visible_item_ids`]), so an
+    /// implementation that does not override it never shows a person the user
+    /// may not see.
+    async fn get_parentally_allowed_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &UserEntity,
+        _skip_allowed_tags: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        self.get_visible_item_ids(ids, user).await
+    }
+
     /// Resolve the distinct physical owners whose extras an item presents.
     /// Concrete managers batch movie-version links and grouped-series folders.
     async fn get_extra_owner_ids_batch(

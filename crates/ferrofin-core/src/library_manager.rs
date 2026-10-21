@@ -2517,6 +2517,37 @@ impl LibraryManager for FerrofinLibraryManager {
             .collect())
     }
 
+    async fn get_parentally_allowed_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &ferrofin_db::entities::users::UserEntity,
+        skip_allowed_tags: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let rows = self.items.retrieve_items(ids).await?;
+        let allowed: std::collections::HashSet<Uuid> = rows
+            .iter()
+            .zip(
+                service
+                    .parentally_allowed(&rows, user, skip_allowed_tags)
+                    .await?,
+            )
+            .filter(|(_, allowed)| *allowed)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .collect();
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| allowed.contains(id))
+            .collect())
+    }
+
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
         // Exactly `get_item_by_id(id).is_some()`, minus the row decode:
         // `get_item_by_id` rejects the nil id and `retrieve_item`'s predicate
@@ -5539,6 +5570,59 @@ mod tests {
                 .is_empty()
         );
         assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
+    }
+
+    /// The parental check over ids keeps the input order and drops what it
+    /// rejects or cannot find: a person carrying a blocked tag, an unknown id.
+    /// Without a visibility service it refuses rather than allow every id.
+    #[tokio::test]
+    async fn parentally_allowed_ids_keep_the_order_and_drop_a_blocked_person() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7301)).await;
+        let [shown, hidden, missing] = [0x7302, 0x7303, 0x7304].map(Uuid::from_u128);
+        seed_named_item(&db, shown, BaseItemKind::Person, "Shown").await;
+        seed_named_item(&db, hidden, BaseItemKind::Person, "Hidden").await;
+        let mut row = crate::test_support::fetch_item(&db, hidden).await;
+        row.tags = Some("Private".into());
+        crate::test_support::save_item(&db, &row).await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockedTags,
+            &["private".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            base.get_parentally_allowed_item_ids(&[shown], &user, true)
+                .await
+                .is_err(),
+            "no visibility service"
+        );
+
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base.with_visibility(visibility);
+        assert_eq!(
+            library
+                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user, true)
+                .await
+                .unwrap(),
+            [shown]
+        );
+        assert!(
+            library
+                .get_parentally_allowed_item_ids(&[], &user, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
