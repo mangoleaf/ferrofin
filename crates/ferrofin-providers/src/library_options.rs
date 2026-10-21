@@ -41,12 +41,19 @@ fn type_entry<'a>(
 /// exactly `libraryTypeOptions.MetadataFetchers.Contains(name,
 /// OrdinalIgnoreCase)` — so an EMPTY list disables every remote fetcher.
 /// With no entry (the library never customised that type, or the item is in
-/// no library at all — a by-name artist, which `GetLibraryOptions` gives a
-/// bare `new LibraryOptions()`, `LibraryManager.cs:2884-2896`), the SERVER-WIDE options for the kind decide
+/// no library at all and `GetLibraryOptions` gives it a bare
+/// `new LibraryOptions()`, `LibraryManager.cs:2884-2896`), the SERVER-WIDE
+/// options for the kind decide, except for a `MusicArtist` (below)
 /// (`:45-46`): `itemConfig is null ||
 /// !itemConfig.DisabledMetadataFetchers.Contains(name)`. `global` is that
 /// server-wide entry ([`global_metadata_options`]); `None` when the server
 /// configuration names none for the kind (every fetcher enabled).
+///
+/// The one exception comes from v12.2 `ProviderManager.CanRefreshMetadata`
+/// (jellyfin/jellyfin#16606): a `MusicArtist` with no `TypeOptions` entry may
+/// use every remote metadata provider. A by-name artist, or one in a library
+/// that never saved MusicArtist options, is therefore not held to the
+/// server-wide defaults, which disable TheAudioDB for it.
 ///
 /// This is the ONE gate: C# routes both the scan and the on-demand
 /// `POST /Items/{id}/Refresh` through `ProviderManager.CanRefreshMetadata`,
@@ -71,6 +78,7 @@ pub fn metadata_fetcher_enabled(
             .metadata_fetchers
             .iter()
             .any(|f| f.eq_ignore_ascii_case(name)),
+        None if kind.eq_ignore_ascii_case("MusicArtist") => true,
         None => global.is_none_or(|g| {
             !g.disabled_metadata_fetchers
                 .iter()
@@ -455,7 +463,11 @@ struct Defaults<'a> {
 /// `DisabledMetadataFetchers` / `DisabledImageFetchers` — the same
 /// server-wide lists the scan's gate falls back to
 /// ([`metadata_fetcher_enabled`], [`image_fetcher_enabled`]), so the
-/// dashboard shows unticked what the scan would not run.
+/// dashboard shows unticked what the scan would not run. The exception is a
+/// `MusicArtist` metadata fetcher, which the scan runs without a library entry
+/// even though it is listed unticked. Upstream lists it the same way, because
+/// `IsMetadataFetcherEnabledByDefault` does not consult `CanRefreshMetadata`,
+/// so do not align the listing with the scan.
 fn default_enabled_for(
     name: &str,
     cap: Cap,
@@ -1163,6 +1175,56 @@ mod tests {
         ));
     }
 
+    /// v12.2 `ProviderManager.CanRefreshMetadata` (jellyfin/jellyfin#16606):
+    /// a `MusicArtist` whose library saved no type options for it, or that is
+    /// in no library (a by-name artist), may use every remote metadata
+    /// provider, whatever the server-wide options disable; a saved entry still
+    /// decides, and other kinds still fall back to the server.
+    #[test]
+    fn a_music_artist_without_type_options_may_use_every_metadata_provider() {
+        use super::fetcher_names::AUDIODB;
+        let server = |kind: &str| ferrofin_model::configuration::MetadataOptions {
+            item_type: Some(kind.to_owned()),
+            disabled_metadata_fetchers: vec![AUDIODB.to_owned()],
+            ..Default::default()
+        };
+        let artist = server("MusicArtist");
+        assert!(metadata_fetcher_enabled(
+            None,
+            Some(&artist),
+            "MusicArtist",
+            AUDIODB
+        ));
+        let unsaved = LibraryOptions::default();
+        assert!(metadata_fetcher_enabled(
+            Some(&unsaved),
+            Some(&artist),
+            "MusicArtist",
+            AUDIODB
+        ));
+        let saved = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("MusicArtist".to_owned()),
+                metadata_fetchers: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!metadata_fetcher_enabled(
+            Some(&saved),
+            Some(&artist),
+            "MusicArtist",
+            AUDIODB
+        ));
+        let album = server("MusicAlbum");
+        assert!(!metadata_fetcher_enabled(
+            None,
+            Some(&album),
+            "MusicAlbum",
+            AUDIODB
+        ));
+    }
+
     #[test]
     fn a_listed_fetcher_is_enabled_case_insensitively() {
         let ticked = LibraryOptions {
@@ -1212,7 +1274,21 @@ mod tests {
         };
         let audiodb = super::fetcher_names::AUDIODB;
         let musicbrainz = super::fetcher_names::MUSICBRAINZ;
+        // Metadata for a MusicArtist is the one exception (`CanRefreshMetadata`,
+        // `a_music_artist_without_type_options_may_use_every_metadata_provider`);
+        // any other kind falls back to its server-wide entry.
+        let album_server = MetadataOptions {
+            item_type: Some("MusicAlbum".to_owned()),
+            disabled_metadata_fetchers: vec!["TheAudioDB".to_owned()],
+            ..MetadataOptions::default()
+        };
         assert!(!metadata_fetcher_enabled(
+            None,
+            Some(&album_server),
+            "MusicAlbum",
+            audiodb
+        ));
+        assert!(metadata_fetcher_enabled(
             None,
             Some(&server),
             "MusicArtist",

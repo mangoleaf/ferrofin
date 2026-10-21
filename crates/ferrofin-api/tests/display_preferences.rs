@@ -767,6 +767,42 @@ async fn display_preferences_home_sections_round_trip_with_default_substitution(
     assert_eq!(v["CustomPrefs"]["homesection9"], "none");
 }
 
+/// `Enum.TryParse<HomeSectionType>(value, true, out var type)`: an integer of
+/// the underlying type, named or not, or a comma-separated list of names
+/// (OR'd); anything else takes the order's default. The GET echoes
+/// `type.ToString().ToLowerInvariant()`, which for an unnamed value is the
+/// number itself.
+#[rstest::rstest]
+#[case::number("4", "resume")]
+#[case::padded_number(" 7 ", "nextup")]
+#[case::signed_number("+6", "latestmedia")]
+#[case::unnamed_number("99", "99")]
+#[case::negative_number("-1", "-1")]
+#[case::name_any_case("ReSuMe", "resume")]
+#[case::name_list("resume, resumeaudio", "resumeaudio")]
+#[case::not_a_name("bogus", "smalllibrarytiles")]
+#[case::list_with_a_bad_name("resume,bogus", "smalllibrarytiles")]
+#[case::list_with_an_empty_name("resume,", "smalllibrarytiles")]
+#[case::number_out_of_range("99999999999", "smalllibrarytiles")]
+#[tokio::test]
+async fn home_section_values_parse_as_enum_try_parse(#[case] value: &str, #[case] echoed: &str) {
+    let body = format!(
+        r#"{{
+            "CustomPrefs": {{ "homesection0": "{value}" }},
+            "ScrollDirection": "Horizontal",
+            "SortOrder": "Ascending",
+            "ShowBackdrop": false,
+            "ShowSidebar": true,
+            "RememberIndexing": false,
+            "RememberSorting": true,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250
+        }}"#
+    );
+    let (v, _saved) = round_trip(Box::leak(body.into_boxed_str())).await;
+    assert_eq!(v["CustomPrefs"]["homesection0"], echoed, "{value:?}");
+}
+
 /// A display-preferences manager that actually round-trips: `get` returns the
 /// last row `update` saved (falling back to the canned row), so a POST→GET test
 /// observes the write path rather than a canned answer.

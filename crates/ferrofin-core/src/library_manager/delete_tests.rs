@@ -484,7 +484,7 @@ async fn a_missing_file_still_deletes_the_row() {
 #[tokio::test]
 async fn collections_delete_their_own_folder_in_the_data_directory() {
     let f = fixture().await;
-    // A collection Ferrofin created has no folder of its own.
+    // A collection an older Ferrofin created has no folder of its own.
     let ours = row(&f.db, BaseItemKind::BoxSet, None, |_| {}).await;
     f.manager
         .delete_item(ours, &with_files())
