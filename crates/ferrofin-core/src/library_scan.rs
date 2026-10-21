@@ -1191,8 +1191,12 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
             ..Default::default()
         },
         // Extract embedded chapter markers so they show on the playback
-        // timeline (matching Jellyfin's `-show_chapters`).
-        extract_chapters: true,
+        // timeline (matching Jellyfin's `-show_chapters`): every video
+        // (`FFProbeVideoInfo`), and among audio only an audiobook
+        // (`AudioFileProber`: `ExtractChapters = item is AudioBook`).
+        extract_chapters: !is_audio
+            || crate::item_type_lookup::kind_from_type_name(&entity.type_)
+                == Some(BaseItemKind::AudioBook),
         media_is_audio: is_audio,
     })
 }
@@ -7457,6 +7461,8 @@ impl LibraryScanner {
             cancel,
         )
         .await?;
+        self.persist_audiobook_chapters(&entity, &rows, cancel)
+            .await?;
         // A new video needs its first item save for the trickplay FK. Finish
         // its metadata refresh stamp only after the custom provider returns;
         // ordinary custom-provider errors still complete; cancellation stops it.
@@ -15357,6 +15363,46 @@ impl LibraryScanner {
                 name: chapter.name,
                 image_path: chapter.image_path,
                 image_date_modified: Some(chapter.image_date_modified),
+            })
+            .collect::<Vec<_>>();
+        repo.save_chapters(id, &saved).await
+    }
+
+    /// Saves an audiobook's probed chapters, as Jellyfin 12's `AudioFileProber`
+    /// does after its streams: `if (audio is AudioBook && mediaInfo.Chapters is
+    /// { Length: > 0 }) _chapterManager.SaveChapters(audio, mediaInfo.Chapters)`,
+    /// keeping only chapters that start before the runtime
+    /// (`ChapterManager.SaveChapters`). Unlike the video prober it checks no
+    /// refresh mode: whenever the probe ran, its chapters are saved. A probe that
+    /// found none leaves the stored rows alone; no dummy chapters and no chapter
+    /// images, which stay a video's.
+    async fn persist_audiobook_chapters(
+        &self,
+        book: &BaseItemEntity,
+        probe: &ProbeRows,
+        cancel: &ScanCancel,
+    ) -> Result<(), ServiceError> {
+        if cancel.is_cancelled()
+            || probe.chapters.is_empty()
+            || crate::item_type_lookup::kind_from_type_name(&book.type_)
+                != Some(BaseItemKind::AudioBook)
+        {
+            return Ok(());
+        }
+        let Some(repo) = &self.chapters else {
+            return Ok(());
+        };
+        let id = Uuid::parse_str(&book.id)
+            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
+        let runtime = book.run_time_ticks.unwrap_or(0);
+        let saved = probe
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.start_position_ticks < runtime)
+            .map(|chapter| ChapterEntity {
+                item_id: book.id.clone(),
+                chapter_index: 0,
+                ..chapter.clone()
             })
             .collect::<Vec<_>>();
         repo.save_chapters(id, &saved).await
@@ -38258,6 +38304,95 @@ mod chapter_image_refresh_tests {
             assert_eq!(std::fs::read(&target).unwrap(), b"previous frame");
         }
         assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    /// Jellyfin 12's `AudioFileProber`: an audiobook's probed chapters are saved,
+    /// cut at the runtime (`ChapterManager.SaveChapters`); a probe that found none
+    /// keeps the stored rows; a music track saves nothing; no chapter image is
+    /// ever extracted from audio. (The scan-level path is
+    /// `tests/library_scan_audiobook_chapters.rs`.)
+    #[tokio::test]
+    async fn an_audiobook_saves_its_probed_chapters_and_a_track_does_not() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let as_kind = |kind: BaseItemKind| {
+            let mut item = fixture.video.clone();
+            item.type_ = crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned();
+            item.media_type = Some("Audio".to_owned());
+            item.run_time_ticks = Some(500_000_000);
+            item
+        };
+        let book = as_kind(BaseItemKind::AudioBook);
+        let cancel = ScanCancel::new();
+        // An audio probe: its attachments are not authoritative.
+        let audio_probe = |positions: &[i64]| ProbeRows {
+            save_attachments: false,
+            ..video_probe(positions)
+        };
+        let starts = |chapters: Vec<ChapterEntity>| {
+            chapters
+                .iter()
+                .map(|chapter| chapter.start_position_ticks)
+                .collect::<Vec<_>>()
+        };
+
+        scanner
+            .persist_audiobook_chapters(
+                &book,
+                &audio_probe(&[0, 200_000_000, 600_000_000]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            starts(repo.get_chapters(id).await.unwrap()),
+            [0, 200_000_000],
+            "a chapter at or past the runtime is dropped"
+        );
+
+        for (item, probe) in [
+            (&book, audio_probe(&[])),
+            (&as_kind(BaseItemKind::Audio), audio_probe(&[100])),
+        ] {
+            scanner
+                .persist_audiobook_chapters(item, &probe, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(
+                starts(repo.get_chapters(id).await.unwrap()),
+                [0, 200_000_000],
+                "{}",
+                item.type_
+            );
+        }
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    /// `ExtractChapters`: every video probe asks for chapters
+    /// (`FFProbeVideoInfo`), and among audio only an audiobook's
+    /// (`AudioFileProber`: `ExtractChapters = item is AudioBook`).
+    #[test]
+    fn only_videos_and_audiobooks_probe_for_chapters() {
+        let fixture_item = |kind: BaseItemKind, media_type: &str| BaseItemEntity {
+            id: Uuid::new_v4().to_string(),
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned(),
+            media_type: Some(media_type.to_owned()),
+            path: Some("/media/file".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        for (kind, media_type, expected) in [
+            (BaseItemKind::Movie, "Video", true),
+            (BaseItemKind::AudioBook, "Audio", true),
+            (BaseItemKind::Audio, "Audio", false),
+        ] {
+            let request = probe_request(&fixture_item(kind, media_type)).expect("probed");
+            assert_eq!(request.extract_chapters, expected, "{kind:?}");
+        }
     }
 
     #[tokio::test]
