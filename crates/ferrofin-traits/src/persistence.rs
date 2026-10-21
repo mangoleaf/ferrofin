@@ -917,6 +917,23 @@ pub trait ItemPersistenceService: Send + Sync {
         values: &[(i32, String)],
     ) -> Result<(), ServiceError>;
 
+    /// [`save_item_values`](Self::save_item_values) for several items, in one
+    /// write where the store can: the Live TV guide mirror rewrites the genres
+    /// of thousands of airings on a first import, and one transaction each
+    /// holds the single writer for every one of them.
+    ///
+    /// All or nothing per call where the store batches: a failure leaves none
+    /// of `items` written. The default writes the items one at a time.
+    async fn save_item_values_for_items(
+        &self,
+        items: &[(Uuid, Vec<(i32, String)>)],
+    ) -> Result<(), ServiceError> {
+        for (item_id, values) in items {
+            self.save_item_values(*item_id, values).await?;
+        }
+        Ok(())
+    }
+
     /// Whether an item row with this id exists (used to self-heal a library's
     /// `CollectionFolder` row before parenting scanned children to it).
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
