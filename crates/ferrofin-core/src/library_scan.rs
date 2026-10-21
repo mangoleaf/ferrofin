@@ -9600,7 +9600,10 @@ impl LibraryScanner {
                 xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
         };
-        if parsed.is_err() {
+        if let Err(error) = parsed {
+            // A malformed season/album/artist NFO: upstream's plain `Fetch`
+            // lets the `XmlException` fail the local provider, which is logged.
+            tracing::warn!(path = %nfo_path, ?error, "local NFO not read");
             return LocalNfo::default();
         }
         apply_nfo(entity, &result.item);
