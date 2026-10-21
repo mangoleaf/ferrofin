@@ -23699,8 +23699,9 @@ mod tests {
         // The library's saved MusicAlbum list is the whole answer…
         assert!(own.metadata_enabled("MusicAlbum", AUDIODB));
         assert!(!own.metadata_enabled("MusicAlbum", MUSICBRAINZ));
-        // …and a kind it saved none for falls back to the server.
-        assert!(!own.metadata_enabled("MusicArtist", AUDIODB));
+        // …and a MusicArtist it saved none for may use every provider
+        // (`CanRefreshMetadata`), whatever the server's defaults disable.
+        assert!(own.metadata_enabled("MusicArtist", AUDIODB));
         assert!(own.metadata_enabled("MusicArtist", MUSICBRAINZ));
         // An item whose library is not configured takes the server's alone.
         let elsewhere =
@@ -24992,10 +24993,10 @@ mod tests {
                         .audiodb
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if line.contains("/album-mb.php") {
-                        r#"{"album":[{"strAlbum":"AudioDb Album","strDescriptionEN":"Album text."}]}"#
+                        r#"{"album":[{"strAlbum":"AudioDb Album","strDescription":"Album text."}]}"#
                             .to_owned()
                     } else {
-                        r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#
+                        r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#
                             .to_owned()
                     }
                 };

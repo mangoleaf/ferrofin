@@ -248,12 +248,6 @@ fn provider_row(item: &BaseItemEntity) -> BaseItemEntity {
     }
 }
 
-/// The `ResultLanguage` of a TheAudioDB answer: Ferrofin maps its English
-/// description (`strDescriptionEN`), which `AudioDbAlbumProvider`/
-/// `AudioDbArtistProvider` mark `"en"` so it does not block a provider that
-/// can serve the requested language (`AudioDbAlbumProvider.cs:122-131`).
-const AUDIODB_LANGUAGE: &str = "en";
-
 /// `AlbumMetadataService.SetPeople` (`:195-227`): an album credits each of
 /// its album artists, then each of its artists — `None` when it has neither,
 /// as upstream then leaves its credits alone. The columns split as
@@ -1436,8 +1430,10 @@ impl LibraryScanner {
                         && let Some(album) = &album
                     {
                         answered = true;
-                        let mut result =
-                            RemoteAnswer::for_row(&current.item, Some(AUDIODB_LANGUAGE));
+                        // `ProcessResult`: the description in the album's
+                        // language, else English marked `en`.
+                        let (description, language) = album.description(Some(&preferred));
+                        let mut result = RemoteAnswer::for_row(&current.item, Some(&language));
                         let item = &mut result.item;
                         // `ProcessResult`: with `ReplaceAlbumName` (off by
                         // default) the album's name. ACCEPTED DIVERGENCE
@@ -1446,7 +1442,7 @@ impl LibraryScanner {
                         // copies — a no-op): see `AudioDbAlbum::name`.
                         item.name.clone_from(&album.name);
                         item.album_artists.clone_from(&album.artist);
-                        item.overview.clone_from(&album.description);
+                        item.overview = description;
                         item.production_year = album.year.map(i64::from);
                         item.genres.clone_from(&album.genre);
                         result.provider_ids = [
@@ -1595,10 +1591,12 @@ impl LibraryScanner {
                         && let Some(artist) = &artist
                     {
                         answered = true;
-                        let mut result =
-                            RemoteAnswer::for_row(&current.item, Some(AUDIODB_LANGUAGE));
+                        // `ProcessResult`: the biography in the artist's
+                        // language, else English marked `en`.
+                        let (biography, language) = artist.biography(Some(&preferred));
+                        let mut result = RemoteAnswer::for_row(&current.item, Some(&language));
                         let item = &mut result.item;
-                        item.overview.clone_from(&artist.biography);
+                        item.overview = biography;
                         // `ProcessResult`: the genre and the sub-genre.
                         let genres: Vec<String> = [&artist.genre, &artist.sub_genre]
                             .into_iter()
