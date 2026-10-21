@@ -4757,6 +4757,20 @@ mod tests {
         assert_eq!(hls_segment_type("mp4"), "fmp4");
     }
 
+    /// Gives `video` the metadata of an out-of-spec Dolby Vision stream on a
+    /// PQ base layer (profile 8 with compatibility id 6): `DOVIInvalid`, HDR.
+    fn invalid_dovi(video: &mut MediaStream) {
+        video.color_transfer = Some("smpte2084".to_owned());
+        video.dv_profile = Some(8);
+        video.dv_bl_signal_compatibility_id = Some(6);
+        video.rpu_present_flag = Some(1);
+        video.bl_present_flag = Some(1);
+        assert_eq!(
+            video.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviInvalid
+        );
+    }
+
     /// A 4K HDR10 HEVC video stream (the heavy-transcode benchmark shape).
     fn hdr_4k_video_stream(codec: &str) -> MediaStream {
         MediaStream {
@@ -5407,7 +5421,6 @@ mod tests {
         stub_vaapi_ffmpeg(dir.path(), "Mesa Gallium driver 24.0.0 for AMD Radeon");
         let mut video = hdr_4k_video_stream("hevc");
         video.pixel_format = Some("yuv420p10le".to_owned());
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
         let p = planner_over_caps(
             Arc::new(FakeMediaSources {
                 sources: vec![source("abc", vec![video, audio_stream("aac")])],
@@ -5535,7 +5548,6 @@ mod tests {
         if tonemap {
             video.pixel_format = Some("yuv420p10le".to_owned());
             video.bit_depth = Some(10);
-            video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
             video.color_transfer = Some("smpte2084".to_owned());
             video.codec = Some("hevc".to_owned());
         }
@@ -5711,8 +5723,7 @@ mod tests {
         // The whole point of the bitstream filters: this file copies through to
         // an HDR10 client instead of being re-encoded.
         let mut video = video_stream("hevc");
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
-        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        invalid_dovi(&mut video);
         video.nal_length_size = Some("4".to_owned());
         let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
         let mut req = request("abc");
@@ -5739,8 +5750,7 @@ mod tests {
         // removal as well as the container fixup — so the Dolby Vision RPU
         // survives here even though the client asked for it gone.
         let mut video = video_stream("hevc");
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
-        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        invalid_dovi(&mut video);
         video.nal_length_size = Some("0".to_owned());
         let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
         let mut req = request("abc");
@@ -5757,8 +5767,7 @@ mod tests {
         // A fresh bitstream needs neither the fixup nor the strip.
         let mut video = nvdec_decodable_video_stream();
         video.codec = Some("hevc".to_owned());
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
-        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        invalid_dovi(&mut video);
         video.nal_length_size = Some("4".to_owned());
         let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
         let mut req = request("abc");
@@ -5882,7 +5891,6 @@ mod tests {
     async fn an_hdr_source_tonemaps_on_the_gpu() {
         let mut video = hdr_4k_video_stream("hevc");
         video.pixel_format = Some("yuv420p10le".to_owned());
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
         // Both switches are off by default and both are load-bearing here:
         // HEVC is not in the default hardware-decode list, and tonemapping is
         // opt-in.

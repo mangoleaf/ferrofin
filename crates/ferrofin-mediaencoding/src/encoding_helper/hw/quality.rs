@@ -136,8 +136,8 @@ mod tests {
     use crate::encoder::{FfmpegVersion, REQUIRED_FILTERS};
     use crate::encoding_helper::hw::capabilities::Platform;
     use crate::encoding_helper::hw::decoder::RequestedSize;
-    use ferrofin_model::data::{VideoRange, VideoRangeType};
-    use ferrofin_model::entities::MediaStreamType;
+    use crate::encoding_helper::test_streams::with_range;
+    use ferrofin_model::data::VideoRangeType;
     use ferrofin_model::entities_media::MediaStream;
     use rstest::rstest;
 
@@ -156,22 +156,21 @@ mod tests {
     }
 
     fn hdr_stream() -> MediaStream {
-        MediaStream {
-            codec: Some("hevc".to_owned()),
-            index: 0,
-            stream_type: MediaStreamType::Video,
-            pixel_format: Some("yuv420p10le".to_owned()),
-            bit_depth: Some(10),
-            video_range: Some(VideoRange::Hdr),
-            // The VPP tonemap tests the RANGE TYPE specifically, where the
-            // OpenCL one is satisfied by the range alone — so a fixture with
-            // only the latter silently exercises the OpenCL path.
-            video_range_type: Some(VideoRangeType::Hdr10),
-            color_transfer: Some("smpte2084".to_owned()),
-            width: Some(3840),
-            height: Some(2160),
-            ..MediaStream::default()
-        }
+        // HDR10, because the VPP tonemap wants the RANGE TYPE (HDR10,
+        // HDR10+ or DV on an HDR10 base) where the OpenCL one takes any HDR
+        // range: an HLG or profile-5 fixture would exercise the OpenCL path.
+        with_range(
+            MediaStream {
+                codec: Some("hevc".to_owned()),
+                index: 0,
+                pixel_format: Some("yuv420p10le".to_owned()),
+                bit_depth: Some(10),
+                width: Some(3840),
+                height: Some(2160),
+                ..MediaStream::default()
+            },
+            VideoRangeType::Hdr10,
+        )
     }
 
     fn ctx<'a>(
