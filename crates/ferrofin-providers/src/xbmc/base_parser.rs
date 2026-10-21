@@ -85,6 +85,10 @@ pub type FetchResult = Result<(), FetchError>;
 pub enum FetchError {
     /// The metadata-file path was empty (`ArgumentException.ThrowIfNullOrEmpty`).
     EmptyMetadataFile,
+    /// The document is malformed and its parser does not recover: the plain
+    /// `Fetch` lets the `XmlException` reach the provider, whose result is
+    /// then not used.
+    MalformedXml,
 }
 
 /// The extension point the per-kind subclasses implement.
@@ -173,17 +177,23 @@ impl<'a> BaseNfoParser<'a> {
     /// Port of the two `Fetch` bodies: the `SupportsUrlAfterClosingXmlTag` path
     /// (handle a raw provider URL after the last closing tag) and the plain
     /// path. The caller supplies the file contents (I/O stays outside).
+    ///
+    /// # Errors
+    /// [`FetchError::MalformedXml`] when the plain path meets a malformed
+    /// document. The URL path keeps the elements read before the error, as
+    /// its C# `catch (XmlException)` does.
     pub fn fetch<P: NfoParser>(
         &self,
         parser: &P,
         result: &mut MetadataResult<NfoBaseItem>,
         xml: &str,
-    ) {
+    ) -> FetchResult {
         result.reset_people();
 
         if !parser.supports_url_after_closing_xml_tag() {
-            self.fetch_document(parser, result, xml);
-            return;
+            let reader = XmlCursor::new(xml).map_err(|_| FetchError::MalformedXml)?;
+            self.fetch_document(parser, result, reader);
+            return Ok(());
         }
 
         // Handle a url after the xml data (http://kodi.wiki/view/NFO_files/movies).
@@ -199,29 +209,27 @@ impl<'a> BaseNfoParser<'a> {
 
                 // If the file is just an IMDb url (closing tag at 0), stop.
                 if idx == 0 {
-                    return;
+                    return Ok(());
                 }
 
-                let doc = &xml[..=idx];
-                self.fetch_document(parser, result, doc);
+                let (reader, _) = XmlCursor::up_to_error(&xml[..=idx]);
+                self.fetch_document(parser, result, reader);
             }
             None => {
                 // The file is just provider urls.
                 Self::parse_provider_links(result, xml);
             }
         }
+        Ok(())
     }
 
-    /// Streams a well-formed(ish) XML document through the element switch.
+    /// Streams a document's elements through the element switch.
     fn fetch_document<P: NfoParser>(
         &self,
         parser: &P,
         result: &mut MetadataResult<NfoBaseItem>,
-        xml: &str,
+        mut reader: XmlCursor,
     ) {
-        let Ok(mut reader) = XmlCursor::new(xml) else {
-            return;
-        };
         reader.move_to_content();
         reader.read();
 

@@ -307,21 +307,22 @@ impl FerrofinSystemManager {
         self
     }
 
-    /// Resolves and prepares the same live transcode root as the media consumers.
-    fn transcode_path(&self) -> Result<String, ServiceError> {
+    /// Resolves and prepares the same live transcode root as the media
+    /// consumers, on the blocking pool: the preparation walks the whole tree.
+    async fn transcode_path(&self) -> Result<String, ServiceError> {
         if let Some(path) = self
             .facts
             .transcoding_temp_path
             .as_ref()
             .filter(|path| !path.is_empty())
         {
-            ferrofin_util::directory_path::prepare_transcode_directory(std::path::Path::new(path))
-                .map_err(|error| {
-                    ServiceError::backend(format!("prepare transcode directory {path}: {error}"))
-                })?;
+            ferrofin_traits::system::prepare_transcode_directory_off_runtime(
+                std::path::PathBuf::from(path),
+            )
+            .await?;
             return Ok(path.clone());
         }
-        self.paths.prepare_transcode_path()
+        ferrofin_traits::system::prepare_transcode_path_off_runtime(self.paths.clone()).await
     }
 }
 
@@ -346,7 +347,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     async fn get_system_info(&self, request: &RequestContext) -> Result<SystemInfo, ServiceError> {
         let cfg = self.configuration_manager.configuration().await?;
         let local_address = self.application_host.get_smart_api_url(request).await.ok();
-        let transcode = self.transcode_path()?;
+        let transcode = self.transcode_path().await?;
         let internal_metadata = self.paths.internal_metadata_path();
 
         #[allow(deprecated)]
@@ -432,7 +433,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             self.paths.cache_path(),
             self.paths.log_directory_path(),
             self.paths.internal_metadata_path(),
-            self.transcode_path()?,
+            self.transcode_path().await?,
         ];
         for (_, _, folders) in &library_folders {
             paths.extend(folders.iter().cloned());

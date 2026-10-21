@@ -132,7 +132,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a kind a library saved no fetcher choices for, and an item in no library (an artist known
   only by name), now uses the server-wide metadata options — their disabled fetchers and
   their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
-  artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
+  OMDb for music videos. A music artist with no saved choices may use every metadata
+  downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- TheAudioDB descriptions return for music artists and albums, in the item's metadata
+  language when TheAudioDB has it, else in English
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'

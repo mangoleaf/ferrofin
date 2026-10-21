@@ -1370,7 +1370,6 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "futures-util",
- "libc",
  "regex",
  "reqwest",
  "rstest",
@@ -1381,7 +1380,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1420,6 +1418,7 @@ dependencies = [
 name = "ferrofin-keyframes"
 version = "0.4.1"
 dependencies = [
+ "ferrofin-util",
  "rstest",
  "serde",
  "serde_json",
@@ -1442,6 +1441,7 @@ dependencies = [
  "flate2",
  "icu_collator",
  "quick-xml",
+ "regex",
  "reqwest",
  "rstest",
  "serde",
@@ -1661,12 +1661,15 @@ dependencies = [
  "icu_locale_fallback",
  "icu_normalizer",
  "icu_provider",
+ "libc",
  "rand 0.8.7",
  "regex",
  "rstest",
  "thiserror 2.0.21",
+ "tokio",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
  "zerovec",
 ]
 
