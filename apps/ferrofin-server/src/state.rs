@@ -726,8 +726,16 @@ pub async fn build_app_state(
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
             MediaEncoderConfig {
-                analyze_duration: None,
-                probe_size: None,
+                // Jellyfin's `FFmpeg:analyzeduration` / `FFmpeg:probesize`
+                // defaults, which every probe passes; without them ffprobe
+                // falls back to its own 5 s / 5 MB and can miss late streams.
+                analyze_duration: Some(
+                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION
+                        .to_owned(),
+                ),
+                probe_size: Some(
+                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
+                ),
                 threads: 0,
                 // Frame extraction (chapter images) writes here, never next to
                 // the media file — media mounts are commonly read-only. The
