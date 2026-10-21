@@ -55,7 +55,6 @@ use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::media_encoding::{
     HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
-use ferrofin_traits::system::ServerApplicationPaths as _;
 
 use crate::encoding_options::EncodingOptionsReader;
 
@@ -1031,7 +1030,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         } else {
             output_id
         };
-        let transcode_root = PathBuf::from(self.paths.prepare_transcode_path()?);
+        let transcode_root = PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(self.paths.clone()).await?,
+        );
         let playlist_path = transcode_root.join(if progressive {
             format!("{output_id}.{output_extension}")
         } else {
@@ -2283,6 +2284,7 @@ fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrofin_traits::system::ServerApplicationPaths as _;
 
     use ferrofin_model::configuration::HlsAudioSeekStrategy;
     use ferrofin_model::entities_media::MediaAttachment;
@@ -3091,6 +3093,49 @@ mod tests {
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
         assert_eq!(plan.segment_length_ms, 3000);
         assert_eq!(plan.segment_container, "ts");
+    }
+
+    /// Every dynamic HLS segment and playlist request plans, and planning
+    /// prepares the transcode directory, a walk of the whole tree. That walk
+    /// runs on the blocking pool: with the pool's only thread held busy the
+    /// plan cannot finish, which an inline walk would ignore.
+    #[test]
+    fn plan_prepares_the_transcode_directory_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+            let p = planner(vec![src]);
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                p.plan(&request("abc"), false, None, PlaylistKind::Vod),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "the plan finished with the blocking pool starved, so the walk ran inline"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let plan = p
+                .plan(&request("abc"), false, None, PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert_eq!(plan.media_path, "/media/movie.mkv");
+        });
     }
 
     #[tokio::test]

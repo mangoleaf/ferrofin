@@ -50,7 +50,14 @@ fn conflicting_transcode_marker(path: &Path) -> std::io::Result<Option<PathBuf>>
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let child = entry.path();
-        if child.is_dir() {
+        // The entry's own type comes with the listing; only a symlink needs a
+        // `stat` to learn what it points at. `is_dir()` on every entry stat'ed
+        // each segment file of every live transcode, on every HLS request.
+        let is_dir = match entry.file_type() {
+            Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+            _ => child.is_dir(),
+        };
+        if is_dir {
             if let Some(conflict) = conflicting_transcode_marker(&child)? {
                 return Ok(Some(conflict));
             }
@@ -294,6 +301,28 @@ mod tests {
             target
         );
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The walk reads each entry's type from the listing, and a link is still
+    /// resolved, so a conflicting marker inside a linked directory is found
+    /// as it is inside a real one.
+    #[cfg(unix)]
+    #[test]
+    fn transcode_directory_finds_a_conflicting_marker_through_a_directory_link() {
+        let base =
+            std::env::temp_dir().join(format!("ferrofin-transcode-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&elsewhere).expect("linked directory");
+        std::fs::write(root.join("segment0.ts"), b"segment").expect("a segment");
+        std::os::unix::fs::symlink(&elsewhere, root.join("linked")).expect("directory link");
+        prepare_transcode_directory(&root).expect("nothing conflicts yet");
+
+        std::fs::write(elsewhere.join(".jellyfin-data"), b"").expect("foreign marker");
+        let error = prepare_transcode_directory(&root).expect_err("conflicting owner");
+        assert!(error.to_string().contains(".jellyfin-data"), "{error}");
+        std::fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[cfg(target_os = "linux")]

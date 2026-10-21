@@ -4429,7 +4429,7 @@ impl FerrofinLiveTvManager {
         let opened = match kind {
             crate::tuner_host::ChannelStreamKind::LegacyUdp(plan) => {
                 let base_url = self.local_api_url().await?;
-                let transcode_dir = self.transcode_dir()?;
+                let transcode_dir = self.transcode_dir().await?;
                 Some((
                     crate::hdhomerun::udp_stream::open_legacy_udp_stream(
                         plan,
@@ -4447,7 +4447,7 @@ impl FerrofinLiveTvManager {
                     && self.can_share_stream(path, source).await;
                 if share {
                     let base_url = self.local_api_url().await?;
-                    let transcode_dir = self.transcode_dir()?;
+                    let transcode_dir = self.transcode_dir().await?;
                     Some((
                         crate::stream::open_shared_http_stream(
                             self.tuner_source.as_ref(),
@@ -4569,21 +4569,16 @@ impl FerrofinLiveTvManager {
         }
     }
 
-    /// The directory a shared live stream's buffer is written to.
-    fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
+    /// The directory a shared live stream's buffer is written to, prepared on
+    /// the blocking pool: the preparation walks the whole transcode tree.
+    async fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
         let path = self.paths.transcode_dir.resolve();
         if path.as_os_str().is_empty() {
             return Err(ServiceError::Backend(
                 "live tv transcode path not wired".to_owned(),
             ));
         }
-        ferrofin_util::directory_path::prepare_transcode_directory(&path).map_err(|error| {
-            ServiceError::backend(format!(
-                "prepare transcode directory {}: {error}",
-                path.display()
-            ))
-        })?;
-        Ok(path)
+        ferrofin_traits::system::prepare_transcode_directory_off_runtime(path).await
     }
 
     /// The API base URL a live stream's buffered file is served from.
