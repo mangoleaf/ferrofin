@@ -1816,8 +1816,8 @@ pub trait UserViewManager: Send + Sync {
     /// folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
     /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
     /// its own per-collection-type query instead
-    /// ([`ItemRepository::get_latest_item_list`] — the grouped-threshold form
-    /// for tvshows, the newest albums for music).
+    /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or
+    /// Series card per newest series for tvshows, the newest albums for music).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
     /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,

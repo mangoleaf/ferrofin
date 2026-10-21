@@ -364,17 +364,14 @@ pub trait ItemRepository: Send + Sync {
     /// The "latest media" rows of a **tvshows or music** library — port of C#
     /// `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The two types answer differently, and they track different upstream
-    /// versions — the music arm is v12's rewrite, the tvshows arm is still
-    /// 10.11.8's (v12 replaced that one too, with `GetLatestTvShowItems`;
-    /// porting it is its own work item):
+    /// The two types answer differently (both v12):
     ///
-    /// - **tvshows** (v10.11.8) — one grouped-threshold statement: the filter's predicates
-    ///   are grouped by `SeriesName`, the newest `filter.limit` groups'
-    ///   `MAX(DateCreated)` are taken, and every row at or above the *smallest*
-    ///   of those maxima is returned in the filter's `order_by`, unpaged — so
-    ///   `limit` caps groups, not rows, and the caller buckets the rows by
-    ///   container afterwards;
+    /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
+    ///   `filter.limit` series (by the newest row the filter matches, grouped
+    ///   by `SeriesName`): the Episode, Season or Series card chosen from that
+    ///   series' rows added within 24 hours of its newest one, a container the
+    ///   filter's parental limits hide replaced by the episode, newest first.
+    ///   The filter's `order_by` and `start_index` play no part;
     /// - **music** (v12) — the newest `filter.limit` `MusicAlbum` rows
     ///   themselves, ordered `DateCreated DESC, Id DESC`, scoped by the filter's
     ///   top parent ids — which reads no track at all — or, for an
