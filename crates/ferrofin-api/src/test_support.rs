@@ -1402,8 +1402,9 @@ impl SystemManager for FakeSystem {
     }
 }
 
-/// A fake [`ServerApplicationHost`]; getters return neutral values, URL builders
-/// are unused by INFRA-level tests.
+/// A fake [`ServerApplicationHost`]; getters return neutral values. The smart
+/// API URL is `http://localhost:8096` at the root; the other URL builders are
+/// unused by INFRA-level tests.
 pub struct FakeAppHost;
 
 #[async_trait]
@@ -1435,8 +1436,11 @@ impl ServerApplicationHost for FakeAppHost {
     fn friendly_name(&self) -> String {
         "ferrofin-test".to_owned()
     }
+    fn base_url(&self) -> String {
+        String::new()
+    }
     async fn get_smart_api_url(&self, _request: &RequestContext) -> Result<String, ServiceError> {
-        unimplemented!("fake")
+        Ok("http://localhost:8096".to_owned())
     }
     async fn get_smart_api_url_for_peer(
         &self,

@@ -727,6 +727,9 @@ mod tests {
         fn friendly_name(&self) -> String {
             self.name.clone()
         }
+        fn base_url(&self) -> String {
+            String::new()
+        }
         async fn get_smart_api_url(
             &self,
             _request: &HostRequestContext,
