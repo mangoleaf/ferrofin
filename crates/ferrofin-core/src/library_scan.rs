@@ -21512,8 +21512,6 @@ mod trickplay;
 #[cfg(test)]
 mod directory_cache_tests;
 #[cfg(test)]
-mod extra_names_tests;
-#[cfg(test)]
 mod plan_paths_tests;
 
 #[cfg(test)]

@@ -13,15 +13,16 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ferrofin_core::file_system::FerrofinFileSystem;
+use ferrofin_core::item_type_lookup::ItemTypeLookup;
+use ferrofin_core::{
+    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
+    LibraryScanner,
+};
 use ferrofin_db::Database;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::library::VirtualFolderManager;
-
-use super::LibraryScanner;
-use crate::file_system::FerrofinFileSystem;
-use crate::item_persistence_service::FerrofinItemPersistenceService;
-use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
 
 /// A movie library over a temporary folder, scanned by one scanner.
 struct MovieLibrary {
@@ -37,7 +38,8 @@ impl MovieLibrary {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         std::fs::create_dir_all(&media).unwrap();
-        let db = crate::test_support::test_db().await;
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
         let folders: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join(".views"))
@@ -58,7 +60,10 @@ impl MovieLibrary {
             .unwrap();
         let scanner =
             LibraryScanner::new(folders, Arc::new(FerrofinFileSystem::new()), persistence)
-                .with_items(crate::test_support::item_repository_over(db.clone()));
+                .with_items(Arc::new(FerrofinItemRepository::new(
+                    db.clone(),
+                    Arc::new(ItemTypeLookup::new()),
+                )));
         let library = Self {
             _tmp: tmp,
             media,
