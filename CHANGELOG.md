@@ -229,6 +229,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- Collections and playlists take their genres and studios from their members, as in
+  Jellyfin. A collection also takes its earliest member's date and year, and a playlist's
+  runtime is the sum of its members'. Before, they took only a rating, so they had no
+  genres, studios, year or runtime and never matched a genre or studio filter. Locked
+  items and locked fields keep their values. A collection also keeps a current list of
+  the libraries its members are in, which decides who can see it
 
 ## [1.0.0] - 2026-09-05
 
