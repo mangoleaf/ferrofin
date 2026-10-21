@@ -631,20 +631,26 @@ fn provider_id(name: &str) -> &str {
     }
 }
 
-/// Validates a username against the C# `ValidUsernameRegex`
-/// (`^(?!\s)[\w \-'._@+]+(?<!\s)$`) plus the `.`/`..` exclusions, without a
-/// regex engine: allowed characters are word characters (Unicode alphanumerics
-/// or `_`), space, and any of `- ' . _ @ +`; it must be non-empty, must not
-/// start or end with whitespace, and must not be `.` or `..`.
+/// The C# `ValidUsernameRegex` (`^(?!\s)[\w\ \-'._@+]+(?<!\s)$`,
+/// `UserManager.cs:119`) without its lookarounds, which [`valid_username`]
+/// checks itself. .NET's `\w` is `[\p{L}\p{Mn}\p{Nd}\p{Pc}]`, narrower than
+/// Rust's: it has no other numerics (`²`, `½`, `Ⅻ`) and no spacing marks.
+static VALID_USERNAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[\p{L}\p{Mn}\p{Nd}\p{Pc} \-'._@+]+$")
+        .expect("ValidUsernameRegex pattern is valid")
+});
+
+/// Validates a username against the C# `ValidUsernameRegex` plus the
+/// `.`/`..` exclusions (`ThrowIfInvalidUsername`, `UserManager.cs:965`): word
+/// characters, space and any of `- ' . _ @ +`, not starting or ending with a
+/// space. One divergence: .NET's `$` also matches before a final newline, so
+/// upstream admits `"alice\n"`; Ferrofin does not.
 fn valid_username(name: &str) -> bool {
-    if name.is_empty() || name == "." || name == ".." {
-        return false;
-    }
-    if name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace) {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | ' ' | '-' | '\'' | '.' | '@' | '+'))
+    VALID_USERNAME.is_match(name)
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && name != "."
+        && name != ".."
 }
 
 /// Validates a username or returns [`ServiceError::InvalidInput`] (C#
@@ -1883,17 +1889,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn valid_username_accepts_and_rejects() {
-        assert!(valid_username("alice"));
-        assert!(valid_username("a-b_c.d@e+f 1"));
-        assert!(!valid_username(""));
-        assert!(!valid_username("."));
-        assert!(!valid_username(".."));
-        assert!(!valid_username(" leading"));
-        assert!(!valid_username("trailing "));
-        assert!(!valid_username("has\ttab"));
-        assert!(!valid_username("bad/slash"));
+    /// `UserManagerTests.ThrowIfInvalidUsername_*` (`[InlineData]` verbatim),
+    /// then the word class .NET `\w` is: letters, nonspacing marks (a
+    /// Devanagari virama, a decomposed acute), decimal digits and connector
+    /// punctuation — not spacing marks, nor other numerics such as `²`, `½`
+    /// or `Ⅻ`.
+    #[rstest::rstest]
+    #[case::upstream_valid_1("this_is_valid", true)]
+    #[case::upstream_valid_2("this is also valid", true)]
+    #[case::upstream_valid_3("0@_-' .", true)]
+    #[case::upstream_valid_4("Aa0@_-' .+", true)]
+    #[case::upstream_valid_5("thisisa+testemail@test.foo", true)]
+    #[case::upstream_valid_6(
+        "------@@@--+++----@@--abcdefghijklmn---------@----_-_-___-_ .9foo+",
+        true
+    )]
+    #[case::upstream_invalid_1(" ", false)]
+    #[case::upstream_invalid_2("", false)]
+    #[case::upstream_invalid_3("special characters like & $ ? are not allowed", false)]
+    #[case::upstream_invalid_4("thishasaspaceontheend ", false)]
+    #[case::upstream_invalid_5(" thishasaspaceatthestart", false)]
+    #[case::upstream_invalid_6(" thishasaspaceatbothends ", false)]
+    #[case::upstream_invalid_7(" this has a space at both ends and inbetween ", false)]
+    #[case::upstream_invalid_8(".", false)]
+    #[case::upstream_invalid_9("..", false)]
+    #[case::devanagari_virama("कृष्ण", true)]
+    // ज़ुबैर: a nukta and two vowel signs, all nonspacing (`Mn`).
+    #[case::devanagari_nukta("\u{91c}\u{93c}\u{941}\u{92c}\u{948}\u{930}", true)]
+    // जो: the vowel sign O is a spacing mark (`Mc`), outside .NET's `\w`.
+    #[case::devanagari_spacing_mark("\u{91c}\u{94b}", false)]
+    #[case::decomposed_latin("Jose\u{301}", true)]
+    #[case::connector_punctuation("a\u{203f}b", true)]
+    #[case::superscript_digit("user²", false)]
+    #[case::vulgar_fraction("half½", false)]
+    #[case::roman_numeral("Louis Ⅻ", false)]
+    #[case::tab("has\ttab", false)]
+    #[case::trailing_no_break_space("a\u{a0}", false)]
+    #[case::slash("bad/slash", false)]
+    // .NET's `$` also matches before a final newline, so upstream admits
+    // "alice\n"; Ferrofin does not port that.
+    #[case::trailing_newline("alice\n", false)]
+    fn valid_username_matches_the_upstream_regex(#[case] name: &str, #[case] valid: bool) {
+        assert_eq!(valid_username(name), valid, "{name:?}");
     }
 
     // jellyfin-web refuses to initialize the Cast SDK when CastReceiverId is

@@ -132,7 +132,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a kind a library saved no fetcher choices for, and an item in no library (an artist known
   only by name), now uses the server-wide metadata options — their disabled fetchers and
   their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
-  artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
+  OMDb for music videos. A music artist with no saved choices may use every metadata
+  downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- TheAudioDB descriptions return for music artists and albums, in the item's metadata
+  language when TheAudioDB has it, else in English
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'
@@ -164,6 +167,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
   the algorithm's filter is active, `-ac 2` is suppressed (the `pan=` filter sets the
   channel count)
+- Serve Jellyfin's `/health`: plain-text `Healthy`, or `Unhealthy` with a 503 when the
+  database does not answer, and behind a base URL a redirect from `/health` to
+  `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
+  the same database check, so the chart's readiness probe now fails while the database is
+  unreachable (it was always ready before)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

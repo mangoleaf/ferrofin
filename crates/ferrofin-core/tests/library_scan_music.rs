@@ -110,9 +110,9 @@ impl Music {
                 } else if line.contains("/ws/2/artist?") {
                     format!(r#"{{"artists":[{{"id":"{ARTIST}","name":"Miles Davis"}}]}}"#)
                 } else if line.contains("/album-mb.php") {
-                    r#"{"album":[{"strDescriptionEN":"Album text.","strGenre":"Jazz"}]}"#.to_owned()
+                    r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned()
                 } else {
-                    r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned()
+                    r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned()
                 };
                 let _ = write!(
                     s,
@@ -722,6 +722,44 @@ async fn a_by_name_artist_refreshes_through_the_scanner() {
     assert_eq!(
         fx.id_of(id, "MusicBrainzArtist").await.as_deref(),
         Some(CHOSEN_ARTIST)
+    );
+}
+
+/// The server-wide options ship with TheAudioDB off for music albums and
+/// artists (`ServerConfiguration`). A music artist whose library saved no
+/// MusicArtist choices still asks it, as v12.2 `CanRefreshMetadata` lets
+/// every metadata provider through for a `MusicArtist` with no type options
+/// (jellyfin/jellyfin#16606); an album has no such exception.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_music_artist_without_type_options_asks_theaudiodb_despite_the_server_defaults() {
+    use ferrofin_model::configuration::MetadataOptions;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    let disabled = |kind: &str| MetadataOptions {
+        item_type: Some(kind.to_owned()),
+        disabled_metadata_fetchers: vec!["TheAudioDB".to_owned()],
+        ..MetadataOptions::default()
+    };
+    let server = vec![disabled("MusicAlbum"), disabled("MusicArtist")];
+    let fx = Fixture {
+        scanner: fx.scanner.with_metadata_options(move || server.clone()),
+        ..fx
+    };
+    fx.scan().await;
+    let asked = fx.music.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/artist-mb.php")),
+        "the artist asks TheAudioDB: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|l| l.contains("/album-mb.php")),
+        "the album follows the server-wide options: {asked:?}"
+    );
+    let artist = derive_item_id(BaseItemKind::MusicArtist, &fx.artist_dir.to_string_lossy())
+        .expect("artist id");
+    assert_eq!(
+        fx.row(artist).await.overview.as_deref(),
+        Some("Artist bio.")
     );
 }
 

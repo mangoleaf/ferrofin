@@ -281,6 +281,9 @@ pub struct TrickplayExtraction<'a> {
     pub qscale: i32,
     /// The ffmpeg thread count; `0` lets ffmpeg decide.
     pub threads: i32,
+    /// `TrickplayOptions.ProcessPriority`: the priority the extraction's
+    /// ffmpeg runs at.
+    pub priority: ferrofin_model::configuration::ProcessPriorityClass,
     /// Where the numbered JPEGs are written; created if absent.
     pub output_dir: &'a str,
     /// `TrickplayOptions.EnableHwAcceleration` — the trickplay-specific

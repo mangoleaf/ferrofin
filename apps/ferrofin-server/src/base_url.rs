@@ -1,8 +1,9 @@
 //! Mount the API/web routes under the advertised base URL.
 //!
-//! Mirrors Jellyfin's BaseUrlRedirectionMiddleware followed by Startup's Map.
-//! Ferrofin's own health probe endpoints also remain available at the root so
-//! deployments can keep probing while the application's base URL changes.
+//! Mirrors Jellyfin's BaseUrlRedirectionMiddleware followed by Startup's Map:
+//! Jellyfin's `/health` outside the mount redirects into it. Ferrofin's own
+//! probe endpoints (`/health/live`, `/health/ready`) also remain available at
+//! the root so deployments can keep probing while the base URL changes.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
@@ -30,6 +31,14 @@ pub(crate) async fn rewrite(
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&base));
     let suffix = path.get(base.len()..).unwrap_or_default();
     if !has_prefix || suffix.is_empty() || suffix == "/" {
+        // Upstream sends a health check outside the mount into it.
+        if path.eq_ignore_ascii_case("/health") || path.eq_ignore_ascii_case("/health/") {
+            return (
+                StatusCode::FOUND,
+                [(header::LOCATION, format!("{base}/health"))],
+            )
+                .into_response();
+        }
         // Jellyfin redirects missing prefixes and the mount root to its default
         // web path. Use 302 (not Axum Redirect's 303/307/308).
         return (
@@ -87,6 +96,7 @@ mod tests {
                 "/System/Info/Public",
                 get(|uri: Uri| async move { uri.to_string() }),
             )
+            .route("/health", get(|| async { "health" }))
             .route("/health/live", get(|| async { "live" }))
             .route("/health/ready", get(|| async { "ready" }))
             .route(
@@ -183,12 +193,25 @@ mod tests {
             "/health/ready",
             "/jellyfin/health/live",
             "/jellyfin/health/ready",
+            "/jellyfin/health",
+            "/JELLYFIN/HEALTH",
         ] {
             assert_eq!(
                 send("/jellyfin", path).await.status(),
                 StatusCode::OK,
                 "{path}"
             );
+        }
+    }
+
+    /// Upstream `BaseUrlRedirectionMiddleware`: `/health` (or `/health/`)
+    /// outside the mount redirects to `{base}/health`, not to the web client.
+    #[tokio::test]
+    async fn bare_health_redirects_into_the_mount() {
+        for path in ["/health", "/health/", "/HEALTH"] {
+            let response = send("/jellyfin", path).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+            assert_eq!(response.headers()[header::LOCATION], "/jellyfin/health");
         }
     }
 
@@ -199,5 +222,6 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(send("/", "/web").await.headers()[header::LOCATION], "/web/");
+        assert_eq!(send("", "/HEALTH").await.status(), StatusCode::OK);
     }
 }
