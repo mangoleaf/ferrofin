@@ -1267,6 +1267,49 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/LiveTv/ListingProviders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "AddListingProvider",
+        ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
+               save_listing_provider (ListingsBackend::of, validate_xmltv, \
+               store_listing_provider) → schedules_direct/mod.rs SchedulesDirect::validate \
+               (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
+               SchedulesDirect.Validate)",
+        date: "2026-10-21",
+        divergences: &[
+            "An XMLTV provider without a Path is a 400; upstream's Validate dereferences \
+         the null path and answers a NullReferenceException 500. Jellyfin bug not ported.",
+            "Schedules Direct's /token body is serialized, so a username with a quote or a \
+         backslash stays valid JSON; upstream concatenates it into the body raw. Jellyfin \
+         bug not ported.",
+            "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
+         logs the password, its hash or the token. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/ListingProviders/Lineups",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLineups",
+        ferrofin: "handlers/live_tv.rs get_lineups → ferrofin-livetv manager.rs get_lineups \
+               (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
+               SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
+               XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
+        date: "2026-10-21",
+        divergences: &[
+            "A blank id is a 404 whatever the type; upstream calls \
+         GetProvider(type).GetLineups(null, …), which is a 404 for an unknown type but \
+         dereferences the null provider (500) for xmltv and SchedulesDirect. Jellyfin bug \
+         not ported.",
+            "The country and postal code are percent-encoded into Schedules Direct's \
+         headends query; upstream concatenates them raw, so a value holding `&` or `#` \
+         changes the query. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

@@ -282,14 +282,29 @@ pub trait LiveTvManager: Send + Sync {
     /// Deletes the tuner host with the given id (and its cached channels).
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError>;
 
-    /// Lists the configured XMLTV listing providers.
+    /// Lists the configured listing providers (XMLTV and Schedules Direct).
     async fn get_listing_providers(&self) -> Result<Vec<ListingsProviderInfo>, ServiceError>;
 
     /// Saves (adds or updates) a listing provider, returning the stored value
     /// with its assigned id.
+    ///
+    /// Port of `ListingsManager.SaveListingProvider(info, validateLogin,
+    /// validateListings)`: the backend registered for `info.Type` validates the
+    /// info first. XMLTV checks that a local path names a file; Schedules Direct
+    /// resets its error state, then logs in (`validate_login`) and adds the
+    /// chosen lineup to the account (`validate_listings`).
+    ///
+    /// # Errors
+    ///
+    /// An unknown or missing `Type` and a missing XMLTV file are
+    /// [`ServiceError::NotFound`]; a missing required field is
+    /// [`ServiceError::InvalidInput`]; a Schedules Direct login that fails is
+    /// [`ServiceError::Unauthorized`].
     async fn save_listing_provider(
         &self,
         info: ListingsProviderInfo,
+        validate_login: bool,
+        validate_listings: bool,
     ) -> Result<ListingsProviderInfo, ServiceError>;
 
     /// Deletes the listing provider with the given id.

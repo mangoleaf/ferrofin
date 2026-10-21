@@ -8,6 +8,26 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Schedules Direct guides, and listings providers are checked on save
+
+**Schedules Direct works.** In **Dashboard → Live TV → Add TV guide data provider →
+Schedules Direct**, the account and the lineup save and the guide fills on the next
+refresh. A Schedules Direct provider carried over from a Jellyfin `livetv.xml` now gets
+its guide too.
+
+When Schedules Direct refuses requests, the guide refresh keeps the stored guide instead of
+emptying it. That covers an account error (fixed by saving the provider again), the
+30-minute pause after a failed login, and its daily request limit (lifted at 00:00 UTC).
+
+Saving a listings provider is now checked the way Jellyfin checks it:
+- **A provider without a `Type` is refused (404).** Earlier versions saved it as XMLTV.
+  The dashboard always sends the type, so only scripts calling
+  `POST /LiveTv/ListingProviders` directly need to add `"Type": "xmltv"`.
+- **An XMLTV provider whose path is a local file that does not exist is refused (404).**
+  An `http`/`https` URL is still accepted unchecked.
+
+Providers already saved are not touched.
+
 ## Unreleased — TheAudioDB descriptions return, in the library's language
 
 TheAudioDB stopped filling its English-suffixed description fields, and earlier versions
