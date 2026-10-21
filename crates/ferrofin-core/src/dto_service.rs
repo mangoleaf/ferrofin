@@ -1733,21 +1733,32 @@ impl FerrofinDtoService {
         &self,
         clean_pairs: &[(BaseItemKind, String)],
     ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+        // Artist names link to an actual `MusicArtist` item found by its clean
+        // name (`LinkedChildrenService.FindArtists`), and a music video's album
+        // to the `MusicAlbum` of that name (`SetMusicVideoProperties`) — both
+        // independent of the `ItemValues` rows; a name with no such item has
+        // no id at all.
+        const ITEM_KINDS: [BaseItemKind; 2] = [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum];
         // Dedup the (kind, clean) keys we need.
         let want: std::collections::HashSet<&(BaseItemKind, String)> = clean_pairs.iter().collect();
-        // Artist names link to an actual `MusicArtist` item found by its clean
-        // name (`LinkedChildrenService.FindArtists`), independent of the
-        // `ItemValues` rows; a name with no such item has no id at all.
-        let (artist_keys, keys): (Vec<_>, Vec<_>) = want
+        let (item_keys, keys): (Vec<_>, Vec<_>) = want
             .into_iter()
-            .partition(|(kind, _)| *kind == BaseItemKind::MusicArtist);
+            .partition(|(kind, _)| ITEM_KINDS.contains(kind));
         let keys: Vec<(BaseItemKind, String)> = keys.into_iter().cloned().collect();
         let mut map = crate::item_repository::by_name_ids_by_clean_name(&self.db, &keys).await?;
-        let artist_cleans: Vec<&String> = artist_keys.iter().map(|(_, clean)| clean).collect();
-        let artists =
-            crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
+        for kind in ITEM_KINDS {
+            let cleans: Vec<&String> = item_keys
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, clean)| clean)
+                .collect();
+            let type_name = crate::item_type_lookup::stored_type_name(kind).ok_or_else(|| {
+                ServiceError::backend(format!("no stored type name for {kind:?}"))
+            })?;
+            let ids = crate::item_repository::item_ids_by_clean_name(&self.db, type_name, &cleans)
                 .await?;
-        map.insert(BaseItemKind::MusicArtist, artists);
+            map.insert(kind, ids);
+        }
         Ok(map)
     }
 
@@ -2926,6 +2937,23 @@ impl FerrofinDtoService {
             dto.video_type = Some(format.video_type);
             dto.video3d_format = format.video3d_format;
             dto.iso_type = format.iso_type;
+            // `IHasAspectRatio.AspectRatio` (v12.2 DtoService.cs:1138) and,
+            // only when true, `ISupportsPlaceHolders.IsPlaceHolder` (:1290):
+            // `Video` implements both, off its `Data`.
+            let display = crate::item_data::video_display(item.data.as_deref());
+            dto.aspect_ratio = display.aspect_ratio;
+            if display.is_place_holder {
+                dto.is_place_holder = Some(true);
+            }
+            // `SetMusicVideoProperties` (:842-860): the album, and the id of the
+            // `MusicAlbum` of that name when one exists.
+            if kind == BaseItemKind::MusicVideo {
+                if let Some(album) = item.album.as_deref().filter(|a| !a.is_empty()) {
+                    dto.album_id = prefetched
+                        .lookup_clean(BaseItemKind::MusicAlbum, &prefetched.clean_key(album));
+                }
+                dto.album = item.album.clone();
+            }
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // C# only assigns when true, so the key is absent otherwise (the
             // `skip_serializing_if` on the DTO matches that omission).
@@ -4387,6 +4415,13 @@ impl FerrofinDtoService {
                     let artist = |n| (BaseItemKind::MusicArtist, n);
                     wanted.extend(split_multi_str(item.artists.as_deref()).map(artist));
                     wanted.extend(split_multi_str(item.album_artists.as_deref()).map(artist));
+                }
+                // `SetMusicVideoProperties`: the `MusicAlbum` named like the
+                // music video's album.
+                if row_kind(item) == BaseItemKind::MusicVideo
+                    && let Some(album) = item.album.as_deref().filter(|a| !a.is_empty())
+                {
+                    wanted.insert((BaseItemKind::MusicAlbum, album));
                 }
             }
             let mut clean_values: HashMap<String, String> = HashMap::new();
@@ -8553,6 +8588,68 @@ mod tests {
             assert_eq!(single.can_download, Some(expected));
             assert_eq!(page[0].can_download, Some(expected));
         }
+    }
+
+    /// `DtoService.AttachBasicFields` (v12.2 :1138, :1290, :842-860): a video
+    /// carries its stored `AspectRatio`, and `IsPlaceHolder` only when true;
+    /// a music video its `Album` and the id of the `MusicAlbum` of that name,
+    /// on the single and the page path alike.
+    #[tokio::test]
+    async fn videos_carry_aspect_ratio_place_holder_and_music_video_album() {
+        let db = test_db().await;
+        let (wide, stub, clip, album) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, wide, BaseItemKind::Movie, "Wide").await;
+        seed_named_item(&db, stub, BaseItemKind::Movie, "Stub").await;
+        seed_named_item(&db, clip, BaseItemKind::MusicVideo, "Clip").await;
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Greatest Hits").await;
+        crate::test_support::set_clean_name(&db, album, "Greatest Hits").await;
+        let mut wide = fetch_item(&db, wide).await;
+        wide.data = Some(r#"{"AspectRatio":"2.35:1"}"#.to_owned());
+        let mut stub = fetch_item(&db, stub).await;
+        stub.data = Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#.to_owned());
+        let mut clip = fetch_item(&db, clip).await;
+        clip.album = Some("Greatest Hits".to_owned());
+        let svc = service(db);
+        let options = DtoOptions {
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+
+        let page = svc
+            .get_base_item_dtos(
+                &[wide.clone(), stub, clip.clone()],
+                &options,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page[0].aspect_ratio.as_deref(), Some("2.35:1"));
+        assert_eq!(page[0].is_place_holder, None, "only a placeholder says so");
+        assert_eq!(page[1].is_place_holder, Some(true));
+        assert_eq!(page[1].aspect_ratio, None);
+        assert_eq!(page[2].album.as_deref(), Some("Greatest Hits"));
+        assert_eq!(page[2].album_id, Some(album));
+
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album_id, Some(album));
+        clip.album = Some("No Such Album".to_owned());
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album.as_deref(), Some("No Such Album"));
+        assert_eq!(single.album_id, None, "no album of that name, no id");
     }
 
     #[tokio::test]
