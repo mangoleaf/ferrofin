@@ -172,6 +172,15 @@ pub trait FileSystemWatcher: Send + Sync {
 
     /// Stops watching everything.
     async fn unwatch_all(&self) -> Result<(), ServiceError>;
+
+    /// Names every library location, watched or not, so the watcher can drop
+    /// a metadata-only change of one (its own `touch`, `chmod` or
+    /// `rsync -a`): reporting it would rescan its whole library. A location
+    /// inside a watched one is never passed to [`Self::watch`] (its parent's
+    /// recursive watch covers it, or its library has no real-time
+    /// monitoring), but it is a library root all the same. Replaces the
+    /// previous set. The default keeps nothing.
+    fn set_library_roots(&self, _roots: &[String]) {}
 }
 
 fn _assert_object_safe_file_system_watcher(_: &dyn FileSystemWatcher) {}

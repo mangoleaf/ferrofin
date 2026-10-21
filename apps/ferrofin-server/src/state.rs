@@ -868,7 +868,8 @@ pub async fn build_app_state(
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
     // the filesystem scanner the library manager runs on `queue_library_scan`.
     // Kept concrete so the library monitor can take it as its `WatchRootsSource`
-    // (the roots of every library with realtime monitoring enabled).
+    // (the roots of every library with realtime monitoring enabled, and every
+    // library's locations).
     // The playlists media folder lives at `{data}/playlists` (stored as
     // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
     // `GetClientTypeName()`). Both seams need the path: the user-root store
