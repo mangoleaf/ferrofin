@@ -518,10 +518,20 @@ impl DynamicImageProviders {
             return Ok(ItemUpdateType::None);
         }
         let mut images = self.items.get_image_infos(item_id).await?;
+        // `ValidateImages`, ahead of the providers: an image whose file is gone
+        // is no image at all (an adopted database moved without its metadata
+        // folder), so the provider draws a new one.
+        if drop_missing_images(&mut images)
+            && let Err(err) = self.persistence.save_item_images(item_id, &images).await
+        {
+            // The refresh goes on with the rows that are left; the draw's own
+            // save writes them anyway.
+            tracing::warn!(%err, item_id = %item_id, "failed to drop the item's missing images");
+        }
         let item_dir = self.item_dir(item_id);
         if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) {
             // `FetchAsync`: an image that is not ours is never replaced.
-            if !primary.is_local_file() || !is_under(&item_dir, Path::new(&primary.path)) {
+            if !is_own_image(&self.metadata_dir.resolve(), item_id, primary) {
                 return Ok(ItemUpdateType::None);
             }
             // `HasChanged` → `HasChangedByDate`: unchanged on disk means done.
@@ -617,7 +627,7 @@ impl DynamicImageProviders {
 
     /// The item's art folder (`{root}/{ID}`).
     fn item_dir(&self, item_id: Uuid) -> PathBuf {
-        self.metadata_dir.join(guid_to_db(item_id))
+        own_art_dir(&self.metadata_dir.resolve(), item_id)
     }
 
     /// `GetItemsWithImages` + `GetStripCollageImagePaths` for one provider: the
@@ -853,9 +863,42 @@ fn has_changed_by_date(image: &ItemImageInfo) -> bool {
     datetime_to_db(DateTime::<Utc>::from(modified)) != datetime_to_db(image.date_modified)
 }
 
-/// `FileSystem.ContainsSubPath(item.GetInternalMetadataPath(), image.Path)`.
-fn is_under(dir: &Path, path: &Path) -> bool {
-    path.starts_with(dir)
+/// An item's own art folders under the metadata `root`: Ferrofin's
+/// `{root}/{ID}`, and the `{root}/{xx}/{id:N}` folder Jellyfin's
+/// `BaseItem.GetInternalMetadataPath` uses (`BaseItem.cs:927-937`), which an
+/// adopted database's images keep.
+#[must_use]
+pub(crate) fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 2] {
+    let simple = item_id.simple().to_string();
+    [
+        own_art_dir(root, item_id),
+        root.join(&simple[..2]).join(&simple),
+    ]
+}
+
+/// The folder Ferrofin draws an item's art into: `{root}/{ID}`.
+#[must_use]
+pub(crate) fn own_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
+    root.join(guid_to_db(item_id))
+}
+
+/// Whether `image` is the item's own (`BaseDynamicImageProvider.FetchAsync` /
+/// `HasChanged`): a local file inside one of its
+/// [`internal_metadata_dirs`] (`FileSystem.ContainsSubPath`).
+#[must_use]
+pub(crate) fn is_own_image(root: &Path, item_id: Uuid, image: &ItemImageInfo) -> bool {
+    image.is_local_file()
+        && internal_metadata_dirs(root, item_id)
+            .iter()
+            .any(|dir| Path::new(&image.path).starts_with(dir))
+}
+
+/// `ImageService.ValidateImages`: drops the local images whose file is gone,
+/// returning whether any was.
+pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
+    let before = images.len();
+    images.retain(|image| !image.is_local_file() || Path::new(&image.path).is_file());
+    images.len() != before
 }
 
 /// The file's modification time, or now when it cannot be read.
@@ -1724,14 +1767,33 @@ mod tests {
             DynamicImageKind::for_entity(&row(BaseItemKind::Movie)),
             None
         );
-        assert!(is_under(
-            Path::new("/m/lib/ID"),
-            Path::new("/m/lib/ID/primary.png")
+        let id = Uuid::parse_str("a1b2c3d4-0000-0000-0000-000000000001").unwrap();
+        let image = |path: &str| ItemImageInfo {
+            path: path.to_owned(),
+            image_type: ImageType::Primary,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let root = Path::new("/m/lib");
+        let ours = format!("/m/lib/{}/primary.png", guid_to_db(id));
+        assert!(is_own_image(root, id, &image(&ours)));
+        // Jellyfin's sharded folder.
+        assert!(is_own_image(
+            root,
+            id,
+            &image("/m/lib/a1/a1b2c3d4000000000000000000000001/folder.jpg")
         ));
-        assert!(!is_under(
-            Path::new("/m/lib/ID"),
-            Path::new("/m/lib/IDX/primary.png")
+        // A sibling folder that only shares the prefix, a file beside the
+        // item, and a remote image are not.
+        assert!(!is_own_image(
+            root,
+            id,
+            &image(&format!("/m/lib/{}X/primary.png", guid_to_db(id)))
         ));
+        assert!(!is_own_image(root, id, &image("/media/Genre/folder.jpg")));
+        assert!(!is_own_image(root, id, &image("https://e.test/a.jpg")));
     }
 
     #[test]
