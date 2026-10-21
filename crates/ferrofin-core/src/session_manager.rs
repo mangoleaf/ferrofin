@@ -1202,10 +1202,18 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        if item.is_some() {
+        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
+        // logged here so every route that reports a start logs it once.
+        if let Some(item) = &item {
             info!(
-                user = ?session.user_name,
-                client = ?session.client,
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.name.as_deref(),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
                 "user started playback",
             );
         }
@@ -1338,6 +1346,41 @@ impl SessionManager for FerrofinSessionManager {
                     .await?;
                 self.push_user_data_changed(user_id, progress_item).await;
             }
+        }
+
+        // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
+        // ({3} {4})", for a stop whose item resolves. `position_ms` is left out
+        // when the client sent no position (upstream writes "unknown"; a numeric
+        // field cannot). The lookup only names the item in this line, so its
+        // failure must not fail the stop report.
+        let stopped_item = if info.item_id.is_nil() {
+            None
+        } else {
+            match self.library_manager.get_item_by_id(info.item_id).await {
+                Ok(item) => item,
+                Err(error) => {
+                    tracing::debug!(
+                        item_id = %info.item_id,
+                        %error,
+                        "playback stop: item lookup failed"
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(item) = stopped_item {
+            info!(
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.name.as_deref(),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
+                "user stopped playback",
+            );
         }
 
         // C# `OnPlaybackStopped`: the live stream the client was playing is
@@ -2264,7 +2307,14 @@ fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
 
-/// The JSON payload for a playback-progress event.
+/// .NET ticks (100 ns each) in a millisecond.
+const TICKS_PER_MILLISECOND: i64 = 10_000;
+
+/// The JSON payload for a playback event. The user name, device name and
+/// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and
+/// `ClientName`: the playback activity loggers read the first two
+/// ([`crate::playback_activity`]), and plugins receive all three, as
+/// upstream's event consumers do.
 fn playback_event_payload(
     session: &SessionInfo,
     item_id: Uuid,
@@ -2273,6 +2323,9 @@ fn playback_event_payload(
     serde_json::json!({
         "SessionId": session.id,
         "UserId": session.user_id,
+        "UserName": session.user_name,
+        "DeviceName": session.device_name,
+        "ClientName": session.client,
         "ItemId": item_id,
         "PositionTicks": position_ticks,
     })

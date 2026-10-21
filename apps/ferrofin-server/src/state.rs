@@ -2186,6 +2186,10 @@ pub async fn build_app_state(
             "AuthenticationSucceeded",
             |user, _device| format!("{user} successfully authenticated"),
         );
+        // Port of `PlaybackStartLogger` / `PlaybackStopLogger`, on the same
+        // awaited bus, so every route that reports playback (the obsolete
+        // `/PlayingItems/{itemId}` forms included) writes its entry.
+        ferrofin_core::playback_activity::subscribe(&event_bus, &activity, &library);
     }
 
     // These two maintenance tasks gate on active playback, so they register
