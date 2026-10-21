@@ -172,6 +172,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
