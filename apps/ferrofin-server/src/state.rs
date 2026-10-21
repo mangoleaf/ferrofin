@@ -1351,19 +1351,17 @@ pub async fn build_app_state(
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
-    // `ServerConfiguration.LibraryUpdateDuration` — how long the notifier waits
-    // for changes to stop before it pushes. A non-positive value would make the
-    // debounce fire instantly and push once per saved row, so it falls back to
-    // Jellyfin's default rather than honouring it.
-    let library_update_duration = u64::try_from(server_config.library_update_duration)
-        .ok()
-        .filter(|d| *d > 0)
-        .unwrap_or(ferrofin_core::library_changed_notifier::DEFAULT_LIBRARY_UPDATE_DURATION_SECS);
+    // `ServerConfiguration.LibraryUpdateDuration` — how long a batch of changes
+    // waits, from its first change, before the notifier pushes it. Read live as
+    // each batch opens; Jellyfin's default covers a failed read.
     let change_notifier = Arc::new(
         ferrofin_core::library_changed_notifier::LibraryChangedNotifier::new(
             Arc::clone(&event_manager),
-            std::time::Duration::from_secs(library_update_duration),
-        ),
+            std::time::Duration::from_secs(
+                ferrofin_core::library_changed_notifier::DEFAULT_LIBRARY_UPDATE_DURATION_SECS,
+            ),
+        )
+        .with_config(Arc::clone(&config_trait)),
     );
     // `IsVisible`/`IsVisibleStandalone`: one evaluator, shared by the library's
     // user-scoped lookups and the media sources' per-user version filter.
