@@ -218,6 +218,9 @@ async fn set_remote_access(
     tokio::fs::write(&path, json).await.map_err(|e| {
         ApiError::from(ferrofin_traits::error::ServiceError::backend(e.to_string()))
     })?;
+    // `SaveConfiguration(NetworkConfigurationStore.StoreKey, …)` runs the
+    // `NamedConfigurationUpdated` handlers too.
+    crate::handlers::config::run_committed_checks(&state, "network")?;
     Ok(StatusCode::NO_CONTENT)
 }
 

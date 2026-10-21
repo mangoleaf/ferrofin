@@ -242,6 +242,13 @@ impl NetworkManager {
         }
     }
 
+    /// The network configuration the manager was last given
+    /// (`GetNetworkConfiguration`).
+    #[must_use]
+    pub fn configuration(&self) -> &NetworkConfiguration {
+        &self.config
+    }
+
     /// Whether discovery should start for the next server lifetime.
     #[must_use]
     pub fn auto_discovery(&self) -> bool {

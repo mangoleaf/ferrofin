@@ -1371,6 +1371,71 @@ async fn registered_store_validates_before_replacing_configuration() {
     );
 }
 
+/// A host check run after each committed save; it fails the save with a
+/// missing file after recording which store was saved.
+struct MissingFileAfterSave {
+    saved: std::sync::Mutex<Vec<String>>,
+}
+
+impl ferrofin_common::configuration::CommittedConfigurationCheck for MissingFileAfterSave {
+    fn check(
+        &self,
+        key: &str,
+    ) -> Result<(), ferrofin_common::configuration::ConfigurationValidationError> {
+        self.saved.lock().unwrap().push(key.to_owned());
+        Err(
+            ferrofin_common::configuration::ConfigurationValidationError::FileNotFound(
+                "Certificate file 'missing.pfx' does not exist.".into(),
+            ),
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_committed_check_answers_every_named_save_after_it_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let check = Arc::new(MissingFileAfterSave {
+        saved: std::sync::Mutex::new(Vec::new()),
+    });
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_committed_configuration_check(check.clone());
+    let body = serde_json::json!({"CertificatePath": "missing.pfx"});
+    assert_eq!(
+        post(app.clone(), "/System/Configuration/network", &body).await,
+        StatusCode::NOT_FOUND
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["CertificatePath"], "missing.pfx");
+    // Upstream's handler runs after every named save, branding included.
+    assert_eq!(
+        post(
+            app.clone(),
+            "/System/Configuration/encoding",
+            &serde_json::json!({"EncodingThreadCount": 2})
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post(
+            app.clone(),
+            "/System/Configuration/Branding",
+            &serde_json::json!({"LoginDisclaimer": "hello"})
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        *check.saved.lock().unwrap(),
+        ["network", "encoding", "branding"]
+    );
+}
+
 #[tokio::test]
 async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() {
     use ferrofin_networking::{NetworkConfiguration, NetworkManager};

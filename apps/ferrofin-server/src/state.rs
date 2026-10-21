@@ -130,6 +130,9 @@ pub struct WiredApp {
     /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
     /// `StartServer` iteration).
     pub background: Vec<tokio::task::JoinHandle<()>>,
+    /// HTTPS for this lifetime, when the server listens with it
+    /// (`ListenWithHttps`): the certificate the HTTPS listeners serve.
+    pub https: Option<crate::tls::HttpsServing>,
 }
 
 /// The concrete [`LifecycleController`] for the running server.
@@ -748,6 +751,13 @@ pub async fn build_app_state(
     // Configuration saves update this same object through AppState.
     let network_config = load_network_configuration(paths.as_ref()).await;
     let discovery_enabled = network_config.auto_discovery;
+    // `ApplicationHost.Init`: the certificate is loaded once per lifetime.
+    let https = crate::tls::HttpsServing::from_network_configuration(
+        &network_config,
+        config.port,
+        config.https_port,
+    );
+    let loaded_certificate_path = network_config.certificate_path.clone();
     let network = Arc::new(std::sync::RwLock::new(
         ferrofin_networking::NetworkManager::live(network_config),
     ));
@@ -1656,6 +1666,14 @@ pub async fn build_app_state(
             }
         }));
     }
+    // A new HTTPS certificate path takes a restart, or is refused when the file
+    // is missing (`ApplicationHost.OnConfigurationUpdated`).
+    let certificate_check = Arc::new(crate::tls::CertificatePathCheck::new(
+        loaded_certificate_path,
+        Arc::clone(&network),
+        Arc::clone(&lifecycle),
+    ));
+    config_mgr.add_configuration_listener(certificate_check.configuration_listener());
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
@@ -2257,7 +2275,7 @@ pub async fn build_app_state(
             HostNetworkInfo {
                 http_port: config.port,
                 https_port: config.https_port,
-                listen_with_https: false,
+                listen_with_https: https.is_some(),
                 published_server_url: config.published_url.clone(),
                 base_url: config.base_url.clone(),
                 // Read live from the network manager attached below; this is
@@ -2434,12 +2452,15 @@ pub async fn build_app_state(
     }
 
     // The host and HTTP policy share one network manager, constructed above.
-    let state = state.with_network(network).with_configuration_validator(
-        "encoding",
-        Arc::new(
-            ferrofin_mediaencoding::configuration::store::EncodingConfigurationStore::default(),
-        ),
-    );
+    let state = state
+        .with_network(network)
+        .with_configuration_validator(
+            "encoding",
+            Arc::new(
+                ferrofin_mediaencoding::configuration::store::EncodingConfigurationStore::default(),
+            ),
+        )
+        .with_committed_configuration_check(certificate_check);
 
     // ---- virtual-folder (library-structure) store -------------------------
     // The `/Library/VirtualFolders*` + `/Library/PhysicalPaths` admin surface is
@@ -2572,6 +2593,7 @@ pub async fn build_app_state(
         file_transformations,
         lifecycle: lifecycle_concrete,
         background,
+        https,
     })
 }
 

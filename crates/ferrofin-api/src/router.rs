@@ -96,12 +96,20 @@ pub fn create_router(state: AppState) -> Router {
             .on_request(record_trace_id)
             .on_response(record_status),
     )
-    .layer(CorsLayer::permissive())
+    .layer(cors_layer())
     // Jellyfin's `UseResponseCompression()`. Outermost so it also covers the
     // health and OpenAPI routes, exactly as ASP.NET's middleware covers
     // everything mounted under the base URL. Only the allow-listed media types
     // are touched, so images and the streaming paths are unaffected.
     .layer(compression_layer())
+}
+
+/// Jellyfin's CORS policy (`AnyOrigin`, any method and header), as a layer.
+///
+/// Public so middleware the server runs in front of the router, like the HTTPS
+/// redirect, can answer under the same policy Jellyfin applies before it.
+pub fn cors_layer() -> CorsLayer {
+    CorsLayer::permissive()
 }
 
 /// Whether an OTLP endpoint is configured, i.e. whether a span exporter will

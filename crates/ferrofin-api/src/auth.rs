@@ -47,6 +47,10 @@ use crate::state::AppState;
 /// Copies every header as a `(name, value)` pair (dropping non-UTF-8 values,
 /// which Jellyfin's ASCII header grammar never uses) and carries the raw query
 /// string so the authorization logic can read the `api_key`/`ApiKey` parameter.
+///
+/// The scheme is left unresolved (`None`, read as `http`): authorization does
+/// not need it. A context that builds addresses comes from
+/// `handlers::system::context_from_parts`, which resolves it.
 pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -65,6 +69,7 @@ pub(crate) fn request_context(
         headers: copied,
         query_string: query.map(ToOwned::to_owned),
         remote_endpoint: remote,
+        scheme: None,
     }
 }
 

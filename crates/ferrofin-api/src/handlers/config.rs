@@ -126,6 +126,7 @@ async fn update_branding_configuration(
     current.custom_css = dto.custom_css;
     current.splashscreen_enabled = dto.splashscreen_enabled;
     state.config.update_branding(&current).await?;
+    run_committed_checks(&state, "branding")?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -375,6 +376,7 @@ async fn update_named_configuration(
         let branding: BrandingOptions =
             serde_json::from_value(body).map_err(|error| configuration_error(&error))?;
         state.config.update_branding(&branding).await?;
+        run_committed_checks(&state, &key)?;
         return Ok(StatusCode::NO_CONTENT);
     }
     // Once accepted, finish persistence and the live update even if the HTTP
@@ -392,7 +394,6 @@ async fn save_named_configuration(
     key: String,
     body: Value,
 ) -> Result<(), ApiError> {
-    use ferrofin_common::configuration::ConfigurationValidationError;
     use ferrofin_traits::error::ServiceError;
     let path = named_config_file(&state, &key)
         .ok_or_else(|| ApiError::BadRequest("invalid configuration key".to_owned()))?;
@@ -422,16 +423,7 @@ async fn save_named_configuration(
             serde_json::to_string(&saved.unwrap_or_else(|| serde_json::json!({})))
         }
         .map_err(|error| configuration_error(&error))?;
-        validator
-            .validate(&old, &json)
-            .map_err(|error| match error {
-                ConfigurationValidationError::DirectoryNotFound(message) => {
-                    ServiceError::not_found(message)
-                }
-                ConfigurationValidationError::InvalidOperation(message) => {
-                    ServiceError::backend(message)
-                }
-            })?;
+        validator.validate(&old, &json).map_err(validation_error)?;
     }
     let committed: std::sync::Arc<str> = json.clone().into();
     tokio::task::spawn_blocking(move || {
@@ -444,7 +436,31 @@ async fn save_named_configuration(
         state.update_network_settings(&config);
     }
     state.config.named_configuration_updated(&key, committed);
+    run_committed_checks(&state, &key)
+}
+
+/// Runs the checks registered for after a named save (Jellyfin's
+/// `NamedConfigurationUpdated` handlers). An error answers the save, which
+/// stays committed.
+pub(crate) fn run_committed_checks(state: &AppState, key: &str) -> Result<(), ApiError> {
+    for check in &state.committed_configuration_checks {
+        check.check(key).map_err(validation_error)?;
+    }
     Ok(())
+}
+
+/// A rejected or failed save as Jellyfin's exception middleware answers it:
+/// a missing directory or file is `404`, anything else `500`.
+fn validation_error(
+    error: ferrofin_common::configuration::ConfigurationValidationError,
+) -> ferrofin_traits::error::ServiceError {
+    use ferrofin_common::configuration::ConfigurationValidationError;
+    use ferrofin_traits::error::ServiceError;
+    match error {
+        ConfigurationValidationError::DirectoryNotFound(message)
+        | ConfigurationValidationError::FileNotFound(message) => ServiceError::not_found(message),
+        ConfigurationValidationError::InvalidOperation(message) => ServiceError::backend(message),
+    }
 }
 
 /// `GET /System/Configuration/Branding` — the branding configuration.
