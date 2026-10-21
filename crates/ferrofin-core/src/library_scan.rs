@@ -3367,6 +3367,10 @@ struct ScanWork<'r> {
     /// (`runAllProviders`, which forces the redraw). Their providers run in
     /// the closing passes, once the art they draw from is saved.
     generated_images: Vec<(Uuid, bool)>,
+    /// The series this scan refreshes, not those it carries for context:
+    /// each one's refresh ends removing its obsolete virtual episodes
+    /// ([`obsolete_episodes`]), once the walk saved every row.
+    series: Vec<Uuid>,
 }
 
 impl ScanWork<'_> {
@@ -5775,6 +5779,14 @@ impl LibraryScanner {
                     (p.id, RefreshReach::of(options))
                 }));
         }
+        let refreshed_series: Vec<Uuid> = planned
+            .iter()
+            .filter(|p| {
+                item_type_lookup::kind_from_type_name(&p.entity.type_) == Some(BaseItemKind::Series)
+                    && scope.is_none_or(|scope| scope.covers(p))
+            })
+            .map(|p| p.id)
+            .collect();
         log_scan_planned(planned.len(), folders.len(), options);
         if let Some(tracking) = run.tracking {
             let mut totals = HashMap::new();
@@ -5872,6 +5884,7 @@ impl LibraryScanner {
             served: Served::new(),
             outside: refresh.outside,
             generated_images: Vec::new(),
+            series: refreshed_series,
         };
         // The versions the walk took out of a local group, by the primary
         // that owned them ([`released_from`]). A stop still unlinks them: the
@@ -8226,10 +8239,15 @@ impl LibraryScanner {
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        // The children-derived columns of every folder the scan planned:
+        // Each refreshed series' obsolete virtual episodes go
+        // (`SeriesMetadataService.AfterMetadataRefresh`), then the
+        // children-derived columns of every folder the scan planned:
         // cumulative runtime (albums, artists) and last media added
         // (series).
         let started = std::time::Instant::now();
+        if let Err(err) = self.remove_obsolete_episodes(&work.series, run).await {
+            tracing::warn!(%err, "obsolete episode pass failed");
+        }
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
         }
@@ -8881,7 +8899,8 @@ impl LibraryScanner {
         // its own leaves it unknown. And only a virtual season, which this
         // scan plans, may be found gone: upstream's validation removes only
         // a child that is `IsFileProtocol` (`Folder.cs:569`), so an adopted
-        // Jellyfin missing episode (no path) is never removed by a scan.
+        // Jellyfin missing episode (no path) is never pruned: its series'
+        // refresh removes it once it is obsolete ([`obsolete_episodes`]).
         let paths: HashMap<Uuid, Option<&str>> = existing
             .iter()
             .map(|row| (row.id, row.path.as_deref()))
@@ -21274,6 +21293,7 @@ mod artwork;
 mod collections;
 mod fanout;
 mod music;
+mod obsolete_episodes;
 mod playlists;
 mod trickplay;
 

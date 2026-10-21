@@ -172,6 +172,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- A series refresh removes its missing episodes once you have them, as Jellyfin 12.2 does:
+  a missing episode whose number a file covers, one with no number, and one carrying the
+  provider id of an episode you have under another number are removed, so an adopted
+  library no longer lists those episodes twice (see `docs/UPGRADING.md`)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
