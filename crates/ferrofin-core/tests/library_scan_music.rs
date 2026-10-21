@@ -1870,14 +1870,18 @@ async fn a_plugin_is_never_asked_by_an_unchanged_rescan() {
 /// MusicBrainz, TheAudioDB and a plugin ranked first only fill what the NFO
 /// left: the NFO's overview and genres stand over all three; the plugin's
 /// tagline and MusicBrainz's year fill the gaps. "Replace all metadata"
-/// keeps it so — upstream's local readers still seed `temp` there unless the
-/// item has a metadata saver (`isSavingMetadata`, `:803`), and Ferrofin
-/// runs none — and the NFO's values replace the stored ones.
+/// reads neither: an existing NFO enables the Nfo saver at `MetadataEdit`
+/// (`ProviderManager.IsSaverEnabledForItem`, `:880-889`), and upstream skips
+/// the local readers of an item it is saving metadata for under "Replace all
+/// metadata" (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:
+/// 803`), so the providers' values replace the NFO's.
 #[rstest::rstest]
 #[case::first_scan(false)]
 #[case::replace_all(true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) {
+async fn the_music_nfo_stands_over_every_remote_provider_except_under_replace_all(
+    #[case] replace: bool,
+) {
     let plugin = PluginDb::new();
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(true), plugin.source()).await;
@@ -1896,9 +1900,24 @@ async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) 
     if replace {
         fx.scan_with(&replace_all()).await;
     }
+    let (album_text, album_genre, artist_text, artist_genre) = if replace {
+        (
+            "PluginDb album text.",
+            "Cool jazz",
+            "PluginDb artist text.",
+            "Hard bop",
+        )
+    } else {
+        (
+            "NFO album text.",
+            "Bebop",
+            "NFO artist bio.",
+            "Trumpet jazz",
+        )
+    };
     let album = fx.row(fx.album_id()).await;
-    assert_eq!(album.overview.as_deref(), Some("NFO album text."));
-    assert_eq!(album.genres.as_deref(), Some("Bebop"));
+    assert_eq!(album.overview.as_deref(), Some(album_text));
+    assert_eq!(album.genres.as_deref(), Some(album_genre));
     assert_eq!(album.tagline.as_deref(), Some("PluginDb tagline."));
     assert_eq!(
         album.production_year,
@@ -1906,8 +1925,8 @@ async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) 
         "MusicBrainz fills the year"
     );
     let artist = fx.row(fx.artist_id()).await;
-    assert_eq!(artist.overview.as_deref(), Some("NFO artist bio."));
-    assert_eq!(artist.genres.as_deref(), Some("Trumpet jazz"));
+    assert_eq!(artist.overview.as_deref(), Some(artist_text));
+    assert_eq!(artist.genres.as_deref(), Some(artist_genre));
     assert_eq!(artist.tagline.as_deref(), Some("PluginDb tagline."));
     assert!(
         plugin.take().iter().any(|(kind, _)| kind == "MusicAlbum"),

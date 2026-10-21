@@ -15,7 +15,7 @@
 //! returns `[]` (no repository fetch yet). See `docs/PLUGINS_UPSTREAM.md` for
 //! the compiled-in plugin design.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +54,9 @@ pub struct RegisteredPlugin {
     /// links the first page whose `PluginId` matches); the rest are typically
     /// the JS/CSS resources that page loads by name.
     pub config_pages: Vec<PluginConfigPage>,
+    /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
+    /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
+    pub artifact: Option<PathBuf>,
 }
 
 /// One dashboard page (or page resource) a plugin ships. Mirrors the C#
@@ -93,7 +96,16 @@ impl RegisteredPlugin {
             image,
             default_config: b"{}".to_vec(),
             config_pages: Vec::new(),
+            artifact: None,
         }
+    }
+
+    /// Records the file a runtime-loaded plugin came from (see
+    /// [`Self::artifact`]).
+    #[must_use]
+    pub fn with_artifact(mut self, path: PathBuf) -> Self {
+        self.artifact = Some(path);
+        self
     }
 
     /// Reports `CanUninstall: false`, undoing the `true` [`Self::new`] forces.
@@ -442,6 +454,11 @@ pub struct FerrofinPluginManager {
     /// `ConfigurationChanged`), as the in-process
     /// [`PLUGIN_CONFIGURATION_CHANGED`] event.
     events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
+    /// Runtime-loaded plugins uninstalled since the boot. `DeletePlugin`
+    /// takes a plugin out of `_plugins`; the registry is fixed after
+    /// construction, so these ids are skipped by every lookup instead, which
+    /// also stops the host running them until the restart.
+    removed: Mutex<HashSet<Uuid>>,
 }
 
 /// The in-process event a plugin configuration save publishes, with
@@ -481,6 +498,7 @@ impl FerrofinPluginManager {
             application_version: DEFAULT_APPLICATION_VERSION.to_owned(),
             legacy_repositories_migrated: tokio::sync::OnceCell::new(),
             events: None,
+            removed: Mutex::default(),
         }
     }
 
@@ -541,9 +559,32 @@ impl FerrofinPluginManager {
         Self::new(Vec::new(), plugins_dir)
     }
 
-    /// Looks up a registered plugin by id.
+    /// Looks up a registered plugin by id; an uninstalled one is gone.
     fn find(&self, id: Uuid) -> Option<&RegisteredPlugin> {
+        if self.is_removed(id) {
+            return None;
+        }
         self.plugins.iter().find(|p| p.descriptor.id == id)
+    }
+
+    /// The registered plugins minus the ones uninstalled since the boot.
+    fn live_plugins(&self) -> impl Iterator<Item = &RegisteredPlugin> {
+        let removed = self
+            .removed
+            .lock()
+            .expect("plugin removal lock poisoned")
+            .clone();
+        self.plugins
+            .iter()
+            .filter(move |plugin| !removed.contains(&plugin.descriptor.id))
+    }
+
+    /// Whether the plugin was uninstalled since the boot.
+    fn is_removed(&self, id: Uuid) -> bool {
+        self.removed
+            .lock()
+            .expect("plugin removal lock poisoned")
+            .contains(&id)
     }
 
     /// A plugin's effective enabled flag: the persisted override when the
@@ -843,8 +884,7 @@ impl PluginManager for FerrofinPluginManager {
     async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
         let state = self.state.lock().expect("plugin state lock poisoned");
         Ok(self
-            .plugins
-            .iter()
+            .live_plugins()
             .map(|p| {
                 let mut d = p.descriptor.clone();
                 d.enabled = Self::effective_enabled(&state, p);
@@ -872,20 +912,37 @@ impl PluginManager for FerrofinPluginManager {
     }
 
     async fn remove_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
-        // A runtime-installed WASM plugin is a file we staged — deletable.
-        // (Look for the file FIRST: a freshly-installed plugin is not in the
-        // in-memory registry until the restart that loads it.)
+        // A runtime-loaded WASM plugin is removed by the file it was loaded
+        // from, whatever its name (a hand-dropped `myplugin.wasm` too); one an
+        // install staged but no restart has loaded yet is `{id}.wasm`.
         if let Some(wasm_dir) = &self.wasm_plugins_dir {
-            let artifact = wasm_dir.join(format!("{id}.wasm"));
-            if artifact.exists() {
-                std::fs::remove_file(&artifact).map_err(|e| {
-                    ServiceError::backend(format!("removing {}: {e}", artifact.display()))
-                })?;
-                // Best-effort cleanup of the plugin's KV state, config dir
-                // + enabled override; the artifact removal above is the
-                // load-bearing part.
+            let loaded = self.find(id).and_then(|plugin| plugin.artifact.clone());
+            let staged = Some(wasm_dir.join(format!("{id}.wasm"))).filter(|path| path.exists());
+            if loaded.is_some() || staged.is_some() {
+                for artifact in loaded.iter().chain(&staged) {
+                    match std::fs::remove_file(artifact) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(ServiceError::backend(format!(
+                                "removing {}: {e}",
+                                artifact.display()
+                            )));
+                        }
+                    }
+                }
+                // Best-effort cleanup of the plugin's KV state, segment cache,
+                // config dir + enabled override; the artifact removal above is
+                // the load-bearing part.
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
+                let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.segments")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
+                // `DeletePlugin`'s `_plugins.Remove`: gone from every lookup,
+                // so it no longer runs, until the restart that drops it.
+                self.removed
+                    .lock()
+                    .expect("plugin removal lock poisoned")
+                    .insert(id);
                 {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
@@ -1373,8 +1430,7 @@ impl PluginManager for FerrofinPluginManager {
         // name + assemblyGuid, so resolve it here rather than 404ing — without
         // putting it in the installable catalogue.
         let synthesized: Vec<PackageInfo> = self
-            .plugins
-            .iter()
+            .live_plugins()
             .map(|plugin| PackageInfo {
                 name: plugin.descriptor.name.clone(),
                 description: plugin.descriptor.description.clone(),
@@ -1403,15 +1459,16 @@ impl PluginManager for FerrofinPluginManager {
         // HTML/JS served to the admin's browser (outside the WASM sandbox),
         // and Disable is the kill switch an admin reaches for — it must
         // disarm this surface too.
+        let plugins: Vec<&RegisteredPlugin> = self.live_plugins().collect();
         let enabled_flags: Vec<bool> = {
             let state = self.state.lock().expect("plugin state lock poisoned");
-            self.plugins
+            plugins
                 .iter()
                 .map(|p| Self::effective_enabled(&state, p))
                 .collect()
         };
         let mut pages = Vec::new();
-        for (plugin, enabled) in self.plugins.iter().zip(enabled_flags) {
+        for (plugin, enabled) in plugins.into_iter().zip(enabled_flags) {
             if !enabled {
                 continue;
             }
@@ -1445,8 +1502,7 @@ impl PluginManager for FerrofinPluginManager {
         // plugin's page must not remain fetchable by name.
         let state = self.state.lock().expect("plugin state lock poisoned");
         Ok(self
-            .plugins
-            .iter()
+            .live_plugins()
             .filter(|plugin| Self::effective_enabled(&state, plugin))
             .find_map(|plugin| {
                 plugin
@@ -2529,6 +2585,72 @@ mod tests {
         );
         // Unknown id after removal → NotFound (not in registry either).
         assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
+    }
+
+    /// Uninstalling a loaded WASM plugin removes it now, as upstream's
+    /// `RemovePlugin` drops it from the list: it is no longer listed or
+    /// looked up, so the host stops running it whatever its descriptor
+    /// default (an admin had disabled it), its segment cache goes too, and a
+    /// second uninstall is a `404`, not "compiled-in".
+    #[tokio::test]
+    async fn an_uninstalled_wasm_plugin_is_gone_until_the_restart() {
+        let rig = update_rig("0.9.0", true, false).await;
+        let segments = rig.wasm_dir.join(format!("{PKG_ID}.segments"));
+        std::fs::write(&segments, b"{}").unwrap();
+        let listed = |plugins: Vec<PluginDescriptor>| plugins.iter().any(|d| d.id == PKG_ID);
+        assert!(listed(rig.mgr.list_plugins().await.unwrap()));
+
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        assert!(
+            rig.mgr.get_plugin(PKG_ID).await.unwrap().is_none(),
+            "not re-enabled by its descriptor default"
+        );
+        assert!(!listed(rig.mgr.list_plugins().await.unwrap()));
+        assert!(!segments.exists(), "segment cache removed");
+        assert!(rig.lifecycle.has_pending_restart());
+        // The disable is forgotten with it: a reinstall starts at its default.
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.mgr.plugins_dir_for_test().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["enabled"].get(PKG_ID.to_string()).is_none(),
+            "{persisted}"
+        );
+        assert!(matches!(
+            rig.mgr.remove_plugin(PKG_ID).await,
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    /// A plugin dropped in by hand under its own file name (the documented
+    /// air-gapped install) is uninstalled by that file, not a guessed
+    /// `{id}.wasm`.
+    #[tokio::test]
+    async fn a_hand_dropped_wasm_plugin_is_uninstalled_by_its_own_file() {
+        let mut rig = update_rig("0.9.0", false, true).await;
+        std::fs::create_dir_all(&rig.wasm_dir).unwrap();
+        let dropped = rig.wasm_dir.join("myplugin.wasm");
+        std::fs::write(&dropped, b"component").unwrap();
+        rig.mgr = FerrofinPluginManager::new(
+            vec![
+                RegisteredPlugin::new(descriptor(PKG_ID, "HelloPkg", true), None)
+                    .with_artifact(dropped.clone()),
+            ],
+            rig.mgr.plugins_dir_for_test().to_path_buf(),
+        )
+        .with_installer(
+            rig.wasm_dir.clone(),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            rig.lifecycle.clone(),
+        );
+
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        assert!(!dropped.exists(), "its own file removed");
+        assert!(rig.mgr.get_plugin(PKG_ID).await.unwrap().is_none());
     }
 
     /// Builds an install rig whose registry already knows `PKG_ID` at

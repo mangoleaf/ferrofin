@@ -247,6 +247,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 2,
             wait_for_path,
             segment_container: Some(seg_ext.to_owned()),
