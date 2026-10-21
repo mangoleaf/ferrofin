@@ -286,16 +286,36 @@ async fn insert_version(
     .expect("insert version");
 }
 
-/// Both prunes weigh exactly the rows a library read lists: an owned
-/// non-extra (Jellyfin's part or version stored under its owner) and an
-/// alternate version whose primary is in the library are never weighed —
-/// not even when the version's own file is gone — while a version whose
-/// primary is in no library is listed, and pruned once its file is gone. An
-/// owned `Video` at a path the scan plans as a `Movie` is not pruned either:
-/// it moves to the `Movie` id (owner decision D9b). The same for a
+/// Writes an empty file at `relative` under the media root and stores an
+/// unowned version of B there as `kind`, under the id `kind` derives for it.
+async fn present_version(lib: &Library, relative: &str, kind: BaseItemKind) -> Uuid {
+    let path = lib.media.join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, b"").expect("write");
+    let id = derive_item_id(kind, &path.to_string_lossy()).expect("id");
+    insert_version(
+        &lib.db,
+        id,
+        kind,
+        &path,
+        lib.physical,
+        None,
+        Some(lib.movie(1)),
+    )
+    .await;
+    id
+}
+
+/// Both prunes weigh every unowned row, alternate versions included
+/// (Jellyfin 12.1's `Folder.GetChildrenForValidation`,
+/// `IncludeAlternateVersions = true`): a version whose file is gone is
+/// pruned, whether its primary is in the library or in none. An owned
+/// non-extra (Jellyfin's part or version stored under its owner) is never
+/// weighed, and an owned `Video` at a path the scan plans as a `Movie` is not
+/// pruned: it moves to the `Movie` id (owner decision D9b). The same for a
 /// path-scoped scan and a library scan.
 #[tokio::test]
-async fn a_version_a_library_read_does_not_list_is_never_pruned() {
+async fn an_unowned_version_whose_file_is_gone_is_pruned() {
     let lib = Library::new(true).await;
     // A version Ferrofin plans as a movie of its own: it moves to that id.
     let part_path = lib.media.join("A (2001)/A (2001) - 1080p.mkv");
@@ -325,6 +345,19 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
         Some(lib.movie(1)),
     )
     .await;
+    // A version of B merged by hand whose file is still there: planned under
+    // its own id, so kept.
+    let present = present_version(&lib, "B Cut (2002)/B Cut (2002).mkv", BaseItemKind::Movie).await;
+    // A version of B stored as a `Video` at a path the scan plans as a
+    // `Movie`: it moves to the `Movie` id, not pruned.
+    let video = present_version(&lib, "B Alt (2002)/B Alt (2002).mkv", BaseItemKind::Video).await;
+    let video_moved = derive_item_id(
+        BaseItemKind::Movie,
+        &lib.media
+            .join("B Alt (2002)/B Alt (2002).mkv")
+            .to_string_lossy(),
+    )
+    .expect("id");
     // A version whose primary is in no library, its file gone.
     let orphan = Uuid::from_u128(0x0A_0003);
     let orphan_path = lib.media.join("C (2003)/C (2003) - 720p.mkv");
@@ -345,16 +378,32 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
             lib.media.join("A (2001)").to_string_lossy().into_owned(),
             version_path.to_string_lossy().into_owned(),
             orphan_path.to_string_lossy().into_owned(),
+            lib.media
+                .join("B Cut (2002)")
+                .to_string_lossy()
+                .into_owned(),
+            lib.media
+                .join("B Alt (2002)")
+                .to_string_lossy()
+                .into_owned(),
         ])
         .await
         .expect("scan");
-    assert_eq!(scoped.removed, 1, "{scoped:?}");
+    assert_eq!(scoped.removed, 2, "{scoped:?}");
     let rows = lib.rows().await;
     assert!(
         rows.contains_key(&moved) && !rows.contains_key(&part),
         "an owned Video planned as a Movie moves"
     );
-    assert!(rows.contains_key(&version), "a version of B is not weighed");
+    assert!(
+        !rows.contains_key(&version),
+        "a version of B whose file is gone"
+    );
+    assert!(rows.contains_key(&present), "a version whose file is there");
+    assert!(
+        rows.contains_key(&video_moved) && !rows.contains_key(&video),
+        "a version planned as another kind moves"
+    );
     assert!(
         !rows.contains_key(&orphan),
         "a listed row whose file is gone"
@@ -363,7 +412,8 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
     let full = lib.scanner.scan_all().await.expect("scan");
     assert_eq!(full.removed, 0, "{full:?}");
     let rows = lib.rows().await;
-    assert!(rows.contains_key(&moved) && rows.contains_key(&version));
+    assert!(rows.contains_key(&moved));
+    assert!(rows.contains_key(&present) && rows.contains_key(&video_moved));
 }
 
 /// The first scan of an adopted library saves what it plans under the
