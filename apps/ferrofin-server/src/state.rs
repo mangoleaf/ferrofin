@@ -476,12 +476,12 @@ pub async fn build_app_state(
     // The real `image`-crate encoder (resize + format-convert), not the no-op
     // `NullImageEncoder` — so `maxWidth`/`fillHeight`/`format` image requests are
     // honoured instead of serving the full-size original.
+    // One encoder for the processor, trickplay and the scan's splashscreen
+    // pass, which writes `{data}/splashscreen.png`.
+    let image_encoder = Arc::new(ImageCrateEncoder::new().with_data_path(paths.data_path()));
     let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
-        ImageProcessor::new(
-            Arc::new(ImageCrateEncoder::new()),
-            cache_root.child("images"),
-        )
-        .with_encoding_limit(image_encoding_limit),
+        ImageProcessor::new(Arc::clone(&image_encoder) as _, cache_root.child("images"))
+            .with_encoding_limit(image_encoding_limit),
     );
     // The shared TMDB client — the scan's automatic artwork, the remote-search
     // ("Identify") providers, and the remote-image ("Choose Image") methods all
@@ -854,7 +854,7 @@ pub async fn build_app_state(
                     Arc::clone(&config_trait),
                 ),
             ),
-            Arc::new(ImageCrateEncoder::new()),
+            Arc::clone(&image_encoder) as _,
         )
         .with_live_tv(&live_tv)
         .with_generation_concurrency(trickplay_concurrency(
@@ -1251,6 +1251,8 @@ pub async fn build_app_state(
     // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
     // Width/Height + ImageBlurHashes).
     .with_image_processor(Arc::clone(&image_processor))
+    // Builds `{data}/splashscreen.png` in the post-scan splashscreen pass.
+    .with_image_encoder(Arc::clone(&image_encoder) as _)
     // The SERVER-WIDE per-item-type MetadataOptions: the fetcher gate for a
     // kind a library saved no checkboxes for, and for an item in no library
     // (a by-name artist), as upstream's `IsMetadataFetcherEnabled` falls

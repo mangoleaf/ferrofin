@@ -22,13 +22,13 @@
 //!   [`ServiceError::Backend`] for an I/O/encode failure.
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
-//! - `CreateSplashscreen` is a deferred feature returning [`ServiceError::Backend`].
-//!   `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
+//! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
+//!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
-//!   foreground layer, unplayed/percent-played indicators) is **not** ported —
-//!   this encoder does resize + format-convert only, so `has_default_options`
-//!   already decides whether re-encoding is needed.
+//!   foreground layer: gl-805; unplayed/percent-played indicators: gl-806) is
+//!   **not** ported yet — this encoder does resize + format-convert only, so
+//!   `has_default_options` already decides whether re-encoding is needed.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -76,18 +76,25 @@ fn encode_permits() -> &'static Semaphore {
 /// delegated to the shared
 /// `ferrofin-model` `drawing_utils`, so it matches the C# `DrawingUtils` /
 /// `ImageHelper.GetNewImageSize` exactly.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ImageCrateEncoder;
+#[derive(Debug, Clone, Default)]
+pub struct ImageCrateEncoder {
+    /// The server's data directory, where [`ImageEncoder::create_splashscreen`]
+    /// writes `splashscreen.png` (upstream's `IApplicationPaths.DataPath`).
+    data_path: Option<std::path::PathBuf>,
+}
 
 impl ImageCrateEncoder {
-    /// The message on the [`ServiceError::Backend`] returned by the deferred
-    /// blurhash/splashscreen features.
-    const DEFERRED: &'static str = "ImageCrateEncoder: feature not implemented (deferred)";
-
     /// Constructs a new [`ImageCrateEncoder`].
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The encoder writing the generated splashscreen into `data_path`.
+    #[must_use]
+    pub fn with_data_path(mut self, data_path: impl Into<std::path::PathBuf>) -> Self {
+        self.data_path = Some(data_path.into());
+        self
     }
 
     /// The lowercase file extension of `path` without its leading dot, or an
@@ -112,7 +119,7 @@ impl ImageCrateEncoder {
     /// [`ServiceError`]. A missing file is [`ServiceError::NotFound`]; an
     /// undecodable one is [`ServiceError::InvalidInput`] (the port of Skia's
     /// `InvalidDataException`/`return null` fallbacks).
-    fn decode(path: &str) -> Result<DynamicImage, ServiceError> {
+    pub(crate) fn decode(path: &str) -> Result<DynamicImage, ServiceError> {
         if !Path::new(path).exists() {
             return Err(ServiceError::not_found(format!(
                 "image file not found: {path}"
@@ -659,8 +666,8 @@ impl ImageEncoder for ImageCrateEncoder {
 
     /// Port of `CreateImageCollage`. Dispatches on the width/height ratio: a
     /// `>= 1.4` ratio builds a horizontal thumb strip, anything else a `2×2`
-    /// square collage. The text/gradient extras Skia draws are omitted — this is
-    /// a plain tile composite.
+    /// square collage. The thumb strip's library-name text is not drawn yet
+    /// (see [`build_thumb_collage`]).
     async fn create_image_collage(
         &self,
         options: &ImageCollageOptions,
@@ -685,14 +692,61 @@ impl ImageEncoder for ImageCrateEncoder {
             .map_err(|e| ServiceError::backend(format!("image collage task failed: {e}")))?
     }
 
-    /// Deferred feature — always [`ServiceError::Backend`]. Port of
-    /// `CreateSplashscreen`, whose builder is out of scope for this unit.
+    /// Port of `CreateSplashscreen`: builds `{DataPath}/splashscreen.png`
+    /// ([`crate::splashscreen`]) when there is at least one poster and one
+    /// backdrop, and does nothing otherwise. The file is written beside the
+    /// final name and renamed over it, so a reader never sees half a PNG.
     async fn create_splashscreen(
         &self,
-        _posters: &[String],
-        _backdrops: &[String],
+        posters: &[String],
+        backdrops: &[String],
     ) -> Result<(), ServiceError> {
-        Err(ServiceError::backend(Self::DEFERRED))
+        // Only generate the splash screen if we have at least one poster and at
+        // least one backdrop/thumbnail.
+        if posters.is_empty() || backdrops.is_empty() {
+            return Ok(());
+        }
+        let Some(data_path) = self.data_path.clone() else {
+            return Err(ServiceError::backend(
+                "ImageCrateEncoder has no data path to write the splashscreen to",
+            ));
+        };
+        // Dozens of decodes, a 5760x2160 wall and a projection: CPU-bound, so
+        // under the shared encode permit on the blocking pool.
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let (posters, backdrops) = (posters.to_vec(), backdrops.to_vec());
+        tokio::task::spawn_blocking(move || {
+            // A scratch name per call: two validations finishing together must
+            // not write, or rename away, each other's file.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let splash = crate::splashscreen::generate_splash(&posters, &backdrops)?;
+            let output = data_path.join("splashscreen.png");
+            let partial = data_path.join(format!(
+                "splashscreen.png.{}.partial",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let written = Self::write(
+                &DynamicImage::ImageRgba8(splash),
+                &partial.to_string_lossy(),
+                CrateFormat::Png,
+                COLLAGE_QUALITY,
+            )
+            .and_then(|()| {
+                std::fs::rename(&partial, &output).map_err(|e| {
+                    DrawingError::io(format!("rename {}", partial.display()), e).into()
+                })
+            });
+            if written.is_err() {
+                // Best effort: the scratch file may not exist at all.
+                let _ = std::fs::remove_file(&partial);
+            }
+            written
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("splashscreen task failed: {e}")))?
     }
 
     /// Port of `CreateTrickplayTile`. Packs `input_paths` into an
@@ -764,7 +818,8 @@ const COLLAGE_QUALITY: i32 = 90;
 
 /// Decodes the first path that loads, tiling the rest into a `2×2` square,
 /// each cell `width/2 × height/2`. Port of
-/// `StripCollageBuilder.BuildSquareCollageBitmap` (no text/shadow extras).
+/// `StripCollageBuilder.BuildSquareCollageBitmap`; [`next_valid`] wraps, so
+/// fewer than four images repeat.
 fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
     let cell_w = (width / 2).max(1);
     let cell_h = (height / 2).max(1);
@@ -797,9 +852,10 @@ fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage 
 }
 
 /// Builds a thumb-strip collage: the first valid image scaled to the collage
-/// width (aspect-preserved) and drawn at the top on a black canvas. Port of the
-/// backdrop-fill portion of `StripCollageBuilder.BuildThumbCollageBitmap`; the
-/// shadow rectangle and library-name text are omitted.
+/// width (aspect-preserved) and drawn at the top on a black canvas, under a
+/// black rectangle at alpha `0x78`. Port of
+/// `StripCollageBuilder.BuildThumbCollageBitmap` without its library-name text
+/// (TODO(gl-804): the text needs a font rasterizer and a bundled font).
 fn build_thumb_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(
         u32::try_from(width).unwrap_or(1),
@@ -818,23 +874,43 @@ fn build_thumb_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
             imageops::FilterType::Lanczos3,
         );
         imageops::overlay(&mut canvas, &resized.to_rgba8(), 0, 0);
+        // The shadow rectangle: black at alpha 0x78 over every pixel.
+        for pixel in canvas.pixels_mut() {
+            for channel in &mut pixel.0[..3] {
+                let dimmed = (u16::from(*channel) * (255 - THUMB_SHADOW_ALPHA) + 127) / 255;
+                *channel = u8::try_from(dimmed).unwrap_or(u8::MAX);
+            }
+        }
     }
 
     canvas
 }
 
-/// Returns the first decodable image at or after `start`, plus the index one
-/// past it. Port of `SkiaHelper.GetNextValidImage` — undecodable paths are
-/// skipped rather than fatal.
+/// The alpha of the black rectangle `BuildThumbCollageBitmap` draws over the
+/// backdrop (`SKColors.Black.WithAlpha(0x78)`).
+const THUMB_SHADOW_ALPHA: u16 = 0x78;
+
+/// Returns the first decodable image from `start` on, plus the index one past
+/// it. See [`next_valid`].
 fn next_valid_image(paths: &[String], start: usize) -> Option<(DynamicImage, usize)> {
-    let mut index = start;
-    while index < paths.len() {
-        if let Ok(image) = ImageCrateEncoder::decode(&paths[index]) {
-            return Some((image, index + 1));
-        }
-        index += 1;
-    }
-    None
+    next_valid(paths, start, &mut |path| {
+        ImageCrateEncoder::decode(path).ok()
+    })
+}
+
+/// Port of `SkiaHelper.GetNextValidImage`: the first path from `start` that
+/// `load` accepts, wrapping to the start of the list, plus the index one past
+/// it. Each path is tried at most once; undecodable ones are skipped, and
+/// `None` means no path loads.
+pub(crate) fn next_valid<T>(
+    paths: &[String],
+    start: usize,
+    load: &mut impl FnMut(&str) -> Option<T>,
+) -> Option<(T, usize)> {
+    (0..paths.len()).find_map(|offset| {
+        let index = (start + offset) % paths.len();
+        load(&paths[index]).map(|value| (value, index + 1))
+    })
 }
 
 #[cfg(test)]
@@ -1099,7 +1175,7 @@ mod tests {
 
         let mut handles = Vec::new();
         for i in 0..32 {
-            let (e, inp, op) = (enc, input.clone(), options.clone());
+            let (e, inp, op) = (enc.clone(), input.clone(), options.clone());
             let out = out_path(&dir, &format!("o{i}.png"));
             handles.push(tokio::spawn(async move {
                 let written = e
@@ -1546,13 +1622,133 @@ mod tests {
         assert_eq!(dims, ImageDimensions::new(960, 540));
     }
 
+    /// Port of `SkiaEncoder.CreateSplashscreen` + `SplashscreenBuilder`: a
+    /// 1920x1080 PNG at `{DataPath}/splashscreen.png`, built from however few
+    /// posters and backdrops there are (they repeat, `GetNextValidImage` wraps).
     #[tokio::test]
-    async fn splashscreen_is_deferred() {
-        let enc = ImageCrateEncoder::new();
+    async fn the_splashscreen_is_written_to_the_data_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let posters = vec![fixture(&dir, "poster.png", 200, 300)];
+        let backdrops = vec![fixture(&dir, "thumb.png", 320, 180)];
+        let enc = ImageCrateEncoder::new().with_data_path(dir.path());
+        enc.create_splashscreen(&posters, &backdrops)
+            .await
+            .expect("splashscreen");
+        let output = dir.path().join("splashscreen.png");
+        let image = image::open(&output).expect("a PNG");
+        assert_eq!((image.width(), image.height()), (1920, 1080));
+        // The tilted wall fills the middle of the frame with tiles; only the
+        // 20 px gaps between them are black.
+        let image = image.to_rgba8();
+        let middle: Vec<_> = (760..1160)
+            .flat_map(|x| (340..740).map(move |y| (x, y)))
+            .map(|(x, y)| image.get_pixel(x, y).0)
+            .collect();
+        let tiled = middle
+            .iter()
+            .filter(|p| **p == [0x30, 0x60, 0x90, 0xFF])
+            .count();
+        assert!(
+            tiled * 2 > middle.len(),
+            "{tiled} of {} tile pixels",
+            middle.len()
+        );
+    }
+
+    /// Upstream generates nothing unless both lists have an entry.
+    #[rstest]
+    #[case::no_posters(false, true)]
+    #[case::no_backdrops(true, false)]
+    #[tokio::test]
+    async fn the_splashscreen_needs_a_poster_and_a_backdrop(
+        #[case] with_poster: bool,
+        #[case] with_backdrop: bool,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let posters: Vec<String> = with_poster
+            .then(|| fixture(&dir, "poster.png", 200, 300))
+            .into_iter()
+            .collect();
+        let backdrops: Vec<String> = with_backdrop
+            .then(|| fixture(&dir, "thumb.png", 320, 180))
+            .into_iter()
+            .collect();
+        let enc = ImageCrateEncoder::new().with_data_path(dir.path());
+        enc.create_splashscreen(&posters, &backdrops)
+            .await
+            .expect("no-op");
+        assert!(!dir.path().join("splashscreen.png").exists());
+    }
+
+    /// `GenerateCollage` throws when a list has no decodable image left.
+    #[tokio::test]
+    async fn a_splashscreen_with_no_decodable_poster_is_an_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let broken = dir.path().join("broken.png");
+        std::fs::write(&broken, b"not an image").expect("write");
+        let backdrops = vec![fixture(&dir, "thumb.png", 320, 180)];
+        let enc = ImageCrateEncoder::new().with_data_path(dir.path());
         assert!(matches!(
-            enc.create_splashscreen(&[], &[]).await,
-            Err(ServiceError::Backend(_))
+            enc.create_splashscreen(&[broken.to_string_lossy().into_owned()], &backdrops)
+                .await,
+            Err(ServiceError::InvalidInput(_))
         ));
+        assert!(!dir.path().join("splashscreen.png").exists());
+    }
+
+    /// `GetNextValidImage` wraps to the start of the list, so a square collage
+    /// of two images repeats them instead of leaving cells empty.
+    #[tokio::test]
+    async fn a_square_collage_of_two_images_fills_every_cell() {
+        let dir = TempDir::new().expect("tempdir");
+        let inputs: Vec<String> = (0..2)
+            .map(|i| fixture(&dir, &format!("c{i}.png"), 200, 200))
+            .collect();
+        let output = out_path(&dir, "collage.png");
+        let options = ImageCollageOptions {
+            input_paths: inputs,
+            output_path: output.clone(),
+            width: 400,
+            height: 400,
+        };
+        ImageCrateEncoder::new()
+            .create_image_collage(&options, None)
+            .await
+            .expect("collage");
+        let collage = image::open(&output).expect("png").to_rgba8();
+        for (x, y) in [(100, 100), (300, 100), (100, 300), (300, 300)] {
+            assert_eq!(
+                collage.get_pixel(x, y).0,
+                [0x30, 0x60, 0x90, 0xFF],
+                "cell at {x},{y}"
+            );
+        }
+    }
+
+    /// `BuildThumbCollageBitmap` draws a black rectangle at alpha `0x78` over
+    /// the backdrop.
+    #[tokio::test]
+    async fn a_thumb_collage_is_dimmed() {
+        let dir = TempDir::new().expect("tempdir");
+        let inputs = vec![fixture(&dir, "b.png", 1920, 1080)];
+        let output = out_path(&dir, "thumb.png");
+        let options = ImageCollageOptions {
+            input_paths: inputs,
+            output_path: output.clone(),
+            width: 960,
+            height: 540,
+        };
+        ImageCrateEncoder::new()
+            .create_image_collage(&options, Some("Movies"))
+            .await
+            .expect("thumb collage");
+        let pixel = image::open(&output)
+            .expect("png")
+            .to_rgba8()
+            .get_pixel(480, 270)
+            .0;
+        // 0x30/0x60/0x90 under black at 0x78/0xFF: c * (255 - 120) / 255.
+        assert_eq!(pixel, [25, 51, 76, 0xFF]);
     }
 
     #[tokio::test]
@@ -1631,7 +1827,7 @@ mod tests {
             .expect("runtime");
 
         runtime.block_on(async {
-            let encoder = ImageCrateEncoder;
+            let encoder = ImageCrateEncoder::new();
 
             // Occupy the single blocking thread, and wait until it is provably
             // busy so the probe below cannot win the race for it.
@@ -1680,7 +1876,7 @@ mod tests {
             .expect("runtime");
 
         runtime.block_on(async {
-            let encoder = ImageCrateEncoder;
+            let encoder = ImageCrateEncoder::new();
 
             // Occupy the single blocking thread, provably, before the calls.
             let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();

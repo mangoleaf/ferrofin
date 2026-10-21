@@ -70,7 +70,7 @@ pub const METRIC_NAMES: &[&str] = &[
 /// The closing passes of a library validation, in the order they run — the
 /// `pass` label set of [`SCAN_PASS_DURATION_SECONDS`] (the fields of the
 /// "post-scan passes complete" log line, without their `_ms`).
-pub const SCAN_PASSES: [&str; 10] = [
+pub const SCAN_PASSES: [&str; 11] = [
     "music",
     "album_covers",
     "years",
@@ -81,6 +81,7 @@ pub const SCAN_PASSES: [&str; 10] = [
     "library_images",
     "dynamic_images",
     "collections",
+    "splashscreen",
 ];
 
 /// The default boundaries (seconds) of both duration histograms: 1–2.5–5 per
