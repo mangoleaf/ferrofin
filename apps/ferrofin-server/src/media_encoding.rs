@@ -280,6 +280,12 @@ pub fn build_media_encoding(
         Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
         None => Arc::new(NoopSessionReporter),
     };
+    // `TranscodeManager`'s constructor clears the transcode cache before any
+    // job can start (`DeleteEncodedMediaCache`, `TranscodeManager.cs:94`).
+    let cleared = ferrofin_core::scheduled_tasks::maintenance::delete_encoded_media_cache(&*paths);
+    if cleared > 0 {
+        tracing::info!(deleted = cleared, "cleared the transcode cache");
+    }
     let manager = Arc::new(TranscodeManagerImpl::new(reporter).with_encoding_configuration(config));
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
@@ -843,6 +849,26 @@ mod tests {
         (config, paths)
     }
 
+    /// [`config_and_paths`] rooted at `root`. The composition clears the
+    /// transcode directory, so a test that builds it must own its paths.
+    fn config_and_paths_in(
+        root: &std::path::Path,
+    ) -> (
+        Arc<dyn ServerConfigurationManager>,
+        Arc<FerrofinServerApplicationPaths>,
+    ) {
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            root.join("data"),
+            root.join("log"),
+            root.join("config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        let config: Arc<dyn ServerConfigurationManager> =
+            Arc::new(FakeConfig(Arc::clone(&paths), EncodingOptions::default()));
+        (config, paths)
+    }
+
     /// A fake [`ServerConfigurationManager`] exposing the paths and fixed
     /// encoding options.
     struct FakeConfig(Arc<FerrofinServerApplicationPaths>, EncodingOptions);
@@ -904,9 +930,10 @@ mod tests {
             attachments: Vec::new(),
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
-        let (config, paths) = config_and_paths();
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, paths) = config_and_paths_in(tmp.path());
         let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
-            root: "/cache/att".to_owned(),
+            root: tmp.path().join("att").to_string_lossy().into_owned(),
         });
         // The trio builds without panicking; every slot is a real trait object.
         let ffmpeg = FfmpegPaths {
@@ -930,6 +957,53 @@ mod tests {
                 sessions: None,
             },
         );
+    }
+
+    /// The composition runs upstream's `DeleteEncodedMediaCache`
+    /// (`TranscodeManager.cs:94,718`): every file a crash left under the
+    /// transcode directory is gone before any job starts, whatever its age;
+    /// the directories stay.
+    #[test]
+    fn build_media_encoding_clears_the_transcode_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, paths) = config_and_paths_in(tmp.path());
+        let job = tmp.path().join("cache/transcodes/0123abcd");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(job.join("0123abcd0.mp4"), b"segment").unwrap();
+        std::fs::write(
+            tmp.path().join("cache/transcodes/0123abcd.m3u8"),
+            b"#EXTM3U",
+        )
+        .unwrap();
+        let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: "ffmpeg".into(),
+            ffprobe: "ffprobe".into(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+            chromaprint_muxer: false,
+        };
+        let _ = build_media_encoding(
+            Arc::new(FakeSources {
+                sources: Vec::new(),
+                attachments: Vec::new(),
+            }),
+            Arc::new(RecordingEncoder),
+            config,
+            paths,
+            Arc::new(FakePathManager {
+                root: tmp.path().join("att").to_string_lossy().into_owned(),
+            }),
+            &ffmpeg,
+            MediaEncodingExtras {
+                library: None,
+                virtual_folders: None,
+                trickplay: None,
+                sessions: None,
+            },
+        );
+        assert!(!job.join("0123abcd0.mp4").exists());
+        assert!(!tmp.path().join("cache/transcodes/0123abcd.m3u8").exists());
+        assert!(job.is_dir(), "directories stay");
     }
 
     /// Records what job teardown asked the session layer to release.
