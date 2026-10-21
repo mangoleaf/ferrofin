@@ -1351,8 +1351,8 @@ pub async fn build_app_state(
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
-    // `ServerConfiguration.LibraryUpdateDuration` — how long the notifier waits
-    // for changes to stop before it pushes. A non-positive value would make the
+    // `ServerConfiguration.LibraryUpdateDuration` — how long a batch of changes
+    // waits, from its first change, before the notifier pushes it. A non-positive value would make the
     // debounce fire instantly and push once per saved row, so it falls back to
     // Jellyfin's default rather than honouring it.
     let library_update_duration = u64::try_from(server_config.library_update_duration)
