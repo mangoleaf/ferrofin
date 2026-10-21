@@ -21,6 +21,7 @@
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::{NameGuidPair, NameValuePair};
 use ferrofin_model::entities::MediaStreamType;
@@ -64,6 +65,51 @@ struct FiltersLegacyQuery {
 /// treats specially by *not* resolving a parent item.
 fn is_trailer_or_program(types: &[BaseItemKind]) -> bool {
     types.len() == 1 && matches!(types[0], BaseItemKind::Trailer | BaseItemKind::Program)
+}
+
+/// The parent scope the `/Items/Filters2` facet queries share, as
+/// `(ancestor_ids, parent_id)` — v12.2 `FilterController.cs:198-210`:
+///
+/// ```text
+/// if ((recursive ?? true) || parentItem is UserView || parentItem is ICollectionFolder)
+///     AncestorIds = parentItem is null ? [] : [parentItem.Id]   // its descendants
+/// else
+///     Parent = parentItem                                       // its direct children
+/// ```
+///
+/// `ICollectionFolder` is a library (`CollectionFolder`) or a `BasePluginFolder`;
+/// the playlists folder derives from it, stored as `PlaylistsFolder` or the
+/// older `ManualPlaylistsFolder`. A `parentId` that names no item leaves
+/// `parentItem` null, and so no scope at all: the facets then cover everything
+/// the user can see.
+///
+/// Upstream's `Parent` reaches `TranslateQuery` as a strict `ParentId` equality
+/// (`TranslateQuery.cs:320-322`): the direct children, never a box set's or a
+/// playlist's linked members, nor a root folder's rewritten children. The
+/// facet queries say so with `physical_children_only`, which is that shape.
+fn parent_scope(
+    parent_id: Uuid,
+    parent: Option<&BaseItemEntity>,
+    recursive: Option<bool>,
+) -> (Vec<Uuid>, Uuid) {
+    let Some(parent) = parent else {
+        return (Vec::new(), Uuid::nil());
+    };
+    let view_or_collection_folder = matches!(
+        BaseItemKind::from_stored_type_name(&parent.type_),
+        Some(
+            BaseItemKind::UserView
+                | BaseItemKind::CollectionFolder
+                | BaseItemKind::BasePluginFolder
+                | BaseItemKind::PlaylistsFolder
+                | BaseItemKind::ManualPlaylistsFolder
+        )
+    );
+    if recursive.unwrap_or(true) || view_or_collection_folder {
+        (vec![parent_id], Uuid::nil())
+    } else {
+        (Vec::new(), parent_id)
+    }
 }
 
 /// `GET /Items/Filters` — the legacy flat-string filter facets.
@@ -147,13 +193,9 @@ struct FiltersQuery {
     /// Optional live-tv "is series" filter.
     #[serde(default)]
     is_series: Option<bool>,
-    /// Whether to aggregate recursively (defaults `true`).
-    ///
-    /// Accepted for wire compatibility but not applied: it selects between
-    /// Jellyfin's two parent-scoping branches, and telling them apart needs the
-    /// un-ported domain tree (documented deferral — see [`get_query_filters`]).
+    /// Whether to aggregate over the parent's descendants (defaults `true`) or
+    /// only its direct children — see [`parent_scope`].
     #[serde(default)]
-    #[allow(dead_code)]
     recursive: Option<bool>,
 }
 
@@ -241,22 +283,14 @@ fn language_pairs(
 /// The audio and subtitle language facets (Jellyfin 12+) are filled only for
 /// a type set naming `Movie`, `Series`, `Season` or `Episode`
 /// (`FilterController.cs:242-272`), from a second query that shares the genre
-/// query's user, live-TV flags and parent scope (`:161-178`, `:197-209`) but
+/// query's user, live-TV flags and parent scope (`:161-178`, `:198-210`) but
 /// includes owned items — a language may exist only on an alternate version —
 /// and widens a show/season set to its episodes (`:212-217`).
 ///
-/// A `parentId` always becomes an **ancestor** scope. Jellyfin picks between two
-/// branches — `genreQuery.AncestorIds = [parent]` when
-/// `(recursive ?? true) || parentItem is UserView || parentItem is ICollectionFolder`,
-/// else `genreQuery.Parent = parentItem` (direct children only) — and Ferrofin has
-/// no domain tree to tell a `UserView`/`ICollectionFolder` from a plain folder. So
-/// the ancestor branch is taken unconditionally: byte-identical to Jellyfin for
-/// every recursive request and for the `recursive=false` requests clients actually
-/// send (clients pass a library-view id, which *is* a `UserView`/`CollectionFolder`
-/// and so takes the ancestor branch there too), and a superset — the whole subtree
-/// instead of the direct children — only for `recursive=false` against a plain
-/// folder. What it must never be is *unscoped*: Jellyfin never widens a `parentId`
-/// request back out to the entire library.
+/// A `parentId` scopes every facet query to the parent's descendants, or to its
+/// direct children for `recursive=false` under a parent that is neither a view
+/// nor a collection folder ([`parent_scope`]). A lone `Trailer` or `Program`
+/// type set ignores the parent (`FilterController.cs:132-137`).
 #[utoipa::path(
     get,
     path = "/Items/Filters2",
@@ -274,14 +308,15 @@ async fn get_query_filters(
     let language_facets = has_language_facets(&include_item_types);
     let stream_types = stream_language_types(&include_item_types);
 
-    // Trailer/Program skip the parent; otherwise the parent scopes the aggregate
-    // (as an ancestor, regardless of `recursive` — see the doc comment).
-    let mut ancestor_ids = Vec::new();
-    if !is_trailer_or_program(&include_item_types)
-        && let Some(parent) = query.parent_id
-    {
-        ancestor_ids.push(parent);
-    }
+    // `parentItem` (`FilterController.cs:131-141`): none for a lone Trailer or
+    // Program type set, else the item `parentId` names, if there is one.
+    let (ancestor_ids, parent_id) = match query.parent_id {
+        Some(id) if !is_trailer_or_program(&include_item_types) => {
+            let parent = state.library.get_item_by_id(id).await?;
+            parent_scope(id, parent.as_ref(), query.recursive)
+        }
+        _ => (Vec::new(), Uuid::nil()),
+    };
 
     let is_music = is_music_type_set(&include_item_types);
     let base = InternalItemsQuery {
@@ -303,6 +338,8 @@ async fn get_query_filters(
         is_news: query.is_news,
         is_series: query.is_series,
         ancestor_ids,
+        parent_id,
+        physical_children_only: !parent_id.is_nil(),
         ..InternalItemsQuery::default()
     };
 

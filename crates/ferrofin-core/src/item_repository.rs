@@ -1964,6 +1964,20 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
         push_in_list(qb, r#"a."ParentItemId""#, ancestors);
         qb.push(")");
     }
+    // `innerQueryFilter.ParentId = filter.ParentId` (v12.2 `ByName.cs:188`, and
+    // the counts' `scopeQuery`, `:346`), which `TranslateQuery` matches as a
+    // strict `ParentId` equality (`TranslateQuery.cs:320-322`): the parent's
+    // direct children, never a box set's linked members.
+    //
+    // `+`: a plan pin, like `Type` above and `TopParentId` below. Unpinned, the
+    // planner drives the semijoin from the parent's children
+    // (`IX_BaseItems_ParentId`) and probes the value's map for each, per
+    // candidate value: 1.1 s for 400 genres over a folder of 6,000 movies,
+    // against 0.1 s probing each map row's item by its primary key.
+    if !filter.parent_id.is_nil() {
+        qb.push(r#" AND +ci."ParentId" = "#)
+            .push_bind(guid_to_db(filter.parent_id));
+    }
     if !filter.item_ids.is_empty() {
         qb.push(" AND ");
         push_in_list(qb, r#"ci."Id""#, &to_guid_strings(&filter.item_ids));
@@ -3774,6 +3788,7 @@ fn stream_language_query(filter: &InternalItemsQuery) -> InternalItemsQuery {
     query.item_ids.clone_from(&filter.item_ids);
     query.top_parent_ids.clone_from(&filter.top_parent_ids);
     query.parent_id = filter.parent_id;
+    query.physical_children_only = filter.physical_children_only;
     query.is_airing = filter.is_airing;
     query.is_movie = filter.is_movie;
     query.is_sports = filter.is_sports;
@@ -8016,6 +8031,161 @@ mod tests {
         assert_eq!(subtitles, ["fra", "und"]);
         assert_eq!(by_type.remove(&MediaStreamType::Lyric), Some(Vec::new()));
         assert!(by_type.is_empty());
+    }
+
+    /// `/Items/Filters2?recursive=false` under a folder that is neither a view
+    /// nor a library gives each facet query the folder as `Parent`, which
+    /// upstream's `TranslateQuery` matches as a strict `ParentId` equality
+    /// (v12.2 `TranslateQuery.cs:320-322`; the by-name `innerQueryFilter`
+    /// carries it, `ByName.cs:188`). So the genre, music-genre and
+    /// stream-language facets count the folder's direct children only: not a
+    /// grandchild, and under a box set not its linked members.
+    #[tokio::test]
+    async fn filter_facets_under_a_parent_count_its_direct_children_only() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xA1D0)).await;
+        let ids: Vec<_> = (0xA1D1..0xA1D9).map(Uuid::from_u128).collect();
+        let (folder, sub, box_set) = (ids[0], ids[1], ids[2]);
+        let (child, grandchild, elsewhere) = (ids[3], ids[4], ids[5]);
+        let (song, grand_song) = (ids[6], ids[7]);
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Kids", None).await;
+        seed_folder_item(&db, sub, BaseItemKind::Folder, "Classics", Some(folder)).await;
+        seed_folder_item(&db, box_set, BaseItemKind::BoxSet, "Set", None).await;
+        seed_child_item(&db, child, BaseItemKind::Movie, "Film A", folder).await;
+        seed_child_item(&db, grandchild, BaseItemKind::Movie, "Film B", sub).await;
+        seed_named_item(&db, elsewhere, BaseItemKind::Movie, "Other Film").await;
+        seed_child_item(&db, song, BaseItemKind::Audio, "Song", folder).await;
+        seed_child_item(&db, grand_song, BaseItemKind::Audio, "Old Song", sub).await;
+        seed_library_over(&db, &ids).await;
+        for (item, genre) in [
+            (child, "Animation"),
+            (grandchild, "Western"),
+            (elsewhere, "Drama"),
+            (elsewhere, "Animation"),
+            (song, "Jazz"),
+            (grand_song, "Blues"),
+        ] {
+            seed_item_value(&db, item, ItemValueType::Genre, genre).await;
+        }
+        for (item, language) in [(child, "eng"), (grandchild, "fra"), (elsewhere, "jpn")] {
+            insert_stream(&db, item, 0, MediaStreamType::Audio, Some(language)).await;
+        }
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+               VALUES (?, ?, 0, 0)"#,
+        )
+        .bind(guid_to_db(box_set))
+        .bind(guid_to_db(elsewhere))
+        .execute(db.writer())
+        .await
+        .expect("link the set's member");
+
+        let under = |parent: Uuid, kind: BaseItemKind| InternalItemsQuery {
+            user: Some(user.clone()),
+            include_item_types: vec![kind],
+            parent_id: parent,
+            physical_children_only: true,
+            ..InternalItemsQuery::default()
+        };
+        let names = |result: QueryResult<ItemWithCounts>| -> Vec<String> {
+            result
+                .items
+                .into_iter()
+                .filter_map(|row| row.item.name)
+                .collect()
+        };
+        let audio = |query: InternalItemsQuery| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_media_stream_languages(&query, MediaStreamType::Audio)
+                    .await
+                    .expect("languages")
+            }
+        };
+
+        let movies = under(folder, BaseItemKind::Movie);
+        let genres = repository.get_genres(&movies).await.expect("genres");
+        // The per-kind counts carry the same parent (`scopeQuery`, `:346`).
+        assert_eq!(
+            genres
+                .items
+                .iter()
+                .map(|row| row.counts.movie_count)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(names(genres), ["Animation"]);
+        assert_eq!(audio(movies).await, ["eng"]);
+        assert_eq!(
+            names(
+                repository
+                    .get_music_genres(&under(folder, BaseItemKind::Audio))
+                    .await
+                    .expect("music genres")
+            ),
+            ["Jazz"]
+        );
+        let set = under(box_set, BaseItemKind::Movie);
+        assert!(
+            names(repository.get_genres(&set).await.expect("genres")).is_empty(),
+            "a box set's linked member is not its child"
+        );
+        assert!(audio(set).await.is_empty());
+    }
+
+    /// Plan pin for the by-name semijoin under a parent (`/Items/Filters2?recursive=false`
+    /// under a folder): each of the value's map rows reaches its item by the
+    /// item's primary key, with or without a kind filter. Driven from the
+    /// parent's children instead (`IX_BaseItems_ParentId`), every candidate
+    /// value walked the folder's whole child list.
+    #[tokio::test]
+    async fn by_name_semijoin_under_a_parent_probes_items_by_id() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery {
+            parent_id: Uuid::from_u128(0xA2D0),
+            ..InternalItemsQuery::default()
+        };
+        let type_ints = [i64::from(i32::from(ItemValueType::Genre))];
+        let movie = [stored_type_name(BaseItemKind::Movie)
+            .expect("stored")
+            .to_owned()];
+        for content_type_names in [&movie[..], &[]] {
+            let scope = ByNameScope {
+                filter: &filter,
+                type_ints: &type_ints,
+                content_type_names,
+                exclude_type_names: &[],
+                media_types: &[],
+                ancestors: &[],
+                top_parents: &[],
+            };
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Type" = "#);
+            qb.push_bind(stored_type_name(BaseItemKind::Genre).expect("stored"));
+            push_value_exists(&mut qb, &scope, InnerScope::Page);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|d| d == "SEARCH ci USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.contains("IX_BaseItems_ParentId")),
+                "{plan:#?}"
+            );
+        }
     }
 
     /// The grouping regression: with a user set, the `build_query` id list
