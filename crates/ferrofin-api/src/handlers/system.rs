@@ -26,7 +26,7 @@ use crate::state::AppState;
 /// Builds a [`RequestContext`] from an axum request's [`Parts`] (headers +
 /// query), mirroring the auth middleware's construction so the system manager
 /// sees the same request view.
-fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
+pub(crate) fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
     crate::auth::request_context(
         &parts.headers,
         parts.uri.query(),
