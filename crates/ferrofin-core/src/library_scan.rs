@@ -3063,6 +3063,39 @@ impl<'a> PlanCtx<'a> {
     }
 }
 
+/// The folders under the art `root` the scan writes `entity`'s art to: its
+/// own folder ([`crate::dynamic_images::own_art_dir`]), then the lower-cased
+/// [`crate::dynamic_images::legacy_art_dir`] older scans also wrote to, while
+/// that is a different folder. A row whose id is no UUID has its stored id's
+/// folder only.
+fn written_art_dirs(root: &Path, entity: &BaseItemEntity) -> Vec<PathBuf> {
+    let Ok(id) = Uuid::parse_str(&entity.id) else {
+        return vec![root.join(&entity.id)];
+    };
+    let own = crate::dynamic_images::own_art_dir(root, id);
+    let legacy = crate::dynamic_images::legacy_art_dir(root, id);
+    if legacy == own {
+        vec![own]
+    } else {
+        vec![own, legacy]
+    }
+}
+
+/// The folder a writer looks for and writes `id`'s `stem` art in: the item's
+/// own folder, unless only the legacy folder older scans wrote to holds a file
+/// of that stem. That file is then reused where it is, its stored path intact,
+/// rather than fetched or extracted again into the own folder.
+fn art_dir_for(root: &Path, id: Uuid, stem: &str) -> PathBuf {
+    let own = crate::dynamic_images::own_art_dir(root, id);
+    if existing_art_file(&own, stem).is_none() {
+        let legacy = crate::dynamic_images::legacy_art_dir(root, id);
+        if legacy != own && existing_art_file(&legacy, stem).is_some() {
+            return legacy;
+        }
+    }
+    own
+}
+
 /// `dir` without its trailing slashes (`/` stays `/`).
 fn trimmed_dir(dir: &str) -> &str {
     match dir.trim_end_matches('/') {
@@ -11012,7 +11045,11 @@ impl LibraryScanner {
         for person in written {
             let id = person.id.to_string();
             if let Some(url) = person.image_url {
-                let dir = meta_root.join(&id);
+                let dir = art_dir_for(
+                    &meta_root.resolve(),
+                    person.id,
+                    image_type_file_stem(ImageType::Primary),
+                );
                 let mut infos = download_images(
                     tmdb,
                     &dir,
@@ -11164,7 +11201,17 @@ impl LibraryScanner {
                     continue;
                 }
             }
-            let dest = match studio_thumb(studios, &meta_root.join(id.to_string()), name).await {
+            let dest = match studio_thumb(
+                studios,
+                &art_dir_for(
+                    &meta_root.resolve(),
+                    id,
+                    image_type_file_stem(ImageType::Thumb),
+                ),
+                name,
+            )
+            .await
+            {
                 StudioThumb::Found(dest) => dest,
                 StudioThumb::Answered => {
                     refreshed.push(id);
@@ -11241,8 +11288,8 @@ impl LibraryScanner {
         else {
             return Vec::new();
         };
-        let dir = meta_root.join(item_id.to_string());
         let stem = image_type_file_stem(ImageType::Primary);
+        let dir = art_dir_for(&meta_root.resolve(), item_id, stem);
         let dest = dir.join(format!("{stem}.jpg"));
         if !dest.exists() {
             let index = i32::try_from(index).ok();
@@ -11635,7 +11682,7 @@ impl LibraryScanner {
         if fetch == ImageFetch::All
             && let Some(root) = &self.metadata_dir
         {
-            artwork::prune_old_backdrops(&root.join(&entity.id), &images);
+            artwork::prune_old_backdrops_in(&written_art_dirs(&root.resolve(), entity), &images);
         }
         self.append_art_dir_images(entity, &mut images);
         // An album's Primary is stored as its shared, content-addressed cover
@@ -12282,29 +12329,37 @@ impl LibraryScanner {
         let Some(meta_root) = &self.metadata_dir else {
             return;
         };
-        let Ok(entries) = std::fs::read_dir(meta_root.join(&entity.id)) else {
-            return;
-        };
         // Snapshot the types discovery produced up front, so several art-dir
         // files of one type (backdrop.jpg, backdrop1.jpg, …) all append.
         let discovered: std::collections::HashSet<ImageType> =
             images.iter().map(|i| i.image_type).collect();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(image_type) = parse_art_file_stem(&path) else {
+        // The item's own folder first. The legacy folder adds only the types
+        // the own folder has none of, so art present in both lists once.
+        let mut found = std::collections::HashSet::new();
+        for dir in written_art_dirs(&meta_root.resolve(), entity) {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            if discovered.contains(&image_type) {
-                continue;
+            let mut here = std::collections::HashSet::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(image_type) = parse_art_file_stem(&path) else {
+                    continue;
+                };
+                if discovered.contains(&image_type) || found.contains(&image_type) {
+                    continue;
+                }
+                here.insert(image_type);
+                images.push(ItemImageInfo {
+                    path: path.to_string_lossy().into_owned(),
+                    image_type,
+                    date_modified: file_date_modified(&path),
+                    width: 0,
+                    height: 0,
+                    blur_hash: None,
+                });
             }
-            images.push(ItemImageInfo {
-                path: path.to_string_lossy().into_owned(),
-                image_type,
-                date_modified: file_date_modified(&path),
-                width: 0,
-                height: 0,
-                blur_hash: None,
-            });
+            found.extend(here);
         }
     }
 
@@ -24654,6 +24709,109 @@ mod tests {
         }
     }
 
+    /// The lower-cased folder older scans wrote music, person, studio and
+    /// embedded-cover art to is still the item's: discovery lists what it
+    /// holds (the own folder winning a type both hold), and removing the
+    /// item's images removes its files.
+    #[tokio::test]
+    async fn the_legacy_lowercase_art_folder_is_read_and_cleaned() {
+        use ferrofin_model::entities::ImageType;
+        let tmp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::from_u128(0xABCD_EF02);
+        let meta = tmp.path().join("meta");
+        let ours = meta.join(ferrofin_db::store::guid_to_db(id));
+        let legacy = meta.join(id.hyphenated().to_string());
+        assert_ne!(ours, legacy);
+        for dir in [&ours, &legacy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let file = |dir: &std::path::Path, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            path
+        };
+        let own_primary = file(&ours, "primary.jpg");
+        let old_primary = file(&legacy, "primary.jpg");
+        let old_backdrop = file(&legacy, "backdrop.jpg");
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata_dir(meta.clone());
+        let entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            ..BaseItemEntity::default()
+        };
+
+        let mut images = Vec::new();
+        scanner.append_art_dir_images(&entity, &mut images);
+        let mut found: Vec<(ImageType, String)> = images
+            .iter()
+            .map(|image| (image.image_type, image.path.clone()))
+            .collect();
+        found.sort_by_key(|(_, path)| path.clone());
+        let mut expected = vec![
+            (
+                ImageType::Primary,
+                own_primary.to_string_lossy().into_owned(),
+            ),
+            (
+                ImageType::Backdrop,
+                old_backdrop.to_string_lossy().into_owned(),
+            ),
+        ];
+        expected.sort_by_key(|(_, path)| path.clone());
+        assert_eq!(found, expected);
+
+        scanner.remove_item_images(&entity, Some(&images));
+        for gone in [&own_primary, &old_backdrop] {
+            assert!(!gone.exists(), "{} removed", gone.display());
+        }
+        assert!(
+            old_primary.exists(),
+            "an image the item does not list stays"
+        );
+    }
+
+    /// A writer reuses art an older scan left in the legacy folder rather than
+    /// fetch it again; with none there, or one in the own folder, it writes to
+    /// the own folder.
+    #[test]
+    fn a_writer_reuses_legacy_art_before_fetching_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let id = uuid::Uuid::from_u128(0xABCD_EF03);
+        let own = crate::dynamic_images::own_art_dir(root, id);
+        let legacy = crate::dynamic_images::legacy_art_dir(root, id);
+        assert_eq!(
+            super::art_dir_for(root, id, "thumb"),
+            own,
+            "nothing anywhere"
+        );
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("thumb.png"), b"x").unwrap();
+        assert_eq!(
+            super::art_dir_for(root, id, "thumb"),
+            legacy,
+            "reused in place"
+        );
+        assert_eq!(
+            super::art_dir_for(root, id, "primary"),
+            own,
+            "another stem is written to the own folder"
+        );
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("thumb.jpg"), b"x").unwrap();
+        assert_eq!(
+            super::art_dir_for(root, id, "thumb"),
+            own,
+            "the own folder wins"
+        );
+    }
+
     /// Phase 3L: a person's biography fetch is a remote provider, so it
     /// writes nothing onto a locked `Person`, and a field lock keeps the
     /// stored overview or birthplace.
@@ -24799,7 +24957,7 @@ mod tests {
         let meta_root = tmp.path().join("People");
         // Pre-place the profile art under the name `download_images` looks for,
         // so it reuses the on-disk file and the test never needs the network.
-        let art_dir = meta_root.join(person_id.to_string());
+        let art_dir = crate::dynamic_images::own_art_dir(&meta_root, person_id);
         std::fs::create_dir_all(&art_dir).unwrap();
         let mut profile = image::RgbImage::new(48, 64);
         for (x, _y, px) in profile.enumerate_pixels_mut() {
@@ -24896,7 +25054,7 @@ mod tests {
         let meta_root = tmp.path().join("People");
         // Pre-place the profile art where `download_images` looks, so the test
         // never reaches the network.
-        let art_dir = meta_root.join(person_id.to_string());
+        let art_dir = crate::dynamic_images::own_art_dir(&meta_root, person_id);
         std::fs::create_dir_all(&art_dir).unwrap();
         write_poster(&art_dir.join("primary.jpg"), 48, 64);
 
@@ -25096,7 +25254,11 @@ mod tests {
         // An answering repository; Mosfilm's thumb cannot be written (its
         // folder is a file).
         std::fs::create_dir_all(tmp.path().join("metadata")).unwrap();
-        std::fs::write(tmp.path().join("metadata").join(mosfilm.to_string()), b"x").unwrap();
+        std::fs::write(
+            crate::dynamic_images::own_art_dir(&tmp.path().join("metadata"), mosfilm),
+            b"x",
+        )
+        .unwrap();
         let base = spawn_art_server("Mosfilm\nLenfilm", b"JPEGDATA");
         scanner(&base)
             .enrich_studio_images(super::ScanRun::defaults())
