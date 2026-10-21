@@ -1510,6 +1510,17 @@ impl FerrofinStreamStatePlanner {
             tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
             vec![hwaccel_input.args.clone()]
         }));
+        // `GetGraphicalSubCanvasSize`, next in `GetInputArgument`: a burned-in
+        // bitmap subtitle is decoded onto the canvas it was authored for, not
+        // one the size of the video.
+        args.extend(
+            hw::input_args::graphical_sub_canvas_size(
+                state.subtitle_stream.as_ref(),
+                ferrofin_mediaencoding::encoding_helper::helper::should_encode_subtitle(state),
+            )
+            .split_whitespace()
+            .map(str::to_owned),
+        );
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
         args.push("200M".to_owned());
@@ -6063,6 +6074,53 @@ mod tests {
         let args = software_args(interlaced, 50.0, EncodingOptions::default(), Some(cap)).await;
         assert!(args.contains(expected), "{args}");
         assert_eq!(args.matches("fps=").count(), 1, "{args}");
+    }
+
+    /// `GetInputArgument` appends `GetGraphicalSubCanvasSize` after the input
+    /// hardware arguments: a burned-in bitmap subtitle is decoded onto the
+    /// canvas it was authored for (`-canvas_size WxH`, an input option), not
+    /// one the size of the video. Never for a text subtitle, DVBSUB (a fixed
+    /// 720x576), a subtitle that is not burned in, or one with no size.
+    #[rstest]
+    #[case::bitmap("pgssub", Some((1920, 1080)), "Encode", Some("1920x1080"))]
+    #[case::bitmap_not_burned_in("pgssub", Some((1920, 1080)), "External", None)]
+    #[case::bitmap_without_a_size("pgssub", None, "Encode", None)]
+    #[case::dvbsub("dvbsub", Some((720, 576)), "Encode", None)]
+    #[case::text("subrip", Some((1920, 1080)), "Encode", None)]
+    #[tokio::test]
+    async fn a_burned_in_bitmap_subtitle_is_decoded_on_its_own_canvas(
+        #[case] codec: &str,
+        #[case] size: Option<(i32, i32)>,
+        #[case] method: &str,
+        #[case] canvas: Option<&str>,
+    ) {
+        let mut video = video_stream("h264");
+        video.width = Some(3840);
+        video.height = Some(2160);
+        let mut sub = subtitle_stream(codec, 2);
+        sub.width = size.map(|(width, _)| width);
+        sub.height = size.map(|(_, height)| height);
+        sub.populate_computed_fields();
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac"), sub])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some(method.to_owned());
+        let arguments = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments;
+        let at = |flag: &str| arguments.iter().position(|arg| arg == flag);
+        let given = at("-canvas_size").map(|flag| arguments[flag + 1].as_str());
+        assert_eq!(given, canvas, "{arguments:?}");
+        if given.is_some() {
+            assert!(
+                at("-canvas_size") < at("-i"),
+                "an input option: {arguments:?}"
+            );
+        }
     }
 
     /// The burn-in graphs keep upstream's main-chain order: a text subtitle is
