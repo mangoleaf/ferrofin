@@ -992,11 +992,14 @@ async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
         );
         assert!(f.row("Show/Extras/bonus.mkv").await.is_in_mixed_folder);
         assert!(!f.row(extra_path).await.is_in_mixed_folder);
+        // `IsGeneratedExtraName` (v12.2) counts a type's numbers up to the
+        // candidates it has now: with one trailer left, "Trailer 2" is no
+        // name this scan could give, so it reads as the user's and stands.
         std::fs::remove_file(f.media.join("Show/Show-trailer.mkv")).unwrap();
         f.scanner.scan_all().await.unwrap();
         assert_eq!(
             f.row("Show/trailer.mkv").await.name.as_deref(),
-            Some("Trailer")
+            Some("Trailer 2")
         );
         let episode = f.row("Show/Season 01/Show S01E01.mkv").await;
         assert_eq!(episode.parent_id.as_ref(), Some(&season.id));

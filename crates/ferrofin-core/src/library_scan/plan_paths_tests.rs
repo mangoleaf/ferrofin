@@ -349,6 +349,7 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
             id: p.id,
             entity: p.entity.clone(),
             ancestors: p.ancestors.clone(),
+            generated_names: p.generated_names.clone(),
         })
         .collect()
 }
