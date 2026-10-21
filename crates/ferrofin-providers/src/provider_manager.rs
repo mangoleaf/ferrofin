@@ -37,7 +37,9 @@ use ferrofin_traits::providers::{
 use uuid::Uuid;
 
 use crate::error::ProvidersError;
-use crate::library_options::{fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled};
+use crate::library_options::{
+    channel_fetcher_override, fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled,
+};
 use crate::refresh_plan::{
     FileFacts, ImageFetch, PassOutcome, ProbeKind, RefreshRequest, StoredState, decide_save,
     plan_item_refresh,
@@ -1626,25 +1628,28 @@ impl LocalProviderManager {
         let library = self.library_options_for(entity).await;
         let kind = short_kind(entity);
         let global = self.global_metadata_options_for(kind);
+        let channel = channel_gate(entity);
         let metadata_allowed = !entity.is_locked
             && self.metadata_fetchers(kind).iter().any(|name| {
-                metadata_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+                channel.unwrap_or_else(|| {
+                    metadata_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+                })
             });
-        let images_allowed = (!entity.is_locked
-            || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
-            && ((entity.extra_type.is_none()
-                && self.image_sources_for(entity).iter().any(|source| {
-                    image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, source.name())
-                }))
-                || self.dynamic_image_providers.iter().any(|provider| {
-                    provider.library_gated()
-                        && image_fetcher_enabled(
-                            library.as_ref(),
-                            global.as_ref(),
-                            kind,
-                            provider.name(),
-                        )
-                }));
+        let image_enabled = |name: &str| {
+            channel.unwrap_or_else(|| {
+                image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+            })
+        };
+        let images_allowed =
+            (!entity.is_locked || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
+                && ((entity.extra_type.is_none()
+                    && self
+                        .image_sources_for(entity)
+                        .iter()
+                        .any(|source| image_enabled(source.name())))
+                    || self.dynamic_image_providers.iter().any(|provider| {
+                        provider.library_gated() && image_enabled(provider.name())
+                    }));
         MetadataRefreshOptions {
             metadata_refresh_mode: if metadata_allowed {
                 options.metadata_refresh_mode
@@ -2760,8 +2765,11 @@ impl LocalProviderManager {
             .map(|p| (p.name(), Some(p.as_ref())))
             .collect();
         sources.extend(remote_sources.iter().map(|source| (source.name(), None)));
+        let channel = channel_gate(row);
         sources.retain(|(name, _)| {
-            image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+            channel.unwrap_or_else(|| {
+                image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+            })
         });
         sources.sort_by_key(|(name, _)| {
             (
@@ -3585,16 +3593,19 @@ impl LocalProviderManager {
         let kind = short_kind(entity);
         let global = self.global_metadata_options_for(kind);
         let preferred = self.preferred_metadata_language(entity).await;
+        let channel = channel_gate(entity);
         let mut results = Vec::new();
         for source in sources {
             if !query.include_disabled_providers
                 && (entity.extra_type.is_some()
-                    || !image_fetcher_enabled(
-                        library.as_ref(),
-                        global.as_ref(),
-                        kind,
-                        source.name(),
-                    ))
+                    || !channel.unwrap_or_else(|| {
+                        image_fetcher_enabled(
+                            library.as_ref(),
+                            global.as_ref(),
+                            kind,
+                            source.name(),
+                        )
+                    }))
             {
                 continue;
             }
@@ -4186,6 +4197,12 @@ fn short_kind(entity: &BaseItemEntity) -> &str {
     entity.type_.rsplit('.').next().unwrap_or(&entity.type_)
 }
 
+/// The fetcher answer `BaseItemManager`'s channel arms give for `entity`
+/// before any option is read ([`channel_fetcher_override`]).
+fn channel_gate(entity: &BaseItemEntity) -> Option<bool> {
+    channel_fetcher_override(short_kind(entity), entity.channel_id.as_deref())
+}
+
 /// The pure `(kind, name, year)` extraction for a movie/series row, shared by
 /// [`LocalProviderManager::get_available_remote_images`] and the refresh-target
 /// resolver.
@@ -4729,10 +4746,13 @@ impl ProviderManager for LocalProviderManager {
         // reference item drops every non-local provider outright.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
         let global = self.global_metadata_options_for(&kind);
+        let channel = reference.as_ref().and_then(channel_gate);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
                 || (!locked
-                    && metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name))
+                    && channel.unwrap_or_else(|| {
+                        metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name)
+                    }))
         };
 
         // Select the providers that serve this item kind, drop the ones the
@@ -6185,6 +6205,19 @@ mod tests {
         // Ticked: the provider survives the scoped search.
         let ticked = manager(vec!["MusicBrainz".to_owned()], rows.clone());
         assert_eq!(ticked.remote_search(&scoped).await.unwrap().len(), 1);
+
+        // …unless the reference item came from a channel: `BaseItemManager`'s
+        // `SourceType.Channel` arm answers `!EnableMediaSourceDisplay` (false
+        // with no channel plugin) before the library's list is read.
+        let mut from_channel = entity.clone();
+        from_channel.channel_id = Some("6f1e4c1a-2b3d-4e5f-6a7b-8c9d0e1f2a3b".to_owned());
+        let mut channel_rows = HashMap::new();
+        channel_rows.insert(artist_id, from_channel);
+        let channel = manager(vec!["MusicBrainz".to_owned()], channel_rows);
+        assert!(
+            channel.remote_search(&scoped).await.unwrap().is_empty(),
+            "a channel's item uses no metadata fetcher"
+        );
 
         // A LOCKED reference item drops every remote provider outright
         // ("If locked only allow local providers", `ProviderManager.cs:478`).
@@ -8737,6 +8770,17 @@ mod tests {
         let gated = mgr.gated_options(&open, &Opts::default()).await;
         assert_eq!(gated.metadata_refresh_mode, Mode::Default);
         assert_eq!(gated.image_refresh_mode, Mode::Default);
+
+        // …unless it came from a channel: `BaseItemManager`'s
+        // `SourceType.Channel` arm answers `!EnableMediaSourceDisplay` (false
+        // with no channel plugin) for every metadata and image fetcher.
+        let from_channel = BaseItemEntity {
+            channel_id: Some("6f1e4c1a-2b3d-4e5f-6a7b-8c9d0e1f2a3b".to_owned()),
+            ..open
+        };
+        let gated = mgr.gated_options(&from_channel, &Opts::default()).await;
+        assert_eq!(gated.metadata_refresh_mode, Mode::None);
+        assert_eq!(gated.image_refresh_mode, Mode::None);
     }
     // ── remote search: the library-options / IsLocked gate ──────────────────
     //
