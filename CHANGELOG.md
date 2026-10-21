@@ -172,6 +172,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Trickplay frames and tiles are made in the server's temp directory (`{cache}/temp`), as
+  Jellyfin makes them in its own, instead of the system's `/tmp`. "Clean Cache Directory"
+  sweeps what a killed generation leaves there, and a small or read-only `/tmp` no longer
+  stops trickplay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
