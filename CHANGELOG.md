@@ -164,6 +164,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
   the algorithm's filter is active, `-ac 2` is suppressed (the `pan=` filter sets the
   channel count)
+- Serve Jellyfin's `/health`: plain-text `Healthy`, or `Unhealthy` with a 503 when the
+  database does not answer, and behind a base URL a redirect from `/health` to
+  `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
+  the same database check, so the chart's readiness probe now fails while the database is
+  unreachable (it was always ready before)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

@@ -128,8 +128,7 @@ Conventions:
   versions here. The linked-child reroute is not ported.
 - Accepted divergences (do NOT "fix" during sync): No
   `VideoType`/`Video3DFormat` columns in Ferrofin's schema, so primary selection
-  cannot demote 3D/non-file videos (width ordering only). No `IndexNumberEnd`
-  column, so that episode-key component is always empty. Upstream's
+  cannot demote 3D/non-file videos (width ordering only). Upstream's
   `Parallel.ForEach` fire-and-forget async merges (error-dropping) run
   sequentially in Ferrofin. The episode merge key is scoped to the series
   *row* (`SeriesPresentationUniqueKey`), not the series name as upstream

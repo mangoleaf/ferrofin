@@ -12,21 +12,22 @@ use ferrofin_model::dto::SessionInfoDto;
 use ferrofin_traits::options::AuthorizationInfo;
 
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
 
 /// Resolves (and logs activity for) the caller's current session.
 ///
-/// Mirrors C# `RequestHelpers.GetSession`: resolve the authenticated user, then
+/// Mirrors C# `RequestHelpers.GetSession`: resolve the caller's user when it
+/// has one (`if (!userId.IsNullOrEmpty()) user = GetUserById(userId)`), then
 /// `LogSessionActivity` with the client/device fields from the request's
-/// [`AuthorizationInfo`]. A caller with no resolvable user is a `400` (via
-/// [`resolve_user`]); a session the manager cannot open surfaces its
-/// `ServiceError`.
+/// [`AuthorizationInfo`] and that user, possibly none. So an API key, which
+/// has no user, gets a user-less session and the request goes on. A session
+/// the manager cannot open surfaces its `ServiceError`.
 pub(crate) async fn current_session(
     state: &AppState,
     auth: &AuthorizationInfo,
 ) -> Result<SessionInfoDto, ApiError> {
-    let user = resolve_user(state, auth, None).await?;
+    let user = resolve_user_opt(state, auth, None).await?;
     let session = state
         .sessions
         .log_session_activity(
@@ -40,7 +41,7 @@ pub(crate) async fn current_session(
             // passing "" would blank the value the login recorded, because
             // `upsert_session` writes this field unconditionally.
             auth.remote_endpoint.as_deref().unwrap_or_default(),
-            &user,
+            user.as_ref(),
         )
         .await?;
     Ok(session)

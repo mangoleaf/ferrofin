@@ -425,7 +425,7 @@ pub fn build_accelerated_trickplay_args(
             Some(stream),
         ),
         source_codec: stream.codec.as_deref(),
-        is_dovi: hw::tonemap::is_dovi(Some(stream)),
+        requires_dovi_reshaping: hw::tonemap::requires_dovi_reshaping(Some(stream)),
         is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(Some(stream)),
         subtitle: hw::sw_chain::SubtitleOverlay::None,
     };

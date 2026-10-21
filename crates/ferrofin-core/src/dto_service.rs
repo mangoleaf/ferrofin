@@ -54,6 +54,7 @@
 // is allowed for this module.
 #![allow(clippy::assigning_clones)]
 
+use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -92,6 +93,9 @@ use crate::item_type_lookup::kind_from_type_name;
 struct Prefetched {
     /// Counts of owned extras, loaded only when either count field is requested.
     extra_counts: HashMap<Uuid, ExtraCounts>,
+    /// The configured `PathSubstitutions`, read once per page when the `Path`
+    /// or `MediaSources` field is requested.
+    path_substitutions: Vec<PathSubstitution>,
     /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
@@ -1267,6 +1271,10 @@ pub struct FerrofinDtoService {
     /// is `Clone` and the composition root wires the seam after the clones
     /// exist — every copy must see the value once it lands.
     live_tv: Arc<OnceLock<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>>,
+    /// The server configuration whose `PathSubstitutions` the `Path` field and
+    /// the static media sources go through (`DtoService.GetMappedPath`).
+    /// Without it, paths are served as stored.
+    configuration: Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The localization the per-user default-stream selection normalizes
     /// languages through (`MediaSourceManager.NormalizeLanguage`) — the same
     /// one the media-source manager holds, so the item DTO and `PlaybackInfo`
@@ -1314,7 +1322,20 @@ impl FerrofinDtoService {
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
             localization: None,
+            configuration: None,
         }
+    }
+
+    /// Installs the server configuration whose `PathSubstitutions` map the
+    /// `Path` field and the media sources' paths. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_configuration(
+        mut self,
+        configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.configuration = Some(configuration);
+        self
     }
 
     /// Installs the localization the `MediaSources`' default-stream selection
@@ -1712,21 +1733,32 @@ impl FerrofinDtoService {
         &self,
         clean_pairs: &[(BaseItemKind, String)],
     ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+        // Artist names link to an actual `MusicArtist` item found by its clean
+        // name (`LinkedChildrenService.FindArtists`), and a music video's album
+        // to the `MusicAlbum` of that name (`SetMusicVideoProperties`) — both
+        // independent of the `ItemValues` rows; a name with no such item has
+        // no id at all.
+        const ITEM_KINDS: [BaseItemKind; 2] = [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum];
         // Dedup the (kind, clean) keys we need.
         let want: std::collections::HashSet<&(BaseItemKind, String)> = clean_pairs.iter().collect();
-        // Artist names link to an actual `MusicArtist` item found by its clean
-        // name (`LinkedChildrenService.FindArtists`), independent of the
-        // `ItemValues` rows; a name with no such item has no id at all.
-        let (artist_keys, keys): (Vec<_>, Vec<_>) = want
+        let (item_keys, keys): (Vec<_>, Vec<_>) = want
             .into_iter()
-            .partition(|(kind, _)| *kind == BaseItemKind::MusicArtist);
+            .partition(|(kind, _)| ITEM_KINDS.contains(kind));
         let keys: Vec<(BaseItemKind, String)> = keys.into_iter().cloned().collect();
         let mut map = crate::item_repository::by_name_ids_by_clean_name(&self.db, &keys).await?;
-        let artist_cleans: Vec<&String> = artist_keys.iter().map(|(_, clean)| clean).collect();
-        let artists =
-            crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
+        for kind in ITEM_KINDS {
+            let cleans: Vec<&String> = item_keys
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, clean)| clean)
+                .collect();
+            let type_name = crate::item_type_lookup::stored_type_name(kind).ok_or_else(|| {
+                ServiceError::backend(format!("no stored type name for {kind:?}"))
+            })?;
+            let ids = crate::item_repository::item_ids_by_clean_name(&self.db, type_name, &cleans)
                 .await?;
-        map.insert(BaseItemKind::MusicArtist, artists);
+            map.insert(kind, ids);
+        }
         Ok(map)
     }
 
@@ -2457,6 +2489,14 @@ impl FerrofinDtoService {
                     attachments.get(&id).cloned().unwrap_or_default(),
                 )
             });
+            // `GetStaticMediaSources(item, true, user)`: the DTO always asks for
+            // path substitution.
+            for source in &mut sources {
+                crate::media_source_manager::map_source_path(
+                    source,
+                    &prefetched.path_substitutions,
+                );
+            }
             // A version the user may not open is no source for them; the item
             // itself always is (`MediaSourceManager.cs:397-403`).
             if let Some(visible) = &prefetched.version_visible {
@@ -2784,7 +2824,15 @@ impl FerrofinDtoService {
                 .filter(|id| !id.is_nil());
         }
         if options.contains_field(ItemFields::Path) {
-            dto.path = item.path.clone();
+            // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
+            // path after the network substitutions.
+            dto.path = item.path.as_deref().map(|path| {
+                if crate::media_info_resolver::is_file_protocol(path) {
+                    path_after_network_substitution(path, &prefetched.path_substitutions)
+                } else {
+                    path.to_owned()
+                }
+            });
         }
 
         dto.premiere_date = item.premiere_date;
@@ -2889,6 +2937,23 @@ impl FerrofinDtoService {
             dto.video_type = Some(format.video_type);
             dto.video3d_format = format.video3d_format;
             dto.iso_type = format.iso_type;
+            // `IHasAspectRatio.AspectRatio` (v12.2 DtoService.cs:1138) and,
+            // only when true, `ISupportsPlaceHolders.IsPlaceHolder` (:1290):
+            // `Video` implements both, off its `Data`.
+            let display = crate::item_data::video_display(item.data.as_deref());
+            dto.aspect_ratio = display.aspect_ratio;
+            if display.is_place_holder {
+                dto.is_place_holder = Some(true);
+            }
+            // `SetMusicVideoProperties` (:842-860): the album, and the id of the
+            // `MusicAlbum` of that name when one exists.
+            if kind == BaseItemKind::MusicVideo {
+                if let Some(album) = item.album.as_deref().filter(|a| !a.is_empty()) {
+                    dto.album_id = prefetched
+                        .lookup_clean(BaseItemKind::MusicAlbum, &prefetched.clean_key(album));
+                }
+                dto.album = item.album.clone();
+            }
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // C# only assigns when true, so the key is absent otherwise (the
             // `skip_serializing_if` on the DTO matches that omission).
@@ -4351,6 +4416,13 @@ impl FerrofinDtoService {
                     wanted.extend(split_multi_str(item.artists.as_deref()).map(artist));
                     wanted.extend(split_multi_str(item.album_artists.as_deref()).map(artist));
                 }
+                // `SetMusicVideoProperties`: the `MusicAlbum` named like the
+                // music video's album.
+                if row_kind(item) == BaseItemKind::MusicVideo
+                    && let Some(album) = item.album.as_deref().filter(|a| !a.is_empty())
+                {
+                    wanted.insert((BaseItemKind::MusicAlbum, album));
+                }
             }
             let mut clean_values: HashMap<String, String> = HashMap::new();
             let mut pairs: Vec<(BaseItemKind, String)> = Vec::with_capacity(wanted.len());
@@ -4599,8 +4671,24 @@ impl FerrofinDtoService {
         } else {
             crate::item_deletion::DeleteFacts::default()
         };
+        // `GetMappedPath` maps the `Path` field and the static sources through
+        // the configured substitutions: read them once for the page.
+        let path_substitutions = match &self.configuration {
+            Some(configuration)
+                if options.contains_field(ItemFields::Path)
+                    || options.contains_field(ItemFields::MediaSources) =>
+            {
+                configuration
+                    .configuration()
+                    .await?
+                    .path_substitutions
+                    .clone()
+            }
+            _ => Vec::new(),
+        };
         Ok(Prefetched {
             extra_counts,
+            path_substitutions,
             images,
             user_data,
             media_streams,
@@ -5315,6 +5403,47 @@ mod tests {
         assert_eq!(ud.played_percentage, None);
         assert!(ud.played);
         assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `DtoService.GetMappedPath` (`DtoService.cs:1827`) and
+    /// `GetStaticMediaSources(item, true, user)`: a file-protocol `Path` and the
+    /// item's media source go through `PathSubstitutions`; a remote path is
+    /// left as it is.
+    #[tokio::test]
+    async fn path_and_media_sources_apply_path_substitutions() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = service(db.clone()).with_configuration(
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/media",
+                "//nas/media",
+            )
+            .await,
+        );
+        let id = Uuid::new_v4();
+        crate::test_support::seed_video_item(&db, id, BaseItemKind::Movie).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::Path, ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let mut movie = fetch_item(&db, id).await;
+        movie.path = Some("/media/movies/a.mkv".to_owned());
+        movie.media_type = Some("Video".to_owned());
+        let dto = svc
+            .get_base_item_dto(&movie, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("//nas/media/movies/a.mkv"));
+        let sources = dto.media_sources.expect("sources");
+        assert_eq!(sources[0].path.as_deref(), Some("//nas/media/movies/a.mkv"));
+
+        movie.path = Some("http://origin/stream".to_owned());
+        let dto = svc
+            .get_base_item_dto(&movie, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("http://origin/stream"));
     }
 
     /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
@@ -8459,6 +8588,68 @@ mod tests {
             assert_eq!(single.can_download, Some(expected));
             assert_eq!(page[0].can_download, Some(expected));
         }
+    }
+
+    /// `DtoService.AttachBasicFields` (v12.2 :1138, :1290, :842-860): a video
+    /// carries its stored `AspectRatio`, and `IsPlaceHolder` only when true;
+    /// a music video its `Album` and the id of the `MusicAlbum` of that name,
+    /// on the single and the page path alike.
+    #[tokio::test]
+    async fn videos_carry_aspect_ratio_place_holder_and_music_video_album() {
+        let db = test_db().await;
+        let (wide, stub, clip, album) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, wide, BaseItemKind::Movie, "Wide").await;
+        seed_named_item(&db, stub, BaseItemKind::Movie, "Stub").await;
+        seed_named_item(&db, clip, BaseItemKind::MusicVideo, "Clip").await;
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Greatest Hits").await;
+        crate::test_support::set_clean_name(&db, album, "Greatest Hits").await;
+        let mut wide = fetch_item(&db, wide).await;
+        wide.data = Some(r#"{"AspectRatio":"2.35:1"}"#.to_owned());
+        let mut stub = fetch_item(&db, stub).await;
+        stub.data = Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#.to_owned());
+        let mut clip = fetch_item(&db, clip).await;
+        clip.album = Some("Greatest Hits".to_owned());
+        let svc = service(db);
+        let options = DtoOptions {
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+
+        let page = svc
+            .get_base_item_dtos(
+                &[wide.clone(), stub, clip.clone()],
+                &options,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page[0].aspect_ratio.as_deref(), Some("2.35:1"));
+        assert_eq!(page[0].is_place_holder, None, "only a placeholder says so");
+        assert_eq!(page[1].is_place_holder, Some(true));
+        assert_eq!(page[1].aspect_ratio, None);
+        assert_eq!(page[2].album.as_deref(), Some("Greatest Hits"));
+        assert_eq!(page[2].album_id, Some(album));
+
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album_id, Some(album));
+        clip.album = Some("No Such Album".to_owned());
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album.as_deref(), Some("No Such Album"));
+        assert_eq!(single.album_id, None, "no album of that name, no id");
     }
 
     #[tokio::test]

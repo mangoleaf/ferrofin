@@ -564,6 +564,7 @@ pub async fn discover_ffmpeg(
         filter_options,
         bsf_options,
         low_priority_hwaccel_flag,
+        prober_first_video_frame,
         os_version,
     ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
     let ffmpeg_version = ffmpeg_version
@@ -589,6 +590,7 @@ pub async fn discover_ffmpeg(
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
         .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
+        .prober_first_video_frame(prober_first_video_frame)
         .validated(true);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
@@ -729,6 +731,7 @@ async fn probe_round(
     [bool; FilterOption::ALL.len()],
     [bool; BsfOption::ALL.len()],
     bool,
+    bool,
     Option<FfmpegVersion>,
 ) {
     tokio::join!(
@@ -742,6 +745,7 @@ async fn probe_round(
         probe_filter_options(ffmpeg),
         probe_bsf_options(ffmpeg),
         probe_hwaccel_flag(ffmpeg, "low_priority"),
+        probe_prober_option(ffprobe, "only_first_vframe"),
         read_os_version(),
     )
 }
@@ -840,6 +844,34 @@ async fn probe_help_pages(
         }
     }
     pages
+}
+
+/// Whether `ffprobe` accepts `-<option>`, decided by its exit status on a 1x1
+/// one-second null source. Port of `EncoderValidator.CheckSupportedProberOption`
+/// (`-loglevel quiet -f lavfi -i nullsrc=s=1x1:d=1 -{option}`).
+async fn probe_prober_option(ffprobe: &Path, option: &str) -> bool {
+    let status = tokio::process::Command::new(ffprobe)
+        .args([
+            "-loglevel",
+            "quiet",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=1x1:d=1",
+            &format!("-{option}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(status) => status.success(),
+        Err(e) => {
+            tracing::debug!(error = %e, option, "error probing ffprobe option");
+            false
+        }
+    }
 }
 
 /// Whether ffmpeg accepts `-hwaccel_flags +<flag>`, decided by exit status on a
@@ -1640,6 +1672,9 @@ mod tests {
         // a mistyped flag, or a probe that stopped running (and so fell through
         // to the version banner's exit 0) all report true and fail this.
         assert!(!caps.low_priority_hwaccel_flag());
+        // `CheckSupportedProberOption("only_first_vframe")`, by exit status too:
+        // the fake accepts it, so an unwired or inverted probe reads false.
+        assert!(caps.prober_supports_first_video_frame());
         // Populated from the host rather than left at the "nothing probed"
         // default; on Linux the OS version is read too.
         assert_eq!(caps.platform(), Platform::current());

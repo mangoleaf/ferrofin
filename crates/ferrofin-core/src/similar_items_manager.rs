@@ -2828,6 +2828,41 @@ mod tests {
         );
     }
 
+    /// `MovieSimilarItemsProvider` builds the seed's people as a `HashSet` of
+    /// person ids per item, so an actor credited in two roles on the seed
+    /// counts once (15), not once per credit row (30). The candidate sharing
+    /// two genres (20) therefore outranks the one sharing only that actor.
+    #[tokio::test]
+    async fn a_seed_actor_with_two_roles_counts_once() {
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x251);
+        let shares_actor = Uuid::from_u128(0x252);
+        let shares_genres = Uuid::from_u128(0x253);
+        seed_movie(&db, seed, "Seed", "SciFi|Horror").await;
+        seed_movie(&db, shares_actor, "SharesActor", "Romance").await;
+        seed_movie(&db, shares_genres, "SharesGenres", "SciFi|Horror").await;
+        let actor = |role: &str| PeopleEntity {
+            id: String::new(),
+            name: "Pat Actor".to_owned(),
+            person_type: Some("Actor".to_owned()),
+            role: Some(role.to_owned()),
+            ..PeopleEntity::default()
+        };
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(seed, &[actor("Twin A"), actor("Twin B")])
+            .await
+            .expect("credit two roles");
+        credit_person(&db, shares_actor, "Pat Actor", "Actor").await;
+
+        let similar = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
+        assert_eq!(names, ["SharesGenres", "SharesActor"]);
+    }
+
     #[tokio::test]
     async fn a_missing_seed_is_reported_as_absent_not_empty() {
         // C# `LibraryController.GetSimilarItems`: `if (item is null) return

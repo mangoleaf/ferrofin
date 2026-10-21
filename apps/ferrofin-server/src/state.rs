@@ -104,17 +104,6 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
 const JELLYFIN_API_VERSION: &str = "12.2.0";
 
-/// The host a Live TV live stream's buffered file is served from.
-///
-/// Jellyfin's `GetApiUrlForLocalAccess()` is the server's own bind address and
-/// deliberately never consults `PublishedServerUrl` (only `GetSmartApiUrl`
-/// does). Loopback is the strictly-local form of that, and it is right for the
-/// readers that matter: this process's own ffmpeg — which probes and transcodes
-/// the channel — and the DVR recorder. Routing them out through a public
-/// hostname would add TLS, a reverse proxy and a dependency on external DNS
-/// resolving from inside the container, any of which breaks Live TV outright.
-const LIVE_STREAM_LOCAL_HOST: &str = "127.0.0.1";
-
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -312,26 +301,8 @@ pub async fn build_app_state(
         ferrofin_util::directory_path::DirectoryPath::live(move || paths.cache_path().into())
     };
 
-    // A stable server/system id, persisted across restarts. Jellyfin persists its
-    // SystemId and the web client keys stored sessions by it, so regenerating it on
-    // every boot breaks reconnect: `ServerConnections.getApiClient` throws on the
-    // now-unknown id and the UI dies with a black screen. Persist to a dedicated
-    // `{config}/system_id` file.
-    // ponytail: a plain id file, not a new field threaded through the config manager.
-    let server_id = {
-        let id_path = config.config_dir.join("system_id");
-        match tokio::fs::read_to_string(&id_path).await {
-            Ok(s) if !s.trim().is_empty() => s.trim().to_owned(),
-            _ => {
-                let id = uuid::Uuid::new_v4().simple().to_string();
-                tokio::fs::create_dir_all(&config.config_dir).await.ok();
-                tokio::fs::write(&id_path, &id)
-                    .await
-                    .context("failed to persist system_id")?;
-                id
-            }
-        }
-    };
+    let server_id =
+        load_server_id(&config.config_dir, std::path::Path::new(&paths.data_path())).await?;
 
     // ---- leaf: lookup + repositories (Database-only) ----------------------
     let item_type_lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -753,6 +724,8 @@ pub async fn build_app_state(
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+        // A local video probe reads its first frame for HDR10+ when ffprobe can.
+        .with_first_video_frame_probe(ffmpeg.capabilities.prober_supports_first_video_frame())
         .with_localization(Arc::clone(&localization))
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);
@@ -923,6 +896,7 @@ pub async fn build_app_state(
             .with_item_store(Arc::clone(&item_persistence_service))
             .with_items(Arc::clone(&item_repository))
             .with_physical_root(db.clone(), root_folder_ids.aggregate)
+            .with_user_preferences(db.clone(), Arc::clone(&auth_cache))
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone())
             .with_user_root(user_root_store.clone())
@@ -1574,7 +1548,10 @@ pub async fn build_app_state(
         // (`GetStaticMediaSources`' per-user filter).
         .with_users(Arc::clone(&users))
         .with_visibility(Arc::clone(&item_visibility))
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // `GetVersionInfo` maps a source's path through `PathSubstitutions`
+        // when the caller asks for it.
+        .with_configuration(Arc::clone(&config_trait)),
     );
 
     // ---- managers over library -------------------------------------------
@@ -1999,7 +1976,9 @@ pub async fn build_app_state(
         .with_virtual_paths(virtual_paths)
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // `GetMappedPath` maps `Path` and the sources through `PathSubstitutions`.
+        .with_configuration(Arc::clone(&config_trait)),
     );
     // `DtoService` finishes a Live TV channel's DTO itself (C#
     // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV
@@ -2281,29 +2260,29 @@ pub async fn build_app_state(
                 listen_with_https: false,
                 published_server_url: config.published_url.clone(),
                 base_url: config.base_url.clone(),
-                enable_published_server_uri_by_request: false,
+                // Read live from the network manager attached below; this is
+                // only the startup fact.
+                enable_published_server_uri_by_request: network
+                    .read()
+                    .is_ok_and(|network| network.enable_published_server_uri_by_request()),
             },
             config.server_name.clone(),
         )
-        .with_network(Arc::clone(&network), config.bind_addr),
+        .with_network(
+            Arc::clone(&network),
+            config.bind_addr_explicit.then_some(config.bind_addr),
+        ),
     );
     config_mgr.add_configuration_listener(app_host.configuration_listener());
+    app_host.warn_if_published_url_base_path_differs();
     app_host
         .refresh_server_name()
         .await
         .context("failed to refresh advertised server name")?;
-    // The URL a live stream's buffered file is served from (C#
-    // `GetApiUrlForLocalAccess()`).
-    live_tv_impl.set_local_api_url(
-        ferrofin_traits::system::ServerApplicationHost::get_local_api_url(
-            app_host.as_ref(),
-            LIVE_STREAM_LOCAL_HOST,
-            None,
-            None,
-        )
-        .await
-        .context("failed to build the Live TV local api url")?,
-    );
+    // Where a live stream's buffered file and an in-progress recording are
+    // served from (C# `GetApiUrlForLocalAccess()`), asked per stream: the
+    // bound listener and the live network settings, never the published URL.
+    live_tv_impl.set_local_api_access(Arc::clone(&app_host) as Arc<_>);
     let app_host_trait: Arc<dyn ferrofin_traits::system::ServerApplicationHost> =
         Arc::clone(&app_host) as Arc<_>;
 
@@ -2345,9 +2324,12 @@ pub async fn build_app_state(
     let auth_context: Arc<dyn ferrofin_traits::net::AuthorizationContext> =
         Arc::new(auth_context_concrete);
 
-    let quick_connect: Arc<dyn ferrofin_traits::security::QuickConnect> = Arc::new(
-        FerrofinQuickConnect::new(Arc::clone(&config_trait), Arc::clone(&sessions)),
-    );
+    let quick_connect: Arc<dyn ferrofin_traits::security::QuickConnect> =
+        Arc::new(FerrofinQuickConnect::with_pending_per_ip(
+            Arc::clone(&config_trait),
+            Arc::clone(&sessions),
+            config.quick_connect_pending_per_ip.unwrap_or(0) as usize,
+        ));
 
     // Clone the collaborators the media-encoding pair needs before they are
     // moved into `AppState::new` below.
@@ -2471,6 +2453,17 @@ pub async fn build_app_state(
     // `maxWidth`/`format`/… requests resize/convert instead of serving the original.
     let state = state.with_image_processor(Arc::clone(&image_processor));
 
+    // `/health` and `/health/ready` check the database, as upstream's
+    // `DbContextFactoryHealthCheck` does.
+    let health_db = db.clone();
+    let state = state.with_health_checkers(vec![Arc::new(ferrofin_health::FnChecker::new(
+        "database",
+        move || {
+            let db = health_db.clone();
+            async move { db.can_connect().await.map_err(|e| e.to_string()) }
+        },
+    ))]);
+
     // Replace the `NoopLibraryMonitor` default with the webhook-driven monitor
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
     let state = state
@@ -2536,7 +2529,7 @@ pub async fn build_app_state(
         Arc::new(
             ferrofin_extensions::file_transformation::WebFileTransformationService::new(
                 Arc::clone(&plugins),
-                format!("http://127.0.0.1:{}", config.port),
+                Arc::clone(&app_host) as Arc<_>,
             ),
         );
     ferrofin_extensions::file_transformation::register_skip_button_transformer(
@@ -2544,8 +2537,9 @@ pub async fn build_app_state(
         Arc::clone(&plugins),
     )
     .await;
-    // Runtime (WASM) plugins' declared web transforms — enabled plugins
-    // only; the WIT trust note applies (client-side injection).
+    // Runtime (WASM) plugins' declared web transforms, each applied only
+    // while its plugin is enabled; the WIT trust note applies (client-side
+    // injection).
     wasm_host
         .register_web_transforms(&file_transformations, &plugins)
         .await;
@@ -2771,8 +2765,158 @@ fn subscribe_intro_skipper(
     );
 }
 
+/// The server's stable id (`ApplicationHost.SystemId`), persisted across
+/// restarts. Jellyfin persists its SystemId and the web client keys stored
+/// sessions by it, so regenerating it on every boot breaks reconnect:
+/// `ServerConnections.getApiClient` throws on the now-unknown id and the UI
+/// dies with a black screen.
+///
+/// In order:
+/// - Ferrofin's own `{config}/system_id`, once written, so an id clients
+///   already know never changes;
+/// - on the first boot over an adopted Jellyfin install, Jellyfin's
+///   `{DataPath}/device.txt`, used as stored when it parses as a GUID
+///   (`DeviceId.GetCachedId`), so clients keep recognising the server;
+/// - otherwise a new N-format GUID (`DeviceId.GetNewId`).
+///
+/// The choice is written to `system_id` through a temporary file and a
+/// rename, so a crash cannot leave an empty file behind.
+// ponytail: a plain id file, not a new field threaded through the config manager.
+async fn load_server_id(
+    config_dir: &std::path::Path,
+    data_path: &std::path::Path,
+) -> anyhow::Result<String> {
+    let id_path = config_dir.join("system_id");
+    // An id clients know is never replaced because its file could not be read
+    // this once: only a missing or empty file lets a new one be chosen.
+    match tokio::fs::read_to_string(&id_path).await {
+        Ok(stored) if !stored.trim().is_empty() => return Ok(stored.trim().to_owned()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", id_path.display()));
+        }
+    }
+    let device_id_path = data_path.join("device.txt");
+    // Kept as stored once it parses, like `GetCachedId`; trimmed (and a BOM
+    // dropped, as `File.ReadAllText` drops it) so a stray newline never
+    // reaches the `Id` clients see. Ferrofin never writes Jellyfin's file:
+    // a minted id lives in `system_id` alone, as adoption is one-way.
+    let adopted = match tokio::fs::read_to_string(&device_id_path).await {
+        Ok(value) => {
+            let value = value.trim_start_matches('\u{feff}').trim();
+            if uuid::Uuid::try_parse(value).is_ok() {
+                Some(value.to_owned())
+            } else {
+                tracing::warn!(
+                    path = %device_id_path.display(),
+                    "invalid value in Jellyfin's device id file; minting a new server id"
+                );
+                None
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                path = %device_id_path.display(),
+                error = %e,
+                "could not read Jellyfin's device id file; minting a new server id"
+            );
+            None
+        }
+    };
+    let adopted_jellyfin_id = adopted.is_some();
+    let id = adopted.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    tokio::fs::create_dir_all(config_dir)
+        .await
+        .context("failed to create the config directory for system_id")?;
+    let staged = config_dir.join("system_id.tmp");
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(&staged)
+            .await
+            .context("failed to create system_id.tmp")?;
+        file.write_all(id.as_bytes())
+            .await
+            .context("failed to write system_id.tmp")?;
+        file.sync_all()
+            .await
+            .context("failed to sync system_id.tmp")?;
+    }
+    tokio::fs::rename(&staged, &id_path)
+        .await
+        .context("failed to move system_id.tmp into place")?;
+    if adopted_jellyfin_id {
+        tracing::info!(
+            path = %device_id_path.display(),
+            "adopted Jellyfin's server id from its device id file"
+        );
+    }
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The server id on first boot over an adopted Jellyfin install is
+    /// Jellyfin's own (`DeviceId`: `{DataPath}/device.txt`), so clients keep
+    /// recognising the server; Ferrofin's `system_id`, once written, wins; and
+    /// with neither (or an unreadable `device.txt`) a new N-format id is minted.
+    #[tokio::test]
+    async fn the_server_id_adopts_jellyfins_device_id() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let config = tmp.path().join("config");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).expect("data dir");
+        std::fs::write(
+            data.join("device.txt"),
+            "0f3c2a7e9b8d4c1aa5e6f7081928374a\n",
+        ) // trailing newline: trimmed
+        .expect("device.txt");
+
+        let adopted = super::load_server_id(&config, &data).await.expect("id");
+        assert_eq!(adopted, "0f3c2a7e9b8d4c1aa5e6f7081928374a");
+        assert_eq!(
+            std::fs::read_to_string(config.join("system_id")).expect("persisted"),
+            adopted
+        );
+
+        // Ferrofin's own id wins once it exists, whatever device.txt says.
+        std::fs::write(data.join("device.txt"), "11111111111111111111111111111111")
+            .expect("device.txt");
+        assert_eq!(
+            super::load_server_id(&config, &data).await.expect("id"),
+            adopted
+        );
+
+        // Neither a Ferrofin id nor a valid device.txt: a fresh N-format id.
+        let fresh_config = tmp.path().join("fresh");
+        std::fs::write(data.join("device.txt"), "not a guid").expect("device.txt");
+        let minted = super::load_server_id(&fresh_config, &data)
+            .await
+            .expect("id");
+        assert_ne!(minted, "not a guid");
+        assert_eq!(minted.len(), 32);
+        assert!(uuid::Uuid::try_parse(&minted).is_ok());
+        assert!(
+            !fresh_config.join("system_id.tmp").exists(),
+            "the staged file is renamed into place"
+        );
+
+        // A device.txt that cannot be read (here a directory) also mints.
+        let other_data = tmp.path().join("other-data");
+        std::fs::create_dir_all(other_data.join("device.txt")).expect("dir");
+        let unread = super::load_server_id(&tmp.path().join("unread"), &other_data)
+            .await
+            .expect("id");
+        assert_eq!(unread.len(), 32);
+
+        // But a system_id that exists and cannot be read fails the boot rather
+        // than replacing the id clients know.
+        let broken_config = tmp.path().join("broken");
+        std::fs::create_dir_all(broken_config.join("system_id")).expect("dir");
+        assert!(super::load_server_id(&broken_config, &data).await.is_err());
+    }
+
     /// What the Intro Skipper was told, through the bus, by the payloads the
     /// publishers really write.
     #[derive(Default)]
@@ -2922,6 +3066,62 @@ mod tests {
             https_port: 8920,
             ..Config::test_stub(root)
         }
+    }
+
+    /// `/health` and `/health/ready` run a real database check (upstream
+    /// `DbContextFactoryHealthCheck`): healthy while the database answers,
+    /// 503 once it cannot.
+    #[tokio::test]
+    async fn health_probes_check_the_database() {
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        let config = test_config(tmp.path());
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory db opens");
+        db.run_migrations().await.expect("migrations apply");
+        let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+            chromaprint_muxer: false,
+        };
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
+            .await
+            .expect("app state wires");
+        let router = ferrofin_api::create_router(wired.state.clone());
+        let status = |path: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("infallible router")
+                    .status()
+            }
+        };
+
+        assert_eq!(status("/health").await, axum::http::StatusCode::OK);
+        assert_eq!(status("/health/ready").await, axum::http::StatusCode::OK);
+
+        db.close().await;
+        assert_eq!(
+            status("/health").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status("/health/ready").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

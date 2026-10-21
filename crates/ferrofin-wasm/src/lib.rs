@@ -247,6 +247,9 @@ pub struct LoadedPlugin {
     pub scan_targets: Vec<String>,
     /// The plugin's named-provider identity, when it is one.
     pub provider_info: Option<bindings::types::ProviderDescriptor>,
+    /// The `.wasm` file the plugin was loaded from, under whatever name it was
+    /// dropped in as; uninstalling the plugin deletes it.
+    pub artifact: std::path::PathBuf,
     /// Where the plugin's KV state persists — the analysis driver keeps its
     /// offer-once watermark there under a host-reserved key.
     state_path: std::path::PathBuf,
@@ -537,7 +540,8 @@ impl WasmPluginHost {
             .iter()
             .map(|p| {
                 let mut registered = RegisteredPlugin::new(p.descriptor.clone(), None)
-                    .with_default_config(p.default_config.clone());
+                    .with_default_config(p.default_config.clone())
+                    .with_artifact(p.artifact.clone());
                 for page in config_pages_for(&p.descriptor, &p.config_pages) {
                     registered = registered.with_config_page(page);
                 }
@@ -809,6 +813,7 @@ fn load_one(
         web_transforms,
         scan_targets,
         provider_info,
+        artifact: path.to_path_buf(),
         state_path,
         egress,
         private_http_allowed,
@@ -1364,8 +1369,11 @@ const MAX_TRANSFORMS_PER_PLUGIN: usize = 16;
 /// Max bytes for one transform's search or replace text.
 const MAX_TRANSFORM_TEXT: usize = 256 * 1024;
 
-/// A declared literal search/replace applied to served `/web` files.
+/// A declared literal search/replace applied to served `/web` files while
+/// its plugin is enabled.
 struct LiteralTransform {
+    plugin: Uuid,
+    plugins: Arc<dyn PluginManager>,
     search: String,
     replace: String,
 }
@@ -1373,16 +1381,28 @@ struct LiteralTransform {
 #[async_trait]
 impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
     async fn transform(&self, _path: &str, contents: String) -> String {
+        // Checked per serve, like the host's other surfaces: Disable or
+        // uninstall stops the injection at once, and Enable starts it.
+        let enabled = self
+            .plugins
+            .get_plugin(self.plugin)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|d| d.enabled);
+        if !enabled {
+            return contents;
+        }
         contents.replace(&self.search, &self.replace)
     }
 }
 
 impl WasmPluginHost {
-    /// Registers every ENABLED plugin's declared web transforms into the
-    /// server's transformation pipeline (capped; see the WIT trust note —
-    /// this is client-side script injection, the largest grant a plugin
-    /// has). A disabled plugin's transforms are not registered; toggling
-    /// takes effect on the next restart, like everything decided at boot.
+    /// Registers every plugin's declared web transforms into the server's
+    /// transformation pipeline (capped; see the WIT trust note — this is
+    /// client-side script injection, the largest grant a plugin has). Each
+    /// one applies only while its plugin is enabled, checked per serve, so
+    /// Disable, Enable and uninstall take effect without a restart.
     pub async fn register_web_transforms(
         &self,
         service: &Arc<dyn ferrofin_traits::plugins::FileTransformationService>,
@@ -1390,15 +1410,6 @@ impl WasmPluginHost {
     ) {
         for plugin in &self.plugins {
             if plugin.web_transforms.is_empty() {
-                continue;
-            }
-            let enabled = plugin_manager
-                .get_plugin(plugin.descriptor.id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|d| d.enabled);
-            if !enabled {
                 continue;
             }
             for transform in plugin.web_transforms.iter().take(MAX_TRANSFORMS_PER_PLUGIN) {
@@ -1422,6 +1433,8 @@ impl WasmPluginHost {
                         plugin.descriptor.id,
                         &transform.path_pattern,
                         Arc::new(LiteralTransform {
+                            plugin: plugin.descriptor.id,
+                            plugins: Arc::clone(plugin_manager),
                             search: transform.search.clone(),
                             replace: transform.replace.clone(),
                         }),
@@ -1477,14 +1490,23 @@ const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
 // Library-disabled items must remain eligible after another library advances the watermark.
 const SEGMENT_POLICY_PENDING_KEY: &str = "host:segment-policy-pending";
 
+/// Library items the analysis pass loads per page (the upstream
+/// `QueryPageLimit` the library tasks page with).
+const ANALYSIS_PAGE_SIZE: usize = 100;
+
 /// The dashboard task driving every analyzer plugin's `scan-media` pass:
 /// for each ENABLED plugin with non-empty `scan-targets`, offers each item
-/// newer than the plugin's watermark exactly once (host-tracked, in the
-/// plugin's own state file under a reserved key, unreadable and unwritable
-/// from the guest). An orderly guest error is logged (aggregated per pass)
-/// and never retried; TRAPS — not orderly errors — count toward the
-/// plugin's breaker, like every other guest call. The task itself never
-/// fails on a plugin's behavior.
+/// newer than the plugin's watermark once (host-tracked, in the plugin's
+/// own state file under a reserved key, unreadable and unwritable from the
+/// guest), oldest first and a page at a time. An orderly guest error is
+/// logged (aggregated per pass) and never retried; TRAPS — not orderly
+/// errors — count toward the plugin's breaker, like every other guest call.
+/// Once the runtime refuses a call (breaker open, runtime gone), the pass
+/// offers nothing more and the watermark stays below every item it did not
+/// reach; the plugin is skipped until the restart, whose first pass offers
+/// those. That pass can offer again an item sharing the cut-off item's
+/// DateCreated, and every item of a first pass cut short before its undated
+/// items. The task itself never fails on a plugin's behavior.
 struct WasmMediaAnalysisTask {
     plugins: Vec<Arc<LoadedPlugin>>,
     plugin_manager: Arc<dyn PluginManager>,
@@ -1508,7 +1530,7 @@ impl ScheduledTask for WasmMediaAnalysisTask {
         "Library"
     }
 
-    #[allow(clippy::too_many_lines)] // producer policy preserves the existing offer-once watermark
+    #[allow(clippy::too_many_lines)] // one pass per plugin: paging, the refusal stop and the pending items share its state
     async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
         let Some(cx) = self.collaborators.get() else {
             return Err(ServiceError::backend(
@@ -1516,6 +1538,11 @@ impl ScheduledTask for WasmMediaAnalysisTask {
             ));
         };
         for plugin in &self.plugins {
+            // A dead plugin refuses every offer until the restart: its pass
+            // would only re-read the library.
+            if plugin.runtime.is_dead() {
+                continue;
+            }
             let Some((config, kinds)) = plugin_pass_prelude(&self.plugin_manager, plugin).await?
             else {
                 continue;
@@ -1527,6 +1554,11 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     .unwrap_or(i64::MIN);
             let query = ferrofin_traits::options::InternalItemsQuery {
                 include_item_types: kinds,
+                // Oldest first, so a pass cut short leaves a tight watermark.
+                order_by: vec![(
+                    ferrofin_model::live_tv::ItemSortBy::DateCreated,
+                    ferrofin_model::dto::SortOrder::Ascending,
+                )],
                 // Push the watermark into the QUERY — materializing the
                 // whole library per pass per plugin would defeat the point.
                 // FIRST pass (no watermark yet) stays UNFILTERED so items
@@ -1541,79 +1573,119 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     .flatten(),
                 ..Default::default()
             };
-            let mut items = cx
+            // Ids first and rows a page at a time: the first pass covers
+            // every item of the target kinds.
+            let mut ids = cx
                 .library
-                .get_item_list(&query)
+                .get_item_ids(&query)
                 .await
                 .map_err(|e| ServiceError::backend(format!("analysis item query: {e}")))?;
             let pending: std::collections::HashSet<Uuid> =
                 capabilities::get_state(Some(&plugin.state_path), SEGMENT_POLICY_PENDING_KEY)
                     .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                     .unwrap_or_default();
-            if !pending.is_empty() {
-                let deferred = cx
-                    .library
-                    .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
-                        item_ids: pending.iter().copied().collect(),
-                        ..Default::default()
-                    })
-                    .await?;
-                items.extend(deferred);
-            }
+            let mut pending_ids: Vec<Uuid> = pending.iter().copied().collect();
+            pending_ids.sort_unstable();
+            ids.extend(pending_ids);
             let mut still_pending = std::collections::HashSet::new();
             let mut seen = std::collections::HashSet::new();
             let mut new_watermark = watermark;
+            // Set once the runtime refuses a call. The pass then offers
+            // nothing more but still reads the rest of its items, so
+            // `unreached` (the oldest one not offered) holds the watermark
+            // below every one of them.
+            let mut refused: Option<String> = None;
+            let mut unreached = i64::MAX;
             let mut offered = 0u32;
             let mut failed = 0u32;
             let mut first_failure: Option<String> = None;
-            for entity in items {
-                // NULL-dated items read as epoch: offered on the first
-                // (unfiltered) pass, then permanently behind the watermark.
-                let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
-                let item_id = uuid::Uuid::parse_str(&entity.id)
-                    .map_err(|error| ServiceError::backend(error.to_string()))?;
-                if !seen.insert(item_id) || (created <= watermark && !pending.contains(&item_id)) {
-                    continue;
-                }
-                new_watermark = new_watermark.max(created);
-                if cx
-                    .media_segments
-                    .is_registered_segment_provider(&format!("wasm:{}", plugin.descriptor.id))
-                    && !cx
-                        .media_segments
-                        .is_provider_enabled(item_id, &plugin.descriptor.name)
-                        .await?
-                {
-                    still_pending.insert(item_id);
-                    continue;
-                }
-                let item = capabilities::summarize(&entity, None);
-                let outcome = plugin.runtime.scan_media(item, config.clone()).await;
-                let result = match outcome {
-                    Ok(outcome) => {
-                        if outcome.policy_skipped {
+            for page_ids in ids.chunks(ANALYSIS_PAGE_SIZE) {
+                let mut page = cx
+                    .library
+                    .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                        item_ids: page_ids.to_vec(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| ServiceError::backend(format!("analysis item page: {e}")))?;
+                page.sort_by_key(|entity| entity.date_created);
+                for entity in page {
+                    // NULL-dated items read as epoch: offered on the first
+                    // (unfiltered) pass, then permanently behind the watermark.
+                    let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
+                    let item_id = uuid::Uuid::parse_str(&entity.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?;
+                    if !seen.insert(item_id)
+                        || (created <= watermark && !pending.contains(&item_id))
+                    {
+                        continue;
+                    }
+                    if refused.is_none() {
+                        if cx.media_segments.is_registered_segment_provider(&format!(
+                            "wasm:{}",
+                            plugin.descriptor.id
+                        )) && !cx
+                            .media_segments
+                            .is_provider_enabled(item_id, &plugin.descriptor.name)
+                            .await?
+                        {
                             still_pending.insert(item_id);
+                            new_watermark = new_watermark.max(created);
+                            continue;
                         }
-                        outcome.result
+                        let item = capabilities::summarize(&entity, None);
+                        match plugin.runtime.scan_media(item, config.clone()).await {
+                            Ok(outcome) => {
+                                if outcome.policy_skipped {
+                                    still_pending.insert(item_id);
+                                }
+                                if let Err(e) = outcome.result {
+                                    // Per-item detail stays at debug (volume
+                                    // scales with library size); one
+                                    // aggregated warn per pass below.
+                                    tracing::debug!(
+                                        plugin = plugin.descriptor.name,
+                                        item = %entity.id,
+                                        error = %e,
+                                        "scan-media failed for one item (offered once; not retried)"
+                                    );
+                                    failed += 1;
+                                    if first_failure.is_none() {
+                                        first_failure = Some(format!("{} -> {e}", entity.id));
+                                    }
+                                }
+                                offered += 1;
+                                new_watermark = new_watermark.max(created);
+                                continue;
+                            }
+                            // The runtime refused the call (breaker open,
+                            // runtime gone): the guest did not analyze it.
+                            Err(error) => refused = Some(error),
+                        }
                     }
-                    Err(error) => Err(error),
-                };
-                if let Err(e) = result {
-                    // Per-item detail stays at debug (volume scales with
-                    // library size); one aggregated warn per pass below.
-                    tracing::debug!(
-                        plugin = plugin.descriptor.name,
-                        item = %entity.id,
-                        error = %e,
-                        "scan-media failed for one item (offered once; not retried)"
-                    );
-                    failed += 1;
-                    if first_failure.is_none() {
-                        first_failure = Some(format!("{} -> {e}", entity.id));
+                    // Not reached this pass: the item stays eligible.
+                    if pending.contains(&item_id) {
+                        still_pending.insert(item_id);
+                    } else {
+                        // Only an unfiltered first pass holds undated items,
+                        // and a date filter would exclude them for good: the
+                        // next pass stays unfiltered.
+                        unreached = unreached.min(
+                            entity
+                                .date_created
+                                .map_or(i64::MIN, |d| d.timestamp_micros()),
+                        );
                     }
                 }
-                offered += 1;
-                new_watermark = new_watermark.max(created);
+            }
+            if let Some(error) = &refused {
+                new_watermark = new_watermark.min(unreached.saturating_sub(1));
+                warn!(
+                    plugin = plugin.descriptor.name,
+                    %error,
+                    offered,
+                    "analysis pass stopped: the plugin runtime refused a call; items not reached are offered after the restart"
+                );
             }
             if failed > 0 {
                 warn!(
@@ -1628,10 +1700,10 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                 let bytes = if still_pending.is_empty() {
                     None
                 } else {
-                    let mut ids: Vec<_> = still_pending.into_iter().collect();
-                    ids.sort_unstable();
+                    let mut pending_ids: Vec<_> = still_pending.into_iter().collect();
+                    pending_ids.sort_unstable();
                     Some(
-                        serde_json::to_vec(&ids)
+                        serde_json::to_vec(&pending_ids)
                             .map_err(|error| ServiceError::backend(error.to_string()))?,
                     )
                 };
@@ -1847,6 +1919,50 @@ impl ScheduledTask for WasmTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_web_transform_applies_only_while_its_plugin_is_enabled() {
+        use ferrofin_traits::plugins::FileTransformer as _;
+        let dir = tempfile::tempdir().unwrap();
+        let id = descriptor().id;
+        let plugins: Arc<dyn PluginManager> =
+            Arc::new(ferrofin_core::plugin_manager::FerrofinPluginManager::new(
+                vec![ferrofin_core::plugin_manager::RegisteredPlugin::new(
+                    descriptor(),
+                    None,
+                )],
+                dir.path().to_path_buf(),
+            ));
+        let transform = |plugin| LiteralTransform {
+            plugin,
+            plugins: Arc::clone(&plugins),
+            search: "</head>".to_owned(),
+            replace: "<script></script></head>".to_owned(),
+        };
+        let injected = "<script></script></head>";
+        let ours = transform(id);
+        assert_eq!(
+            ours.transform("index.html", "</head>".into()).await,
+            injected
+        );
+        plugins.disable_plugin(id).await.unwrap();
+        assert_eq!(
+            ours.transform("index.html", "</head>".into()).await,
+            "</head>",
+            "disabled: served unchanged"
+        );
+        plugins.enable_plugin(id).await.unwrap();
+        assert_eq!(
+            ours.transform("index.html", "</head>".into()).await,
+            injected
+        );
+        let gone = transform(Uuid::from_u128(8));
+        assert_eq!(
+            gone.transform("index.html", "</head>".into()).await,
+            "</head>",
+            "uninstalled (unknown to the manager): served unchanged"
+        );
+    }
 
     fn descriptor() -> PluginDescriptor {
         PluginDescriptor {

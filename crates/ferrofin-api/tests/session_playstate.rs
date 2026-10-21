@@ -111,6 +111,22 @@ fn data_dto(item_id: Uuid, played: bool) -> UserItemDataDto {
 /// ordinary clients.
 struct OkAuth {
     elevated: bool,
+    /// An API key: no user behind the token.
+    api_key: bool,
+}
+
+impl OkAuth {
+    fn info(&self) -> AuthorizationInfo {
+        if self.api_key {
+            AuthorizationInfo {
+                is_api_key: true,
+                user: None,
+                ..authed_info()
+            }
+        } else {
+            authed_info_as(self.elevated)
+        }
+    }
 }
 
 fn authed_info_as(elevated: bool) -> AuthorizationInfo {
@@ -138,7 +154,7 @@ fn authed_info() -> AuthorizationInfo {
 #[async_trait]
 impl AuthService for OkAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(authed_info_as(self.elevated))
+        Ok(self.info())
     }
 }
 
@@ -148,7 +164,7 @@ impl AuthorizationContext for OkAuth {
         &self,
         _r: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(authed_info_as(self.elevated))
+        Ok(self.info())
     }
 }
 
@@ -491,6 +507,8 @@ struct SessionCalls {
     removed_user: Option<(String, Uuid)>,
     now_viewing: Option<(String, String)>,
     logged_out: Option<String>,
+    /// The user each `log_session_activity` call carried (`None` for none).
+    logged_users: Vec<Option<String>>,
 }
 
 /// A recording [`SessionManager`]: `log_session_activity` yields a fixed session
@@ -532,8 +550,13 @@ impl SessionManager for RecordingSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .logged_users
+            .push(user.map(|user| user.id.clone()));
         Ok(current_session_dto(self.with_guest))
     }
     async fn on_playback_start(&self, _i: &PlaybackStartInfo) -> Result<(), ServiceError> {
@@ -862,6 +885,24 @@ fn state_with_users(
     elevated: bool,
     users: Arc<dyn UserManager>,
 ) -> AppState {
+    state_with_auth(
+        sessions,
+        user_data,
+        users,
+        &OkAuth {
+            elevated,
+            api_key: false,
+        },
+    )
+}
+
+/// [`state_with_users`] with the caller `auth` authenticates.
+fn state_with_auth(
+    sessions: Arc<RecordingSessions>,
+    user_data: Arc<RecordingUserData>,
+    users: Arc<dyn UserManager>,
+    auth: &OkAuth,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary),
         users,
@@ -877,8 +918,8 @@ fn state_with_users(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(OkAuth { elevated }),
-        Arc::new(OkAuth { elevated }),
+        Arc::new(OkAuth { ..*auth }),
+        Arc::new(OkAuth { ..*auth }),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1496,6 +1537,42 @@ async fn report_playback_start_is_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(sessions.calls.lock().unwrap().played_starts, 1);
+}
+
+/// `RequestHelpers.GetSession` resolves the caller's user only when it has
+/// one and logs the session with whatever it found: an API key's playback
+/// report gets a user-less session and goes on, where it used to answer 400.
+#[tokio::test]
+async fn an_api_key_reports_playback_through_a_user_less_session() {
+    let (sessions, user_data) = recording();
+    let info = PlaybackStartInfo {
+        item_id: ITEM_ID,
+        ..PlaybackStartInfo::default()
+    };
+    let (status, body) = send(
+        state_with_auth(
+            sessions.clone(),
+            user_data,
+            Arc::new(OkUsers),
+            &OkAuth {
+                elevated: false,
+                api_key: true,
+            },
+        ),
+        "POST",
+        "/Sessions/Playing",
+        Body::from(serde_json::to_vec(&info).unwrap()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let calls = sessions.calls.lock().unwrap();
+    assert_eq!(calls.played_starts, 1);
+    assert_eq!(calls.logged_users, vec![None]);
 }
 
 #[tokio::test]
