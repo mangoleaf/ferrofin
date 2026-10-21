@@ -6755,6 +6755,22 @@ impl LibraryScanner {
         } else {
             None
         };
+        // `FetchEmbeddedInfo` writes the item before the providers run: a
+        // stored item's pre-merge row, which the merge then treats as the
+        // item; a new item's row is upstream's `temp`, so its tags go on a
+        // copy that fills what the readers and providers leave
+        // ([`fill_embedded_info`]).
+        let mut new_item_tags = None;
+        if let Some(info) = video_info {
+            let replace_data = options.replace_all_metadata;
+            if let Some(base) = video_base.as_mut() {
+                fetch_embedded_info(base, info, locked, locked_fields, replace_data);
+            } else {
+                let mut tagged = entity.clone();
+                fetch_embedded_info(&mut tagged, info, locked, locked_fields, replace_data);
+                new_item_tags = Some(tagged);
+            }
+        }
         // `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`: on a
         // full refresh (`isFullRefresh`) of an unlocked season, `BeforeSave`
         // takes its premiere date and year from its episodes before the
@@ -7043,6 +7059,26 @@ impl LibraryScanner {
         // with the tags' (`FetchDataFromTags`, only for an unlocked item): they
         // stand unless a provider's answer replaces them in turn.
         let credits = credits.or_else(|| rows.people.clone().filter(|_| !locked));
+        // `FetchPeople`: the video prober writes the tagged people before the
+        // providers, for an unlocked item whose cast is unlocked, under
+        // "Replace all metadata" or when it has none yet; like the audio
+        // prober's, they stand unless a provider's credits replace them.
+        let credits = match credits {
+            Some(credits) => Some(credits),
+            None => match video_info {
+                Some(info)
+                    if !locked
+                        && !locked_fields.contains(&MetadataField::Cast)
+                        && !info.people.is_empty()
+                        && (options.replace_all_metadata
+                            || stored_row.is_none()
+                            || self.stored_cast_is_empty(item.id).await) =>
+                {
+                    Some(embedded_video_people(info))
+                }
+                _ => None,
+            },
+        };
         // `BeforeSaveInternal`: a stored file that changed on disk is
         // re-dated under "Use file creation date" (`RefreshContext::redated`).
         let redated = stored_row.and_then(|row| state.refresh.redated(row, item));
@@ -7111,6 +7147,17 @@ impl LibraryScanner {
             }
             None => saved_row(metadata_stored, &guesses, &entity, facts),
         };
+        if metadata_stored.is_none()
+            && let Some(tagged) = &new_item_tags
+        {
+            let forced_sort_name = entity.forced_sort_name.clone();
+            fill_embedded_info(&mut entity, tagged);
+            // `saved_row` settled the sort key already; a tagged forced sort
+            // name moves it.
+            if entity.forced_sort_name != forced_sort_name {
+                settle_sort_name(&mut entity);
+            }
+        }
         keep_unplanned_version_owner(
             item.id,
             &mut entity,
@@ -19118,6 +19165,171 @@ fn apply_video_metadata(
     }
 }
 
+/// The tagged values `FFProbeVideoInfo.FetchEmbeddedInfo` (v12.2,
+/// `FFProbeVideoInfo.cs:389-499`) writes onto a probed video, each kept when
+/// the item already has one unless "Replace all metadata" (`replace_data`) is
+/// on: the official rating, genres and studios (each lockable), a music
+/// video's album and artists, the production year and premiere date (not for
+/// an extra, which takes its owner's), the forced sort name (behind the Name
+/// lock), a year from the premiere date, and the overview. The episode numbers
+/// and the embedded title are [`apply_video_metadata`]'s.
+///
+/// Departure: under "Replace all metadata" upstream assigns the tag even when
+/// the file has none, erasing the overview, rating, genres, studios, album and
+/// artists before the merge. Its merge keeps the stored values when every
+/// remote provider failed ("erasing the old values is only safe when a remote
+/// provider returned something to replace them with",
+/// `MetadataService.cs:897-906`), and the prober's erasure defeats exactly
+/// that, so here a tag replaces only when the file carries one. When a
+/// provider does answer, the merge still replaces as upstream's does.
+fn fetch_embedded_info(
+    item: &mut BaseItemEntity,
+    info: &MediaInfo,
+    locked: bool,
+    fields: &[MetadataField],
+    replace_data: bool,
+) {
+    use chrono::Datelike as _;
+    let unlocked = |field: MetadataField| !locked && !fields.contains(&field);
+    let blank = |value: &Option<String>| value.as_deref().is_none_or(|v| v.trim().is_empty());
+    // Fill an empty field; replace a set one under "Replace all metadata"
+    // only with a tag the file carries (see the departure above).
+    let take = |stored: &Option<String>, tag: &Option<String>| {
+        blank(stored) || (replace_data && !blank(tag))
+    };
+    if unlocked(MetadataField::OfficialRating) && take(&item.official_rating, &info.official_rating)
+    {
+        item.official_rating.clone_from(&info.official_rating);
+    }
+    // `Genres = []`, then `AddGenre` for each trimmed tag.
+    let genres = distinct_trimmed(&info.genres);
+    if unlocked(MetadataField::Genres) && take(&item.genres, &genres) {
+        item.genres = genres;
+    }
+    // `SetStudios`: trimmed, distinct.
+    let studios = distinct_trimmed(&info.studios);
+    if unlocked(MetadataField::Studios) && take(&item.studios, &studios) {
+        item.studios = studios;
+    }
+    if !locked
+        && item_type_lookup::kind_from_type_name(&item.type_) == Some(BaseItemKind::MusicVideo)
+    {
+        if take(&item.album, &info.album) {
+            item.album.clone_from(&info.album);
+        }
+        let artists = (!info.artists.is_empty()).then(|| info.artists.join("|"));
+        if take(&item.artists, &artists) {
+            item.artists = artists;
+        }
+    }
+    // Extras have no release date of their own; they take their owner's.
+    let use_container_dates = item.extra_type.is_none();
+    if use_container_dates
+        && let Some(year) = info.production_year
+        && (item.production_year.is_none() || replace_data)
+    {
+        item.production_year = Some(i64::from(year));
+    }
+    if use_container_dates
+        && let Some(date) = info.premiere_date
+        && (item.premiere_date.is_none() || replace_data)
+    {
+        item.premiere_date = Some(date);
+    }
+    if unlocked(MetadataField::Name)
+        && let Some(sort) = info
+            .forced_sort_name
+            .as_deref()
+            .filter(|sort| !sort.trim().is_empty())
+    {
+        item.forced_sort_name = Some(sort.to_owned());
+    }
+    // `video.PremiereDate.Value.ToLocalTime().Year`.
+    if use_container_dates
+        && item.production_year.is_none()
+        && let Some(date) = item.premiere_date
+    {
+        item.production_year = Some(i64::from(date.with_timezone(&chrono::Local).year()));
+    }
+    if unlocked(MetadataField::Overview) && take(&item.overview, &info.overview) {
+        item.overview.clone_from(&info.overview);
+    }
+}
+
+/// `values` trimmed, blank ones dropped and the rest de-duplicated
+/// case-insensitively, pipe-joined as the multi-valued columns store them;
+/// `None` when nothing is left.
+fn distinct_trimmed(values: &[String]) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    for value in values.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        if !kept
+            .iter()
+            .any(|k| ferrofin_util::string_extensions::equals_ordinal_ignore_case(k, value))
+        {
+            kept.push(value);
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join("|"))
+}
+
+/// Fills a NEW item's saved row from the copy [`fetch_embedded_info`] wrote,
+/// where its readers and providers left a field empty. Upstream writes the
+/// tags onto the item before the providers run and merges their answer over
+/// it, so an answer wins and a tag fills what none gave; a new item's row is
+/// upstream's `temp`, which the providers only fill, so the tags go last.
+fn fill_embedded_info(row: &mut BaseItemEntity, tagged: &BaseItemEntity) {
+    for (value, tag) in [
+        (&mut row.official_rating, &tagged.official_rating),
+        (&mut row.genres, &tagged.genres),
+        (&mut row.studios, &tagged.studios),
+        (&mut row.album, &tagged.album),
+        (&mut row.artists, &tagged.artists),
+        (&mut row.forced_sort_name, &tagged.forced_sort_name),
+        (&mut row.overview, &tagged.overview),
+    ] {
+        if value.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            value.clone_from(tag);
+        }
+    }
+    if row.production_year.is_none() {
+        row.production_year = tagged.production_year;
+    }
+    if row.premiere_date.is_none() {
+        row.premiere_date = tagged.premiere_date;
+    }
+}
+
+/// The people `FFProbeVideoInfo.FetchPeople` writes for a probed video: each
+/// named one with its kind and trimmed role (`update_people` de-duplicates
+/// them as `PeopleHelper.AddPerson` does).
+fn embedded_video_people(info: &MediaInfo) -> Vec<PeopleEntity> {
+    info.people
+        .iter()
+        .filter_map(|person| {
+            let name = person
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())?;
+            Some(PeopleEntity {
+                id: guid_to_db(Uuid::new_v4()),
+                name: name.to_owned(),
+                // `PersonInfo.Type.ToString()`, as [`person_to_entity`] keys it.
+                person_type: Some(person.type_.json_name().into_owned()),
+                role: person
+                    .role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_owned),
+                primary_image_url: None,
+                provider_id: None,
+                sort_order: None,
+            })
+        })
+        .collect()
+}
+
 /// The naming rules [`before_metadata_refresh`] reads a path by.
 static PATH_NAMING: std::sync::LazyLock<NamingOptions> =
     std::sync::LazyLock::new(NamingOptions::new);
@@ -20913,6 +21125,179 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The container dates `FetchEmbeddedInfo` reads (v12.2
+    /// `FFProbeVideoInfoTests`): 2016 and 2016-05-04.
+    fn tagged_dates() -> super::MediaInfo {
+        use chrono::TimeZone as _;
+        super::MediaInfo {
+            production_year: Some(2016),
+            premiere_date: Some(chrono::Utc.with_ymd_and_hms(2016, 5, 4, 0, 0, 0).unwrap()),
+            ..super::MediaInfo::default()
+        }
+    }
+
+    /// `FetchEmbeddedInfo_NoExtra_AppliesContainerDates`.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn fetch_embedded_info_no_extra_applies_container_dates(#[case] replace_all: bool) {
+        use chrono::TimeZone as _;
+        let mut video = super::BaseItemEntity::default();
+        super::fetch_embedded_info(&mut video, &tagged_dates(), false, &[], replace_all);
+        assert_eq!(video.production_year, Some(2016));
+        assert_eq!(
+            video.premiere_date,
+            Some(chrono::Utc.with_ymd_and_hms(2016, 5, 4, 0, 0, 0).unwrap())
+        );
+    }
+
+    /// `FetchEmbeddedInfo_Extra_IgnoresContainerDates`: an extra keeps the
+    /// dates it took from its owner.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn fetch_embedded_info_extra_ignores_container_dates(#[case] replace_all: bool) {
+        use chrono::TimeZone as _;
+        let owner_date = chrono::Utc.with_ymd_and_hms(1982, 6, 25, 0, 0, 0).unwrap();
+        let mut video = super::BaseItemEntity {
+            // `ExtraType.Trailer`.
+            extra_type: Some(2),
+            production_year: Some(1982),
+            premiere_date: Some(owner_date),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &tagged_dates(), false, &[], replace_all);
+        assert_eq!(video.production_year, Some(1982));
+        assert_eq!(video.premiere_date, Some(owner_date));
+    }
+
+    /// `FetchEmbeddedInfo_ExtraWithoutDates_StaysWithoutDates`.
+    #[test]
+    fn fetch_embedded_info_extra_without_dates_stays_without_dates() {
+        let mut video = super::BaseItemEntity {
+            // `ExtraType.Trailer`.
+            extra_type: Some(2),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &tagged_dates(), false, &[], false);
+        assert_eq!(video.production_year, None);
+        assert_eq!(video.premiere_date, None);
+    }
+
+    /// Each tag fills an empty field and replaces only under "Replace all
+    /// metadata"; a field's own lock keeps it, the forced sort name follows
+    /// the Name lock, and a locked item takes none of it.
+    #[rstest::rstest]
+    #[case::fills(false, false, &[], "PG|Drama|ACME|tagged|Tag Sort")]
+    #[case::keeps_without_replace(true, false, &[], "R|Comedy|Stored Co|stored|Tag Sort")]
+    #[case::replaces(true, true, &[], "PG|Drama|ACME|tagged|Tag Sort")]
+    #[case::name_locked(true, true, &[ferrofin_model::entities::MetadataField::Name], "PG|Drama|ACME|tagged|stored sort")]
+    #[case::field_locks_keep(
+        true,
+        true,
+        &[
+            ferrofin_model::entities::MetadataField::OfficialRating,
+            ferrofin_model::entities::MetadataField::Genres,
+            ferrofin_model::entities::MetadataField::Studios,
+            ferrofin_model::entities::MetadataField::Overview,
+        ],
+        "R|Comedy|Stored Co|stored|Tag Sort"
+    )]
+    fn fetch_embedded_info_fills_replaces_and_respects_locks(
+        #[case] stored: bool,
+        #[case] replace_all: bool,
+        #[case] fields: &[ferrofin_model::entities::MetadataField],
+        #[case] expected: &str,
+    ) {
+        let info = super::MediaInfo {
+            official_rating: Some("PG".to_owned()),
+            genres: vec![" Drama".to_owned(), "drama".to_owned(), String::new()],
+            studios: vec!["ACME".to_owned()],
+            overview: Some("tagged".to_owned()),
+            forced_sort_name: Some("Tag Sort".to_owned()),
+            ..super::MediaInfo::default()
+        };
+        let mut video = if stored {
+            super::BaseItemEntity {
+                official_rating: Some("R".to_owned()),
+                genres: Some("Comedy".to_owned()),
+                studios: Some("Stored Co".to_owned()),
+                overview: Some("stored".to_owned()),
+                forced_sort_name: Some("stored sort".to_owned()),
+                ..super::BaseItemEntity::default()
+            }
+        } else {
+            super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &info, false, fields, replace_all);
+        let got = [
+            &video.official_rating,
+            &video.genres,
+            &video.studios,
+            &video.overview,
+            &video.forced_sort_name,
+        ]
+        .iter()
+        .map(|v| v.as_deref().unwrap_or("-"))
+        .collect::<Vec<_>>()
+        .join("|");
+        assert_eq!(got, expected);
+        // Replacing with a file that carries no tags keeps the stored values
+        // (the departure in `fetch_embedded_info`'s docs).
+        let mut untagged_replace = super::BaseItemEntity {
+            official_rating: Some("R".to_owned()),
+            genres: Some("Comedy".to_owned()),
+            overview: Some("stored".to_owned()),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(
+            &mut untagged_replace,
+            &super::MediaInfo::default(),
+            false,
+            &[],
+            true,
+        );
+        assert_eq!(
+            (
+                untagged_replace.official_rating.as_deref(),
+                untagged_replace.genres.as_deref(),
+                untagged_replace.overview.as_deref()
+            ),
+            (Some("R"), Some("Comedy"), Some("stored"))
+        );
+        let mut locked = super::BaseItemEntity::default();
+        super::fetch_embedded_info(&mut locked, &info, true, &[], true);
+        assert_eq!(
+            (
+                locked.official_rating,
+                locked.overview,
+                locked.forced_sort_name
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// A music video takes its album and artists from the tags; a year comes
+    /// from the premiere date when none was tagged.
+    #[test]
+    fn fetch_embedded_info_fills_a_music_videos_album_and_a_year_from_its_date() {
+        use chrono::TimeZone as _;
+        let info = super::MediaInfo {
+            album: Some("Live".to_owned()),
+            artists: vec!["Band".to_owned(), "Guest".to_owned()],
+            premiere_date: Some(chrono::Utc.with_ymd_and_hms(2019, 7, 1, 12, 0, 0).unwrap()),
+            ..super::MediaInfo::default()
+        };
+        let mut video = super::BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.MusicVideo".to_owned(),
+            ..super::BaseItemEntity::default()
+        };
+        super::fetch_embedded_info(&mut video, &info, false, &[], false);
+        assert_eq!(video.album.as_deref(), Some("Live"));
+        assert_eq!(video.artists.as_deref(), Some("Band|Guest"));
+        assert_eq!(video.production_year, Some(2019));
+    }
+
     fn credit(name: &str, person_type: &str, role: &str) -> super::PeopleEntity {
         super::PeopleEntity {
             name: name.to_owned(),
