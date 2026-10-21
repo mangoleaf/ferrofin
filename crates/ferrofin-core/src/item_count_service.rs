@@ -31,7 +31,9 @@ use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow, P
 use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{QueryShape, append_parental_restrictions, build_query};
+use crate::translate_query::{
+    ALTERNATE_VERSION_HIDDEN, QueryShape, append_parental_restrictions, build_query,
+};
 
 /// Adds the same rating predicate as browsing before an existing aggregate's
 /// GROUP BY. Its suffix contains no parameters, so the original bind order is
@@ -86,10 +88,27 @@ fn extra_counts_sql(owner_count: usize) -> String {
     )
 }
 
-/// `DescendantQueryHelper.IsDistinctLibraryItem`: a row that is its own
-/// title, not a merged alternate version or a part its owner stands for.
-const DISTINCT_LIBRARY_ITEM: &str =
-    r#""PrimaryVersionId" IS NULL AND ("OwnerId" IS NULL OR "ExtraType" IS NOT NULL)"#;
+/// v12.2 `GetChildCountBatch`'s `accessibleItems` on the `bi` row, short of
+/// the parental and tag rules (which [`restrict_count_query`] adds).
+///
+/// With no user it is `DescendantQueryHelper.IsDistinctLibraryItem`: no
+/// alternate version, and no owned part that is not an extra. With a user it
+/// is `ApplyAccessFiltering`'s pair, which the browse applies too
+/// ([`ALTERNATE_VERSION_HIDDEN`]): an alternate is hidden only while its
+/// primary is in the same library, and an owned non-extra is hidden.
+///
+/// `ApplyAccessFiltering` also starts with `ApplyTopParentFiltering`, which
+/// keeps only rows in libraries the user may open. That part is not ported
+/// yet (GitLab gl-799): it needs the user's visible libraries resolved once
+/// per batch, as the browse does.
+fn accessible_item(has_user: bool) -> String {
+    let owned = r#"(bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)"#;
+    if has_user {
+        format!("{owned}{ALTERNATE_VERSION_HIDDEN}")
+    } else {
+        format!(r#"bi."PrimaryVersionId" IS NULL AND {owned}"#)
+    }
+}
 
 /// Which column ties a child to the parent it is counted under in
 /// `GetChildCountBatch`.
@@ -109,7 +128,7 @@ impl ChildOf {
     /// whole table, and no later index or statistics may choose one.
     fn column_and_term(self) -> (&'static str, &'static str) {
         match self {
-            Self::Parent => ("ParentId", r#" AND +"SeasonId" IS NULL"#),
+            Self::Parent => ("ParentId", r#" AND +bi."SeasonId" IS NULL"#),
             Self::Season => ("SeasonId", ""),
         }
     }
@@ -121,34 +140,57 @@ fn virtual_term(include_virtual: bool) -> &'static str {
     if include_virtual {
         ""
     } else {
-        r#" AND +"IsVirtualItem" = 0"#
+        r#" AND +bi."IsVirtualItem" = 0"#
     }
 }
 
 /// v12.2 `GetChildCountBatch`'s `hierarchicalCounts` and `seasonCounts`: the
-/// distinct children of `n` parents, grouped on `child_of`'s column. Merged
-/// alternates do not count (a season's `ChildCount` is its distinct episodes,
-/// not every version), nor does a stacked part or local version, which
-/// belongs to its owner.
-fn child_count_sql(child_of: ChildOf, n: usize, include_virtual: bool) -> String {
+/// [`accessible_item`] children of `n` parents, grouped on `child_of`'s
+/// column. Merged alternates do not count (a season's `ChildCount` is its
+/// distinct episodes, not every version), nor does a stacked part or local
+/// version, which belongs to its owner.
+fn child_count_sql(child_of: ChildOf, n: usize, has_user: bool, include_virtual: bool) -> String {
     let (column, term) = child_of.column_and_term();
     format!(
-        r#"SELECT "{column}", COUNT(*) FROM "BaseItems"
-           WHERE {DISTINCT_LIBRARY_ITEM}{term}{virtual} AND "{column}" IN ({})
-           GROUP BY "{column}""#,
+        r#"SELECT bi."{column}", COUNT(*) FROM "BaseItems" bi
+           WHERE {access}{term}{virtual} AND bi."{column}" IN ({})
+           GROUP BY bi."{column}""#,
         placeholders(n),
+        access = accessible_item(has_user),
         virtual = virtual_term(include_virtual),
+    )
+}
+
+/// `GetChildCountBatch`'s `linkedCounts`: the `LinkedChildren` rows of `n`
+/// parents whose child is an [`accessible_item`] ("a linked child counts
+/// only when the item it points at is one the user may open").
+fn linked_count_sql(n: usize, has_user: bool) -> String {
+    format!(
+        // `CROSS JOIN` keeps the page's links as the outer loop, so each
+        // child is one primary-key probe.
+        r#"SELECT lc."ParentId", COUNT(*) FROM "LinkedChildren" lc
+           CROSS JOIN "BaseItems" bi ON bi."Id" = lc."ChildId"
+           WHERE {access} AND lc."ParentId" IN ({})
+           GROUP BY lc."ParentId""#,
+        placeholders(n),
+        access = accessible_item(has_user),
     )
 }
 
 /// `GetMergedChildCounts`' child rows for `n` merged folders: the parent each
 /// is counted under, its id and its `PresentationUniqueKey`.
-fn merged_children_sql(child_of: ChildOf, n: usize, include_virtual: bool) -> String {
+fn merged_children_sql(
+    child_of: ChildOf,
+    n: usize,
+    has_user: bool,
+    include_virtual: bool,
+) -> String {
     let (column, term) = child_of.column_and_term();
     format!(
-        r#"SELECT "{column}", "Id", "PresentationUniqueKey" FROM "BaseItems"
-           WHERE {DISTINCT_LIBRARY_ITEM}{term}{virtual} AND "{column}" IN ({})"#,
+        r#"SELECT bi."{column}", bi."Id", bi."PresentationUniqueKey" FROM "BaseItems" bi
+           WHERE {access}{term}{virtual} AND bi."{column}" IN ({})"#,
         placeholders(n),
+        access = accessible_item(has_user),
         virtual = virtual_term(include_virtual),
     )
 }
@@ -865,6 +907,7 @@ impl ItemCountService for FerrofinItemCountService {
         {
             access_filter.set_user(user);
         }
+        let has_user = access_filter.user.is_some();
         // `includeVirtual`: missing episodes count for no user, or for one
         // who displays them.
         let include_virtual = access_filter
@@ -921,29 +964,25 @@ impl ItemCountService for FerrofinItemCountService {
         // about four per tag in the user's tag policy plus a few tens, so a
         // chunk overflows only past ~8,000 tags on one user.
         for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let linked_sql = format!(
-                r#"SELECT "ParentId", COUNT(*) FROM "LinkedChildren" WHERE "ParentId" IN ({})
-                   GROUP BY "ParentId""#,
-                placeholders(chunk.len())
-            );
-            for (sql, id, into) in [
+            let n = chunk.len();
+            for (sql, into) in [
                 (
-                    child_count_sql(ChildOf::Parent, chunk.len(), include_virtual),
-                    r#""BaseItems"."Id""#,
+                    child_count_sql(ChildOf::Parent, n, has_user, include_virtual),
                     &mut hierarchical,
                 ),
                 (
-                    child_count_sql(ChildOf::Season, chunk.len(), include_virtual),
-                    r#""BaseItems"."Id""#,
+                    child_count_sql(ChildOf::Season, n, has_user, include_virtual),
                     &mut seasons,
                 ),
-                (linked_sql, r#""LinkedChildren"."ChildId""#, &mut linked),
+                (linked_count_sql(n, has_user), &mut linked),
             ] {
                 let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
                 for id in chunk {
                     query = query.bind(id.as_str());
                 }
-                let mut query = restrict_count_query(query, &access_filter, Some(id))?;
+                // Every statement reads the child as `bi`, so the parental and
+                // tag rules apply to it directly.
+                let mut query = restrict_count_query(query, &access_filter, None)?;
                 into.extend(
                     query
                         .build_query_as::<(String, i64)>()
@@ -1069,14 +1108,18 @@ impl FerrofinItemCountService {
         let mut keys_by_member: HashMap<String, Vec<String>> = HashMap::new();
         for chunk in members.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             for child_of in [ChildOf::Parent, ChildOf::Season] {
-                let sql = merged_children_sql(child_of, chunk.len(), include_virtual);
+                let sql = merged_children_sql(
+                    child_of,
+                    chunk.len(),
+                    access_filter.user.is_some(),
+                    include_virtual,
+                );
                 let mut query =
                     sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(sql));
                 for id in chunk {
                     query = query.bind(id.as_str());
                 }
-                let mut query =
-                    restrict_count_query(query, access_filter, Some(r#""BaseItems"."Id""#))?;
+                let mut query = restrict_count_query(query, access_filter, None)?;
                 let rows: Vec<(String, String, Option<String>)> = query
                     .build_query_as()
                     .fetch_all(self.db.pool())
@@ -2168,6 +2211,89 @@ mod tests {
             [2, 2, 2, 2, 1],
             "restricted user"
         );
+    }
+
+    /// Since 12.1 a linked child counts only when it is an item the user may
+    /// open (`GetChildCountBatch`'s `accessibleItems` join): a box set that
+    /// links a film and that film's alternate version in the same library
+    /// holds one title, and an owned non-extra is no child of it either.
+    #[tokio::test]
+    async fn a_linked_alternate_version_does_not_count() {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let (library, collection) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, library, BaseItemKind::CollectionFolder, "Movies", None).await;
+        seed_item(&db, collection, BaseItemKind::BoxSet).await;
+        let [primary, alternate, owned] = [(); 3].map(|()| Uuid::new_v4());
+        for id in [primary, alternate, owned] {
+            seed_child_item(&db, id, BaseItemKind::Movie, "m", library).await;
+            set_column(&db, id, "TopParentId", Some(guid_to_db(library))).await;
+        }
+        set_column(
+            &db,
+            alternate,
+            "PrimaryVersionId",
+            Some(guid_to_db(primary)),
+        )
+        .await;
+        set_column(&db, owned, "OwnerId", Some(guid_to_db(primary))).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        for (order, id) in [primary, alternate, owned].into_iter().enumerate() {
+            links
+                .upsert_linked_child(collection, id, i32::try_from(order).unwrap_or(0))
+                .await
+                .expect("link");
+        }
+        let service = svc(&db);
+        for viewer in [None, Some(user)] {
+            let counts = service
+                .get_child_count_batch(&[collection], viewer)
+                .await
+                .expect("child counts");
+            assert_eq!(counts[&collection], 1, "{viewer:?}");
+        }
+    }
+
+    /// With a user, an alternate version is hidden only while its primary is
+    /// in the same library (`ApplyAlternateVersionFiltering`, the rule the
+    /// browse applies): one whose primary is in another library is a child
+    /// the user sees, so it counts. With no user, `IsDistinctLibraryItem`
+    /// still drops every alternate.
+    #[tokio::test]
+    async fn a_cross_library_alternate_counts_for_a_user() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let (films, four_k, folder) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, films, BaseItemKind::CollectionFolder, "Films", None).await;
+        seed_folder_item(&db, four_k, BaseItemKind::CollectionFolder, "4K", None).await;
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Dune", Some(four_k)).await;
+        let (primary, alternate) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_child_item(&db, primary, BaseItemKind::Movie, "Dune", films).await;
+        set_column(&db, primary, "TopParentId", Some(guid_to_db(films))).await;
+        seed_child_item(&db, alternate, BaseItemKind::Movie, "Dune", folder).await;
+        set_column(&db, alternate, "TopParentId", Some(guid_to_db(four_k))).await;
+        set_column(
+            &db,
+            alternate,
+            "PrimaryVersionId",
+            Some(guid_to_db(primary)),
+        )
+        .await;
+        let service = svc(&db);
+        let count = |viewer| {
+            let service = service.clone();
+            async move {
+                service
+                    .get_child_count_batch(&[folder], viewer)
+                    .await
+                    .expect("child counts")[&folder]
+            }
+        };
+        assert_eq!(count(Some(user)).await, 1, "a user sees the 4K copy");
+        assert_eq!(count(None).await, 0, "no user collapses every alternate");
     }
 
     /// `GetChildCountBatch_NoUser_StillCollapsesAlternateVersions`: with no
@@ -3498,30 +3624,92 @@ mod tests {
     }
 
     /// `GetChildCountBatch`'s statements seek their grouped column's own
-    /// index, whatever the virtual rule: `ParentId` for direct children,
-    /// `SeasonId` for a season's episodes. The `+"SeasonId" IS NULL` term
-    /// must not pull the direct count onto the `SeasonId` index, where most
-    /// rows are NULL.
+    /// index, for either access rule and whatever the virtual rule:
+    /// `ParentId` for direct children, `SeasonId` for a season's episodes,
+    /// and the `LinkedChildren` parent for links, each child then read by its
+    /// primary key. The `+bi."SeasonId" IS NULL` term must not pull the
+    /// direct count onto the `SeasonId` index, where most rows are NULL; a
+    /// user's alternate-version rule is one primary-key probe per child.
     #[tokio::test]
     async fn the_child_counts_seek_their_grouped_column() {
         let db = test_db().await;
-        for include_virtual in [true, false] {
-            for (child_of, index) in [
-                (ChildOf::Parent, "IX_BaseItems_ParentId (ParentId=?)"),
-                (ChildOf::Season, "IX_BaseItems_SeasonId (SeasonId=?)"),
-            ] {
-                for sql in [
-                    child_count_sql(child_of, 2, include_virtual),
-                    merged_children_sql(child_of, 2, include_virtual),
+        let by_key = "USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
+        for has_user in [false, true] {
+            for include_virtual in [true, false] {
+                for (child_of, index) in [
+                    (ChildOf::Parent, "IX_BaseItems_ParentId (ParentId=?)"),
+                    (ChildOf::Season, "IX_BaseItems_SeasonId (SeasonId=?)"),
                 ] {
-                    let plan = query_plan(&db, &sql, 2).await;
-                    assert_eq!(
-                        plan,
-                        [format!("SEARCH BaseItems USING INDEX {index}")],
-                        "{sql}"
-                    );
+                    for sql in [
+                        child_count_sql(child_of, 2, has_user, include_virtual),
+                        merged_children_sql(child_of, 2, has_user, include_virtual),
+                    ] {
+                        let plan = query_plan(&db, &sql, 2).await;
+                        assert_eq!(plan[0], format!("SEARCH bi USING INDEX {index}"), "{sql}");
+                        assert!(
+                            plan[1..].iter().all(|step| step.contains(by_key)
+                                || step.starts_with("CORRELATED")),
+                            "{plan:?}"
+                        );
+                    }
                 }
             }
+            let plan = query_plan(&db, &linked_count_sql(2, has_user), 2).await;
+            assert!(plan[0].starts_with("SEARCH lc USING"), "{plan:?}");
+            assert!(plan[0].ends_with("(ParentId=?)"), "{plan:?}");
+            assert_eq!(plan[1], format!("SEARCH bi {by_key}"), "{plan:?}");
+            assert!(!plan.iter().any(|step| step.contains("SCAN")), "{plan:?}");
+        }
+    }
+
+    /// A user with parental and tag rules adds them to each child read as
+    /// `bi` (the tag subqueries probe by item), and the statements keep
+    /// their seeks: no scan of `BaseItems` or `LinkedChildren`.
+    #[tokio::test]
+    async fn restricted_child_counts_keep_their_seeks() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery {
+            max_parental_rating: Some(ferrofin_model::entities_media::ParentalRatingScore {
+                score: 12,
+                sub_score: None,
+            }),
+            exclude_inherited_tags: vec!["horror".to_owned()],
+            ..Default::default()
+        };
+        assert!(crate::translate_query::has_parental_restrictions(&filter));
+        for sql in [
+            child_count_sql(ChildOf::Parent, 2, true, false),
+            child_count_sql(ChildOf::Season, 2, true, false),
+            linked_count_sql(2, true),
+            merged_children_sql(ChildOf::Season, 2, true, false),
+        ] {
+            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql.clone()));
+            for id in ["a", "b"] {
+                query = query.bind(id);
+            }
+            let mut builder = restrict_count_query(query, &filter, None).expect("restrict");
+            let mut built = builder.build();
+            let args = built.take_arguments().expect("arguments").expect("binds");
+            let explain = format!("EXPLAIN QUERY PLAN {}", built.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(explain), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan[0].starts_with("SEARCH bi USING INDEX")
+                    || plan[0].starts_with("SEARCH lc USING"),
+                "{sql}\n{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN bi")
+                    || step.starts_with("SCAN lc")
+                    || step.contains("SCAN BaseItems")),
+                "{sql}\n{plan:?}"
+            );
         }
     }
 
