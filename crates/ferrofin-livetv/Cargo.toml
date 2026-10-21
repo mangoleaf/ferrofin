@@ -10,6 +10,8 @@ description = "Live TV for Ferrofin — M3U tuners, XMLTV guide, DVR timers, Sch
 workspace = true
 
 [dependencies]
+# `M3uParser.KeyValueRegex`, ported verbatim.
+regex.workspace = true
 ferrofin-util.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
