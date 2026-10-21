@@ -9,6 +9,11 @@
 //! used by default. Downloads still require an OpenSubtitles account; with no
 //! account or explicit key configured, the provider remains inactive.
 //!
+//! Downloads share one session, as the plugin's downloader does: the login's
+//! token is reused until it expires or the configured account changes, and the
+//! account's daily quota is tracked, so a spent quota stops downloads until its
+//! reset time instead of logging in again for every file.
+//!
 //! API shape (<https://opensubtitles.stoplight.io>): every call carries the
 //! `Api-Key` header and a descriptive `User-Agent`; `POST /login` exchanges the
 //! account for a bearer token, `GET /subtitles` searches, and `POST /download`
@@ -68,6 +73,13 @@ impl OpenSubtitlesConfig {
         !self.api_key.expose_secret().trim().is_empty()
             || (!self.username.trim().is_empty()
                 && !self.password.expose_secret().trim().is_empty())
+    }
+
+    /// Whether an account is configured: both a username and a password
+    /// (`Login`'s `IsNullOrWhiteSpace` checks). Downloads need one.
+    #[must_use]
+    pub fn has_account(&self) -> bool {
+        !self.username.trim().is_empty() && !self.password.expose_secret().trim().is_empty()
     }
 
     /// The operator's override, or Jellyfin's shared application key.
@@ -139,9 +151,155 @@ struct DownloadRequest {
     sub_format: String,
 }
 
+/// `GET /infos/user`: the account's download quota (`EncapsulatedUserInfo`).
+/// Read leniently, like every quota field: the quota only informs downloads,
+/// so a reply missing part of it must not fail one.
 #[derive(Deserialize)]
+struct UserInfoResponse {
+    #[serde(default)]
+    data: Option<UserQuota>,
+}
+
+/// The plugin's `UserInfo`: how many downloads are left, and when the quota
+/// resets.
+#[derive(Deserialize)]
+struct UserQuota {
+    #[serde(default)]
+    remaining_downloads: Option<i32>,
+    #[serde(default, rename = "reset_time_utc", deserialize_with = "lenient_time")]
+    reset_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `POST /download` (`SubtitleDownloadInfo`), read leniently: an error reply
+/// may carry only part of it.
+#[derive(Deserialize, Default)]
 struct DownloadResponse {
-    link: String,
+    #[serde(default)]
+    link: Option<String>,
+    #[serde(default)]
+    remaining: Option<i32>,
+    #[serde(default, rename = "reset_time_utc", deserialize_with = "lenient_time")]
+    reset_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// An RFC 3339 time, or `None` for anything else (absent, null, malformed).
+fn lenient_time<'de, D>(deserializer: D) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|time| time.with_timezone(&chrono::Utc)))
+}
+
+/// A logged-in OpenSubtitles session: the plugin downloader's `_login`.
+struct Session {
+    /// The account and key the token was issued for. A configuration naming
+    /// another one needs a new login, as `ConfigurationChanged` forces.
+    username: String,
+    password: SecretString,
+    api_key: SecretString,
+    token: SecretString,
+    /// The token's `exp` (`LoginInfo.ExpirationDate`).
+    expires_at: chrono::DateTime<chrono::Utc>,
+    /// The account's quota (`_login.User`), once read.
+    quota: Option<UserQuota>,
+}
+
+impl Session {
+    /// Whether this session belongs to `cfg`'s account and key.
+    fn belongs_to(&self, cfg: &OpenSubtitlesConfig) -> bool {
+        self.username == cfg.username
+            && self.password.expose_secret() == cfg.password.expose_secret()
+            && self.api_key.expose_secret() == cfg.effective_api_key()
+    }
+
+    /// Whether the token is still good (`DateTime.UtcNow < ExpirationDate`).
+    fn is_live(&self) -> bool {
+        chrono::Utc::now() < self.expires_at
+    }
+
+    /// Whether this session holds `token`.
+    fn holds(&self, token: &SecretString) -> bool {
+        self.token.expose_secret() == token.expose_secret()
+    }
+
+    /// Whether the quota is known to be spent (`RemainingDownloads <= 0`).
+    fn quota_spent(&self) -> bool {
+        self.quota
+            .as_ref()
+            .and_then(|quota| quota.remaining_downloads)
+            .is_some_and(|remaining| remaining <= 0)
+    }
+}
+
+/// What downloads share: the session and the quota's reset time (the
+/// plugin's `_login` and `_limitReset`).
+#[derive(Default)]
+struct DownloadState {
+    session: Option<Session>,
+    limit_reset: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl DownloadState {
+    /// The quota of `cfg`'s account, if its session has read one. The quota
+    /// is the account's, so a download's reply updates it whichever of the
+    /// account's logins the download used.
+    fn account_quota(&mut self, cfg: &OpenSubtitlesConfig) -> Option<&mut UserQuota> {
+        self.session
+            .as_mut()
+            .filter(|session| session.belongs_to(cfg))
+            .and_then(|session| session.quota.as_mut())
+    }
+}
+
+/// The expiry a JWT carries in its payload's `exp` (`LoginInfo.ExpirationDate`).
+/// A token with no readable `exp` counts as already expired, as upstream's
+/// `?.Exp ?? 0`.
+fn token_expiry(token: &str) -> chrono::DateTime<chrono::Utc> {
+    #[derive(Deserialize)]
+    struct Payload {
+        #[serde(default)]
+        exp: i64,
+    }
+    token
+        .split('.')
+        .nth(1)
+        .and_then(decode_base64url)
+        .and_then(|payload| serde_json::from_slice::<Payload>(&payload).ok())
+        .and_then(|payload| chrono::DateTime::from_timestamp(payload.exp, 0))
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+}
+
+/// Decodes unpadded or padded base64url (a JWT segment).
+fn decode_base64url(text: &str) -> Option<Vec<u8>> {
+    let value = |byte: u8| -> Option<u32> {
+        Some(u32::from(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return None,
+        }))
+    };
+    let digits = text.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    for chunk in digits.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut buffer = 0u32;
+        for (index, &digit) in chunk.iter().enumerate() {
+            buffer |= value(digit)? << (18 - 6 * index);
+        }
+        let bytes = buffer.to_be_bytes();
+        out.extend_from_slice(&bytes[1..chunk.len()]);
+    }
+    Some(out)
 }
 
 /// The provider-local id of one downloadable file, in the exact shape of the
@@ -254,6 +412,8 @@ pub struct OpenSubtitlesProvider {
     limiter: RateLimiter,
     plugins: Arc<dyn PluginManager>,
     base_url: String,
+    /// Held across a login, so concurrent downloads share one.
+    state: tokio::sync::Mutex<DownloadState>,
 }
 
 impl std::fmt::Debug for OpenSubtitlesProvider {
@@ -272,6 +432,7 @@ impl OpenSubtitlesProvider {
             limiter: RateLimiter::new("opensubtitles"),
             plugins,
             base_url: API_BASE.to_owned(),
+            state: tokio::sync::Mutex::new(DownloadState::default()),
         }
     }
 
@@ -313,6 +474,129 @@ impl OpenSubtitlesProvider {
         }
         let body: LoginResponse = resp.counted_json().await.map_err(net_err)?;
         Ok(body.token)
+    }
+
+    /// The session's token for `cfg`, logging in when there is none for that
+    /// account or it has expired (`OpenSubtitleDownloader.Login`), then
+    /// reading the account's quota (`UpdateUserInfo`).
+    async fn session_token(
+        &self,
+        state: &mut DownloadState,
+        cfg: &OpenSubtitlesConfig,
+    ) -> Result<SecretString, ServiceError> {
+        if let Some(session) = state
+            .session
+            .as_ref()
+            .filter(|session| session.belongs_to(cfg) && session.is_live())
+        {
+            return Ok(session.token.clone());
+        }
+        state.session = None;
+        let token = self.login(cfg).await?;
+        let expires_at = token_expiry(&token);
+        if expires_at <= chrono::Utc::now() {
+            tracing::debug!(
+                "the OpenSubtitles token carries no future expiry; it serves one download"
+            );
+        }
+        let token = SecretString::from(token);
+        state.session = Some(Session {
+            username: cfg.username.clone(),
+            password: cfg.password.clone(),
+            api_key: SecretString::from(cfg.effective_api_key().to_owned()),
+            token: token.clone(),
+            expires_at,
+            quota: None,
+        });
+        self.update_user_info(state, cfg).await?;
+        tracing::debug!(
+            limit_reset = ?state.limit_reset,
+            %expires_at,
+            "logged in to OpenSubtitles"
+        );
+        Ok(token)
+    }
+
+    /// `UpdateUserInfo`: reads the session's quota and its reset time, and
+    /// says whether it could. A refused or unreadable reply leaves both as
+    /// they were, as upstream.
+    async fn update_user_info(
+        &self,
+        state: &mut DownloadState,
+        cfg: &OpenSubtitlesConfig,
+    ) -> Result<bool, ServiceError> {
+        let Some(session) = state.session.as_mut() else {
+            return Ok(false);
+        };
+        let response = self
+            .http
+            .get(format!("{}/infos/user", self.base_url))
+            .header("Api-Key", cfg.effective_api_key())
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .bearer_auth(session.token.expose_secret())
+            .send_limited(&self.limiter)
+            .await
+            .map_err(request_err)?;
+        let status = response.status();
+        if !status.is_success() {
+            tracing::debug!(%status, "OpenSubtitles refused the quota read");
+            return Ok(false);
+        }
+        let body = response.counted_bytes().await.map_err(net_err)?;
+        let Ok(info) = serde_json::from_slice::<UserInfoResponse>(&body) else {
+            tracing::debug!("OpenSubtitles sent an unreadable quota");
+            return Ok(false);
+        };
+        // A quota without a reset time counts as already reset: upstream's
+        // `ResetTime` is then `default(DateTime)`.
+        state.limit_reset = info.data.as_ref().map(|quota| {
+            quota
+                .reset_time
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        });
+        session.quota = info.data;
+        Ok(true)
+    }
+
+    /// The start of `GetSubtitlesInternal`: while the session's quota is
+    /// spent, no download is tried, until its reset time has passed and a
+    /// fresh read of the quota shows downloads left.
+    ///
+    /// Past the reset time, a session whose token has expired, or whose
+    /// quota read is refused, is dropped instead, so the login that follows
+    /// reads the quota afresh. Upstream re-reads with the stale token, which a
+    /// refusal leaves spent for good; there, a search's `Login` replaces the
+    /// session, and Ferrofin's search does not log in.
+    async fn ensure_quota(
+        &self,
+        state: &mut DownloadState,
+        cfg: &OpenSubtitlesConfig,
+    ) -> Result<(), ServiceError> {
+        let spent = |state: &DownloadState| {
+            state
+                .session
+                .as_ref()
+                .is_some_and(|session| session.belongs_to(cfg) && session.quota_spent())
+        };
+        if !spent(state) {
+            return Ok(());
+        }
+        if state
+            .limit_reset
+            .is_some_and(|reset| reset < chrono::Utc::now())
+        {
+            tracing::debug!("OpenSubtitles quota reset time passed; reading the quota again");
+            let live = state.session.as_ref().is_some_and(Session::is_live);
+            if !live || !self.update_user_info(state, cfg).await? {
+                state.session = None;
+                return Ok(());
+            }
+            if !spent(state) {
+                return Ok(());
+            }
+        }
+        Err(download_limit_reached())
     }
 
     /// Validates the supplied credentials by attempting a login. Returns `Ok(())`
@@ -363,6 +647,42 @@ fn request_err(error: RequestError) -> ServiceError {
 
 fn net_err(e: reqwest::Error) -> ServiceError {
     ProvidersError::http("OpenSubtitles request failed", e).into()
+}
+
+/// The plugin's `RateLimitExceededException`.
+fn download_limit_reached() -> ServiceError {
+    ServiceError::backend("OpenSubtitles download limit reached")
+}
+
+/// A refused `/download`, with the API's reply unless it is an HTML page
+/// (`GetSubtitlesInternal`'s `[html]`).
+fn invalid_download_response(
+    file_id: i64,
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> ServiceError {
+    let body = String::from_utf8_lossy(body);
+    let body = if body.to_ascii_lowercase().contains("<html") {
+        "[html]".into()
+    } else {
+        body
+    };
+    ServiceError::backend(format!(
+        "Invalid response for file {file_id}: {status}\n\n{body}"
+    ))
+}
+
+/// `UpdateResetTime`: the API's reset times wander by a second or two, so a
+/// time within two seconds of the known one is not a change.
+fn update_reset_time(state: &mut DownloadState, reset: chrono::DateTime<chrono::Utc>) {
+    if state
+        .limit_reset
+        .is_some_and(|known| (known - reset).num_milliseconds().abs() <= 2_000)
+    {
+        return;
+    }
+    state.limit_reset = Some(reset);
+    tracing::debug!(limit_reset = %reset, "OpenSubtitles quota reset time updated");
 }
 
 #[async_trait]
@@ -473,47 +793,99 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         provider_local_id: &str,
     ) -> Result<SubtitleResponse, ServiceError> {
         let cfg = self.config().await?;
-        if !cfg.is_configured() {
-            return Err(ServiceError::invalid_input(
-                "OpenSubtitles account or API key is not configured",
+        if !cfg.has_account() {
+            return Err(ServiceError::unauthorized(
+                "OpenSubtitles account username and/or password are not set up",
             ));
         }
         let parsed = parse_subtitle_id(provider_local_id)
             .ok_or_else(|| ServiceError::invalid_input("invalid OpenSubtitles subtitle id"))?;
         let file_id = parsed.file_id;
 
-        let token = self.login(&cfg).await?;
-
-        // Turn the file id into a one-time download link.
-        let dl: DownloadResponse = self
-            .http
-            .post(format!("{}/download", self.base_url))
-            .header("Api-Key", cfg.effective_api_key())
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .bearer_auth(&token)
-            .json(&DownloadRequest {
-                file_id,
-                sub_format: parsed.format.clone(),
-            })
-            .send_limited(&self.limiter)
-            .await
-            .map_err(request_err)?
-            .error_for_status()
-            .map_err(net_err)?
-            .counted_json()
-            .await
-            .map_err(net_err)?;
+        // Port of `GetSubtitlesInternal`. A rejected token is dropped and the
+        // download tried once more with a fresh login; upstream retries
+        // without a bound.
+        let mut retried = false;
+        let link = loop {
+            let token = {
+                let mut state = self.state.lock().await;
+                self.ensure_quota(&mut state, &cfg).await?;
+                self.session_token(&mut state, &cfg).await?
+            };
+            // Turn the file id into a one-time download link.
+            let response = self
+                .http
+                .post(format!("{}/download", self.base_url))
+                .header("Api-Key", cfg.effective_api_key())
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .bearer_auth(token.expose_secret())
+                .json(&DownloadRequest {
+                    file_id,
+                    sub_format: parsed.format.clone(),
+                })
+                .send_limited(&self.limiter)
+                .await
+                .map_err(request_err)?;
+            let status = response.status();
+            let body = response.counted_bytes().await.map_err(net_err)?;
+            let info: DownloadResponse = serde_json::from_slice(&body).unwrap_or_default();
+            let mut state = self.state.lock().await;
+            if let Some(reset) = info.reset_time {
+                update_reset_time(&mut state, reset);
+            }
+            if status == reqwest::StatusCode::NOT_ACCEPTABLE
+                && info.remaining.is_some_and(|remaining| remaining <= 0)
+            {
+                if let Some(quota) = state.account_quota(&cfg) {
+                    quota.remaining_downloads = Some(0);
+                }
+                return Err(download_limit_reached());
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // Only the rejected token is dropped: a concurrent download
+                // may already have logged in again.
+                if state
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.holds(&token))
+                {
+                    state.session = None;
+                }
+                if !retried {
+                    tracing::debug!(file_id, "OpenSubtitles refused the token; logging in again");
+                    retried = true;
+                    continue;
+                }
+            }
+            if !status.is_success() {
+                return Err(invalid_download_response(file_id, status, &body));
+            }
+            if let Some(quota) = state.account_quota(&cfg) {
+                quota.remaining_downloads = info.remaining;
+                // Info, as upstream: one line per subtitle a user downloads,
+                // bounded by the account's daily quota.
+                tracing::info!(
+                    remaining = info.remaining,
+                    "remaining OpenSubtitles downloads"
+                );
+            }
+            break info
+                .link
+                .filter(|link| !link.trim().is_empty())
+                .ok_or_else(|| {
+                    ServiceError::backend(format!(
+                        "Failed to obtain download link for file {file_id}: {status} (empty response)"
+                    ))
+                })?;
+        };
 
         // Fetch the subtitle bytes from the link.
         let content = self
             .http
-            .get(&dl.link)
+            .get(&link)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send_limited(&crate::image_download::limiter_for(
-                &dl.link,
-                "opensubtitles",
-            ))
+            .send_limited(&crate::image_download::limiter_for(&link, "opensubtitles"))
             .await
             .map_err(request_err)?
             .error_for_status()
@@ -662,6 +1034,559 @@ mod tests {
                     .any(|line| line.eq_ignore_ascii_case(&format!("api-key: {expected}")))
             );
         }
+    }
+
+    /// A mocked OpenSubtitles API. Each route (a path substring) answers its
+    /// queued `(status, body)` replies in order and then repeats the last;
+    /// every request line (`METHOD /path`) is recorded.
+    struct ApiMock {
+        base_url: String,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ApiMock {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    impl ApiMock {
+        /// Starts the mock; `routes` gets its base URL, for download links.
+        async fn start(
+            routes: impl FnOnce(&str) -> Vec<(&'static str, Vec<(u16, String)>)>,
+        ) -> Self {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let routes = Arc::new(std::sync::Mutex::new(
+                routes(&base_url)
+                    .into_iter()
+                    .map(|(path, replies)| (path, std::collections::VecDeque::from(replies)))
+                    .collect::<Vec<_>>(),
+            ));
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            let handle = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let routes = Arc::clone(&routes);
+                    let seen = Arc::clone(&seen);
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 16 * 1024];
+                        let n = socket.read(&mut buffer).await.unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..n]).into_owned();
+                        let line = request.lines().next().unwrap_or("").to_owned();
+                        let mut parts = line.split_whitespace();
+                        let (method, path) = (
+                            parts.next().unwrap_or("").to_owned(),
+                            parts.next().unwrap_or("").to_owned(),
+                        );
+                        seen.lock().unwrap().push(format!("{method} {path}"));
+                        let (status, body) = {
+                            let mut routes = routes.lock().unwrap();
+                            routes
+                                .iter_mut()
+                                .find(|(route, _)| path.contains(route))
+                                .map_or((404, "{}".to_owned()), |(_, replies)| {
+                                    if replies.len() > 1 {
+                                        replies.pop_front().unwrap()
+                                    } else {
+                                        replies.front().cloned().unwrap()
+                                    }
+                                })
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+            Self {
+                base_url,
+                requests,
+                handle,
+            }
+        }
+
+        /// How many requests started with `prefix` (`"POST /login"`).
+        fn count(&self, prefix: &str) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with(prefix))
+                .count()
+        }
+    }
+
+    /// A JWT whose payload is `{"exp": exp}` (the signature is not checked).
+    fn token(payload: &str) -> String {
+        format!("eyJhbGciOiJIUzI1NiJ9.{payload}.c2ln")
+    }
+
+    /// `{"exp":4102444800}`: 2100-01-01.
+    const FUTURE_PAYLOAD: &str = "eyJleHAiOjQxMDI0NDQ4MDB9";
+    /// `{"exp":1000000000}`: 2001-09-09.
+    const PAST_PAYLOAD: &str = "eyJleHAiOjEwMDAwMDAwMDB9";
+
+    fn login_reply(payload: &str) -> (u16, String) {
+        (200, format!(r#"{{"token":"{}"}}"#, token(payload)))
+    }
+
+    fn user_reply(remaining: i32, reset: &str) -> (u16, String) {
+        (
+            200,
+            format!(
+                r#"{{"data":{{"allowed_downloads":20,"remaining_downloads":{remaining},"reset_time_utc":"{reset}"}}}}"#
+            ),
+        )
+    }
+
+    fn download_reply(base: &str, remaining: i32) -> (u16, String) {
+        (
+            200,
+            format!(
+                r#"{{"link":"{base}/file/1.srt","remaining":{remaining},"reset_time_utc":"2100-01-01T00:00:00Z"}}"#
+            ),
+        )
+    }
+
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nhi\n";
+
+    /// A provider over `mock` with an account configured.
+    fn account_provider(
+        mock: &ApiMock,
+        username: &str,
+    ) -> (OpenSubtitlesProvider, Arc<dyn PluginManager>) {
+        let config = format!(r#"{{"Username":"{username}","Password":"secret"}}"#);
+        let plugins =
+            crate::plugin_config::tests_support::manager_with(PLUGIN_ID, config.into_bytes());
+        let provider =
+            OpenSubtitlesProvider::new(Arc::clone(&plugins)).with_base_url(&mock.base_url);
+        (provider, plugins)
+    }
+
+    /// `OpenSubtitleDownloader.Login`: the token is kept until it expires
+    /// (`DateTime.UtcNow < _login.ExpirationDate`), so downloads do not log in
+    /// again; the user's quota is read once, after the login.
+    #[tokio::test]
+    async fn downloads_reuse_one_login_until_it_expires() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![download_reply(base, 19), download_reply(base, 18)],
+                ),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        for _ in 0..2 {
+            let response = provider.get_subtitles("srt-en-1").await.expect("download");
+            assert_eq!(response.content, SRT.as_bytes());
+        }
+
+        assert_eq!(mock.count("POST /login"), 1);
+        assert_eq!(mock.count("GET /infos/user"), 1);
+        assert_eq!(mock.count("POST /download"), 2);
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_logs_in_again() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(PAST_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                ("/download", vec![download_reply(base, 19)]),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        for _ in 0..2 {
+            provider.get_subtitles("srt-en-1").await.expect("download");
+        }
+
+        assert_eq!(mock.count("POST /login"), 2);
+    }
+
+    /// `HttpStatusCode.Unauthorized` on `/download`: the token is dropped and
+    /// the download tried again with a fresh login.
+    #[tokio::test]
+    async fn a_rejected_token_logs_in_again_and_retries() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![
+                        (401, r#"{"message":"expired"}"#.to_owned()),
+                        download_reply(base, 19),
+                    ],
+                ),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        provider.get_subtitles("srt-en-1").await.expect("download");
+
+        assert_eq!(mock.count("POST /login"), 2);
+        assert_eq!(mock.count("POST /download"), 2);
+    }
+
+    /// `NotAcceptable` with no downloads left: the quota is spent, and until
+    /// its reset time no download is attempted at all.
+    #[tokio::test]
+    async fn a_spent_quota_stops_downloads_until_it_resets() {
+        let mock = ApiMock::start(|_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(1, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![(
+                        406,
+                        r#"{"remaining":0,"reset_time_utc":"2100-01-01T00:00:00Z","message":"limit"}"#
+                            .to_owned(),
+                    )],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        for _ in 0..2 {
+            let error = provider.get_subtitles("srt-en-1").await.expect_err("limit");
+            assert!(
+                error.to_string().contains("download limit reached"),
+                "{error}"
+            );
+        }
+
+        assert_eq!(
+            mock.count("POST /download"),
+            1,
+            "the second try never asked"
+        );
+    }
+
+    /// Past the quota's reset time, the user's quota is read again
+    /// (`UpdateUserInfo`) and downloads resume.
+    #[tokio::test]
+    async fn a_passed_reset_time_reads_the_quota_again() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(5, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![
+                        (
+                            406,
+                            r#"{"remaining":0,"reset_time_utc":"2001-01-01T00:00:00Z"}"#.to_owned(),
+                        ),
+                        download_reply(base, 4),
+                    ],
+                ),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let error = provider.get_subtitles("srt-en-1").await.expect_err("spent");
+        assert!(
+            error.to_string().contains("download limit reached"),
+            "{error}"
+        );
+        provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect("the reset passed: downloads resume");
+
+        assert_eq!(mock.count("GET /infos/user"), 2);
+        assert_eq!(mock.count("POST /download"), 2);
+        assert_eq!(mock.count("POST /login"), 1);
+    }
+
+    /// Past the reset time, a spent session whose token has expired is not
+    /// read again with that token: the download logs in afresh, which reads
+    /// the quota.
+    #[tokio::test]
+    async fn an_expired_spent_session_logs_in_again_past_its_reset() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                (
+                    "/login",
+                    vec![login_reply(PAST_PAYLOAD), login_reply(FUTURE_PAYLOAD)],
+                ),
+                (
+                    "/infos/user",
+                    vec![
+                        user_reply(0, "2001-01-01T00:00:00Z"),
+                        user_reply(5, "2100-01-01T00:00:00Z"),
+                    ],
+                ),
+                (
+                    "/download",
+                    vec![
+                        (
+                            406,
+                            r#"{"remaining":0,"reset_time_utc":"2001-01-01T00:00:00Z"}"#.to_owned(),
+                        ),
+                        download_reply(base, 4),
+                    ],
+                ),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        provider.get_subtitles("srt-en-1").await.expect_err("spent");
+        provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect("a fresh login");
+
+        assert_eq!(mock.count("POST /login"), 2);
+        assert_eq!(
+            mock.count("GET /infos/user"),
+            2,
+            "no read with the expired token"
+        );
+    }
+
+    /// Past the reset time, a refused quota read drops the session instead of
+    /// leaving the quota spent for good.
+    #[tokio::test]
+    async fn a_refused_quota_read_past_the_reset_logs_in_again() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                (
+                    "/infos/user",
+                    vec![
+                        user_reply(0, "2001-01-01T00:00:00Z"),
+                        (401, r#"{"message":"revoked"}"#.to_owned()),
+                        user_reply(5, "2100-01-01T00:00:00Z"),
+                    ],
+                ),
+                (
+                    "/download",
+                    vec![
+                        (
+                            406,
+                            r#"{"remaining":0,"reset_time_utc":"2001-01-01T00:00:00Z"}"#.to_owned(),
+                        ),
+                        download_reply(base, 4),
+                    ],
+                ),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        provider.get_subtitles("srt-en-1").await.expect_err("spent");
+        provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect("a fresh login");
+
+        assert_eq!(mock.count("POST /login"), 2);
+        assert_eq!(mock.count("GET /infos/user"), 3);
+    }
+
+    /// The retry after a rejected token is bounded: a second rejection fails
+    /// the download, and its token is not kept.
+    #[tokio::test]
+    async fn a_second_rejection_fails_the_download_and_drops_the_token() {
+        let mock = ApiMock::start(|_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                ("/download", vec![(401, r#"{"message":"no"}"#.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let error = provider.get_subtitles("srt-en-1").await.expect_err("401");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid response for file 1: 401"),
+            "{error}"
+        );
+        assert_eq!(mock.count("POST /login"), 2);
+        assert_eq!(mock.count("POST /download"), 2);
+
+        provider.get_subtitles("srt-en-1").await.expect_err("401");
+        // The next download starts with a login of its own (kept, it would
+        // have tried the rejected token first: 3 logins), then retries once.
+        assert_eq!(
+            mock.count("POST /login"),
+            4,
+            "the rejected token was dropped"
+        );
+    }
+
+    /// `Login`'s account check: a download without a username or password
+    /// fails before any request.
+    #[tokio::test]
+    async fn downloads_need_an_account() {
+        let mock = ApiMock::start(|_| Vec::new()).await;
+        let (provider, _) = account_provider(&mock, " ");
+
+        let error = provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect_err("no account");
+
+        assert!(matches!(error, ServiceError::Unauthorized(_)), "{error:?}");
+        assert_eq!(mock.count(""), 0);
+    }
+
+    /// A refused download names the API's reply, except an HTML page.
+    #[tokio::test]
+    async fn a_refused_download_names_the_reply_unless_it_is_html() {
+        let mock = ApiMock::start(|_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![
+                        (403, r#"{"message":"forbidden"}"#.to_owned()),
+                        (503, "<HTML><body>down</body></HTML>".to_owned()),
+                    ],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let error = provider.get_subtitles("srt-en-1").await.expect_err("403");
+        assert!(
+            error.to_string().contains(
+                r#"403 Forbidden
+
+{"message":"forbidden"}"#
+            ),
+            "{error}"
+        );
+        let error = provider.get_subtitles("srt-en-1").await.expect_err("503");
+        assert!(
+            error
+                .to_string()
+                .ends_with("503 Service Unavailable\n\n[html]"),
+            "{error}"
+        );
+    }
+
+    /// The quota only informs downloads: a reply missing its reset time, or
+    /// carrying an unreadable one, does not fail a download.
+    #[tokio::test]
+    async fn a_partial_quota_does_not_fail_a_download() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![(200, r#"{"data":{"remaining_downloads":20}}"#.to_owned())]),
+                (
+                    "/download",
+                    vec![(
+                        200,
+                        format!(r#"{{"link":"{base}/file/1.srt","remaining":19,"reset_time_utc":"soon"}}"#),
+                    )],
+                ),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let response = provider.get_subtitles("srt-en-1").await.expect("download");
+
+        assert_eq!(response.content, SRT.as_bytes());
+    }
+
+    /// `UpdateResetTime`: a reset time within two seconds of the known one is
+    /// the same time.
+    #[test]
+    fn reset_times_within_two_seconds_are_the_same() {
+        let known = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        let mut state = DownloadState {
+            limit_reset: Some(known),
+            ..DownloadState::default()
+        };
+
+        update_reset_time(&mut state, known + chrono::Duration::milliseconds(1_999));
+        assert_eq!(state.limit_reset, Some(known));
+        update_reset_time(&mut state, known - chrono::Duration::milliseconds(2_500));
+        assert_eq!(
+            state.limit_reset,
+            Some(known - chrono::Duration::milliseconds(2_500))
+        );
+    }
+
+    /// `ConfigurationChanged` forces a login: a token belongs to the account
+    /// it was issued for.
+    #[tokio::test]
+    async fn changed_credentials_log_in_again() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                ("/download", vec![download_reply(base, 19)]),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, plugins) = account_provider(&mock, "first");
+        provider.get_subtitles("srt-en-1").await.expect("download");
+
+        plugins
+            .set_plugin_configuration(
+                PLUGIN_ID,
+                br#"{"Username":"second","Password":"secret"}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        provider.get_subtitles("srt-en-1").await.expect("download");
+
+        assert_eq!(mock.count("POST /login"), 2);
+    }
+
+    /// `LoginInfo.ExpirationDate`: the JWT payload's `exp`, in seconds; a
+    /// token without one counts as expired.
+    #[rstest::rstest]
+    #[case::year_2100(token(FUTURE_PAYLOAD), 4_102_444_800)]
+    #[case::year_2001(token(PAST_PAYLOAD), 1_000_000_000)]
+    #[case::no_exp(token("e30"), 0)]
+    #[case::not_a_jwt("opaque".to_owned(), 0)]
+    #[case::bad_base64(token("!!!"), 0)]
+    fn the_token_expires_at_its_exp(#[case] token: String, #[case] expected: i64) {
+        assert_eq!(token_expiry(&token).timestamp(), expected);
+    }
+
+    #[test]
+    fn base64url_decodes_with_and_without_padding() {
+        assert_eq!(decode_base64url("aGk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(decode_base64url("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(decode_base64url("_-8").as_deref(), Some(&[0xff, 0xef][..]));
+        assert_eq!(decode_base64url("a"), None);
     }
 
     #[test]

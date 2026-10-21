@@ -172,6 +172,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
+  expires or the account changes (it was renewed for every subtitle). A rejected token is
+  renewed and the download retried once. The account's daily quota is tracked: once it is
+  spent, downloads stop with "OpenSubtitles download limit reached" until its reset time,
+  and the remaining count is logged after each download
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
