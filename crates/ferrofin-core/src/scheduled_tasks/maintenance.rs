@@ -719,7 +719,7 @@ mod tests {
             device_id: &str,
             device_name: &str,
             remote_endpoint: &str,
-            user: &UserEntity,
+            user: Option<&UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
