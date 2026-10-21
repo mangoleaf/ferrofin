@@ -260,7 +260,10 @@ impl FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        self.auth_cache.clear();
+        // Only this user's row changed (a lockout cleared everything above);
+        // a wholesale clear here would let a stream of wrong passwords for one
+        // account keep every other user's cached auth cold.
+        self.auth_cache.invalidate_user(&user.id);
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -1078,7 +1081,8 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
-        self.auth_cache.clear();
+        // The writes above touch this user's row only.
+        self.auth_cache.invalidate_user(&user.id);
         Ok(Some(user))
     }
 
@@ -2485,6 +2489,96 @@ mod tests {
             mgr.change_password(id, "   ").await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// A login attempt that does not lock the account changes only that user's
+    /// own row, so it drops only that user's cached auth: a failed or a
+    /// successful login for one user leaves every other user's cached token
+    /// and DTO in place, and a failed password stream cannot keep the whole
+    /// cache cold.
+    #[tokio::test]
+    async fn a_login_attempt_invalidates_only_that_users_cached_auth() {
+        let db = test_db().await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let mgr = FerrofinUserManager::new(db).with_auth_cache(Arc::clone(&cache));
+        let tried = mgr.create_user("tried").await.unwrap();
+        let other = mgr.create_user("other").await.unwrap();
+        mgr.change_password(Uuid::parse_str(&tried.id).unwrap(), "secret")
+            .await
+            .unwrap();
+        let tried = mgr
+            .get_user_by_id(Uuid::parse_str(&tried.id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let cache_both = || {
+            let generation = cache.generation();
+            for (token, user) in [("tried-token", &tried), ("other-token", &other)] {
+                let device = ferrofin_db::entities::security::DeviceEntity {
+                    id: 1,
+                    access_token: token.to_owned(),
+                    app_name: "app".into(),
+                    app_version: "1.0".into(),
+                    date_created: chrono::Utc::now(),
+                    date_last_activity: chrono::Utc::now(),
+                    date_modified: chrono::Utc::now(),
+                    device_id: token.to_owned(),
+                    device_name: "Device".into(),
+                    is_active: true,
+                    user_id: user.id.clone(),
+                };
+                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put_user_dto(generation, user, UserDto::default());
+            }
+        };
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "secret", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        // A failure that locks the account out still clears everyone: the
+        // lock must not wait for any cached resolution to expire.
+        let tried_id = Uuid::parse_str(&tried.id).unwrap();
+        mgr.update_policy(
+            tried_id,
+            &UserPolicy {
+                login_attempts_before_lockout: 1,
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache.get("other-token").is_none(),
+            "a lockout clears everyone"
+        );
     }
 
     #[rstest::rstest]
