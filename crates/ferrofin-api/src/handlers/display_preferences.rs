@@ -17,7 +17,8 @@
 //! The row's `HomeSection` children round-trip through the same `CustomPrefs`
 //! map as `homesection{n}` keys: the GET emits one per stored section, and the
 //! POST parses them back, substituting the C# per-order default when a value
-//! does not name a `HomeSectionType`. They are loaded and rewritten through the
+//! does not parse as a `HomeSectionType` (`Enum.TryParse`: a name list or an
+//! integer). They are loaded and rewritten through the
 //! display-preferences seam's `list_home_sections`/`set_home_sections`, which
 //! stand in for EF's `.Include(HomeSections)` eager-load.
 
@@ -295,9 +296,9 @@ async fn update_display_preferences(
     prefs.tv_home = take_nullable_pref(&mut dto.custom_prefs, "tvhome");
 
     // Home sections: every `homesection{order}` key is consumed off CustomPrefs
-    // and turned into a `HomeSection` row. A value that does not name a
-    // `HomeSectionType` falls back to the per-order default, and an order at or
-    // beyond that table falls back to `None` — C#
+    // and turned into a `HomeSection` row. A value that does not parse as a
+    // `HomeSectionType` (`enum_try_parse`) falls back to the per-order default,
+    // and an order at or beyond that table falls back to `None` — C#
     // `type = order < 8 ? defaults[order] : HomeSectionType.None;`.
     let mut home_sections: Vec<(i32, i32)> = Vec::new();
     let home_section_keys: Vec<String> = dto
@@ -318,7 +319,7 @@ async fn update_display_preferences(
         };
         let type_ = value
             .as_deref()
-            .and_then(home_section_from_name)
+            .and_then(|value| enum_try_parse(value, HomeSectionType::ALL))
             .unwrap_or_else(|| {
                 usize::try_from(order)
                     .ok()
@@ -423,35 +424,40 @@ const HOME_SECTION_DEFAULTS: [i32; 8] = [
 ];
 
 /// The `HomeSectionType` name for a stored discriminant — C#
-/// `homeSection.Type.ToString().ToLowerInvariant()`.
+/// `homeSection.Type.ToString().ToLowerInvariant()`, which writes an unnamed
+/// value (one `Enum.TryParse` stored from an integer) as the number itself.
 fn home_section_name(value: i32) -> String {
     HomeSectionType::try_from(value)
-        .map_or_else(|_| "none".to_owned(), |t| format!("{t:?}").to_lowercase())
+        .map_or_else(|_| value.to_string(), |t| format!("{t:?}").to_lowercase())
 }
 
-/// Parses a `HomeSectionType` name back to its stored discriminant, case
-/// insensitively (C# `Enum.TryParse<HomeSectionType>(value, true, out _)`).
-fn home_section_from_name(name: &str) -> Option<i32> {
-    HomeSectionType::ALL
-        .iter()
-        .find(|t| format!("{t:?}").eq_ignore_ascii_case(name))
-        .map(|t| i32::from(*t))
-}
-
-/// Whether `value` parses as a `ViewType`, case insensitively: C#
-/// `Enum.TryParse<ViewType>(value, true, out _)`, which takes any integer of the
-/// enum's underlying type (named or not) or a comma-separated list of names.
-fn is_view_type_name(value: &str) -> bool {
+/// C# `Enum.TryParse<TEnum>(value, ignoreCase: true, out var result)` for an
+/// `int`-backed enum with the members `all`: a value starting with a digit or a
+/// sign is an integer of the underlying type, named or not; anything else is a
+/// comma-separated list of member names, case insensitive, whose values are
+/// OR'd. Surrounding whitespace is ignored; anything else is `None`.
+fn enum_try_parse<T>(value: &str, all: &[T]) -> Option<i32>
+where
+    T: Copy + std::fmt::Debug,
+    i32: From<T>,
+{
     let value = value.trim();
     if value.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+') {
-        return value.parse::<i32>().is_ok();
+        return value.parse::<i32>().ok();
     }
-    !value.is_empty()
-        && value.split(',').all(|name| {
-            ViewType::ALL
-                .iter()
-                .any(|v| format!("{v:?}").eq_ignore_ascii_case(name.trim()))
-        })
+    if value.is_empty() {
+        return None;
+    }
+    value.split(',').try_fold(0, |acc, name| {
+        all.iter()
+            .find(|member| format!("{member:?}").eq_ignore_ascii_case(name.trim()))
+            .map(|member| acc | i32::from(*member))
+    })
+}
+
+/// Whether `value` parses as a `ViewType` ([`enum_try_parse`]).
+fn is_view_type_name(value: &str) -> bool {
+    enum_try_parse(value, ViewType::ALL).is_some()
 }
 
 /// Whether `key` starts with the ASCII `prefix`, ignoring case (C#

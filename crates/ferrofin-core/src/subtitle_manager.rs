@@ -201,7 +201,7 @@ impl FerrofinSubtitleManager {
             .ok_or_else(|| ServiceError::invalid_input("item has no media path for a sidecar"))?;
 
         let save_with_media = if let Some(folders) = &self.virtual_folders {
-            let folders = folders.get_virtual_folders().await?;
+            let folders = folders.library_folders().await?;
             ferrofin_model::entities_media::owning_library(
                 &folders,
                 item.top_parent_id.as_deref(),

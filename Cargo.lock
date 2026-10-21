@@ -1441,6 +1441,7 @@ dependencies = [
  "flate2",
  "icu_collator",
  "quick-xml",
+ "regex",
  "reqwest",
  "rstest",
  "serde",
