@@ -317,6 +317,30 @@ fn warn_unsupported_accelerator(options: &EncodingOptions) {
     }
 }
 
+/// The `-filter_complex` pads of a subtitle burn-in, for the hardware chains
+/// and the software overlay alike.
+///
+/// `find_index`, not the stream's own `index`: the pads have to name the same
+/// numbers `map_args` does, and the two diverge as soon as a source's streams
+/// are not contiguously indexed. It matters most for an external subtitle,
+/// which is input 1 with a single stream at index 0 whatever its index in the
+/// parent source. A stream missing from the source is `-1`, which ffmpeg
+/// refuses rather than reading some other stream.
+fn stream_pads(
+    streams: &[MediaStream],
+    subtitle: Option<&MediaStream>,
+    video: Option<&MediaStream>,
+) -> hw::sw_chain::StreamPads {
+    let index = |stream: &MediaStream| {
+        ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, stream)
+    };
+    hw::sw_chain::StreamPads {
+        subtitle_is_external: subtitle.is_some_and(|s| s.is_external),
+        subtitle_index: subtitle.map_or(0, index),
+        video_index: video.map_or(0, index),
+    }
+}
+
 /// The rate ffmpeg encodes a constant-rate output at when no `-r` is set.
 ///
 /// Port of the first rule of libavformat's `av_guess_frame_rate`, whose
@@ -1672,21 +1696,7 @@ impl FerrofinStreamStatePlanner {
                 is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
                 subtitle,
             };
-            // `find_index`, not the stream's own `index` — the pads have to
-            // name the same numbers `map_args` does, and the two diverge as soon
-            // as a source's streams are not contiguously indexed. It matters
-            // most for an external subtitle, which is input 1 with a single
-            // stream at index 0 whatever its index in the parent source.
-            let streams = &state.media_source.media_streams;
-            let pads = hw::sw_chain::StreamPads {
-                subtitle_is_external: sub_stream.is_some_and(|s| s.is_external),
-                subtitle_index: sub_stream.map_or(0, |s| {
-                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, s)
-                }),
-                video_index: video_stream.map_or(0, |v| {
-                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, v)
-                }),
-            };
+            let pads = stream_pads(&state.media_source.media_streams, sub_stream, video_stream);
             // Upstream dispatches `GetVideoProcessingFilterParam` on the
             // accelerator, and each vendor chain falls back to the software one
             // itself when its own pipeline cannot run.
@@ -1992,29 +2002,55 @@ impl FerrofinStreamStatePlanner {
         }
 
         // ---- graphical subtitle burn-in --------------------------------------
-        // Composite the (bitmap) subtitle stream onto the video: `overlay` takes
-        // the base video and the decoded subtitle as its two inputs and emits the
+        // `GetSwVidFilterChain`'s graphical branch, assembled as
+        // `GetVideoProcessingFilterParam` does: the subtitle is first fitted to
+        // the output frame (`GetGraphicalSubPreProcessFilters`), so a bitmap
+        // authored for one canvas lands where it should on another (a 1080p
+        // PGS on a 720p or a 2160p encode), then overlaid on the base video,
+        // which is downscaled and tonemapped first. The graph ends in the
         // labelled `[v]` that `map_args` maps in place of the raw video.
         if burn_graphical
             && !hw_filters
             && let Some(sub) = state.subtitle_stream.as_ref()
         {
-            let sub_idx = sub.index.max(0);
-            let vid_idx = state.video_stream.as_ref().map_or(0, |v| v.index.max(0));
-            // No hardware format conversion here: this block runs only when
-            // the matrix did not claim the job, so the frames are in system
-            // memory and the software chain above has already set the format.
-            push_split(&mut args, "-filter_complex");
-            let base = with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace);
-            if base.is_empty() {
-                args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay[v]"));
+            let video = state.video_stream.as_ref();
+            let pads = stream_pads(&state.media_source.media_streams, Some(sub), video);
+            // The scaler sees the transpose of a frame rotated by 90 degrees.
+            let (width, height) = (video.and_then(|v| v.width), video.and_then(|v| v.height));
+            let (width, height) = if video.and_then(|v| v.rotation).unwrap_or(0).abs() == 90 {
+                (height, width)
             } else {
-                // Downscale/tonemap the base video before compositing, so the
-                // bitmap subtitle is overlaid in SDR at output resolution.
-                args.push(format!(
-                    "[0:{vid_idx}]{}[base];[base][0:{sub_idx}]overlay[v]",
-                    base.join(",")
-                ));
+                (width, height)
+            };
+            let fit = hw::filters::graphical_sub_preprocess_filters(
+                width, height, sub.width, sub.height, requested,
+            );
+            let chain = hw::sw_chain::FilterChain {
+                // No hardware format conversion here: this block runs only when
+                // the matrix did not claim the job, so the frames are in system
+                // memory and the software chain above has already set the
+                // format. The frame-rate cap is already in place.
+                main: with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace),
+                // With no output size to fit to (a video stream without
+                // dimensions), `null` keeps the subtitle as authored.
+                sub: vec![if fit.is_empty() {
+                    "null".to_owned()
+                } else {
+                    fit
+                }],
+                overlay: vec!["overlay=eof_action=pass:repeatlast=0".to_owned()],
+            };
+            // Always a graph: the sub and overlay lists are never empty here.
+            if let Some((flag, graph)) = hw::sw_chain::video_processing_filter_args(
+                chain,
+                None,
+                sw_deinterlace,
+                pads,
+                true,
+                false,
+            ) {
+                args.push(flag.to_owned());
+                args.push(format!("{graph}[v]"));
             }
         }
 
@@ -5229,7 +5265,11 @@ mod tests {
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-map [v]"), "{args}");
-        assert!(args.contains("[0:0][0:2]overlay[v]"), "{args}");
+        assert!(args.contains("[0:2]scale,"), "{args}");
+        assert!(
+            args.contains("[sub];[0:0][sub]overlay=eof_action=pass:repeatlast=0[v]"),
+            "{args}"
+        );
         // ...and no negative map, because this graph's output IS labelled.
         assert!(!args.contains("-map -0:0"), "{args}");
     }
@@ -6076,6 +6116,89 @@ mod tests {
         assert_eq!(args.matches("fps=").count(), 1, "{args}");
     }
 
+    /// `GetSwVidFilterChain` fits a burned-in bitmap subtitle to the output
+    /// frame before the overlay (`GetGraphicalSubPreProcessFilters`): a plain
+    /// rescale when the shapes match, a pad onto a transparent canvas when
+    /// they do not. Overlaid at its authored size instead, a 1080p PGS on a
+    /// 720p encode is drawn below the frame, and on 2160p video in its top-left
+    /// quarter.
+    ///
+    /// A video rotated by 90 degrees is fitted as the scaler sees it,
+    /// transposed (`swpInW`/`swpInH`); a video with no size has no frame to
+    /// fit to, and its subtitle is overlaid as authored (`null`).
+    #[rstest]
+    #[case::downscaled(
+        Some((1920, 1080)),
+        None,
+        Some(1280),
+        (1920, 1080),
+        "scale,scale=1280:720:fast_bilinear"
+    )]
+    #[case::larger_video(
+        Some((3840, 2160)),
+        None,
+        None,
+        (1920, 1080),
+        "scale,scale=3840:2160:fast_bilinear"
+    )]
+    #[case::another_shape(
+        Some((1920, 1080)),
+        None,
+        None,
+        (720, 480),
+        "scale,scale=-1:1080:fast_bilinear,crop,pad=max(1920\\,iw):max(1080\\,ih):\
+         (ow-iw)/2:(oh-ih)/2:black@0,crop=1920:1080"
+    )]
+    #[case::rotated(
+        Some((1080, 1920)),
+        Some(90),
+        None,
+        (1920, 1080),
+        "scale,scale=1920:1080:fast_bilinear"
+    )]
+    #[case::no_video_size(None, None, None, (1920, 1080), "null")]
+    #[tokio::test]
+    async fn a_software_bitmap_burn_in_fits_the_subtitle_to_the_output_frame(
+        #[case] video_size: Option<(i32, i32)>,
+        #[case] rotation: Option<i32>,
+        #[case] max_width: Option<i32>,
+        #[case] subtitle_size: (i32, i32),
+        #[case] fit: &str,
+    ) {
+        let mut video = video_stream("h264");
+        video.width = video_size.map(|(width, _)| width);
+        video.height = video_size.map(|(_, height)| height);
+        video.rotation = rotation;
+        let mut sub = subtitle_stream("pgssub", 2);
+        sub.width = Some(subtitle_size.0);
+        sub.height = Some(subtitle_size.1);
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac"), sub])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = max_width;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let arguments = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments;
+        let graph = arguments
+            .iter()
+            .position(|arg| arg == "-filter_complex")
+            .and_then(|at| arguments.get(at + 1))
+            .unwrap_or_else(|| panic!("no -filter_complex: {arguments:?}"));
+        assert!(
+            graph.starts_with(&format!("[0:2]{fit}[sub];[0:0]")),
+            "{graph}"
+        );
+        assert!(
+            graph.ends_with("[sub]overlay=eof_action=pass:repeatlast=0[v]"),
+            "{graph}"
+        );
+    }
+
     /// `GetInputArgument` appends `GetGraphicalSubCanvasSize` after the input
     /// hardware arguments: a burned-in bitmap subtitle is decoded onto the
     /// canvas it was authored for (`-canvas_size WxH`, an input option), not
@@ -6170,7 +6293,10 @@ mod tests {
         } else {
             assert_eq!(
                 graph,
-                "[0:0]yadif=0:-1:0,scale=1280:720,fps=24[base];[base][0:2]overlay[v]"
+                "[0:2]scale,scale=-1:720:fast_bilinear,crop,pad=max(1280\\,iw):max(720\\,ih):\
+                 (ow-iw)/2:(oh-ih)/2:black@0,crop=1280:720[sub];\
+                 [0:0]yadif=0:-1:0,scale=1280:720,fps=24[main];\
+                 [main][sub]overlay=eof_action=pass:repeatlast=0[v]"
             );
         }
     }
