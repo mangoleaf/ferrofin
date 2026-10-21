@@ -225,7 +225,7 @@ async fn log_session_activity_creates_and_reuses_a_session() {
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
 
     let first = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&user))
         .await
         .unwrap();
     assert_eq!(first.client.as_deref(), Some("Web"));
@@ -235,11 +235,36 @@ async fn log_session_activity_creates_and_reuses_a_session() {
 
     // Same app+device → same session id (reused, not duplicated).
     let again = mgr
-        .log_session_activity("Web", "1.1", "dev-1", "Chrome", "1.2.3.4", &user)
+        .log_session_activity("Web", "1.1", "dev-1", "Chrome", "1.2.3.4", Some(&user))
         .await
         .unwrap();
     assert_eq!(first.id, again.id);
     assert_eq!(again.application_version.as_deref(), Some("1.1"));
+}
+
+/// `RequestHelpers.GetSession` logs an API-key caller's activity with no user:
+/// the session's `UserId` is `Guid.Empty`, it has no `UserName`, and it is
+/// keyed like any other (`{appName}{deviceId}`).
+#[tokio::test]
+async fn a_session_logged_without_a_user_has_none() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+
+    let session = mgr
+        .log_session_activity("my-key", "12.2", "server-id", "Jellyfin Server", "e", None)
+        .await
+        .unwrap();
+    assert_eq!(session.user_id, Uuid::nil());
+    assert_eq!(session.user_name, None);
+    assert_eq!(session.client.as_deref(), Some("my-key"));
+    let again = mgr
+        .log_session_activity("my-key", "12.2", "server-id", "Jellyfin Server", "e", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.id, again.id,
+        "the same key and device reuse the session"
+    );
 }
 
 #[tokio::test]
@@ -249,7 +274,7 @@ async fn empty_device_name_falls_back_to_network_device() {
     let user = seed_named_user(&db, Uuid::new_v4(), "bob").await;
 
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-x", "", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-x", "", "e", Some(&user))
         .await
         .unwrap();
     assert_eq!(dto.device_name.as_deref(), Some("Network Device"));
@@ -282,7 +307,7 @@ async fn a_non_admin_sees_the_transcode_but_not_the_silicon() {
     .await
     .unwrap();
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.clone().unwrap();
@@ -350,7 +375,7 @@ async fn additional_users_add_and_remove() {
     let _guest = seed_named_user(&db, guest_id, "guest").await;
 
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &primary)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&primary))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -389,7 +414,7 @@ async fn adding_the_primary_user_as_additional_is_rejected() {
     let primary_id = Uuid::new_v4();
     let primary = seed_named_user(&db, primary_id, "primary").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &primary)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&primary))
         .await
         .unwrap();
     let err = mgr
@@ -405,7 +430,7 @@ async fn report_capabilities_updates_session_and_persists() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -449,7 +474,7 @@ async fn bus_connected_session_is_controllable_and_receives_play() {
     .await
     .unwrap();
     let dto = mgr
-        .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", &user)
+        .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -506,7 +531,7 @@ async fn report_now_viewing_rejects_bad_id() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let err = mgr
@@ -716,10 +741,10 @@ async fn get_sessions_non_admin_sees_only_own() {
     let bob_id = Uuid::new_v4();
     let alice = seed_named_user(&db, alice_id, "alice").await;
     let bob = seed_named_user(&db, bob_id, "bob").await;
-    mgr.log_session_activity("Web", "1.0", "a", "A", "e", &alice)
+    mgr.log_session_activity("Web", "1.0", "a", "A", "e", Some(&alice))
         .await
         .unwrap();
-    mgr.log_session_activity("Web", "1.0", "b", "B", "e", &bob)
+    mgr.log_session_activity("Web", "1.0", "b", "B", "e", Some(&bob))
         .await
         .unwrap();
 
@@ -747,10 +772,10 @@ async fn get_sessions_admin_sees_all() {
     .await
     .unwrap();
     let other = seed_named_user(&db, Uuid::new_v4(), "other").await;
-    mgr.log_session_activity("Web", "1.0", "a", "A", "e", &admin)
+    mgr.log_session_activity("Web", "1.0", "a", "A", "e", Some(&admin))
         .await
         .unwrap();
-    mgr.log_session_activity("Web", "1.0", "b", "B", "e", &other)
+    mgr.log_session_activity("Web", "1.0", "b", "B", "e", Some(&other))
         .await
         .unwrap();
 
@@ -768,7 +793,7 @@ async fn broadcast_pushes_to_attached_connections() {
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -805,15 +830,15 @@ async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions(
 
     // The same user on two devices, plus an unrelated user's session.
     let tv = mgr
-        .log_session_activity("wolphin", "1.0", "dev-tv", "Shield", "e", &user)
+        .log_session_activity("wolphin", "1.0", "dev-tv", "Shield", "e", Some(&user))
         .await
         .unwrap();
     let web = mgr
-        .log_session_activity("Jellyfin Web", "1.0", "dev-web", "Mac", "e", &user)
+        .log_session_activity("Jellyfin Web", "1.0", "dev-web", "Mac", "e", Some(&user))
         .await
         .unwrap();
     let other_session = mgr
-        .log_session_activity("Web", "1.0", "dev-o", "PC", "e", &other)
+        .log_session_activity("Web", "1.0", "dev-o", "PC", "e", Some(&other))
         .await
         .unwrap();
 
@@ -860,7 +885,7 @@ async fn send_message_command_accepts_any_existing_session() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -891,7 +916,7 @@ async fn report_session_ended_removes_the_session() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -1042,7 +1067,7 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
     let item_id = Uuid::new_v4();
     crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-solo", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-solo", "TV", "e", Some(&user))
         .await
         .unwrap();
     let info = PlaybackProgressInfo {
@@ -1151,7 +1176,7 @@ async fn stopping_playback_closes_the_reported_live_stream() {
     );
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-live", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-live", "TV", "e", Some(&user))
         .await
         .unwrap();
 
@@ -1241,11 +1266,11 @@ async fn one_viewer_stopping_does_not_release_another_viewers_stream() {
     );
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let alice = mgr
-        .log_session_activity("Web", "1.0", "dev-a", "TV A", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-a", "TV A", "e", Some(&user))
         .await
         .unwrap();
     let bob = mgr
-        .log_session_activity("Web", "1.0", "dev-b", "TV B", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-b", "TV B", "e", Some(&user))
         .await
         .unwrap();
 
@@ -1310,7 +1335,7 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.clone().unwrap();
@@ -1341,7 +1366,7 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
 
     // The client's next request recreates it — same id, capabilities intact.
     let again = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     assert_eq!(again.id.as_deref(), Some(session_id.as_str()));
@@ -1420,7 +1445,7 @@ async fn cast_target(
     device_id: &str,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
     let session_id = mgr
-        .log_session_activity("Web", "1.0", device_id, "TV", "e", user)
+        .log_session_activity("Web", "1.0", device_id, "TV", "e", Some(user))
         .await
         .unwrap()
         .id
@@ -2035,7 +2060,14 @@ async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
     allow_playback(&db, &target_user).await;
 
     let controlling_session = mgr
-        .log_session_activity("Web", "1.0", "dev-controller", "Phone", "e", &controller)
+        .log_session_activity(
+            "Web",
+            "1.0",
+            "dev-controller",
+            "Phone",
+            "e",
+            Some(&controller),
+        )
         .await
         .unwrap()
         .id
@@ -2320,7 +2352,7 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
     let alice_id = Uuid::parse_str(&alice.id).unwrap();
     let bob = seed_named_user(&db, Uuid::new_v4(), "target").await;
     let controller = mgr
-        .log_session_activity("Web", "1", "control", "Control", "e", &alice)
+        .log_session_activity("Web", "1", "control", "Control", "e", Some(&alice))
         .await
         .unwrap()
         .id
@@ -2504,7 +2536,7 @@ async fn progress_is_kept_against_the_version_the_media_source_names() {
         crate::test_support::save_item(&db, &row).await;
     }
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-v", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-v", "TV", "e", Some(&user))
         .await
         .unwrap();
     let report = |source: Uuid, ticks: i64| PlaybackProgressInfo {
@@ -2565,7 +2597,7 @@ async fn progress_alone_restores_the_now_playing_item() {
     let item_id = Uuid::new_v4();
     crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-recreated", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-recreated", "TV", "e", Some(&user))
         .await
         .unwrap();
     assert!(!mgr.has_active_playback().await.unwrap());
@@ -2615,7 +2647,7 @@ async fn progress_names_only_items_the_library_knows() {
     let item_id = Uuid::new_v4();
     crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-unknown", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-unknown", "TV", "e", Some(&user))
         .await
         .unwrap();
     let id = session.id.as_deref().unwrap();
