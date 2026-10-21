@@ -1109,9 +1109,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// The stored items whose `TopParentId` is one of `top_parent_ids` (a
     /// library's, [`library_top_parents`](Self::library_top_parents)) that a
     /// library scan's pruning weighs: every one of them but an owned
-    /// non-extra (a part or a version stored under its owner) and an
-    /// alternate version whose primary is in the same library — the rows a
-    /// library read lists. Only the columns the pruning needs, unordered.
+    /// non-extra (a part or a version stored under its owner); an unowned
+    /// alternate version is weighed too (Jellyfin 12.1's
+    /// `IncludeAlternateVersions` validation read). Only the columns the
+    /// pruning needs, unordered.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
     /// stub/fake services); the scan then reads the library through the item

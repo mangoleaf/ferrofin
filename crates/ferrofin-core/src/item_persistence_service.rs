@@ -5903,38 +5903,30 @@ fn parse_stored_datetime(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// The rows of a library — `TopParentId` one of the `libraries` top
 /// parents bound as `?1..?libraries` ([`ItemPersistenceService::library_top_parents`])
-/// — that its pruning weighs: every one but the placeholder, an owned
-/// non-extra (a part, or a version stored under its owner) and an alternate
-/// version whose primary is in the same library. Those are exactly the rows
-/// the item repository's library read leaves out (`translate_query`'s
-/// owner and `ALTERNATE_VERSION_HIDDEN` terms), so a row a library browse
-/// never lists is never weighed as gone either — not even when a planned
-/// item claims its path, which is the case for a version that shares its
-/// primary's file. "The same library" is the library's top-parent set, not
-/// the row's own `TopParentId`: on an adopted database a primary a scan
-/// saved carries the collection folder while its version may still carry
-/// Jellyfin's physical folder. `top_parent` is the `TopParentId` term's
-/// column expression, which the caller pins (`+`) or not. The outer table
-/// is aliased `bi`.
+/// — that its pruning weighs: every one but the placeholder and an owned
+/// non-extra (a part, or a version stored under its owner). An unowned
+/// alternate version — one merged by hand — is weighed like any other row,
+/// as Jellyfin 12.1's `Folder.GetChildrenForValidation` reads the children
+/// with `IncludeAlternateVersions = true` and the owner filter only: kept
+/// while its file is on disk, pruned once it is gone. `top_parent` is the
+/// `TopParentId` term's column expression, which the caller pins (`+`) or
+/// not. The outer table is aliased `bi`.
 fn prune_candidate_terms(libraries: usize, top_parent: &str) -> String {
     let tops = numbered_placeholders(libraries);
     format!(
         r#"{top_parent} IN ({tops}) AND bi."Id" <> '{PLACEHOLDER_ID}'
             AND (+bi."OwnerId" IS NULL
                  OR +bi."OwnerId" = '00000000-0000-0000-0000-000000000000'
-                 OR +bi."ExtraType" IS NOT NULL)
-            AND (+bi."PrimaryVersionId" IS NULL OR NOT EXISTS (
-                 SELECT 1 FROM "BaseItems" p
-                 WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IN ({tops})))"#
+                 OR +bi."ExtraType" IS NOT NULL)"#
     )
 }
 
 /// [`ItemPersistenceService::library_items`] over the `libraries` top
 /// parents bound as `?1..?libraries`: the library's rows by a `TopParentId`
-/// index seek per top parent, the other terms a filter on the rows found (an
-/// alternate's primary a primary-key probe), unordered — the pruning needs
-/// no order, and sorting some 20,000 rows spilled to a temp file on every
-/// scan. `EXPLAIN QUERY PLAN` pinned by `the_library_read_seeks_by_top_parent`.
+/// index seek per top parent, the other terms a filter on the rows found,
+/// unordered — the pruning needs no order, and sorting some 20,000 rows
+/// spilled to a temp file on every scan. `EXPLAIN QUERY PLAN` pinned by
+/// `the_library_read_seeks_by_top_parent`.
 pub(crate) fn library_items_sql(libraries: usize) -> String {
     let terms = prune_candidate_terms(libraries, r#"bi."TopParentId""#);
     format!(
