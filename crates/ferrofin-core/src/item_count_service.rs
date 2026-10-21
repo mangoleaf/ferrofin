@@ -6,8 +6,9 @@
 //! playlist's links through the `DescendantOfId` closure, as v12.2 does. The
 //! per-page played/total batch (`get_played_and_total_count_batch`) unions
 //! v12.2's three branches: the `AncestorIds` closure, the `LinkedChildren`, and
-//! the closure of each linked folder. See the TODOs in its body and on
-//! `folder_leaf_count_sql` for where it still differs from v12.2. A folder the
+//! the closure of each linked folder, each page folder standing for its merged
+//! presentation-key group. See the TODO on `folder_leaf_count_sql` for where
+//! it still differs from v12.2. A folder the
 //! batch leaves out (0/0) is counted per item, as `Folder.FillUserDataDtoValues`
 //! does, through `get_played_and_total_count` or its linked sibling.
 
@@ -161,27 +162,48 @@ impl FerrofinItemCountService {
         )
     }
 
-    /// The folders sharing `folder_id`'s `PresentationUniqueKey`: a merged
-    /// series or season is one row per library (v12.2
-    /// `GetPresentationKeyGroups`, `ItemCountService.cs:693-733`). A folder
-    /// with no key, or whose key matches no folder, is a group of one.
+    /// The folders sharing `folder_id`'s `PresentationUniqueKey`
+    /// ([`Self::presentation_key_groups`] for one folder).
     async fn presentation_key_group(&self, folder_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
-        let members: Vec<String> = sqlx::query_scalar(
-            r#"SELECT m."Id" FROM "BaseItems" r
-               JOIN "BaseItems" m ON m."PresentationUniqueKey" = r."PresentationUniqueKey"
-               WHERE r."Id" = ?1 AND r."PresentationUniqueKey" <> '' AND m."IsFolder""#,
-        )
-        .bind(guid_to_db(folder_id))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        if members.is_empty() {
-            return Ok(vec![folder_id]);
+        Ok(self
+            .presentation_key_groups(&[folder_id])
+            .await?
+            .remove(&folder_id)
+            .unwrap_or_else(|| vec![folder_id]))
+    }
+
+    /// Each of `folder_ids` with the folders sharing its
+    /// `PresentationUniqueKey`: a merged series or season is one row per
+    /// library (v12.2 `GetPresentationKeyGroups`, `ItemCountService.cs:
+    /// 693-733`). A folder with no key, or whose key matches no folder, is a
+    /// group of one. One statement for all of them
+    /// ([`presentation_key_groups_sql`]).
+    async fn presentation_key_groups(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        let ids: Vec<String> = folder_ids.iter().copied().map(guid_to_db).collect();
+        let page = serde_json::to_string(&ids).map_err(ServiceError::backend_source)?;
+        let rows: Vec<(String, String)> = sqlx::query_as(presentation_key_groups_sql())
+            .bind(page)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        let parse =
+            |id: &str| Uuid::parse_str(id).map_err(|e| ServiceError::backend(e.to_string()));
+        let mut groups: HashMap<Uuid, Vec<Uuid>> = HashMap::with_capacity(folder_ids.len());
+        for (folder, member) in rows {
+            let (folder, member) = (parse(&folder)?, parse(&member)?);
+            let members = groups.entry(folder).or_default();
+            // A page that lists a folder twice reads its group twice.
+            if !members.contains(&member) {
+                members.push(member);
+            }
         }
-        members
-            .iter()
-            .map(|id| Uuid::parse_str(id).map_err(|e| ServiceError::backend(e.to_string())))
-            .collect()
+        for &folder in folder_ids {
+            groups.entry(folder).or_insert_with(|| vec![folder]);
+        }
+        Ok(groups)
     }
 
     /// Counts each person's credited items by type via `PeopleBaseItemMap`→`Peoples`,
@@ -662,7 +684,15 @@ impl ItemCountService for FerrofinItemCountService {
         // re-scanned every leaf in the library (a folder-independent id set) before
         // intersecting via a thousand-parameter `IN` — O(folders × library) with no
         // batching, which dominated the by-name browse endpoints.
-        let ids: Vec<String> = folder_ids.iter().copied().map(guid_to_db).collect();
+        //
+        // Each page folder stands for its merged presentation-key group (v12.2
+        // `GetPresentationKeyGroups`): the branches count every member, and
+        // each folder sums its members below.
+        let groups = self.presentation_key_groups(folder_ids).await?;
+        let mut members: Vec<Uuid> = groups.values().flatten().copied().collect();
+        members.sort_unstable();
+        members.dedup();
+        let ids: Vec<String> = members.iter().copied().map(guid_to_db).collect();
         let page = serde_json::to_string(&ids).map_err(ServiceError::backend_source)?;
 
         let total_sql = folder_leaf_count_sql("", "");
@@ -722,18 +752,21 @@ impl ItemCountService for FerrofinItemCountService {
         // `GetAllDescendantIdsBatch`, which follows a box set nested in a box
         // set where the branches here stop at the inner set's own closure.
         //
-        // TODO: v12.2 also resolves each requested folder to its merged
-        // presentation-key group (`GetPresentationKeyGroups`,
-        // `ItemCountService.cs:612`, `:693`) and sums the members' counts
-        // (`:669-688`); here each folder counts
-        // alone, so a series merged across rows counts one row's episodes on a
-        // page while its detail page and mark-played answer (per item, through
-        // `presentation_key_group`) count the whole group.
-        // Un-defer path: resolve each page id's group, seed the branches with
-        // every member, and sum the members per requested id.
-        for (&folder, key) in folder_ids.iter().zip(&ids) {
-            if let Some(&counts) = by_parent.get(key) {
-                out.insert(folder, counts);
+        // A group's members are distinct folders, so their leaves never
+        // overlap and the sum is exact (`ItemCountService.cs:669-688`).
+        for &folder in folder_ids {
+            let mut sum = PlayedAndTotal {
+                played: 0,
+                total: 0,
+            };
+            for member in groups.get(&folder).map_or(&[][..], Vec::as_slice) {
+                if let Some(counts) = by_parent.get(&guid_to_db(*member)) {
+                    sum.played = sum.played.saturating_add(counts.played);
+                    sum.total = sum.total.saturating_add(counts.total);
+                }
+            }
+            if sum.total > 0 || sum.played > 0 {
+                out.insert(folder, sum);
             }
         }
         // The `AggregateFolder` is the PHYSICAL root
@@ -1074,6 +1107,18 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
     }
     sql.push_str(r#" GROUP BY p."Name", bi."Type""#);
     sql
+}
+
+/// Each page folder (the JSON array `?1`) with every folder sharing its
+/// non-empty `PresentationUniqueKey`, itself among them: a primary-key probe
+/// per page id, then an `IX_BaseItems_PresentationUniqueKey` seek. The `+`
+/// keeps the planner off the `IsFolder`-led composites. `EXPLAIN QUERY PLAN`
+/// pinned by `the_presentation_key_groups_seek_by_key`.
+fn presentation_key_groups_sql() -> &'static str {
+    r#"SELECT r."Id", m."Id" FROM json_each(?1) AS page
+       CROSS JOIN "BaseItems" r ON r."Id" = page.value
+       CROSS JOIN "BaseItems" m ON m."PresentationUniqueKey" = r."PresentationUniqueKey"
+       WHERE r."PresentationUniqueKey" <> '' AND +m."IsFolder""#
 }
 
 /// The grouped leaf-descendant count for a page of folders. Its first bind is
@@ -1744,10 +1789,18 @@ mod tests {
             seed_user_data(&db, user_id, episode, series == first, None).await;
         }
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user);
+        filter.set_user(user.clone());
         let service = svc(&db);
+        // The page's batch sums each group too (v12.2
+        // `GetPlayedAndTotalCountBatch`), one statement for the groups.
+        let batch = service
+            .get_played_and_total_count_batch(&[first, second, other], &user)
+            .await
+            .expect("batch");
         // Either merged row stands for the whole series.
         for (series, (played, total)) in [(first, (1, 2)), (second, (1, 2)), (other, (0, 1))] {
+            let b = batch[&series];
+            assert_eq!((b.played, b.total), (played, total), "batch");
             let c = service
                 .get_played_and_total_count(&filter, series)
                 .await
@@ -3059,6 +3112,33 @@ mod tests {
             .into_iter()
             .map(|(_, _, _, detail)| detail)
             .collect()
+    }
+
+    /// The page's presentation-key groups: each page id by its primary key,
+    /// then its key's folders by `IX_BaseItems_PresentationUniqueKey` — never
+    /// a scan of `BaseItems`, never an `IsFolder`- or `TopParentId`-led
+    /// composite.
+    #[tokio::test]
+    async fn the_presentation_key_groups_seek_by_key() {
+        let db = test_db().await;
+        let plan = query_plan(&db, super::presentation_key_groups_sql(), 1).await;
+        assert!(
+            !plan
+                .iter()
+                .any(|s| s.starts_with("SCAN r") || s.starts_with("SCAN m")),
+            "no scan of BaseItems, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH r ") && s.contains("(Id=?)")),
+            "each page id by its primary key, got: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|s| s.starts_with(
+                "SEARCH m USING INDEX IX_BaseItems_PresentationUniqueKey (PresentationUniqueKey=?)"
+            )),
+            "the members by IX_BaseItems_PresentationUniqueKey, got: {plan:?}"
+        );
     }
 
     /// Both by-name count aggregates must start from the *name* side. Left to
