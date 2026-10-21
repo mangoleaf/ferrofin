@@ -183,6 +183,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- Book metadata from an EPUB's or a sidecar's OPF follows Jellyfin's reader:
+  - the first description, publisher, language, date and identifier of each kind count;
+  - the first Calibre series, series index, rating and sort title count;
+  - Calibre's series index and rating round half to even (a `2.5` series index is book 2);
+  - a cover named by `<meta name="cover">` is also found under `Images/`.
+
+  Affected books change on their next metadata refresh
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
