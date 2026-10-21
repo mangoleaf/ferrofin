@@ -569,3 +569,60 @@ fn startup_published_server_url_override_wins() {
     let (intf, _) = nm.get_bind_address("192.168.1.1");
     assert_eq!(intf, "http://startup.example");
 }
+
+/// `InitializeOverrides_FullUrlPublicPathDiffersFromBaseUrl_LogsWarning`: the
+/// overrides `WarnIfPublishedUrlBasePathDiffers` warns about. Ferrofin's app
+/// host does the logging, against the mounted base URL.
+#[rstest]
+// Full-URL override with a different public path: warn about the Live TV fallback.
+#[case("all=https://media.example.com", "/jellyfin", true)]
+// Full-URL override that ends with the base URL (with and without a trailing slash): no warning.
+#[case("all=https://media.example.com/jellyfin", "/jellyfin", false)]
+#[case("all=https://media.example.com/jellyfin/", "/jellyfin", false)]
+#[case("all=https://media.example.com/media/jellyfin", "/jellyfin", false)]
+#[case("all=https://media.example.com/cool%20server", "/cool server", false)]
+// A similar segment or a path following the base URL is a different public API base.
+#[case("all=https://media.example.com/jellyfinx", "/jellyfin", true)]
+#[case("all=https://media.example.com/jellyfin/media", "/jellyfin", true)]
+// No base URL configured: there is no path to compare.
+#[case("all=https://media.example.com", "", false)]
+// Bare host overrides get the base URL appended when the API URL is built: no warning.
+#[case("all=media.example.com", "/jellyfin", false)]
+#[case("internal=http-proxy.lan:8097", "/jellyfin", false)]
+// Keyword overrides go through the same check as "all".
+#[case("internal=http://10.0.0.5:8096", "/jellyfin", true)]
+fn initialize_overrides_full_url_public_path_differs_from_base_url_logs_warning(
+    #[case] published_servers: &str,
+    #[case] base_url: &str,
+    #[case] expect_warning: bool,
+) {
+    let conf = NetworkConfiguration {
+        local_network_subnets: vec!["192.168.1.0/24".to_owned()],
+        local_network_addresses: vec!["eth16".to_owned()],
+        enable_ipv4: true,
+        published_server_uri_by_subnet: vec![published_servers.to_owned()],
+        ..Default::default()
+    };
+    let nm = NetworkManager::with_defaults(conf, "192.168.1.208/24,-16,eth16");
+    let overrides: Vec<&str> = nm
+        .published_server_urls()
+        .iter()
+        .map(|entry| entry.override_uri.as_str())
+        .collect();
+    assert!(!overrides.is_empty(), "the override was parsed");
+    let warned = ferrofin_networking::published_urls_missing_base_url(overrides, base_url);
+    assert_eq!(!warned.is_empty(), expect_warning, "{warned:?}");
+}
+
+/// `InitializeOverrides_StartupPublishedServerUrlPathDiffersFromBaseUrl_LogsWarningWithoutCredentials`:
+/// only the host and port of the override are reported.
+#[test]
+fn a_published_url_warning_names_only_its_host_and_port() {
+    assert_eq!(
+        ferrofin_networking::published_urls_missing_base_url(
+            ["https://user:password@media.example.com?access_token=secret#fragment"],
+            "/jellyfin",
+        ),
+        vec!["media.example.com:443".to_owned()]
+    );
+}

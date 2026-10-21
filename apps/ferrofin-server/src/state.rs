@@ -2269,6 +2269,7 @@ pub async fn build_app_state(
         ),
     );
     config_mgr.add_configuration_listener(app_host.configuration_listener());
+    app_host.warn_if_published_url_base_path_differs();
     app_host
         .refresh_server_name()
         .await
