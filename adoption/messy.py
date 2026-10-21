@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Messy real-world rows, first slice: shapes long-lived Jellyfin databases carry that no API
+"""Messy real-world rows: shapes long-lived Jellyfin databases carry that no API
 can produce, injected by SQL into a STOPPED copy of a finished fixture, each with the end state
 Jellyfin 12.2 gives it.
 
@@ -13,6 +13,15 @@ Shapes (SHAPES), one function and one manifest entry each:
                         a user that no longer exists
   dangling_owner_extra  an extra whose OwnerId names an item that does not exist
   duplicate_paths       two BaseItems rows with one Path
+  guid_casing           owner and primary-version ids in lower-case and 32-character spellings
+  case_duplicates       people, a person item and an artist whose names differ only in case
+  orphan_ancestor       AncestorIds rows naming a parent or an item that does not exist
+  virtual_season        a season with no folder, numbered past the highest real one
+  gone_file_userdata    an item whose file is gone, with play state kept
+  non_ascii_names       users, a person and a library path no ASCII-only code survives
+
+Items that need a file are given one in a hard-linked copy of the shared media tree
+(DIR/media-messy), which the oracle and the messy rows mount in place of it.
 
 Each is seeded into the latest 10.11.x fixture and the latest 12.x fixture (DERIVED), one per
 lineage (the 10.11 lineage runs the 0032 / FixIncorrectOwnerIdRelationships migrations on
@@ -41,9 +50,10 @@ import uuid
 from metadata import CheckError
 from synthetic_fixture import USERS, Api, seed_id
 
-#: The shapes of this slice, in the order they are seeded.
-SHAPES = ("deleted_user", "dangling_owner_extra", "duplicate_paths")
-#: Derived fixture -> (source fixture, lineage). D1: the latest 10.11.x and the latest 12.x.
+#: The shapes, in the order they are seeded.
+SHAPES = ("deleted_user", "dangling_owner_extra", "duplicate_paths", "guid_casing", "case_duplicates",
+          "orphan_ancestor", "virtual_season", "gone_file_userdata", "non_ascii_names")
+#: Derived fixture -> (source fixture, lineage): the latest 10.11.x and the latest 12.x.
 DERIVED = (("jellyfin-10.11.11-messy", "jellyfin-10.11.11", "10.11"),
            ("jellyfin-12.2-messy", "jellyfin-12.2-from-121", "12.x"))
 #: What Jellyfin 12.2 runs for the oracle (pulled, and its image id recorded, when it is built).
@@ -60,9 +70,12 @@ REASON_CHARS = 200
 OLDEST_DATE = "2000-01-01"
 #: Seeded rows per table that have more than one to copy: two UserData items is enough to count.
 USER_DATA_ROWS = 2
+#: Users whose play state the item of gone_file_userdata keeps: two is enough to count.
+GONE_FILE_USERS = 2
 #: The tables holding rows of a deleted user (shape deleted_user).
 USER_TABLES = ("UserData", "Permissions", "Preferences", "Devices", "DisplayPreferences")
 VIDEO_TYPE = "MediaBrowser.Controller.Entities.Video"
+MOVIE_TYPE = "MediaBrowser.Controller.Entities.Movies.Movie"
 PLACEHOLDER = "00000000000000000000000000000001"
 #: The ghost user's rows are cloned from this fixture user.
 SOURCE_USER = USERS[1]
@@ -70,6 +83,35 @@ SOURCE_USER = USERS[1]
 #: SkipForwardLength ms, SkipBackwardLength ms, ChromecastVersion, EnableNextVideoInfoOverlay), for a
 #: fixture none of whose users has saved one.
 DISPLAY_PREFERENCE_DEFAULTS = (0, 1, 0, 30000, 10000, 0, 1)
+
+
+#: The media tree the messy rows mount as /media: a hard-linked copy of the fixtures' own, plus a link
+#: for each file a seeded item needs. The clean rows scan the shared tree, so it stays as it is.
+MESSY_MEDIA = "media-messy"
+
+
+def link_media(root, entry):
+    """Make `root`/MESSY_MEDIA (a hard-linked copy of `root`/media on first use) hold every file the
+    seeded shapes in `entry` list as [path, template path] (container paths under /media): the new
+    path is a hard link to the template's file. A template that is not there is an error."""
+    tree = root / MESSY_MEDIA
+    if not tree.exists():
+        # Built beside and renamed into place, so an interrupted copy is never taken for a whole tree
+        # (an item whose file is missing would be removed by Jellyfin's upgrade, which is what the tree is for).
+        partial = root / (MESSY_MEDIA + ".partial")
+        shutil.rmtree(partial, ignore_errors=True)
+        shutil.copytree(root / "media", partial, copy_function=os.link)
+        partial.rename(tree)
+    for shape in entry["shapes"].values():
+        for path, template in shape.get("files", ()):
+            if not (path.startswith("/media/") and template.startswith("/media/")):
+                raise CheckError(f"messy media: {path} and {template} must be container paths under /media/")
+            source, target = tree / template.removeprefix("/media/"), tree / path.removeprefix("/media/")
+            if not source.is_file():
+                raise CheckError(f"messy media: the template file {template} is not in {tree}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                os.link(source, target)
 
 
 # ── seeding ─────────────────────────────────────────────────────────────────
@@ -152,18 +194,20 @@ def seed_deleted_user(conn, manifest):
 
 def seed_dangling_owner_extra(conn, manifest):
     """A copy of an existing extra that sits in a directory of its own and names an owner that
-    does not exist, under a path no file has (nothing in the library scan can remove it first)."""
-    row = conn.execute('SELECT "Id", "OwnerId" FROM "BaseItems" WHERE "ExtraType" IS NOT NULL AND "ExtraType" <> 0 '
-                       'AND "Type" = ? ORDER BY "Id" LIMIT 1', (VIDEO_TYPE,)).fetchone()
+    does not exist. Its file exists (a link to the extra's, in the messy media tree): Jellyfin 12.2
+    removes an item whose file is missing when it upgrades a 10.11 database, which would hide what
+    it does with the owner."""
+    row = conn.execute('SELECT "Id", "OwnerId", "Path" FROM "BaseItems" WHERE "ExtraType" IS NOT NULL AND "ExtraType" <> 0 '
+                       f'AND "Type" = ? AND {original("BaseItems")} ORDER BY "Id" LIMIT 1', (VIDEO_TYPE,)).fetchone()
     if row is None:
         raise CheckError("messy seed: the fixture has no extra to copy")
     extra, missing = seed_id("messy-extra"), seed_id("messy-missing-owner")
+    path = "/media/movies/Synthetic dangling extras/extra.mkv"
     clone_rows(conn, "BaseItems", '"Id" = ?', (row[0],), {
         # an extra with no owner reads its id's spelling from its own id
         "Id": spelled(row[0], extra), "OwnerId": spelled(row[1] or row[0], missing),
-        "Name": "Synthetic dangling extra", "PresentationUniqueKey": extra.hex,
-        "Path": "/media/movies/Synthetic dangling extras/extra.mkv"})
-    return {"extra": extra.hex, "owner": missing.hex}
+        "Name": "Synthetic dangling extra", "PresentationUniqueKey": extra.hex, "Path": path})
+    return {"extra": extra.hex, "owner": missing.hex, "files": [[path, row[2]]]}
 
 
 def seed_duplicate_paths(conn, manifest):
@@ -183,8 +227,224 @@ def seed_duplicate_paths(conn, manifest):
     return {"path": row[1], "original": original.hex, "duplicate": duplicate.hex}
 
 
+# ── the shapes of identifier spelling, duplicates and names ─────────────────
+#: Three users whose names a naive case or Unicode mapping gets wrong, each for its own reason: the
+#: dotted capital I of Turkish, the sharp s (which .NET's invariant upper-casing leaves alone and
+#: ICU turns into SS) and an e with a combining diaeresis that no normalisation has composed.
+UNICODE_USERS = {"dotted_capital_i": "\u0130stanbul", "sharp_s": "Stra\u00dfe", "decomposed": "Zoe\u0308"}
+#: A person pair that differs only by an accented capital, and a name written decomposed.
+UNICODE_PEOPLE = {"capital": "\u00c9mile Zola", "small": "\u00e9mile zola", "decomposed": "Zoe\u0308 Saldan\u0303a"}
+#: A library path no ASCII-only code survives: an accent, a decomposed accent (U and a combining diaeresis,
+#: which no normalisation has composed) and a symbol.
+UNICODE_PATH = "/media/movies/U\u0308n\u00efcode \u2603 Movie (2020)/U\u0308n\u00efcode \u2603 Movie.mkv"
+PERSON_TYPE = "MediaBrowser.Controller.Entities.Person"
+ARTIST_TYPE = "MediaBrowser.Controller.Entities.Audio.MusicArtist"
+SEASON_TYPE = "MediaBrowser.Controller.Entities.TV.Season"
+EPISODE_TYPE = "MediaBrowser.Controller.Entities.TV.Episode"
+
+
+def person_path(template, name):
+    """The metadata path of the person `name`, laid out like `template`'s (`…/People/<initial>/<name>`):
+    a case-variant name has a path of its own, so two persons never share one."""
+    return f"{os.path.dirname(os.path.dirname(template))}/{name[0].upper()}/{name}"
+
+
+def sid(like, name):
+    """A fixed id for the seeded row `name`, spelled the way the stored id `like` is."""
+    return spelled(like, seed_id(name))
+
+
+def clone_one(conn, table, key, changes, what):
+    """The one row of `table` with primary key `key` copied with `changes` (a CheckError when absent)."""
+    if not clone_rows(conn, table, key[0], key[1], changes, 1):
+        raise CheckError(f"messy seed: the fixture has no {what} to copy")
+
+
+def first(conn, sql, params, what):
+    row = conn.execute(sql, params).fetchone()
+    if row is None:
+        raise CheckError(f"messy seed: the fixture has no {what}")
+    return row
+
+
+def seed_guid_casing(conn, manifest):
+    """Extras whose OwnerId and videos whose PrimaryVersionId read as a lower-case dashed id and as
+    32 undashed characters, each naming an item that exists. Jellyfin writes upper-case dashed ids
+    from 12.0 on; older databases hold other spellings, and 12.x converts them on upgrade only."""
+    known = original("BaseItems", 'b."Id"')
+    owner_exists = "EXISTS (SELECT 1 FROM \"BaseItems\" o WHERE lower(replace(o.\"Id\", '-', '')) = lower(replace(b.\"OwnerId\", '-', '')))"
+    extra = first(conn, 'SELECT b."Id", b."OwnerId", b."Path" FROM "BaseItems" b WHERE b."ExtraType" IS NOT NULL AND b."ExtraType" <> 0 '
+                  f'AND b."Type" = ? AND {known} AND {owner_exists} ORDER BY b."Id" LIMIT 1', (VIDEO_TYPE,), "extra with an owner to copy")
+    owner = uuid.UUID(extra[1])
+    primary_row = first(conn, 'SELECT "Id", "Path" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                        (uuid.UUID(manifest["private_movie"]).hex,), "movie to name as a primary version")
+    primary = uuid.UUID(primary_row[0])
+    items, files = {}, []
+    for label, source, template, column, value in (
+            ("owner_lower36", extra[0], extra[2], "OwnerId", str(owner).lower()),
+            ("owner_n32", extra[0], extra[2], "OwnerId", owner.hex),
+            ("primary_lower36", primary_row[0], primary_row[1], "PrimaryVersionId", str(primary).lower()),
+            ("primary_n32", primary_row[0], primary_row[1], "PrimaryVersionId", primary.hex)):
+        ident = seed_id("messy-guid-" + label)
+        path = f"/media/movies/Synthetic guid casing/{label}/{label}.mkv"
+        clone_one(conn, "BaseItems", ('"Id" = ?', (source,)), {
+            "Id": spelled(source, ident), column: value, "Name": "Synthetic guid casing " + label,
+            "PresentationUniqueKey": ident.hex, "Path": path}, "item")
+        items[label] = ident.hex
+        files.append([path, template])
+    return {"items": items, "owner": owner.hex, "primary": primary.hex, "files": files}
+
+
+def seed_case_duplicates(conn, manifest):
+    """Pairs of rows whose names differ only by case, as Jellyfin 12.0's MergeDuplicatePeople and
+    MergeDuplicateMusicArtists routines look for, each pair independent of the others: a Person item
+    in ASCII, a Peoples row in ASCII (linked to a movie), an accented pair of both (each linked), and
+    a music artist. The pairs are read by lower-cased name, not by id: a server may re-key a person."""
+    person = first(conn, 'SELECT "Id", "Name", "Path" FROM "BaseItems" WHERE "Type" = ? AND ' + original("BaseItems") + ' ORDER BY "Id" LIMIT 1',
+                   (PERSON_TYPE,), "person")
+    peoples = first(conn, 'SELECT "Id", "Name" FROM "Peoples" WHERE ' + original("Peoples") + ' ORDER BY "Id" LIMIT 1', (), "people row")
+    link = first(conn, 'SELECT "ItemId", "Role" FROM "PeopleBaseItemMap" WHERE "PeopleId" = ? ORDER BY "ItemId" LIMIT 1',
+                 (peoples[0],), "movie linked to a person")
+    artist = first(conn, 'SELECT "Id", "Name", "Path" FROM "BaseItems" WHERE "Type" = ? AND ' + original("BaseItems") + ' ORDER BY "Id" LIMIT 1',
+                   (ARTIST_TYPE,), "music artist")
+
+    def add_item(label, name):
+        ident = seed_id("messy-case-item-" + label)
+        clone_one(conn, "BaseItems", ('"Id" = ?', (person[0],)), {
+            "Id": spelled(person[0], ident), "Name": name, "CleanName": name.lower(), "SortName": name,
+            "PresentationUniqueKey": ident.hex, "Path": person_path(person[2], name)}, "person")
+
+    def add_people(label, name):
+        row = seed_id("messy-case-people-" + label)
+        clone_one(conn, "Peoples", ('"Id" = ?', (peoples[0],)), {"Id": spelled(peoples[0], row), "Name": name}, "people row")
+        clone_one(conn, "PeopleBaseItemMap", ('"PeopleId" = ? AND "ItemId" = ? AND "Role" = ?', (peoples[0], link[0], link[1])),
+                  {"PeopleId": spelled(peoples[0], row)}, "people link")
+
+    add_item("ascii", person[1].upper())
+    add_people("ascii", peoples[1].upper())
+    for label in ("capital", "small"):
+        add_item("unicode-" + label, UNICODE_PEOPLE[label])
+        add_people("unicode-" + label, UNICODE_PEOPLE[label])
+    twin = seed_id("messy-case-artist")
+    clone_one(conn, "BaseItems", ('"Id" = ?', (artist[0],)), {
+        "Id": spelled(artist[0], twin), "Name": artist[1].upper(), "CleanName": artist[1].lower(), "SortName": artist[1].upper(),
+        "PresentationUniqueKey": twin.hex, "Path": f"{os.path.dirname(artist[2])}/{artist[1].upper()}"}, "music artist")
+    return {"movie": uuid.UUID(link[0]).hex,
+            "keys": {"person_item_ascii": person[1].lower(), "people_ascii": peoples[1].lower(),
+                     "unicode": UNICODE_PEOPLE["small"], "artist": artist[1].lower()}}
+
+
+def seed_orphan_ancestor(conn, manifest):
+    """Two AncestorIds rows with an end that names no item: one whose parent is missing and one whose
+    item is missing. The key is not enforced while foreign keys are off."""
+    # A movie no other shape names or copies as an original: Jellyfin rewrites the ancestors of an item
+    # whose versions change (guid_casing's versions name the private movie), which would drop the row.
+    movie = first(conn, 'SELECT "Id" FROM "BaseItems" WHERE "Type" = ? AND lower(replace("Id", \'-\', \'\')) <> ? AND '
+                  + original("BaseItems") + ' ORDER BY "Id" LIMIT 1', (MOVIE_TYPE, uuid.UUID(manifest["private_movie"]).hex), "movie other shapes leave alone")
+    missing_parent, missing_item = seed_id("messy-orphan-parent"), seed_id("messy-orphan-item")
+    conn.execute('INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?, ?)', (movie[0], spelled(movie[0], missing_parent)))
+    conn.execute('INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?, ?)', (spelled(movie[0], missing_item), movie[0]))
+    return {"movie": uuid.UUID(movie[0]).hex, "missing_parent": missing_parent.hex, "missing_item": missing_item.hex}
+
+
+def seed_virtual_season(conn, manifest):
+    """A season no folder backs (Path NULL) with one episode in it: what a series gets when its files
+    skip a season. Its number is one past the series' highest, so it collides with no real season."""
+    season = first(conn, 'SELECT "Id", "SeriesId" FROM "BaseItems" WHERE "Type" = ? AND ' + original("BaseItems") +
+                   ' ORDER BY "IndexNumber" DESC, "Id" LIMIT 1', (SEASON_TYPE,), "season")
+    number = conn.execute('SELECT MAX("IndexNumber") + 1 FROM "BaseItems" WHERE "Type" = ? AND "SeriesId" = ?',
+                          (SEASON_TYPE, season[1])).fetchone()[0]
+    episode = first(conn, 'SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ? AND "SeasonId" = ? AND ' + original("BaseItems") +
+                    ' ORDER BY "Id" LIMIT 1', (EPISODE_TYPE, season[0]), "episode of that season")
+    new_season, new_episode = seed_id("messy-virtual-season"), seed_id("messy-virtual-episode")
+    # In the series folder, not a folder of its own: a season no folder backs is what files laid out
+    # as `Show S09E01.mkv` give, and a Season folder on disk would let a scan make a real season.
+    episode_path = f"{os.path.dirname(os.path.dirname(episode[1]))}/Synthetic virtual season episode S{number:02d}E01.mkv"
+    clone_one(conn, "BaseItems", ('"Id" = ?', (season[0],)), {
+        "Id": spelled(season[0], new_season), "Name": f"Season {number}", "IndexNumber": number, "Path": None,
+        "PresentationUniqueKey": new_season.hex}, "season")
+    clone_one(conn, "BaseItems", ('"Id" = ?', (episode[0],)), {
+        "Id": spelled(episode[0], new_episode), "Name": "Synthetic virtual season episode", "IndexNumber": 1,
+        "ParentIndexNumber": number, "ParentId": spelled(season[0], new_season), "SeasonId": spelled(season[0], new_season),
+        "PresentationUniqueKey": new_episode.hex,
+        "Path": episode_path}, "episode")
+    return {"series": uuid.UUID(season[1]).hex, "season": new_season.hex, "number": number, "episode": new_episode.hex,
+            "files": [[episode_path, episode[1]]]}
+
+
+def seed_gone_file_userdata(conn, manifest):
+    """A movie whose file is not there and the play state two users recorded for it: what is left
+    when a file is deleted while the server is off."""
+    source = first(conn, 'SELECT b."Id" FROM "BaseItems" b WHERE b."Type" = ? AND ' + original("BaseItems", 'b."Id"') +
+                   ' AND EXISTS (SELECT 1 FROM "UserData" u WHERE u."ItemId" = b."Id") ORDER BY b."Id" LIMIT 1',
+                   (MOVIE_TYPE,), "movie with play state")
+    ident = seed_id("messy-gone-file")
+    key = "messy-gone-file-" + ident.hex
+    clone_one(conn, "BaseItems", ('"Id" = ?', (source[0],)), {
+        "Id": spelled(source[0], ident), "Name": "Vanished Movie", "PresentationUniqueKey": ident.hex,
+        "Path": "/media/movies/Vanished Movie (2001)/Vanished Movie.mkv"}, "movie")
+    # users the database has: another shape's rows of a deleted user are not this shape's to copy
+    users = [user for (user,) in conn.execute(
+        'SELECT DISTINCT d."UserId" FROM "UserData" d WHERE d."ItemId" = ? AND lower(replace(d."UserId", \'-\', \'\')) IN '
+        '(SELECT lower(replace("Id", \'-\', \'\')) FROM "Users") ORDER BY d."UserId" LIMIT ?', (source[0], GONE_FILE_USERS))]
+    # one row per user (a user can hold several under different keys, and the key here is one)
+    rows = sum(clone_rows(conn, "UserData", '"ItemId" = ? AND "UserId" = ? ORDER BY "CustomDataKey"', (source[0], user),
+                          {"ItemId": spelled(source[0], ident), "CustomDataKey": key, "Played": 1}, 1) for user in users)
+    if not rows:
+        raise CheckError("messy seed: the fixture has no play state to copy")
+    return {"item": ident.hex, "key": key, "rows": rows}
+
+
+def seed_non_ascii_names(conn, manifest):
+    """Names that case and Unicode mappings disagree on: three users (each stored, where the table has
+    the column, with a normalised name that is no normalisation of it, "stale-<label>" because the
+    column is unique), one person with a decomposed name, and a movie whose path has an accent, a
+    decomposed accent and a symbol. (The accented capital and small person pair belongs to case_duplicates.)"""
+    has_normalized = any(column[1] == "NormalizedUsername" for column in conn.execute('PRAGMA table_info("Users")'))
+    source = stored_user(conn, manifest)
+    top = conn.execute('SELECT COALESCE(MAX("InternalId"), 0) FROM "Users"').fetchone()[0]
+    users = {}
+    for index, (label, name) in enumerate(UNICODE_USERS.items(), 1):
+        ident = seed_id("messy-unicode-user-" + label)
+        changes = {"Id": spelled(source, ident), "Username": name, "InternalId": top + index}
+        if has_normalized:
+            changes["NormalizedUsername"] = "stale-" + label
+        clone_one(conn, "Users", ('"Id" = ?', (source,)), changes, "user")
+        users[label] = {"user": ident.hex, "name": name}
+    person = first(conn, 'SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ? AND ' + original("BaseItems") + ' ORDER BY "Id" LIMIT 1',
+                   (PERSON_TYPE,), "person")
+    peoples = first(conn, 'SELECT "Id" FROM "Peoples" WHERE ' + original("Peoples") + ' ORDER BY "Id" LIMIT 1', (), "people row")
+    people = {}
+    for label in ("decomposed",):
+        name = UNICODE_PEOPLE[label]
+        item, row = seed_id("messy-unicode-person-" + label), seed_id("messy-unicode-people-" + label)
+        clone_one(conn, "BaseItems", ('"Id" = ?', (person[0],)), {
+            "Id": spelled(person[0], item), "Name": name, "CleanName": name.lower(), "SortName": name,
+            "PresentationUniqueKey": item.hex, "Path": person_path(person[1], name)}, "person")
+        clone_one(conn, "Peoples", ('"Id" = ?', (peoples[0],)), {"Id": spelled(peoples[0], row), "Name": name}, "people row")
+        people[label] = {"item": item.hex, "people": row.hex, "name": name}
+    movie = first(conn, 'SELECT "Id", "Path" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                  (uuid.UUID(manifest["private_movie"]).hex,), "movie")
+    ident = seed_id("messy-unicode-path")
+    clone_one(conn, "BaseItems", ('"Id" = ?', (movie[0],)), {
+        "Id": spelled(movie[0], ident), "Name": "Synthetic unicode path", "PresentationUniqueKey": ident.hex,
+        "Path": UNICODE_PATH}, "movie")
+    return {"users": users, "people": people, "movie": ident.hex, "path": UNICODE_PATH,
+            "files": [[UNICODE_PATH, movie[1]]]}
+
+
 SEEDERS = {"deleted_user": seed_deleted_user, "dangling_owner_extra": seed_dangling_owner_extra,
-           "duplicate_paths": seed_duplicate_paths}
+           "duplicate_paths": seed_duplicate_paths, "guid_casing": seed_guid_casing,
+           "case_duplicates": seed_case_duplicates, "orphan_ancestor": seed_orphan_ancestor,
+           "virtual_season": seed_virtual_season, "gone_file_userdata": seed_gone_file_userdata,
+           "non_ascii_names": seed_non_ascii_names}
+
+
+def original(table, column='"Id"'):
+    """SQL limiting a query on `table` to the rows it held before any shape wrote (seed_messy keeps
+    their ids in a temporary table): a shape copies from those only, never from another shape's rows,
+    so the combined fixture ends as each shape alone does whatever the ids sort like."""
+    return f'{column} IN (SELECT "Id" FROM temp."messy_original_{table}")'
 
 
 def seed_messy(db, manifest, shapes=SHAPES):
@@ -194,6 +454,8 @@ def seed_messy(db, manifest, shapes=SHAPES):
         # A deleted user and a missing owner need foreign keys off, outside a transaction.
         conn.execute("PRAGMA foreign_keys = OFF")
         with conn:
+            for table in ("BaseItems", "Peoples"):
+                conn.execute(f'CREATE TEMP TABLE "messy_original_{table}" AS SELECT "Id" FROM "{table}"')
             for shape in shapes:
                 entry["shapes"][shape] = SEEDERS[shape](conn, manifest)
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -222,6 +484,112 @@ def owner_kind(conn, extra):
     return "other" if item(conn, owned) else "dangling"
 
 
+def stored_hex(column):
+    """SQL that reads the id column `column` as 32 lower-case hex digits, whatever its spelling."""
+    return f"lower(replace(\"{column}\", '-', ''))"
+
+
+def count_where(conn, table, where, params):
+    return conn.execute(f'SELECT COUNT(*) FROM "{table}" WHERE {where}', params).fetchone()[0]
+
+
+def ref_form(conn, value):
+    """How an identifier column reads: null, or its spelling (lower36, upper36, mixed36, n32 lower or
+    upper, other) and whether it names an item, the all-zero id, or nothing."""
+    if value is None:
+        return "null"
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return "invalid"
+    if len(value) == 36:
+        form = "lower36" if value == value.lower() else "upper36" if value == value.upper() else "mixed36"
+    elif len(value) == 32:
+        form = "n32lower" if value == value.lower() else "n32upper"
+    else:
+        form = "other"
+    if parsed.int == 0:
+        return form + "-zero"
+    return form + ("->item" if item(conn, parsed.hex) else "->none")
+
+
+def guid_casing_state(conn, entry):
+    state = {}
+    for label, ident in entry["items"].items():
+        row = conn.execute(f'SELECT "OwnerId", "PrimaryVersionId" FROM "BaseItems" WHERE {stored_hex("Id")} = ?',
+                           (ident,)).fetchone()
+        state[label] = "gone" if row is None else {"owner": ref_form(conn, row[0]), "primary": ref_form(conn, row[1])}
+    return state
+
+
+def named(conn, table, kind, key):
+    """The rows of `table` (of Type `kind` when it has one) whose name lower-cases to `key`: the ids
+    of those rows. Lower-cased here, not in SQL, whose lower() leaves an accented capital alone."""
+    where, params = ('"Type" = ?', (kind,)) if kind else ("1 = 1", ())
+    return [ident for ident, name in conn.execute(f'SELECT "Id", "Name" FROM "{table}" WHERE {where}', params)
+            if name is not None and name.lower() == key]
+
+
+def case_duplicates_state(conn, entry):
+    """How many rows of each pair are left, and how many links a movie keeps to the people rows."""
+    keys, movie = entry["keys"], entry["movie"]
+
+    def links(people):
+        return sum(count_where(conn, "PeopleBaseItemMap", f'{stored_hex("ItemId")} = ? AND "PeopleId" = ?', (movie, row))
+                   for row in people)
+
+    ascii_people, unicode_people = named(conn, "Peoples", None, keys["people_ascii"]), named(conn, "Peoples", None, keys["unicode"])
+    return {"person_item_ascii": len(named(conn, "BaseItems", PERSON_TYPE, keys["person_item_ascii"])),
+            "people_ascii": {"rows": len(ascii_people), "links": links(ascii_people)},
+            "unicode": {"items": len(named(conn, "BaseItems", PERSON_TYPE, keys["unicode"])),
+                        "peoples": len(unicode_people), "links": links(unicode_people)},
+            "artists": len(named(conn, "BaseItems", ARTIST_TYPE, keys["artist"]))}
+
+
+def orphan_ancestor_state(conn, entry):
+    movie = stored_hex("ItemId")
+    return {"missing_parent_rows": count_where(conn, "AncestorIds", f'{movie} = ? AND {stored_hex("ParentItemId")} = ?',
+                                               (entry["movie"], entry["missing_parent"])),
+            "missing_item_rows": count_where(conn, "AncestorIds", f"{movie} = ?", (entry["missing_item"],))}
+
+
+def virtual_season_state(conn, entry):
+    season = conn.execute(f'SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ? AND {stored_hex("SeriesId")} = ? '
+                          'AND "IndexNumber" = ?', (SEASON_TYPE, entry["series"], entry["number"])).fetchone()
+    episode = conn.execute(f'SELECT "ParentId", "SeasonId" FROM "BaseItems" WHERE {stored_hex("Id")} = ?',
+                           (entry["episode"],)).fetchone()
+    return {"season": None if season is None else {"has_path": season[1] is not None},
+            "episode": None if episode is None else {
+                "under_season": season is not None and hex_of(episode[0]) == hex_of(season[0]),
+                "season_id_is_season": season is not None and hex_of(episode[1]) == hex_of(season[0])}}
+
+
+def gone_file_userdata_state(conn, entry):
+    return {"item": item(conn, entry["item"]) is not None,
+            "userdata_on_item": count_where(conn, "UserData", f'{stored_hex("ItemId")} = ?', (entry["item"],)),
+            "userdata_with_key": count_where(conn, "UserData", '"CustomDataKey" = ?', (entry["key"],))}
+
+
+def non_ascii_names_state(conn, entry):
+    has_normalized = any(column[1] == "NormalizedUsername" for column in conn.execute('PRAGMA table_info("Users")'))
+    users = {}
+    for label, user in entry["users"].items():
+        row = conn.execute('SELECT "NormalizedUsername" FROM "Users" WHERE "Username" = ?' if has_normalized else
+                           'SELECT 1 FROM "Users" WHERE "Username" = ?', (user["name"],)).fetchone()
+        users[label] = None if row is None else (row[0] if has_normalized else True)
+    # people are counted by their exact stored name (byte for byte), not by id: a server may re-key a person
+    people = {label: {"items": count_where(conn, "BaseItems", '"Type" = ? AND "Name" = ?', (PERSON_TYPE, row["name"])),
+                      "peoples": count_where(conn, "Peoples", '"Name" = ?', (row["name"],))}
+              for label, row in entry["people"].items()}
+    path = conn.execute(f'SELECT "Path" FROM "BaseItems" WHERE {stored_hex("Id")} = ?', (entry["movie"],)).fetchone()
+    return {"users": users, "people": people, "path": path and path[0]}
+
+
+STATE_READERS = {"guid_casing": guid_casing_state, "case_duplicates": case_duplicates_state,
+                 "orphan_ancestor": orphan_ancestor_state, "virtual_season": virtual_season_state,
+                 "gone_file_userdata": gone_file_userdata_state, "non_ascii_names": non_ascii_names_state}
+
+
 def shape_state(conn, entry):
     """The end state of the seeded shapes in `conn` (a database any server has had since)."""
     state = {}
@@ -237,6 +605,9 @@ def shape_state(conn, entry):
         paths = shapes["duplicate_paths"]
         state["duplicate_paths"] = {"original": item(conn, paths["original"]) is not None,
                                     "duplicate": item(conn, paths["duplicate"]) is not None}
+    for shape, reader in STATE_READERS.items():
+        if shape in shapes:
+            state[shape] = reader(conn, shapes[shape])
     return state
 
 
@@ -248,9 +619,9 @@ def read_state(db, entry):
 # ── what Ferrofin is expected to differ in ──────────────────────────────────
 # (shape, lineage) -> (the state Ferrofin must reach, why it differs from Jellyfin 12.2). A
 # difference from Jellyfin 12.2 that is not here fails the run. Read off the oracle's record
-# (messy-oracle.json) and a live adoption; the dangling owner on the 12.x lineage is what Ferrofin
-# must reach, not what it does today (gl-707).
+# (messy-oracle.json) and a live adoption.
 NO_USER_ROWS = {table: 0 for table in USER_TABLES}
+NO_ORPHAN_ANCESTORS = {"missing_parent_rows": 0, "missing_item_rows": 0}
 DIVERGENCES = {
     # Jellyfin 12.2 deletes only the Permissions and Preferences of a missing user (12.1's cleanup)
     # when it upgrades a 10.11 database, and nothing when it boots a 12.x one: UserData, Devices
@@ -261,8 +632,8 @@ DIVERGENCES = {
     ("deleted_user", "12.x"): (NO_USER_ROWS, "0044 deletes every row of a missing user; Jellyfin 12.2 keeps them all"),
     # Jellyfin 12.2 keeps an extra whose owner is gone on a 12.x database (the routines that
     # remove it ran when that database was upgraded), and boots. Ferrofin's foreign_key_check
-    # refuses a dangling OwnerId, so the extra must be removed as on the 10.11 lineage, where 12.2
-    # deletes it too. Ferrofin refuses the database instead today: gl-707.
+    # refuses a dangling OwnerId, so migration 0045 hands the extra to the placeholder item and the
+    # boot repair removes it, as on the 10.11 lineage, where 12.2 deletes it too.
     ("dangling_owner_extra", "12.x"): ({"exists": False, "owner": None},
                                        "Ferrofin removes a dangling-owner extra (as 12.2 does from 10.11); 12.2 keeps it on 12.x"),
     # A 12.x database has already run Jellyfin's FixIncorrectOwnerIdRelationships, so 12.2 keeps both
@@ -270,6 +641,36 @@ DIVERGENCES = {
     # keeps (children, then extras, then the newer one), deleting the other.
     ("duplicate_paths", "12.x"): ({"original": True, "duplicate": False},
                                   "Ferrofin collapses duplicate paths at adoption; 12.2 does not re-run its routine on 12.x"),
+    # Jellyfin 12.2 leaves a 12.x database as written, because its upgrade routines ran
+    # when that database was upgraded; Ferrofin runs its ports once, whatever the source.
+    # 0032 (a 10.11 source) upper-cases an OwnerId and nulls one that is not 36 characters, as
+    # Jellyfin's ChangeOwnerIdToGuid does; 0045 does both for every other source (an owner that
+    # exists in another case takes the id's spelling, a 32-character one becomes NULL). PrimaryVersionId
+    # is left as written, as 12.2 leaves it, though Ferrofin's own lookups of it are byte-exact: whether
+    # it should be re-spelled too is gl-752, and this expectation changes with that decision.
+    ("guid_casing", "12.x"): ({"owner_lower36": {"owner": "upper36->item", "primary": "null"},
+                              "owner_n32": {"owner": "null", "primary": "null"},
+                              "primary_lower36": {"owner": "null", "primary": "lower36->item"},
+                              "primary_n32": {"owner": "null", "primary": "n32lower->item"}},
+                             "0045 re-spells an owner in another case and nulls a 32-character one; 12.2 keeps them as written"),
+    # MergeDuplicatePeople and MergeDuplicateMusicArtists (12.0) run once per adoption in Ferrofin, so a
+    # case-only pair on a 12.x database is merged (people grouped by lower-cased name and type, which
+    # is why the ASCII people group ends with two rows: the fixture already holds a third row of that
+    # name with another type, which the seeder does not write and the merge leaves alone).
+    ("case_duplicates", "12.x"): ({"person_item_ascii": 1, "people_ascii": {"rows": 2, "links": 2},
+                                  "unicode": {"items": 1, "peoples": 1, "links": 1}, "artists": 1},
+                                 "Ferrofin merges case-only duplicates at adoption; 12.2 does not re-run its routines on 12.x"),
+    # Migration 0044 deletes AncestorIds rows naming an item that is not there (what the key's cascade
+    # would have removed); Jellyfin 12.2 never looks at them and keeps both rows (Ferrofin's
+    # every-boot foreign_key_check stays strict, so it cannot keep a row naming an item that is gone).
+    ("orphan_ancestor", "10.11"): (NO_ORPHAN_ANCESTORS, "0044 deletes ancestor rows naming a missing item; Jellyfin 12.2 keeps them"),
+    ("orphan_ancestor", "12.x"): (NO_ORPHAN_ANCESTORS, "0044 deletes ancestor rows naming a missing item; Jellyfin 12.2 keeps them"),
+    # Ferrofin sets every user's NormalizedUsername to the name upper-cased as .NET's ToUpperInvariant
+    # does (normalized_usernames.rs), once, whatever is stored; Jellyfin 12.2 recomputes it only when
+    # it upgrades a 10.11 database and keeps the stored value on a 12.x one.
+    ("non_ascii_names", "12.x"): ({"users": {"decomposed": "ZOE\u0308", "dotted_capital_i": "\u0130STANBUL", "sharp_s": "STRA\u00dfE"},
+                                  "people": {"decomposed": {"items": 1, "peoples": 1}}, "path": UNICODE_PATH},
+                                 "Ferrofin recomputes every user's normalised name at adoption; 12.2 keeps the stored value on 12.x"),
 }
 
 
@@ -380,7 +781,7 @@ def record_oracle(root, source, entry_shapes, manifest, port):
         try:
             shutil.copytree(source, copy)
             entry = seed_messy(copy / "data/jellyfin.db", manifest, (shape,) if shape else entry_shapes)
-            outcome = run_oracle_server(copy, root / "media", port)
+            outcome = run_oracle_server(copy, root / MESSY_MEDIA, port)
             outcome["state"] = read_state(copy / "data/jellyfin.db", entry)
         finally:
             shutil.rmtree(copy, ignore_errors=True)
@@ -394,8 +795,10 @@ def record_oracle(root, source, entry_shapes, manifest, port):
                  != (record["combined"]["outcome"], record["combined"]["state"][shape])]
     if differing:
         # Ferrofin adopts the fixture carrying every shape, so the expectation must hold there too.
+        detail = "; ".join(f"{shape}: alone {record['shapes'][shape]['state'][shape]}, with all {record['combined']['state'][shape]}"
+                           for shape in differing)
         raise CheckError("Jellyfin 12.2 handled " + ", ".join(differing) + " differently with all the shapes "
-                         "present than with each alone; the per-shape record would be the wrong expectation")
+                         f"present than with each alone ({detail}); the per-shape record would be the wrong expectation")
     return record
 
 
@@ -426,6 +829,7 @@ def build(root, port):
             entry = seed_messy(target / "data/jellyfin.db", manifest)
             entry["lineage"] = lineage
             entry["source"] = source_name
+            link_media(root, entry)
             save(target / "messy.json", entry)
             oracle = record_oracle(root, source, SHAPES, manifest, port)
             save(target / "messy-oracle.json", oracle)

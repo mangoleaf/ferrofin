@@ -18,6 +18,8 @@
 #   jellyfin-10.11.11-messy/  jellyfin-12.2-messy/   copies of 10.11.11 and 12.2-from-121 plus rows of
 #                                  shapes no API produces, each with Jellyfin 12.2's end state for it
 #                                  (messy.py: messy.json, messy-oracle.json)
+#   media-messy/                   a hard-linked copy of media/ plus a link per file a seeded item needs; only the
+#                                  messy rows and their oracle mount it, so the clean rows' media is untouched
 # Existing fixtures and oracles are kept; synthetic.py refuses fixtures from an older recipe, so
 # build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
 # can leave a copy under DIR/work/oracle-* (or messy-oracle-*); work/ is scratch and may be deleted
@@ -27,7 +29,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
-while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,24p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,26p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || { echo "--fixtures DIR is required" >&2; exit 2; }
 adoption_require_local "$FIXTURES" || exit 2
 mkdir -p "$FIXTURES"; FIXTURES=$(cd "$FIXTURES" && pwd)

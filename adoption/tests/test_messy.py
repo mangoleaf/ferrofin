@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 import uuid
@@ -23,10 +24,23 @@ ITEM = "1559654E-1FB0-5780-0C66-00CA97F14DBB"
 OTHER_ITEM = "2A59654E-1FB0-5780-0C66-00CA97F14DBB"
 EXTRA = "3B36F4F7-6903-1423-B8DF-4F11C37566A5"
 PRIVATE = "4C36F4F7-6903-1423-B8DF-4F11C37566A5"
+PERSON = "5D36F4F7-6903-1423-B8DF-4F11C37566A5"
+ARTIST = "6E36F4F7-6903-1423-B8DF-4F11C37566A5"
+SERIES = "7F36F4F7-6903-1423-B8DF-4F11C37566A5"
+SEASON = "8036F4F7-6903-1423-B8DF-4F11C37566A5"
+EPISODE = "9136F4F7-6903-1423-B8DF-4F11C37566A5"
+PEOPLE = "A236F4F7-6903-1423-B8DF-4F11C37566A5"
 SCHEMA = """
-CREATE TABLE Users (Id TEXT NOT NULL PRIMARY KEY);
+CREATE TABLE Users (Id TEXT NOT NULL PRIMARY KEY, Username TEXT NOT NULL, NormalizedUsername TEXT NOT NULL DEFAULT '',
+    InternalId INTEGER NOT NULL);
+CREATE UNIQUE INDEX IX_Users_NormalizedUsername ON Users (NormalizedUsername);
 CREATE TABLE BaseItems (Id TEXT NOT NULL PRIMARY KEY, Type TEXT NOT NULL, Name TEXT, Path TEXT, OwnerId TEXT,
-    ExtraType INTEGER NULL, PresentationUniqueKey TEXT, DateCreated TEXT);
+    PrimaryVersionId TEXT, ExtraType INTEGER NULL, PresentationUniqueKey TEXT, DateCreated TEXT, CleanName TEXT,
+    SortName TEXT, IndexNumber INTEGER, ParentIndexNumber INTEGER, ParentId TEXT, SeasonId TEXT, SeriesId TEXT);
+CREATE TABLE Peoples (Id TEXT NOT NULL PRIMARY KEY, Name TEXT NOT NULL, PersonType TEXT);
+CREATE TABLE PeopleBaseItemMap (ItemId TEXT NOT NULL, PeopleId TEXT NOT NULL, Role TEXT NOT NULL, ListOrder INTEGER,
+    SortOrder INTEGER, PRIMARY KEY (ItemId, PeopleId, Role));
+CREATE TABLE AncestorIds (ItemId TEXT NOT NULL, ParentItemId TEXT NOT NULL, PRIMARY KEY (ItemId, ParentItemId));
 CREATE TABLE UserData (ItemId TEXT NOT NULL, UserId TEXT NOT NULL, CustomDataKey TEXT NOT NULL,
     Played INTEGER NOT NULL, PRIMARY KEY (ItemId, UserId, CustomDataKey));
 CREATE TABLE Permissions (Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, Kind INTEGER NOT NULL,
@@ -51,10 +65,25 @@ def populate(db):
     """A scratch database holding the rows the seeders copy: one user, two movies, an extra."""
     with closing(sqlite3.connect(db)) as conn:
         conn.executescript(SCHEMA + f"""
-            INSERT INTO Users VALUES ('{ADULT}');
-            INSERT INTO BaseItems VALUES ('{ITEM}', 'MediaBrowser.Controller.Entities.Movies.Movie', 'Movie', '/media/movies/a/a.mkv', NULL, NULL, 'k1', '2026-10-20 04:22:14.4161545');
-            INSERT INTO BaseItems VALUES ('{PRIVATE}', 'MediaBrowser.Controller.Entities.Movies.Movie', 'Private', '/media/movies/p/p.mkv', NULL, NULL, 'k2', '2026-10-20 04:22:15.4161545');
-            INSERT INTO BaseItems VALUES ('{EXTRA}', '{messy.VIDEO_TYPE}', 'Making of', '/media/movies/a/extras/x.mkv', '{ITEM}', 3, 'k3', '2026-10-20 04:22:16.4161545');
+            INSERT INTO Users (Id, Username, NormalizedUsername, InternalId) VALUES ('{ADULT}', 'adult', 'ADULT', 1);
+            INSERT INTO BaseItems (Id, Type, Name, Path, OwnerId, ExtraType, PresentationUniqueKey, DateCreated)
+              VALUES ('{ITEM}', 'MediaBrowser.Controller.Entities.Movies.Movie', 'Movie', '/media/movies/a/a.mkv', NULL, NULL, 'k1', '2026-10-20 04:22:14.4161545');
+            INSERT INTO BaseItems (Id, Type, Name, Path, OwnerId, ExtraType, PresentationUniqueKey, DateCreated)
+              VALUES ('{PRIVATE}', 'MediaBrowser.Controller.Entities.Movies.Movie', 'Private', '/media/movies/p/p.mkv', NULL, NULL, 'k2', '2026-10-20 04:22:15.4161545');
+            INSERT INTO BaseItems (Id, Type, Name, Path, OwnerId, ExtraType, PresentationUniqueKey, DateCreated)
+              VALUES ('{EXTRA}', '{messy.VIDEO_TYPE}', 'Making of', '/media/movies/a/extras/x.mkv', '{ITEM.lower()}', 3, 'k3', '2026-10-20 04:22:16.4161545');
+            INSERT INTO BaseItems (Id, Type, Name, CleanName, SortName, Path, PresentationUniqueKey)
+              VALUES ('{PERSON}', '{messy.PERSON_TYPE}', 'Synthetic Actor', 'synthetic actor', 'Synthetic Actor',
+                      '%MetadataPath%/People/S/Synthetic Actor', 'k4');
+            INSERT INTO BaseItems (Id, Type, Name, CleanName, SortName, Path, PresentationUniqueKey)
+              VALUES ('{ARTIST}', '{messy.ARTIST_TYPE}', 'Synthetic Soloist', 'synthetic soloist', 'Synthetic Soloist', '/media/music/Synthetic Soloist', 'k5');
+            INSERT INTO BaseItems (Id, Type, Name, Path, PresentationUniqueKey) VALUES ('{SERIES}', 'MediaBrowser.Controller.Entities.TV.Series', 'Show', '/media/shows/Show', 'k6');
+            INSERT INTO BaseItems (Id, Type, Name, Path, IndexNumber, ParentId, SeriesId, PresentationUniqueKey)
+              VALUES ('{SEASON}', '{messy.SEASON_TYPE}', 'Season 1', '/media/shows/Show/Season 01', 1, '{SERIES}', '{SERIES}', 'k7');
+            INSERT INTO BaseItems (Id, Type, Name, Path, IndexNumber, ParentIndexNumber, ParentId, SeasonId, SeriesId, PresentationUniqueKey)
+              VALUES ('{EPISODE}', '{messy.EPISODE_TYPE}', 'Episode', '/media/shows/Show/Season 01/e1.mkv', 1, 1, '{SEASON}', '{SEASON}', '{SERIES}', 'k8');
+            INSERT INTO Peoples VALUES ('{PEOPLE}', 'Synthetic Actor', 'Actor');
+            INSERT INTO PeopleBaseItemMap VALUES ('{ITEM}', '{PEOPLE}', 'Lead', 0, 0);
             INSERT INTO UserData VALUES ('{ITEM}', '{ADULT}', 'a', 1), ('{PRIVATE}', '{ADULT}', 'b', 0), ('{EXTRA}', '{ADULT}', 'c', 0);
             INSERT INTO Permissions (Kind, RowVersion, UserId, Value) VALUES (0, 0, '{ADULT}', 1), (1, 0, '{ADULT}', 0);
             INSERT INTO Preferences (Kind, RowVersion, UserId, Value) VALUES (2, 0, '{ADULT}', 'x');
@@ -141,6 +170,252 @@ class Seeders(Scratch):
         first = messy.seed_messy(self.db, MANIFEST, ("dangling_owner_extra", "duplicate_paths"))
         self.assertEqual(first["shapes"]["duplicate_paths"]["duplicate"], seed_id("messy-duplicate").hex)
         self.assertEqual(first["shapes"]["dangling_owner_extra"]["extra"], seed_id("messy-extra").hex)
+
+
+class NewShapeSeeders(Scratch):
+    """The six shapes of identifier spelling, duplicates and names: what each writes and how its end
+    state reads, on the scratch database."""
+
+    def seed(self, shape):
+        entry = messy.seed_messy(self.db, MANIFEST, (shape,))["shapes"][shape]
+        return entry, {"shapes": {shape: entry}}
+
+    def test_ref_form_reads_every_spelling_and_whether_it_names_an_item(self):
+        conn = self.conn()
+        lower, upper = str(uuid.UUID(ITEM)).lower(), str(uuid.UUID(ITEM)).upper()
+        for value, form in ((None, "null"), (lower, "lower36->item"), (upper, "upper36->item"),
+                            (lower[:8] + upper[8:], "mixed36->item"), (uuid.UUID(ITEM).hex, "n32lower->item"),
+                            (uuid.UUID(ITEM).hex.upper(), "n32upper->item"), (str(uuid.UUID(int=0)), "lower36-zero"),
+                            ("00000000000000000000000000000000", "n32lower-zero"), ("not a guid", "invalid"),
+                            (str(uuid.UUID(int=0xabc)).upper(), "upper36->none"), (uuid.UUID(int=0xabc).hex, "n32lower->none")):
+            with self.subTest(form):
+                self.assertEqual(messy.ref_form(conn, value), form)
+
+    def test_guid_casing_writes_two_extras_and_two_versions_naming_existing_items_in_two_spellings(self):
+        entry, wanted = self.seed("guid_casing")
+        self.assertEqual(set(entry["items"]), {"owner_lower36", "owner_n32", "primary_lower36", "primary_n32"})
+        self.assertEqual(messy.read_state(self.db, wanted)["guid_casing"], {
+            "owner_lower36": {"owner": "lower36->item", "primary": "null"},
+            "owner_n32": {"owner": "n32lower->item", "primary": "null"},
+            "primary_lower36": {"owner": "null", "primary": "lower36->item"},
+            "primary_n32": {"owner": "null", "primary": "n32lower->item"}})
+        conn = self.conn()
+        paths = [path for (path,) in conn.execute("SELECT Path FROM BaseItems WHERE Name LIKE 'Synthetic guid casing%'")]
+        self.assertEqual(len(set(paths)), 4)   # no two share a path, or the duplicate-path repair would fold them
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM BaseItems WHERE Name LIKE 'Synthetic guid casing%' AND ExtraType = 3").fetchone()[0], 2)
+
+    def test_guid_casing_needs_an_extra_with_an_owner_to_copy(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM BaseItems WHERE ExtraType IS NOT NULL")
+        with self.assertRaisesRegex(CheckError, "no extra with an owner to copy"):
+            messy.seed_messy(self.db, MANIFEST, ("guid_casing",))
+
+    def test_case_duplicates_write_independent_pairs_that_differ_only_by_case(self):
+        entry, wanted = self.seed("case_duplicates")
+        conn = self.conn()
+        # the pairs: a person item, a Peoples row (linked to a movie), and an accented pair of each
+        self.assertEqual(sorted(name for (name,) in conn.execute("SELECT Name FROM BaseItems WHERE Type = ?", (messy.PERSON_TYPE,))),
+                         sorted(["Synthetic Actor", "SYNTHETIC ACTOR", messy.UNICODE_PEOPLE["capital"], messy.UNICODE_PEOPLE["small"]]))
+        self.assertEqual(sorted(name for (name,) in conn.execute("SELECT Name FROM Peoples")),
+                         sorted(["Synthetic Actor", "SYNTHETIC ACTOR", messy.UNICODE_PEOPLE["capital"], messy.UNICODE_PEOPLE["small"]]))
+        self.assertEqual(messy.UNICODE_PEOPLE["capital"].lower(), messy.UNICODE_PEOPLE["small"])
+        self.assertEqual(messy.read_state(self.db, wanted)["case_duplicates"], {
+            "person_item_ascii": 2, "people_ascii": {"rows": 2, "links": 2},
+            "unicode": {"items": 2, "peoples": 2, "links": 2}, "artists": 2})
+        self.assertEqual(conn.execute("SELECT Path FROM BaseItems WHERE Name = 'SYNTHETIC SOLOIST'").fetchone()[0],
+                         "/media/music/SYNTHETIC SOLOIST")
+
+    def test_the_pairs_are_read_by_name_so_a_re_keyed_row_still_counts(self):
+        entry, wanted = self.seed("case_duplicates")
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE BaseItems SET Id = ? WHERE Name = 'SYNTHETIC ACTOR'", (str(uuid.UUID(int=0xabc)).upper(),))
+            conn.execute("UPDATE Peoples SET Id = ? WHERE Name = 'SYNTHETIC ACTOR'", (str(uuid.UUID(int=0xdef)).upper(),))
+        state = messy.read_state(self.db, wanted)["case_duplicates"]
+        self.assertEqual((state["person_item_ascii"], state["people_ascii"]["rows"]), (2, 2))
+        # the link still names the old people id, so it no longer counts: a re-keyed row without its link shows
+        self.assertEqual(state["people_ascii"]["links"], 1)
+
+    def test_no_two_persons_share_a_metadata_path_so_the_duplicate_path_repair_cannot_stand_in_for_the_merge(self):
+        self.seed("case_duplicates")
+        paths = [path for (path,) in self.conn().execute("SELECT Path FROM BaseItems WHERE Type = ?", (messy.PERSON_TYPE,))]
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertIn("%MetadataPath%/People/S/SYNTHETIC ACTOR", paths)
+        self.assertIn(f"%MetadataPath%/People/{messy.UNICODE_PEOPLE['small'][0].upper()}/{messy.UNICODE_PEOPLE['small']}", paths)
+
+    def test_case_duplicates_state_shows_a_merge(self):
+        entry, wanted = self.seed("case_duplicates")
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            # what a merge does: the upper-case rows go, and the link of the duplicate people row with them
+            conn.execute("DELETE FROM BaseItems WHERE Name = 'SYNTHETIC ACTOR'")
+            conn.execute("DELETE FROM PeopleBaseItemMap WHERE PeopleId IN (SELECT Id FROM Peoples WHERE Name = 'SYNTHETIC ACTOR')")
+            conn.execute("DELETE FROM Peoples WHERE Name = 'SYNTHETIC ACTOR'")
+        state = messy.read_state(self.db, wanted)["case_duplicates"]
+        self.assertEqual((state["person_item_ascii"], state["people_ascii"]), (1, {"rows": 1, "links": 1}))
+        self.assertEqual(state["unicode"], {"items": 2, "peoples": 2, "links": 2})   # the other pair is untouched
+
+    def test_orphan_ancestor_writes_a_row_with_a_missing_parent_and_one_with_a_missing_item(self):
+        entry, wanted = self.seed("orphan_ancestor")
+        self.assertEqual(messy.read_state(self.db, wanted)["orphan_ancestor"], {"missing_parent_rows": 1, "missing_item_rows": 1})
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM AncestorIds")
+        self.assertEqual(messy.read_state(self.db, wanted)["orphan_ancestor"], {"missing_parent_rows": 0, "missing_item_rows": 0})
+
+    def test_virtual_season_is_a_season_with_no_folder_one_past_the_highest_and_an_episode_in_it(self):
+        entry, wanted = self.seed("virtual_season")
+        self.assertEqual(entry["number"], 2)
+        conn = self.conn()
+        season = conn.execute("SELECT Path, IndexNumber, ParentId FROM BaseItems WHERE Name = 'Season 2'").fetchone()
+        self.assertEqual((season[0], season[1], uuid.UUID(season[2]).hex), (None, 2, uuid.UUID(SERIES).hex))
+        self.assertEqual(messy.read_state(self.db, wanted)["virtual_season"],
+                         {"season": {"has_path": False}, "episode": {"under_season": True, "season_id_is_season": True}})
+        self.assertEqual(conn.execute("SELECT Path FROM BaseItems WHERE Name = 'Synthetic virtual season episode'").fetchone()[0],
+                         "/media/shows/Show/Synthetic virtual season episode S02E01.mkv")   # in the series folder: no Season folder to scan
+
+    def test_virtual_season_state_follows_the_season_when_it_is_given_a_new_id(self):
+        entry, wanted = self.seed("virtual_season")
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE BaseItems SET Id = ? WHERE Name = 'Season 2'", (sid := str(uuid.UUID(int=99)).upper(),))
+            conn.execute("UPDATE BaseItems SET ParentId = ?, SeasonId = ? WHERE Name = 'Synthetic virtual season episode'", (sid, sid))
+        self.assertEqual(messy.read_state(self.db, wanted)["virtual_season"]["episode"], {"under_season": True, "season_id_is_season": True})
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM BaseItems WHERE Name = 'Season 2'")
+        self.assertEqual(messy.read_state(self.db, wanted)["virtual_season"], {"season": None, "episode": {"under_season": False, "season_id_is_season": False}})
+
+    def test_gone_file_userdata_is_a_movie_with_no_file_and_the_play_state_recorded_for_it(self):
+        entry, wanted = self.seed("gone_file_userdata")
+        self.assertEqual(entry["rows"], 1)
+        self.assertEqual(messy.read_state(self.db, wanted)["gone_file_userdata"],
+                         {"item": True, "userdata_on_item": 1, "userdata_with_key": 1})
+        self.assertEqual(self.conn().execute("SELECT Played FROM UserData WHERE CustomDataKey = ?", (entry["key"],)).fetchone()[0], 1)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            # what a scan does to an item whose file is gone: the item goes, its state moves to the placeholder
+            conn.execute("DELETE FROM BaseItems WHERE lower(replace(Id, '-', '')) = ?", (entry["item"],))
+            conn.execute("UPDATE UserData SET ItemId = ? WHERE CustomDataKey = ?", (messy.PLACEHOLDER, entry["key"]))
+        self.assertEqual(messy.read_state(self.db, wanted)["gone_file_userdata"],
+                         {"item": False, "userdata_on_item": 0, "userdata_with_key": 1})
+
+    def test_non_ascii_names_write_three_users_one_person_and_a_path_no_ascii_code_survives(self):
+        entry, wanted = self.seed("non_ascii_names")
+        conn = self.conn()
+        self.assertEqual(sorted(name for (name,) in conn.execute("SELECT Username FROM Users WHERE Username <> 'adult'")),
+                         sorted(messy.UNICODE_USERS.values()))
+        # each normalised name is a distinct stale value (the column is unique), none a normalisation
+        self.assertEqual(sorted(value for (value,) in conn.execute("SELECT NormalizedUsername FROM Users WHERE Username <> 'adult'")),
+                         sorted("stale-" + label for label in messy.UNICODE_USERS))
+        state = messy.read_state(self.db, wanted)["non_ascii_names"]
+        self.assertEqual(state["users"], {label: "stale-" + label for label in messy.UNICODE_USERS})
+        self.assertEqual(state["people"]["decomposed"], {"items": 1, "peoples": 1})
+        self.assertEqual(state["path"], messy.UNICODE_PATH)
+        # every decomposed text is one no normalisation has composed, so a mapping that normalises shows
+        for text in (messy.UNICODE_USERS["decomposed"], messy.UNICODE_PEOPLE["decomposed"], messy.UNICODE_PATH):
+            self.assertNotEqual(text, unicodedata.normalize("NFC", text))
+
+    def test_the_users_are_copies_with_internal_ids_of_their_own(self):
+        self.seed("non_ascii_names")
+        ids = [value for (value,) in self.conn().execute("SELECT InternalId FROM Users ORDER BY InternalId")]
+        self.assertEqual(ids, [1, 2, 3, 4])
+
+    def test_every_new_shape_has_a_seeder_and_a_state_reader(self):
+        for shape in messy.SHAPES:
+            with self.subTest(shape):
+                self.assertIn(shape, messy.SEEDERS)
+        self.assertEqual(set(messy.STATE_READERS), set(messy.SHAPES) - {"deleted_user", "dangling_owner_extra", "duplicate_paths"})
+
+
+class Independence(unittest.TestCase):
+    """Each shape reads the same alone as with every other shape seeded, whatever the ids of the
+    rows it copies sort like: it copies only rows the fixture had before any shape wrote."""
+
+    NAMES = ("ITEM", "EXTRA", "PRIVATE", "PERSON", "ARTIST", "SERIES", "SEASON", "EPISODE", "PEOPLE")
+
+    def late_ids(self):
+        """Every scratch id moved behind the seeded ones (FFFF prefix, an index to keep them distinct)."""
+        return {name: f"FFFF{index:04X}" + globals()[name][8:] for index, name in enumerate(self.NAMES)}
+
+    def states(self, ids):
+        """{shape: its end state alone} and the same with all shapes seeded, on scratch databases whose
+        original rows carry `ids` (constant name -> id)."""
+        module = sys.modules[__name__]
+        with contextlib.ExitStack() as stack:
+            if ids:
+                stack.enter_context(mock.patch.multiple(module, **ids))
+            stack.enter_context(mock.patch.dict(MANIFEST, {"private_movie": ids.get("PRIVATE", PRIVATE)}))
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+
+            def read(shapes, label):
+                db = str(Path(directory.name) / f"{label}.db")
+                populate(db)
+                return messy.read_state(db, messy.seed_messy(db, MANIFEST, shapes))
+
+            return {shape: read((shape,), shape)[shape] for shape in messy.SHAPES}, read(messy.SHAPES, "all")
+
+    def assert_independent(self, ids):
+        alone, together = self.states(ids)
+        for shape in messy.SHAPES:
+            with self.subTest(shape):
+                self.assertEqual(alone[shape], together[shape])
+
+    def test_with_the_original_ids_as_they_are(self):
+        self.assert_independent({})
+
+    def test_with_original_ids_that_sort_after_every_seeded_id(self):
+        # a shape that picked "the first row" over the whole table would now pick another shape's row
+        self.assert_independent(self.late_ids())
+
+    def test_every_row_a_seeder_copies_from_is_one_the_fixture_held_before_any_shape_wrote(self):
+        """Wraps what the seeders copy through (`first` picks, `clone_rows` copies) and checks every
+        source id against the rows present before seeding, with ids that sort behind the seeded ones."""
+        sources = []
+        real_first, real_clone = messy.first, messy.clone_rows
+
+        def first(conn, sql, params, what):
+            row = real_first(conn, sql, params, what)
+            sources.append((what, str(row[0]).replace("-", "").lower()))
+            return row
+
+        def clone(conn, table, where, params, changes, limit=None):
+            if where == '"Id" = ?':
+                sources.append((table, str(params[0]).replace("-", "").lower()))
+            return real_clone(conn, table, where, params, changes, limit)
+
+        ids = self.late_ids()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.multiple(sys.modules[__name__], **ids))
+            stack.enter_context(mock.patch.dict(MANIFEST, {"private_movie": ids["PRIVATE"]}))
+            stack.enter_context(mock.patch.object(messy, "first", first))
+            stack.enter_context(mock.patch.object(messy, "clone_rows", clone))
+            with tempfile.TemporaryDirectory() as directory:
+                db = str(Path(directory) / "jellyfin.db")
+                populate(db)
+                with closing(sqlite3.connect(db)) as conn:
+                    before = {str(row[0]).replace("-", "").lower()
+                              for table in ("BaseItems", "Peoples", "Users") for row in conn.execute(f'SELECT "Id" FROM "{table}"')}
+                messy.seed_messy(db, MANIFEST)
+        self.assertGreater(len(sources), 10)   # the wrappers saw the seeders at work
+        self.assertEqual([source for source in sources if source[1] not in before], [])
+
+    def test_original_names_only_the_rows_present_before_any_shape_wrote(self):
+        seen = {}
+
+        def writes(conn, manifest):
+            messy.clone_one(conn, "BaseItems", ('"Id" = ?', (ITEM,)), {"Id": "AAAAAAAA-0000-0000-0000-000000000001"}, "item")
+            return {}
+
+        def reads(conn, manifest):
+            seen["ids"] = {row[0] for row in conn.execute(f'SELECT "Id" FROM "BaseItems" WHERE {messy.original("BaseItems")}')}
+            seen["all"] = {row[0] for row in conn.execute('SELECT "Id" FROM "BaseItems"')}
+            return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "jellyfin.db")
+            populate(db)
+            with closing(sqlite3.connect(db)) as conn:
+                before = {row[0] for row in conn.execute('SELECT "Id" FROM "BaseItems"')}
+            with mock.patch.dict(messy.SEEDERS, {"writes": writes, "reads": reads}):
+                messy.seed_messy(db, MANIFEST, ("writes", "reads"))
+        self.assertEqual(seen["ids"], before)
+        self.assertEqual(len(seen["all"]), len(before) + 1)   # the row the first shape wrote is there, and not "original"
 
 
 class EndState(Scratch):
@@ -305,6 +580,10 @@ class RecordAndBuild(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         (self.root / "media").mkdir()
+        # the files the scratch database's items point at: the templates the messy shapes link
+        for template in ("movies/a/a.mkv", "movies/p/p.mkv", "movies/a/extras/x.mkv", "shows/Show/Season 01/e1.mkv"):
+            (self.root / "media" / template).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / "media" / template).write_bytes(b"synthetic media " + template.encode())
         for name in ("jellyfin-10.11.11", "jellyfin-12.2-from-121"):
             source = self.root / name
             (source / "data").mkdir(parents=True)
@@ -312,6 +591,7 @@ class RecordAndBuild(unittest.TestCase):
             (source / "synthetic-ready.json").write_text("{}")
             (source / "synthetic.json").write_text(json.dumps(MANIFEST))
         self.boots = []
+        self.media = []
 
     def oracle(self, command, **kwargs):
         if command[:2] == ["docker", "pull"] or command[:3] == ["docker", "image", "inspect"]:
@@ -321,6 +601,7 @@ class RecordAndBuild(unittest.TestCase):
     def booted(self, outcome="booted", combined=None):
         def run(config, media, port):
             self.boots.append(Path(config).name)
+            self.media.append(Path(media))
             if combined and Path(config).name.endswith("-all"):
                 return dict(combined)
             return {"outcome": outcome, "reason": ""}
@@ -340,9 +621,27 @@ class RecordAndBuild(unittest.TestCase):
         self.assertEqual(set(record["shapes"]["deleted_user"]["state"]), {"deleted_user"})
         self.assertEqual(list((self.root / "work").iterdir()), [])
 
-    def test_a_combined_run_that_differs_from_the_single_runs_is_an_error(self):
+    def test_a_combined_run_that_differs_from_the_single_runs_is_an_error_naming_both_states(self):
         with self.assertRaisesRegex(CheckError, "handled .* differently with all the shapes present"):
             self.record(combined={"outcome": "refused", "reason": "x"})
+        record = {"outcome": "booted", "reason": "", "state": {shape: {"alone": shape} for shape in messy.SHAPES}}
+        record["state"]["orphan_ancestor"] = {"with": "all"}
+        with self.assertRaisesRegex(CheckError, r"orphan_ancestor: alone \{'alone': 'orphan_ancestor'\}, with all \{'with': 'all'\}"):
+            with mock.patch.object(messy.subprocess, "run", self.oracle), \
+                 mock.patch.object(messy, "run_oracle_server", lambda config, media, port: dict(record)), \
+                 mock.patch.object(messy, "read_state", lambda db, entry: {s: ({"with": "all"} if Path(db).parent.parent.name.endswith("-all") and s == "orphan_ancestor"
+                                                                              else {"alone": s}) for s in entry["shapes"]}):
+                messy.record_oracle(self.root, self.root / "jellyfin-10.11.11", messy.SHAPES, MANIFEST, 18130)
+
+    def test_every_oracle_boot_mounts_the_messy_media_tree_and_the_build_links_the_files_into_it(self):
+        self.record()
+        self.assertEqual(set(self.media), {self.root / "media-messy"})
+        record = {"shapes": {shape: {"outcome": "booted"} for shape in messy.SHAPES}}
+        with mock.patch.object(messy, "record_oracle", return_value=record):
+            messy.build(self.root, 18130)
+        linked = self.root / "media-messy/movies/Synthetic dangling extras/extra.mkv"
+        self.assertTrue(linked.samefile(self.root / "media/movies/a/extras/x.mkv"))
+        self.assertFalse((self.root / "media/movies/Synthetic dangling extras").exists())   # the shared tree is untouched
 
     def test_a_failed_boot_leaves_no_scratch_copy(self):
         def boom(config, media, port):
@@ -384,9 +683,78 @@ class RecordAndBuild(unittest.TestCase):
             messy.build(self.root, 18130)
 
 
+class MediaTree(unittest.TestCase):
+    """The messy rows mount a media tree of their own: the shared one plus a link per seeded file."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / "media/movies/a").mkdir(parents=True)
+        (self.root / "media/movies/a/a.mkv").write_bytes(b"movie")
+        self.entry = {"shapes": {"x": {"files": [["/media/movies/Synthetic x/y/new.mkv", "/media/movies/a/a.mkv"]]}, "y": {}}}
+
+    def test_a_seeded_file_is_a_hard_link_to_its_template_in_a_tree_of_its_own(self):
+        messy.link_media(self.root, self.entry)
+        linked = self.root / "media-messy/movies/Synthetic x/y/new.mkv"
+        self.assertTrue(linked.samefile(self.root / "media/movies/a/a.mkv"))
+        self.assertTrue((self.root / "media-messy/movies/a/a.mkv").samefile(self.root / "media/movies/a/a.mkv"))
+        # the shared tree, which the clean rows scan, gains nothing
+        self.assertEqual(sorted(path.name for path in (self.root / "media").rglob("*")), ["a", "a.mkv", "movies"])
+
+    def test_linking_twice_changes_nothing_and_a_missing_template_is_named(self):
+        messy.link_media(self.root, self.entry)
+        messy.link_media(self.root, self.entry)
+        self.entry["shapes"]["y"] = {"files": [["/media/movies/b/new.mkv", "/media/movies/nope.mkv"]]}
+        with self.assertRaisesRegex(CheckError, "the template file /media/movies/nope.mkv is not in"):
+            messy.link_media(self.root, self.entry)
+
+    def test_every_shape_that_creates_an_item_lists_the_file_it_needs_and_has_its_row_there(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db = str(Path(directory.name) / "jellyfin.db")
+        populate(db)
+        entry = messy.seed_messy(db, MANIFEST)
+        with closing(sqlite3.connect(db)) as conn:
+            for shape in ("dangling_owner_extra", "guid_casing", "virtual_season", "non_ascii_names"):
+                with self.subTest(shape):
+                    files = entry["shapes"][shape]["files"]
+                    self.assertTrue(files)
+                    for path, template in files:
+                        self.assertTrue(path.startswith("/media/") and template.startswith("/media/"))
+                        self.assertEqual(conn.execute("SELECT COUNT(*) FROM BaseItems WHERE Path = ?", (path,)).fetchone()[0], 1, path)
+
+    def test_a_half_copied_tree_is_never_taken_for_a_whole_one(self):
+        (self.root / "media-messy.partial").mkdir()
+        (self.root / "media-messy.partial/leftover").write_bytes(b"x")
+        messy.link_media(self.root, self.entry)
+        self.assertFalse((self.root / "media-messy.partial").exists())
+        self.assertFalse((self.root / "media-messy/leftover").exists())
+        self.assertTrue((self.root / "media-messy/movies/a/a.mkv").exists())
+
+    def test_a_path_outside_media_is_an_error_not_a_link_outside_the_tree(self):
+        self.entry["shapes"]["y"] = {"files": [["/etc/escape.mkv", "/media/movies/a/a.mkv"]]}
+        with self.assertRaisesRegex(CheckError, "must be container paths under /media/"):
+            messy.link_media(self.root, self.entry)
+
+    def test_a_shape_whose_file_is_meant_to_be_gone_lists_none(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db = str(Path(directory.name) / "jellyfin.db")
+        populate(db)
+        entry = messy.seed_messy(db, MANIFEST, ("gone_file_userdata",))
+        self.assertNotIn("files", entry["shapes"]["gone_file_userdata"])
+
+
 class WrittenDivergences(unittest.TestCase):
     KEYS = {"deleted_user": set(messy.USER_TABLES), "dangling_owner_extra": {"exists", "owner"},
-            "duplicate_paths": {"original", "duplicate"}}
+            "duplicate_paths": {"original", "duplicate"},
+            "guid_casing": {"owner_lower36", "owner_n32", "primary_lower36", "primary_n32"},
+            "case_duplicates": {"person_item_ascii", "people_ascii", "unicode", "artists"},
+            "orphan_ancestor": {"missing_parent_rows", "missing_item_rows"},
+            "virtual_season": {"season", "episode"},
+            "gone_file_userdata": {"item", "userdata_on_item", "userdata_with_key"},
+            "non_ascii_names": {"users", "people", "path"}}
 
     def test_each_divergence_names_a_seeded_shape_a_derived_lineage_and_a_whole_state_with_a_reason(self):
         lineages = {lineage for _, _, lineage in messy.DERIVED}

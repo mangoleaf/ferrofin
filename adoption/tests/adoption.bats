@@ -230,6 +230,10 @@ EOS
 
 # --- run.sh command line -----------------------------------------------------------
 
+bin_first() { # the fake binaries in $TMP/bin win over the real ones (a function: shellcheck reads a @test body as a subshell)
+  PATH="$TMP/bin:$PATH"
+}
+
 fake_docker() { # a docker on PATH that has every image and no containers
   mkdir -p bin; cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
@@ -376,10 +380,13 @@ fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports thes
 }
 
 @test "run.sh: the only media mounted is the fixtures' own media, read-only" {
-  run grep -n 'MEDIA=' "$ADOPTION/run.sh"
+  run grep -n '^MEDIA=' "$ADOPTION/run.sh"
   [ "${#lines[@]}" -eq 1 ]
   # shellcheck disable=SC2016 # the script's literal source line, not an expansion
   [[ "$output" == *'MEDIA=(-v "$FIXTURES/media:/media:ro")' ]]
+  # the messy rows' tree, when it is built, is the only other one, and read-only as well
+  run grep -c 'media-messy:/media:ro' "$ADOPTION/run.sh"
+  [ "$output" = 1 ]
 }
 
 @test "run.sh, build-fixtures.sh and synthetic.py refuse a network filesystem before creating anything" {
@@ -425,7 +432,8 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
   # the messy copies are built, so build-fixtures.sh's messy.py step finds nothing to do
   for f in jellyfin-10.11.11-messy jellyfin-12.2-messy; do
     mkdir -p "fixtures/$f"; echo '{}' > "fixtures/$f/messy-oracle.json"
-    echo '{"shapes": {"deleted_user": {}, "dangling_owner_extra": {}, "duplicate_paths": {}}}' > "fixtures/$f/messy.json"
+    python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import messy; print(json.dumps({"shapes": {s: {} for s in messy.SHAPES}}))' \
+      "$ADOPTION" > "fixtures/$f/messy.json"
   done
 }
 
@@ -536,45 +544,45 @@ EOS
   [ "$status" -eq 0 ]
 }
 
-# A messy fixture copy holding every shape (the deleted user's tables empty, the dangling extra
-# absent, one duplicate-path row), with the manifest and the oracle record messy.py reads: the
-# record says Jellyfin 12.2 left the same, except for the duplicate path it records as given.
-messy_fixture() { # messy_fixture <original-kept> <oracle original> <oracle duplicate>
-  local t zeros=
+# A messy fixture copy holding every shape, seeded by messy.py into a scratch database, with the
+# manifest and an oracle record saying Jellyfin 12.2 left each shape as the seeders read it.
+messy_fixture() { # messy_fixture <yes|no>: every shape seeded and recorded as Jellyfin 12.2 left it; "no" then loses the original of duplicate_paths
   mkdir -p messy
-  sqlite3 messy/jellyfin.db "CREATE TABLE BaseItems (Id TEXT PRIMARY KEY, Path TEXT, OwnerId TEXT);
-    INSERT INTO BaseItems (Id, Path) VALUES ('$(printf 'a%.0s' {1..32})', '/p');"
-  for t in UserData Permissions Preferences Devices DisplayPreferences; do
-    sqlite3 messy/jellyfin.db "CREATE TABLE \"$t\" (UserId TEXT);"
-    zeros="$zeros${zeros:+, }\"$t\": 0"
-  done
-  [ "$1" = yes ] || sqlite3 messy/jellyfin.db "DELETE FROM BaseItems"
-  # a lineage no divergence is ever written for, so the oracle record decides
-  printf '{"lineage": "test", "shapes": {"deleted_user": {"user": "%s"}, "dangling_owner_extra": {"extra": "%s", "owner": "%s"},
-    "duplicate_paths": {"path": "/p", "original": "%s", "duplicate": "%s"}}}' \
-    "$(printf 'c%.0s' {1..32})" "$(printf 'd%.0s' {1..32})" "$(printf 'e%.0s' {1..32})" \
-    "$(printf 'a%.0s' {1..32})" "$(printf 'b%.0s' {1..32})" > messy/messy.json
-  printf '{"shapes": {"deleted_user": {"outcome": "booted", "state": {"deleted_user": {%s}}},
-    "dangling_owner_extra": {"outcome": "booted", "state": {"dangling_owner_extra": {"exists": false, "owner": null}}},
-    "duplicate_paths": {"outcome": "booted", "state": {"duplicate_paths": {"original": %s, "duplicate": %s}}}}}' \
-    "$zeros" "$2" "$3" > messy/messy-oracle.json
+  python3 - "$ADOPTION" "$PWD/messy" "$1" <<'PY'
+import json, sqlite3, sys
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + "/tests")
+import messy
+from test_messy import MANIFEST, populate
+
+db = sys.argv[2] + "/jellyfin.db"
+populate(db)
+entry = messy.seed_messy(db, MANIFEST)
+entry["lineage"] = "test"   # a lineage no divergence is ever written for, so the oracle record decides
+state = messy.read_state(db, entry)
+json.dump(entry, open(sys.argv[2] + "/messy.json", "w"))
+json.dump({"shapes": {shape: {"outcome": "booted", "state": {shape: state[shape]}} for shape in entry["shapes"]}},
+          open(sys.argv[2] + "/messy-oracle.json", "w"))
+if sys.argv[3] == "no":
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM BaseItems WHERE lower(replace(Id, '-', '')) = ?", (entry["shapes"]["duplicate_paths"]["original"],))
+PY
 }
 
 @test "check_messy: a shape that ends as Jellyfin 12.2 left it says nothing" {
-  messy_fixture yes true false
+  messy_fixture yes
   run adoption_check_messy messy/jellyfin.db messy
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
 @test "check_messy: a shape that ends differently names the shape and both states" {
-  messy_fixture no true false
+  messy_fixture no
   run adoption_check_messy messy/jellyfin.db messy
   [[ "$output" == "messy: duplicate_paths: "*"expected"*"Jellyfin 12.2"* ]]
 }
 
 @test "check_messy: a checker that cannot run is a reason, never a pass" {
-  messy_fixture yes true false
+  messy_fixture yes
   rm messy/messy-oracle.json
   run adoption_check_messy messy/jellyfin.db messy
   [[ "$output" == "messy: the checker failed: "* ]]
@@ -629,7 +637,7 @@ case "$1" in
 esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
-  chmod +x bin/docker; PATH="$TMP/bin:$PATH"
+  chmod +x bin/docker; bin_first
   start=$SECONDS
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
   [ "$status" -eq 1 ]
@@ -637,6 +645,56 @@ EOS
   [[ "$output" == *"messy: "* ]]   # the shape checker ran and said why it could not pass
   [ $((SECONDS - start)) -lt 60 ]
   [[ "$output" != *"unexpected docker"* ]]
+}
+
+# A messy 12.x row for run.sh with a docker that logs its `run` arguments to $DOCKER_LOG and
+# whose server never answers: enough to reach the mount and the table baseline.
+logging_messy_row() { # logging_messy_row <source name or empty>
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "source": "%s", "shapes": {}}' "$1" > fixtures/jellyfin-12.2-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  run) echo "$*" >> "$DOCKER_LOG"; exit 0;;
+  image|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  export DOCKER_LOG="$TMP/docker.log"
+}
+
+@test "run.sh: the messy rows mount media-messy when it is built, the shared media otherwise" {
+  logging_messy_row jellyfin-12.2-from-121
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  grep -q "$TMP/fixtures/media:/media:ro" "$DOCKER_LOG"          # a fixture directory built before media-messy existed
+  [ "$(grep -c "media-messy" "$DOCKER_LOG")" = 0 ]
+  mkdir fixtures/media-messy; : > "$DOCKER_LOG"
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  grep -q "$TMP/fixtures/media-messy:/media:ro" "$DOCKER_LOG"
+  [ "$(grep -c "$TMP/fixtures/media:/media:ro" "$DOCKER_LOG")" = 0 ]
+}
+
+@test "run.sh: the messy rows' table baseline is the clean source fixture's, else the copy's" {
+  logging_messy_row jellyfin-12.2-from-121
+  mkdir -p fixtures/jellyfin-12.2-from-121/data
+  empty_adoption_db fixtures/jellyfin-12.2-from-121/data/jellyfin.db
+  sqlite3 fixtures/jellyfin-12.2-from-121/data/jellyfin.db "INSERT INTO ApiKeys (Id) VALUES (1)"
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  baseline=fixtures/work/run/jellyfin-12.2-messy.tables.json
+  [ "$(jq '.tables.ApiKeys.rows | length' "$baseline")" = 1 ]          # the row only the clean source holds
+  [ ! -e fixtures/jellyfin-12.2-from-121/data/jellyfin.db-wal ]        # the fixture itself was not opened
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json   # no source named
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$(jq '.tables.ApiKeys.rows | length' "$baseline")" = 0 ]
+  rm -r fixtures/jellyfin-12.2-from-121
+  printf '{"lineage": "12.x", "source": "jellyfin-12.2-from-121", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json   # source gone
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$(jq '.tables.ApiKeys.rows | length' "$baseline")" = 0 ]
 }
 
 @test "build-fixtures.sh: the messy copies are built last, after the schema diff" {
