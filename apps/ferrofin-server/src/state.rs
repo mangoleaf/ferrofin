@@ -788,6 +788,27 @@ pub async fn build_app_state(
             cache_root.clone(),
         )
         .with_users(Arc::clone(&users))
+        // `M3UTunerHost`'s `IsInLocalNetwork(uri.Host)`: the configured
+        // policy, resolving tuner host names. The name is resolved with the
+        // policy's lock released, so a slow resolver never holds up a
+        // network-settings save or the request paths that read the policy.
+        // Like upstream's `Dns.GetHostAddresses`, the lookup has no deadline
+        // of its own beyond the resolver's; it runs on a blocking thread.
+        .with_local_network({
+            let network = Arc::clone(&network);
+            Arc::new(move |host: &str| {
+                let read = || {
+                    network
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                };
+                let lookup = read().host_lookup();
+                lookup.addresses(host).is_some_and(|addresses| {
+                    let policy = read();
+                    addresses.iter().any(|a| policy.is_in_local_network(*a))
+                })
+            })
+        })
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
         // back to when a tuner is not a transport stream).
         .with_encoder(Arc::clone(&media_encoder))

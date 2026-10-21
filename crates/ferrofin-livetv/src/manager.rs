@@ -356,6 +356,8 @@ pub struct FerrofinLiveTvManager {
     /// root builds the application host *after* this manager, and every clone
     /// must see it once it lands.
     local_api: Arc<OnceLock<Arc<dyn LocalApiAccess>>>,
+    /// The server's local-network check, shared with the M3U tuner host.
+    local_network: Arc<OnceLock<crate::stream::LocalNetworkCheck>>,
     /// The open live streams, keyed by `LiveStreamId` (C#
     /// `MediaSourceManager._openStreams`, whose values are the tuner-side
     /// `ILiveStream`s). Guarded by a `std::sync::Mutex`: the guard is always
@@ -662,9 +664,13 @@ impl FerrofinLiveTvManager {
         // then M3U. The ORDER of registration is not the advertised order —
         // `GetTunerHostTypes` sorts by name — but keeping it identical means a
         // future first-match rule cannot silently diverge.
+        let local_network = Arc::new(OnceLock::new());
         let hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>> = vec![
             Arc::new(crate::hdhomerun::HdHomerunHost::new(Arc::clone(&fetcher))),
-            Arc::new(crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))),
+            Arc::new(
+                crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))
+                    .sharing_local_network(Arc::clone(&local_network)),
+            ),
         ];
         let schedules_direct = SchedulesDirect::new(fetcher, cache_dir);
         Self {
@@ -679,6 +685,7 @@ impl FerrofinLiveTvManager {
             paths: LiveTvPaths::default(),
             tuner_source: Arc::new(crate::stream::ReqwestTunerSource::new()),
             local_api: Arc::new(OnceLock::new()),
+            local_network,
             live_streams: Arc::new(Mutex::new(HashMap::new())),
             active_recordings: Arc::new(Mutex::new(HashMap::new())),
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -689,6 +696,17 @@ impl FerrofinLiveTvManager {
             schedules_direct,
             xmltv,
         }
+    }
+
+    /// Gives the M3U tuner host the server's local-network check
+    /// (`NetworkManager.IsInLocalNetwork(string)`), which decides whether a
+    /// channel's source is remote. Without it, only private IP literals count
+    /// as local.
+    #[must_use]
+    pub fn with_local_network(self, check: crate::stream::LocalNetworkCheck) -> Self {
+        // Set once, before the manager is shared; a second call keeps the first.
+        let _ = self.local_network.set(check);
+        self
     }
 
     /// Attaches the media encoder the encoded recorder runs ffmpeg through.
