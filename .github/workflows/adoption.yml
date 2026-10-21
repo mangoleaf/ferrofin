@@ -38,7 +38,8 @@ jobs:
           df -h /
       # The fixtures depend on the synthetic recipe and on each Jellyfin release that builds
       # one (digests read from the registry, nothing pulled); the oracles also on smoke.sh
-      # and build-fixtures.sh, which build_oracle runs, and the messy copies on messy.py.
+      # and build-fixtures.sh, which build_oracle runs; the messy copies on messy.py and
+      # the scale copy on scale.py.
       - name: fixture cache key
         id: key
         run: |
@@ -49,7 +50,7 @@ jobs:
           [ -n "$tags" ]
           {
             (cd adoption && python3 -c 'from synthetic import recipe; print(recipe())')
-            sha256sum adoption/smoke.sh adoption/build-fixtures.sh adoption/messy.py
+            sha256sum adoption/smoke.sh adoption/build-fixtures.sh adoption/messy.py adoption/scale.py
             for tag in $tags; do
               digest=$(docker buildx imagetools inspect "jellyfin/jellyfin:$tag" --format '{{json .Manifest.Digest}}')
               [ -n "$digest" ]

@@ -54,6 +54,30 @@ def artwork(api, item):
         return {"size": list(rgb.size), "rgb": ImageStat.Stat(rgb).mean}
 
 
+#: Items asked for per request: the single page the snapshot used to read, so a small library
+#: is fetched exactly as before.
+PAGE_SIZE = 1000
+
+
+def all_items(api, **params):
+    """Every item `GET /Items` answers for `params`, read PAGE_SIZE at a time until the server's
+    TotalRecordCount is reached, so a library of any size is snapshotted whole. Anything that would
+    silently drop items is an error: a response without a count, a server that counts more than it
+    serves, or an item returned on two pages (the order moved between requests)."""
+    items = []
+    while True:
+        page = api.get("/Items", startIndex=len(items), limit=PAGE_SIZE, **params)
+        total = page["TotalRecordCount"]
+        items.extend(page["Items"])
+        if len(items) >= total:
+            break
+        if not page["Items"]:
+            raise CheckError(f"GET /Items served {len(items)} of the {total} items it counts")
+    if len({row["Id"] for row in items}) != len(items):
+        raise CheckError("GET /Items returned an item on two pages; the snapshot would miss others")
+    return items
+
+
 def snapshot(admin, manifest, images=None):
     """Use authenticated users for permissions and views, not an admin impersonation.
     images: the client user avatars are fetched as (user_accounts.snapshot)."""
@@ -64,8 +88,8 @@ def snapshot(admin, manifest, images=None):
     for library in admin.get("/Library/VirtualFolders"):
         if library["Name"] in manifest["libraries"]:
             result["libraries"][library["Name"]] = select(library["LibraryOptions"], LIBRARY_OPTIONS)
-    items = admin.get("/Items", userId=admin.user, recursive="true", limit=1000,
-                      includeItemTypes=TYPES, fields="Path,Overview,Genres,ProviderIds,MediaSources,MediaStreams")["Items"]
+    items = all_items(admin, userId=admin.user, recursive="true", includeItemTypes=TYPES,
+                      fields="Path,Overview,Genres,ProviderIds,MediaSources,MediaStreams")
     result["relationships"] = {row["Id"]: select(row, RELATIONS) for row in items}
     result["subtitles"] = {row["Id"]: sorted(
         (stream.get("Language"), stream.get("IsExternal"), stream.get("Codec"))
@@ -96,7 +120,7 @@ def snapshot(admin, manifest, images=None):
     }
     for name in USERS[1:]:
         api = admin.login(name)
-        visible = api.get("/Items", userId=api.user, recursive="true", includeItemTypes="Movie,Episode,Audio", limit=1000)["Items"]
+        visible = all_items(api, userId=api.user, recursive="true", includeItemTypes="Movie,Episode,Audio")
         result["visibility"][name] = sorted(ids(visible))
         # Negative read and write checks use the restricted user's own token.
         other = manifest["users"][USERS[1] if name == USERS[2] else USERS[2]]
@@ -120,7 +144,7 @@ def snapshot(admin, manifest, images=None):
             "resume": ids(api.get("/UserItems/Resume", userId=api.user, mediaTypes="Video", limit=100)["Items"]),
             "next_up": ids(api.get("/Shows/NextUp", userId=api.user, limit=100)["Items"]),
             "folders": {row["Id"]: select(row.get("UserData", {}), ("Played", "UnplayedItemCount"))
-                        for row in api.get("/Items", userId=api.user, recursive="true", includeItemTypes="Series,Season", limit=100)["Items"]},
+                        for row in all_items(api, userId=api.user, recursive="true", includeItemTypes="Series,Season")},
         }
     return normalize(result)
 
