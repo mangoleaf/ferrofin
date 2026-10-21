@@ -4767,12 +4767,78 @@ impl LibraryScanner {
                         tracing::warn!(%err, library = %library, "could not record the library's completed scan");
                     }
                 }
+                self.refresh_box_sets(&folders, run).await;
             }
         }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;
         result
+    }
+
+    /// Refreshes the box sets of each Collections (`boxsets`) library in
+    /// `folders` with the scan's options: upstream's
+    /// `Folder.ValidateChildrenInternal2` → `RefreshMetadataRecursive` runs
+    /// `BoxSetMetadataService` for every child of the library, as for any
+    /// library. A box set has no file to resolve, so the walk plans none; its
+    /// children are the box sets in the library's locations
+    /// (`{data}/collections/<name> [boxset]`). The single-item refresh decides
+    /// what runs, as for any item: a plain scan fetches only for a box set
+    /// never refreshed or past the library's `AutomaticRefreshIntervalDays`,
+    /// within the library's fetcher settings. A failure is logged and the
+    /// next box set refreshed; a cancelled scan stops between two. Both the
+    /// stored box-set paths and the library locations are expanded first: an
+    /// adopted row stores `%AppDataPath%/collections/<name> [boxset]`.
+    ///
+    /// TODO(gl-796): only a scan of whole libraries reaches this pass. A
+    /// scoped scan under a Collections library's location (a watcher-reported
+    /// change in `{data}/collections`, a folder refresh there) refreshes no box
+    /// set, where upstream refreshes the ones in the folder it validates; the
+    /// path is to run this pass over the box sets under the scope's paths in
+    /// `scan_scoped`/`scan_changed` too.
+    async fn refresh_box_sets(&self, folders: &[VirtualFolderInfo], run: ScanRun<'_>) {
+        let (Some(providers), Some(items)) = (&self.metadata_savers, &self.item_repository) else {
+            return;
+        };
+        let locations: Vec<PathBuf> = folders
+            .iter()
+            .filter(|folder| folder.collection_type == Some(CollectionTypeOptions::boxsets))
+            .flat_map(|folder| folder.locations.iter())
+            .map(|location| PathBuf::from(self.virtual_paths.expand(location)))
+            .collect();
+        if locations.is_empty() {
+            return;
+        }
+        let box_sets = match items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::BoxSet],
+                ..InternalItemsQuery::default()
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "could not list the box sets to refresh");
+                return;
+            }
+        };
+        for row in box_sets {
+            if run.cancel.is_cancelled() {
+                return;
+            }
+            let in_library = row.path.as_deref().is_some_and(|path| {
+                let path = self.virtual_paths.expand(path);
+                locations
+                    .iter()
+                    .any(|root| Path::new(&path).starts_with(root))
+            });
+            let Some(id) = in_library.then(|| Uuid::parse_str(&row.id).ok()).flatten() else {
+                continue;
+            };
+            if let Err(err) = providers.refresh_single_item(id, run.options).await {
+                tracing::warn!(%err, item_id = %id, "could not refresh a box set");
+            }
+        }
     }
 
     /// Scans the library monitor's reported `changed` filesystem paths —
@@ -13051,7 +13117,9 @@ impl LibraryScanner {
                         self.plan_movies(location, location, cf, walk, &ctx, &mut out);
                     }
                     // `boxsets` is the only type left: a BoxSet's members are
-                    // curated through the collection API, not resolved off disk.
+                    // curated through the collection API, not resolved off
+                    // disk. Its box sets are refreshed once the walk is done
+                    // (`refresh_box_sets`).
                     Some(_) => {}
                 }
                 if let Some((location_folder, aggregate)) = placed {
