@@ -2,15 +2,19 @@
 //!
 //! Port of `MediaBrowser.MediaEncoding.Subtitles.SubtitleEditParser` (and the
 //! `ISubtitleParser` interface). The C# implementation reflects over the whole
-//! `libse` assembly to discover every `SubtitleFormat`; since the formats are
-//! hand-ported here, this keeps an explicit extension → parser table covering
-//! the formats Jellyfin actually parses on the read path (`srt`, `ssa`, `ass`,
-//! plus the `subrip`/`vtt`/`webvtt` aliases).
+//! `libse` assembly to discover every `SubtitleFormat` and keys them by
+//! extension; since the formats are hand-ported here, this keeps an explicit
+//! extension → formats table: `srt` (and the `subrip` codec alias), `ssa`,
+//! `ass` and `vtt`.
+//!
+//! TODO(gl-768): libse registers more formats than these: a second `vtt` one
+//! (`WebVTTFileWithLineNumber`), `smi` (`Sami`), the text `sub` formats and the
+//! rest. Each unported one still takes the encoder's ffmpeg SRT conversion.
 
 use ferrofin_model::media_info::{SubtitleTrackEvent, SubtitleTrackInfo};
 
 use super::model::Subtitle;
-use super::{srt, ssa};
+use super::{srt, ssa, vtt};
 
 /// Parses subtitle streams keyed by file extension.
 ///
@@ -37,7 +41,7 @@ pub trait SubtitleParser: Send + Sync {
 /// The extension-keyed SubtitleEdit-style parser used by the encoder.
 ///
 /// Port of `SubtitleEditParser`. Stateless — the C# per-instance
-/// reflection cache is replaced by the static [`Self::format_for`] table.
+/// reflection cache is replaced by the static [`Self::formats_for`] table.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SubtitleEditParser;
 
@@ -48,16 +52,18 @@ impl SubtitleEditParser {
         Self
     }
 
-    /// Resolves the parser [`Format`] for `file_extension`, if supported.
-    fn format_for(file_extension: &str) -> Option<Format> {
+    /// The formats registered for `file_extension`, in the order `Parse`
+    /// tries them, if any.
+    fn formats_for(file_extension: &str) -> Option<&'static [Format]> {
         match file_extension
             .trim_start_matches('.')
             .to_ascii_lowercase()
             .as_str()
         {
-            "srt" | "subrip" => Some(Format::SubRip),
-            "ssa" => Some(Format::Ssa),
-            "ass" => Some(Format::Ass),
+            "srt" | "subrip" => Some(&[Format::SubRip]),
+            "ssa" => Some(&[Format::Ssa]),
+            "ass" => Some(&[Format::Ass]),
+            "vtt" => Some(&[Format::WebVtt]),
             _ => None,
         }
     }
@@ -72,6 +78,29 @@ enum Format {
     Ssa,
     /// Advanced SubStation Alpha (`.ass`).
     Ass,
+    /// WebVTT (`.vtt`).
+    WebVtt,
+}
+
+impl Format {
+    /// libse's `SubtitleFormat.Name`, for the logs.
+    fn name(self) -> &'static str {
+        match self {
+            Self::SubRip => "SubRip",
+            Self::Ssa => "Sub Station Alpha",
+            Self::Ass => "Advanced Sub Station Alpha",
+            Self::WebVtt => "WebVTT",
+        }
+    }
+
+    /// `LoadSubtitle` into `subtitle`, returning its `ErrorCount`.
+    fn load(self, subtitle: &mut Subtitle, lines: &[String]) -> Result<i32, String> {
+        match self {
+            Self::SubRip => Ok(srt::load(subtitle, lines)),
+            Self::Ssa | Self::Ass => Ok(ssa::load(subtitle, lines)),
+            Self::WebVtt => vtt::load(subtitle, lines),
+        }
+    }
 }
 
 /// Splits raw bytes into logical lines, matching .NET `Stream.ReadAllLines`.
@@ -91,19 +120,44 @@ fn read_all_lines(data: &[u8]) -> Vec<String> {
 }
 
 impl SubtitleParser for SubtitleEditParser {
+    /// Upstream tries each format registered for the extension until one
+    /// loads with no errors, all into ONE `Subtitle`, so a format that failed
+    /// leaves its cues for the next to add to (as read, a failed WebVTT load
+    /// followed by `WebVTTFileWithLineNumber` duplicates every cue, or keeps
+    /// only the last). Each format loads into its own here; the first clean
+    /// load wins, and when none is clean the first format's cues stand, which
+    /// is what upstream returns for an extension with one format.
     fn parse(&self, data: &[u8], file_extension: &str) -> Result<Subtitle, String> {
-        let format = Self::format_for(file_extension)
+        let formats = Self::formats_for(file_extension)
             .ok_or_else(|| format!("Unsupported file extension: {file_extension}"))?;
 
         let lines = read_all_lines(data);
-        let mut subtitle = Subtitle::new();
-
-        let errors = match format {
-            Format::SubRip => srt::load(&mut subtitle, &lines),
-            Format::Ssa | Format::Ass => ssa::load(&mut subtitle, &lines),
-        };
-
-        let _ = errors;
+        let mut first: Option<Subtitle> = None;
+        let mut clean: Option<Subtitle> = None;
+        for format in formats {
+            tracing::debug!(
+                file_extension,
+                parser = format.name(),
+                "trying a subtitle format parser"
+            );
+            let mut subtitle = Subtitle::new();
+            let errors = format.load(&mut subtitle, &lines)?;
+            if errors == 0 {
+                clean = Some(subtitle);
+                break;
+            }
+            // Upstream logs this at error. Debug here: the SubRip loader does
+            // not count errors as libse's does (gl-757), so a file libse
+            // loads cleanly could report some on every request.
+            tracing::debug!(
+                errors,
+                file_extension,
+                parser = format.name(),
+                "errors encountered while parsing a subtitle"
+            );
+            first.get_or_insert(subtitle);
+        }
+        let subtitle = clean.or(first).unwrap_or_default();
 
         if subtitle.paragraphs.is_empty() {
             return Err(format!("Unsupported format: {file_extension}"));
@@ -113,7 +167,7 @@ impl SubtitleParser for SubtitleEditParser {
     }
 
     fn supports_file_extension(&self, file_extension: &str) -> bool {
-        Self::format_for(file_extension).is_some()
+        Self::formats_for(file_extension).is_some()
     }
 }
 
