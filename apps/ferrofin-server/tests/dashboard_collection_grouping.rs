@@ -197,6 +197,10 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
                 id: guid_to_db(episode_id),
                 type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
                 name: Some("Unplayed episode".into()),
+                // A stored key like the other rows': an episode's own
+                // `CreateSortName` keeps its name's case, which would sort it
+                // before "bravo series" in the TV view's expected order.
+                sort_name: Some("unplayed episode".into()),
                 parent_id: Some(guid_to_db(ids[1])),
                 series_id: Some(guid_to_db(ids[1])),
                 series_presentation_unique_key: Some(series_key),

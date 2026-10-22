@@ -74,6 +74,13 @@ pub struct ImageProcessingOptions {
 
     /// Whether the encoder must auto-orient the image from EXIF.
     pub requires_auto_orientation: bool,
+
+    /// Whether the image is turned upright from its EXIF orientation before
+    /// any resize: `ImageProcessor.ProcessImage`'s `autoOrient`, which it sets
+    /// for a `Photo` whose stored orientation is unknown or not `TopLeft`.
+    /// This port drops the item (see the module docs), so the caller, which
+    /// read it, sets the flag.
+    pub auto_orient: bool,
 }
 
 impl Default for ImageProcessingOptions {
@@ -96,6 +103,7 @@ impl Default for ImageProcessingOptions {
             background_color: None,
             foreground_layer: None,
             requires_auto_orientation: true,
+            auto_orient: false,
         }
     }
 }

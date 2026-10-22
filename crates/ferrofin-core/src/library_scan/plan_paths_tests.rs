@@ -886,3 +886,58 @@ async fn plan_follows_linked_folders_and_stops_at_a_loop() {
         "a link back to the library root is not descended: {paths:#?}"
     );
 }
+
+/// `DotIgnoreIgnoreRule` (`LibraryManager.IgnoreFile`): a `.ignore` file hides
+/// what lies beneath its folder from the plan, everything when it is empty
+/// and otherwise what its gitignore lines match. The plan records the hidden
+/// entries as excluded, so stored rows under them are pruned.
+#[tokio::test]
+async fn dot_ignore_files_hide_paths_from_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("movies");
+    for rel in [
+        "Heat (1995)/Heat (1995).mkv",
+        "Ronin (1998)/Ronin (1998).mkv",
+        "Private/.ignore",
+        "Private/Home Video (2001)/Home Video (2001).mkv",
+        "Drafts/Cut (2020)/Cut (2020).mkv",
+    ] {
+        touch(&movies, rel);
+    }
+    std::fs::write(movies.join(".ignore"), "# work in progress\ndrafts/\n").unwrap();
+    let folders = vec![library(1, Some(CollectionTypeOptions::movies), &movies)];
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default())).await;
+    let plan = scanner.plan_in(
+        &folders,
+        &folders,
+        PlanScope::ALL,
+        super::DateAdded::default(),
+        None,
+        None,
+    );
+    let planned: Vec<String> = plan
+        .items
+        .iter()
+        .filter_map(|p| p.entity.path.clone())
+        .collect();
+    let root = movies.to_string_lossy();
+    for kept in [
+        "Heat (1995)/Heat (1995).mkv",
+        "Ronin (1998)/Ronin (1998).mkv",
+    ] {
+        let path = format!("{root}/{kept}");
+        assert!(planned.contains(&path), "{kept} not planned: {planned:?}");
+    }
+    for hidden in ["Private", "Drafts"] {
+        let path = format!("{root}/{hidden}");
+        assert!(
+            planned.iter().all(|p| !p.starts_with(&path)),
+            "{hidden} planned: {planned:?}"
+        );
+        assert!(
+            plan.excluded.contains(&path),
+            "{hidden} not excluded: {:?}",
+            plan.excluded
+        );
+    }
+}
