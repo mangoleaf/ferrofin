@@ -1,7 +1,8 @@
 //! The HLS **master** playlist (`master.m3u8`) — port of
 //! `Jellyfin.Api/Helpers/DynamicHlsHelper.cs` (10.11.8), the
 //! `GetMasterPlaylistInternal` assembly and its `AppendPlaylist*` helpers,
-//! plus Jellyfin 12's `AppendDoviPlaylist` (jellyfin#16362).
+//! plus Jellyfin 12's `AppendDoviPlaylist` (jellyfin#16362) and
+//! `GetPlaylistAudioCodecs` (jellyfin#15959).
 //!
 //! A pure builder over an already-resolved [`TranscodePlan`]: no I/O, so the
 //! exact bytes a client receives are unit-testable against the upstream oracle.
@@ -21,9 +22,11 @@
 //!   keep their original spelling, `UrlEncoder.Default` percent-encoding), and
 //!   the variants share ONE mutable query dictionary just as the C# does, so a
 //!   later variant inherits the keys an earlier one set.
-//! - `IsDoviRemoved`/`IsHdr10PlusRemoved` are constant `false`: Ferrofin's
-//!   remux has no bitstream-filter metadata removal, so a copied stream keeps
-//!   (and advertises) its dynamic HDR metadata.
+//! - `IsDoviRemoved`/`IsHdr10PlusRemoved` need the ffmpeg build's
+//!   capabilities, which this builder does not have, so the planner evaluates
+//!   them and the [`TranscodePlan`] carries the answers. Between variants
+//!   upstream changes only the output codec (a non-copy variant returns before
+//!   the field) and the HEVC level, neither of which they read.
 
 use std::fmt::Write as _;
 
@@ -276,6 +279,10 @@ pub fn build_master_playlist(
     // swaps OutputVideoCodec / VideoStream.Level and restores them); a local
     // copy keeps the plan itself untouched.
     let mut state = plan.state.clone();
+    let removal = DynamicHdrRemoval {
+        dovi: plan.is_dovi_removed,
+        hdr10_plus: plan.is_hdr10_plus_removed,
+    };
     let total_bitrate = state
         .output_audio_bitrate
         .unwrap_or(0)
@@ -404,6 +411,7 @@ pub fn build_master_playlist(
     let basic_playlist = append_playlist(
         &mut builder,
         &state,
+        removal,
         &playlist_url,
         total_bitrate,
         subtitle_group,
@@ -444,6 +452,7 @@ pub fn build_master_playlist(
                 append_playlist(
                     &mut builder,
                     &state,
+                    removal,
                     &sdr_video_url,
                     total_bitrate,
                     subtitle_group,
@@ -474,6 +483,7 @@ pub fn build_master_playlist(
             append_playlist(
                 &mut builder,
                 &state,
+                removal,
                 &sdr_video_url,
                 total_bitrate,
                 subtitle_group,
@@ -538,6 +548,7 @@ pub fn build_master_playlist(
         append_playlist(
             &mut builder,
             &state,
+            removal,
             &variant_url,
             new_bitrate,
             subtitle_group,
@@ -557,6 +568,7 @@ pub fn build_master_playlist(
         append_playlist(
             &mut builder,
             &state,
+            removal,
             &variant_url,
             new_bitrate,
             subtitle_group,
@@ -577,12 +589,21 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .contains(&needle.to_ascii_lowercase())
 }
 
+/// Which dynamic HDR metadata the transcode strips from a copied video
+/// (`IsDoviRemoved`, `IsHdr10PlusRemoved`), as the plan recorded it.
+#[derive(Debug, Clone, Copy)]
+struct DynamicHdrRemoval {
+    dovi: bool,
+    hdr10_plus: bool,
+}
+
 /// Port of `AppendPlaylist`: appends one `#EXT-X-STREAM-INF` entry + its URL
 /// to `builder` and returns that entry on its own (the HEVC level-5.0 duplicate
 /// is made by string-replacing the `CODECS` field inside it).
 fn append_playlist(
     builder: &mut String,
     state: &EncodingJobInfo,
+    removal: DynamicHdrRemoval,
     url: &str,
     bitrate: i32,
     subtitle_group: Option<&str>,
@@ -595,7 +616,7 @@ fn append_playlist(
 
     append_playlist_video_range_field(&mut playlist_builder, state);
     append_playlist_codecs_field(&mut playlist_builder, state);
-    append_playlist_supplemental_codecs_field(&mut playlist_builder, state);
+    append_playlist_supplemental_codecs_field(&mut playlist_builder, state, removal);
     append_playlist_resolution_field(&mut playlist_builder, state);
     append_playlist_framerate_field(&mut playlist_builder, state);
 
@@ -737,19 +758,22 @@ fn append_playlist_codecs_field(builder: &mut String, state: &EncodingJobInfo) {
 
 /// Appends a `SUPPLEMENTAL-CODECS` field for a stream-copied Dolby Vision /
 /// HDR10+ video (`AppendPlaylistSupplementalCodecsField`).
-fn append_playlist_supplemental_codecs_field(builder: &mut String, state: &EncodingJobInfo) {
+fn append_playlist_supplemental_codecs_field(
+    builder: &mut String,
+    state: &EncodingJobInfo,
+    removal: DynamicHdrRemoval,
+) {
     // HDR dynamic metadata currently cannot exist when transcoding
     if !is_copy(state.output_video_codec.as_deref()) {
         return;
     }
 
-    // Ferrofin's remux never strips dynamic HDR metadata (no bitstream-filter
-    // removal), so upstream's `IsDoviRemoved` / `IsHdr10PlusRemoved` are
-    // constant `false` here.
+    // A stripped format is not advertised: a DoVi + HDR10+ source whose DoVi
+    // is stripped is labelled HDR10+.
     let video_stream = state.video_stream.as_ref();
-    if is_dovi(video_stream) {
+    if is_dovi(video_stream) && !removal.dovi {
         append_dv_string(builder, state);
-    } else if is_hdr10_plus(video_stream) {
+    } else if is_hdr10_plus(video_stream) && !removal.hdr10_plus {
         append_hdr10_plus_string(builder, state);
     }
 }
@@ -1013,12 +1037,24 @@ fn output_video_codec_profile(state: &EncodingJobInfo, codec: &str) -> String {
 }
 
 /// Gets a formatted string of the output audio codec, for use in the `CODECS`
-/// field (`GetPlaylistAudioCodecs`).
+/// field (Jellyfin 12's `GetPlaylistAudioCodecs`, v12.2
+/// `DynamicHlsHelper.cs:832-886`).
 fn playlist_audio_codecs(state: &EncodingJobInfo) -> String {
     let actual = state.actual_output_audio_codec().unwrap_or_default();
+    let copied = is_copy(state.output_audio_codec.as_deref());
+    let source_profile = || {
+        state
+            .audio_stream
+            .as_ref()
+            .and_then(|stream| stream.profile.clone())
+    };
     if actual.eq_ignore_ascii_case("aac") {
-        let profiles = state.requested_profiles("aac");
-        return hls_codec_strings::aac_string(profiles.first().map(String::as_str));
+        let profile = if copied {
+            source_profile()
+        } else {
+            state.requested_profiles("aac").into_iter().next()
+        };
+        return hls_codec_strings::aac_string(profile.as_deref());
     }
     if actual.eq_ignore_ascii_case("mp3") {
         return hls_codec_strings::MP3.to_owned();
@@ -1037,6 +1073,18 @@ fn playlist_audio_codecs(state: &EncodingJobInfo) -> String {
     }
     if actual.eq_ignore_ascii_case("opus") {
         return hls_codec_strings::OPUS.to_owned();
+    }
+    if actual.eq_ignore_ascii_case("truehd") {
+        return hls_codec_strings::TRUEHD.to_owned();
+    }
+    if actual.eq_ignore_ascii_case("dts") {
+        // lavc only support encoding DTS core profile
+        let profile = if copied {
+            source_profile()
+        } else {
+            Some("DTS".to_owned())
+        };
+        return hls_codec_strings::dts_string(profile.as_deref()).to_owned();
     }
     String::new()
 }
@@ -1253,6 +1301,8 @@ mod tests {
             segment_container: "ts".to_owned(),
             encoding_options: EncodingOptions::default(),
             min_segments: 3,
+            is_dovi_removed: false,
+            is_hdr10_plus_removed: false,
         }
     }
 
@@ -1273,6 +1323,49 @@ mod tests {
             query_string: FIXTURE_QUERY.to_owned(),
             ..HlsStreamRequest::default()
         }
+    }
+
+    /// `GetPlaylistAudioCodecs` (v12.2 `DynamicHlsHelper.cs:832-886`): a copied
+    /// AAC names the SOURCE stream's profile and an encode the requested one;
+    /// TrueHD is `mlpa`; DTS names the copied stream's profile through
+    /// `GetDTSString`, and an encode is DTS core ("lavc only support encoding
+    /// DTS core profile").
+    #[rstest::rstest]
+    #[case::copied_he_aac("aac", Some("HE-AAC"), "copy", None, "mp4a.40.5")]
+    #[case::copied_lc("aac", Some("LC"), "copy", Some("HE-AAC"), "mp4a.40.2")]
+    #[case::encoded_requests_he_aac("aac", Some("LC"), "aac", Some("HE-AAC"), "mp4a.40.5")]
+    #[case::encoded_requests_he("aac", Some("HE-AAC"), "aac", Some("HE"), "mp4a.40.2")]
+    #[case::truehd("truehd", None, "copy", None, "mlpa")]
+    #[case::dts("dts", Some("DTS"), "copy", None, "dtsc")]
+    #[case::dts_es("dts", Some("DTS-ES"), "copy", None, "dtsc")]
+    #[case::dts_96_24("dts", Some("DTS 96/24"), "copy", None, "dtsc")]
+    #[case::dts_hd_hra("dts", Some("DTS-HD HRA"), "copy", None, "dtsh")]
+    #[case::dts_hd_ma("dts", Some("DTS-HD MA"), "copy", None, "dtsh")]
+    #[case::dts_x("dts", Some("dts-hd ma + dts:x"), "copy", None, "dtsh")]
+    #[case::dts_x_imax("dts", Some("DTS-HD MA + DTS:X IMAX"), "copy", None, "dtsh")]
+    #[case::dts_express("dts", Some("DTS Express"), "copy", None, "dtse")]
+    #[case::dts_unknown("dts", Some("DTS-HD Something"), "copy", None, "dtsc")]
+    #[case::dts_no_profile("dts", None, "copy", None, "dtsc")]
+    #[case::dts_encoded("dts", Some("DTS-HD MA"), "dts", None, "dtsc")]
+    fn playlist_audio_codecs_follow_jellyfin_12(
+        #[case] codec: &str,
+        #[case] source_profile: Option<&str>,
+        #[case] output_audio_codec: &str,
+        #[case] requested_profile: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let mut s = state(vec![
+            video_stream(),
+            MediaStream {
+                codec: Some(codec.to_owned()),
+                profile: source_profile.map(str::to_owned),
+                ..audio_stream()
+            },
+        ]);
+        s.output_audio_codec = Some(output_audio_codec.to_owned());
+        s.base_request.audio_codec = Some(codec.to_owned());
+        s.base_request.profile = requested_profile.map(str::to_owned);
+        assert_eq!(playlist_audio_codecs(&s), expected);
     }
 
     fn fixture_plan() -> TranscodePlan {
@@ -1369,7 +1462,9 @@ mod tests {
             ("aac-profile".to_owned(), "HE".to_owned()),
         ];
         let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
-        assert!(pl.contains("CODECS=\"avc1.640033,mp4a.40.5\""), "got: {pl}");
+        // Jellyfin 12's `GetAACString` matches ffprobe's `HE-AAC`, so a
+        // requested `HE` is LC (jellyfin#15959); 10.11.8 gave `mp4a.40.5`.
+        assert!(pl.contains("CODECS=\"avc1.640033,mp4a.40.2\""), "got: {pl}");
         // An over-limit level is clamped by NormalizeTranscodingLevel (h264 → 51).
         let mut s = state(vec![video_stream(), audio_stream()]);
         s.base_request.level = Some("62".to_owned());
@@ -1547,6 +1642,48 @@ mod tests {
         let s = state(vec![video, audio_stream()]);
         let pl = build_master_playlist(&plan(s), &request(), &MasterPlaylistContext::default());
         assert!(!pl.contains("SUPPLEMENTAL-CODECS"), "got: {pl}");
+    }
+
+    /// `IsDoviRemoved`/`IsHdr10PlusRemoved` (v12.2 `DynamicHlsHelper.cs:539-546`):
+    /// a format the transcode strips is not advertised. A DoVi + HDR10+ source
+    /// with its DoVi stripped is labelled HDR10+, and with HDR10+ stripped as
+    /// well it carries no field at all.
+    #[test]
+    fn supplemental_codecs_skip_the_metadata_the_transcode_strips() {
+        let mut video = hdr_hevc_stream();
+        video.dv_profile = Some(8);
+        video.dv_level = Some(6);
+        video.dv_bl_signal_compatibility_id = Some(1);
+        video.rpu_present_flag = Some(1);
+        video.bl_present_flag = Some(1);
+        video.el_present_flag = Some(0);
+        video.hdr10_plus_present_flag = Some(true);
+        let build = |dovi: bool, hdr10_plus: bool| {
+            let mut s = state(vec![video.clone(), audio_stream()]);
+            s.output_video_codec = Some("copy".to_owned());
+            let plan = TranscodePlan {
+                is_dovi_removed: dovi,
+                is_hdr10_plus_removed: hdr10_plus,
+                ..plan(s)
+            };
+            build_master_playlist(&plan, &request(), &MasterPlaylistContext::default())
+        };
+
+        let kept = build(false, false);
+        assert!(
+            kept.contains(",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\","),
+            "got: {kept}"
+        );
+        let dovi_stripped = build(true, false);
+        assert!(
+            dovi_stripped.contains(",SUPPLEMENTAL-CODECS=\"hvc1.2.4.L153.B0/cdm4\","),
+            "got: {dovi_stripped}"
+        );
+        let both_stripped = build(true, true);
+        assert!(
+            !both_stripped.contains("SUPPLEMENTAL-CODECS"),
+            "got: {both_stripped}"
+        );
     }
 
     /// A Dolby Vision stream with no compatible base layer (HEVC P5, AV1 P10
