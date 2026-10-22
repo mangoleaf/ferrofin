@@ -330,6 +330,8 @@ struct Tree {
     locked_written: Mutex<Vec<(Uuid, Vec<i32>)>>,
     /// Other items the library resolves by id (a folder's parent).
     others: Vec<BaseItemEntity>,
+    /// `update_people` calls: the item and the credits written.
+    people_written: Mutex<Vec<(String, Vec<PeopleEntity>)>>,
 }
 
 /// The folder-refresh scans the library was asked to queue.
@@ -337,6 +339,19 @@ type RecordedScans = Arc<Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>>;
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        self.tree
+            .people_written
+            .lock()
+            .unwrap()
+            .push((item.id.clone(), people.to_vec()));
+        Ok(())
+    }
+
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -1493,7 +1508,201 @@ async fn season_and_album_edits_cascade_to_their_children() {
         assert_eq!(kid.official_rating, None, "{kind}: a blank rating clears");
         assert_eq!(kid.tags.as_deref(), Some("T"), "{kind}");
         assert_eq!(kid.series_name.as_deref(), Some("Old series"), "{kind}");
+        // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`):
+        // a season's episodes take its new name; an album's tracks have none.
+        let season_name = (kind == "TV.Season").then_some("P");
+        assert_eq!(kid.season_name.as_deref(), season_name, "{kind}");
     }
+}
+
+/// The fixture item stored as `kind` with `data`, edited with `fields`;
+/// returns the row the handler wrote.
+async fn edit_kind(kind: &str, data: Option<&str>, fields: &str) -> BaseItemEntity {
+    let id = Uuid::from_u128(0x80);
+    let tree = Tree {
+        root: Some(BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.{kind}"),
+            data: data.map(ToOwned::to_owned),
+            ..base_item_entity(id)
+        }),
+        ..Tree::default()
+    };
+    let library = post_update(
+        tree_library(id, tree),
+        format!(r#"{{"Id":"{id}","Name":"N"{fields}}}"#),
+    )
+    .await;
+    let written = library.updated.lock().unwrap().clone();
+    written.into_iter().next().expect("item written")
+}
+
+/// The row's `Data` blob.
+fn data_of(item: &BaseItemEntity) -> serde_json::Value {
+    item.data
+        .as_deref()
+        .map_or(serde_json::Value::Null, |data| {
+            serde_json::from_str(data).expect("json")
+        })
+}
+
+/// The editor fields `UpdateItem` writes per kind (v12.2
+/// `ItemUpdateController.cs:259-264, 423-437, 465-473`): a series' status,
+/// air days, air time and runtime; an episode's special placement, kept in
+/// `Data` compactly; a video's 3D format; a Live TV channel's height.
+#[tokio::test]
+async fn an_edit_writes_each_kinds_editor_fields() {
+    let series = edit_kind(
+        "Entities.TV.Series",
+        None,
+        r#","Status":"ended","AirDays":["Friday","Saturday"],"AirTime":"20:00","RunTimeTicks":"25000000000""#,
+    )
+    .await;
+    let data = data_of(&series);
+    assert_eq!(data["Status"], "Ended");
+    assert_eq!(data["AirDays"], serde_json::json!(["Friday", "Saturday"]));
+    assert_eq!(data["AirTime"], "20:00");
+    assert_eq!(series.run_time_ticks, Some(25_000_000_000));
+    // No air days sent: the stored ones stay; an empty status clears it.
+    let series = edit_kind(
+        "Entities.TV.Series",
+        Some(r#"{"Status":"Ended","AirDays":["Friday"],"AirTime":"20:00"}"#),
+        r#","Status":"""#,
+    )
+    .await;
+    let data = data_of(&series);
+    assert!(data.get("Status").is_none(), "{data}");
+    assert_eq!(data["AirDays"], serde_json::json!(["Friday"]));
+    assert_eq!(data["AirTime"], "20:00");
+
+    let episode = edit_kind(
+        "Entities.TV.Episode",
+        None,
+        r#","AirsBeforeSeasonNumber":"2","AirsBeforeEpisodeNumber":3,"AirsAfterSeasonNumber":null"#,
+    )
+    .await;
+    let raw = episode.data.clone().expect("data");
+    assert!(
+        raw.contains(r#""AirsBeforeSeasonNumber":2"#)
+            && raw.contains(r#""AirsBeforeEpisodeNumber":3"#),
+        "compact, as the AiredDuringSeason filter matches them: {raw}"
+    );
+    assert!(!raw.contains("AirsAfterSeasonNumber"), "{raw}");
+
+    let movie = edit_kind(
+        "Entities.Movies.Movie",
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        r#","Video3DFormat":"HalfSideBySide""#,
+    )
+    .await;
+    assert_eq!(data_of(&movie)["Video3DFormat"], "HalfSideBySide");
+    assert_eq!(data_of(&movie)["VideoType"], "VideoFile");
+
+    let channel = edit_kind("LiveTv.LiveTvChannel", None, r#","Height":"1080""#).await;
+    assert_eq!(channel.height, Some(1080));
+    // A field of another kind is ignored.
+    let movie = edit_kind(
+        "Entities.Movies.Movie",
+        None,
+        r#","AirsBeforeSeasonNumber":2,"Status":"Ended""#,
+    )
+    .await;
+    assert!(
+        movie
+            .data
+            .as_deref()
+            .is_none_or(|d| !d.contains("Airs") && !d.contains("Status"))
+    );
+}
+
+/// A status `Enum.Parse` cannot read, on a series: upstream throws (500);
+/// the request is refused with a 400 instead, and nothing is written. On any
+/// other kind `Status` is never read, so the edit applies.
+#[tokio::test]
+async fn an_unreadable_series_status_is_a_bad_request() {
+    let id = Uuid::from_u128(0x82);
+    let send_to = |kind: &'static str| {
+        let library = tree_library(
+            id,
+            Tree {
+                root: Some(BaseItemEntity {
+                    type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+                    ..base_item_entity(id)
+                }),
+                ..Tree::default()
+            },
+        );
+        async move {
+            let router = create_router(state_with_library(
+                Arc::clone(&library),
+                Arc::new(Mutex::new(Vec::new())),
+            ));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/Items/{id}"))
+                        .header("X-Emby-Token", "valid")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"Id":"{id}","Name":"N","Status":"Cancelled","People":[{{"Name":"X"}}]}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (
+                response.status(),
+                library.updated.lock().unwrap().len(),
+                library.tree.people_written.lock().unwrap().len(),
+            )
+        }
+    };
+    assert_eq!(send_to("TV.Series").await, (StatusCode::BAD_REQUEST, 0, 0));
+    assert_eq!(
+        send_to("Movies.Movie").await,
+        (StatusCode::NO_CONTENT, 1, 1)
+    );
+}
+
+/// `request.People` replaces the item's credits before the save, each as
+/// `new PersonInfo { Name, Role, Type }`; a nameless entry is dropped and an
+/// absent `Type` is `Unknown`. Without the key nothing is written.
+#[tokio::test]
+async fn an_edit_writes_the_items_people() {
+    let id = Uuid::from_u128(0x81);
+    let library = post_update(
+        tree_library(id, Tree::default()),
+        format!(
+            r#"{{"Id":"{id}","Name":"N","People":[{{"Name":"Al Pacino","Role":"Lt. Hanna","Type":"Actor"}},{{"Name":"Michael Mann","Type":"Director"}},{{"Role":"nobody"}},{{"Name":"Unsure"}}]}}"#
+        ),
+    )
+    .await;
+    let written = library.tree.people_written.lock().unwrap().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].0, id.to_string());
+    let credits: Vec<(String, Option<String>, Option<String>)> = written[0]
+        .1
+        .iter()
+        .map(|p| (p.name.clone(), p.role.clone(), p.person_type.clone()))
+        .collect();
+    assert_eq!(
+        credits,
+        [
+            (
+                "Al Pacino".into(),
+                Some("Lt. Hanna".into()),
+                Some("Actor".into())
+            ),
+            ("Michael Mann".into(), None, Some("Director".into())),
+            ("Unsure".into(), None, Some("Unknown".into())),
+        ]
+    );
+    let library = post_update(
+        tree_library(id, Tree::default()),
+        format!(r#"{{"Id":"{id}","Name":"N"}}"#),
+    )
+    .await;
+    assert!(library.tree.people_written.lock().unwrap().is_empty());
 }
 
 /// `if (isLockedChanged && item.IsFolder)`: a change of `LockData` on a
