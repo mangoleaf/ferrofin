@@ -489,6 +489,21 @@ pub trait ItemRepository: Send + Sync {
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
+    /// [`Self::get_image_infos`] in the same read as whether the item's images
+    /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
+    /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or
+    /// not `TopLeft`. The default reads the rows and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_image_infos_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_image_infos(item_id).await?, false))
+    }
+
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///
@@ -1538,6 +1553,20 @@ pub trait ItemPersistenceService: Send + Sync {
     ///
     /// [`ServiceError::Backend`] on a storage failure.
     async fn superseded_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// The ids of the unlocked `MusicArtist` rows accessed by name (no
+    /// `ParentId`) whose `CleanName` no artist or album-artist value an item
+    /// still maps to carries, in id order: the by-name artists the library
+    /// no longer credits (upstream `ArtistsValidator`'s dead artists).
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn dead_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
         Ok(Vec::new())
     }
 
