@@ -104,6 +104,24 @@ pub fn is_video(kind: BaseItemKind) -> bool {
     )
 }
 
+/// `BaseItem.SupportsPeople` and its overrides: the kinds that carry cast and
+/// crew — every video, audio and audiobook, book, series, season, box set and
+/// music album. `BaseItem`'s own answer, and so every other kind's, is no.
+#[must_use]
+pub fn supports_people(kind: BaseItemKind) -> bool {
+    is_video(kind)
+        || matches!(
+            kind,
+            BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+                | BaseItemKind::BoxSet
+                | BaseItemKind::MusicAlbum
+        )
+}
+
 /// The `PresentationUniqueKey` a row of `kind` is stored with — C#
 /// `BaseItem.CreatePresentationUniqueKey` and its overrides, which
 /// `MetadataService` stamps on every refresh.
@@ -289,11 +307,11 @@ pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
 /// EnableAlphaNumericSorting, config)` (`BaseItem.cs:945`) including its
 /// [`enable_alpha_numeric_sorting`] branch.
 ///
-/// One home for the rule, because three separate write paths
-/// (`upsert_item`'s fallback, `backfill_missing_sort_names`, and the people
-/// repository's inserts) each have to answer the same question, and a `Person`
-/// row that any one of them lower-cases stops matching where Jellyfin sorts and
-/// filters it.
+/// One home for the rule, because several write paths (the people
+/// repository's inserts, [`saved_sort_name`], and through
+/// `metadata_merge::derived_sort_name` [`fallback_sort_name`]) each have to
+/// answer the same question, and a `Person` row that any one of them
+/// lower-cases stops matching where Jellyfin sorts and filters it.
 #[must_use]
 pub fn sort_name_for(kind: BaseItemKind, name: &str) -> String {
     ferrofin_util::sort_name::get_sort_name(name, enable_alpha_numeric_sorting(kind))
@@ -326,6 +344,30 @@ pub fn saved_sort_name(kind: BaseItemKind, name: &str, forced: Option<&str>) -> 
     match forced.filter(|forced| !forced.is_empty()) {
         Some(forced) => forced_sort_name_for(kind, forced),
         None => sort_name_for(kind, name),
+    }
+}
+
+/// The `SortName` of a row that has none stored, as upstream's
+/// `BaseItem.SortName` getter derives it: the forced sort title's key
+/// ([`forced_sort_name_for`]; a `Person`'s verbatim), else the row kind's own
+/// `CreateSortName` of its name, the derivation every writer settles with
+/// ([`ferrofin_providers::metadata_merge::derived_sort_name`]), which puts
+/// an episode, season or track in number order. `None` with neither.
+#[must_use]
+pub fn fallback_sort_name(
+    row: &ferrofin_db::entities::base_items::BaseItemEntity,
+) -> Option<String> {
+    match row.forced_sort_name.as_deref().filter(|f| !f.is_empty()) {
+        Some(forced) => Some(
+            match crate::item_type_lookup::kind_from_type_name(&row.type_) {
+                Some(kind) => forced_sort_name_for(kind, forced),
+                None => ferrofin_util::sort_name::forced_sort_key(forced),
+            },
+        ),
+        None => row
+            .name
+            .as_deref()
+            .map(|name| ferrofin_providers::metadata_merge::derived_sort_name(row, name)),
     }
 }
 
@@ -698,6 +740,15 @@ pub fn latest_items_index_container_kind(kind: BaseItemKind) -> Option<BaseItemK
     }
 }
 
+/// Whether a `Photo` with the stored `orientation` (the `Data` value, an
+/// `ImageOrientation` name) has its images turned upright when served:
+/// `ImageProcessor.ProcessImage` sets `autoOrient` unless the orientation is
+/// known to be `TopLeft` ("Orientation unknown, so do it").
+#[must_use]
+pub fn photo_auto_orients(orientation: Option<&str>) -> bool {
+    !orientation.is_some_and(|o| o.eq_ignore_ascii_case("TopLeft"))
+}
+
 /// Maps a library's configured [`CollectionTypeOptions`] to the
 /// [`CollectionType`] its `CollectionFolder` reports (C#
 /// `CollectionFolder.CollectionType`, parsed from the `<type>.collection`
@@ -723,19 +774,74 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
 }
 
 #[cfg(test)]
+mod people_tests {
+    use super::supports_people;
+    use ferrofin_model::data::BaseItemKind;
+
+    /// `SupportsPeople`: true where a class overrides it so, false on
+    /// `BaseItem` and the by-name, folder-view and person kinds.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::MusicVideo, true)]
+    #[case(BaseItemKind::Trailer, true)]
+    #[case(BaseItemKind::Video, true)]
+    #[case(BaseItemKind::Series, true)]
+    #[case(BaseItemKind::Season, true)]
+    #[case(BaseItemKind::Audio, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::Book, true)]
+    #[case(BaseItemKind::BoxSet, true)]
+    #[case(BaseItemKind::MusicAlbum, true)]
+    #[case(BaseItemKind::Person, false)]
+    #[case(BaseItemKind::Genre, false)]
+    #[case(BaseItemKind::MusicGenre, false)]
+    #[case(BaseItemKind::Studio, false)]
+    #[case(BaseItemKind::MusicArtist, false)]
+    #[case(BaseItemKind::Year, false)]
+    #[case(BaseItemKind::CollectionFolder, false)]
+    #[case(BaseItemKind::UserView, false)]
+    #[case(BaseItemKind::Folder, false)]
+    #[case(BaseItemKind::Playlist, false)]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::LiveTvChannel, false)]
+    #[case(BaseItemKind::LiveTvProgram, false)]
+    fn supports_people_follows_the_class_overrides(
+        #[case] kind: BaseItemKind,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(supports_people(kind), expected, "{kind:?}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         collection_type_of, is_folder, is_item_by_name, is_video,
-        latest_items_index_container_kind, presentation_unique_key, saved_sort_name,
-        series_presentation_unique_key, series_user_data_keys, supports_adding_to_playlist,
-        supports_ancestors, supports_inherited_parent_images, supports_played_status,
-        supports_position_ticks_resume, supports_similarity, supports_theme_media,
+        latest_items_index_container_kind, photo_auto_orients, presentation_unique_key,
+        saved_sort_name, series_presentation_unique_key, series_user_data_keys,
+        supports_adding_to_playlist, supports_ancestors, supports_inherited_parent_images,
+        supports_played_status, supports_position_ticks_resume, supports_similarity,
+        supports_theme_media,
     };
     use ferrofin_model::data::MediaType;
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::entities::ExtraType;
     use rstest::rstest;
+
+    /// `ImageProcessor.ProcessImage`: only a known `TopLeft` skips orienting.
+    #[rstest]
+    #[case::top_left(Some("TopLeft"), false)]
+    #[case::rotated(Some("RightTop"), true)]
+    #[case::mirrored(Some("TopRight"), true)]
+    #[case::unknown(None, true)]
+    fn photo_auto_orients_unless_known_top_left(
+        #[case] orientation: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(photo_auto_orients(orientation), expected);
+    }
 
     /// The series key a `Season` case carries.
     const SERIES_KEY: Option<&str> = Some("595f611d217e8273327033dd5d500d81");

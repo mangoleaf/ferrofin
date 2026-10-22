@@ -1168,6 +1168,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let min_segments = request
             .min_segments
             .unwrap_or(if segment_length_secs >= 10 { 2 } else { 3 });
+        let is_dovi_removed = bitstream::is_dovi_removed(&probed_caps, &state);
+        let is_hdr10_plus_removed = bitstream::is_hdr10_plus_removed(&probed_caps, &state);
         Ok(TranscodePlan {
             state,
             playlist_path,
@@ -1180,6 +1182,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_container,
             encoding_options: options,
             min_segments,
+            is_dovi_removed,
+            is_hdr10_plus_removed,
         })
     }
 }
@@ -1510,11 +1514,19 @@ impl FerrofinStreamStatePlanner {
             tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
             vec![hwaccel_input.args.clone()]
         }));
-        // GetInputArgument yields the full `-i file:"…"` fragment.
+        // `GetInputModifier`'s `GetFfmpegAnalyzeDurationArg` (the source's own
+        // `AnalyzeDurationMs`, the 3 s a Live TV source carries, else the
+        // `FFmpeg:analyzeduration` default) and `GetFfmpegProbesizeArg`;
+        // GetInputArgument then yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
-        args.push("200M".to_owned());
+        args.push(
+            ferrofin_mediaencoding::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+        );
         push_split(&mut args, "-probesize");
-        args.push("1G".to_owned());
+        args.push(ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned());
         // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
         // source (a tuner, a playlist channel) requires, as the probe sends
         // them. Each value is one argv element, never parsed as options.
@@ -3043,6 +3055,30 @@ mod tests {
         let args = plan.arguments.join(" ");
         assert!(args.contains("-c:a flac"), "{args}");
         assert!(!args.contains("-b:a"), "{args}");
+    }
+
+    /// `GetInputModifier` → `GetFfmpegAnalyzeDurationArg` (v12.2
+    /// `EncodingHelper.cs:7330-7348`): a source's own `AnalyzeDurationMs` (the
+    /// 3 s every Live TV source carries) is passed in microseconds; any other
+    /// source takes the `FFmpeg:analyzeduration` default, `200M`. `-probesize`
+    /// is the `FFmpeg:probesize` default, `1G`, either way.
+    #[tokio::test]
+    async fn analyzeduration_prefers_the_sources_own_value() {
+        let mut live = source("live", vec![video_stream("h264"), audio_stream("aac")]);
+        live.analyze_duration_ms = Some(3000);
+        let file = source("file", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![live, file]);
+        for (id, analyze) in [("live", "3000000"), ("file", "200M")] {
+            let plan = p
+                .plan(&request(id), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains(&format!("-analyzeduration {analyze} -probesize 1G")),
+                "{id}: {args}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5824,6 +5860,71 @@ mod tests {
             args.contains("-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1"),
             "{args}"
         );
+    }
+
+    /// `IsDoviRemoved` reaches the plan for the master playlist: true when the
+    /// client needs the Dolby Vision metadata gone and this ffmpeg can remove
+    /// it, false when the build has no filter that can (upstream's
+    /// `CanEncoderRemoveDynamicHdrMetadata`, the test capabilities' default).
+    #[tokio::test]
+    async fn the_plan_records_whether_dolby_vision_is_stripped() {
+        use ferrofin_mediaencoding::BsfOption;
+        let mut video = video_stream("hevc");
+        invalid_dovi(&mut video);
+        video.nal_length_size = Some("4".to_owned());
+        let mut req = request("abc");
+        req.video_codec = Some("copy".to_owned());
+        req.query_string = "hevc-rangetype=DOVI".to_owned();
+        for (supports_strip, expected) in [(true, true), (false, false)] {
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source("abc", vec![video.clone(), audio_stream("aac")])],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                FfmpegCapabilities::builder()
+                    .bsf_option(BsfOption::DoviRpuStrip, supports_strip)
+                    .build(),
+                EncodingOptions::default(),
+            );
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            assert_eq!(
+                plan.is_dovi_removed, expected,
+                "strip filter: {supports_strip}"
+            );
+            assert!(!plan.is_hdr10_plus_removed);
+        }
+
+        // `IsHdr10PlusRemoved`: a Dolby Vision client is confused by HDR10+
+        // beside a valid profile 8.1 layer, and this build can strip it.
+        let mut both = video_stream("hevc");
+        both.color_transfer = Some("smpte2084".to_owned());
+        both.color_primaries = Some("bt2020".to_owned());
+        both.color_space = Some("bt2020nc".to_owned());
+        both.dv_profile = Some(8);
+        both.dv_bl_signal_compatibility_id = Some(1);
+        both.rpu_present_flag = Some(1);
+        both.bl_present_flag = Some(1);
+        both.hdr10_plus_present_flag = Some(true);
+        both.nal_length_size = Some("4".to_owned());
+        assert_eq!(
+            both.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviWithHdr10Plus
+        );
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![both, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .bsf_option(BsfOption::HevcMetadataRemoveHdr10Plus, true)
+                .build(),
+            EncodingOptions::default(),
+        );
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(plan.is_hdr10_plus_removed);
+        assert!(!plan.is_dovi_removed);
     }
 
     #[tokio::test]
