@@ -545,30 +545,15 @@ fn day_of_week_contains(
 ///    root installs `with_connect_info`. Failing closed there costs a real
 ///    caller nothing and keeps the unknown case from being the permissive one.
 ///
-/// The local-network test is [`crate::handlers::system::is_in_local_network`],
-/// shared with `GET /System/Endpoint` so the endpoint that *reports* whether a
-/// client is in-network and the policy that *acts* on it can never disagree.
-///
-/// Two limits of that test, both of which make this arm **wider** than
-/// upstream's. Neither is a regression — before this gate the route took plain
-/// [`RequireAuth`], so any account could restart from anywhere, and both cases
-/// below still land on "authenticated caller only". But do not read the gate as
-/// stronger than it is:
-///
-/// - **Reverse proxies.** The peer address is the transport peer, and nothing
-///   here consumes `X-Forwarded-For`. Behind a proxy or ingress — including
-///   this repo's own `charts/ferrofin/templates/ingress.yaml` — every request
-///   presents the proxy's address, which is private, so the local arm is
-///   satisfied for all callers and the gate degrades to "any authenticated
-///   account". Upstream needs `KnownProxies` configured to do better;
-///   `NetworkConfiguration::known_proxies` exists here but nothing reads it
-///   yet.
-/// - **Configured subnets.** This now asks
-///   [`AppState::is_in_local_network`], which is
-///   `NetworkManager.IsInLocalNetwork` — `LocalNetworkSubnets` intersected and
-///   the `!`-prefixed exclusions subtracted — whenever the composition root has
-///   wired the policy. Without it (unit tests) the private-range fallback still
-///   applies.
+/// The local-network test is [`AppState::is_in_local_network`] over
+/// [`AppState::client_address`], as `GET /System/Endpoint`'s `IsInNetwork` is,
+/// so the endpoint that *reports* whether a client is in-network and the policy
+/// that *acts* on it can never disagree. With the composition root's network
+/// policy wired, that is `NetworkManager.IsInLocalNetwork` (the
+/// `LocalNetworkSubnets` intersected and the `!`-prefixed exclusions
+/// subtracted) over the client behind any `KnownProxies`, as upstream reads
+/// `GetNormalizedRemoteIP()`. Without it (unit tests) the private-range
+/// fallback in `handlers::system` applies.
 #[derive(Debug, Clone)]
 pub struct RequireLocalAccessOrAdmin(pub AuthorizationInfo);
 

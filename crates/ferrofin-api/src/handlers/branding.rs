@@ -172,6 +172,7 @@ async fn get_splashscreen(
         uuid::Uuid::nil(),
         &image,
         0,
+        false,
         &ImageQuery::tagged(query.tag, query.format),
         request,
     )
