@@ -62,7 +62,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 abs() { case "$1" in /*) echo "$1";; *) echo "$CALLER/$1";; esac; }   # user paths are relative to the caller's shell
-[ -n "$ORACLE_IMAGE" ] && [ -n "$FERROFIN_IMAGE" ] || die "--oracle IMAGE and --ferrofin IMAGE are required"
+if [ -z "$ORACLE_IMAGE" ] || [ -z "$FERROFIN_IMAGE" ]; then die "--oracle IMAGE and --ferrofin IMAGE are required"; fi
 for setting in PARITY_CAP_S PARITY_REQUEST_TIMEOUT READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S ORACLE_PORT FERROFIN_PORT; do
   [[ "${!setting}" =~ ^[1-9][0-9]*$ ]] || die "$setting must be a positive integer"
 done
@@ -141,7 +141,7 @@ fi
 
 # ── the run ───────────────────────────────────────────────────────────────────────────────────
 FAIL_REASON=""; CAP_EXCEEDED=false
-# shellcheck disable=SC2329  # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap (SC2317 is the code before shellcheck 0.11)
 cleanup() {   # the EXIT trap: stops what runs, removes the containers, and makes sure a report exists
   local rc=$? name cleanup_rc=0 give_up
   set +e
