@@ -532,6 +532,7 @@ EOS
   normal_status=$status; normal_output=$output
   [ "$normal_status" -eq 1 ]
   [ -f fixtures/work/run/report.html ]
+  # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
   [[ "$stderr" != *"report"* ]]   # a run that wrote its page says nothing about it
   # the same run from a copy of the harness whose report module crashes, then from one that has none
   cp -r "$ADOPTION" copy

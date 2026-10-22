@@ -67,7 +67,7 @@ record() { python3 "$REPORT_PY" "$@" >/dev/null 2>&1 || true; }
 # record_detail <args...> <detail>: the last argument goes in on stdin, so a detail that starts with "-" or is huge survives.
 record_detail() { local detail=${!#}; set -- "${@:1:$#-1}"; printf '%s' "$detail" | python3 "$REPORT_PY" "$@" --detail-stdin >/dev/null 2>&1 || true; }
 sampler=
-# shellcheck disable=SC2329  # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap (SC2317 is the code before shellcheck 0.11)
 finish() {
   [ -z "$sampler" ] || kill "$sampler" 2>/dev/null
   python3 "$REPORT_PY" build "$WORK" >/dev/null 2>&1 || true
