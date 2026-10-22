@@ -408,11 +408,16 @@ fn select_image(
 /// This is the shared tail of every image route once an image row is resolved.
 /// A remote (`http(s)`) path has no local file to serve without the not-yet-ported
 /// image processor, so it is a `404` (the contract's not-found outcome).
+///
+/// `auto_orient` is `ImageProcessor.ProcessImage`'s photo flag: the image is
+/// turned upright from its EXIF orientation, so it goes through the processor
+/// even when nothing else is asked for, as upstream re-encodes it.
 pub(crate) async fn serve_image_file(
     state: &AppState,
     item_id: Uuid,
     image: &ItemImageInfo,
     index: i32,
+    auto_orient: bool,
     query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -428,7 +433,10 @@ pub(crate) async fn serve_image_file(
     // already matches), so a plain request still serves the untouched original.
     let mut serve_path = image.path.clone();
     let mut content_type: Option<String> = None;
-    if let (true, Some(processor)) = (query.wants_transform(), state.image_processor.as_ref()) {
+    if let (true, Some(processor)) = (
+        query.wants_transform() || auto_orient,
+        state.image_processor.as_ref(),
+    ) {
         let options = ImageProcessingOptions {
             item_id,
             image: image.clone(),
@@ -453,6 +461,7 @@ pub(crate) async fn serve_image_file(
                     },
                     |f| vec![f],
                 ),
+            auto_orient,
             ..Default::default()
         };
         let processed = processor.process_image(&options).await?;
@@ -630,10 +639,13 @@ async fn serve_item_image(
     } else {
         None
     };
-    let images = if chapter_image.is_some() {
-        Vec::new()
+    let (images, auto_orient) = if chapter_image.is_some() {
+        (Vec::new(), false)
     } else {
-        state.library.get_item_images(item_id).await?
+        state
+            .library
+            .get_item_images_with_auto_orient(item_id)
+            .await?
     };
     let image = chapter_image
         .as_ref()
@@ -646,7 +658,7 @@ async fn serve_item_image(
             "item {item_id} has no {image_type:?} image at {index}"
         )));
     };
-    serve_image_file(state, item_id, image, index, query, request).await
+    serve_image_file(state, item_id, image, index, auto_orient, query, request).await
 }
 
 /// Resolve authenticated item access even on image-cache hits. Anonymous
@@ -1084,7 +1096,7 @@ async fn get_user_image(
         .get_profile_image(user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {user_id} has no profile image")))?;
-    serve_image_file(&state, user_id, &image, 0, &query, request).await
+    serve_image_file(&state, user_id, &image, 0, false, &query, request).await
 }
 
 /// `POST /UserImage` — upload a user's profile image.

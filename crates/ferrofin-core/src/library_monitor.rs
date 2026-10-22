@@ -509,6 +509,23 @@ impl FerrofinLibraryMonitor {
             tracing::trace!(path, "change ignored (ignore patterns)");
             return Ok(());
         }
+        // `DotIgnoreIgnoreRule.ShouldIgnore` (`LibraryMonitor.cs:389`): nor
+        // does a path a `.ignore` file hides. The lookup stats the path's
+        // folders, so it stays off the async workers.
+        let owned = path.to_owned();
+        let hidden = tokio::task::spawn_blocking(move || {
+            let is_dir = Path::new(&owned).is_dir();
+            crate::dot_ignore::DotIgnoreRule::default().should_ignore(&owned, is_dir)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(path, %error, ".ignore lookup failed; the change is not filtered by it");
+            false
+        });
+        if hidden {
+            tracing::trace!(path, "change ignored (.ignore file)");
+            return Ok(());
+        }
         if self.is_path_suppressed(path) {
             tracing::trace!(path, "change suppressed (server-initiated write)");
             return Ok(());
@@ -1168,6 +1185,32 @@ mod tests {
             .expect("report");
         monitor.report_webhook_change(path).await.expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `ReportFileSystemChanged` also returns when a `.ignore` file hides
+    /// the path (`LibraryMonitor.cs:389`); a path its rules keep still scans.
+    #[tokio::test]
+    async fn a_dot_ignored_path_does_not_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(movies.join("Private")).expect("mkdir");
+        std::fs::write(movies.join("Private/.ignore"), "").expect(".ignore");
+        std::fs::write(movies.join(".ignore"), "*.part\n").expect(".ignore");
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        for hidden in ["Private/Home Video.mkv", "Private", "Heat.mkv.part"] {
+            monitor
+                .report_file_system_changed(&movies.join(hidden).to_string_lossy())
+                .await
+                .expect("report");
+        }
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        monitor
+            .report_file_system_changed(&movies.join("Heat.mkv").to_string_lossy())
+            .await
+            .expect("report");
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
