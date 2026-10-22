@@ -199,8 +199,8 @@ fn fake_sessions_methods_panic() {
         ferrofin_model::session::SessionMessageType::ForceKeepAlive,
         "d",
     ));
-    // A no-op (not a panic): the user-data handlers push `UserDataChanged`
-    // through it best-effort on every played/favorite/rating write.
+    // A no-op (not a panic): the user-data manager's batched
+    // `UserDataChanged` goes out through it.
     assert!(
         tokio::runtime::Builder::new_current_thread()
             .build()
