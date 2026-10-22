@@ -3007,6 +3007,37 @@ mod tests {
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
 
+    /// The closing sweep's dead genre and studio selections
+    /// ([`crate::library_scan::dead_by_name_queries`]) seek the by-name rows
+    /// by `Type` and each row's values by `IX_ItemValues_Type_Value`: never a
+    /// scan, which on a large library's every validation would be the pass's
+    /// whole cost.
+    #[tokio::test]
+    async fn the_dead_by_name_selections_seek_the_values_by_type_and_value() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        for filter in crate::library_scan::dead_by_name_queries() {
+            let mut builder = build_query(&filter, QueryShape::IdsOnly);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|d| d.starts_with("SEARCH iv")
+                    && d.contains("IX_ItemValues_Type_Value")
+                    && d.contains("(Type=? AND Value=?)")),
+                "{plan:?}"
+            );
+            assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
+        }
+    }
+
     /// The candidate read behind the Playlists/Collections views
     /// (`UserViewManager.HasVisibleItem`, see
     /// [`crate::user_view_manager::visible_item_query`]), as the repository
