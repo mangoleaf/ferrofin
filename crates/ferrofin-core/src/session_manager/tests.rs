@@ -811,16 +811,42 @@ async fn broadcast_pushes_to_attached_connections() {
     assert_eq!(frame["MessageType"], "RestartRequired");
 }
 
-// Progress reported from one device must be pushed (`UserDataChanged`) to the
-// same user's OTHER sessions — that's what keeps resume positions in sync when
-// jumping between devices — and must not leak to other users' sessions.
+/// [`manager`] whose user-data manager announces its saves to the manager's
+/// sessions, as the composition root wires them.
+fn manager_announcing_user_data(db: &Database) -> Arc<FerrofinSessionManager> {
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let user_data = Arc::new(FerrofinUserDataManager::new(db.clone(), config));
+    let mgr = Arc::new(FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        user_data.clone(),
+        library_manager(db),
+        Arc::new(UnusedDtoService),
+        Arc::new(FerrofinEventManager::new()),
+        db.clone(),
+        "server-1".to_owned(),
+    ));
+    let sessions: Arc<dyn SessionManager> = mgr.clone();
+    user_data.set_user_data_changed_sink(Arc::new(crate::user_data_manager::SessionUserDataSink(
+        Arc::downgrade(&sessions),
+    )));
+    mgr
+}
+
+// A stop reported from one device reaches the same user's OTHER sessions as
+// `UserDataChanged`, which keeps resume positions in sync between devices, and
+// never another user's. A progress report is not announced, as upstream's
+// `UserDataChangeNotifier` skips `PlaybackProgress` saves.
 #[tokio::test]
-async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions() {
+async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_progress_does_not()
+{
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::session::PlaybackProgressInfo;
 
     let db = test_db().await;
-    let mgr = manager(&db);
+    let mgr = manager_announcing_user_data(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "shared").await;
     let other_id = Uuid::new_v4();
@@ -864,18 +890,38 @@ async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions(
         ..PlaybackProgressInfo::default()
     };
     mgr.on_playback_progress(&info, false).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    // A progress report is never announced (`UserDataChangeNotifier`) …
+    assert_eq!(web_conn.sent_count(), 0);
 
-    // The same user's other device received the play-state push …
-    assert_eq!(web_conn.sent_count(), 1);
-    let frame: serde_json::Value =
-        serde_json::from_slice(&web_conn.sent.lock().unwrap()[0]).unwrap();
-    assert_eq!(frame["MessageType"], "UserDataChanged");
-    assert_eq!(frame["Data"]["UserId"], user_id.simple().to_string());
+    let stop = ferrofin_model::session::PlaybackStopInfo {
+        session_id: tv.id.clone(),
+        item_id,
+        position_ticks: Some(2000),
+        ..ferrofin_model::session::PlaybackStopInfo::default()
+    };
+    mgr.on_playback_stopped(&stop).await.unwrap();
+    // … the stop is, to the same user's other device, once its batch window
+    // closes (polled up to a deadline, so a loaded host does not fail it) …
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while web_conn.sent_count() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let frames: Vec<serde_json::Value> = web_conn
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|raw| serde_json::from_slice(raw).unwrap())
+        .filter(|frame: &serde_json::Value| frame["MessageType"] == "UserDataChanged")
+        .collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["Data"]["UserId"], user_id.simple().to_string());
     assert_eq!(
-        frame["Data"]["UserDataList"][0]["ItemId"],
+        frames[0]["Data"]["UserDataList"][0]["ItemId"],
         item_id.simple().to_string()
     );
-    // … and the unrelated user's session did not.
+    // … and the unrelated user's session hears nothing.
     assert_eq!(other_conn.sent_count(), 0);
 }
 
@@ -1058,12 +1104,11 @@ fn manager_counting(
     ))
 }
 
-// A progress report still persists play state when the user has no session that
-// could receive the `UserDataChanged` push — but it must not pay the extra
-// `UserData` read to build a message nobody can receive. Playstate progress is
-// the hottest write in the server, so that read is per-report waste.
+// A progress report persists play state and pays no `UserData` read for a
+// push, with or without a session listening: progress is the hottest write in
+// the server, and upstream announces no progress save.
 #[tokio::test]
-async fn progress_without_a_listening_session_skips_the_push_read() {
+async fn progress_reports_pay_no_read_for_a_push() {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::session::PlaybackProgressInfo;
 
@@ -1090,13 +1135,11 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
         ..PlaybackProgressInfo::default()
     };
 
-    // No WebSocket, no bus sink: the push would reach nobody.
     mgr.on_playback_progress(&info, false).await.unwrap();
     assert_eq!(counting.play_state_writes(), 1, "the write still happens");
-    assert_eq!(counting.dto_reads(), 0, "no push means no read for it");
+    assert_eq!(counting.dto_reads(), 0);
 
-    // Attach a socket to that same session: the push is deliverable again and
-    // the read is paid for exactly one message.
+    // A socket on that same session changes nothing.
     let conn = FakeConnection::new(AuthorizationInfo::default());
     mgr.add_web_socket(
         session.id.as_deref().unwrap(),
@@ -1106,8 +1149,8 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
     .unwrap();
     mgr.on_playback_progress(&info, false).await.unwrap();
     assert_eq!(counting.play_state_writes(), 2);
-    assert_eq!(counting.dto_reads(), 1);
-    assert_eq!(conn.sent_count(), 1);
+    assert_eq!(counting.dto_reads(), 0);
+    assert_eq!(conn.sent_count(), 0);
 }
 
 /// "Remember audio/subtitle selections": a progress report saves the tracks

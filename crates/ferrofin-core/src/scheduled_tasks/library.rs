@@ -143,10 +143,15 @@ impl ScheduledTask for KeyframeExtractionTask {
         LIBRARY
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `KeyframeExtractionScheduledTask.cs:55-65`: every library video,
+        // a movie's alternate versions included (`IncludeOwnedItems`).
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+            media_types: vec![MediaType::Video],
             is_virtual_item: Some(false),
+            source_types: vec![SourceType::Library],
             recursive: true,
+            include_owned_items: true,
             ..InternalItemsQuery::default()
         };
         let total = self.library.get_count(&query).await?.max(0);
@@ -1069,13 +1074,17 @@ impl ScheduledTask for SubtitleDownloadTask {
             progress.report(100.0);
             return Ok(());
         }
+        // `SubtitleScheduledTask.cs:97-107`: a movie's alternate versions are
+        // candidates too (`IncludeOwnedItems`).
         let videos = self
             .library
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+                media_types: vec![MediaType::Video],
                 is_virtual_item: Some(false),
                 source_types: vec![SourceType::Library],
                 recursive: true,
+                include_owned_items: true,
                 ..InternalItemsQuery::default()
             })
             .await?;
@@ -2366,6 +2375,7 @@ mod tests {
         let path = media.path().join("film.mkv");
         std::fs::write(&path, b"x").expect("write");
         set_path(&db, movie, &path.to_string_lossy()).await;
+        set_media_type(&db, movie, "Video").await;
 
         // A German audio track satisfies "ger" via skip-if-audio-matches;
         // "eng" has nothing and must be searched + downloaded.
@@ -3139,6 +3149,63 @@ mod tests {
         let kept = keyframes.get_keyframe_data(done).await.expect("kept");
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
+    }
+
+    /// `KeyframeExtractionScheduledTask` queries with `IncludeOwnedItems`: a
+    /// movie's alternate version gets keyframes too, not only its primary.
+    #[tokio::test]
+    async fn keyframe_task_extracts_alternate_versions_too() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let keyframes: Arc<dyn KeyframeRepository> =
+            Arc::new(crate::FerrofinKeyframeRepository::new(db.clone()));
+        let (primary, alternate) = (Uuid::from_u128(0xC1), Uuid::from_u128(0xC2));
+        // A movie row over a real file of that name, written here.
+        let movie = |id: Uuid, name: &str, version_of: Option<Uuid>| {
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            BaseItemEntity {
+                id: guid_to_db(id),
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                    .expect("Movie has a stored type")
+                    .to_owned(),
+                name: Some(name.to_owned()),
+                path: Some(path.to_string_lossy().into_owned()),
+                media_type: Some("Video".to_owned()),
+                // A local alternate version is owned by its primary.
+                owner_id: version_of.map(guid_to_db),
+                primary_version_id: version_of.map(guid_to_db),
+                ..BaseItemEntity::default()
+            }
+        };
+        crate::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[
+                movie(primary, "Heat.mkv", None),
+                movie(alternate, "Heat - 2160p.mkv", Some(primary)),
+            ])
+            .await
+            .expect("seed the versions");
+
+        let task = KeyframeExtractionTask::new(
+            library_manager_over(db.clone()),
+            Arc::clone(&keyframes),
+            Arc::new(FakeEncoder {
+                fail_extract: false,
+            }),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        for id in [primary, alternate] {
+            assert!(
+                !keyframes
+                    .get_keyframe_data(id)
+                    .await
+                    .expect("read")
+                    .is_empty(),
+                "{id} was extracted"
+            );
+        }
     }
 
     // -- Extract Chapter Images ----------------------------------------------
