@@ -14,11 +14,11 @@
 //!   [`ImageProcessor::with_encoding_limit`], matching the C# constructor.
 //! - The overloaded `GetImageDimensions` / `GetImageCacheTag` methods collapse
 //!   onto the id-plus-[`ItemImageInfo`] forms the trait declares.
-//! - The `Photo` auto-orientation branch is **deferred**: the `Photo` entity is
-//!   not wired into [`ImageProcessingOptions`] here (it carries an
-//!   [`item_id`](ImageProcessingOptions::item_id), not a domain item), so
-//!   `auto_orient` is always `false`. The gate is preserved structurally so it
-//!   can be re-enabled once the entity lands.
+//! - The `Photo` auto-orientation branch is decided by the caller, which read
+//!   the item: [`ImageProcessingOptions`] carries an
+//!   [`item_id`](ImageProcessingOptions::item_id), not a domain item, so the
+//!   `autoOrient` the C# derives from `item is Photo` arrives as
+//!   [`auto_orient`](ImageProcessingOptions::auto_orient).
 //! - `MimeTypes.GetMimeType` is reused from [`ferrofin_model::net::mime_types`];
 //!   `GetMD5().ToString("N")` is reused from [`ferrofin_common::extensions::get_md5`]
 //!   plus [`Uuid::simple`] (32-char lowercase hex, identical to .NET `"N"`).
@@ -315,6 +315,13 @@ impl<F: FileMeta> ImageProcessor<F> {
             filename.push_str(foreground_layer);
         }
 
+        // Ferrofin-local, not in upstream's key: earlier Ferrofin builds cached
+        // photos un-oriented under the same key, so an oriented encode needs
+        // its own. Only auto-oriented photos are re-encoded.
+        if options.auto_orient {
+            filename.push_str(",autoorient");
+        }
+
         filename.push_str(",v=");
         filename.push(self.cache_version);
 
@@ -523,7 +530,7 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
 
     /// Port of `ProcessImage`: the full on-the-fly pipeline — `.tbn` passthrough,
     /// `SupportsImageEncoding` gate, missing-file / GIF passthrough, transparency
-    /// detection, the (deferred) `Photo` auto-orient branch, the
+    /// detection, the `Photo` auto-orient branch (decided by the caller), the
     /// `HasDefaultOptions` short-circuit, output-format selection, cache-key
     /// derivation, cache-hit skip, encode, `resultPath == original` short-circuit,
     /// and error-to-original fallback.
@@ -571,9 +578,8 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         let requires_transparency =
             TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
 
-        // The Photo auto-orientation branch is deferred: no Photo entity is wired
-        // into the options, so auto_orient stays false. The gate is preserved.
-        let auto_orient = false;
+        // `autoOrient` for a Photo; the caller, which read the item, sets it.
+        let auto_orient = options.auto_orient;
 
         if options.has_default_options(&original_image_path, original_image_size)
             && (!auto_orient || !options.requires_auto_orientation)
@@ -1049,6 +1055,23 @@ mod tests {
         assert_eq!(processed.path, input);
         // No encode happened.
         assert_eq!(encoder.calls.load(Ordering::SeqCst), 0);
+
+        // `autoOrient` (a photo) defeats the passthrough, as upstream, and the
+        // oriented encode is cached under its own key.
+        let oriented = ImageProcessingOptions {
+            auto_orient: true,
+            ..options.clone()
+        };
+        let processed = proc.process_image(&oriented).await.expect("process");
+        assert_ne!(processed.path, input);
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+        let dt = Utc::now();
+        assert_ne!(
+            proc.cache_file_path(&input, &options, 95, dt, ImageFormat::Jpg)
+                .expect("key"),
+            proc.cache_file_path(&input, &oriented, 95, dt, ImageFormat::Jpg)
+                .expect("key")
+        );
     }
 
     #[rstest::rstest]
