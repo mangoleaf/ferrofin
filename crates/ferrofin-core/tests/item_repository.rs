@@ -1959,3 +1959,98 @@ async fn item_value_sorts_order_by_the_first_value_of_the_type() {
         "no artist first, then by name (ties by SortName)"
     );
 }
+
+/// `ImageProcessor.ProcessImage`'s `autoOrient` comes back with the image
+/// rows: a photo is oriented unless its stored orientation is `TopLeft`, and
+/// nothing else is; the rows are those `get_image_infos` reads.
+#[tokio::test]
+async fn image_infos_carry_the_photo_auto_orientation() {
+    use ferrofin_model::entities::ImageType;
+    use ferrofin_traits::options::ItemImageInfo;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let rotated = Uuid::new_v4();
+    let upright = Uuid::new_v4();
+    let unknown = Uuid::new_v4();
+    let movie = Uuid::new_v4();
+    // Stored the way the image rows' foreign key reads it.
+    let with_data = |id: Uuid, kind, data: Option<&str>| BaseItemEntity {
+        id: id.to_string().to_uppercase(),
+        data: data.map(str::to_owned),
+        ..item(id, kind, "Item")
+    };
+    persist
+        .save_items(&[
+            with_data(
+                rotated,
+                BaseItemKind::Photo,
+                Some(r#"{"Orientation":"RightTop"}"#),
+            ),
+            with_data(
+                upright,
+                BaseItemKind::Photo,
+                Some(r#"{"Orientation":"TopLeft"}"#),
+            ),
+            with_data(unknown, BaseItemKind::Photo, None),
+            with_data(
+                movie,
+                BaseItemKind::Movie,
+                Some(r#"{"Orientation":"RightTop"}"#),
+            ),
+        ])
+        .await
+        .expect("save");
+    for id in [rotated, upright, unknown, movie] {
+        let image = |image_type| ItemImageInfo {
+            path: format!("/media/{id}.jpg"),
+            image_type,
+            date_modified: chrono::Utc::now(),
+            ..ItemImageInfo::default()
+        };
+        persist
+            .save_item_images(id, &[image(ImageType::Primary), image(ImageType::Thumb)])
+            .await
+            .expect("images");
+    }
+
+    let repo = repo(&db);
+    for (id, expected) in [
+        (rotated, true),
+        (upright, false),
+        (unknown, true),
+        (movie, false),
+    ] {
+        let (images, auto_orient) = repo
+            .get_image_infos_with_auto_orient(id)
+            .await
+            .expect("read");
+        assert_eq!(auto_orient, expected, "{id}");
+        assert_eq!(images, repo.get_image_infos(id).await.expect("read"));
+    }
+    let (images, auto_orient) = repo
+        .get_image_infos_with_auto_orient(Uuid::new_v4())
+        .await
+        .expect("read");
+    assert!(images.is_empty() && !auto_orient);
+
+    // The owner is read by primary key beside the image rows' own index, and
+    // that index already yields the order: no scan, no sort.
+    let shown = plan(
+        &db,
+        r#"SELECT ii.*, bi."Type" = 'x' AS "IsPhoto",
+                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData"
+            FROM "BaseItemImageInfos" ii
+            JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+            WHERE ii."ItemId" = 'y'
+            ORDER BY ii."ImageType", ii.rowid"#,
+    )
+    .await;
+    assert!(
+        shown.contains("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)")
+            && shown.contains("SEARCH ii USING INDEX")
+            && !shown.contains("SCAN")
+            && !shown.contains("TEMP B-TREE"),
+        "{shown}"
+    );
+}
