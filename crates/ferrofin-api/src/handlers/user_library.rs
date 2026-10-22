@@ -42,7 +42,6 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
-use crate::handlers::session_ctx::notify_user_data_changed;
 use crate::state::AppState;
 
 /// The default `GET /Items/Latest` return limit (C# `limit = 20`).
@@ -120,21 +119,19 @@ async fn save_and_return(
         .get_user_data_dto(item_id, user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user data for item {item_id}")))?;
-    notify_user_data_changed(state, user_id, &dto).await;
     Ok(Json(dto))
 }
 
-/// Sets — or clears — the user's like for an item, pushing the refreshed data
-/// to the user's other sessions before returning it (the shared body of the
-/// four rating routes).
-async fn set_likes_and_notify(
+/// Sets — or clears — the user's like for an item and returns the refreshed
+/// data (the shared body of the four rating routes). The user-data manager
+/// announces the save to the user's sessions.
+async fn apply_likes(
     state: &AppState,
     user_id: Uuid,
     item_id: Uuid,
     likes: Option<bool>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let dto = state.user_data.set_likes(user_id, item_id, likes).await?;
-    notify_user_data_changed(state, user_id, &dto).await;
     Ok(Json(dto))
 }
 
@@ -228,7 +225,7 @@ async fn update_rating_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
-    set_likes_and_notify(&state, user_uuid, resolved_item, query.likes).await
+    apply_likes(&state, user_uuid, resolved_item, query.likes).await
 }
 
 /// `DELETE /Users/{userId}/Items/{itemId}/Rating` — legacy per-user clear-like.
@@ -240,7 +237,7 @@ async fn delete_rating_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
-    set_likes_and_notify(&state, user_uuid, resolved_item, None).await
+    apply_likes(&state, user_uuid, resolved_item, None).await
 }
 
 /// Shared favourite toggle for the mark/unmark handlers.
@@ -307,7 +304,7 @@ async fn update_rating(
         resolve_user_and_item(&state, &auth, query.user_id, item_id).await?;
     // C# assigns `userData.Likes = likes` (clearing when the query param is
     // absent), so use the explicit like setter rather than the merge path.
-    set_likes_and_notify(&state, user_uuid, resolved_item, query.likes).await
+    apply_likes(&state, user_uuid, resolved_item, query.likes).await
 }
 
 /// `DELETE /UserItems/{itemId}/Rating` — clears the like rating for an item.
@@ -332,7 +329,7 @@ async fn delete_rating(
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, query.user_id, item_id).await?;
     // Persist the cleared like (C# saves `Likes = null`), then return the row.
-    set_likes_and_notify(&state, user_uuid, resolved_item, None).await
+    apply_likes(&state, user_uuid, resolved_item, None).await
 }
 
 /// `GET /UserItems/{itemId}/UserData` — reads an item's user data.
