@@ -442,6 +442,21 @@ pub trait LibraryManager: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`Self::get_item_images`] in the same read as whether they are
+    /// auto-oriented when served; delegates to
+    /// [`ItemRepository::get_image_infos_with_auto_orient`](crate::persistence::ItemRepository::get_image_infos_with_auto_orient).
+    /// The default reads the images and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_item_images(item_id).await?, false))
+    }
+
     /// The image of the item's `index`-th chapter, if it has one.
     ///
     /// Chapter thumbnails are not item image rows — they live on the chapter
@@ -741,6 +756,23 @@ pub trait LibraryManager: Send + Sync {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let _ = (video, user);
         Err(ServiceError::backend("get_additional_parts not supported"))
+    }
+
+    /// Replaces `item`'s cast and crew with `people` when its kind credits
+    /// any (`LibraryManager.UpdatePeople`, gated on `SupportsPeople`),
+    /// creating the `Person` item each new name needs. The default writes
+    /// nothing (stub and fake libraries).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[ferrofin_db::entities::base_items::PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        let _ = (item, people);
+        Ok(())
     }
 
     /// Gets the people rows attached to an item.
