@@ -2718,7 +2718,9 @@ async fn an_extra_find_extras_renames_takes_the_title_metadata_again() {
 #[tokio::test]
 async fn an_extras_nfo_title_change_is_no_rename() {
     let f = Fixture::new(&[BR, BR_FEATURETTE]).await;
-    let nfo = f.media.join("Blade Runner (1982)/featurettes/Making of.nfo");
+    let nfo = f
+        .media
+        .join("Blade Runner (1982)/featurettes/Making of.nfo");
     std::fs::write(&nfo, "<movie><title>Old cut</title></movie>").unwrap();
     write_movie_nfo(&f, "First plot", 1982);
     f.scanner.scan_all().await.unwrap();
