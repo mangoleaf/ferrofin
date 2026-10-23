@@ -342,11 +342,22 @@ def soak_session(session, plan, gate):
     return {"verdicts": rows, "soaks": soaks, "blocking": soak.blocking(rows)}
 
 
+def judge_candidate_runs(session, plan, rows):
+    """Give every candidate run of the session the gated verdicts as `ab-verdicts.json` and
+    rewrite its report.html: how a verdict of a gate whose runs are `run.sh` runs (A/B,
+    ramp, soak) reaches the run in the viewer (`report.py --serve`)."""
+    cells = {"cells": viewer_cells(rows)}
+    for run in run_dirs(session, plan)["b"]:
+        with open(os.path.join(run, "ab-verdicts.json"), "w") as f:
+            json.dump(cells, f, indent=2)
+        report.write_html(run)
+
+
 def render(session):
     """Compute the session's tables, write report.md, report.html and the machine-readable
-    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B also gives
-    every candidate run the gated verdicts as `ab-verdicts.json` and rewrites its
-    report.html, which is how they reach the viewer (`report.py --serve`)."""
+    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B, ramp or soak
+    gate also gives its candidate runs the gated verdicts ([`judge_candidate_runs`]); the
+    session's own report.html is listed in the viewer too (`report.list_runs`)."""
     plan = report.load(os.path.join(session, "gate.json"))
     if not plan:
         raise ValueError(f"{session} has no gate.json")
@@ -360,6 +371,7 @@ def render(session):
             f.write(md)
         with open(os.path.join(session, "report.html"), "w") as f:
             f.write(soak.render_html(header(plan), result, report.CSS))
+        judge_candidate_runs(session, plan, result["verdicts"])
         return md, result["blocking"]
     if plan["mode"] == "ramp":
         docs = {role: [report.load(os.path.join(d, "ferrofin", "ramp.json")) for d in dirs]
@@ -386,7 +398,7 @@ def render(session):
         result["kinds"] = kind_summary(result["noise"], gate)
         name, block = "noise.json", []
     else:
-        built, by_role = models(session, plan)
+        built, _ = models(session, plan)
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
@@ -397,12 +409,8 @@ def render(session):
         f.write(md)
     with open(os.path.join(session, "report.html"), "w") as f:
         f.write(render_html(plan, result))
-    if plan["mode"] == "ab":
-        cells = {"cells": viewer_cells(result["verdicts"])}
-        for run in by_role["b"]:
-            with open(os.path.join(run, "ab-verdicts.json"), "w") as f:
-                json.dump(cells, f, indent=2)
-            report.write_html(run)
+    if plan["mode"] in ("ab", "ramp"):
+        judge_candidate_runs(session, plan, result["verdicts"])
     return md, block
 
 

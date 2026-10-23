@@ -224,6 +224,31 @@ fn library_options_lufs_and_delimiters_casing() {
     assert_eq!(back, opts);
 }
 
+/// A configuration document without the sort lists keeps Jellyfin's
+/// initializer lists, as C# deserialization does, so a partial
+/// `POST /System/Configuration` cannot switch sort-name stripping off; an
+/// explicit empty list is kept as the operator's choice.
+#[test]
+fn absent_sort_lists_keep_jellyfins_defaults() {
+    use ferrofin_model::configuration::ServerConfiguration;
+    let absent: ServerConfiguration = serde_json::from_value(json!({})).expect("deserialize");
+    assert_eq!(absent.sort_remove_words, ["the", "a", "an"]);
+    assert_eq!(
+        absent.sort_remove_characters,
+        [",", "&", "-", "{", "}", "'"]
+    );
+    assert_eq!(absent.sort_replace_characters, [".", "+", "%"]);
+    let emptied: ServerConfiguration = serde_json::from_value(json!({
+        "SortRemoveWords": [],
+        "SortRemoveCharacters": [],
+        "SortReplaceCharacters": []
+    }))
+    .expect("deserialize");
+    assert!(emptied.sort_remove_words.is_empty());
+    assert!(emptied.sort_remove_characters.is_empty());
+    assert!(emptied.sort_replace_characters.is_empty());
+}
+
 #[test]
 fn encoding_options_number_casing_and_defaults() {
     use ferrofin_model::configuration::EncodingOptions;

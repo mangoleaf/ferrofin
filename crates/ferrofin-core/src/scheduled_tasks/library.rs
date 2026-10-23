@@ -27,8 +27,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::{BaseItemEntity, KeyframeDataEntity};
-use ferrofin_db::store::{datetime_to_db, guid_to_db};
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::store::datetime_to_db;
 #[cfg(test)]
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::data::{BaseItemKind, MediaType};
@@ -42,7 +42,7 @@ use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
-use ferrofin_traits::media_encoding::MediaEncoder;
+use ferrofin_traits::media_encoding::{KeyframeExtractor, MediaEncoder};
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::{InternalItemsQuery, SourceType};
 use ferrofin_traits::persistence::KeyframeRepository;
@@ -101,27 +101,44 @@ async fn page(
 // ---------------------------------------------------------------------------
 
 /// "Keyframe Extractor" — extracts keyframes from video files to create more
-/// precise HLS playlists. Port of `KeyframeExtractionScheduledTask` over the
-/// ffprobe extractor in `ferrofin-keyframes` (the upstream cache decorator's
-/// "already extracted" check becomes a stored-row check).
+/// precise HLS playlists. Port of `KeyframeExtractionScheduledTask`: each video
+/// goes through the keyframe extractors, metadata-based ones first
+/// (`OrderByDescending(IsMetadataBased)`), until one yields keyframes. The
+/// extractors' repository cache skips videos already extracted and stores the
+/// rest.
 pub struct KeyframeExtractionTask {
     library: Arc<dyn LibraryManager>,
-    keyframes: Arc<dyn KeyframeRepository>,
-    encoder: Arc<dyn MediaEncoder>,
+    extractors: Vec<Arc<dyn KeyframeExtractor>>,
 }
 
 impl KeyframeExtractionTask {
-    /// Builds the task over the library, keyframe-repository and encoder seams.
+    /// Builds the task over the library and the registered keyframe
+    /// extractors ([`crate::keyframe_extractors::keyframe_extractors`]): the
+    /// ffprobe and Matroska extractors behind the keyframe-repository cache.
     #[must_use]
     pub fn new(
         library: Arc<dyn LibraryManager>,
         keyframes: Arc<dyn KeyframeRepository>,
         encoder: Arc<dyn MediaEncoder>,
     ) -> Self {
+        Self::with_extractors(
+            library,
+            crate::keyframe_extractors::keyframe_extractors(keyframes, encoder),
+        )
+    }
+
+    /// Builds the task over the library and the given keyframe extractors,
+    /// which it orders metadata-based first.
+    #[must_use]
+    pub fn with_extractors(
+        library: Arc<dyn LibraryManager>,
+        mut extractors: Vec<Arc<dyn KeyframeExtractor>>,
+    ) -> Self {
+        // A stable sort, as `OrderByDescending` is.
+        extractors.sort_by_key(|e| !e.is_metadata_based());
         Self {
             library,
-            keyframes,
-            encoder,
+            extractors,
         }
     }
 }
@@ -143,14 +160,18 @@ impl ScheduledTask for KeyframeExtractionTask {
         LIBRARY
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `KeyframeExtractionScheduledTask.cs:55-65`: every library video,
+        // a movie's alternate versions included (`IncludeOwnedItems`).
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+            media_types: vec![MediaType::Video],
             is_virtual_item: Some(false),
+            source_types: vec![SourceType::Library],
             recursive: true,
+            include_owned_items: true,
             ..InternalItemsQuery::default()
         };
         let total = self.library.get_count(&query).await?.max(0);
-        let probe = self.encoder.probe_path();
         let mut done = 0i32;
         let mut start_index = 0i32;
         while start_index < total {
@@ -164,33 +185,18 @@ impl ScheduledTask for KeyframeExtractionTask {
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
                     continue;
                 };
-                let Some(path) = item.path.clone().filter(|p| Path::new(p).exists()) else {
+                // Only local files supported.
+                let Some(path) = item.path.as_deref().filter(|p| Path::new(p).exists()) else {
                     continue;
                 };
-                // Already extracted → skip (the C# cache decorator's role).
-                if !self.keyframes.get_keyframe_data(item_id).await?.is_empty() {
-                    continue;
-                }
-                let probe = probe.clone();
-                let extracted = tokio::task::spawn_blocking(move || {
-                    ferrofin_keyframes::ff_probe::get_keyframe_data(&probe, &path)
-                })
-                .await
-                .map_err(|e| ServiceError::backend(format!("keyframe task panicked: {e}")))?;
-                match extracted {
-                    Ok(data) => {
-                        let entity = KeyframeDataEntity {
-                            item_id: guid_to_db(item_id),
-                            keyframe_ticks: Some(
-                                serde_json::to_string(&data.keyframe_ticks)
-                                    .map_err(|e| ServiceError::backend(e.to_string()))?,
-                            ),
-                            total_duration: data.total_duration,
-                        };
-                        self.keyframes.save_keyframe_data(item_id, &entity).await?;
-                    }
-                    Err(e) => {
-                        tracing::warn!(item = %item.id, error = %e, "keyframe extraction failed");
+                for extractor in &self.extractors {
+                    // The cache stores what an extractor extracts.
+                    if extractor
+                        .try_extract_keyframes(item_id, path)
+                        .await
+                        .is_some()
+                    {
+                        break;
                     }
                 }
             }
@@ -1069,13 +1075,17 @@ impl ScheduledTask for SubtitleDownloadTask {
             progress.report(100.0);
             return Ok(());
         }
+        // `SubtitleScheduledTask.cs:97-107`: a movie's alternate versions are
+        // candidates too (`IncludeOwnedItems`).
         let videos = self
             .library
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+                media_types: vec![MediaType::Video],
                 is_virtual_item: Some(false),
                 source_types: vec![SourceType::Library],
                 recursive: true,
+                include_owned_items: true,
                 ..InternalItemsQuery::default()
             })
             .await?;
@@ -1437,7 +1447,8 @@ impl ScheduledTask for MediaSegmentExtractionTask {
 mod tests {
     use std::sync::Mutex;
 
-    use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+    use ferrofin_db::entities::base_items::{KeyframeDataEntity, MediaStreamInfoEntity};
+    use ferrofin_db::store::guid_to_db;
     use ferrofin_model::configuration::MediaPathInfo;
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::entities::MediaStreamType as StreamTypeEnum;
@@ -2366,6 +2377,7 @@ mod tests {
         let path = media.path().join("film.mkv");
         std::fs::write(&path, b"x").expect("write");
         set_path(&db, movie, &path.to_string_lossy()).await;
+        set_media_type(&db, movie, "Video").await;
 
         // A German audio track satisfies "ger" via skip-if-audio-matches;
         // "eng" has nothing and must be searched + downloaded.
@@ -3108,6 +3120,8 @@ mod tests {
         let (done, fresh) = (Uuid::from_u128(0xB1), Uuid::from_u128(0xB2));
         for (id, name) in [(done, "done.mkv"), (fresh, "fresh.mkv")] {
             seed_item(&db, id, BaseItemKind::Movie).await;
+            // The task asks for video items only.
+            set_media_type(&db, id, "Video").await;
             let path = media.path().join(name);
             std::fs::write(&path, b"x").expect("write");
             set_path(&db, id, &path.to_string_lossy()).await;
@@ -3122,23 +3136,174 @@ mod tests {
             .await
             .expect("seed keyframes");
 
-        // The fake probe path is /bin/false: extraction "runs" and yields
-        // empty data, which must not fail the task.
-        let task = KeyframeExtractionTask::new(
-            library,
+        // A probe that finds nothing, behind the repository cache: the
+        // extracted item is served from its row, the new one reaches the
+        // probe, and an empty answer must not fail the task.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = crate::keyframe_extractors::CachedKeyframeExtractor::new(
             Arc::clone(&keyframes),
-            Arc::new(FakeEncoder {
-                fail_extract: false,
+            Arc::new(LoggingExtractor {
+                name: "probe",
+                metadata_based: false,
+                answers_for: ".none",
+                log: Arc::clone(&log),
             }),
+            "probe",
         );
+        let task = KeyframeExtractionTask::with_extractors(library, vec![Arc::new(probe)]);
         assert_eq!(task.key(), "KeyframeExtraction");
         assert!(task.default_triggers().is_empty());
         task.execute(&TaskProgress::default()).await.expect("run");
 
+        assert_eq!(*log.lock().expect("log"), ["probe:fresh.mkv"]);
         // The pre-extracted item is untouched.
         let kept = keyframes.get_keyframe_data(done).await.expect("kept");
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
+        // The failed probe stored nothing for the new item.
+        assert!(
+            keyframes
+                .get_keyframe_data(fresh)
+                .await
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    /// A keyframe extractor that logs `name:file` for each call and answers
+    /// for files ending in `answers_for`.
+    struct LoggingExtractor {
+        name: &'static str,
+        metadata_based: bool,
+        answers_for: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl KeyframeExtractor for LoggingExtractor {
+        fn is_metadata_based(&self) -> bool {
+            self.metadata_based
+        }
+
+        async fn try_extract_keyframes(
+            &self,
+            _item_id: Uuid,
+            file_path: &str,
+        ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData> {
+            let file = Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("{}:{file}", self.name));
+            file.ends_with(self.answers_for)
+                .then(|| ferrofin_keyframes::keyframe_data::KeyframeData::new(10, vec![0]))
+        }
+    }
+
+    #[tokio::test]
+    async fn keyframe_task_tries_metadata_extractors_first_and_stops_at_the_first_answer() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let library = library_manager_over(db.clone());
+        let (mkv, mp4, gone) = (
+            Uuid::from_u128(0xB3),
+            Uuid::from_u128(0xB4),
+            Uuid::from_u128(0xB5),
+        );
+        for (id, name) in [(mkv, "a.mkv"), (mp4, "b.mp4")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_media_type(&db, id, "Video").await;
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+        }
+        // A video whose file is gone: the task finds it and skips it.
+        seed_item(&db, gone, BaseItemKind::Episode).await;
+        set_media_type(&db, gone, "Video").await;
+        set_path(&db, gone, &media.path().join("gone.mkv").to_string_lossy()).await;
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // Registered ffprobe first, as upstream registers them.
+        let task = KeyframeExtractionTask::with_extractors(
+            library,
+            vec![
+                Arc::new(LoggingExtractor {
+                    name: "ffprobe",
+                    metadata_based: false,
+                    answers_for: "",
+                    log: Arc::clone(&log),
+                }),
+                Arc::new(LoggingExtractor {
+                    name: "matroska",
+                    metadata_based: true,
+                    answers_for: ".mkv",
+                    log: Arc::clone(&log),
+                }),
+            ],
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let mut calls = log.lock().expect("log").clone();
+        calls.sort();
+        // The Matroska extractor answers for the `.mkv`, so ffprobe never sees
+        // it; the `.mp4` falls through to ffprobe; the missing file is skipped.
+        assert_eq!(calls, ["ffprobe:b.mp4", "matroska:a.mkv", "matroska:b.mp4"]);
+    }
+
+    /// `KeyframeExtractionScheduledTask` queries with `IncludeOwnedItems`: a
+    /// movie's alternate version gets keyframes too, not only its primary.
+    #[tokio::test]
+    async fn keyframe_task_extracts_alternate_versions_too() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let (primary, alternate) = (Uuid::from_u128(0xC1), Uuid::from_u128(0xC2));
+        // A movie row over a real file of that name, written here.
+        let movie = |id: Uuid, name: &str, version_of: Option<Uuid>| {
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            BaseItemEntity {
+                id: guid_to_db(id),
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                    .expect("Movie has a stored type")
+                    .to_owned(),
+                name: Some(name.to_owned()),
+                path: Some(path.to_string_lossy().into_owned()),
+                media_type: Some("Video".to_owned()),
+                // A local alternate version is owned by its primary.
+                owner_id: version_of.map(guid_to_db),
+                primary_version_id: version_of.map(guid_to_db),
+                ..BaseItemEntity::default()
+            }
+        };
+        crate::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[
+                movie(primary, "Heat.mkv", None),
+                movie(alternate, "Heat - 2160p.mkv", Some(primary)),
+            ])
+            .await
+            .expect("seed the versions");
+
+        // An extractor that answers for every file, so the log shows which
+        // items the task's query reached.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task = KeyframeExtractionTask::with_extractors(
+            library_manager_over(db.clone()),
+            vec![Arc::new(LoggingExtractor {
+                name: "ffprobe",
+                metadata_based: false,
+                answers_for: "",
+                log: Arc::clone(&log),
+            })],
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let mut calls = log.lock().expect("log").clone();
+        calls.sort();
+        assert_eq!(calls, ["ffprobe:Heat - 2160p.mkv", "ffprobe:Heat.mkv"]);
     }
 
     // -- Extract Chapter Images ----------------------------------------------
