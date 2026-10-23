@@ -328,12 +328,10 @@ fn warn_unsupported_accelerator(options: &EncodingOptions) {
 /// (100 s at the 30 fps ffmpeg encodes at) on such a file. ffmpeg's
 /// field-coding rule is not ported: it needs the codec frame rate, which
 /// ffprobe does not report, so a doubled-`tbr` source (`25 fps, 50 tbr`)
-/// still gets a GOP of two segments on the encoders that take a GOP alone.
+/// gets a GOP of two segments. No segment is cut by that GOP alone: libsvtav1
+/// also forces keyframes on time (`hls_video_key_frame_arguments`), and the
+/// encoders that take a GOP alone, AMF and RKMPP, are never selected.
 fn guessed_frame_rate(video: &MediaStream) -> Option<f32> {
-    // TODO(parity): the doubled-`tbr` case. Path: give libsvtav1 forced
-    // keyframes like NVENC/QSV (it honours them on ffmpeg n9.0.1 with
-    // SVT-AV1 4.2) once the oldest supported ffmpeg is checked, which leaves
-    // only AMF/RKMPP, never selected here, on a guessed GOP.
     match (video.real_frame_rate, video.average_frame_rate) {
         (Some(real), Some(average)) if real > 210.0 && average > 0.0 && average < 70.0 => {
             Some(average)
@@ -1168,6 +1166,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let min_segments = request
             .min_segments
             .unwrap_or(if segment_length_secs >= 10 { 2 } else { 3 });
+        let is_dovi_removed = bitstream::is_dovi_removed(&probed_caps, &state);
+        let is_hdr10_plus_removed = bitstream::is_hdr10_plus_removed(&probed_caps, &state);
         Ok(TranscodePlan {
             state,
             playlist_path,
@@ -1180,6 +1180,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_container,
             encoding_options: options,
             min_segments,
+            is_dovi_removed,
+            is_hdr10_plus_removed,
         })
     }
 }
@@ -1493,8 +1495,23 @@ impl FerrofinStreamStatePlanner {
             // video by (target − keyframe), an audible desync on every seeked
             // copy-video stream (measured 0.7–1.6 s on real media). Start the
             // audio at the same keyframe instead; the segment already begins
-            // there for video anyway.
-            if copying_video && !progressive {
+            // there for video anyway. Never on a wtv input: every upstream
+            // version that passed the flag kept it off wtv, "because it breaks
+            // seeking" (as `copied_audio_trim_bsf` does for its trim).
+            //
+            // TS segments keep it, even though 10.11.8 left it off them ("the
+            // timestamps issue on some clients") and v12 dropped it
+            // altogether: the copied video starts at the earlier keyframe with
+            // or without it, and only with it does the audio start there as
+            // well. Measured on a seek to 18 s between keyframes at 15 and
+            // 20 s, TS segments (PTS carry the TS muxer's 1.4 s start offset):
+            // first video / audio PTS 16.40 / 16.39 s with the flag, 16.40 /
+            // 19.38 s without (the audio a whole 3 s after the video).
+            let wtv = state
+                .input_container
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("wtv"));
+            if copying_video && !progressive && !wtv {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
@@ -1510,11 +1527,19 @@ impl FerrofinStreamStatePlanner {
             tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
             vec![hwaccel_input.args.clone()]
         }));
-        // GetInputArgument yields the full `-i file:"…"` fragment.
+        // `GetInputModifier`'s `GetFfmpegAnalyzeDurationArg` (the source's own
+        // `AnalyzeDurationMs`, the 3 s a Live TV source carries, else the
+        // `FFmpeg:analyzeduration` default) and `GetFfmpegProbesizeArg`;
+        // GetInputArgument then yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
-        args.push("200M".to_owned());
+        args.push(
+            ferrofin_mediaencoding::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+        );
         push_split(&mut args, "-probesize");
-        args.push("1G".to_owned());
+        args.push(ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned());
         // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
         // source (a tuner, a playlist channel) requires, as the probe sends
         // them. Each value is one argv element, never parsed as options.
@@ -1665,12 +1690,18 @@ impl FerrofinStreamStatePlanner {
             // name the same numbers `map_args` does, and the two diverge as soon
             // as a source's streams are not contiguously indexed. It matters
             // most for an external subtitle, which is input 1 with a single
-            // stream at index 0 whatever its index in the parent source.
+            // stream at index 0 whatever its index in the parent source. The
+            // subtitle's is its ffmpeg index (`GetSubtitleStreamIndexForFfmpeg`):
+            // a Blu-ray source's TrueHD/Atmos streams before it, which ffprobe
+            // does not list but ffmpeg counts, shift it.
             let streams = &state.media_source.media_streams;
             let pads = hw::sw_chain::StreamPads {
                 subtitle_is_external: sub_stream.is_some_and(|s| s.is_external),
                 subtitle_index: sub_stream.map_or(0, |s| {
-                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, s)
+                    ferrofin_mediaencoding::encoding_helper::helper::get_subtitle_stream_index_for_ffmpeg(
+                        &state.media_source,
+                        s,
+                    )
                 }),
                 video_index: video_stream.map_or(0, |v| {
                     ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, v)
@@ -1988,8 +2019,19 @@ impl FerrofinStreamStatePlanner {
             && !hw_filters
             && let Some(sub) = state.subtitle_stream.as_ref()
         {
-            let sub_idx = sub.index.max(0);
-            let vid_idx = state.video_stream.as_ref().map_or(0, |v| v.index.max(0));
+            // Upstream's overlay names the subtitle by its ffmpeg index
+            // (`GetSubtitleStreamIndexForFfmpeg`, which counts a Blu-ray
+            // source's hidden TrueHD/Atmos streams) and the video by
+            // `FindIndex`, as the hardware chains' pads do above.
+            let streams = &state.media_source.media_streams;
+            let sub_idx = ferrofin_mediaencoding::encoding_helper::helper::get_subtitle_stream_index_for_ffmpeg(
+                &state.media_source,
+                sub,
+            )
+            .max(0);
+            let vid_idx = state.video_stream.as_ref().map_or(0, |v| {
+                ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, v).max(0)
+            });
             // No hardware format conversion here: this block runs only when
             // the matrix did not claim the job, so the frames are in system
             // memory and the software chain above has already set the format.
@@ -3045,6 +3087,30 @@ mod tests {
         assert!(!args.contains("-b:a"), "{args}");
     }
 
+    /// `GetInputModifier` → `GetFfmpegAnalyzeDurationArg` (v12.2
+    /// `EncodingHelper.cs:7330-7348`): a source's own `AnalyzeDurationMs` (the
+    /// 3 s every Live TV source carries) is passed in microseconds; any other
+    /// source takes the `FFmpeg:analyzeduration` default, `200M`. `-probesize`
+    /// is the `FFmpeg:probesize` default, `1G`, either way.
+    #[tokio::test]
+    async fn analyzeduration_prefers_the_sources_own_value() {
+        let mut live = source("live", vec![video_stream("h264"), audio_stream("aac")]);
+        live.analyze_duration_ms = Some(3000);
+        let file = source("file", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![live, file]);
+        for (id, analyze) in [("live", "3000000"), ("file", "200M")] {
+            let plan = p
+                .plan(&request(id), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains(&format!("-analyzeduration {analyze} -probesize 1G")),
+                "{id}: {args}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn saved_transcoding_permissions_override_client_copy_vetoes() {
         use ferrofin_traits::library::PlaybackPermissions;
@@ -4058,6 +4124,36 @@ mod tests {
         );
     }
 
+    /// The burn-in overlay names a Blu-ray source's embedded subtitle by its
+    /// ffmpeg index (`GetSubtitleStreamIndexForFfmpeg`): the TrueHD stream
+    /// before it, which ffprobe does not list but ffmpeg counts, shifts it by
+    /// one.
+    #[tokio::test]
+    async fn a_blu_ray_subtitle_is_overlaid_by_its_ffmpeg_index() {
+        let mut src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("truehd"),
+                subtitle_stream("PGSSUB", 2),
+            ],
+        );
+        src.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("overlay"), "burned in: {args}");
+        assert!(args.contains("[0:3]"), "the ffmpeg index, 2 + 1: {args}");
+        assert!(!args.contains("[0:2]"), "{args}");
+    }
+
     /// Upstream appends the embed arguments to the progressive command only.
     #[tokio::test]
     async fn hls_never_gets_subtitle_embed_arguments() {
@@ -4794,6 +4890,46 @@ mod tests {
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "no seek, no flag: {:?}",
+            plan.arguments
+        );
+
+        // TS segments take it as fMP4 ones do: the copied video starts at the
+        // keyframe either way, and the flag starts the audio there too.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("ts".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "TS segments keep the flag: {:?}",
+            plan.arguments
+        );
+
+        // A wtv input never takes it: every upstream version that passed the
+        // flag kept it off wtv, "because it breaks seeking".
+        let mut src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        src.container = Some("wtv".to_owned());
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "wtv input keeps accurate seek: {:?}",
             plan.arguments
         );
     }
@@ -5702,8 +5838,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_libsvtav1_gop_is_one_segment_of_output_frames() {
-        // libsvtav1 takes the GOP alone, sized in output frames: the `-r` a
-        // `MaxFramerate` sets, else the rate ffmpeg guesses and encodes at.
+        // libsvtav1 forces a keyframe at every segment boundary, and keeps
+        // upstream's GOP, sized in output frames: the `-r` a `MaxFramerate`
+        // sets, else the rate ffmpeg guesses and encodes at.
         for (average, real, max_framerate, gop) in [
             (None, Some(23.976), None, Some(72)),
             (Some(59.94), Some(59.94), Some(30.0), Some(90)),
@@ -5759,7 +5896,10 @@ mod tests {
                 ),
                 None => assert!(!args.contains("-g:v:0"), "{case}"),
             }
-            assert!(!args.contains("-force_key_frames"), "{case}");
+            assert!(
+                args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+                "{case}"
+            );
         }
     }
 
@@ -5824,6 +5964,71 @@ mod tests {
             args.contains("-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1"),
             "{args}"
         );
+    }
+
+    /// `IsDoviRemoved` reaches the plan for the master playlist: true when the
+    /// client needs the Dolby Vision metadata gone and this ffmpeg can remove
+    /// it, false when the build has no filter that can (upstream's
+    /// `CanEncoderRemoveDynamicHdrMetadata`, the test capabilities' default).
+    #[tokio::test]
+    async fn the_plan_records_whether_dolby_vision_is_stripped() {
+        use ferrofin_mediaencoding::BsfOption;
+        let mut video = video_stream("hevc");
+        invalid_dovi(&mut video);
+        video.nal_length_size = Some("4".to_owned());
+        let mut req = request("abc");
+        req.video_codec = Some("copy".to_owned());
+        req.query_string = "hevc-rangetype=DOVI".to_owned();
+        for (supports_strip, expected) in [(true, true), (false, false)] {
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source("abc", vec![video.clone(), audio_stream("aac")])],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                FfmpegCapabilities::builder()
+                    .bsf_option(BsfOption::DoviRpuStrip, supports_strip)
+                    .build(),
+                EncodingOptions::default(),
+            );
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            assert_eq!(
+                plan.is_dovi_removed, expected,
+                "strip filter: {supports_strip}"
+            );
+            assert!(!plan.is_hdr10_plus_removed);
+        }
+
+        // `IsHdr10PlusRemoved`: a Dolby Vision client is confused by HDR10+
+        // beside a valid profile 8.1 layer, and this build can strip it.
+        let mut both = video_stream("hevc");
+        both.color_transfer = Some("smpte2084".to_owned());
+        both.color_primaries = Some("bt2020".to_owned());
+        both.color_space = Some("bt2020nc".to_owned());
+        both.dv_profile = Some(8);
+        both.dv_bl_signal_compatibility_id = Some(1);
+        both.rpu_present_flag = Some(1);
+        both.bl_present_flag = Some(1);
+        both.hdr10_plus_present_flag = Some(true);
+        both.nal_length_size = Some("4".to_owned());
+        assert_eq!(
+            both.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviWithHdr10Plus
+        );
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![both, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .bsf_option(BsfOption::HevcMetadataRemoveHdr10Plus, true)
+                .build(),
+            EncodingOptions::default(),
+        );
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(plan.is_hdr10_plus_removed);
+        assert!(!plan.is_dovi_removed);
     }
 
     #[tokio::test]
@@ -5894,6 +6099,30 @@ mod tests {
         );
         // ...and NOT with the premultiplied option, which is text-only.
         assert!(!args.contains("alpha_format"), "{args}");
+    }
+
+    /// The hardware chains' subtitle pad is the ffmpeg index too: a Blu-ray
+    /// source's TrueHD stream before the subtitle shifts it by one.
+    #[tokio::test]
+    async fn a_blu_ray_subtitle_pad_on_the_gpu_is_its_ffmpeg_index() {
+        let mut src = source(
+            "abc",
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("truehd"),
+                subtitle_stream("pgssub", 2),
+            ],
+        );
+        src.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+        let p = nvenc_planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("[0:3]scale,scale="), "{args}");
     }
 
     #[tokio::test]

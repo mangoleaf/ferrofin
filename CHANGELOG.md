@@ -35,6 +35,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Take a comic's cover from `.cb7` (7z) and `.cbt` (tar) archives as well as `.cbz`, and open
+  every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
+  really a ZIP gets its cover too. The fallback page is the first in .NET's key order
+  (case ignored first), not byte order. A real RAR `.cbr` still gets no cover
 - Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
   Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
   the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
@@ -172,6 +176,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -183,6 +192,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A Live TV channel that drops out of the tuner lineup and comes back keeps its users'
   favourites, likes and play state, as in Jellyfin. The guide refresh that recreates the
   channel gives back the data its removal had set aside
@@ -232,6 +244,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- An episode, season or music track stored without a sort name, which the startup repair
+  fills, now sorts by its numbers, as Jellyfin's own sort names do. Before, the repair gave
+  it an alphabetical key, which put episodes out of order and could break "next episode"
 
 ## [1.0.0] - 2026-09-05
 

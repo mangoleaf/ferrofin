@@ -858,6 +858,26 @@ fn disc_terms(format: crate::item_data::VideoFormat) -> Vec<&'static str> {
     terms
 }
 
+/// The index of the item a merge makes primary when none of `items` already
+/// has versions: 3D and disc (not `VideoType::VideoFile`) videos after plain
+/// files, then the widest, the first of equals — the fallback of
+/// `VideosController.MergeVersions` (`VideosController.cs:204-217`) and of
+/// the MergeVersions plugin. The item's `Width` column stands in for its
+/// default video stream's width. `0` for an empty slice.
+#[must_use]
+pub fn preferred_primary_version(items: &[BaseItemEntity]) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, item)| {
+            let format = crate::item_data::video_format(item.data.as_deref());
+            let demoted = format.video3d_format.is_some()
+                || format.video_type != ferrofin_model::entities::VideoType::VideoFile;
+            (demoted, std::cmp::Reverse(item.width.unwrap_or(0)))
+        })
+        .map_or(0, |(index, _)| index)
+}
+
 /// The prefix the media source items' file names share, or `None` when
 /// fewer than two of them are files or they share none — port of
 /// `BaseItem.GetCommonNamePrefix` (`BaseItem.cs:1386-1405`).

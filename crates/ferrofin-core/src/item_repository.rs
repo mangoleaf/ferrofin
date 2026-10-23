@@ -45,9 +45,8 @@ use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::kinds::is_video;
 use crate::translate_query::{
-    PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query,
-    build_latest_music_albums_query, build_query, media_type_name, non_blank, push_in_list,
-    to_guid_strings,
+    PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_music_albums_query, build_query,
+    media_type_name, non_blank, push_in_list, to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use crate::virtual_paths::VirtualPathExpander;
@@ -1010,19 +1009,15 @@ impl FerrofinItemRepository {
     /// 1. a Live TV view stands for itself;
     /// 2. a `DisplayParentId` is followed (and a dangling one resolves to nothing);
     /// 3. so is a `ParentId`;
-    /// 4. a `CollectionFolder` becomes its `PhysicalFolderIds`, and itself
-    ///    ([`library_top_parents_by_view`]);
-    /// 5. anything else a view could be resolves to nothing.
+    /// 4. a view with neither stands for the libraries the user grouped into it,
+    ///    when its type groups at all ([`Self::grouped_library_ids`]), and for
+    ///    nothing otherwise;
+    /// 5. a `CollectionFolder` becomes its `PhysicalFolderIds`, and itself
+    ///    ([`library_top_parents_by_view`]).
     ///
     /// Both of the views a real 10.11.8 database carries take one of the first two
     /// arms: its Live TV view is `ViewType: livetv`, and its Playlists view carries
     /// a `DisplayParentId` pointing at the real `PlaylistsFolder`.
-    ///
-    /// NOT ported: upstream's fifth arm, which groups libraries when the user has a
-    /// non-empty `GroupedFolders` preference. That needs each collection folder's
-    /// `CollectionType`, which this layer has no access to — see the task filed
-    /// against it. A user without that preference (every user of a default install,
-    /// and both users of the verification deployment) never reaches it.
     async fn top_parent_ids_for_query(
         db: &Database,
         id: Uuid,
@@ -1125,11 +1120,18 @@ impl FerrofinItemRepository {
             ));
         }
 
-        Box::pin(Self::grouped_library_ids(db, &blob, user, depth)).await
+        let view_type = crate::user_view_repository::view_type_of(data.as_deref());
+        Box::pin(Self::grouped_library_ids(
+            db,
+            view_type.as_deref(),
+            user,
+            depth,
+        ))
+        .await
     }
 
     /// The libraries a user has GROUPED into this view — C#
-    /// `GetTopParentIdsForQuery`'s fifth arm, reached by a `UserView` that has
+    /// `GetTopParentIdsForQuery`'s grouping arm, reached by a `UserView` that has
     /// no `DisplayParentId` and no `ParentId` of its own.
     ///
     /// `user is not null && ViewType != unknown && IsEligibleForGrouping(ViewType)
@@ -1141,38 +1143,15 @@ impl FerrofinItemRepository {
     /// too — a view that groups no library stands for no library.
     async fn grouped_library_ids(
         db: &Database,
-        blob: &serde_json::Value,
+        view_type: Option<&str>,
         user: Option<&UserEntity>,
         depth: u8,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         let Some(user) = user else {
             return Ok(Some(Vec::new()));
         };
-        let view_type = blob
-            .get("ViewType")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_ascii_lowercase);
-        // `movies`, `tvshows`, and an untyped view — `UserView.cs:22`. A view of any
-        // other type is never a grouping of libraries.
-        if !matches!(view_type.as_deref(), Some("movies" | "tvshows")) {
-            return Ok(Some(Vec::new()));
-        }
-        let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
-        if grouped.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-
         let mut scope = Vec::new();
-        for folder in visible_views(db, user).await? {
-            if !grouped.contains(&folder) {
-                continue;
-            }
-            // `CollectionType is null || CollectionType == view.ViewType` — an
-            // untyped library groups into any view.
-            let folder_type = Self::collection_type_of(db, folder).await?;
-            if folder_type.is_some() && folder_type != view_type {
-                continue;
-            }
+        for folder in grouped_libraries(db, user, view_type).await? {
             match Box::pin(Self::top_parent_ids_for_query(
                 db,
                 folder,
@@ -2588,6 +2567,43 @@ async fn scope_to_user_libraries_prepared(
     Ok(Some(resolved))
 }
 
+/// The libraries `user` grouped into a `view_type` view: of the views the
+/// user may see, those in their `GroupedFolders` preference whose
+/// `CollectionType` is the view's or none (an untyped library groups into any
+/// view). Empty unless `view_type` is `movies`, `tvshows` or none (an untyped
+/// view), the set `UserView.IsEligibleForGrouping` accepts (`UserView.cs:22-27`);
+/// an `unknown` view, which upstream excludes by name, groups nothing. An untyped
+/// view therefore stands for the grouped libraries that have no type.
+///
+/// The set a grouped view's browse is scoped to
+/// (`GetTopParentIdsForQuery`'s grouping arm) and the set its `ChildCount`
+/// counts (`DtoService.GetChildCountSourceIds`, v12.2 `DtoService.cs:781-792`).
+pub(crate) async fn grouped_libraries(
+    db: &Database,
+    user: &UserEntity,
+    view_type: Option<&str>,
+) -> Result<Vec<Uuid>, ServiceError> {
+    if !matches!(view_type, None | Some("movies" | "tvshows")) {
+        return Ok(Vec::new());
+    }
+    let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
+    if grouped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut libraries = Vec::new();
+    for folder in visible_views(db, user).await? {
+        if !grouped.contains(&folder) {
+            continue;
+        }
+        let folder_type = FerrofinItemRepository::collection_type_of(db, folder).await?;
+        if folder_type.is_some() && folder_type.as_deref() != view_type {
+            continue;
+        }
+        libraries.push(folder);
+    }
+    Ok(libraries)
+}
+
 /// The library views `user` may see, as item ids.
 ///
 /// The `Folder.IsVisible` half of `AddUserToQuery`: a non-empty
@@ -2806,9 +2822,12 @@ pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
     {
         return crate::kinds::forced_sort_name_for(kind, forced);
     }
-    row.sort_name.clone().unwrap_or_else(|| {
-        crate::kinds::sort_name_for(kind, row.name.as_deref().unwrap_or_default())
-    })
+    // With no stored key, the row's own `CreateSortName`: a season among its
+    // siblings by number, never by title.
+    row.sort_name
+        .clone()
+        .or_else(|| crate::kinds::fallback_sort_name(row))
+        .unwrap_or_default()
 }
 
 fn folder_values_contain(values: Option<&str>, wanted: &str) -> bool {
@@ -3231,10 +3250,9 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Ferrofin implements two arms of `BaseItemRepository.GetLatestItemList`
-        // — music from v12 (`Querying.cs:147-180`) and tvshows still from
-        // 10.11.8 (`BaseItemRepository.cs:328-369`; v12 replaced that one too,
-        // with `GetLatestTvShowItems`). Every other collection type
+        // Ferrofin implements two arms of v12's `BaseItemRepository.
+        // GetLatestItemList`: music (`Querying.cs:147-180`) and tvshows
+        // (`GetLatestTvShowItems`, `:282-540`). Every other collection type
         // returns empty and the user-view manager sends it through
         // `get_item_list`. That is WIDER than the C# early exit
         // (`Querying.cs:112-116`, which only rejects types outside
@@ -3254,22 +3272,20 @@ impl ItemRepository for FerrofinItemRepository {
         // a TV or Music library on an adopted database comes back empty.
         let resolved = self.resolve_views(filter).await?;
         let filter = resolved.as_ref().unwrap_or(filter);
-        let mut qb = if collection_type == CollectionType::music {
-            // v12's music arm: the newest `limit` MusicAlbum rows themselves,
-            // one statement — which reads no track at all when the caller is
-            // library-scoped, and runs the caller's track query only as the
-            // ancestor fallback's inner subquery. The rows come back already
-            // "grouped" — an album carries no `LatestItemsIndexContainer`, so
-            // the caller's grouping pass is a no-op over them.
-            build_latest_music_albums_query(filter)
-        } else {
-            // tvshows, one statement: the newest `limit` groups' maxima set a
-            // DateCreated threshold, and every row at or above it comes back in
-            // the caller's order (`filter.limit` caps GROUPS, not rows — the
-            // outer query is unpaged). The caller's `order_by` rides through
-            // untouched.
-            build_latest_item_list_query(filter)
-        };
+        if collection_type == CollectionType::tvshows {
+            // One Episode, Season or Series card per series, the newest
+            // `limit` series — see `latest_tv_repository`. A Season or Series
+            // is a folder, so the caller lists it on its own; an Episode
+            // groups under its series as before.
+            return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter).await;
+        }
+        // v12's music arm: the newest `limit` MusicAlbum rows themselves,
+        // one statement — which reads no track at all when the caller is
+        // library-scoped, and runs the caller's track query only as the
+        // ancestor fallback's inner subquery. The rows come back already
+        // "grouped" — an album carries no `LatestItemsIndexContainer`, so
+        // the caller's grouping pass is a no-op over them.
+        let mut qb = build_latest_music_albums_query(filter);
         qb.build_query_as::<BaseItemEntity>()
             .fetch_all(self.db.pool())
             .await
@@ -3408,6 +3424,52 @@ impl ItemRepository for FerrofinItemRepository {
             .into_iter()
             .map(|row| image_info_from_row(row, &self.virtual_paths))
             .collect())
+    }
+
+    async fn get_image_infos_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        /// An image row with its owner's photo facts.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            image: BaseItemImageInfoEntity,
+            #[sqlx(rename = "IsPhoto")]
+            is_photo: bool,
+            #[sqlx(rename = "PhotoData")]
+            photo_data: Option<String>,
+        }
+        // The image read of `get_image_infos`, plus the owner by primary key.
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT ii.*, bi."Type" = ?2 AS "IsPhoto",
+                    CASE WHEN bi."Type" = ?2 THEN bi."Data" END AS "PhotoData"
+                FROM "BaseItemImageInfos" ii
+                JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+                WHERE ii."ItemId" = ?1
+                ORDER BY ii."ImageType", ii.rowid"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(BaseItemKind::Photo.stored_type_name())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        // Every row has the same owner, so the first one speaks for all.
+        let auto_orient = rows.first().is_some_and(|row| {
+            row.is_photo
+                && crate::kinds::photo_auto_orients(
+                    crate::item_data::read_data_string(
+                        &crate::item_data::parse_data(row.photo_data.as_deref()),
+                        "Orientation",
+                    )
+                    .as_deref(),
+                )
+        });
+        let images = rows
+            .into_iter()
+            .map(|row| image_info_from_row(row.image, &self.virtual_paths))
+            .collect();
+        Ok((images, auto_orient))
     }
 
     async fn swap_item_images(
@@ -8293,70 +8355,70 @@ mod tests {
         }
     }
 
-    /// tvshows groups by `SeriesName`: with `limit` 2 and three series whose
-    /// newest episodes are day 9 / day 5 / day 3, the threshold is day 5 (the
-    /// smallest of the top-two maxima) — so series C is out entirely, and
-    /// series A's OLD episode (day 2, older than the threshold) is out too,
-    /// even though its series is in. That is upstream's exact semantics.
-    #[tokio::test]
-    async fn latest_item_list_groups_by_series_name_for_tvshows_with_min_of_top_n_threshold() {
-        let db = test_db().await;
-        let repository = repo(&db);
-        let (a_new, a_old, b_new, b_mid, c_new) = (
-            Uuid::from_u128(0xD101),
-            Uuid::from_u128(0xD102),
-            Uuid::from_u128(0xD103),
-            Uuid::from_u128(0xD104),
-            Uuid::from_u128(0xD105),
-        );
-        seed_latest_row(
-            &db,
-            a_new,
-            BaseItemKind::Episode,
-            "A e2",
-            "Series A",
-            day(9),
-        )
-        .await;
-        seed_latest_row(
-            &db,
-            a_old,
-            BaseItemKind::Episode,
-            "A e1",
-            "Series A",
-            day(2),
-        )
-        .await;
-        seed_latest_row(
-            &db,
-            b_new,
-            BaseItemKind::Episode,
-            "B e2",
-            "Series B",
-            day(5),
-        )
-        .await;
-        seed_latest_row(
-            &db,
-            b_mid,
-            BaseItemKind::Episode,
-            "B e1",
-            "Series B",
-            day(5),
-        )
-        .await;
-        seed_latest_row(
-            &db,
-            c_new,
-            BaseItemKind::Episode,
-            "C e1",
-            "Series C",
-            day(3),
-        )
-        .await;
+    /// A season's id and its episodes' `(id, DateCreated)`.
+    type ShowSeason<'a> = (Uuid, &'a [(Uuid, chrono::DateTime<Utc>)]);
 
-        let filter = |limit: i32| InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::Episode],
+    /// A show as a scan stores it: the `Series` row, one `Season` row per
+    /// season, and its episodes, each carrying `SeriesName`, `SeriesId` and
+    /// `SeasonId`, created at the given instants.
+    async fn seed_latest_show(db: &Database, series: Uuid, name: &str, seasons: &[ShowSeason<'_>]) {
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let mut rows = vec![BaseItemEntity {
+            id: guid_to_db(series),
+            type_: stored_type_name(BaseItemKind::Series)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(name.to_owned()),
+            sort_name: Some(name.to_owned()),
+            is_folder: true,
+            date_created: Some(day(1)),
+            ..BaseItemEntity::default()
+        }];
+        for (n, (season, episodes)) in seasons.iter().enumerate() {
+            rows.push(BaseItemEntity {
+                id: guid_to_db(*season),
+                type_: stored_type_name(BaseItemKind::Season)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: Some(format!("Season {}", n + 1)),
+                series_id: Some(guid_to_db(series)),
+                series_name: Some(name.to_owned()),
+                is_folder: true,
+                date_created: Some(day(1)),
+                ..BaseItemEntity::default()
+            });
+            for (e, (episode, created)) in episodes.iter().enumerate() {
+                rows.push(BaseItemEntity {
+                    id: guid_to_db(*episode),
+                    type_: stored_type_name(BaseItemKind::Episode)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    name: Some(format!("{name} S{}E{}", n + 1, e + 1)),
+                    sort_name: Some(format!("{name} s{}e{}", n + 1, e + 1)),
+                    series_id: Some(guid_to_db(series)),
+                    season_id: Some(guid_to_db(*season)),
+                    series_name: Some(name.to_owned()),
+                    date_created: Some(*created),
+                    media_type: Some("Video".to_owned()),
+                    ..BaseItemEntity::default()
+                });
+            }
+        }
+        persistence.save_items(&rows).await.expect("seed show");
+    }
+
+    fn hour(day_of_month: u32, hour: u32) -> chrono::DateTime<Utc> {
+        day(day_of_month) + chrono::Duration::hours(i64::from(hour))
+    }
+
+    /// The jellyfin-web "Latest in TV" filter, as `GetItemsForLatestItems`
+    /// builds it for a grouped tvshows request.
+    fn latest_tv_filter(limit: i32) -> InternalItemsQuery {
+        InternalItemsQuery {
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            media_types: vec![ferrofin_model::data::MediaType::Video],
             limit: Some(limit),
             order_by: vec![
                 (
@@ -8369,28 +8431,174 @@ mod tests {
                 ),
             ],
             ..InternalItemsQuery::default()
-        };
-        let ids = |rows: Vec<BaseItemEntity>| -> Vec<Uuid> {
-            rows.iter()
-                .filter_map(|r| Uuid::parse_str(&r.id).ok())
-                .collect()
-        };
+        }
+    }
+
+    /// v12 `GetLatestTvShowItems` (`BaseItemRepository.Querying.cs:282-540`):
+    /// the newest `limit` series by their newest episode, and for each one
+    /// card chosen from the episodes added within 24 hours of that newest one:
+    ///
+    /// - one recent episode → the **Episode**;
+    /// - several in one season of a multi-season series → the **Season**;
+    /// - several in the only season → the **Series**;
+    /// - recent episodes across seasons → the **Series**.
+    ///
+    /// The cards come back newest first. An older episode outside the window
+    /// does not count toward its series' recent additions.
+    #[tokio::test]
+    async fn latest_tv_items_pick_the_episode_season_or_series_card() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let id = |n: u128| Uuid::from_u128(0xD100 + n);
+        // Show A: two seasons, one new episode in season 2 beside an older
+        // one there, outside the window → the Episode. (Were it the season's
+        // only episode, the whole season would be new: the Season.)
+        seed_latest_show(
+            &db,
+            id(0x10),
+            "Alpha",
+            &[
+                (id(0x11), &[(id(0x12), day(2))]),
+                (id(0x13), &[(id(0x15), day(3)), (id(0x14), hour(9, 6))]),
+            ],
+        )
+        .await;
+        // Show B: two seasons, three new episodes in season 2 → the Season.
+        seed_latest_show(
+            &db,
+            id(0x20),
+            "Bravo",
+            &[
+                (id(0x21), &[(id(0x22), day(2))]),
+                (
+                    id(0x23),
+                    &[
+                        (id(0x24), hour(9, 1)),
+                        (id(0x25), hour(9, 2)),
+                        (id(0x26), hour(9, 3)),
+                    ],
+                ),
+            ],
+        )
+        .await;
+        // Show C: one season, two new episodes → the Series.
+        seed_latest_show(
+            &db,
+            id(0x30),
+            "Charlie",
+            &[(id(0x31), &[(id(0x32), hour(8, 4)), (id(0x33), hour(8, 5))])],
+        )
+        .await;
+        // Show D: new episodes in two seasons → the Series.
+        seed_latest_show(
+            &db,
+            id(0x40),
+            "Delta",
+            &[
+                (id(0x41), &[(id(0x42), hour(7, 1))]),
+                (id(0x43), &[(id(0x44), hour(7, 2))]),
+            ],
+        )
+        .await;
+
         let rows = repository
-            .get_latest_item_list(&filter(2), CollectionType::tvshows)
+            .get_latest_item_list(&latest_tv_filter(16), CollectionType::tvshows)
             .await
             .expect("latest tvshows");
-        // DateCreated DESC, then SortName DESC on the day-5 tie ("B e2" > "B e1").
-        assert_eq!(ids(rows), vec![a_new, b_new, b_mid]);
+        let cards: Vec<(Uuid, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    Uuid::parse_str(&r.id).unwrap(),
+                    r.type_.rsplit('.').next().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cards,
+            [
+                (id(0x14), "Episode".to_owned()),
+                (id(0x23), "Season".to_owned()),
+                (id(0x30), "Series".to_owned()),
+                (id(0x40), "Series".to_owned()),
+            ]
+        );
 
-        // No groups (`limit` 0) → `MIN` over nothing is NULL → `>= NULL` is
-        // never true → no rows. A "helpful" COALESCE on that threshold would
-        // turn "no groups" into "every row", and only a real statement against
-        // a real database catches it.
-        let none = repository
-            .get_latest_item_list(&filter(0), CollectionType::tvshows)
+        // `limit` caps the series considered, newest first.
+        let top_two = repository
+            .get_latest_item_list(&latest_tv_filter(2), CollectionType::tvshows)
             .await
-            .expect("latest tvshows, no groups");
-        assert!(none.is_empty(), "{:?}", ids(none));
+            .expect("latest tvshows, two");
+        let ids: Vec<Uuid> = top_two
+            .iter()
+            .map(|r| Uuid::parse_str(&r.id).unwrap())
+            .collect();
+        assert_eq!(ids, [id(0x14), id(0x23)]);
+
+        // No series at all (`limit` 0) answers nothing.
+        let none = repository
+            .get_latest_item_list(&latest_tv_filter(0), CollectionType::tvshows)
+            .await
+            .expect("latest tvshows, none");
+        assert!(none.is_empty());
+    }
+
+    /// A Season card the user's parental limit hides is replaced by the
+    /// series' newest episode (`GetLatestTvShowItems` step 5b,
+    /// `Querying.cs:458-490`): a matching episode does not make its container
+    /// visible.
+    #[tokio::test]
+    async fn latest_tv_items_show_the_episode_when_the_season_is_hidden() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let id = |n: u128| Uuid::from_u128(0xD200 + n);
+        seed_latest_show(
+            &db,
+            id(0x10),
+            "Bravo",
+            &[
+                (id(0x11), &[(id(0x12), day(2))]),
+                (id(0x13), &[(id(0x14), hour(9, 1)), (id(0x15), hour(9, 2))]),
+            ],
+        )
+        .await;
+        // The season is rated above the limit; its episodes carry no rating.
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = 18 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id(0x13)))
+        .execute(db.writer())
+        .await
+        .expect("rate the season");
+        let card = |rows: Vec<BaseItemEntity>| -> Vec<(Uuid, String)> {
+            rows.iter()
+                .map(|r| {
+                    (
+                        Uuid::parse_str(&r.id).unwrap(),
+                        r.type_.rsplit('.').next().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        };
+
+        let open = repository
+            .get_latest_item_list(&latest_tv_filter(16), CollectionType::tvshows)
+            .await
+            .expect("latest tvshows");
+        assert_eq!(card(open), [(id(0x13), "Season".to_owned())]);
+
+        let limited = InternalItemsQuery {
+            max_parental_rating: Some(ferrofin_model::entities_media::ParentalRatingScore {
+                score: 13,
+                sub_score: None,
+            }),
+            ..latest_tv_filter(16)
+        };
+        let hidden = repository
+            .get_latest_item_list(&limited, CollectionType::tvshows)
+            .await
+            .expect("latest tvshows, limited");
+        assert_eq!(card(hidden), [(id(0x15), "Episode".to_owned())]);
     }
 
     /// Seeds a `MusicAlbum` row the way the scanner writes one — the library it
@@ -9714,8 +9922,73 @@ mod tests {
         );
     }
 
+    /// An untyped view groups too. Upstream's `GetTopParentIdsForQuery` groups
+    /// when `ViewType != unknown && IsEligibleForGrouping(ViewType)`, whose set
+    /// is `{ movies, tvshows, null }` (`UserView.cs:22-27`), and its
+    /// `CollectionType is null || == ViewType` filter then keeps only the
+    /// grouped libraries that have no type. An `unknown` view still groups
+    /// nothing.
+    #[tokio::test]
+    async fn an_untyped_view_stands_for_the_untyped_libraries_grouped_into_it() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (untyped, movies, user_id, user) = two_libraries(&db).await;
+        set_collection_type(&db, movies, "movies").await;
+        set_folder_preference(
+            &db,
+            user_id,
+            PreferenceKind::GroupedFolders,
+            &[untyped, movies],
+        )
+        .await;
+        let untyped_view = Uuid::from_u128(0x9F82);
+        seed_item_with_data(&db, untyped_view, BaseItemKind::UserView, "Media", "{}").await;
+        // `unknown` by name, and by its discriminant (0), as an adopted blob
+        // written without the enum converter stores it.
+        let unknown_views = [Uuid::from_u128(0x9F83), Uuid::from_u128(0x9F84)];
+        for (view, data) in unknown_views
+            .iter()
+            .zip([r#"{"ViewType":"unknown"}"#, r#"{"ViewType":0}"#])
+        {
+            seed_item_with_data(&db, *view, BaseItemKind::UserView, "Unknown", data).await;
+        }
+        let browse = |parent: Uuid| {
+            let repository = &repository;
+            let user = user.clone();
+            async move {
+                let mut names: Vec<String> = repository
+                    .get_item_list(&InternalItemsQuery {
+                        parent_id: parent,
+                        recursive: true,
+                        user: Some(user),
+                        include_item_types: vec![BaseItemKind::Movie],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await
+                    .expect("browse")
+                    .into_iter()
+                    .filter_map(|r| r.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+
+        assert_eq!(
+            browse(untyped_view).await,
+            ["In First"],
+            "an untyped view stands for the grouped untyped library only"
+        );
+        for view in unknown_views {
+            assert!(
+                browse(view).await.is_empty(),
+                "an unknown view groups nothing"
+            );
+        }
+    }
+
     /// A view the user has GROUPED libraries into stands for those libraries —
-    /// C# `GetTopParentIdsForQuery`'s fifth arm.
+    /// C# `GetTopParentIdsForQuery`'s grouping arm.
     ///
     /// Only reachable for a user whose `GroupedFolders` preference is
     /// non-empty, which is why neither the default install nor the adoption
@@ -12775,6 +13048,20 @@ mod folder_forced_sort_tests {
             }),
             "cached"
         );
+    }
+
+    /// A child with no stored sort name is ordered by its kind's
+    /// `CreateSortName`: a season by its number, not its title.
+    #[test]
+    fn an_unsorted_season_orders_by_its_number() {
+        let season = |index: i64, name: &str| BaseItemEntity {
+            type_: stored_type_name(BaseItemKind::Season).unwrap().to_owned(),
+            name: Some(name.to_owned()),
+            index_number: Some(index),
+            ..Default::default()
+        };
+        assert_eq!(folder_sort_name(&season(10, "Season 10")), "0010");
+        assert_eq!(folder_sort_name(&season(2, "Season 2")), "0002");
     }
 }
 

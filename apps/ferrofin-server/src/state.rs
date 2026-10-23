@@ -712,8 +712,16 @@ pub async fn build_app_state(
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
             MediaEncoderConfig {
-                analyze_duration: None,
-                probe_size: None,
+                // Jellyfin's `FFmpeg:analyzeduration` / `FFmpeg:probesize`
+                // defaults, which every probe passes; without them ffprobe
+                // falls back to its own 5 s / 5 MB and can miss late streams.
+                analyze_duration: Some(
+                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION
+                        .to_owned(),
+                ),
+                probe_size: Some(
+                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
+                ),
                 threads: 0,
                 // Frame extraction (chapter images) writes here, never next to
                 // the media file — media mounts are commonly read-only. The
@@ -730,6 +738,10 @@ pub async fn build_app_state(
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);
             move || config_mgr.snapshot_shared().chapter_image_resolution
+        })
+        .with_image_extraction_timeout({
+            let config_mgr = Arc::clone(&config_mgr);
+            move || config_mgr.snapshot_shared().image_extraction_timeout_ms
         }),
     );
 
@@ -788,6 +800,27 @@ pub async fn build_app_state(
             cache_root.clone(),
         )
         .with_users(Arc::clone(&users))
+        // `M3UTunerHost`'s `IsInLocalNetwork(uri.Host)`: the configured
+        // policy, resolving tuner host names. The name is resolved with the
+        // policy's lock released, so a slow resolver never holds up a
+        // network-settings save or the request paths that read the policy.
+        // Like upstream's `Dns.GetHostAddresses`, the lookup has no deadline
+        // of its own beyond the resolver's; it runs on a blocking thread.
+        .with_local_network({
+            let network = Arc::clone(&network);
+            Arc::new(move |host: &str| {
+                let read = || {
+                    network
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                };
+                let lookup = read().host_lookup();
+                lookup.addresses(host).is_some_and(|addresses| {
+                    let policy = read();
+                    addresses.iter().any(|a| policy.is_in_local_network(*a))
+                })
+            })
+        })
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
         // back to when a tuner is not a transport stream).
         .with_encoder(Arc::clone(&media_encoder))
@@ -845,6 +878,10 @@ pub async fn build_app_state(
                     ffmpeg.capabilities.ffmpeg_version(),
                 )
                 .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+                .with_image_extraction_timeout({
+                    let config_mgr = Arc::clone(&config_mgr);
+                    move || config_mgr.snapshot_shared().image_extraction_timeout_ms
+                })
                 // Trickplay decodes a whole file to produce a handful of frames,
                 // which is what a GPU is for and what makes a library-wide pass
                 // take hours in software. Gated by the dashboard's trickplay
@@ -868,7 +905,8 @@ pub async fn build_app_state(
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
     // the filesystem scanner the library manager runs on `queue_library_scan`.
     // Kept concrete so the library monitor can take it as its `WatchRootsSource`
-    // (the roots of every library with realtime monitoring enabled).
+    // (the roots of every library with realtime monitoring enabled, and every
+    // library's locations).
     // The playlists media folder lives at `{data}/playlists` (stored as
     // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
     // `GetClientTypeName()`). Both seams need the path: the user-root store
@@ -1343,19 +1381,17 @@ pub async fn build_app_state(
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
-    // `ServerConfiguration.LibraryUpdateDuration` — how long the notifier waits
-    // for changes to stop before it pushes. A non-positive value would make the
-    // debounce fire instantly and push once per saved row, so it falls back to
-    // Jellyfin's default rather than honouring it.
-    let library_update_duration = u64::try_from(server_config.library_update_duration)
-        .ok()
-        .filter(|d| *d > 0)
-        .unwrap_or(ferrofin_core::library_changed_notifier::DEFAULT_LIBRARY_UPDATE_DURATION_SECS);
+    // `ServerConfiguration.LibraryUpdateDuration` — how long a batch of changes
+    // waits, from its first change, before the notifier pushes it. Read live as
+    // each batch opens; Jellyfin's default covers a failed read.
     let change_notifier = Arc::new(
         ferrofin_core::library_changed_notifier::LibraryChangedNotifier::new(
             Arc::clone(&event_manager),
-            std::time::Duration::from_secs(library_update_duration),
-        ),
+            std::time::Duration::from_secs(
+                ferrofin_core::library_changed_notifier::DEFAULT_LIBRARY_UPDATE_DURATION_SECS,
+            ),
+        )
+        .with_config(Arc::clone(&config_trait)),
     );
     // `IsVisible`/`IsVisibleStandalone`: one evaluator, shared by the library's
     // user-scoped lookups and the media sources' per-user version filter.
@@ -2021,8 +2057,8 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
-    // The versions a played-state change propagates to are announced to the
-    // user's sessions (`UserDataChanged`), as each save is upstream.
+    // Every user-data save but a progress report reaches the user's sessions
+    // as a batched `UserDataChanged` (upstream's `UserDataChangeNotifier`).
     user_data_impl.set_user_data_changed_sink(Arc::new(
         ferrofin_core::user_data_manager::SessionUserDataSink(Arc::downgrade(&sessions)),
     ));
@@ -2186,6 +2222,10 @@ pub async fn build_app_state(
             "AuthenticationSucceeded",
             |user, _device| format!("{user} successfully authenticated"),
         );
+        // Port of `PlaybackStartLogger` / `PlaybackStopLogger`, on the same
+        // awaited bus, so every route that reports playback (the obsolete
+        // `/PlayingItems/{itemId}` forms included) writes its entry.
+        ferrofin_core::playback_activity::subscribe(&event_bus, &activity, &library);
     }
 
     // These two maintenance tasks gate on active playback, so they register

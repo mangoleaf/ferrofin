@@ -43,6 +43,11 @@ pub struct NotifyFileSystemWatcher {
     /// `unwatch_all` — and for the event callback, which drops a
     /// metadata-only change of a root itself.
     watched: Arc<Mutex<HashSet<String>>>,
+    /// Every library location (without a trailing slash), from
+    /// [`FileSystemWatcher::set_library_roots`]: the event callback drops a
+    /// metadata-only change of these too, including locations nested in a
+    /// watched root, which are never watched on their own.
+    library_roots: Arc<Mutex<HashSet<String>>>,
 }
 
 /// `path` without its trailing slashes (`/` stays `/`).
@@ -74,7 +79,9 @@ impl NotifyFileSystemWatcher {
     pub fn new() -> Result<(Self, mpsc::UnboundedReceiver<String>), ServiceError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let root_set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let roots = Arc::clone(&root_set);
+        let library_root_set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let watched_roots = Arc::clone(&root_set);
+        let library_roots = Arc::clone(&library_root_set);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let event = match res {
                 Ok(event) => event,
@@ -98,6 +105,16 @@ impl NotifyFileSystemWatcher {
                 event.kind,
                 EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Data(_))
             );
+            // A poisoned set still holds whole entries (each update is one
+            // insert, remove or replacement).
+            let is_library_root = |path: &str| {
+                let key = root_key(path);
+                [&watched_roots, &library_roots].iter().any(|set| {
+                    set.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&key)
+                })
+            };
             for path in event.paths {
                 let path = path.to_string_lossy().into_owned();
                 if should_ignore_path(&path) {
@@ -109,14 +126,7 @@ impl NotifyFileSystemWatcher {
                 // reporting it would rescan the library for a metadata-only
                 // change. A file or folder created or removed in it arrives
                 // with its own path.
-                // A poisoned set still holds whole entries (each update is
-                // one insert or remove).
-                if metadata_only
-                    && roots
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .contains(&root_key(&path))
-                {
+                if metadata_only && is_library_root(&path) {
                     tracing::trace!(path, "metadata-only change of a library root ignored");
                     continue;
                 }
@@ -129,6 +139,7 @@ impl NotifyFileSystemWatcher {
             Self {
                 inner: Arc::new(Mutex::new(watcher)),
                 watched: root_set,
+                library_roots: library_root_set,
             },
             rx,
         ))
@@ -193,6 +204,14 @@ impl FileSystemWatcher for NotifyFileSystemWatcher {
             tracing::debug!(path, error = %e, "unwatch skipped");
         }
         Ok(())
+    }
+
+    fn set_library_roots(&self, roots: &[String]) {
+        *self
+            .library_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            roots.iter().map(|root| root_key(root)).collect();
     }
 
     async fn unwatch_all(&self) -> Result<(), ServiceError> {
@@ -371,6 +390,140 @@ mod tests {
         assert!(
             !seen.iter().any(|p| root_key(p) == root_key(&root)),
             "the root's own metadata change is not: {seen:?}"
+        );
+    }
+
+    /// Libraries where only the outer one has real-time monitoring.
+    struct OnlyOuterMonitored {
+        outer: String,
+        inner: String,
+    }
+
+    #[async_trait]
+    impl crate::library_monitor::WatchRootsSource for OnlyOuterMonitored {
+        async fn watch_roots(&self) -> Vec<String> {
+            vec![self.outer.clone()]
+        }
+
+        async fn library_locations(&self) -> Vec<String> {
+            vec![self.outer.clone(), self.inner.clone()]
+        }
+    }
+
+    /// A library without real-time monitoring inside a monitored one is not
+    /// watched at all, but a change under it is still matched to it; its own
+    /// metadata change must not rescan it either.
+    #[tokio::test]
+    async fn a_metadata_only_change_of_an_unmonitored_library_inside_a_watched_one_is_not_reported()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        let movies = media.join("movies");
+        std::fs::create_dir_all(&movies).expect("mkdir");
+        let (watcher, mut rx) = NotifyFileSystemWatcher::new().expect("watcher");
+        let monitor = crate::library_monitor::FerrofinLibraryMonitor::new(
+            Arc::new(watcher),
+            OnlyOuterMonitored {
+                outer: media.to_string_lossy().into_owned(),
+                inner: movies.to_string_lossy().into_owned(),
+            },
+        );
+        ferrofin_traits::library::LibraryMonitor::start(&monitor)
+            .await
+            .expect("start");
+
+        let later = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        std::fs::File::open(&movies)
+            .expect("movies")
+            .set_modified(later)
+            .expect("touch movies");
+        std::fs::write(movies.join("new.mkv"), b"x").expect("write");
+
+        let seen = recv_until(&mut rx, |p| p.ends_with("new.mkv")).await;
+        assert!(
+            seen.iter().any(|p| p.ends_with("new.mkv")),
+            "the new file is reported: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|p| Path::new(p) == movies),
+            "the inner library's own metadata change is not: {seen:?}"
+        );
+    }
+
+    /// `set_library_roots` replaces the set: a location dropped from it is an
+    /// ordinary folder of its parent library again.
+    #[tokio::test]
+    async fn a_location_dropped_from_the_library_roots_is_reported_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        let movies = media.join("movies");
+        std::fs::create_dir_all(&movies).expect("mkdir");
+        let (media_root, movies_root) = (
+            media.to_string_lossy().into_owned(),
+            movies.to_string_lossy().into_owned(),
+        );
+        let (watcher, mut rx) = NotifyFileSystemWatcher::new().expect("watcher");
+        watcher.watch(&media_root).await.expect("watch");
+        watcher.set_library_roots(&[media_root.clone(), movies_root]);
+        watcher.set_library_roots(&[media_root]);
+
+        let later = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        std::fs::File::open(&movies)
+            .expect("movies")
+            .set_modified(later)
+            .expect("touch movies");
+
+        let seen = recv_until(&mut rx, |p| Path::new(p) == movies).await;
+        assert!(
+            seen.iter().any(|p| Path::new(p) == movies),
+            "the folder's metadata change is reported: {seen:?}"
+        );
+    }
+
+    /// A library location nested in another is covered by its parent's
+    /// recursive watch, so the monitor never watches it on its own; it is a
+    /// library root all the same, and its own metadata change must not
+    /// rescan its library.
+    #[tokio::test]
+    async fn a_metadata_only_change_of_a_nested_library_root_is_not_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Library A at `media`, library B at `media/movies` inside it.
+        let media = dir.path().join("media");
+        let movies = media.join("movies");
+        std::fs::create_dir_all(&movies).expect("mkdir");
+        let (watcher, mut rx) = NotifyFileSystemWatcher::new().expect("watcher");
+        let monitor = crate::library_monitor::FerrofinLibraryMonitor::new(
+            Arc::new(watcher),
+            // The nested location as the dashboard often spells it, with a
+            // trailing slash the event path does not have.
+            vec![
+                media.to_string_lossy().into_owned(),
+                format!("{}/", movies.to_string_lossy()),
+            ],
+        );
+        ferrofin_traits::library::LibraryMonitor::start(&monitor)
+            .await
+            .expect("start");
+
+        // `touch` and `chmod` of the nested location, then a new file in it.
+        let later = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        std::fs::File::open(&movies)
+            .expect("movies")
+            .set_modified(later)
+            .expect("touch movies");
+        std::fs::set_permissions(&movies, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod movies");
+        std::fs::write(movies.join("new.mkv"), b"x").expect("write");
+
+        let seen = recv_until(&mut rx, |p| p.ends_with("new.mkv")).await;
+        assert!(
+            seen.iter().any(|p| p.ends_with("new.mkv")),
+            "the new file is reported: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|p| Path::new(p) == movies),
+            "the nested root's own metadata change is not: {seen:?}"
         );
     }
 
