@@ -99,6 +99,14 @@ pub struct TranscodePlan {
     /// the request's `MinSegments`, else 2 for segments of ten seconds or
     /// longer, else 3.
     pub min_segments: i32,
+    /// Whether the transcode strips a copied video's Dolby Vision metadata
+    /// (`EncodingHelper.IsDoviRemoved`), so the master playlist does not
+    /// advertise it. Evaluated by the planner, which has the ffmpeg build's
+    /// capabilities.
+    pub is_dovi_removed: bool,
+    /// Whether the transcode strips a copied video's HDR10+ metadata
+    /// (`EncodingHelper.IsHdr10PlusRemoved`); see [`Self::is_dovi_removed`].
+    pub is_hdr10_plus_removed: bool,
 }
 
 /// Which playlist shape the transcode's HLS muxer writes — the
@@ -1543,6 +1551,8 @@ mod tests {
                 segment_container: self.segment_container.clone(),
                 encoding_options: EncodingOptions::default(),
                 min_segments: 3,
+                is_dovi_removed: false,
+                is_hdr10_plus_removed: false,
             })
         }
 
