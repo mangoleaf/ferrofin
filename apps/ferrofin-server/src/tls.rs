@@ -434,7 +434,9 @@ fn host_without_port(host: &str) -> &str {
 ///
 /// TODO(gl-554): `OnConfigurationUpdated` also flags a restart when the
 /// dashboard's `InternalHttpPort` or `InternalHttpsPort` differ from the ports
-/// in use; port it with the dashboard ports.
+/// in use, both non-zero, while `IsPortAuthorized` is set; it then clears
+/// `IsPortAuthorized` and saves (`ApplicationHost.cs:803-818`). Port it with the
+/// dashboard ports.
 pub struct CertificatePathCheck {
     loaded_path: String,
     network: Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,

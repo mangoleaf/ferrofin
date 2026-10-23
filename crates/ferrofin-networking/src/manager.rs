@@ -554,6 +554,9 @@ impl NetworkManager {
     ///
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
     /// whole chain is walkable.
+    ///
+    /// TODO(gl-184): the chain it gets has unparsable entries already dropped;
+    /// `ApplyForwarders` stops the walk at the first one instead.
     #[must_use]
     pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
         if self.known_proxies.is_empty() {

@@ -18,9 +18,9 @@ on **Dashboard → Networking**. They now apply at startup:
   `307`, `/metrics` included. Only `/health/live` and `/health/ready` are not redirected.
 
 The ports are still `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`. The port fields on the
-Networking page are not read yet (gl-554). If both name the same port, HTTPS is not served and the log
-says so. If another program holds the HTTPS port, the server does not start, as it does not
-when the HTTP port is taken.
+Networking page are not read yet (gl-554). If both name the same port, HTTPS is not served
+and the log says so. If another program holds the HTTPS port, the server does not start, as
+it does not when the HTTP port is taken.
 
 An adopted Jellyfin configuration keeps **Enable HTTPS** and **Require HTTPS**. It does not
 keep the certificate path and password, which pointed into Jellyfin's own filesystem. So
@@ -36,9 +36,9 @@ If HTTPS is on, make sure clients can reach the HTTPS port:
 A reverse proxy that terminates TLS needs neither setting. List it under **Known proxies**;
 its `X-Forwarded-Proto: https` then counts as HTTPS. That header now counts only from known
 proxies, as in Jellyfin, also for the addresses published from each request (**Enable
-published server URI by request**). A proxy that is not listed gets `http://` addresses. Those
-addresses take their host from the request's `Host`, not yet from the proxy's
-`X-Forwarded-Host` (gl-813).
+published server URI by request**). A proxy that is not listed gets `http://` addresses. A listed
+proxy's `X-Forwarded-Host` is not used yet (gl-813): those addresses still take their host
+from the request's `Host`.
 See [CONFIG.md](CONFIG.md#https).
 
 ## Unreleased — TheAudioDB descriptions return, in the library's language
