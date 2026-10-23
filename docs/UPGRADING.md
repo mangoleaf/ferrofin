@@ -28,6 +28,38 @@ Saving a listings provider is now checked the way Jellyfin checks it:
 
 Providers already saved are not touched.
 
+## Unreleased — missing episodes you now have are removed
+
+A database adopted from Jellyfin can hold **missing episodes**: placeholder rows with no
+file, which Jellyfin's TMDb option or the TheTVDB plugin added. They show to users with
+**Display missing episodes** on. Earlier versions kept every one forever, so when the
+file for one of them arrived, the episode was listed twice.
+
+Each library scan now does what Jellyfin does at the end of every series refresh. It
+removes a series' missing episode when:
+- a file in the same season covers its number;
+- it has no episode number;
+- it carries the TheTVDB, TMDb or other id of exactly one episode you have, under another
+  number. Aired, DVD and absolute orders number the same episode differently.
+
+The first scan after the upgrade does this for every series. Only placeholder rows go;
+no file is touched. A missing episode you still lack stays. A library monitor's event for
+a single file does not refresh its series, as in Jellyfin, so the next library scan
+removes its placeholder.
+
+## Unreleased — the server needs 2 GiB free to start, as Jellyfin does
+
+Ferrofin now checks free space at startup. It refuses to start when `{data_dir}/data`, the
+cache directory (`FERROFIN_CACHE_DIR`, default `{data_dir}/cache`) or `{data_dir}` itself
+has less than 2 GiB free, as Jellyfin does. A scheduled backup restore is checked the same
+way before it is applied. The log names the path and the shortfall: ``The path `…` has
+insufficient free space. Available: …, Required: 2GiB.``
+
+An install that started on a nearly full disk before will stop at boot after this
+upgrade. Free up space on that filesystem, or move the cache to another filesystem with
+`FERROFIN_CACHE_DIR`. A build that cannot read free space (non-Unix, such as Windows) logs
+a warning and starts.
+
 ## Unreleased — TheAudioDB descriptions return, in the library's language
 
 TheAudioDB stopped filling its English-suffixed description fields, and earlier versions
