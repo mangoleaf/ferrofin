@@ -243,6 +243,43 @@ async fn readable_file_unsupported_external_text_converts_to_srt() {
     assert!(info.is_external);
 }
 
+// -- get_readable_file: external WebVTT is parsed, not converted ----------
+
+/// Jellyfin 12 (PR 16998) reads an external sidecar by its extension, and libse
+/// parses WebVTT: a `.vtt` (codec `webvtt`) is served as itself, never sent
+/// through the ffmpeg SRT conversion that drops its cue settings.
+#[tokio::test]
+async fn readable_file_external_vtt_is_parsed_not_converted() {
+    let stream = sub_stream(4, "webvtt", Some("/media/movie.en.vtt"), true);
+    let source = source_with("guid9", "/media/movie.mkv", vec![stream.clone()]);
+    let raw = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000 line:10%\nTop\n";
+    let io = RecordingIo::default();
+    io.files
+        .lock()
+        .unwrap()
+        .insert("/media/movie.en.vtt".to_owned(), raw.as_bytes().to_vec());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), io);
+
+    let info = encoder.get_readable_file(&source, &stream).await.unwrap();
+    assert_eq!(info.path, "/media/movie.en.vtt");
+    assert_eq!(info.format, "vtt");
+
+    // `Stream.vtt` returns the file unchanged, cue settings included.
+    let same = encoder
+        .get_subtitles(&source, &stream, "vtt", 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8(same).unwrap(), raw);
+
+    // Another format is converted from the parsed cues, which keep their
+    // position as libse's `{\an8}` tag.
+    let srt = encoder
+        .get_subtitles(&source, &stream, "srt", 0, 0, false)
+        .await
+        .unwrap();
+    assert!(String::from_utf8(srt).unwrap().contains("{\\an8}Top"));
+}
+
 // -- extract_all_extractable_subtitles: arg building -----------------------
 
 #[tokio::test]

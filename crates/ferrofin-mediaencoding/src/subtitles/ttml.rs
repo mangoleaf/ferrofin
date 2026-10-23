@@ -11,10 +11,10 @@
 //! A source SSA/ASS script's styles become TTML styles
 //! (`SubStationAlphaHeaderToTimedText`); its cues then sit in a `div` created without
 //! a namespace, which is why each `<p>` re-declares the TTML namespace there.
-// TODO(gl-473): libse also writes from a TTML source header (an existing `<head>`,
-// several `div`s, `p.Region`), and from paragraphs with a `Language` or `NewSection`.
-// Only libse's TTML and other XML loaders set those, so they become reachable with
-// the parsers gl-473 ports; port those `ToText` branches with them.
+// TODO(gl-768): libse also writes from a TTML source header (an existing `<head>`
+// with its own styles and regions, several `div`s), and from paragraphs with a
+// `Language` or `NewSection`. Only libse's TTML and other XML loaders set those, and
+// none is ported; port those `ToText` branches with the loader that reaches them.
 
 use super::dotnet::format_double_custom;
 use super::libse_text::{

@@ -31,6 +31,21 @@ pub struct SyncPlaySession {
     pub user_name: String,
 }
 
+/// What a session is playing when it creates a group — the `SessionInfo`
+/// facts `Group.CreateGroup` seeds the new group from (`FullNowPlayingItem`,
+/// `PlayState`, `NowPlayingQueue`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncPlayNowPlaying {
+    /// The playing item's id (`FullNowPlayingItem.Id`).
+    pub item_id: Uuid,
+    /// The reported playback position (`PlayState.PositionTicks`).
+    pub position_ticks: Option<i64>,
+    /// Whether playback is paused (`PlayState.IsPaused`).
+    pub is_paused: bool,
+    /// The reported play queue's item ids (`NowPlayingQueue`).
+    pub queue: Vec<Uuid>,
+}
+
 /// A playback request against a group — the `IGroupPlaybackRequest` hierarchy as
 /// one enum. Ports the 16 `PlaybackRequestType` commands funneled through
 /// `ISyncPlayManager.HandleRequest`.
@@ -146,11 +161,13 @@ pub enum PlaybackRequest {
 /// messages to member sockets.
 #[async_trait]
 pub trait SyncPlayManager: Send + Sync {
-    /// Creates a new group owned by the session, returning its info.
+    /// Creates a new group owned by the session, returning its info. A
+    /// session that is playing (`now_playing`) starts the group on its item.
     async fn new_group(
         &self,
         session: &SyncPlaySession,
         group_name: &str,
+        now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError>;
 
     /// Adds the session to an existing group.

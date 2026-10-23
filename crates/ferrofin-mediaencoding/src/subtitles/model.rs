@@ -162,7 +162,7 @@ pub struct Paragraph {
     pub is_comment: bool,
     /// `Actor`: the SSA/ASS `Name` (or `Actor`) column.
     pub actor: Option<String>,
-    /// `Region`: the WebVTT region of the cue.
+    /// `Region`: the WebVTT region the cue names, if any.
     pub region: Option<String>,
     /// `MarginL`: the SSA/ASS left margin, as written in the source.
     pub margin_l: Option<String>,
@@ -176,7 +176,8 @@ pub struct Paragraph {
     pub layer: i32,
     /// `Language`: the TTML language of the cue.
     pub language: Option<String>,
-    /// `Style`: the TTML style of the cue.
+    /// `Style`: the TTML style of the cue, or for a WebVTT cue its raw cue settings
+    /// (`line:10% align:start`, empty when it has none).
     pub style: Option<String>,
     /// `NewSection`: the cue starts a new TTML `div`.
     pub new_section: bool,
@@ -203,7 +204,9 @@ impl Paragraph {
 pub struct Subtitle {
     /// The subtitle cues, in document order.
     pub paragraphs: Vec<Paragraph>,
-    /// `Header`: the SSA/ASS script header (everything through `[Events]`), or empty.
+    /// `Header`, or empty: the SSA/ASS script header (everything through `[Events]`),
+    /// or for WebVTT the signature line and the `STYLE`, `REGION` and `NOTE` blocks
+    /// before the first cue.
     pub header: String,
     /// `Footer`: the SSA/ASS `[Fonts]`/`[Graphics]` sections after the events, or empty.
     pub footer: String,

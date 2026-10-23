@@ -239,7 +239,8 @@ impl AggregateFolderStore {
                 tracing::warn!(path = %path.display(), %e,
                     "could not create the playlists directory");
             }
-            let row = playlists_folder_row(correct, &path, Some(aggregate));
+            let dir = tokio::fs::metadata(&path).await.ok();
+            let row = playlists_folder_row(correct, &path, Some(aggregate), dir.as_ref());
             crate::item_persistence_service::FerrofinItemPersistenceService::new(self.db.clone())
                 .save_items(std::slice::from_ref(&row))
                 .await?;
@@ -258,7 +259,8 @@ impl AggregateFolderStore {
 }
 
 /// The `PlaylistsFolder` row `CreateRootFolder` saves for `path` under
-/// `parent` (the aggregate): `Name` "Playlists", its own top parent.
+/// `parent` (the aggregate): `Name` "Playlists", its own top parent, created
+/// and modified when `dir` (the directory's metadata) says, else now.
 ///
 /// The id goes in through `guid_to_db`, never `to_string()`: Jellyfin stores
 /// GUID columns uppercase-hyphenated and `BaseItems."Id"` has no `COLLATE
@@ -271,8 +273,13 @@ pub(crate) fn playlists_folder_row(
     id: Uuid,
     path: &Path,
     parent: Option<Uuid>,
+    dir: Option<&std::fs::Metadata>,
 ) -> ferrofin_db::entities::base_items::BaseItemEntity {
     let name = crate::user_view_manager::PLAYLISTS_FOLDER_NAME;
+    // `CreateRootFolder` dates the folder from the directory it just made,
+    // and the `UpdateToRepositoryAsync` that inserts it stamps the save.
+    let now = chrono::Utc::now();
+    let (created, modified) = dir.map_or((now, now), crate::library_scan::created_and_modified);
     ferrofin_db::entities::base_items::BaseItemEntity {
         id: ferrofin_db::store::guid_to_db(id),
         type_: item_type_lookup::stored_type_name(BaseItemKind::PlaylistsFolder)
@@ -284,7 +291,9 @@ pub(crate) fn playlists_folder_row(
         parent_id: parent.map(ferrofin_db::store::guid_to_db),
         top_parent_id: Some(ferrofin_db::store::guid_to_db(id)),
         is_folder: true,
-        date_created: Some(chrono::Utc::now()),
+        date_created: Some(created),
+        date_modified: Some(modified),
+        date_last_saved: Some(now),
         ..Default::default()
     }
 }
@@ -374,6 +383,39 @@ mod tests {
         );
         assert!(store.playlists_path().is_dir());
         assert_eq!(store.ensure().await.expect("again"), ids);
+    }
+
+    /// The folder carries `CreateRootFolder`'s dates: created and modified
+    /// from its directory (`info.CreationTimeUtc`, `info.LastWriteTimeUtc`),
+    /// and saved now (the `UpdateToRepositoryAsync` that inserts it).
+    #[tokio::test]
+    async fn the_playlists_folder_is_dated_from_its_directory() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let dir = store.playlists_path();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let written = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .expect("date")
+            .with_timezone(&chrono::Utc);
+        std::fs::File::open(&dir)
+            .expect("open dir")
+            .set_modified(written.into())
+            .expect("set mtime");
+
+        let before = chrono::Utc::now();
+        store.ensure().await.expect("ensure");
+        let after = chrono::Utc::now();
+
+        let row = fetch_item(&db, store.playlists_id().expect("id")).await;
+        assert_eq!(row.date_modified, Some(written), "LastWriteTimeUtc");
+        assert_eq!(
+            row.date_created,
+            Some(written),
+            "CreationTimeUtc: the older of ctime and mtime"
+        );
+        let saved = row.date_last_saved.expect("saved");
+        assert!((before..=after).contains(&saved), "{saved}");
     }
 
     /// A playlists folder an earlier Ferrofin hung off the `UserRootFolder`

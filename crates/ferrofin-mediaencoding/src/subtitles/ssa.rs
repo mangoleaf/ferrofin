@@ -6,14 +6,16 @@
 //! `LoadSubtitle` paths Jellyfin's `SubtitleEditParser` drives and the `ToText`
 //! writers Jellyfin 12's `SubtitleEncoder.TryGetWriter` returns.
 //!
-//! Only the writer branches Jellyfin can reach from a source Ferrofin parses are
-//! here. The encoder serves an ASS or SSA source verbatim for an ASS request, and an
-//! SSA source verbatim for an SSA request, so the ASS writer only ever sees a source
-//! without a script header (SubRip), and the SSA writer one without a header or with
-//! an ASS header.
-// TODO(gl-473): libse's writers also convert WebVTT and TTML sources (the ASS
-// writer's `WebVttToAssa`, the ASS/SSA writers' `LoadStylesFromTimedText10`). Port
-// those branches with the WebVTT/TTML parsers, which are what make them reachable.
+//! The encoder serves an ASS or SSA source verbatim for an ASS request, and an SSA
+//! source verbatim for an SSA request, so the ASS writer sees a source without a
+//! script header (SubRip) or with a WebVTT one, and the SSA writer one without a
+//! header, with a WebVTT one (which it treats as none, as libse does) or with an ASS
+//! header.
+// TODO(gl-816): the ASS writer sends a WebVTT header through libse's
+// `WebVttToAssa.Convert` (the source's `STYLE` classes become ASS styles and inline
+// tags, every event its own layer); it takes the default-header branch here instead.
+// TODO(gl-768): both writers also read a TTML source header
+// (`LoadStylesFromTimedText10`); port that branch with the TTML loader that reaches it.
 
 use super::dotnet::int_try_parse;
 use super::model::{Paragraph, Subtitle, TimeCode, dotnet_int};

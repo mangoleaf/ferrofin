@@ -194,7 +194,8 @@ fn vtt_turns_font_colours_into_webvtt_classes(#[case] text: &str, #[case] expect
 
 #[test]
 fn vtt_keeps_a_webvtt_source_header_and_cue_region() {
-    // Reachable once a WebVTT source is parsed (gl-473); the writer side is ported now.
+    // libse's writer keeps a WebVTT source's header and cue regions. The encoder never
+    // reaches this branch: it serves a WebVTT source verbatim for a WebVTT request.
     let mut s = subtitle_with(&[("x", 0.0, 1_000.0)]);
     s.header = "WEBVTT - a title\n\nREGION\nid:top\n".to_owned();
     s.paragraphs[0].region = Some("top".to_owned());
@@ -460,10 +461,12 @@ fn json_writer_empty_subtitle_has_empty_events() {
 #[test]
 fn parser_supports_expected_extensions() {
     let p = SubtitleEditParser::new();
-    for ext in ["srt", ".srt", "SRT", "subrip", "ssa", "ass"] {
+    for ext in ["srt", ".srt", "SRT", "subrip", "ssa", "ass", "vtt"] {
         assert!(p.supports_file_extension(ext), "{ext} should be supported");
     }
-    for ext in ["vtt", "webvtt", "sub", "unknown"] {
+    // Upstream keys formats by `Extension` only, so libse's `webvtt`
+    // alternate is not a key (the encoder normalises the codec to `vtt`).
+    for ext in ["webvtt", "sub", "unknown"] {
         assert!(
             !p.supports_file_extension(ext),
             "{ext} should be unsupported"

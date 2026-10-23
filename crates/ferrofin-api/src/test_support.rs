@@ -629,6 +629,29 @@ fake_library_manager!(CountingScans {
     }
 });
 
+/// An ffmpeg build with the common audio encoders (`SupportsEncoder`), for
+/// the routes whose negotiation transcodes audio; a state built by
+/// [`AppState::new`] has none.
+pub struct CommonEncoders;
+
+impl ferrofin_traits::media_encoding::EncoderSupport for CommonEncoders {
+    fn supports_encoder(&self, encoder: &str) -> bool {
+        [
+            "aac",
+            "ac3",
+            "eac3",
+            "flac",
+            "alac",
+            "libopus",
+            "libmp3lame",
+            "libvorbis",
+            "pcm_s16le",
+        ]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(encoder))
+    }
+}
+
 /// A plain, non-administrator [`UserEntity`] for tests that need the
 /// authenticated caller to *be* somebody — every permission extractor resolves
 /// the policy from `AuthorizationInfo::user`, so a `None` there is
@@ -1226,6 +1249,11 @@ impl SessionManager for FakeSessions {
     }
     async fn report_session_ended(&self, _session_id: &str) -> Result<(), ServiceError> {
         unimplemented!("fake")
+    }
+    /// A socket's last close ends quietly here, so a socket test can close its
+    /// last socket. A logout (`report_session_ended`) stays unimplemented.
+    async fn close_if_needed(&self, _session_id: &str) -> Result<(), ServiceError> {
+        Ok(())
     }
     async fn send_general_command(
         &self,
@@ -2758,7 +2786,8 @@ pub fn setup_complete_state(auth: Arc<dyn AuthService>) -> AppState {
 }
 
 /// [`fake_state`] with the given auth service and configuration manager.
-fn fake_state_with(
+#[must_use]
+pub fn fake_state_with(
     auth: Arc<dyn AuthService>,
     config: Arc<dyn ServerConfigurationManager>,
 ) -> AppState {

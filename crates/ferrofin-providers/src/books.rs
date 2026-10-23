@@ -19,7 +19,7 @@
 //! its first page in name order (`ComicImageProvider`), or the EPUB's declared
 //! cover (`EpubImageProvider`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
 
@@ -441,6 +441,7 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
     let mut titles: Vec<(Option<String>, String)> = Vec::new();
     let mut refinements: Vec<(String, String, String)> = Vec::new();
     let mut calibre_title_sort: Option<String> = None;
+    let mut first_seen = HashSet::new();
     let Ok(mut cursor) = XmlCursor::new(xml) else {
         return None;
     };
@@ -470,6 +471,7 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
                 &mut book,
                 &mut refinements,
                 &mut calibre_title_sort,
+                &mut first_seen,
             ) {
                 continue;
             }
@@ -488,7 +490,17 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
         let local = name.rsplit(':').next().unwrap_or(&name).to_owned();
         let value = cursor.read_element_content_as_string();
         let value = value.trim();
-        if value.is_empty() {
+        // `ReadStringInto` is `SelectSingleNode`: only the first element of
+        // each of these counts, and a blank one leaves its field unset.
+        let single = match local.as_str() {
+            "description" | "publisher" | "language" | "date" => Some(local.clone()),
+            "identifier" => scheme
+                .as_deref()
+                .and_then(opf_identifier_key)
+                .map(|key| format!("identifier:{key}")),
+            _ => None,
+        };
+        if single.is_some_and(|key| !first_seen.insert(key)) || value.is_empty() {
             continue;
         }
         match local.as_str() {
@@ -550,30 +562,24 @@ fn read_opf_meta(
     book: &mut BookMetadata,
     refinements: &mut Vec<(String, String, String)>,
     calibre_title_sort: &mut Option<String>,
+    first_seen: &mut HashSet<String>,
 ) -> bool {
-    let meta_name = cursor.get_attribute("name").unwrap_or_default().to_owned();
+    let meta_name = cursor
+        .get_attribute("name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let content = cursor
         .get_attribute("content")
         .unwrap_or_default()
         .to_owned();
-    match meta_name.to_ascii_lowercase().as_str() {
+    // Each of these is read with `SelectSingleNode` too: the first `<meta>`
+    // of the name only, whatever its content.
+    let first = meta_name.starts_with("calibre:") && first_seen.insert(format!("meta:{meta_name}"));
+    match meta_name.as_str() {
+        _ if !first => {}
         "calibre:series" => book.series_name = non_empty(Some(content)),
-        // Calibre writes this as a float (`1.0`); C# rounds via
-        // `Convert.ToInt32(Convert.ToDouble(value))`.
-        "calibre:series_index" => {
-            book.index_number = content
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .map(f64::round)
-                .filter(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
-                .map(|v| {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let rounded = v as i32;
-                    rounded
-                });
-        }
-        "calibre:rating" => book.community_rating = content.trim().parse().ok(),
+        "calibre:series_index" => book.index_number = calibre_int(&content),
+        "calibre:rating" => book.community_rating = calibre_int(&content).map(f64::from),
         // OPF 2.0's sort title.
         "calibre:title_sort" => *calibre_title_sort = non_empty(Some(content)),
         _ => {}
@@ -606,6 +612,24 @@ fn title_with_id(titles: &[(Option<String>, String)], id: &str) -> Option<String
         .iter()
         .find(|(title_id, _)| title_id.as_deref() == Some(id))
         .map(|(_, text)| text.clone())
+}
+
+/// A Calibre `<meta content>` number as `ReadInt32AttributeInto` stores it:
+/// `Convert.ToInt32(Convert.ToDouble(value))`, which rounds half to even
+/// (Calibre writes floats, `1.0`). `None` when it does not parse or does not
+/// fit, where C# throws and the field stays unset.
+fn calibre_int(content: &str) -> Option<i32> {
+    content
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(f64::round_ties_even)
+        .filter(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
+        .map(|v| {
+            #[allow(clippy::cast_possible_truncation)]
+            let rounded = v as i32;
+            rounded
+        })
 }
 
 /// The `ProviderIds` key an OPF `opf:scheme` maps to, or `None` for a scheme
@@ -957,11 +981,18 @@ pub fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     let opf_path = read_epub_content_path(path)?;
     let opf = read_archive_entry_text(path, &opf_path.to_lowercase())?;
     // C# `ReadCoverPath` probes in order: a manifest item with
-    // `properties="cover-image"` (the EPUB 3 way), then id `cover-image`,
-    // then id `cover`, and only then `<meta name="cover" content="…"/>`.
+    // `properties="cover-image"` (the EPUB 3 way), then the image with id
+    // `cover` (its `id='*cover-image'` probe is a literal that never
+    // matches), and only then `<meta name="cover" content="…"/>`: the image
+    // at `Images/<content>`, else the manifest item with that id.
     let href = epub_manifest_href_by_property(&opf, "cover-image")
         .or_else(|| epub_manifest_href(&opf, "cover"))
-        .or_else(|| epub_cover_id(&opf).and_then(|id| epub_manifest_href(&opf, &id)))?;
+        .or_else(|| {
+            epub_cover_id(&opf).and_then(|content| {
+                epub_manifest_image_at(&opf, &format!("Images/{content}"))
+                    .or_else(|| epub_manifest_href(&opf, &content))
+            })
+        })?;
     // Manifest hrefs are relative to the OPF's own directory.
     let root = Path::new(&opf_path)
         .parent()
@@ -1020,6 +1051,27 @@ fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
             if !href.is_empty() {
                 return Some(href);
             }
+        }
+        cursor.read();
+    }
+    None
+}
+
+/// `href` when a manifest image item has exactly that `href`
+/// (`//opf:item[@href='…']` with an image media type).
+fn epub_manifest_image_at(opf: &str, href: &str) -> Option<String> {
+    let Ok(mut cursor) = XmlCursor::new(opf) else {
+        return None;
+    };
+    while !cursor.eof() {
+        if cursor.is_element()
+            && cursor.name().eq_ignore_ascii_case("item")
+            && cursor.get_attribute("href") == Some(href)
+            && cursor
+                .get_attribute("media-type")
+                .is_some_and(is_image_media_type)
+        {
+            return Some(href.to_owned());
         }
         cursor.read();
     }
@@ -1452,6 +1504,91 @@ mod tests {
             book.people,
             [("Frank Herbert".to_owned(), "Author".to_owned())]
         );
+    }
+
+    /// `OpfReader.ReadStringInto` is `SelectSingleNode`: the first element of
+    /// a kind in document order, and nothing at all when that one is blank or
+    /// (a date) does not parse — never a later one.
+    #[test]
+    fn only_the_first_single_valued_element_counts() {
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+                <metadata>
+                  <dc:title>T</dc:title>
+                  <dc:description>First.</dc:description>
+                  <dc:description>Second.</dc:description>
+                  <dc:publisher>Print House</dc:publisher>
+                  <dc:publisher>Ebook House</dc:publisher>
+                  <dc:language>en</dc:language>
+                  <dc:language>fr</dc:language>
+                  <dc:date opf:event="publication">1996-02-01</dc:date>
+                  <dc:date opf:event="conversion">2021-03-09T18:31:22+00:00</dc:date>
+                  <dc:identifier opf:scheme="ISBN">9780000000001</dc:identifier>
+                  <dc:identifier opf:scheme="ISBN">9780000000002</dc:identifier>
+                </metadata>
+              </package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.overview.as_deref(), Some("First."));
+        assert_eq!(book.studios, ["Print House"]);
+        assert_eq!(book.language.as_deref(), Some("en"));
+        assert_eq!(book.production_year, Some(1996));
+        assert_eq!(book.provider_ids["ISBN"], "9780000000001");
+
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>T</dc:title>
+                <dc:description>  </dc:description>
+                <dc:description>Later.</dc:description>
+                <dc:date>not a date</dc:date>
+                <dc:date>1965</dc:date>
+              </package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.overview, None, "a blank first description");
+        assert_eq!(book.production_year, None, "an unparseable first date");
+    }
+
+    /// `ReadInt32AttributeInto` stores `Convert.ToInt32(Convert.ToDouble(…))`,
+    /// which rounds half to even, for the series index and the rating alike.
+    #[rstest::rstest]
+    #[case("2.5", Some(2))]
+    #[case("0.5", Some(0))]
+    #[case("1.5", Some(2))]
+    #[case("3.49", Some(3))]
+    #[case("1.0", Some(1))]
+    #[case("x", None)]
+    fn calibre_numbers_round_half_to_even(#[case] content: &str, #[case] expected: Option<i32>) {
+        let book = parse_opf(&format!(
+            r#"<package><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+                <meta name="calibre:series_index" content="{content}"/>
+                <meta name="calibre:rating" content="{content}"/></package>"#
+        ))
+        .expect("metadata");
+        assert_eq!(book.index_number, expected);
+        assert_eq!(book.community_rating, expected.map(f64::from));
+    }
+
+    /// The Calibre `<meta>` values are each read with `SelectSingleNode` too:
+    /// a later meta of the same name never replaces, or clears, the first.
+    #[test]
+    fn only_the_first_calibre_meta_of_a_name_counts() {
+        let book = parse_opf(
+            r#"<package><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+                <meta name="calibre:series" content="First Saga"/>
+                <meta name="calibre:series" content="Second Saga"/>
+                <meta name="calibre:series_index" content="1"/>
+                <meta name="calibre:series_index" content="2"/>
+                <meta name="calibre:rating" content="8"/>
+                <meta name="calibre:rating" content="x"/>
+                <meta name="calibre:title_sort" content="First, The"/>
+                <meta name="calibre:title_sort" content="Second, The"/></package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.series_name.as_deref(), Some("First Saga"));
+        assert_eq!(book.index_number, Some(1));
+        assert_eq!(book.community_rating, Some(8.0));
+        assert_eq!(book.sort_name.as_deref(), Some("First, The"));
     }
 
     #[test]
@@ -1962,6 +2099,42 @@ mod tests {
         let (name, bytes) = read_book_cover(&path).expect("cover");
         assert_eq!(name, "cover.jpg");
         assert_eq!(bytes, b"cover bytes");
+    }
+
+    /// `ReadCoverPath`: a `<meta name="cover">` holding a file name finds the
+    /// manifest image at `Images/<name>` before looking the value up as an id.
+    #[test]
+    fn an_epub_cover_meta_can_name_the_file_under_images() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "book.epub",
+            &[
+                (
+                    "META-INF/container.xml",
+                    br#"<container><rootfiles>
+                          <rootfile full-path="OEBPS/content.opf"/>
+                        </rootfiles></container>"#,
+                ),
+                (
+                    "OEBPS/content.opf",
+                    br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                          <metadata>
+                            <dc:title>T</dc:title>
+                            <meta name="cover" content="front.jpg"/>
+                          </metadata>
+                          <manifest>
+                            <item id="img1" href="Images/front.jpg" media-type="image/jpeg"/>
+                          </manifest>
+                        </package>"#,
+                ),
+                ("OEBPS/Images/front.jpg", b"front bytes"),
+            ],
+            None,
+        );
+        let (name, bytes) = read_book_cover(&path).expect("cover");
+        assert_eq!(name, "Images/front.jpg");
+        assert_eq!(bytes, b"front bytes");
     }
 
     #[test]

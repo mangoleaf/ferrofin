@@ -242,11 +242,16 @@ fn forget_warning(warned: &std::sync::Mutex<Option<WarnedFile>>) {
         .take();
 }
 
-/// Hands the two settings that shape item ids to id derivation.
-fn publish_item_id_policy(configuration: &ServerConfiguration) {
+/// Hands the settings that shape derived keys to their derivations: the two
+/// that shape item ids, and the one that shapes a Live TV channel's user-data
+/// keys.
+fn publish_key_policies(configuration: &ServerConfiguration) {
     crate::item_type_lookup::set_item_id_policy(
         configuration.enable_case_sensitive_item_ids,
         configuration.enable_normalized_item_by_name_ids,
+    );
+    crate::user_data_keys::set_live_tv_channel_user_data_name_disabled(
+        configuration.disable_live_tv_channel_user_data_name,
     );
 }
 
@@ -397,7 +402,7 @@ impl FerrofinServerConfigurationManager {
 
         prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
-        publish_item_id_policy(&configuration);
+        publish_key_policies(&configuration);
 
         Ok(Self {
             paths,
@@ -704,7 +709,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             ferrofin_util::file_helper::atomic_write(&path, &json)
                 .map_err(|e| io_err("write configuration", &path, &e))?;
             *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
-            publish_item_id_policy(&replacement);
+            publish_key_policies(&replacement);
             paths.set_cache_path(replacement.cache_path.as_deref());
             paths.set_internal_metadata_path(Some(&replacement.metadata_path));
             notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));

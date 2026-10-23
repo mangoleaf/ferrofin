@@ -5,9 +5,12 @@
 //! a set of `FileSystemWatcher`s over each library root and, on a debounce timer,
 //! feeds changed paths back into the library refresh pipeline. Two behaviors of
 //! that class live on this seam:
-//! - **self-suppression:** while the server itself is writing under a path
-//!   (metadata save, image download) it registers the path as "temporarily
-//!   ignored" so the resulting change events do not trigger a redundant refresh.
+//! - **self-suppression:** the server's own writers (subtitle and lyric saves
+//!   and deletes, NFO and image saves, box-set and playlist folders) bracket
+//!   each file they write ([`SelfWriteGuard`]), as upstream's call
+//!   `ReportFileSystemChangeBeginning`/`Complete`. A change to a bracketed
+//!   path, under it, or to the folder holding it is ignored, and stays ignored
+//!   for [`SELF_WRITE_SETTLE`] after the write, since its events arrive late.
 //!   That set is the in-memory state this type owns.
 //! - **watch lifecycle:** `Start`/`Stop` begin/stop watching, delegated to the
 //!   injected [`FileSystemWatcher`] so the real inotify wrapper is supplied at
@@ -45,7 +48,7 @@ use tokio::time::Instant;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryMonitor, ScanTrigger};
+use ferrofin_traits::library::{LibraryMonitor, ScanTrigger, SelfWriteGuard};
 
 use crate::resolvers::FileSystemWatcher;
 
@@ -242,6 +245,12 @@ impl<T: WatchRootsSource + ?Sized> WatchRootsSource for Arc<T> {
     }
 }
 
+/// How long a path the server wrote stays ignored once the write is over
+/// (`ReportFileSystemChangeComplete`, `LibraryMonitor.cs:93-98`): watcher
+/// events for a write often arrive long after it, up to 45 seconds over a
+/// network share. Upstream hardcodes it, with no setting.
+pub const SELF_WRITE_SETTLE: Duration = Duration::from_secs(45);
+
 /// The concrete library monitor.
 ///
 /// Owns the temporarily-ignored path set (self-suppression) and delegates the
@@ -414,9 +423,12 @@ impl FerrofinLibraryMonitor {
         }
     }
 
-    /// Whether `path` (or an ancestor of it) is currently suppressed. Mirrors C#
-    /// `IsPathLocked` — a change under a directory the server is writing is
-    /// ignored.
+    /// Whether a change to `path` is one of the server's own writes, as
+    /// `ReportFileSystemChanged` decides (`LibraryMonitor.cs:396-411`): `path`
+    /// is a path being written, lies under one, or is the folder holding one
+    /// ("go up a level"). Paths compare as `ManagedFileSystem.AreEqual` and
+    /// `ContainsSubPath` compare them: trailing separators ignored, and case
+    /// too on Windows only.
     ///
     /// # Panics
     ///
@@ -426,9 +438,14 @@ impl FerrofinLibraryMonitor {
     #[must_use]
     pub fn is_path_suppressed(&self, path: &str) -> bool {
         let guard = self.suppressed.lock().expect("suppressed set not poisoned");
-        guard
-            .iter()
-            .any(|p| path == p || path.starts_with(&format!("{p}/")))
+        guard.iter().any(|written| {
+            paths_equal(written, path)
+                || contains_sub_path(written, path)
+                || Path::new(written)
+                    .parent()
+                    .map(|parent| parent.to_string_lossy())
+                    .is_some_and(|parent| !parent.is_empty() && paths_equal(&parent, path))
+        })
     }
 }
 
@@ -478,10 +495,7 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
         }
-        self.suppressed
-            .lock()
-            .expect("suppressed set not poisoned")
-            .insert(path.to_owned());
+        SelfWriteGuard::begin(self, path);
         Ok(())
     }
 
@@ -493,13 +507,7 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
         }
-        self.suppressed
-            .lock()
-            .expect("suppressed set not poisoned")
-            .remove(path);
-        if refresh_path {
-            self.report_file_system_changed(path).await?;
-        }
+        SelfWriteGuard::complete(self, path, refresh_path);
         Ok(())
     }
 
@@ -512,7 +520,95 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     }
 }
 
+/// `ReportFileSystemChangeBeginning` / `ReportFileSystemChangeComplete`
+/// (`LibraryMonitor.cs:79-99`), for the server's own writers.
+impl SelfWriteGuard for FerrofinLibraryMonitor {
+    fn begin(&self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        self.suppressed
+            .lock()
+            .expect("suppressed set not poisoned")
+            .insert(path.to_owned());
+    }
+
+    /// The path stays ignored for [`SELF_WRITE_SETTLE`] more, then is let go
+    /// (and, with `refresh_path`, reported as changed) by a task of its own,
+    /// as upstream's `async void` does. Without a runtime to run that task on
+    /// (no caller today) it is let go at once, and a `refresh_path` report,
+    /// which needs one, is dropped.
+    fn complete(&self, path: &str, refresh_path: bool) {
+        if path.is_empty() {
+            return;
+        }
+        let monitor = self.clone();
+        let written = path.to_owned();
+        let settle = async move {
+            tokio::time::sleep(SELF_WRITE_SETTLE).await;
+            monitor.release(&written, refresh_path).await;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(settle);
+            }
+            Err(_) => {
+                self.suppressed
+                    .lock()
+                    .expect("suppressed set not poisoned")
+                    .remove(path);
+            }
+        }
+    }
+}
+
+/// `ManagedFileSystem.AreEqual`: the same path, trailing separators aside,
+/// ignoring case on Windows only.
+fn paths_equal(a: &str, b: &str) -> bool {
+    let (a, b) = (trim_separators(a), trim_separators(b));
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// `ManagedFileSystem.ContainsSubPath`: `path` lies under `parent`, an
+/// anchored prefix ending at a separator.
+fn contains_sub_path(parent: &str, path: &str) -> bool {
+    let parent = trim_separators(parent);
+    let starts = if cfg!(windows) {
+        path.get(..parent.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(parent))
+    } else {
+        path.starts_with(parent)
+    };
+    path.len() > parent.len()
+        && starts
+        && (parent.ends_with(std::path::is_separator)
+            || path[parent.len()..].starts_with(std::path::is_separator))
+}
+
+/// `Path.TrimEndingDirectorySeparator`: a root stays as it is.
+fn trim_separators(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(std::path::is_separator);
+    if trimmed.is_empty() { path } else { trimmed }
+}
+
 impl FerrofinLibraryMonitor {
+    /// The end of [`SelfWriteGuard::complete`]'s settle: `path` is no longer
+    /// ignored, and with `refresh_path` it is reported as changed (an error
+    /// there is logged, as upstream's `catch` does).
+    async fn release(&self, path: &str, refresh_path: bool) {
+        self.suppressed
+            .lock()
+            .expect("suppressed set not poisoned")
+            .remove(path);
+        if refresh_path && let Err(err) = self.report_file_system_changed(path).await {
+            tracing::error!(path, %err, "failed to report a written path as changed");
+        }
+    }
+
     /// `ReportFileSystemChanged`: queues the refresh of what `path` belongs
     /// to, debounced with every other report whatever its source. `trigger`
     /// labels the batch's scan only when this is the window's first report.
@@ -725,7 +821,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn suppression_spans_a_change_window() {
         let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![]);
         let dir = "/media/movies/Solaris";
@@ -742,6 +838,11 @@ mod tests {
             .report_file_system_change_complete(dir, false)
             .await
             .expect("complete");
+        assert!(
+            monitor.is_path_suppressed(dir),
+            "still, while events settle"
+        );
+        tokio::time::sleep(SELF_WRITE_SETTLE + Duration::from_secs(1)).await;
         assert!(!monitor.is_path_suppressed(dir));
     }
 
@@ -1204,6 +1305,68 @@ mod tests {
             .expect("report");
         monitor.report_webhook_change(path).await.expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `ReportFileSystemChangeComplete` (`LibraryMonitor.cs:79-99`) keeps a
+    /// written path ignored for 45 s after the write, since watcher events
+    /// often arrive late, and `ReportFileSystemChanged` (`:396-411`) also
+    /// ignores a change to the folder holding it. A folder further up is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_write_stays_ignored_for_a_while_with_its_folder() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        let scans = || library.scans.load(std::sync::atomic::Ordering::SeqCst);
+        let dir = "/media/movies/Solaris";
+        let file = format!("{dir}/Solaris.en.srt");
+        monitor
+            .report_file_system_change_beginning(&file)
+            .await
+            .expect("begin");
+        monitor
+            .report_file_system_change_complete(&file, false)
+            .await
+            .expect("complete");
+        for path in [file.clone(), dir.to_owned(), format!("{dir}/")] {
+            monitor
+                .report_file_system_changed(&path)
+                .await
+                .expect("report");
+        }
+        assert_eq!(scans(), 0, "the write and its folder stay ignored");
+        monitor
+            .report_file_system_changed("/media/movies")
+            .await
+            .expect("report");
+        assert_eq!(scans(), 1, "a folder further up is not");
+
+        tokio::time::sleep(Duration::from_secs(46)).await;
+        monitor
+            .report_file_system_changed(&file)
+            .await
+            .expect("report");
+        assert_eq!(scans(), 2, "the write is no longer ignored");
+    }
+
+    /// `ReportFileSystemChangeComplete(path, refreshPath: true)` reports the
+    /// path as changed once it is let go, not while the write settles.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_completed_with_a_refresh_is_reported_once_released() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        let scans = || library.scans.load(std::sync::atomic::Ordering::SeqCst);
+        let file = "/media/tv/recordings/Show.ts";
+        SelfWriteGuard::begin(&monitor, file);
+        SelfWriteGuard::complete(&monitor, file, true);
+        monitor
+            .report_file_system_changed(file)
+            .await
+            .expect("report");
+        assert_eq!(scans(), 0, "still settling");
+        tokio::time::sleep(SELF_WRITE_SETTLE + Duration::from_secs(1)).await;
+        assert_eq!(scans(), 1, "reported when released");
+        assert!(!monitor.is_path_suppressed(file));
     }
 
     /// `ReportFileSystemChanged` also returns when a `.ignore` file hides
