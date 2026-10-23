@@ -12225,48 +12225,7 @@ impl LibraryScanner {
             {
                 continue;
             }
-            // Random content sample; over-fetch since not every row has art.
-            // Upstream samples the collection type's own kinds (a music
-            // library's tile comes from its ALBUMS, whose covers are the art
-            // that exists — sampling leaf tracks found nothing and left the
-            // note-icon placeholder). The leaf fallback keeps a library whose
-            // typed rows have no art from losing its tile.
-            let kinds = collage_item_kinds(folder);
-            let sample = |include_item_types: Vec<BaseItemKind>, is_folder| InternalItemsQuery {
-                ancestor_ids: vec![cf],
-                recursive: true,
-                include_item_types,
-                is_folder,
-                is_virtual_item: Some(false),
-                limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
-                order_by: vec![(
-                    ferrofin_model::live_tv::ItemSortBy::Random,
-                    ferrofin_model::dto::SortOrder::Descending,
-                )],
-                ..Default::default()
-            };
-            let mut candidates = items.get_item_ids(&sample(kinds, None)).await?;
-            if candidates.is_empty() {
-                candidates = items.get_item_ids(&sample(Vec::new(), Some(false))).await?;
-            }
-            let mut inputs = Vec::new();
-            for id in candidates {
-                if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
-                    break;
-                }
-                let infos = items.get_image_infos(id).await?;
-                let best = infos
-                    .iter()
-                    .find(|i| i.image_type == ImageType::Backdrop)
-                    .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Primary))
-                    .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Thumb));
-                if let Some(image) = best
-                    && image.is_local_file()
-                    && std::path::Path::new(&image.path).exists()
-                {
-                    inputs.push(image.path.clone());
-                }
-            }
+            let inputs = Self::library_collage_inputs(items, folder, cf).await?;
             if inputs.is_empty() {
                 continue; // an empty library keeps the icon tile
             }
@@ -12358,6 +12317,59 @@ impl LibraryScanner {
             self.persistence.save_item_images(library, &images).await?;
         }
         Ok(())
+    }
+
+    /// The artwork a library tile is drawn from: up to
+    /// [`LIBRARY_COLLAGE_SOURCES`] random descendants' local Backdrop, else
+    /// Primary, else Thumb.
+    async fn library_collage_inputs(
+        items: &Arc<dyn ItemRepository>,
+        folder: &VirtualFolderInfo,
+        cf: Uuid,
+    ) -> Result<Vec<String>, ServiceError> {
+        // Random content sample; over-fetch since not every row has art.
+        // Upstream samples the collection type's own kinds (a music
+        // library's tile comes from its ALBUMS, whose covers are the art
+        // that exists — sampling leaf tracks found nothing and left the
+        // note-icon placeholder). The leaf fallback keeps a library whose
+        // typed rows have no art from losing its tile.
+        let kinds = collage_item_kinds(folder);
+        let sample = |include_item_types: Vec<BaseItemKind>, is_folder| InternalItemsQuery {
+            ancestor_ids: vec![cf],
+            recursive: true,
+            include_item_types,
+            is_folder,
+            is_virtual_item: Some(false),
+            limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::Random,
+                ferrofin_model::dto::SortOrder::Descending,
+            )],
+            ..Default::default()
+        };
+        let mut candidates = items.get_item_ids(&sample(kinds, None)).await?;
+        if candidates.is_empty() {
+            candidates = items.get_item_ids(&sample(Vec::new(), Some(false))).await?;
+        }
+        let mut inputs = Vec::new();
+        for id in candidates {
+            if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
+                break;
+            }
+            let infos = items.get_image_infos(id).await?;
+            let best = infos
+                .iter()
+                .find(|i| i.image_type == ImageType::Backdrop)
+                .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Primary))
+                .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Thumb));
+            if let Some(image) = best
+                && image.is_local_file()
+                && std::path::Path::new(&image.path).exists()
+            {
+                inputs.push(image.path.clone());
+            }
+        }
+        Ok(inputs)
     }
 
     /// Whether `library`'s tile is drawn this pass
