@@ -299,7 +299,7 @@ async fn get_universal_audio_stream(
 
     // Upstream: "SupportsDirectStream actually means can direct play" here.
     let is_static = source.supports_direct_stream;
-    let mut req = crate::handlers::hls::universal_request(item_id, &auth, &request);
+    let mut req = crate::handlers::hls::universal_request(&state, item_id, &auth, &request);
     req.enable_audio_vbr_encoding = query.enable_audio_vbr_encoding.unwrap_or(true);
     req.play_session_id = Some(negotiated.play_session_id.clone());
     req.media_source_id.clone_from(&query.media_source_id);

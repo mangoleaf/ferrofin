@@ -1466,9 +1466,10 @@ const FORCED_IDR_ENCODERS: [(&str, &str); 6] = [
 ];
 
 /// Upstream's encoders that cannot force a keyframe, so only a pinned GOP
-/// cuts segments. Kept verbatim; [`FORCED_IDR_ENCODERS`] is checked first and
-/// takes its NVENC and QSV entries.
-const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 11] = [
+/// cuts segments. Upstream's list but for `libsvtav1`, which forces keyframes
+/// (see [`hls_video_key_frame_arguments`]); [`FORCED_IDR_ENCODERS`] is checked
+/// first and takes its NVENC and QSV entries.
+const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 10] = [
     "h264_qsv",
     "h264_nvenc",
     "h264_amf",
@@ -1479,7 +1480,6 @@ const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 11] = [
     "av1_qsv",
     "av1_nvenc",
     "av1_amf",
-    "libsvtav1",
 ];
 
 /// Encoders that honour `-force_key_frames` and need no pinned GOP.
@@ -1511,6 +1511,13 @@ const FORCED_KEYFRAME_ENCODERS: [&str; 5] = [
 /// sources. NVENC is verified on real hardware; the QSV half rests on
 /// qsvenc's source (`forced_idr` marks a forced frame IDR) and has not yet
 /// been run on an Intel GPU.
+///
+/// Divergence: upstream gives `libsvtav1` the GOP alone too, which on a
+/// doubled-`tbr` source (`25 fps, 50 tbr`) spans two segments. libsvtav1
+/// honours `-force_key_frames` (ffmpeg n9.0.1 with SVT-AV1 4.2 cuts every
+/// segment on time), so it takes the unknown encoder's arm: the forced
+/// keyframes, and the GOP, which still cuts segments on an older ffmpeg
+/// whose libsvtav1 wrapper ignores a forced keyframe.
 ///
 /// The expression is unquoted because the result is split on whitespace into
 /// argv, not handed to a shell. Returns the arguments **with a leading
@@ -3481,14 +3488,23 @@ mod tests {
         false,
         " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
     )]
-    // Unable to force keyframes: the GOP alone, ceil(3 × 23.976) = 72.
-    #[case("libsvtav1", Some(23.976), false, " -g:v:0 72 -keyint_min:v:0 72")]
+    // Unable to force keyframes: the GOP alone, ceil(3 × 30) = 90.
     #[case("h264_amf", Some(30.0), false, " -g:v:0 90 -keyint_min:v:0 90")]
     // No frame rate, no GOP: nothing at all for these encoders.
-    #[case("libsvtav1", None, false, "")]
+    #[case("h264_amf", None, false, "")]
     // Nor from a rate that is no rate: never `-g:v:0 0` or `NaN`.
-    #[case("libsvtav1", Some(0.0), false, "")]
-    #[case("libsvtav1", Some(f32::NAN), false, "")]
+    #[case("h264_amf", Some(0.0), false, "")]
+    #[case("h264_amf", Some(f32::NAN), false, "")]
+    // libsvtav1 forces keyframes, which cut on time whatever the rate, and
+    // keeps upstream's GOP, ceil(3 × 23.976) = 72, for a build that ignores them.
+    #[case(
+        "libsvtav1",
+        Some(23.976),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -g:v:0 72 -keyint_min:v:0 72"
+    )]
+    #[case("libsvtav1", None, false, FORCED_3S)]
+    #[case("libsvtav1", Some(0.0), false, FORCED_3S)]
     #[case("mpeg4", Some(f32::INFINITY), false, FORCED_3S)]
     // Forced keyframes, and libx264 also loses its scene-cut detection.
     #[case(

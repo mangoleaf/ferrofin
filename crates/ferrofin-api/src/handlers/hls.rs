@@ -325,9 +325,12 @@ struct HlsRequestContext {
     api_key: Option<String>,
     /// Trusted policy snapshot from authorization, including on segment requests.
     playback_permissions: Option<ferrofin_traits::library::PlaybackPermissions>,
-    /// The peer's IP from the connection; `None` when the server was not started
-    /// with connect-info (tests) — treated as not local, the conservative answer.
-    remote_ip: Option<std::net::IpAddr>,
+    /// Whether the client is on the local network: `GetNormalizedRemoteIP()`
+    /// (the client behind any known proxy) judged by
+    /// `INetworkManager.IsInLocalNetwork` (the configured LAN subnets). A
+    /// connection with no peer address (tests) is not local, the
+    /// conservative answer.
+    is_in_local_network: bool,
     /// The route's default for `enableSubtitlesInManifest` when the query omits
     /// it: `false` on the master routes, `true` on `live.m3u8` (upstream's
     /// per-DTO defaults).
@@ -335,29 +338,45 @@ struct HlsRequestContext {
 }
 
 impl HlsRequestContext {
-    /// Reads the token and peer address off the request parts.
+    /// Reads the token and the client's locality off the request parts.
     fn from_parts(
+        state: &AppState,
         auth: &ferrofin_traits::options::AuthorizationInfo,
         parts: &axum::http::request::Parts,
         subtitles_in_manifest_default: bool,
     ) -> Self {
-        Self::from_extensions(auth, &parts.extensions, subtitles_in_manifest_default)
+        Self::from_extensions(
+            state,
+            auth,
+            &parts.extensions,
+            &parts.headers,
+            subtitles_in_manifest_default,
+        )
     }
 
-    /// Reads the token and peer address off the request extensions.
+    /// Reads the token and the client's locality off the request extensions
+    /// and headers.
     fn from_extensions(
+        state: &AppState,
         auth: &ferrofin_traits::options::AuthorizationInfo,
         extensions: &axum::http::Extensions,
+        headers: &axum::http::HeaderMap,
         subtitles_in_manifest_default: bool,
     ) -> Self {
         Self {
             api_key: auth.token.as_ref().map(|t| t.expose().to_owned()),
             playback_permissions: auth.user_policy.as_deref().map(Into::into),
-            // Inserted by the server's `with_connect_info`; absent behind a
-            // body-consuming extractor or in tests.
-            remote_ip: extensions
+            // The peer is inserted by the server's `with_connect_info`; it is
+            // absent only in tests.
+            is_in_local_network: extensions
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip()),
+                .is_some_and(|ci| {
+                    let client = state.client_address_for(
+                        crate::state::normalize_ip(ci.0.ip()),
+                        &crate::state::forwarded_for(headers),
+                    );
+                    state.is_in_local_network(client)
+                }),
             subtitles_in_manifest_default,
         }
     }
@@ -437,9 +456,7 @@ fn build_request(
         enable_trickplay: query.enable_trickplay.unwrap_or(true),
         api_key: ctx.api_key,
         playback_permissions: ctx.playback_permissions,
-        is_in_local_network: ctx
-            .remote_ip
-            .is_some_and(crate::handlers::system::is_in_local_network),
+        is_in_local_network: ctx.is_in_local_network,
         query_string,
         // Fields this route does not read keep their DTO defaults.
         ..HlsStreamRequest::default()
@@ -562,6 +579,7 @@ pub(crate) struct HlsQueryPub(HlsQuery);
 /// every streaming field at its DTO default for the caller to fill in. None is
 /// read from the universal query, which binds its own parameters.
 pub(crate) fn universal_request(
+    state: &AppState,
     item_id: Uuid,
     auth: &ferrofin_traits::options::AuthorizationInfo,
     request: &Request,
@@ -570,7 +588,13 @@ pub(crate) fn universal_request(
         item_id,
         HlsQuery::default(),
         request.uri().query().map(ToOwned::to_owned),
-        HlsRequestContext::from_extensions(auth, request.extensions(), false),
+        HlsRequestContext::from_extensions(
+            state,
+            auth,
+            request.extensions(),
+            request.headers(),
+            false,
+        ),
     )
 }
 
@@ -655,7 +679,7 @@ async fn get_video_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, false).await?;
     Ok(master_playlist_response(&parts.method, playlist))
@@ -670,7 +694,7 @@ async fn get_video_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, false).await?;
     Ok(playlist_response(playlist))
@@ -686,7 +710,7 @@ async fn get_video_live_playlist(
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
     // `GetLiveHlsStream` defaults `EnableSubtitlesInManifest` to true.
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, true);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, true);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.live_playlist(&req).await?;
     Ok(playlist_response(playlist))
@@ -701,7 +725,7 @@ async fn get_audio_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, true).await?;
     Ok(master_playlist_response(&parts.method, playlist))
@@ -716,7 +740,7 @@ async fn get_audio_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, true).await?;
     Ok(playlist_response(playlist))
@@ -753,7 +777,7 @@ async fn get_video_hls_segment(
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
     let (parts, body) = request.into_parts();
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let request = Request::from_parts(parts, body);
     let req = build_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, false).await?;
@@ -772,7 +796,7 @@ async fn get_audio_hls_segment(
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
     let (parts, body) = request.into_parts();
-    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let request = Request::from_parts(parts, body);
     let req = build_audio_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, true).await?;
@@ -1252,9 +1276,7 @@ mod tests {
         let ctx = HlsRequestContext {
             api_key: Some("tok".to_owned()),
             playback_permissions: None,
-            remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                192, 168, 1, 5,
-            ))),
+            is_in_local_network: true,
             subtitles_in_manifest_default: false,
         };
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
@@ -1274,15 +1296,15 @@ mod tests {
         assert!(req.enable_adaptive_bitrate_streaming);
         assert!(!req.enable_trickplay);
         assert_eq!(req.api_key.as_deref(), Some("tok"));
-        assert!(req.is_in_local_network, "RFC1918 peer is local");
+        assert!(req.is_in_local_network, "a local client is local");
 
         // The route default fills an omitted `EnableSubtitlesInManifest`
-        // (`live.m3u8` defaults it to true); a public peer is not local.
+        // (`live.m3u8` defaults it to true); a remote client is not local.
         let query: HlsQuery = parse("").expect("parses");
         let ctx = HlsRequestContext {
             api_key: None,
             playback_permissions: None,
-            remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))),
+            is_in_local_network: false,
             subtitles_in_manifest_default: true,
         };
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
