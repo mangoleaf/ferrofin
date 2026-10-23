@@ -1135,6 +1135,21 @@ impl crate::library_monitor::WatchRootsSource for FerrofinVirtualFolderManager {
             }
         }
     }
+
+    async fn library_locations(&self) -> Vec<String> {
+        // Every location of every library, monitored or not, from the
+        // snapshot the `watch_roots` listing just refreshed.
+        match self.library_folders().await {
+            Ok(folders) => folders
+                .iter()
+                .flat_map(|f| f.locations.iter().cloned())
+                .collect(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to list libraries for their locations");
+                Vec::new()
+            }
+        }
+    }
 }
 
 impl FerrofinVirtualFolderManager {
@@ -3106,12 +3121,18 @@ mod tests {
         let mut on = opts_with_paths(std::slice::from_ref(&watched));
         on.enable_realtime_monitor = true;
         mgr.add_virtual_folder("Watched", None, &on).await.unwrap();
-        let mut off = opts_with_paths(&[unwatched]);
+        let mut off = opts_with_paths(std::slice::from_ref(&unwatched));
         off.enable_realtime_monitor = false;
         mgr.add_virtual_folder("Silent", None, &off).await.unwrap();
 
-        // Only the realtime-enabled library's locations are watch roots.
-        assert_eq!(mgr.watch_roots().await, vec![watched]);
+        // Only the realtime-enabled library's locations are watch roots, but
+        // both libraries' locations are library locations.
+        assert_eq!(mgr.watch_roots().await, vec![watched.clone()]);
+        let mut all = mgr.library_locations().await;
+        all.sort();
+        let mut expected = vec![watched, unwatched];
+        expected.sort();
+        assert_eq!(all, expected);
     }
 
     #[tokio::test]

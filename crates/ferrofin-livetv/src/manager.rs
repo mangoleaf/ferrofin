@@ -378,6 +378,9 @@ pub struct FerrofinLiveTvManager {
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
+    /// The NFO options' `ReleaseDateFormat`, for a recording's sidecar NFO
+    /// ([`with_release_date_format`](Self::with_release_date_format)).
+    release_date_format: crate::recording_metadata::ReleaseDateFormat,
     /// Serializes "join or open", so two clients tuning the same channel at
     /// once cannot both miss the join and both dial the tuner.
     ///
@@ -691,6 +694,7 @@ impl FerrofinLiveTvManager {
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
+            release_date_format: crate::recording_metadata::default_release_date_format(),
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             schedules_direct,
@@ -716,6 +720,18 @@ impl FerrofinLiveTvManager {
     #[must_use]
     pub fn with_encoder(mut self, encoder: Arc<dyn MediaEncoder>) -> Self {
         self.encoder = Some(encoder);
+        self
+    }
+
+    /// Writes a recording NFO's dates in the NFO options' `ReleaseDateFormat`
+    /// (the `xbmcmetadata` named configuration). Without one they are written
+    /// `yyyy-MM-dd`, that option's default.
+    #[must_use]
+    pub fn with_release_date_format(
+        mut self,
+        format: crate::recording_metadata::ReleaseDateFormat,
+    ) -> Self {
+        self.release_date_format = format;
         self
     }
 
@@ -4070,7 +4086,7 @@ impl FerrofinLiveTvManager {
         info: TimerRecordingInfo,
     ) -> Result<(), ServiceError> {
         let options = self.live_tv_options().await;
-        let (target, _series_path) =
+        let (target, series_path) =
             crate::dvr::recording_path(&info, &options, &self.paths.data_dir);
         let target = {
             let active: Vec<ActiveRecording> =
@@ -4078,7 +4094,14 @@ impl FerrofinLiveTvManager {
             crate::dvr::ensure_file_unique(&target, &info.id, &active)
         };
 
-        let capture = self.capture(&mut timer, &info, &target).await;
+        let capture = self
+            .capture(
+                &mut timer,
+                &info,
+                &target,
+                (series_path.as_deref(), &options),
+            )
+            .await;
         let (recording_id, outcome) = match capture {
             Ok(captured) => captured,
             // Nothing was ever opened or registered, so there is nothing to
@@ -4106,6 +4129,7 @@ impl FerrofinLiveTvManager {
         timer: &mut TimerInfoDto,
         info: &TimerRecordingInfo,
         target: &std::path::Path,
+        sidecars: (Option<&std::path::Path>, &LiveTvOptions),
     ) -> Result<(Option<Uuid>, Result<(), ServiceError>), ServiceError> {
         // The tuner source, opened if it needs opening.
         let sources = self.get_channel_media_sources(info.channel_id).await?;
@@ -4128,7 +4152,9 @@ impl FerrofinLiveTvManager {
 
         // From here on the tuner is open: every exit goes through
         // `finish_capture`, which closes it and de-registers.
-        let started = self.start_capture(timer, info, target, &opened).await;
+        let started = self
+            .start_capture(timer, info, target, &opened, sidecars)
+            .await;
         let (recording_id, outcome) = match started {
             Ok((recording_id, cancel)) => {
                 let outcome = self
@@ -4151,6 +4177,7 @@ impl FerrofinLiveTvManager {
         info: &TimerRecordingInfo,
         target: &std::path::Path,
         opened: &MediaSourceInfo,
+        (series, options): (Option<&std::path::Path>, &LiveTvOptions),
     ) -> Result<(Uuid, Arc<std::sync::atomic::AtomicBool>), ServiceError> {
         let _ = opened;
         let recording_id = Uuid::new_v4();
@@ -4168,6 +4195,42 @@ impl FerrofinLiveTvManager {
             .insert(info.id.clone(), recording);
         timer.status = RecordingStatus::InProgress;
         self.persist_timer(timer).await?;
+        // `SaveRecordingMetadata`, which upstream's `async void OnStarted`
+        // runs without the recorder waiting on it. A failure is logged, as
+        // its catch-all logs it: a sidecar never fails a recording.
+        if options.save_recording_nfo {
+            let info = info.clone();
+            let target = target.to_path_buf();
+            let series = series.map(std::path::Path::to_path_buf);
+            let release_date = Arc::clone(&self.release_date_format);
+            let span = tracing::info_span!("recording_nfo", timer_id = %info.id);
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(error) = crate::recording_metadata::save_recording_nfo(
+                        &info,
+                        &target,
+                        series.as_deref(),
+                        &release_date,
+                        Utc::now(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            path = %target.display(),
+                            %error,
+                            "live tv: could not save the recording's NFO"
+                        );
+                    }
+                },
+                span,
+            ));
+        }
+        // TODO(parity, open work item — NOT an accepted divergence; gl-749):
+        // with `save_recording_images`, upstream also copies the programme's
+        // artwork beside the recording (`SaveRecordingImages`), but the guide
+        // carries no programme images yet (gl-367). Un-defer path: once it
+        // does, port `SaveRecordingImages` into `recording_metadata` and call
+        // it here, gated on that option.
         Ok((recording_id, cancel))
     }
 
@@ -5374,6 +5437,12 @@ fn apply_program_to_recording_info(program: &GuideProgramRow, info: &mut TimerRe
     info.is_repeat = program.is_repeat;
     info.is_premiere = program.is_premiere;
     info.external_program_id.clone_from(&program.external_id);
+    info.genres = program
+        .genres
+        .as_deref()
+        .and_then(|g| serde_json::from_str(g).ok())
+        .unwrap_or_default();
+    info.official_rating.clone_from(&program.official_rating);
 }
 
 /// How far through a running capture is, as a percentage.
@@ -7872,6 +7941,92 @@ mod tests {
             "a failed attempt leaves no fileless recording"
         );
         mgr.cancel_timer(&timer_id).await.expect("cancel");
+    }
+
+    /// `RecordingsManager.RecordStream`'s `OnStarted` saves the guide's
+    /// metadata beside the recording (`RecordingsMetadataManager
+    /// .SaveRecordingMetadata`, with "Save EPG metadata to NFO files" on by
+    /// default): a programme that is neither a series nor a movie gets a
+    /// locked `<movie>` NFO, dated in UTC.
+    #[tokio::test]
+    async fn a_started_recording_gets_its_guide_nfo_beside_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let defaults = mgr
+            .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults");
+        let before = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+        })
+        .await
+        .expect("a capture is in progress");
+        let nfo = std::path::Path::new(&path).with_extension("nfo");
+        let body = wait_for(|| async { tokio::fs::read_to_string(&nfo).await.ok() })
+            .await
+            .expect("the recording's NFO");
+        let after = chrono::Utc::now() + chrono::Duration::seconds(2);
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+
+        let head = "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n\
+                    <movie>\n  <title>Now Playing</title>\n  <dateadded>";
+        assert!(body.starts_with(head), "{body}");
+        let tail = "</dateadded>\n  <plot />\n  <genre>Drama</genre>\n  \
+                    <lockdata>true</lockdata>\n</movie>";
+        assert!(body.ends_with(tail), "{body}");
+        let added = chrono::NaiveDateTime::parse_from_str(
+            &body[head.len()..body.len() - tail.len()],
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .expect("dateadded")
+        .and_utc();
+        assert!(before <= added && added <= after, "{added} is not UTC now");
+    }
+
+    /// With "Save EPG metadata to NFO files" off, a recording gets no NFO.
+    #[tokio::test]
+    async fn a_recording_gets_no_nfo_when_the_option_is_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let named = dir.path().join("named");
+        std::fs::create_dir_all(&named).expect("mkdir");
+        let options = ferrofin_model::live_tv::LiveTvOptions {
+            save_recording_nfo: false,
+            ..ferrofin_model::live_tv::LiveTvOptions::default()
+        };
+        std::fs::write(
+            named.join("livetv.json"),
+            serde_json::to_string(&options).expect("serialize options"),
+        )
+        .expect("write options");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let defaults = mgr
+            .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults");
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+        })
+        .await
+        .expect("a capture is in progress");
+        // The NFO, when on, is written within a fraction of this.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+        assert!(!std::path::Path::new(&path).with_extension("nfo").exists());
     }
 
     #[tokio::test]
