@@ -1266,6 +1266,22 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Items/{itemId}/ContentType",
+        upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
+        upstream_method: "UpdateItemContentType",
+        ferrofin: "handlers/item_update.rs update_item_content_type → ferrofin-core \
+               library_manager.rs containing_folder_path (BaseItem/Video/Playlist and the \
+               by-name ContainingFolderPath overrides) → ferrofin-model \
+               content_type_overrides.rs with_content_type_override",
+        date: "2026-10-21",
+        divergences: &[
+            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

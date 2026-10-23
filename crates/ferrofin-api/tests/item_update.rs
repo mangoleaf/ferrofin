@@ -22,7 +22,9 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::MetadataEditorInfo;
+use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
+use ferrofin_model::dto::{MetadataEditorInfo, NameValuePair};
 use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::ExternalIdInfo;
 use ferrofin_model::querying::QueryResult;
@@ -330,6 +332,10 @@ struct Tree {
     locked_written: Mutex<Vec<(Uuid, Vec<i32>)>>,
     /// Other items the library resolves by id (a folder's parent).
     others: Vec<BaseItemEntity>,
+    /// What `get_inherited_content_type` answers: `None` is a mixed library.
+    inherited_content_type: Option<CollectionType>,
+    /// What `get_configured_content_type` answers: the item's override.
+    configured_content_type: Option<CollectionType>,
     /// `update_people` calls: the item and the credits written.
     people_written: Mutex<Vec<(String, Vec<PeopleEntity>)>>,
 }
@@ -571,6 +577,18 @@ impl LibraryManager for OkLibrary {
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         unimplemented!()
+    }
+    async fn get_inherited_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(self.tree.inherited_content_type)
+    }
+    async fn get_configured_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(self.tree.configured_content_type)
     }
 }
 
@@ -820,12 +838,30 @@ fn state_with_library(library: Arc<OkLibrary>, queued: Arc<Mutex<Vec<Uuid>>>) ->
     state_recording_options(library, queued, RecordedOptions::default())
 }
 
+/// [`state_with_library`] over `config` (the content-type tests).
+fn state_with_library_and_config(
+    library: Arc<OkLibrary>,
+    config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+) -> AppState {
+    build_state(library, Arc::default(), RecordedOptions::default(), config)
+}
+
 /// [`state_with_library`] recording the options of each provider refresh
 /// into `options`.
 fn state_recording_options(
     library: Arc<OkLibrary>,
     queued: Arc<Mutex<Vec<Uuid>>>,
     options: RecordedOptions,
+) -> AppState {
+    build_state(library, queued, options, Arc::new(FakeConfig))
+}
+
+/// The item-update [`AppState`] over `config`.
+fn build_state(
+    library: Arc<OkLibrary>,
+    queued: Arc<Mutex<Vec<Uuid>>>,
+    options: RecordedOptions,
+    config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
 ) -> AppState {
     AppState::new(
         library,
@@ -836,7 +872,7 @@ fn state_recording_options(
         Arc::new(FakeSessions),
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
-        Arc::new(FakeConfig),
+        config,
         Arc::new(RecordingProviders { queued, options }),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
@@ -2397,8 +2433,7 @@ async fn refresh_missing_item_is_404() {
     assert!(queued.lock().unwrap().is_empty());
 }
 
-/// `POST /Items/{itemId}/ContentType` for a missing item is a `404` (the
-/// success path needs a full `ServerConfiguration`, exercised in `ferrofin-core`).
+/// `POST /Items/{itemId}/ContentType` for a missing item is a `404`.
 #[tokio::test]
 async fn content_type_missing_item_is_404() {
     let router = create_router(state(
@@ -2434,10 +2469,11 @@ async fn metadata_editor_returns_descriptor() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
-    // A plain library item (e.g. a Movie) gets an empty ContentTypeOptions —
-    // Jellyfin only populates it for a collection-folder whose content type is
-    // configurable. See get_metadata_editor.
-    assert!(info.content_type_options.is_empty());
+    // The fixture item's library type is unknown (a mixed library) and it has
+    // no override: the selector offers Inherit, Movies and Shows
+    // (`content_type_*` tests below cover the rest).
+    assert_eq!(info.content_type_options.len(), 3);
+    assert_eq!(info.content_type, None);
     assert_eq!(info.external_id_infos.len(), 1);
 
     // Cultures are deduped case-insensitively and ordered case-insensitively, the
@@ -2466,6 +2502,311 @@ async fn metadata_editor_missing_item_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- folder content-type overrides -------------------------------------------
+
+/// A [`ServerConfigurationManager`] holding one configuration, which
+/// `update_configuration` replaces.
+#[derive(Default)]
+struct RecordingConfig(Mutex<ServerConfiguration>);
+
+#[async_trait]
+impl ferrofin_traits::configuration::ServerConfigurationManager for RecordingConfig {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        Arc::new(ferrofin_api::test_support::FakePaths)
+    }
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(self.0.lock().unwrap().clone()))
+    }
+    async fn update_configuration(
+        &self,
+        configuration: &ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        configuration.clone_into(&mut self.0.lock().unwrap());
+        Ok(())
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// The library for the content-type tests: `ITEM_ID` is `item`, its library's
+/// type is `inherited` and its override `configured`.
+fn content_type_library(
+    item: BaseItemEntity,
+    inherited: Option<CollectionType>,
+    configured: Option<CollectionType>,
+) -> Arc<OkLibrary> {
+    Arc::new(OkLibrary {
+        item_id: ITEM_ID,
+        is_folder: item.is_folder,
+        top_parent_id: None,
+        refresh_scans: Arc::default(),
+        provider_ids: Arc::default(),
+        updated: Arc::default(),
+        tree: Arc::new(Tree {
+            root: Some(item),
+            inherited_content_type: inherited,
+            configured_content_type: configured,
+            ..Tree::default()
+        }),
+    })
+}
+
+/// A row of `kind` at `path`.
+fn item_at(kind: BaseItemKind, path: &str, is_folder: bool) -> BaseItemEntity {
+    let mut item = base_item_entity(ITEM_ID);
+    kind.stored_type_name()
+        .expect("a stored kind")
+        .clone_into(&mut item.type_);
+    item.path = Some(path.to_owned());
+    item.is_folder = is_folder;
+    item
+}
+
+/// One request against `state`: (status, body bytes).
+async fn send_to(state: AppState, method: &str, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", "Token abc")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, bytes.to_vec())
+}
+
+/// The editor's `(ContentType, option values)` for `item`.
+async fn content_type_editor(
+    item: BaseItemEntity,
+    inherited: Option<CollectionType>,
+    configured: Option<CollectionType>,
+) -> (Option<CollectionType>, Vec<String>) {
+    let state = state_with_library(
+        content_type_library(item, inherited, configured),
+        Arc::default(),
+    );
+    let (status, body) = send_to(state, "GET", &format!("/Items/{ITEM_ID}/MetadataEditor")).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
+    let values = info
+        .content_type_options
+        .into_iter()
+        .map(|option| option.value.unwrap_or_default())
+        .collect();
+    (info.content_type, values)
+}
+
+/// v12.2 `GetMetadataEditorInfo`: in a mixed library (no inherited type) a
+/// folder is offered Inherit, Movies and Shows (#15797 added Movies); with an
+/// override it shows it.
+#[tokio::test]
+async fn a_mixed_library_folder_is_offered_inherit_movies_and_shows() {
+    let folder = || item_at(BaseItemKind::Series, "/media/mixed/Blade (1998)", true);
+    assert_eq!(
+        content_type_editor(folder(), None, None).await,
+        (None, vec![String::new(), "movies".into(), "tvshows".into()])
+    );
+    assert_eq!(
+        content_type_editor(folder(), None, Some(CollectionType::movies)).await,
+        (
+            Some(CollectionType::movies),
+            vec![String::new(), "movies".into(), "tvshows".into()]
+        )
+    );
+}
+
+/// Where the library has a type, the selector appears only for an item that
+/// already has an override, and only movies and shows libraries filter it.
+#[tokio::test]
+async fn a_typed_library_offers_the_selector_only_with_an_override() {
+    let folder = || item_at(BaseItemKind::Folder, "/media/movies/Sets", true);
+    assert_eq!(
+        content_type_editor(folder(), Some(CollectionType::movies), None).await,
+        (None, Vec::new())
+    );
+    assert_eq!(
+        content_type_editor(
+            folder(),
+            Some(CollectionType::tvshows),
+            Some(CollectionType::movies)
+        )
+        .await,
+        (
+            Some(CollectionType::movies),
+            vec![String::new(), "movies".into(), "tvshows".into()]
+        )
+    );
+    assert_eq!(
+        content_type_editor(
+            folder(),
+            Some(CollectionType::music),
+            Some(CollectionType::homevideos)
+        )
+        .await,
+        (
+            Some(CollectionType::homevideos),
+            [
+                "",
+                "movies",
+                "music",
+                "tvshows",
+                "homevideos",
+                "musicvideos",
+                "photos"
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        )
+    );
+}
+
+/// The option names go through the server's localization
+/// (`GetLocalizedString`); the stub returns the phrase.
+#[tokio::test]
+async fn the_option_names_are_the_localized_phrases() {
+    let state = state_with_library(
+        content_type_library(
+            item_at(BaseItemKind::Folder, "/media/x", true),
+            Some(CollectionType::music),
+            Some(CollectionType::music),
+        ),
+        Arc::default(),
+    );
+    let (_, body) = send_to(state, "GET", &format!("/Items/{ITEM_ID}/MetadataEditor")).await;
+    let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
+    let names: Vec<_> = info
+        .content_type_options
+        .into_iter()
+        .map(|option| option.name.unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Inherit",
+            "Movies",
+            "Music",
+            "Shows",
+            "HomeVideos",
+            "MusicVideos",
+            "Photos"
+        ]
+    );
+}
+
+/// The guard: a virtual item, a library, a user view, a by-name item, a Live
+/// TV channel or a channel's item never offers the selector, whatever the
+/// library.
+#[tokio::test]
+async fn items_outside_a_library_are_offered_nothing() {
+    let virtual_item = {
+        let mut item = item_at(
+            BaseItemKind::Episode,
+            "/media/mixed/Show/missing.mkv",
+            false,
+        );
+        item.is_virtual_item = true;
+        item
+    };
+    let channel_item = {
+        let mut item = item_at(BaseItemKind::Movie, "/media/mixed/x.mkv", false);
+        item.channel_id = Some(Uuid::from_u128(0xC4).to_string());
+        item
+    };
+    for item in [
+        virtual_item,
+        channel_item,
+        item_at(
+            BaseItemKind::CollectionFolder,
+            "/config/root/default/Mixed",
+            true,
+        ),
+        item_at(BaseItemKind::UserView, "/config/views/x", true),
+        item_at(BaseItemKind::AggregateFolder, "/config/root", true),
+        item_at(BaseItemKind::Person, "/config/metadata/People/A/Ada", false),
+        item_at(BaseItemKind::MusicArtist, "/media/music/Artist", true),
+        item_at(BaseItemKind::TvChannel, "/livetv/1", false),
+    ] {
+        let type_ = item.type_.clone();
+        assert_eq!(
+            content_type_editor(item, None, Some(CollectionType::movies)).await,
+            (None, Vec::new()),
+            "{type_}"
+        );
+    }
+}
+
+/// v12.2 `UpdateItemContentType`: the override is keyed on the item's
+/// `ContainingFolderPath` — a folder's own path, a file's directory — and the
+/// folder's previous entry is replaced; a blank type only clears it.
+#[tokio::test]
+async fn setting_a_content_type_keys_the_items_containing_folder() {
+    async fn post(item: BaseItemEntity, config: &Arc<RecordingConfig>, value: &str) {
+        let state = state_with_library_and_config(
+            content_type_library(item, None, None),
+            Arc::clone(config) as _,
+        );
+        let (status, _) = send_to(
+            state,
+            "POST",
+            // jellyfin-web's spelling; the query binds ignoring case.
+            &format!("/Items/{ITEM_ID}/ContentType?ContentType={value}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let entries = |config: &RecordingConfig| config.0.lock().unwrap().content_types.clone();
+    let pair = |name: &str, value: &str| NameValuePair {
+        name: Some(name.to_owned()),
+        value: Some(value.to_owned()),
+    };
+    let config = Arc::new(RecordingConfig::default());
+    let series = || item_at(BaseItemKind::Series, "/media/mixed/Blade (1998)", true);
+    post(series(), &config, "tvshows").await;
+    post(series(), &config, "movies").await;
+    assert_eq!(
+        entries(&config),
+        vec![pair("/media/mixed/Blade (1998)", "movies")]
+    );
+    post(
+        item_at(
+            BaseItemKind::Movie,
+            "/media/mixed/Heat (1995)/Heat.mkv",
+            false,
+        ),
+        &config,
+        "movies",
+    )
+    .await;
+    assert_eq!(
+        entries(&config),
+        vec![
+            pair("/media/mixed/Blade (1998)", "movies"),
+            pair("/media/mixed/Heat (1995)", "movies"),
+        ]
+    );
+    post(series(), &config, "").await;
+    assert_eq!(
+        entries(&config),
+        vec![pair("/media/mixed/Heat (1995)", "movies")]
+    );
 }
 
 // ---- from batch14_handlers.rs -------------------------------------------------
