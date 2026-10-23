@@ -286,6 +286,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   fail part-way, for example on a full disk. When it does, the request still fails, but
   the server now also refreshes its folder watch and runs the scan the request asked for,
   as Jellyfin does. Before, both were skipped until the next scan
+- A library's folder shortcuts are written as Jellyfin writes them. They are named after
+  the folder without its extension (`Films.HD` gives `Films.mblink`), and a folder inside
+  the server's data directory is stored as `%AppDataPath%/…`, so it keeps working if the
+  data directory moves
 - During a transcode, PGS and VobSub subtitles a client can draw itself are delivered as
   separate subtitle files, as in Jellyfin 12, instead of being burned into the video. The
   "Allow subtitle extraction on the fly" setting now applies: with it off, other embedded
