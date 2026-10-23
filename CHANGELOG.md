@@ -179,8 +179,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
   expires or the account changes (it was renewed for every subtitle). A rejected token is
   renewed and the download retried once. The account's daily quota is tracked: once it is
-  spent, downloads stop with "OpenSubtitles download limit reached" until its reset time,
-  and the remaining count is logged after each download
+  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
+  OpenSubtitles until its reset time, and the remaining count is logged after each
+  download. A download without an account is refused before any request, and the error for
+  a refused download carries the API's reply (a web page as `[html]`), as the plugin's does
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
