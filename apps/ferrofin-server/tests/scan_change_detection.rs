@@ -244,9 +244,16 @@ impl Providers {
 fn subtitle_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
     let path = target.split('?').next()?;
     Some(match path {
-        "/opensubtitles/login" => json!({"token":"test-token"}).to_string(),
+        // A JWT expiring in 2100 (`{"exp":4102444800}`): downloads reuse it.
+        "/opensubtitles/login" => {
+            json!({"token":"eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln"}).to_string()
+        }
+        "/opensubtitles/infos/user" => json!({"data":{
+            "allowed_downloads":20,"remaining_downloads":20,"reset_time_utc":"2100-01-01T00:00:00Z"
+        }})
+        .to_string(),
         "/opensubtitles/download" => {
-            json!({"link":format!("http://{addr}/subtitle-file")}).to_string()
+            json!({"link":format!("http://{addr}/subtitle-file"),"remaining":19}).to_string()
         }
         "/opensubtitles/subtitles" => {
             assert!(target.contains("moviehash="));
@@ -2659,12 +2666,21 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let first = h.settle(mark, &[("api", 1.0)]).await;
+    let subtitles = of(&first.requests, "opensubtitles");
     assert_eq!(
-        of(&first.requests, "opensubtitles").len(),
-        3,
-        "search + login + download: {:?}",
+        subtitles.len(),
+        4,
+        "search + login + quota + download: {:?}",
         first.requests
     );
+    for path in ["/login", "/infos/user", "/download"] {
+        assert!(
+            subtitles
+                .iter()
+                .any(|r| r.contains(&format!("/opensubtitles{path}"))),
+            "{path} in {subtitles:?}"
+        );
+    }
     assert!(first.requests.iter().any(|r| r.contains("languages=en")));
     assert!(!first.requests.iter().any(|r| r.contains("languages=fr")));
     let english = movie.with_extension("eng.srt");
@@ -2701,7 +2717,25 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let repaired = h.settle(mark, &[("api", 1.0)]).await;
-    assert_eq!(of(&repaired.requests, "opensubtitles").len(), 3);
+    let subtitles = of(&repaired.requests, "opensubtitles");
+    assert_eq!(
+        subtitles.len(),
+        2,
+        "search + download, on the first download's login: {:?}",
+        repaired.requests
+    );
+    assert!(
+        subtitles
+            .iter()
+            .any(|r| r.contains("/opensubtitles/download")),
+        "{subtitles:?}"
+    );
+    assert!(
+        !subtitles
+            .iter()
+            .any(|r| r.contains("/opensubtitles/login") || r.contains("/opensubtitles/infos/user")),
+        "the first download's login is reused: {subtitles:?}"
+    );
     assert_eq!(std::fs::read(&english).unwrap(), content);
 
     options["DisabledSubtitleFetchers"] = json!(["opensubtitles"]);

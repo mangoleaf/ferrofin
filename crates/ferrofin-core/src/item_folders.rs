@@ -7,7 +7,6 @@
 
 use std::path::Path;
 
-use ferrofin_db::store::guid_to_db;
 use ferrofin_traits::system::PathManager;
 use uuid::Uuid;
 
@@ -83,16 +82,14 @@ pub(crate) fn move_item_folders(
     (folders, prefixes)
 }
 
-/// The two folders an item's art and internal metadata live in under the
-/// item art root `art_root` (`{metadata}/library`): Ferrofin's
-/// `{art_root}/{GUID}`, and Jellyfin's `{art_root}/{idN[..2]}/{idN}`
-/// (`BaseItem.GetInternalMetadataPath`), which an adopted item carries.
-pub(crate) fn item_art_folders(art_root: &Path, id: Uuid) -> [std::path::PathBuf; 2] {
-    let dashless = id.simple().to_string();
-    [
-        art_root.join(guid_to_db(id)),
-        art_root.join(&dashless[..2]).join(&dashless),
-    ]
+/// The folders an item's art and internal metadata live in under the item
+/// art root `art_root` (`{metadata}/library`): Ferrofin's `{art_root}/{GUID}`,
+/// the lower-cased spelling older scans also wrote art to
+/// ([`crate::dynamic_images::legacy_art_dir`]), and Jellyfin's
+/// `{art_root}/{idN[..2]}/{idN}` (`BaseItem.GetInternalMetadataPath`), which an
+/// adopted item carries.
+pub(crate) fn item_art_folders(art_root: &Path, id: Uuid) -> [std::path::PathBuf; 3] {
+    crate::dynamic_images::internal_metadata_dirs(art_root, id)
 }
 
 /// What [`move_folders`] did, to be confirmed or undone once the database
@@ -284,5 +281,35 @@ mod tests {
             assert!(tmp.path().join(kept).is_dir(), "{kept}");
         }
         assert!(!tmp.path().join("art/MOVING").exists());
+    }
+
+    /// A re-key moves the lower-cased art folder older scans wrote, too, to
+    /// the new id's: an item's art folders are its own, that legacy one and
+    /// Jellyfin's `{xx}/{id:N}`.
+    #[test]
+    fn a_rekey_moves_the_legacy_art_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let art = tmp.path().join("library");
+        let (from, to) = (
+            uuid::Uuid::from_u128(0xABCD_0001),
+            uuid::Uuid::from_u128(0xABCD_0002),
+        );
+        let folders = super::item_art_folders(&art, from);
+        assert_eq!(
+            folders[1],
+            crate::dynamic_images::legacy_art_dir(&art, from),
+            "{folders:?}"
+        );
+        let legacy = crate::dynamic_images::legacy_art_dir(&art, from);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("thumb.jpg"), b"x").unwrap();
+        let (moved, _) = super::move_item_folders(Some(&art), None, (from, to), "", false);
+        moved.commit();
+        assert!(
+            crate::dynamic_images::legacy_art_dir(&art, to)
+                .join("thumb.jpg")
+                .is_file()
+        );
+        assert!(!legacy.exists());
     }
 }

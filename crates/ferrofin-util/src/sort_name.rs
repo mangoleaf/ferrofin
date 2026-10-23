@@ -1,18 +1,68 @@
 //! Sort-name derivation — port of C# `BaseItem.GetSortName` / `CreateSortName` /
 //! `ModifySortChunks` (Jellyfin 12.0 `MediaBrowser.Controller/Entities/BaseItem.cs`),
-//! with Jellyfin's default `SortRemoveWords` / `SortRemoveCharacters` /
-//! `SortReplaceCharacters`.
+//! with the server's `SortRemoveWords` / `SortRemoveCharacters` /
+//! `SortReplaceCharacters` ([`SortRules`], installed by the server with
+//! [`install_sort_rules`]; Jellyfin's defaults until then).
+
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use crate::string_extensions::{lower_invariant, remove_diacritics};
 
-/// `ServerConfiguration.SortRemoveWords` — leading/interior/trailing articles.
+/// `ServerConfiguration.SortRemoveWords` defaults — leading/interior/trailing
+/// articles.
 const SORT_REMOVE_WORDS: [&str; 3] = ["the", "a", "an"];
 
-/// `ServerConfiguration.SortRemoveCharacters` — deleted outright.
-const SORT_REMOVE_CHARACTERS: [char; 6] = [',', '&', '-', '{', '}', '\''];
+/// `ServerConfiguration.SortRemoveCharacters` defaults — deleted outright.
+const SORT_REMOVE_CHARACTERS: [&str; 6] = [",", "&", "-", "{", "}", "'"];
 
-/// `ServerConfiguration.SortReplaceCharacters` — each becomes a space.
-const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
+/// `ServerConfiguration.SortReplaceCharacters` defaults — each becomes a space.
+const SORT_REPLACE_CHARACTERS: [&str; 3] = [".", "+", "%"];
+
+/// The three lists `GetSortName` reads from `ServerConfiguration`: the words
+/// removed where they stand alone, the strings deleted, and the strings
+/// turned into a space. Each entry is matched as the exact string, as C#'s
+/// ordinal `StartsWith`/`Replace` do, against the lower-cased name, so an
+/// entry with an upper-case letter never matches, as upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortRules {
+    /// `SortRemoveWords`.
+    pub remove_words: Vec<String>,
+    /// `SortRemoveCharacters`.
+    pub remove_characters: Vec<String>,
+    /// `SortReplaceCharacters`.
+    pub replace_characters: Vec<String>,
+}
+
+impl Default for SortRules {
+    /// Jellyfin's defaults (`ServerConfiguration`'s initializers).
+    fn default() -> Self {
+        let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+        Self {
+            remove_words: owned(&SORT_REMOVE_WORDS),
+            remove_characters: owned(&SORT_REMOVE_CHARACTERS),
+            replace_characters: owned(&SORT_REPLACE_CHARACTERS),
+        }
+    }
+}
+
+/// The rules every derivation reads ([`get_sort_name`] and the helpers on
+/// it), as `GetSortName` reads `ConfigurationManager.Configuration` on each
+/// call. Jellyfin's defaults until the server installs its own.
+static INSTALLED: LazyLock<RwLock<Arc<SortRules>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(SortRules::default())));
+
+/// Makes `rules` the ones every later derivation uses: the server calls it
+/// with its configuration at startup and again on each save. Stored sort
+/// names are left as they are, as upstream leaves them until an item is
+/// refreshed.
+pub fn install_sort_rules(rules: SortRules) {
+    *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rules);
+}
+
+/// The rules installed now.
+fn installed_rules() -> Arc<SortRules> {
+    Arc::clone(&INSTALLED.read().unwrap_or_else(PoisonError::into_inner))
+}
 
 /// Port of C# `BaseItem.GetSortName(name, enableAlphaNumericSorting, config)`
 /// (Jellyfin 12.0 `MediaBrowser.Controller/Entities/BaseItem.cs:992-1035`) —
@@ -32,17 +82,53 @@ const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 /// `A.I. Artificial Intelligence` replaces `.`→space into `a i  artificial …`,
 /// which then *starts* with the article `a` and gets it stripped. C# strips
 /// articles while the `.` is still attached, so nothing matches.
+///
+/// The lists are the installed [`SortRules`] (see [`get_sort_name_with_rules`]).
 #[must_use]
 pub fn get_sort_name(name: &str, enable_alpha_numeric_sorting: bool) -> String {
-    get_sort_name_with(name, enable_alpha_numeric_sorting, lower_invariant)
+    get_sort_name_with_rules(name, enable_alpha_numeric_sorting, &installed_rules())
+}
+
+/// [`get_sort_name`] over the given `rules` rather than the installed ones.
+///
+/// An empty entry in the remove or replace lists is skipped: C#'s
+/// `string.Replace` throws on an empty search string, which fails the item's
+/// save upstream, and Rust's would insert the replacement between every
+/// character. An empty remove *word* is applied, as upstream applies it (it
+/// turns each double space into one).
+#[must_use]
+pub fn get_sort_name_with_rules(
+    name: &str,
+    enable_alpha_numeric_sorting: bool,
+    rules: &SortRules,
+) -> String {
+    get_sort_name_with(name, enable_alpha_numeric_sorting, lower_invariant, rules)
 }
 
 /// The derivation before invariant casing (full Unicode `to_lowercase`), kept
-/// only so migration `0031` can recognise keys Ferrofin wrote with it. Never
-/// use it for a new write or a query parameter.
+/// only so migration `0031` can recognise keys Ferrofin wrote with it, always
+/// over Jellyfin's default rules (Ferrofin wrote those keys before it read the
+/// configured ones). Never use it for a new write or a query parameter.
 #[must_use]
 pub fn previous_create_sort_name(name: &str) -> String {
-    get_sort_name_with(name, true, str::to_lowercase)
+    get_sort_name_with(name, true, str::to_lowercase, &SortRules::default())
+}
+
+/// [`create_sort_name`] over Jellyfin's default rules, whatever is installed:
+/// the `ferrofin_sort_name` SQLite function released migrations call, which
+/// must keep giving the answer they were written against (and stay
+/// deterministic, as the function is registered).
+#[must_use]
+pub fn default_rules_sort_name(name: &str) -> String {
+    get_sort_name_with_rules(name, true, &SortRules::default())
+}
+
+/// [`forced_sort_key`] over Jellyfin's default rules: the
+/// `ferrofin_forced_sort_key` SQLite function, for the same reason as
+/// [`default_rules_sort_name`].
+#[must_use]
+pub fn default_rules_forced_sort_key(forced: &str) -> String {
+    get_sort_name_with_rules(forced, true, &SortRules::default())
 }
 
 /// The 10.11.8-era forced key — `ModifySortChunks(ForcedSortName)` through
@@ -57,12 +143,13 @@ fn get_sort_name_with(
     name: &str,
     enable_alpha_numeric_sorting: bool,
     lowercase: fn(&str) -> String,
+    rules: &SortRules,
 ) -> String {
     if !enable_alpha_numeric_sorting {
         return name.trim_start().to_owned();
     }
     let mut sortable = lowercase(name.trim());
-    for search in SORT_REMOVE_WORDS {
+    for search in &rules.remove_words {
         if let Some(rest) = sortable.strip_prefix(&format!("{search} ")) {
             sortable = rest.to_owned();
         }
@@ -71,11 +158,11 @@ fn get_sort_name_with(
             sortable = rest.to_owned();
         }
     }
-    for c in SORT_REMOVE_CHARACTERS {
-        sortable = sortable.replace(c, "");
+    for remove in rules.remove_characters.iter().filter(|s| !s.is_empty()) {
+        sortable = sortable.replace(remove.as_str(), "");
     }
-    for c in SORT_REPLACE_CHARACTERS {
-        sortable = sortable.replace(c, " ");
+    for replace in rules.replace_characters.iter().filter(|s| !s.is_empty()) {
+        sortable = sortable.replace(replace.as_str(), " ");
     }
     modify_sort_chunks(&sortable)
 }
@@ -152,7 +239,60 @@ fn modify_sort_chunks(name: &str) -> String {
 mod tests {
     use rstest::rstest;
 
-    use super::{create_sort_name, forced_sort_key, get_sort_name, modify_sort_chunks};
+    use super::{
+        SortRules, create_sort_name, forced_sort_key, get_sort_name, get_sort_name_with_rules,
+        modify_sort_chunks,
+    };
+
+    fn rules(words: &[&str], removes: &[&str], replaces: &[&str]) -> SortRules {
+        let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+        SortRules {
+            remove_words: owned(words),
+            remove_characters: owned(removes),
+            replace_characters: owned(replaces),
+        }
+    }
+
+    /// `GetSortName` reads the three lists from the configuration, so an
+    /// operator's lists decide the key: German articles go, English ones
+    /// stay; emptied lists keep every word and character.
+    #[rstest]
+    #[case(&["der", "die", "das"], &[], &[], "Der Untergang", "untergang")]
+    #[case(&["der", "die", "das"], &[], &[], "The Matrix", "the matrix")]
+    #[case(&[], &[], &[], "The Spider-Man: Homecoming", "the spider-man: homecoming")]
+    #[case(&[], &["-", ":"], &[], "The Spider-Man: Homecoming", "the spiderman homecoming")]
+    #[case(&[], &[], &["-"], "Spider-Man", "spider man")]
+    // Entries are strings, matched whole (ordinal `Replace`).
+    #[case(&[], &["::"], &[], "a::b:c", "ab:c")]
+    // An upper-case entry never matches the lower-cased name, as upstream.
+    #[case(&["The"], &[], &[], "The Matrix", "the matrix")]
+    // An empty character entry is skipped (C# throws on it).
+    #[case(&[], &[""], &[""], "Up", "up")]
+    fn the_configured_lists_decide_the_sort_name(
+        #[case] words: &[&str],
+        #[case] removes: &[&str],
+        #[case] replaces: &[&str],
+        #[case] name: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            get_sort_name_with_rules(name, true, &rules(words, removes, replaces)),
+            expected
+        );
+    }
+
+    /// The defaults are Jellyfin's `ServerConfiguration` initializers.
+    #[test]
+    fn the_default_rules_are_jellyfins() {
+        assert_eq!(
+            SortRules::default(),
+            rules(
+                &["the", "a", "an"],
+                &[",", "&", "-", "{", "}", "'"],
+                &[".", "+", "%"]
+            )
+        );
+    }
 
     // The upstream xUnit oracle, transliterated verbatim
     // (`Jellyfin.Controller.Tests/Entities/BaseItemTests.cs`

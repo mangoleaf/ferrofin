@@ -1,0 +1,33 @@
+# What the parity comparison treats as equal although two servers cannot agree on it.
+#
+# Nothing is normalised implicitly. Every rule names the exact field paths it applies to and says
+# why; there are no wildcards. A path is the field names from the response root joined by dots,
+# with `[]` after an array's name for "each element" (`Items[].ServerId`). A rule that matches
+# nothing in a run is listed in that run's report. Rules change only through a reviewed PR.
+#
+# kind = "opaque"     the values may differ, the JSON type and nullness may not: a value that
+#                     becomes null (or a string that becomes a number) is still a difference.
+# kind = "opaque-keys"  the object at the path is keyed by something opaque (an image tag): the keys
+#                     may differ, the number of entries and their values may not. Each entry's value is
+#                     reported at `<path>.{key}`.
+# kind = "unordered"  the array at the path has no order the contract specifies; its elements are
+#                     matched by the field named in `by` before they are compared.
+
+version = 1
+
+[[rule]]
+paths = ["ServerId"]
+kind = "opaque"
+reason = "Each server generates its own server id; the corpus copies do not share one."
+
+# The image tag is a cache key each server derives for itself from the image file; clients only ever
+# compare it with itself. The blurhash maps are keyed by it.
+[[rule]]
+paths = ["ImageTags.Primary", "BackdropImageTags[]"]
+kind = "opaque"
+reason = "Image cache tags are derived by each server from its own view of the file; clients treat them as opaque cache keys."
+
+[[rule]]
+paths = ["ImageBlurHashes.Primary", "ImageBlurHashes.Backdrop"]
+kind = "opaque-keys"
+reason = "The blurhash maps are keyed by the image tag, which differs per server; the hashes themselves are compared."
