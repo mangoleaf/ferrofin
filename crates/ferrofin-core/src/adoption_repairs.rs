@@ -16,6 +16,7 @@ use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_util::string_extensions::upper_invariant;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -404,10 +405,11 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
 /// deleted. Step 2: a video/movie that is not an extra but has an owner that
 /// is itself a video/movie, or no longer exists, loses its `OwnerId` —
 /// unless it is that owner's local version or stacked part (a
-/// data-preserving divergence, see the step). Step 3:
-/// an orphaned extra is re-attached to the first video/movie whose path
-/// starts with the extra's directory, else loses its owner. Step 4: every
-/// version link's child gets `PrimaryVersionId = ParentId`.
+/// data-preserving divergence, see the step). Step 3: an orphaned extra is
+/// re-attached to the lowest-`Id` video/movie whose path starts with the
+/// extra's directory, literally and ignoring case (`StartsWith(dir,
+/// OrdinalIgnoreCase)`), else loses its owner; one with no path is left alone.
+/// Step 4: every version link's child gets `PrimaryVersionId = ParentId`.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -459,43 +461,7 @@ pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceE
     .await
     .map_err(db_err)?
     .rows_affected();
-    // Step 3: orphaned extras re-attached by directory, else unowned.
-    let orphans: Vec<(String, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Path" FROM "BaseItems"
-           WHERE "ExtraType" IS NOT NULL AND "ExtraType" <> 0 AND "OwnerId" IS NOT NULL
-             AND "OwnerId" NOT IN (SELECT "Id" FROM "BaseItems")"#,
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    let mut reassigned = 0usize;
-    for (id, path) in orphans {
-        let Some(path) = path else { continue };
-        let Some(dir) = Path::new(&path)
-            .parent()
-            .map(|d| d.to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-        let parent: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "BaseItems"
-               WHERE "Type" IN (?1, ?2) AND "Path" IS NOT NULL AND "Path" LIKE ?3 || '%'
-               ORDER BY "Id" LIMIT 1"#,
-        )
-        .bind(video)
-        .bind(movie)
-        .bind(&dir)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
-            .bind(&id)
-            .bind(parent)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        reassigned += 1;
-    }
+    let reassigned = reattach_orphaned_extras(&mut tx, video, movie).await?;
     // Step 4: the pointer follows the link.
     let pointed = sqlx::query(
         r#"UPDATE "BaseItems" SET "PrimaryVersionId" = (
@@ -514,6 +480,76 @@ pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceE
     tx.commit().await.map_err(db_err)?;
     done(db, KEY).await?;
     Ok(usize::try_from(cleared + pointed).unwrap_or(usize::MAX) + reassigned + deleted)
+}
+
+/// `FixIncorrectOwnerIdRelationships` step 3: extras whose owner is gone are
+/// re-attached by directory, else left unowned. Returns how many were updated.
+async fn reattach_orphaned_extras(
+    tx: &mut sqlx::SqliteConnection,
+    video: &str,
+    movie: &str,
+) -> Result<usize, ServiceError> {
+    let orphans: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems"
+           WHERE "ExtraType" IS NOT NULL AND "ExtraType" <> 0 AND "OwnerId" IS NOT NULL
+             AND "OwnerId" NOT IN (SELECT "Id" FROM "BaseItems")"#,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // The new owner is the lowest-Id video or movie whose path starts with the
+    // extra's directory, literally and ignoring case: upstream loads the
+    // candidates once and matches `StartsWith(dir, OrdinalIgnoreCase)`, whose
+    // case folding is the simple invariant uppercase mapping. Paths are
+    // compared uppercased.
+    if orphans.is_empty() {
+        return Ok(0);
+    }
+    let candidates: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        r#"SELECT "Id", "Path" FROM "BaseItems"
+           WHERE "Type" IN (?1, ?2) AND "Path" IS NOT NULL ORDER BY "Id""#,
+    )
+    .bind(video)
+    .bind(movie)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .into_iter()
+    .map(|(id, path)| (id, upper_invariant(&path)))
+    .collect();
+    let mut parents: HashMap<String, Option<String>> = HashMap::new();
+    let mut reassigned = 0usize;
+    for (id, path) in orphans {
+        // `string.IsNullOrEmpty(extra.Path)`: left as it is.
+        let Some(path) = path.filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        // `Path.GetDirectoryName`; an extra with no directory is left unowned.
+        let parent = Path::new(&path)
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .filter(|dir| !dir.is_empty())
+            .and_then(|dir| {
+                parents
+                    .entry(dir)
+                    .or_insert_with_key(|dir| {
+                        let prefix = upper_invariant(dir);
+                        candidates
+                            .iter()
+                            .find(|(_, path)| path.starts_with(&prefix))
+                            .map(|(id, _)| id.clone())
+                    })
+                    .clone()
+            });
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(&id)
+            .bind(parent)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        reassigned += 1;
+    }
+    Ok(reassigned)
 }
 
 /// `FixIncorrectOwnerIdRelationships` step 1: items sharing a `Path`.
@@ -4363,6 +4399,85 @@ mod tests {
                 .expect("pointer");
         assert_eq!(pointer, Some(guid_to_db(primary)));
         assert_eq!(fix_owner_id_relationships(&db).await.expect("again"), 0);
+    }
+
+    /// Upstream re-attaches an orphaned extra to the lowest-Id video whose path
+    /// starts with the extra's directory, literally and ignoring case
+    /// (`StartsWith(dir, OrdinalIgnoreCase)`); an extra with no directory is
+    /// left unowned.
+    #[tokio::test]
+    async fn orphaned_extras_find_their_directory_literally_in_any_case() {
+        let db = test_db().await;
+        // The decoy sorts first: an `_` read as a wildcard would pick it. Of
+        // the two movies in `/m/A_B`, the lower Id is inserted second, so the
+        // order comes from the Ids, not from the rows.
+        let decoy = Uuid::from_u128(0x0100);
+        let underscored_later = Uuid::from_u128(u128::MAX - 1);
+        let underscored = Uuid::from_u128(u128::MAX - 10);
+        let accented = Uuid::from_u128(u128::MAX - 2);
+        for (id, path) in [
+            (decoy, "/m/AxB/film.mkv"),
+            (underscored_later, "/m/A_B/film 2160p.mkv"),
+            (underscored, "/m/A_B/film.mkv"),
+            (accented, "/m/ÉTÉ/film.mkv"),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, path).await;
+        }
+        let (in_underscored, also_in_underscored, in_accented, no_directory, no_path) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let gone = Uuid::new_v4();
+        seed_item(&db, gone, BaseItemKind::Movie).await;
+        for (id, path) in [
+            (in_underscored, "/m/A_B/trailer.mkv"),
+            (also_in_underscored, "/m/A_B/teaser.mkv"),
+            (in_accented, "/m/été/trailer.mkv"),
+            (no_directory, "trailer.mkv"),
+            (no_path, ""),
+        ] {
+            seed_item(&db, id, BaseItemKind::Trailer).await;
+            set_path(&db, id, path).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "ExtraType" = 1 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(gone))
+            .execute(db.writer())
+            .await
+            .expect("orphan");
+        }
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(db.writer())
+            .await
+            .expect("fk off");
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(gone))
+            .execute(db.writer())
+            .await
+            .expect("delete owner");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(db.writer())
+            .await
+            .expect("fk on");
+
+        fix_owner_id_relationships(&db).await.expect("repair");
+        assert_eq!(
+            owner_of(&db, in_underscored).await,
+            Some(guid_to_db(underscored))
+        );
+        assert_eq!(
+            owner_of(&db, also_in_underscored).await,
+            Some(guid_to_db(underscored))
+        );
+        assert_eq!(owner_of(&db, in_accented).await, Some(guid_to_db(accented)));
+        assert_eq!(owner_of(&db, no_directory).await, None);
+        // `string.IsNullOrEmpty(extra.Path)`: skipped, its owner untouched.
+        assert_eq!(owner_of(&db, no_path).await, Some(guid_to_db(gone)));
     }
 
     #[tokio::test]
