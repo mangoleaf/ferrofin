@@ -825,6 +825,7 @@ fn https_redirect(config: &Config, wired: &WiredApp) -> Option<Arc<tls::HttpsRed
             port: wired.app_host.https_port(),
             base: base_url::normalize(&config.base_url),
             network: wired.state.network.clone(),
+            config: Arc::clone(&wired.state.config),
         })
     })
 }

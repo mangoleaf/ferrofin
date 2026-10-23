@@ -30,7 +30,6 @@ use ferrofin_common::configuration::{CommittedConfigurationCheck, ConfigurationV
 use ferrofin_networking::NetworkConfiguration;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
-use tower::{Layer as _, ServiceExt as _};
 
 use crate::listen::Transport;
 
@@ -299,6 +298,9 @@ pub struct HttpsRedirect {
     /// The network manager whose known proxies may forward the scheme and
     /// host; `None` trusts no forwarded header.
     pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
+    /// The live server configuration, whose `CorsHosts` the redirect answers
+    /// under, as the router does.
+    pub config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
 }
 
 /// Port of `HttpsRedirectionMiddleware`, which Jellyfin adds when
@@ -312,7 +314,9 @@ pub struct HttpsRedirect {
 /// - a request is HTTPS when it came over TLS, or when known proxies forwarded
 ///   it as `https`, and a forwarded host is the host redirected to;
 /// - a CORS preflight is answered, and the redirect carries the CORS headers,
-///   so a browser client on another origin can follow it.
+///   so a browser client on another origin can follow it. Both follow the
+///   configured `CorsHosts`, as the router's CORS does
+///   ([`ferrofin_api::cors::with_configured_cors`]).
 ///
 /// Ferrofin's own probes, `/health/live` and `/health/ready`, sit outside
 /// Jellyfin's application (as they sit outside the base URL) and are never
@@ -400,14 +404,7 @@ pub async fn redirect_to_https(
         };
         async move { Ok::<_, std::convert::Infallible>(response) }
     });
-    match ferrofin_api::router::cors_layer()
-        .layer(answer)
-        .oneshot(request)
-        .await
-    {
-        Ok(response) => response,
-        Err(never) => match never {},
-    }
+    ferrofin_api::cors::with_configured_cors(redirect.config.as_ref(), request, answer).await
 }
 
 /// The host part of a `Host` value (`HostString.Host`): an IPv6 address keeps
@@ -522,6 +519,7 @@ mod tests {
     use ferrofin_core::system_manager::LifecycleController as _;
     use rstest::rstest;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tower::ServiceExt as _;
 
     use super::*;
 
@@ -804,11 +802,59 @@ mod tests {
         ))
     }
 
+    /// A configuration whose only setting the redirect reads, `CorsHosts`.
+    struct CorsHosts(Vec<String>);
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::configuration::ServerConfigurationManager for CorsHosts {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("the HTTPS redirect reads only the server configuration")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<
+            Arc<ferrofin_model::configuration::ServerConfiguration>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            Ok(Arc::new(
+                ferrofin_model::configuration::ServerConfiguration {
+                    cors_hosts: self.0.clone(),
+                    ..ferrofin_model::configuration::ServerConfiguration::default()
+                },
+            ))
+        }
+        async fn update_configuration(
+            &self,
+            _configuration: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("the HTTPS redirect never saves")
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ferrofin_traits::error::ServiceError>
+        {
+            unreachable!("the HTTPS redirect never reads branding")
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            unreachable!("the HTTPS redirect never saves")
+        }
+    }
+
     fn redirect(port: u16, base: &str) -> Arc<HttpsRedirect> {
+        redirect_with_cors_hosts(port, base, &[])
+    }
+
+    fn redirect_with_cors_hosts(port: u16, base: &str, cors_hosts: &[&str]) -> Arc<HttpsRedirect> {
         Arc::new(HttpsRedirect {
             port,
             base: base.to_owned(),
             network: Some(known_proxy_network("10.0.0.1")),
+            config: Arc::new(CorsHosts(
+                cors_hosts.iter().map(|host| (*host).to_owned()).collect(),
+            )),
         })
     }
 
@@ -991,6 +1037,48 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&HeaderValue::from_static("*"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_redirect_follows_the_configured_cors_hosts() {
+        let redirect = redirect_with_cors_hosts(8920, "", &["https://app.example"]);
+        let listed = send(
+            Some(Arc::clone(&redirect)),
+            Request::get("/System/Info/Public")
+                .header(header::HOST, "example.com:8096")
+                .header(header::ORIGIN, "https://app.example"),
+            "192.168.1.20",
+            Transport::Plain,
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            listed.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("https://app.example"))
+        );
+        assert_eq!(
+            listed
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&HeaderValue::from_static("true"))
+        );
+
+        let other = send(
+            Some(redirect),
+            Request::get("/System/Info/Public")
+                .header(header::HOST, "example.com:8096")
+                .header(header::ORIGIN, "https://other.example"),
+            "192.168.1.20",
+            Transport::Plain,
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            other
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
         );
     }
 

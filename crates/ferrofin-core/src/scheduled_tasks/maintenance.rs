@@ -250,7 +250,8 @@ impl ScheduledTask for CleanActivityLogTask {
 
 /// "Clean Cache Directory" — deletes cache files no longer needed by the
 /// system. Port of `DeleteCacheFileTask`: cache files older than 30 days, temp
-/// files (`{cache}/temp`) older than 1 day, then empty-folder pruning.
+/// files ([`ServerApplicationPaths::temp_path`], `{cache}/temp`) older than 1
+/// day, then empty-folder pruning.
 pub struct DeleteCacheFileTask {
     paths: Arc<dyn ServerApplicationPaths>,
 }
@@ -289,7 +290,7 @@ impl ScheduledTask for DeleteCacheFileTask {
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let cache = PathBuf::from(self.paths.cache_path());
-        let temp = cache.join("temp");
+        let temp = PathBuf::from(self.paths.temp_path());
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let now = SystemTime::now();
