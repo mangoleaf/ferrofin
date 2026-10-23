@@ -15573,12 +15573,13 @@ impl LibraryScanner {
     /// Music library: an artist directory is a `MusicArtist`
     /// (`MusicArtistResolver`), a folder that directly contains audio files is a
     /// `MusicAlbum` (`MusicAlbumResolver`, its audio files become `Audio`
-    /// tracks); anything else is walked so a deeper layout still yields rows.
+    /// tracks); any other directory is a `Folder` (`FolderResolver`) whose
+    /// contents resolve beneath it.
     fn plan_music(&self, dir: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
         // The library root itself is the CollectionFolder — never an artist or
         // an album (upstream's `args.Parent.IsRoot` guard), so recurse into it.
         fanout::directories(&self.list(dir, ctx), ctx, out, |path, ctx, out| {
-            self.plan_music_node(path, cf, cf, false, ctx, out);
+            self.plan_music_node(path, cf, &[cf], false, ctx, out);
         });
         // Loose audio directly in the library root is `Audio` under the
         // library, with no album: `MusicAlbumResolver` resolves only a
@@ -15586,7 +15587,7 @@ impl LibraryScanner {
         // `AudioResolver.Resolve` (`AudioResolver.cs:108-134`). An album here
         // would have the library location as its path — and its multi-disc
         // subfolders, already albums of their own, planned twice.
-        self.plan_loose_audio(dir, cf, cf, ctx, out);
+        self.plan_loose_audio(dir, cf, &[cf], ctx, out);
     }
 
     /// A successful video Default/FullRefresh reconciles chapter images and
@@ -15969,13 +15970,16 @@ impl LibraryScanner {
 
     /// Resolves one directory beneath a music library: a `MusicArtist` (port of
     /// `MusicArtistResolver`), a `MusicAlbum` (port of `MusicAlbumResolver`), or
-    /// a container to walk through — one of an artist's release subfolders
-    /// (`albums`, `live`, …) or an intermediate grouping directory.
+    /// a plain `Folder` (port of `FolderResolver`, priority Last) — one of an
+    /// artist's release subfolders (`albums`, `live`, …), a grouping
+    /// directory above artists, a folder of playlists.
     ///
     /// The order is upstream's resolver priority: `MusicArtistResolver` is
     /// `ResolverPriority.Second` and `MusicAlbumResolver` `Third`, so a folder
     /// that holds BOTH loose audio and an album subfolder is the artist.
     ///
+    /// `ancestors` is the chain of the directory's parent, the library
+    /// first and the parent last; what `dir` resolves to hangs off that parent.
     /// `in_artist` is upstream's `args.HasParent<MusicArtist>()` guard ("don't
     /// allow nested artists"); its `HasParent<MusicAlbum>()` half is structural
     /// here, because this function returns as soon as a directory resolves as an
@@ -15984,20 +15988,16 @@ impl LibraryScanner {
         &self,
         dir: &str,
         cf: Uuid,
-        parent: Uuid,
+        ancestors: &[Uuid],
         in_artist: bool,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let ancestors = if parent == cf {
-            vec![cf]
-        } else {
-            vec![cf, parent]
-        };
+        let parent = ancestors.last().copied().unwrap_or(cf);
         // `PlaylistResolver` (priority First) answers before the artist and
         // album resolvers.
         let holds_xml = || playlists::holds_playlist_xml(&self.prelist(dir, ctx));
-        if self.plan_playlist_folder(dir, holds_xml, cf, (parent, ancestors.clone()), ctx, out) {
+        if self.plan_playlist_folder(dir, holds_xml, cf, (parent, ancestors.to_vec()), ctx, out) {
             return;
         }
         if !in_artist
@@ -16017,9 +16017,10 @@ impl LibraryScanner {
                 Planned {
                     id: artist_id,
                     entity: artist,
-                    ancestors: vec![cf],
+                    ancestors: ancestors.to_vec(),
                 },
             );
+            let below = [ancestors, &[artist_id]].concat();
             // A music folder searches itself for extras, a theme song above
             // all (`BaseItem.SearchesContainingFolderForExtras`, `BaseItem.cs:782`).
             let entries = self.list(dir, ctx);
@@ -16029,7 +16030,7 @@ impl LibraryScanner {
                 .filter(|entry| !extras.contains(&entry.path))
                 .collect();
             fanout::directories(&dirs, ctx, out, |path, ctx, out| {
-                self.plan_music_node(path, cf, artist_id, true, ctx, out);
+                self.plan_music_node(path, cf, &below, true, ctx, out);
             });
 
             // Loose audio sitting DIRECTLY in a resolved artist folder is not
@@ -16042,25 +16043,46 @@ impl LibraryScanner {
             // parent is the artist. Wrapping them invented a `MusicAlbum` row
             // Jellyfin has no row for and stamped the artist's folder name
             // into every such track's `Album`.
-            self.plan_loose_audio(dir, cf, artist_id, ctx, out);
+            self.plan_loose_audio(dir, cf, &below, ctx, out);
             return;
         }
         if self.is_music_album(dir, ctx, true, true) {
-            self.plan_music_album(dir, cf, parent, ctx, out);
+            self.plan_music_album(dir, cf, ancestors, ctx, out);
             return;
         }
-        // Below the library's top folder an extras-named folder is never
-        // resolved (`CoreResolutionIgnoreRule.cs:46-61`); rows older scans
-        // planned in one are reconciled away.
+        // Neither: `FolderResolver` makes it a `Folder`, and its children
+        // resolve with it as their parent (`Folder.GetNonCachedChildren`),
+        // in the library's content type, so artists and albums still
+        // resolve below it.
+        let folder = folder_name(dir).and_then(|name| {
+            self.base_item(ctx, BaseItemKind::Folder, cf, parent, name, dir, true)
+        });
+        let below = match folder {
+            Some((id, entity)) => {
+                ctx.emit(
+                    out,
+                    Planned {
+                        id,
+                        entity,
+                        ancestors: ancestors.to_vec(),
+                    },
+                );
+                [ancestors, &[id]].concat()
+            }
+            // No id (as `plan_folder`): what it holds hangs off the parent.
+            None => ancestors.to_vec(),
+        };
+        let folder_id = below.last().copied().unwrap_or(cf);
         let entries = self.list(dir, ctx);
-        // A folder that is neither an artist nor an album plans no row of
-        // its own: its playlist files hang off the nearest one that does.
-        self.plan_playlist_files(&entries, cf, (parent, &ancestors), ctx, out);
+        self.plan_playlist_files(&entries, cf, (folder_id, &below), ctx, out);
         let mut dirs = Vec::new();
         for entry in entries {
             if entry.type_ != FileSystemEntryType::Directory {
                 continue;
             }
+            // Below the library's top folder an extras-named folder is never
+            // resolved (`CoreResolutionIgnoreRule.cs:46-61`); rows older scans
+            // planned in one are reconciled away.
             if is_extras_dir(&entry, ctx.naming) {
                 ctx.excluded.borrow_mut().push(entry.path);
                 continue;
@@ -16068,7 +16090,7 @@ impl LibraryScanner {
             dirs.push(entry);
         }
         fanout::directories(&dirs, ctx, out, |path, ctx, out| {
-            self.plan_music_node(path, cf, parent, in_artist, ctx, out);
+            self.plan_music_node(path, cf, &below, in_artist, ctx, out);
         });
     }
 
@@ -16128,15 +16150,17 @@ impl LibraryScanner {
     /// Emits the `MusicAlbum` row for `dir` plus its tracks — the audio files
     /// directly inside, and those in any multi-disc subfolder (`CD1`, `Disc 2`,
     /// …), which fold into the same album rather than becoming albums of their
-    /// own.
+    /// own. `ancestors` is the chain of its parent, the library first and
+    /// the parent last.
     fn plan_music_album(
         &self,
         dir: &str,
         cf: Uuid,
-        parent: Uuid,
+        ancestors: &[Uuid],
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        let parent = ancestors.last().copied().unwrap_or(cf);
         // Every track, whatever the scope. The caller decided the folder is
         // an album (`ContainsMusic`), which a cue sheet alone makes it: such
         // an album has no tracks, as upstream's has none.
@@ -16163,13 +16187,9 @@ impl LibraryScanner {
         // in the library into one row. The writer derives it — see
         // `kinds::presentation_unique_key`.
         // AncestorIds is what the recursive-child count and every
-        // `ancestorIds=` filter read, so a resolved artist must appear in its
-        // albums' and tracks' chains.
-        let album_ancestors = if parent == cf {
-            vec![cf]
-        } else {
-            vec![cf, parent]
-        };
+        // `ancestorIds=` filter read, so a resolved artist, and every folder
+        // above the album, must appear in its and its tracks' chains.
+        let album_ancestors = ancestors.to_vec();
         ctx.emit(
             out,
             Planned {
@@ -16236,8 +16256,9 @@ impl LibraryScanner {
     }
 
     /// The audio files sitting directly in `dir` — a resolved artist
-    /// directory (`parent` the `MusicArtist`) or the library root (`parent`
-    /// the library) — as `Audio` rows parented straight to `parent`: no album.
+    /// directory (`parent`, the last of `ancestors`, the `MusicArtist`) or
+    /// the library root (`parent` the library) — as `Audio` rows parented
+    /// straight to `parent`: no album.
     /// Each is `IsInMixedFolder`, as `AudioResolver.Resolve` sets for every
     /// file it resolves (`AudioResolver.cs:133`); a cue sheet is no item.
     ///
@@ -16250,15 +16271,12 @@ impl LibraryScanner {
         &self,
         dir: &str,
         cf: Uuid,
-        parent: Uuid,
+        ancestors: &[Uuid],
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let ancestors = if parent == cf {
-            vec![cf]
-        } else {
-            vec![cf, parent]
-        };
+        let parent = ancestors.last().copied().unwrap_or(cf);
+        let ancestors = ancestors.to_vec();
         for entry in self.list(dir, ctx) {
             if entry.type_ == FileSystemEntryType::Directory {
                 continue;
@@ -37627,8 +37645,8 @@ mod tests {
     /// `MusicArtistResolver`'s `artist.nfo` shortcut fires before every other
     /// test, so a folder with the sidecar and no album subfolder is still an
     /// artist — and a folder holding a NAMED release container (`albums`,
-    /// `live`, …) is one too, with the albums inside it re-parented onto the
-    /// artist rather than onto the container.
+    /// `live`, …) is one too. The container itself is a `Folder` under the
+    /// artist, and the albums inside it hang off the container.
     #[tokio::test]
     async fn scan_resolves_artists_from_nfo_and_from_release_subfolders() {
         use ferrofin_traits::persistence::ItemRepository as _;
@@ -37669,8 +37687,9 @@ mod tests {
             "both artists resolve"
         );
 
-        // The release container itself is NOT an item; its album parents
-        // straight onto the artist.
+        // The release container is neither artist nor album, so it is a plain
+        // `Folder` under the artist (`FolderResolver`), and the album hangs
+        // off it.
         let boc = artists
             .iter()
             .find(|a| a.name.as_deref() == Some("Boards of Canada"))
@@ -37683,10 +37702,22 @@ mod tests {
             .await
             .expect("albums");
         assert_eq!(albums.len(), 1);
+        let folders = repo
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::Folder],
+                ..Default::default()
+            })
+            .await
+            .expect("folders");
+        let release = folders
+            .iter()
+            .find(|f| f.path.as_deref() == container.to_str())
+            .expect("the `albums` container is a Folder");
+        assert_eq!(release.parent_id.as_deref(), Some(boc.id.as_str()));
         assert_eq!(
             albums[0].parent_id.as_deref(),
-            Some(boc.id.as_str()),
-            "album skips the `albums` container"
+            Some(release.id.as_str()),
+            "the album hangs off the `albums` container"
         );
     }
 
@@ -37836,6 +37867,106 @@ mod tests {
         // `AudioResolver.Resolve` puts every music track in a mixed folder,
         // an album's as much as a loose one (`AudioResolver.cs:133`).
         assert!(audio.iter().all(|track| track.is_in_mixed_folder));
+    }
+
+    /// A music directory that is neither artist nor album is a plain `Folder`
+    /// (`FolderResolver`, priority Last), and what it holds hangs off it: a
+    /// grouping folder above an artist, an artist's release subfolder, a
+    /// folder of playlists. The folder is in the chain of everything below it.
+    #[tokio::test]
+    async fn music_folders_no_resolver_claims_are_folders() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        for file in [
+            "Rock/Artist A/Album 1/01 One.mp3",
+            "Artist B/albums/Album 2/01 Two.mp3",
+            "Lists/top.m3u8",
+        ] {
+            let path = media.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        let (db, cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+        // (id, kind, parent) of every row by its path.
+        let mut rows = std::collections::HashMap::new();
+        for kind in [
+            BaseItemKind::Folder,
+            BaseItemKind::MusicArtist,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::Playlist,
+        ] {
+            for row in rows_of_kind(&db, kind).await {
+                let path = row.path.clone().unwrap_or_default();
+                rows.insert(path, (row.id, kind, row.parent_id.unwrap_or_default()));
+            }
+        }
+        let row = |rel: &str| {
+            let path = media.join(rel).to_string_lossy().into_owned();
+            rows.get(&path)
+                .cloned()
+                .unwrap_or_else(|| panic!("no row at {rel}"))
+        };
+
+        let rock = row("Rock");
+        assert_eq!(
+            (rock.1, rock.2.as_str()),
+            (BaseItemKind::Folder, cf.as_str())
+        );
+        let artist_a = row("Rock/Artist A");
+        assert_eq!(
+            (artist_a.1, artist_a.2.as_str()),
+            (BaseItemKind::MusicArtist, rock.0.as_str())
+        );
+        let artist_b = row("Artist B");
+        let albums = row("Artist B/albums");
+        assert_eq!(
+            (albums.1, albums.2.as_str()),
+            (BaseItemKind::Folder, artist_b.0.as_str())
+        );
+        let album_2 = row("Artist B/albums/Album 2");
+        assert_eq!(
+            (album_2.1, album_2.2.as_str()),
+            (BaseItemKind::MusicAlbum, albums.0.as_str())
+        );
+        let lists = row("Lists");
+        assert_eq!(
+            (lists.1, lists.2.as_str()),
+            (BaseItemKind::Folder, cf.as_str())
+        );
+        let top = row("Lists/top.m3u8");
+        assert_eq!(
+            (top.1, top.2.as_str()),
+            (BaseItemKind::Playlist, lists.0.as_str())
+        );
+
+        // Every `ancestorIds=` filter and recursive count reads the chain.
+        let repo = crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let below = |folder: &str| {
+            let id = uuid::Uuid::parse_str(folder).unwrap();
+            let repo = &repo;
+            async move {
+                let mut kinds: Vec<_> = repo
+                    .get_item_list(&InternalItemsQuery {
+                        ancestor_ids: vec![id],
+                        recursive: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("recursive children")
+                    .iter()
+                    .map(|i| i.type_.rsplit('.').next().unwrap_or("").to_owned())
+                    .collect();
+                kinds.sort_unstable();
+                kinds
+            }
+        };
+        assert_eq!(below(&rock.0).await, ["Audio", "MusicAlbum", "MusicArtist"]);
+        assert_eq!(below(&albums.0).await, ["Audio", "MusicAlbum"]);
+        assert_eq!(below(&artist_b.0).await, ["Audio", "Folder", "MusicAlbum"]);
     }
 
     /// A music artist or album folder owns its extras — a theme song above

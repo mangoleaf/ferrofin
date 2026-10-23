@@ -158,6 +158,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
   the default is 30 minutes
+- Stop playback a client abandoned, as Jellyfin does: a session playing without a progress
+  report for five minutes is stopped at the client's last position, and with
+  `InactiveSessionThreshold` set, a session paused past it is told to stop. A client that
+  vanished mid-playback no longer stays "playing" and no longer makes transcode cleanup and
+  database optimization skip every run
 - Port `TrimCopiedAudio` noise bitstream filter: when a video is being transcoded but the
   audio is direct-copied, ffmpeg 5.0+ trims the leading audio silence to match the
   requested seek point, eliminating the A/V desync on mid-file seeks into remuxed HLS. The
@@ -176,11 +181,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
-- Stop playback a client abandoned, as Jellyfin does: a session playing without a progress
-  report for five minutes is stopped at the client's last position, and with
-  `InactiveSessionThreshold` set, a session paused past it is told to stop. A client that
-  vanished mid-playback no longer stays "playing" and no longer makes transcode cleanup and
-  database optimization skip every run
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -192,6 +197,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See

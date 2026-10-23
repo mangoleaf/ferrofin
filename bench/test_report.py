@@ -1347,7 +1347,7 @@ class GateTests(unittest.TestCase):
             (out / name / 'report.html').write_text('<p>written by run.sh</p>')
         gate.render(str(out))
         runs = [n for n, _ in report.discover('benchmark', str(self.root))]
-        self.assertEqual(sorted(runs), [f'gate-ab/0{i}-{r}' for i, r in zip(range(1, 7), 'ababab')])
+        self.assertEqual(sorted(runs), ['gate-ab'] + [f'gate-ab/0{i}-{r}' for i, r in zip(range(1, 7), 'ababab')])
         status, tab = self.viewer('/benchmark')
         self.assertEqual(status, 200)
         self.assertIn("href='/report/benchmark/gate-ab/02-b'", tab)
@@ -1429,6 +1429,20 @@ class GateTests(unittest.TestCase):
         rows = json.loads((self.root / 'self' / 'verdict.json').read_text())['verdicts']
         self.assertEqual({r['verdict'] for r in rows.values()}, {'within noise'})
         self.assertEqual(set(rows), {c[0] for c in gate.SCAN_CELLS})
+
+    def test_a_rendered_gate_session_is_listed_with_its_own_report(self):
+        out = self.scan_session('gate-scan', [100, 100, 100])
+        self.assertEqual(report.discover('benchmark', str(self.root)), [])  # not rendered yet: nothing to open
+        gate.render(str(out))
+        listed = report.discover('benchmark', str(self.root))
+        self.assertEqual([n for n, _ in listed], ['gate-scan'])  # its runs hold scan.json, not run.json
+        self.assertIn('gate scan', listed[0][1])
+        status, tab = self.viewer('/benchmark')
+        self.assertIn("href='/report/benchmark/gate-scan'", tab)
+        status, page = self.viewer('/report/benchmark/gate-scan')
+        self.assertEqual(status, 200)
+        self.assertEqual(page, (out / 'report.html').read_text())
+        self.assertIn('scan/wall time', page)
 
     def test_scan_session_without_a_measurement_is_a_readable_error(self):
         out = self.scan_session('partial', [100, 100, 100])
