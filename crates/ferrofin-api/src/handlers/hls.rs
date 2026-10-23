@@ -261,6 +261,9 @@ struct HlsQuery {
     /// Whether `-c:a copy` is permitted.
     #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
+    /// Whether the audio may be encoded VBR (`enableAudioVbrEncoding`).
+    #[serde(default)]
+    enable_audio_vbr_encoding: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
     #[serde(default, rename = "static")]
     is_static: Option<bool>,
@@ -332,23 +335,33 @@ struct HlsRequestContext {
     /// it: `false` on the master routes, `true` on `live.m3u8` (upstream's
     /// per-DTO defaults).
     subtitles_in_manifest_default: bool,
+    /// The request's `User-Agent` header (`StreamState.UserAgent`).
+    user_agent: Option<String>,
 }
 
 impl HlsRequestContext {
-    /// Reads the token and the client's locality off the request parts.
+    /// Reads the token, the client's locality and its user agent off the
+    /// request parts.
     fn from_parts(
         state: &AppState,
         auth: &ferrofin_traits::options::AuthorizationInfo,
         parts: &axum::http::request::Parts,
         subtitles_in_manifest_default: bool,
     ) -> Self {
-        Self::from_extensions(
-            state,
-            auth,
-            &parts.extensions,
-            &parts.headers,
-            subtitles_in_manifest_default,
-        )
+        Self {
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            ..Self::from_extensions(
+                state,
+                auth,
+                &parts.extensions,
+                &parts.headers,
+                subtitles_in_manifest_default,
+            )
+        }
     }
 
     /// Reads the token and the client's locality off the request extensions
@@ -375,6 +388,7 @@ impl HlsRequestContext {
                     state.is_in_local_network(client)
                 }),
             subtitles_in_manifest_default,
+            user_agent: None,
         }
     }
 }
@@ -408,6 +422,7 @@ fn build_request(
         output_container: query.container,
         context: query.context,
         segment_length: query.segment_length,
+        user_agent: ctx.user_agent,
         current_runtime_ticks: query.runtime_ticks,
         actual_segment_length_ticks: query.actual_segment_length_ticks,
         audio_codec: query.audio_codec,
@@ -430,6 +445,7 @@ fn build_request(
         max_framerate: query.max_framerate,
         allow_video_stream_copy: query.allow_video_stream_copy.unwrap_or(true),
         allow_audio_stream_copy: query.allow_audio_stream_copy.unwrap_or(true),
+        enable_audio_vbr_encoding: query.enable_audio_vbr_encoding.unwrap_or(true),
         is_static: query.is_static.unwrap_or(false),
         start_time_ticks: query.start_time_ticks,
         profile: query.profile,
@@ -1206,6 +1222,22 @@ mod tests {
         assert_eq!(req.live_stream_id, None);
     }
 
+    /// `enableAudioVbrEncoding=false` reaches the request, in either
+    /// spelling a client sends.
+    #[rstest::rstest]
+    #[case::camel("enableAudioVbrEncoding=false")]
+    #[case::pascal("EnableAudioVbrEncoding=false")]
+    fn build_request_carries_a_refused_vbr_encoding(#[case] query: &str) {
+        let query: HlsQuery = parse(query).expect("parses");
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            None,
+            HlsRequestContext::default(),
+        );
+        assert!(!req.enable_audio_vbr_encoding);
+    }
+
     #[test]
     fn build_request_maps_caps_and_defaults_allow_copy() {
         let query: HlsQuery = parse("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
@@ -1219,6 +1251,10 @@ mod tests {
         assert_eq!(req.video_bitrate, Some(4_000_000));
         assert!(req.allow_video_stream_copy, "copy allowed by default");
         assert!(req.allow_audio_stream_copy, "copy allowed by default");
+        assert!(
+            req.enable_audio_vbr_encoding,
+            "VBR allowed by default (`enableAudioVbrEncoding = true`)"
+        );
         assert_eq!(req.query_string, "?MaxWidth=1280");
         // The master-playlist DTO defaults.
         assert!(!req.enable_subtitles_in_manifest);
@@ -1254,8 +1290,13 @@ mod tests {
             playback_permissions: None,
             is_in_local_network: true,
             subtitles_in_manifest_default: false,
+            user_agent: Some("AppleCoreMedia/1.0 (iPhone)".to_owned()),
         };
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
+        assert_eq!(
+            req.user_agent.as_deref(),
+            Some("AppleCoreMedia/1.0 (iPhone)")
+        );
         assert_eq!(req.profile.as_deref(), Some("high"));
         assert_eq!(req.level.as_deref(), Some("41"));
         assert_eq!(req.framerate, Some(30.0));
@@ -1282,6 +1323,7 @@ mod tests {
             playback_permissions: None,
             is_in_local_network: false,
             subtitles_in_manifest_default: true,
+            user_agent: None,
         };
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
         assert!(req.enable_subtitles_in_manifest);

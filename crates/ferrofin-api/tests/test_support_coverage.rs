@@ -171,6 +171,11 @@ fn fake_media_sources_methods_panic() {
     assert_panics(f.close_live_stream("id"));
 }
 
+#[tokio::test]
+async fn fake_sessions_close_a_last_socket_quietly() {
+    assert!(FakeSessions.close_if_needed("s").await.is_ok());
+}
+
 #[test]
 fn fake_sessions_methods_panic() {
     let f = FakeSessions;

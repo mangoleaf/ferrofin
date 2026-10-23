@@ -84,12 +84,22 @@ pub(crate) enum Doc<const FOLD: bool = true> {
 
 impl<'de, const FOLD: bool> Deserialize<'de> for Doc<FOLD> {
     fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // serde_json reads the whole body once here and rejects malformed JSON
+        // with its own error; the tree is then built in one more pass over the
+        // validated text.
         let raw = <&RawValue>::deserialize(deserializer)?;
-        Self::from_raw(raw.get(), 0).map_err(de::Error::custom)
+        Reader {
+            text: raw.get(),
+            pos: 0,
+        }
+        .value(0)
+        .map_err(de::Error::custom)
     }
 }
 
-/// Reads an object's raw member values without sorting or collapsing its keys.
+/// Reads an object's raw member values without sorting or collapsing its keys:
+/// how the binder read objects before [`Reader`], kept to report a member name
+/// serde_json cannot decode with the same error it always gave.
 struct RawMembers;
 
 impl<'de> Visitor<'de> for RawMembers {
@@ -112,43 +122,169 @@ impl<'de> Visitor<'de> for RawMembers {
 /// `System.Text.Json`'s default `MaxDepth` of 64. Every value counts as a level
 /// (a scalar leaf included), so this is marginally stricter than STJ's
 /// container-only count — immaterial, since real clients never nest this deep. A
-/// body past the bound is rejected before its deepest level is built. The parser
-/// still re-reads each container's raw text per level, so a lower bound also
-/// caps the adversarial cost of a deeply nested body (tracked for a true
-/// single-pass rewrite in the follow-up to gl-32).
+/// body past the bound is rejected before its deepest level is built.
 const MAX_BODY_DEPTH: usize = 64;
 
-impl<const FOLD: bool> Doc<FOLD> {
-    /// Builds the ordered tree while retaining numeric lexemes. Raw values
-    /// borrow the request only during parsing; the completed tree owns its data.
-    fn from_raw(raw: &str, depth: usize) -> Result<Self, Error> {
-        if depth >= MAX_BODY_DEPTH {
-            return Err(de::Error::custom("recursion limit exceeded"));
-        }
-        match raw.as_bytes()[0] {
-            b'n' => Ok(Self::Null),
-            b't' => Ok(Self::Bool(true)),
-            b'f' => Ok(Self::Bool(false)),
-            b'"' => serde_json::from_str(raw).map(Self::String),
-            b'[' => serde_json::from_str::<Vec<&RawValue>>(raw)?
-                .into_iter()
-                .map(|value| Self::from_raw(value.get(), depth + 1))
-                .collect::<Result<_, _>>()
-                .map(Self::Array),
-            b'{' => {
-                use serde::Deserializer;
-                let members =
-                    serde_json::Deserializer::from_str(raw).deserialize_map(RawMembers)?;
-                members
-                    .into_iter()
-                    .map(|(key, value)| Ok((key, Self::from_raw(value.get(), depth + 1)?)))
-                    .collect::<Result<_, _>>()
-                    .map(Self::Object)
-            }
-            _ => Ok(Self::Number(raw.to_owned())),
+/// Builds a [`Doc`] in one pass over a body serde_json has already validated:
+/// each byte is read once, so a deeply nested body costs no more than a flat
+/// one of its size. A number keeps its exact source spelling (`1E+02`, `-0`),
+/// which no streaming serde visitor preserves; object members stay in
+/// document order with their duplicates; a string with an escape is decoded
+/// by serde_json itself, its errors included.
+struct Reader<'a> {
+    /// The validated body.
+    text: &'a str,
+    /// The byte offset read up to.
+    pos: usize,
+}
+
+impl Reader<'_> {
+    fn peek(&self) -> u8 {
+        self.text
+            .as_bytes()
+            .get(self.pos)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), b' ' | b'\t' | b'\n' | b'\r') {
+            self.pos += 1;
         }
     }
 
+    /// The text from `start` up to the current position.
+    fn since(&self, start: usize) -> &str {
+        self.text.get(start..self.pos).unwrap_or_default()
+    }
+
+    /// Steps over an empty container's closing `close`, if that is what follows.
+    fn closes(&mut self, close: u8) -> bool {
+        self.skip_whitespace();
+        let empty = self.peek() == close;
+        if empty {
+            self.pos += 1;
+        }
+        empty
+    }
+
+    /// Steps over the separator after an element: whether another follows
+    /// (`,`) or the container closed.
+    fn next_element(&mut self) -> bool {
+        self.skip_whitespace();
+        let more = self.peek() == b',';
+        self.pos += 1;
+        more
+    }
+
+    fn value<const FOLD: bool>(&mut self, depth: usize) -> Result<Doc<FOLD>, Error> {
+        if depth >= MAX_BODY_DEPTH {
+            return Err(de::Error::custom("recursion limit exceeded"));
+        }
+        self.skip_whitespace();
+        let start = self.pos;
+        match self.peek() {
+            b'n' => {
+                self.pos += "null".len();
+                Ok(Doc::Null)
+            }
+            b't' => {
+                self.pos += "true".len();
+                Ok(Doc::Bool(true))
+            }
+            b'f' => {
+                self.pos += "false".len();
+                Ok(Doc::Bool(false))
+            }
+            b'"' => self.string().map(Doc::String),
+            b'[' => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                if !self.closes(b']') {
+                    loop {
+                        items.push(self.value(depth + 1)?);
+                        if !self.next_element() {
+                            break;
+                        }
+                    }
+                }
+                Ok(Doc::Array(items))
+            }
+            b'{' => {
+                self.pos += 1;
+                let mut members = Vec::new();
+                if !self.closes(b'}') {
+                    loop {
+                        self.skip_whitespace();
+                        let name = self.member_name(start)?;
+                        self.skip_whitespace();
+                        self.pos += 1; // `:`
+                        members.push((name, self.value(depth + 1)?));
+                        if !self.next_element() {
+                            break;
+                        }
+                    }
+                }
+                Ok(Doc::Object(members))
+            }
+            _ => {
+                while matches!(self.peek(), b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    self.pos += 1;
+                }
+                Ok(Doc::Number(self.since(start).to_owned()))
+            }
+        }
+    }
+
+    /// The string token at the current position. One without an escape is its
+    /// text (validation rejected any control character in it).
+    fn string(&mut self) -> Result<String, Error> {
+        let start = self.pos;
+        let mut escaped = false;
+        self.pos += 1;
+        loop {
+            match self.text.as_bytes().get(self.pos) {
+                Some(b'\\') => {
+                    escaped = true;
+                    self.pos += 2;
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(_) => self.pos += 1,
+                None => break,
+            }
+        }
+        let token = self.since(start);
+        if escaped {
+            serde_json::from_str(token)
+        } else {
+            Ok(token
+                .strip_prefix('"')
+                .and_then(|text| text.strip_suffix('"'))
+                .unwrap_or_default()
+                .to_owned())
+        }
+    }
+
+    /// A member name of the object starting at `object`. One serde_json
+    /// cannot decode (a lone surrogate escape, which validation lets through)
+    /// is reported by reading the object as [`RawMembers`], so the error and
+    /// its position are the ones the binder always gave.
+    fn member_name(&mut self, object: usize) -> Result<String, Error> {
+        self.string().map_err(|name_error| {
+            use serde::Deserializer;
+            let object = self.text.get(object..).unwrap_or_default();
+            serde_json::Deserializer::from_str(object)
+                .deserialize_map(RawMembers)
+                .err()
+                .unwrap_or(name_error)
+        })
+    }
+}
+
+impl<const FOLD: bool> Doc<FOLD> {
     /// Whether this is an object — the top-level kind every struct DTO needs.
     pub(crate) fn is_object(&self) -> bool {
         matches!(self, Self::Object(_))
@@ -844,6 +980,143 @@ mod tests {
         assert!(serde_json::from_str::<Doc>(&under_cap).is_ok());
         assert!(serde_json::from_str::<Doc>("[1,]").is_err());
     }
+
+    /// The recursive parser [`Reader`] replaced, which re-read each
+    /// container's text at every level: the oracle the single pass is held to.
+    fn legacy<const FOLD: bool>(raw: &str, depth: usize) -> Result<Doc<FOLD>, Error> {
+        if depth >= MAX_BODY_DEPTH {
+            return Err(de::Error::custom("recursion limit exceeded"));
+        }
+        match raw.as_bytes()[0] {
+            b'n' => Ok(Doc::Null),
+            b't' => Ok(Doc::Bool(true)),
+            b'f' => Ok(Doc::Bool(false)),
+            b'"' => serde_json::from_str(raw).map(Doc::String),
+            b'[' => serde_json::from_str::<Vec<&RawValue>>(raw)?
+                .into_iter()
+                .map(|value| legacy(value.get(), depth + 1))
+                .collect::<Result<_, _>>()
+                .map(Doc::Array),
+            b'{' => {
+                use serde::Deserializer;
+                let members =
+                    serde_json::Deserializer::from_str(raw).deserialize_map(RawMembers)?;
+                members
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, legacy(value.get(), depth + 1)?)))
+                    .collect::<Result<_, _>>()
+                    .map(Doc::Object)
+            }
+            _ => Ok(Doc::Number(raw.to_owned())),
+        }
+    }
+
+    #[test]
+    fn the_single_pass_builds_what_the_recursive_parser_built() {
+        let nested = |open: &str, close: &str, depth: usize| {
+            format!("{}0{}", open.repeat(depth), close.repeat(depth))
+        };
+        let mut bodies: Vec<String> = [
+            "null",
+            " true ",
+            "false",
+            "0",
+            "-0",
+            "1.50",
+            "1E+02",
+            "1e400",
+            "18446744073709551616",
+            r#""plain""#,
+            r#""日本 \"quoted\" \\ \/ \n\t\u00e9\ud83d\ude00""#,
+            r#""\ud800""#,
+            r#""a\\""#,
+            r#""\\""#,
+            r#""\"""#,
+            r#""日本""#,
+            r#"{"日本":"値","é":[]}"#,
+            "[ [ ] , { } ]",
+            "[]",
+            "[ ]",
+            "{}",
+            "{ }",
+            " [1, 2 ,3 ] ",
+            "[[[],[{}]],{}]",
+            r#"{"A":"first","a":"second","A":3}"#,
+            r#"{"k\u00e9y":1,"":2}"#,
+            r#"{"\ud800":1}"#,
+            r#"{"a":1,"b\udc00":2}"#,
+            r#"[{"a":[1]},{"\ud800":1}]"#,
+            "{\n \"a\" : [ {\"b\":null} , \"x\" ] ,\r\n\t\"c\":true}",
+            "[1,]",
+            r#"{"a":}"#,
+            r#"{"a" 1}"#,
+            "[1 2]",
+            r#""unterminated"#,
+            "{",
+            "tru",
+            "01",
+            "1.",
+            "-",
+            "[1]x",
+            "\"\u{1}\"",
+            "",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for depth in [MAX_BODY_DEPTH - 1, MAX_BODY_DEPTH, 128, 200] {
+            bodies.push(nested("[", "]", depth));
+            bodies.push(nested(r#"{"a":"#, "}", depth));
+        }
+        for body in &bodies {
+            let legacy = serde_json::from_str::<&RawValue>(body)
+                .and_then(|raw| legacy::<true>(raw.get(), 0).map_err(de::Error::custom));
+            match (serde_json::from_str::<Doc>(body), legacy) {
+                (Ok(doc), Ok(expected)) => assert_eq!(doc, expected, "{body}"),
+                (Err(error), Err(expected)) => {
+                    assert_eq!(error.to_string(), expected.to_string(), "{body}");
+                }
+                (got, expected) => panic!("{body}: {got:?} vs {expected:?}"),
+            }
+        }
+
+        // The one difference: an object with an undecodable member name after
+        // a member value that fails reports the value's error (document
+        // order), where the old parser decoded every name first.
+        let body = format!(r#"{{"a":{},"\ud800":1}}"#, nested("[", "]", MAX_BODY_DEPTH));
+        let error = serde_json::from_str::<Doc>(&body).expect_err("too deep");
+        assert_eq!(error.to_string(), "recursion limit exceeded");
+        let raw = serde_json::from_str::<&RawValue>(&body).expect("valid JSON");
+        let old = legacy::<true>(raw.get(), 0).expect_err("an undecodable name");
+        assert_ne!(old.to_string(), error.to_string());
+    }
+
+    /// The tree is built in one pass: a body nested near the depth cap costs
+    /// about what the same bytes nested once do, where re-reading every
+    /// level's text cost ~depth times more. A ratio of two timings on the
+    /// same machine, the best of three each, with room for noise either way.
+    #[test]
+    fn a_deeply_nested_body_parses_in_linear_time() {
+        let payload = format!("\"{}\"", "x".repeat(2 * 1024 * 1024));
+        let depth = MAX_BODY_DEPTH - 4;
+        let deep = format!("{}{payload}{}", "[".repeat(depth), "]".repeat(depth));
+        let flat = format!("[{payload}]");
+        let best = |body: &str| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    serde_json::from_str::<Doc>(body).expect("parses");
+                    start.elapsed()
+                })
+                .min()
+                .unwrap_or_default()
+        };
+        let (deep, flat) = (best(&deep), best(&flat));
+        assert!(
+            deep < flat * 8,
+            "nested {depth} deep: {deep:?}, nested once: {flat:?}"
+        );
+    }
+
     #[test]
     fn string_and_boolean_binding_match_jellyfin_oracle() {
         let fixture = include_str!("../../tests/data/json-binding/jellyfin-12.2.jsonl");

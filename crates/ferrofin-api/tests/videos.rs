@@ -241,6 +241,9 @@ struct StreamSources {
     /// The HTTP URL the item's own source is read from instead of its path
     /// (an in-progress recording's `EncoderPath`), if any.
     encoder: Option<String>,
+    /// Whether the item's own source is still being written
+    /// (`IsInfiniteStream`).
+    infinite: bool,
 }
 
 impl StreamSources {
@@ -319,6 +322,7 @@ impl MediaSourceManager for StreamSources {
             video_type: self.disc.then_some(VideoType::BluRay),
             encoder_protocol: self.encoder.as_ref().map(|_| MediaProtocol::Http),
             encoder_path: self.encoder.clone(),
+            is_infinite_stream: self.infinite,
             ..static_source(&self.path)
         }];
         if let Some(alternate) = &self.alternate {
@@ -1056,6 +1060,136 @@ async fn a_static_stream_is_read_from_the_encoder_path_its_source_names() {
     let (status, body) = get_body(&router, &format!("/Videos/{ITEM_ID}/stream?static=true")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, SERVER_AGENT.as_bytes());
+}
+
+/// `VideosController.GetVideoStream`: a file source still being written
+/// (`IsInfiniteStream`) with no encoder path to relay is served as a
+/// `ProgressiveFileStream`, which keeps reading as the file grows, not as the
+/// bytes on disk when the request came in. It is typed by the output
+/// container, and no range of it is addressable.
+///
+/// Over a real connection: a response framed by the file's length at request
+/// time ends there, which an in-process call would not show. A `Range` is
+/// ignored: nothing of a growing file is addressable.
+#[tokio::test]
+async fn a_static_stream_of_a_growing_file_follows_the_file() {
+    let growing = TempMedia::new(b"written so far");
+    let sources = StreamSources {
+        infinite: true,
+        ..StreamSources::at(&growing.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let request = reqwest::Client::new()
+        .get(format!(
+            "http://{address}/Videos/{ITEM_ID}/stream.ts?static=true"
+        ))
+        .header("Authorization", "Bearer token")
+        .header("Range", "bytes=0-3")
+        .send();
+    let mut response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("the response starts")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let headers = response.headers().clone();
+
+    let mut read = Vec::new();
+    let mut appended = false;
+    let wanted = b"written so far, and then some".as_slice();
+    while read.len() < wanted.len() {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk())
+            .await
+            .expect("the stream waits for the file to grow, it does not stall")
+            .expect("chunk");
+        let Some(chunk) = chunk else {
+            panic!(
+                "the stream ended at {:?}, before the file grew",
+                String::from_utf8_lossy(&read)
+            );
+        };
+        read.extend_from_slice(&chunk);
+        if !appended && read.len() >= b"written so far".len() {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&growing.path)
+                .and_then(|mut file| file.write_all(b", and then some"))
+                .expect("grow the file");
+            appended = true;
+        }
+    }
+    assert_eq!(read, wanted);
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(header("content-type"), Some("video/mp2t"));
+    assert_eq!(header("accept-ranges"), Some("none"));
+}
+
+/// `StreamingHelpers.GetStreamingState`: a request for a file still being
+/// written that names no container is typed `ts`, whatever the file's own
+/// extension; a finished file keeps its own type. A `HEAD` answers the same
+/// headers and no body.
+#[rstest::rstest]
+#[case::growing("GET", true, "video/mp2t")]
+#[case::growing_head("HEAD", true, "video/mp2t")]
+#[case::finished("GET", false, "video/x-matroska")]
+#[tokio::test]
+async fn a_static_stream_naming_no_container_is_typed_by_its_source(
+    #[case] method: &str,
+    #[case] infinite: bool,
+    #[case] content_type: &str,
+) {
+    let file = TempMedia::new(b"some bytes");
+    let sources = StreamSources {
+        infinite,
+        ..StreamSources::at(&file.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let response = router
+        .oneshot(authed(
+            method,
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some(content_type)
+    );
+    if method == "HEAD" {
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("a HEAD body ends at once")
+        .unwrap();
+        assert!(body.is_empty(), "{body:?}");
+    }
 }
 
 /// `StreamingHelpers.GetStreamingState`: a `LiveStreamId` wins over the

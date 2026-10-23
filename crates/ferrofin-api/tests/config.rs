@@ -1042,6 +1042,8 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn save_listing_provider(
         &self,
         _info: ferrofin_model::live_tv::ListingsProviderInfo,
+        _validate_login: bool,
+        _validate_listings: bool,
     ) -> Result<ferrofin_model::live_tv::ListingsProviderInfo, ServiceError> {
         unreachable!()
     }

@@ -1945,6 +1945,20 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
         push_in_list(qb, r#"a."ParentItemId""#, ancestors);
         qb.push(")");
     }
+    // `innerQueryFilter.ParentId = filter.ParentId` (v12.2 `ByName.cs:188`, and
+    // the counts' `scopeQuery`, `:346`), which `TranslateQuery` matches as a
+    // strict `ParentId` equality (`TranslateQuery.cs:320-322`): the parent's
+    // direct children, never a box set's linked members.
+    //
+    // `+`: a plan pin, like `Type` above and `TopParentId` below. Unpinned, the
+    // planner drives the semijoin from the parent's children
+    // (`IX_BaseItems_ParentId`) and probes the value's map for each, per
+    // candidate value: 1.1 s for 400 genres over a folder of 6,000 movies,
+    // against 0.1 s probing each map row's item by its primary key.
+    if !filter.parent_id.is_nil() {
+        qb.push(r#" AND +ci."ParentId" = "#)
+            .push_bind(guid_to_db(filter.parent_id));
+    }
     if !filter.item_ids.is_empty() {
         qb.push(" AND ");
         push_in_list(qb, r#"ci."Id""#, &to_guid_strings(&filter.item_ids));
@@ -3742,6 +3756,23 @@ impl ItemRepository for FerrofinItemRepository {
         self.distinct_years(scoped.as_ref().unwrap_or(filter)).await
     }
 
+    async fn get_tag_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        // `BaseItemRepository.GetTagNames` (v12.2 `ByName.cs:121-147`) takes the
+        // `Tags` values of the items `TranslateQuery` matches, grouped by
+        // `CleanValue`, `MIN(Value)` per group, ordered by that value: the
+        // legacy facet's own statement. `LibraryManager.GetTagNames` applies
+        // `AddUserToQuery` and `SetTopParentOrAncestorIds` first; the view
+        // resolution here applies the user's libraries as the other facets
+        // do. TODO(gl-807): it does not rewrite an all-view/library ancestor
+        // scope to `TopParentIds` as `SetTopParentOrAncestorIds` does.
+        let scoped = self.resolve_views(filter).await?;
+        self.distinct_item_values(scoped.as_ref().unwrap_or(filter), ItemValueType::Tags)
+            .await
+    }
+
     async fn get_is_played(
         &self,
         user: &UserEntity,
@@ -3860,6 +3891,7 @@ fn stream_language_query(filter: &InternalItemsQuery) -> InternalItemsQuery {
     query.item_ids.clone_from(&filter.item_ids);
     query.top_parent_ids.clone_from(&filter.top_parent_ids);
     query.parent_id = filter.parent_id;
+    query.physical_children_only = filter.physical_children_only;
     query.is_airing = filter.is_airing;
     query.is_movie = filter.is_movie;
     query.is_sports = filter.is_sports;
@@ -3922,31 +3954,42 @@ impl FerrofinItemRepository {
         // One entry per CLEANED value (upstream GetQueryFiltersLegacy groups by
         // CleanValue and keeps MIN(Value)), so "Sci-Fi"/"Sci-fi" case variants
         // collapse instead of doubling the filter dialog's list.
-        //
-        // `CROSS JOIN` pins the join order to iv → ivm → bi: the values of the
-        // type, their map rows by the map's primary key, the item by its own.
-        // Left to itself the planner — with no `sqlite_stat1` to tell it the
-        // user-scope `TopParentId IN (…)` matches every item there is — pairs
-        // every value with every item under the user's libraries and probes
-        // the map for each pair: 38 genres × 21k items ≈ 800k probes, 820 ms
-        // for the genre facet of `/Items/Filters` on the bench library; pinned,
-        // it is one probe per map row of the type.
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
-               CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
-               CROSS JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
-               WHERE iv."Type" = "#,
-        );
-        qb.push_bind(i64::from(i32::from(value_type)));
-        qb.push(r#" AND bi."Id" <> "#);
-        qb.push_bind(PLACEHOLDER_ID);
-        append_predicates(&mut qb, filter);
-        qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
-        qb.build_query_scalar()
+        item_values_statement(filter, value_type)
+            .build_query_scalar()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
     }
+}
+
+/// The statement [`FerrofinItemRepository::distinct_item_values`] runs: one
+/// `MIN("Value")` per `CleanValue` of `value_type`, over the items `filter`
+/// matches, ordered by that value.
+///
+/// `CROSS JOIN` pins the join order to iv → ivm → bi: the values of the type,
+/// their map rows by the map's primary key, the item by its own. Left to
+/// itself the planner — with no `sqlite_stat1` to tell it the user-scope
+/// `TopParentId IN (…)` matches every item there is — pairs every value with
+/// every item under the user's libraries and probes the map for each pair:
+/// 38 genres × 21k items ≈ 800k probes, 820 ms for the genre facet of
+/// `/Items/Filters` on the bench library; pinned, it is one probe per map row
+/// of the type. `item_values_statement_walks_values_then_map_then_items` pins it.
+fn item_values_statement(
+    filter: &InternalItemsQuery,
+    value_type: ItemValueType,
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
+           CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+           CROSS JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
+           WHERE iv."Type" = "#,
+    );
+    qb.push_bind(i64::from(i32::from(value_type)));
+    qb.push(r#" AND bi."Id" <> "#);
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
+    qb
 }
 
 /// Builds a `?, ?, …` placeholder list of length `n` (at least one).
@@ -4069,6 +4112,64 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    /// The batched image read answers each item exactly as `get_image_infos`
+    /// does (by type, then insertion order), and leaves out an item with no
+    /// images.
+    #[tokio::test]
+    async fn image_infos_batch_matches_the_per_item_read() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+
+        let db = test_db().await;
+        let repo = repo(&db);
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let (first, second, bare) = (
+            Uuid::from_u128(0x9a01),
+            Uuid::from_u128(0x9a02),
+            Uuid::from_u128(0x9a03),
+        );
+        let image = |path: &str, image_type| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            date_modified: chrono::Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        for (id, name) in [(first, "First"), (second, "Second"), (bare, "Bare")] {
+            seed_named_item(&db, id, BaseItemKind::MusicAlbum, name).await;
+        }
+        store
+            .save_item_images(
+                first,
+                &[
+                    image("/m/a/backdrop.jpg", ImageType::Backdrop),
+                    image("/m/a/folder.jpg", ImageType::Primary),
+                    image("/m/a/backdrop2.jpg", ImageType::Backdrop),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .save_item_images(second, &[image("/m/b/cover.jpg", ImageType::Primary)])
+            .await
+            .unwrap();
+
+        let batched = repo
+            .get_image_infos_batch(&[first, second, bare])
+            .await
+            .unwrap();
+        assert_eq!(batched.len(), 2, "no entry for an item with no images");
+        for id in [first, second] {
+            let one = repo.get_image_infos(id).await.unwrap();
+            let paths = |images: &[ItemImageInfo]| {
+                images.iter().map(|i| i.path.clone()).collect::<Vec<_>>()
+            };
+            assert_eq!(paths(&batched[&id]), paths(&one), "{id}");
+        }
+    }
 
     /// A page's artist and music-video album links resolve through one
     /// `(Type, CleanName)` index search per chunk ([`item_ids_by_clean_name`]),
@@ -8104,6 +8205,345 @@ mod tests {
         assert!(by_type.is_empty());
     }
 
+    /// `/Items/Filters2?recursive=false` under a folder that is neither a view
+    /// nor a library gives each facet query the folder as `Parent`, which
+    /// upstream's `TranslateQuery` matches as a strict `ParentId` equality
+    /// (v12.2 `TranslateQuery.cs:320-322`; the by-name `innerQueryFilter`
+    /// carries it, `ByName.cs:188`). So the genre, music-genre and
+    /// stream-language facets count the folder's direct children only: not a
+    /// grandchild, and under a box set not its linked members.
+    #[tokio::test]
+    async fn filter_facets_under_a_parent_count_its_direct_children_only() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xA1D0)).await;
+        let ids: Vec<_> = (0xA1D1..0xA1D9).map(Uuid::from_u128).collect();
+        let (folder, sub, box_set) = (ids[0], ids[1], ids[2]);
+        let (child, grandchild, elsewhere) = (ids[3], ids[4], ids[5]);
+        let (song, grand_song) = (ids[6], ids[7]);
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Kids", None).await;
+        seed_folder_item(&db, sub, BaseItemKind::Folder, "Classics", Some(folder)).await;
+        seed_folder_item(&db, box_set, BaseItemKind::BoxSet, "Set", None).await;
+        seed_child_item(&db, child, BaseItemKind::Movie, "Film A", folder).await;
+        seed_child_item(&db, grandchild, BaseItemKind::Movie, "Film B", sub).await;
+        seed_named_item(&db, elsewhere, BaseItemKind::Movie, "Other Film").await;
+        seed_child_item(&db, song, BaseItemKind::Audio, "Song", folder).await;
+        seed_child_item(&db, grand_song, BaseItemKind::Audio, "Old Song", sub).await;
+        seed_library_over(&db, &ids).await;
+        for (item, genre) in [
+            (child, "Animation"),
+            (grandchild, "Western"),
+            (elsewhere, "Drama"),
+            (elsewhere, "Animation"),
+            (song, "Jazz"),
+            (grand_song, "Blues"),
+        ] {
+            seed_item_value(&db, item, ItemValueType::Genre, genre).await;
+        }
+        for (item, language) in [(child, "eng"), (grandchild, "fra"), (elsewhere, "jpn")] {
+            insert_stream(&db, item, 0, MediaStreamType::Audio, Some(language)).await;
+        }
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+               VALUES (?, ?, 0, 0)"#,
+        )
+        .bind(guid_to_db(box_set))
+        .bind(guid_to_db(elsewhere))
+        .execute(db.writer())
+        .await
+        .expect("link the set's member");
+
+        let under = |parent: Uuid, kind: BaseItemKind| InternalItemsQuery {
+            user: Some(user.clone()),
+            include_item_types: vec![kind],
+            parent_id: parent,
+            physical_children_only: true,
+            ..InternalItemsQuery::default()
+        };
+        let names = |result: QueryResult<ItemWithCounts>| -> Vec<String> {
+            result
+                .items
+                .into_iter()
+                .filter_map(|row| row.item.name)
+                .collect()
+        };
+        let audio = |query: InternalItemsQuery| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_media_stream_languages(&query, MediaStreamType::Audio)
+                    .await
+                    .expect("languages")
+            }
+        };
+
+        let movies = under(folder, BaseItemKind::Movie);
+        let genres = repository.get_genres(&movies).await.expect("genres");
+        // The per-kind counts carry the same parent (`scopeQuery`, `:346`).
+        assert_eq!(
+            genres
+                .items
+                .iter()
+                .map(|row| row.counts.movie_count)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(names(genres), ["Animation"]);
+        assert_eq!(audio(movies).await, ["eng"]);
+        assert_eq!(
+            names(
+                repository
+                    .get_music_genres(&under(folder, BaseItemKind::Audio))
+                    .await
+                    .expect("music genres")
+            ),
+            ["Jazz"]
+        );
+        let set = under(box_set, BaseItemKind::Movie);
+        assert!(
+            names(repository.get_genres(&set).await.expect("genres")).is_empty(),
+            "a box set's linked member is not its child"
+        );
+        assert!(audio(set).await.is_empty());
+    }
+
+    /// Upstream's `BaseItemRepositoryItemValueTests.GetTagNames_GroupsAndFiltersItemValues`
+    /// (Jellyfin 12.1, `ca06ccfa13`), the oracle for `/Items/Filters2`'s tags:
+    /// one name per clean value (its smallest spelling), only `Tags` (not
+    /// `InheritedTags` or a genre), only from the requested kinds.
+    #[tokio::test]
+    async fn tag_names_group_by_clean_value_and_keep_only_tags_of_the_kinds() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xA3D0)).await;
+        let ids: Vec<_> = (0xA3D1..0xA3D4).map(Uuid::from_u128).collect();
+        let (movie, other_movie, audio) = (ids[0], ids[1], ids[2]);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_named_item(&db, other_movie, BaseItemKind::Movie, "Other Movie").await;
+        seed_named_item(&db, audio, BaseItemKind::Audio, "Excluded Audio").await;
+        seed_library_over(&db, &ids).await;
+        for (item, value_type, value) in [
+            (movie, ItemValueType::Tags, "Alpha"),
+            (movie, ItemValueType::Tags, "alpha"),
+            (other_movie, ItemValueType::Tags, "Beta"),
+            (movie, ItemValueType::InheritedTags, "Inherited"),
+            (movie, ItemValueType::Genre, "Genre Leak"),
+            (audio, ItemValueType::Tags, "Excluded Tag"),
+        ] {
+            seed_item_value(&db, item, value_type, value).await;
+        }
+
+        let tags = repository
+            .get_tag_names(&InternalItemsQuery {
+                user: Some(user),
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("tag names");
+        assert_eq!(tags, ["Alpha", "Beta"]);
+    }
+
+    /// The tag facet honours the scope `/Items/Filters2` hands it: a parent's
+    /// descendants (`AncestorIds`) or its direct children (a strict parent),
+    /// and an unscoped query is confined to the libraries the user may open.
+    #[tokio::test]
+    async fn tag_names_follow_the_facet_scope() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let ids: Vec<_> = (0xA5D1..0xA5D8).map(Uuid::from_u128).collect();
+        let (folder, sub, child, grandchild, elsewhere) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        let (hidden_library, hidden) = (ids[5], ids[6]);
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Kids", None).await;
+        seed_folder_item(&db, sub, BaseItemKind::Folder, "Classics", Some(folder)).await;
+        seed_child_item(&db, child, BaseItemKind::Movie, "Film A", folder).await;
+        seed_child_item(&db, grandchild, BaseItemKind::Movie, "Film B", sub).await;
+        seed_named_item(&db, elsewhere, BaseItemKind::Movie, "Other Film").await;
+        let library = seed_library_over(&db, &ids[..5]).await;
+        seed_named_item(
+            &db,
+            hidden_library,
+            BaseItemKind::CollectionFolder,
+            "Hidden",
+        )
+        .await;
+        seed_top_parented_item(
+            &db,
+            hidden,
+            BaseItemKind::Movie,
+            "Hidden Film",
+            hidden_library,
+        )
+        .await;
+        for (item, ancestor) in [
+            (sub, folder),
+            (child, folder),
+            (grandchild, sub),
+            (grandchild, folder),
+        ] {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?, ?)"#)
+                .bind(guid_to_db(item))
+                .bind(guid_to_db(ancestor))
+                .execute(db.writer())
+                .await
+                .expect("ancestor row");
+        }
+        for (item, tag) in [
+            (child, "Near"),
+            (grandchild, "Deep"),
+            (elsewhere, "Far"),
+            (hidden, "Hidden"),
+        ] {
+            seed_item_value(&db, item, ItemValueType::Tags, tag).await;
+        }
+        let user_id = Uuid::from_u128(0xA5D0);
+        let user = seed_user_with_defaults(&db, user_id).await;
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::EnableAllFolders,
+            false,
+        )
+        .await
+        .expect("restrict the user");
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[library]).await;
+
+        let base = InternalItemsQuery {
+            user: Some(user),
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        };
+        let tags = |query: InternalItemsQuery| {
+            let repository = &repository;
+            async move { repository.get_tag_names(&query).await.expect("tag names") }
+        };
+        assert_eq!(tags(base.clone()).await, ["Deep", "Far", "Near"]);
+        assert_eq!(
+            tags(InternalItemsQuery {
+                ancestor_ids: vec![folder],
+                ..base.clone()
+            })
+            .await,
+            ["Deep", "Near"]
+        );
+        assert_eq!(
+            tags(InternalItemsQuery {
+                parent_id: folder,
+                physical_children_only: true,
+                ..base
+            })
+            .await,
+            ["Near"]
+        );
+    }
+
+    /// Plan pin for the tag facet (`/Items/Filters2`; the legacy facet set's
+    /// genres and tags run the same statement): the `CROSS JOIN` order holds,
+    /// the type's values first, then their map rows, then each item by a point
+    /// probe on its `Id` (the primary key, or under a user scope
+    /// `IX_BaseItems_Type_TopParentId_Id` ending in `Id=?`).
+    #[tokio::test]
+    async fn item_values_statement_walks_values_then_map_then_items() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let libraries = [Uuid::from_u128(0xA4D1), Uuid::from_u128(0xA4D2)];
+        // Unscoped, under a strict parent, and a user-scoped statement
+        // (`TopParentId IN (…)`) with an ancestor scope.
+        for (parent, top_parent_ids, ancestor_ids) in [
+            (Uuid::nil(), vec![], vec![]),
+            (Uuid::from_u128(0xA4D0), vec![], vec![]),
+            (Uuid::nil(), libraries.to_vec(), vec![libraries[0]]),
+        ] {
+            let filter = InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                parent_id: parent,
+                physical_children_only: !parent.is_nil(),
+                top_parent_ids,
+                ancestor_ids,
+                ..InternalItemsQuery::default()
+            };
+            let mut qb = item_values_statement(&filter, ItemValueType::Tags);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            let at = |prefix: &str| {
+                plan.iter()
+                    .position(|d| d.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("no {prefix}: {plan:#?}"))
+            };
+            let (iv, ivm, bi) = (at("SEARCH iv "), at("SEARCH ivm "), at("SEARCH bi "));
+            assert!(iv < ivm && ivm < bi, "{plan:#?}");
+            // A point probe by the map row's item: the primary key, or under a
+            // user scope `IX_BaseItems_Type_TopParentId_Id` ending in `Id=?` (a
+            // `TopParentId=?` range of the library's items would not do).
+            assert!(
+                plan[bi].ends_with("(Id=?)") || plan[bi].ends_with(" AND Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(!plan.iter().any(|d| d.starts_with("SCAN ")), "{plan:#?}");
+        }
+    }
+
+    /// Plan pin for the by-name semijoin under a parent (`/Items/Filters2?recursive=false`
+    /// under a folder): each of the value's map rows reaches its item by the
+    /// item's primary key, with or without a kind filter. Driven from the
+    /// parent's children instead (`IX_BaseItems_ParentId`), every candidate
+    /// value walked the folder's whole child list.
+    #[tokio::test]
+    async fn by_name_semijoin_under_a_parent_probes_items_by_id() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery {
+            parent_id: Uuid::from_u128(0xA2D0),
+            ..InternalItemsQuery::default()
+        };
+        let type_ints = [i64::from(i32::from(ItemValueType::Genre))];
+        let movie = [stored_type_name(BaseItemKind::Movie)
+            .expect("stored")
+            .to_owned()];
+        for content_type_names in [&movie[..], &[]] {
+            let scope = ByNameScope {
+                filter: &filter,
+                type_ints: &type_ints,
+                content_type_names,
+                exclude_type_names: &[],
+                media_types: &[],
+                ancestors: &[],
+                top_parents: &[],
+            };
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Type" = "#);
+            qb.push_bind(stored_type_name(BaseItemKind::Genre).expect("stored"));
+            push_value_exists(&mut qb, &scope, InnerScope::Page);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|d| d == "SEARCH ci USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.contains("IX_BaseItems_ParentId")),
+                "{plan:#?}"
+            );
+        }
+    }
+
     /// The grouping regression: with a user set, the `build_query` id list
     /// grouped the version pair by `PresentationUniqueKey` and kept only the
     /// primary, so the alternate's French never reached the facet. Upstream
@@ -10440,6 +10880,77 @@ mod tests {
             .await
             .expect("page");
         assert_eq!(paged.total_record_count, 1);
+    }
+
+    /// Which row stands for a presentation-key group when the primary-version
+    /// preference does not decide: C# `ApplyGroupingFilter` takes
+    /// `g.Where(e => e.PrimaryVersionId == null).Min(e => (Guid?)e.Id) ??
+    /// g.Min(e => (Guid?)e.Id)`, so the smallest id among the primaries, and
+    /// the smallest id overall in a group with none.
+    ///
+    /// Each group's larger id is written first, so a pick that falls back on
+    /// SQLite's scan order (the first row reaching the `MIN`) lands on it.
+    #[tokio::test]
+    async fn a_presentation_group_is_represented_by_its_smallest_primary_id() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9C11);
+        let other_library = Uuid::from_u128(0x9C12);
+        // Two primaries share a key: two seasons of one series with the same
+        // number.
+        let (tie_big, tie_small) = (Uuid::from_u128(0x9C1B), Uuid::from_u128(0x9C1A));
+        // The keyless group: every row without a key is one group.
+        let (keyless_big, keyless_small) = (Uuid::from_u128(0x9C4B), Uuid::from_u128(0x9C4A));
+        // Alternates whose primary is gone: none of the group is a primary.
+        let (orphan_big, orphan_small) = (Uuid::from_u128(0x9C2B), Uuid::from_u128(0x9C2A));
+        let gone = Uuid::from_u128(0x9C2F);
+        // The primary wins over a smaller alternate. The alternate is in another
+        // library, where it is listed as an item of its own (an alternate beside
+        // its primary is hidden before grouping), so the two meet in one group.
+        let (primary, alternate) = (Uuid::from_u128(0x9C3B), Uuid::from_u128(0x9C3A));
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, other_library, BaseItemKind::CollectionFolder, "More").await;
+        for (id, key, primary_version, top_parent) in [
+            (tie_big, Some("tie"), None, library),
+            (tie_small, Some("tie"), None, library),
+            (keyless_big, None, None, library),
+            (keyless_small, None, None, library),
+            (orphan_big, Some("orphans"), Some(gone), library),
+            (orphan_small, Some("orphans"), Some(gone), library),
+            (primary, Some("mixed"), None, library),
+            (alternate, Some("mixed"), Some(primary), other_library),
+        ] {
+            let name = key.unwrap_or("keyless");
+            seed_top_parented_item(&db, id, BaseItemKind::Movie, name, top_parent).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2, "PrimaryVersionId" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(key)
+            .bind(primary_version.map(guid_to_db))
+            .execute(db.writer())
+            .await
+            .expect("set the key and the primary version");
+        }
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9C05)).await;
+
+        let mut found: Vec<String> = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user),
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse")
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [tie_small, orphan_small, primary, keyless_small].map(guid_to_db)
+        );
     }
 
     /// Resume surfaces the version that was actually PLAYED, not the primary.

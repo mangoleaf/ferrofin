@@ -202,6 +202,11 @@ pub struct Inner {
     /// Defaults to the disabled stub; the composition root injects the
     /// ffmpeg-backed `SubtitleEncoderImpl`.
     pub subtitle_encoder: Arc<dyn SubtitleEncoder>,
+    /// The encoders the probed ffmpeg has, which the playback negotiation
+    /// asks before offering an audio transcode (`ITranscoderSupport`).
+    /// Defaults to none, a server without ffmpeg; the composition root
+    /// injects the probed set.
+    pub encoder_support: Arc<dyn ferrofin_traits::media_encoding::EncoderSupport>,
     /// The on-disk virtual-folder (library-structure) admin surface backing
     /// `/Library/VirtualFolders*` and `/Library/PhysicalPaths`. Defaults to the
     /// disabled stub (empty reads, rejected writes); the composition root injects
@@ -443,6 +448,7 @@ impl AppState {
             hls: Arc::new(DisabledHlsStreamManager),
             attachments: Arc::new(ferrofin_traits::stubs::DisabledAttachmentExtractor),
             subtitle_encoder: Arc::new(DisabledSubtitleEncoder),
+            encoder_support: Arc::new(ferrofin_traits::media_encoding::NoEncoders),
             // Default to the disabled virtual-folder store; the composition root
             // overrides it via `with_virtual_folders`.
             virtual_folders: Arc::new(DisabledVirtualFolderManager),
@@ -504,6 +510,24 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_subtitle_encoder must be called before the state is shared");
         inner.subtitle_encoder = subtitle_encoder;
+        self
+    }
+
+    /// Replaces the encoder set the playback negotiation reads with the
+    /// probed ffmpeg's ([`new`](Self::new) installs none).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_encoder_support(
+        mut self,
+        encoder_support: Arc<dyn ferrofin_traits::media_encoding::EncoderSupport>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_encoder_support must be called before the state is shared");
+        inner.encoder_support = encoder_support;
         self
     }
 
