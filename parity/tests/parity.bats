@@ -169,6 +169,11 @@ containers_gone() { # no container left in the fake docker, no server process le
   [[ "$output" == *"PARITY_CAP_S must be a positive integer"* ]]
   PARITY_PIN=2 run parity
   [ "$status" -eq 2 ]
+  for bad in 0 9; do
+    PARITY_CONCURRENCY=$bad run parity
+    [ "$status" -eq 2 ]
+  done
+  [[ "$output" == *"PARITY_CONCURRENCY is 1 to 8"* ]]
   [ ! -e out ]
 }
 
@@ -334,6 +339,20 @@ containers_gone() { # no container left in the fake docker, no server process le
   containers_gone
 }
 
+@test "run.sh: a request directory is every *.jsonl in it, read PARITY_CONCURRENCY at a time, and run.json records both" {
+  mkdir set
+  echo '{"id": "a", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > set/1.jsonl
+  echo '{"id": "b", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > set/2.jsonl
+  echo 'not requests' > set/notes.txt
+  PARITY_CONCURRENCY=2 run parity --requests set
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '[.requests[].id]' out/results.json)" = '["a","b"]' ]
+  [ "$(jq -r .concurrency out/run.json)" = 2 ]
+  [ "$(jq -r .timing.reads.concurrency out/results.json)" = 2 ]
+  [ "$(jq -r .requests_sha256 out/run.json)" = "$(cat set/1.jsonl set/2.jsonl | sha256sum | cut -d' ' -f1)" ]
+  containers_gone
+}
+
 # ── writes ────────────────────────────────────────────────────────────────────────────────────
 @test "run.sh: each write runs after every read, on a fresh copy of the isolated configuration, followed by its read-backs" {
   printf '%s\n' '{"id": "fav-a", "method": "POST", "path": "/UserFavoriteItems/a", "readbacks": [{"id": "list", "path": "/favourites"}]}' \
@@ -375,7 +394,8 @@ containers_gone() { # no container left in the fake docker, no server process le
   printf '%s\n' '{"id": "a", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' \
                 '{"id": "b", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > two.jsonl
   start=$SECONDS
-  PARITY_CAP_S=20 PARITY_REQUEST_TIMEOUT=10 FERROFIN_IMAGE=ferrofin:slow run parity --requests two.jsonl
+  # one read at a time, so the second starts with less than its timeout left (in parallel both finish in time)
+  PARITY_CAP_S=20 PARITY_REQUEST_TIMEOUT=10 PARITY_CONCURRENCY=1 FERROFIN_IMAGE=ferrofin:slow run parity --requests two.jsonl
   [ "$status" -eq 1 ]
   [ "$(jq -r .verdict out/results.json)" = "run failed" ]
   grep -q "before every request was sent" out/report.html   # the comparison hit the cap, not the boot

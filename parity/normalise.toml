@@ -47,3 +47,9 @@ paths = ["DateCreated", "DateLastMediaAdded", "Etag"]
 kind = "opaque"
 requests = ["playlist-create/detail", "collection-create/detail"]
 reason = "A playlist or collection created by the write carries the time each server created it, and an Etag derived from that time."
+
+# An error answer in RFC 9110 problem-details form carries the id of the request's trace, new on every request.
+[[rule]]
+paths = ["traceId"]
+kind = "opaque"
+reason = "The trace id of an error answer is new for every request on every server."
