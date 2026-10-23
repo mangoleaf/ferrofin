@@ -20,9 +20,12 @@ use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::SortOrder;
+use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::search::{SearchHint, SearchQuery};
+use ferrofin_traits::drawing::ImageProcessor;
+use ferrofin_traits::options::ItemImageInfo;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -44,6 +47,7 @@ const SCORE_SUBSTRING: f32 = 1.0;
 pub struct FerrofinSearchManager {
     items: Arc<dyn ItemRepository>,
     users: Arc<dyn UserManager>,
+    images: Option<Arc<dyn ImageProcessor>>,
 }
 
 impl std::fmt::Debug for FerrofinSearchManager {
@@ -64,7 +68,20 @@ impl FerrofinSearchManager {
     /// rows the caller cannot browse.
     #[must_use]
     pub fn new(items: Arc<dyn ItemRepository>, users: Arc<dyn UserManager>) -> Self {
-        Self { items, users }
+        Self {
+            items,
+            users,
+            images: None,
+        }
+    }
+
+    /// Attaches the image processor the hints' artwork tags come from
+    /// (`SearchController`'s `IImageProcessor`). Without one, a hint carries
+    /// no image tags.
+    #[must_use]
+    pub fn with_image_processor(mut self, images: Arc<dyn ImageProcessor>) -> Self {
+        self.images = Some(images);
+        self
     }
 
     /// Translates a [`SearchQuery`] into the item query that backs it.
@@ -189,6 +206,97 @@ impl FerrofinSearchManager {
             .await
     }
 
+    /// `ChannelName`: the name of the item a hint's `ChannelId` names (C#
+    /// `_libraryManager.GetItemById(item.ChannelId)`), read once per page.
+    async fn attach_channel_names(&self, hints: &mut [SearchHint]) -> Result<(), ServiceError> {
+        let mut ids: Vec<Uuid> = hints
+            .iter()
+            .filter_map(|hint| hint.channel_id.filter(|id| !id.is_nil()))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let names: std::collections::HashMap<Uuid, Option<String>> = self
+            .items
+            .retrieve_items(&ids)
+            .await?
+            .into_iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row.name)))
+            .collect();
+        for hint in hints {
+            if let Some(name) = hint.channel_id.and_then(|id| names.get(&id)) {
+                hint.channel_name.clone_from(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// The hints' artwork (`GetSearchHintResult` with `SetThumbImageInfo` and
+    /// `SetBackdropImageInfo`): the page's ancestors are read one generation
+    /// per batch and every image row in one more read, never a query per hint.
+    async fn attach_artwork(
+        &self,
+        hints: &mut [SearchHint],
+        items: &[BaseItemEntity],
+    ) -> Result<(), ServiceError> {
+        let Some(processor) = self.images.as_deref() else {
+            return Ok(());
+        };
+        let rows: std::collections::HashMap<Uuid, &BaseItemEntity> = items
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+            .collect();
+        let page_rows: Vec<&BaseItemEntity> = hints
+            .iter()
+            .filter_map(|h| rows.get(&h.id).copied())
+            .collect();
+        let ancestors = self.ancestors(&page_rows).await?;
+        let mut ids: Vec<Uuid> = hints
+            .iter()
+            .map(|h| h.id)
+            .chain(ancestors.keys().copied())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let images = self.items.get_image_infos_batch(&ids).await?;
+        for hint in hints.iter_mut() {
+            let parents = rows
+                .get(&hint.id)
+                .map(|row| parent_chain(row, &ancestors))
+                .unwrap_or_default();
+            fill_artwork(processor, hint, &parents, &images).await;
+        }
+        Ok(())
+    }
+
+    /// Every ancestor of `items` by id (`BaseItem.GetParents()`: the parent,
+    /// its parent, and so on up the `ParentId` chain), one batch per generation.
+    async fn ancestors(
+        &self,
+        items: &[&BaseItemEntity],
+    ) -> Result<std::collections::HashMap<Uuid, BaseItemEntity>, ServiceError> {
+        let mut known = std::collections::HashMap::new();
+        let mut wanted: Vec<Uuid> = items.iter().filter_map(|row| parent_of(row)).collect();
+        loop {
+            wanted.sort_unstable();
+            wanted.dedup();
+            wanted.retain(|id| !known.contains_key(id));
+            if wanted.is_empty() {
+                return Ok(known);
+            }
+            let rows = self.items.retrieve_items(&wanted).await?;
+            wanted.clear();
+            for row in rows {
+                if let Ok(id) = Uuid::parse_str(&row.id) {
+                    wanted.extend(parent_of(&row));
+                    known.insert(id, row);
+                }
+            }
+        }
+    }
+
     /// The `MusicAlbum` parents of the `Audio` rows in `items`, by album id.
     ///
     /// C# reads `song.AlbumEntity` (the song's parent `MusicAlbum`) per hint;
@@ -252,6 +360,119 @@ fn score(name: &str, term: &str) -> Option<f32> {
     }
 }
 
+/// A row's parent id, when it has one.
+fn parent_of(row: &BaseItemEntity) -> Option<Uuid> {
+    row.parent_id
+        .as_deref()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .filter(|id| !id.is_nil())
+}
+
+/// `item.GetParents()` as `(id, kind)`, nearest first, from the rows
+/// [`FerrofinSearchManager::ancestors`] read. A cycle ends the walk.
+fn parent_chain(
+    item: &BaseItemEntity,
+    ancestors: &std::collections::HashMap<Uuid, BaseItemEntity>,
+) -> Vec<(Uuid, BaseItemKind)> {
+    let mut chain: Vec<(Uuid, BaseItemKind)> = Vec::new();
+    let mut next = parent_of(item);
+    while let Some(id) = next {
+        let Some(row) = ancestors.get(&id) else { break };
+        if chain.iter().any(|(seen, _)| *seen == id) {
+            break;
+        }
+        chain.push((
+            id,
+            kind_from_type_name(&row.type_).unwrap_or(BaseItemKind::Folder),
+        ));
+        next = parent_of(row);
+    }
+    chain
+}
+
+/// The first image of `kind` an item has (`GetImageInfo(type, 0)`).
+fn first_image(
+    images: &std::collections::HashMap<Uuid, Vec<ItemImageInfo>>,
+    item: Uuid,
+    kind: ImageType,
+) -> Option<&ItemImageInfo> {
+    images
+        .get(&item)?
+        .iter()
+        .find(|image| image.image_type == kind)
+}
+
+/// The image half of `GetSearchHintResult`: the Primary tag with that image's
+/// aspect ratio; the Thumb of the item, else (for an Episode) its first Series
+/// with one, else its first parent with one (`SetThumbImageInfo`); the
+/// Backdrop of the item, else its first parent with one
+/// (`SetBackdropImageInfo`). An image the processor cannot tag is skipped.
+async fn fill_artwork(
+    processor: &dyn ImageProcessor,
+    hint: &mut SearchHint,
+    parents: &[(Uuid, BaseItemKind)],
+    images: &std::collections::HashMap<Uuid, Vec<ItemImageInfo>>,
+) {
+    let tag = |item: Uuid, image: &ItemImageInfo| {
+        let image = image.clone();
+        async move {
+            processor
+                .get_image_cache_tag(item, &image)
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    if let Some(primary) = first_image(images, hint.id, ImageType::Primary)
+        && let Some(primary_tag) = tag(hint.id, primary).await
+    {
+        hint.primary_image_tag = Some(primary_tag);
+        let own = images.get(&hint.id).map_or(&[][..], Vec::as_slice);
+        hint.primary_image_aspect_ratio =
+            crate::dto_service::primary_image_aspect_ratio(processor, hint.id, hint.type_, own)
+                .await;
+    }
+    let with = |kind: ImageType| {
+        move |(id, _): &&(Uuid, BaseItemKind)| first_image(images, *id, kind).is_some()
+    };
+    let thumb_owner = if first_image(images, hint.id, ImageType::Thumb).is_some() {
+        Some(hint.id)
+    } else {
+        (hint.type_ == BaseItemKind::Episode)
+            .then(|| {
+                parents
+                    .iter()
+                    .filter(|(_, kind)| *kind == BaseItemKind::Series)
+                    .find(with(ImageType::Thumb))
+            })
+            .flatten()
+            .or_else(|| parents.iter().find(with(ImageType::Thumb)))
+            .map(|(id, _)| *id)
+    };
+    if let Some(owner) = thumb_owner
+        && let Some(image) = first_image(images, owner, ImageType::Thumb)
+        && let Some(thumb_tag) = tag(owner, image).await
+    {
+        hint.thumb_image_tag = Some(thumb_tag);
+        hint.thumb_image_item_id = Some(owner.simple().to_string());
+    }
+    let backdrop_owner = if first_image(images, hint.id, ImageType::Backdrop).is_some() {
+        Some(hint.id)
+    } else {
+        parents
+            .iter()
+            .find(with(ImageType::Backdrop))
+            .map(|(id, _)| *id)
+    };
+    if let Some(owner) = backdrop_owner
+        && let Some(image) = first_image(images, owner, ImageType::Backdrop)
+        && let Some(backdrop_tag) = tag(owner, image).await
+    {
+        hint.backdrop_image_tag = Some(backdrop_tag);
+        hint.backdrop_image_item_id = Some(owner.simple().to_string());
+    }
+}
+
 /// Maps an item row to a [`SearchHint`].
 ///
 /// Port of `SearchController.GetSearchHintResult`, whose emission rules the
@@ -259,7 +480,8 @@ fn score(name: &str, term: &str) -> Option<f32> {
 /// `SearchEngine` never populates, so it stays null and is dropped from the
 /// JSON; `IsFolder` is only assigned `true` (a non-folder leaves it null);
 /// and `ChannelId` is copied from the item's non-nullable `Guid`, so it is
-/// always present — the all-zero id when the item has no channel.
+/// always present — the all-zero id when the item has no channel. The artwork
+/// and `ChannelName` need other rows and are attached to the page afterwards.
 fn to_hint(
     item: &BaseItemEntity,
     albums: &std::collections::HashMap<Uuid, BaseItemEntity>,
@@ -324,10 +546,20 @@ fn to_hint(
         is_folder: crate::dto_service::runtime_is_folder(item).then_some(true),
         run_time_ticks: item.run_time_ticks,
         media_type: parse_media_type(item.media_type.as_deref()),
-        start_date: item.start_date,
+        // `case LiveTvProgram program: result.StartDate = program.StartDate`.
+        start_date: if kind == BaseItemKind::LiveTvProgram {
+            item.start_date
+        } else {
+            None
+        },
         end_date: item.end_date,
         series: item.series_name.clone(),
-        status: None,
+        // `case Series series: result.Status = series.Status.Value.ToString()`.
+        status: if kind == BaseItemKind::Series {
+            crate::item_data::read_series_status(item.data.as_deref())
+        } else {
+            None
+        },
         album,
         album_id,
         album_artist,
@@ -401,6 +633,8 @@ impl SearchManager for FerrofinSearchManager {
         if let Some(limit) = query.limit {
             hints.truncate(usize::try_from(limit).unwrap_or(0));
         }
+        self.attach_channel_names(&mut hints).await?;
+        self.attach_artwork(&mut hints, &items).await?;
 
         Ok(QueryResult::new(query.start_index, Some(total), hints))
     }
@@ -436,7 +670,9 @@ mod tests {
     use super::*;
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
-    use crate::test_support::{seed_named_item, set_clean_name, test_db};
+    use crate::test_support::{
+        FakeImages, image_info, save_item, seed_images, seed_named_item, set_clean_name, test_db,
+    };
     use ferrofin_db::Database;
 
     /// `to_hint` must DROP a row whose stored `Id` is not a `Guid` rather than
@@ -533,6 +769,175 @@ mod tests {
             Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone())),
         )
+    }
+
+    /// `GetParents()` as the artwork walk reads it: nearest first, ending at a
+    /// parent with no row and at a cycle (upstream would loop forever).
+    #[test]
+    fn parent_chain_stops_at_a_missing_row_and_at_a_cycle() {
+        let row = |id: u128, parent: Option<u128>| BaseItemEntity {
+            id: Uuid::from_u128(id).to_string().to_uppercase(),
+            type_: "MediaBrowser.Controller.Entities.Folder".to_owned(),
+            parent_id: parent.map(|p| Uuid::from_u128(p).to_string().to_uppercase()),
+            ..Default::default()
+        };
+        let ancestors: std::collections::HashMap<Uuid, BaseItemEntity> = [
+            row(0xA, Some(0xB)),
+            row(0xB, Some(0xA)),
+            row(0xC, Some(0xD)),
+        ]
+        .into_iter()
+        .map(|r| (Uuid::parse_str(&r.id).expect("id"), r))
+        .collect();
+        let ids = |item: BaseItemEntity| -> Vec<u128> {
+            parent_chain(&item, &ancestors)
+                .into_iter()
+                .map(|(id, _)| id.as_u128())
+                .collect()
+        };
+        assert_eq!(
+            ids(row(0x1, Some(0xA))),
+            [0xA, 0xB],
+            "a cycle ends the walk"
+        );
+        assert_eq!(
+            ids(row(0x2, Some(0xC))),
+            [0xC],
+            "a parent with no row ends it"
+        );
+        assert!(ids(row(0x3, None)).is_empty());
+    }
+
+    /// The hint-artwork fixture: a series (with a status, a Thumb and a
+    /// Backdrop), its season (a Thumb of its own), an episode of it (a
+    /// Primary), a movie airing on a channel, and that channel. Returns their
+    /// ids in that order.
+    async fn seed_hint_artwork(db: &Database) -> [Uuid; 5] {
+        let [series, season, episode, movie, channel] =
+            [0x501, 0x502, 0x503, 0x504, 0x505].map(|n: u128| Uuid::from_u128(n));
+        let row = |id: Uuid, type_: &str, name: &str, parent: Option<Uuid>| BaseItemEntity {
+            id: id.to_string().to_uppercase(),
+            type_: format!("MediaBrowser.Controller.Entities.{type_}"),
+            name: Some(name.to_owned()),
+            clean_name: Some(name.to_lowercase()),
+            parent_id: parent.map(|p| p.to_string().to_uppercase()),
+            ..Default::default()
+        };
+        save_item(
+            db,
+            &BaseItemEntity {
+                is_folder: true,
+                data: Some(r#"{"Status":"Ended"}"#.to_owned()),
+                ..row(series, "TV.Series", "Show", None)
+            },
+        )
+        .await;
+        save_item(
+            db,
+            &BaseItemEntity {
+                is_folder: true,
+                ..row(season, "TV.Season", "Season 1", Some(series))
+            },
+        )
+        .await;
+        save_item(db, &row(episode, "TV.Episode", "Pilot", Some(season))).await;
+        save_item(
+            db,
+            &BaseItemEntity {
+                start_date: Some(chrono::Utc::now()),
+                channel_id: Some(channel.to_string().to_uppercase()),
+                ..row(movie, "Movies.Movie", "Pilot Light", None)
+            },
+        )
+        .await;
+        save_item(
+            db,
+            &BaseItemEntity {
+                type_: "MediaBrowser.Controller.Channels.Channel".to_owned(),
+                ..row(channel, "", "Chan", None)
+            },
+        )
+        .await;
+        let seed = |id: Uuid, images: Vec<(ImageType, &str)>| {
+            let images: Vec<_> = images
+                .into_iter()
+                .map(|(kind, path)| image_info(kind, path, None))
+                .collect();
+            let db = db.clone();
+            async move { seed_images(&db, id, &images).await }
+        };
+        seed(
+            series,
+            vec![
+                (ImageType::Thumb, "/img/series-thumb.jpg"),
+                (ImageType::Backdrop, "/img/series-backdrop.jpg"),
+            ],
+        )
+        .await;
+        seed(season, vec![(ImageType::Thumb, "/img/season-thumb.jpg")]).await;
+        seed(episode, vec![(ImageType::Primary, "/img/episode.jpg")]).await;
+        [series, season, episode, movie, channel]
+    }
+
+    /// `SearchController.GetSearchHintResult`: a hint carries its Primary tag
+    /// and that image's aspect ratio, a Thumb and a Backdrop from the item or
+    /// else its first ancestor with one (for an Episode, a Series first), the
+    /// series status and the channel name; only a program carries `StartDate`.
+    #[tokio::test]
+    async fn hints_carry_artwork_status_and_channel_as_upstream_does() {
+        let db = test_db().await;
+        let [series, _season, episode, movie, _channel] = seed_hint_artwork(&db).await;
+        let mgr = manager(&db).with_image_processor(Arc::new(FakeImages));
+        let hints = |term: &str| {
+            let query = SearchQuery {
+                search_term: term.to_owned(),
+                ..Default::default()
+            };
+            let mgr = &mgr;
+            async move { mgr.get_search_hints(&query).await.expect("hints").items }
+        };
+
+        let pilot = hints("pilot").await;
+        let hit = |id: Uuid| pilot.iter().find(|h| h.id == id).expect("hint");
+        let ep = hit(episode);
+        assert_eq!(
+            ep.primary_image_tag.as_deref(),
+            Some("tag:/img/episode.jpg")
+        );
+        assert_eq!(
+            ep.primary_image_aspect_ratio,
+            Some(2.0),
+            "the fake's 400x200"
+        );
+        assert_eq!(
+            (
+                ep.thumb_image_tag.as_deref(),
+                ep.thumb_image_item_id.as_deref()
+            ),
+            (
+                Some("tag:/img/series-thumb.jpg"),
+                Some(series.simple().to_string().as_str())
+            ),
+            "the Series' thumb, not the nearer Season's"
+        );
+        assert_eq!(
+            (
+                ep.backdrop_image_tag.as_deref(),
+                ep.backdrop_image_item_id.as_deref()
+            ),
+            (
+                Some("tag:/img/series-backdrop.jpg"),
+                Some(series.simple().to_string().as_str())
+            )
+        );
+        let film = hit(movie);
+        assert_eq!(film.primary_image_tag, None);
+        assert_eq!(film.primary_image_aspect_ratio, None);
+        assert_eq!(film.start_date, None, "StartDate is a program's only");
+        assert_eq!(film.channel_name.as_deref(), Some("Chan"));
+
+        let show = hints("show").await;
+        assert_eq!(show[0].status.as_deref(), Some("Ended"));
     }
 
     #[rstest::rstest]

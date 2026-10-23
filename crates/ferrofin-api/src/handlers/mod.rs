@@ -989,7 +989,6 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
-            VERSION_RESUME_DATA_DIVERGENCE,
         ],
         refs: &[],
     },
@@ -1267,6 +1266,22 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Items/{itemId}/ContentType",
+        upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
+        upstream_method: "UpdateItemContentType",
+        ferrofin: "handlers/item_update.rs update_item_content_type → ferrofin-core \
+               library_manager.rs containing_folder_path (BaseItem/Video/Playlist and the \
+               by-name ContainingFolderPath overrides) → ferrofin-model \
+               content_type_overrides.rs with_content_type_override",
+        date: "2026-10-21",
+        divergences: &[
+            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
@@ -1331,7 +1346,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
-    VERSION_RESUME_DATA_DIVERGENCE,
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
      count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
@@ -1340,13 +1354,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",
 ];
-
-/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
-const VERSION_RESUME_DATA_DIVERGENCE: &str = "VersionResumeData.ApplyTo is not ported \
-     (DtoService via UserDataManager.GetResumeUserDataBatch): a returned video's UserData \
-     is its own row, where v12 takes Played, LastPlayedDate and the resume position from \
-     the most recently played version of its group. The write-side propagate_played_state \
-     covers finishing a version through playback. Fix path: gl-47.";
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

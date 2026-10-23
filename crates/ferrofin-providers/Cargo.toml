@@ -46,6 +46,8 @@ unicode-normalization.workspace = true
 encoding_rs.workspace = true
 chardetng.workspace = true
 zip.workspace = true
+tar.workspace = true
+sevenz-rust2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tokio.workspace = true
@@ -60,5 +62,7 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 rstest.workspace = true
 tempfile.workspace = true
+# Writes the `.cb7` fixtures of the comic cover tests.
+sevenz-rust2 = { workspace = true, features = ["compress"] }
 chrono.workspace = true
 uuid.workspace = true
