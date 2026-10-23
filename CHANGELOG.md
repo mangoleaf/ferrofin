@@ -70,6 +70,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   content" and "Uncoded languages". External subtitle files named with these codes
   (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
   `GET /Items/Filters` is unchanged
+- `GET /Items/Filters2?isAiring=false` lists the filters of the programmes not on now
+  (starting later or already ended), as Jellyfin 12 does. It returned an empty filter set,
+  because the predicate required a programme to start after now and also end before now
 - Serve Jellyfin 12's `MediaStream.IsOriginal` (ffprobe's `original` disposition, always
   written), `LocalizedLanguage` and `LocalizedOriginal` (on every audio stream). An
   original audio track's `DisplayTitle` ends in " - Original" (localized). As upstream, a
@@ -97,6 +100,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 - Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
   `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
   file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
@@ -140,6 +147,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
 - TheAudioDB descriptions return for music artists and albums, in the item's metadata
   language when TheAudioDB has it, else in English
+- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
+  expires or the account changes (it was renewed for every subtitle). A rejected token is
+  renewed and the download retried once. The account's daily quota is tracked: once it is
+  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
+  OpenSubtitles until its reset time, and the remaining count is logged with each
+  download. A download without an account is refused before any request, and the error for
+  a download OpenSubtitles rejects carries its reply (a web page as `[html]`), as the
+  plugin's does
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'
@@ -154,6 +169,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
   forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
   some clients produce on partial-GOP audio. As upstream, the default is off
+- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
+  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
+  the same store, trying the Matroska cues before ffprobe, and
+  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
+  the transcode at the segment's playlist time, half a second later for a copied video so
+  ffmpeg lands on the keyframe itself
 - Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
@@ -166,6 +187,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `MediaEncoder`: extraction failures are logged at WARN with the ffmpeg output and do not
   abort the transcode; ASS subtitles with missing `[Fonts]` or `[Graphics]` sections get
   the headers appended on write so libass renders them correctly
+- Trickplay frames and tiles are made in the server's temp directory (`{cache}/temp`), as
+  Jellyfin makes them in its own, instead of the system's `/tmp`. "Clean Cache Directory"
+  sweeps what a killed generation leaves there, and a small or read-only `/tmp` no longer
+  stops trickplay
 - Port `DownMixStereoAlgorithm` filter table: the 15-entry `(algorithm, channel_layout) →
   pan=stereo|…` lookup for Dave750, NightmodeDialogue, Rfc7845 and Ac4 algorithms, with
   7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
@@ -181,6 +206,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
   instead of being lifted to the level above. The next scan moves existing items under
   their folders; their ids, play state and playlist entries stay
+- A series refresh removes its missing episodes once you have them, as Jellyfin 12.2 does:
+  a missing episode whose number a file covers, one with no number, and one carrying the
+  provider id of an episode you have under another number are removed, so an adopted
+  library no longer lists those episodes twice (see `docs/UPGRADING.md`)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -195,6 +224,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
   while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
   database write for up to 30 seconds when the two overlapped
+- A Live TV channel that drops out of the tuner lineup and comes back keeps its users'
+  favourites, likes and play state, as in Jellyfin. The guide refresh that recreates the
+  channel gives back the data its removal had set aside
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
@@ -250,6 +282,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   genres, studios, year or runtime and never matched a genre or studio filter. Locked
   items and locked fields keep their values. A collection also keeps a current list of
   the libraries its members are in, which decides who can see it
+- Adding, removing or renaming a library, or adding or removing one of its folders, can
+  fail part-way, for example on a full disk. When it does, the request still fails, but
+  the server now also refreshes its folder watch and runs the scan the request asked for,
+  as Jellyfin does. Before, both were skipped until the next scan
 - A library's folder shortcuts are written as Jellyfin writes them. They are named after
   the folder without its extension (`Films.HD` gives `Films.mblink`), and a folder inside
   the server's data directory is stored as `%AppDataPath%/…`, so it keeps working if the

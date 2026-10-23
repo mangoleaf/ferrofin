@@ -489,6 +489,26 @@ pub trait ItemRepository: Send + Sync {
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
+    /// The image rows of several items in one read, keyed by item id, each
+    /// item's rows in the [`get_image_infos`](Self::get_image_infos) order; an
+    /// item without images is absent.
+    ///
+    /// The default reads one item at a time, so test doubles compile
+    /// unchanged; the concrete repository overrides it with a batched read.
+    async fn get_image_infos_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map = HashMap::new();
+        for &id in item_ids {
+            let images = self.get_image_infos(id).await?;
+            if !images.is_empty() {
+                map.insert(id, images);
+            }
+        }
+        Ok(map)
+    }
+
     /// [`Self::get_image_infos`] in the same read as whether the item's images
     /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
     /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or

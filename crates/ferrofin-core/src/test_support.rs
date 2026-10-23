@@ -18,13 +18,17 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::{guid_to_db, opt_datetime_to_db, opt_guid_to_db};
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::drawing::{ImageDimensions, ImageFormat};
 use ferrofin_model::entities::ImageType;
+use ferrofin_traits::drawing::{ImageProcessor, ProcessedImage};
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use uuid::Uuid;
@@ -801,6 +805,77 @@ pub async fn corrupt_last_played_date(db: &Database, user: Uuid, item: Uuid) {
     .execute(db.writer())
     .await
     .expect("corrupt last played date");
+}
+
+/// An [`ImageProcessor`] fake: a deterministic cache tag per path, a fixed
+/// 2:1 dimension.
+#[derive(Default)]
+pub struct FakeImages;
+
+#[async_trait]
+impl ImageProcessor for FakeImages {
+    fn supported_input_formats(&self) -> Vec<String> {
+        vec![]
+    }
+    fn supports_image_collage_creation(&self) -> bool {
+        false
+    }
+    fn supported_image_output_formats(&self) -> Vec<ImageFormat> {
+        vec![]
+    }
+    async fn get_image_dimensions(&self, _path: &str) -> Result<ImageDimensions, ServiceError> {
+        Ok(ImageDimensions {
+            width: 400,
+            height: 200,
+        })
+    }
+    async fn get_item_image_dimensions(
+        &self,
+        _item_id: Uuid,
+        _info: &ItemImageInfo,
+    ) -> Result<ImageDimensions, ServiceError> {
+        Ok(ImageDimensions {
+            width: 400,
+            height: 200,
+        })
+    }
+    async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
+        Ok("blur".into())
+    }
+    async fn get_image_blur_hash_sized(
+        &self,
+        _path: &str,
+        _image_dimensions: ImageDimensions,
+    ) -> Result<String, ServiceError> {
+        Ok("blur".into())
+    }
+    async fn get_image_cache_tag(
+        &self,
+        _item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(Some(format!("tag:{}", image.path)))
+    }
+    async fn get_image_cache_tag_for_path(
+        &self,
+        _base_item_path: &str,
+        _image_date_modified: DateTime<Utc>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn process_image(
+        &self,
+        _options: &ferrofin_traits::options::ImageProcessingOptions,
+    ) -> Result<ProcessedImage, ServiceError> {
+        Err(ServiceError::NotFound("process_image".into()))
+    }
+    async fn create_image_collage(
+        &self,
+        _options: &ferrofin_traits::options::ImageCollageOptions,
+        _library_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// A real configuration manager under `dir` whose `PathSubstitutions` hold one
