@@ -70,7 +70,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
 | `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb uses a built-in key) |
-| `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
+| `ferrofin-livetv` | Live TV — M3U/HDHomeRun tuners + XMLTV/Schedules Direct guides, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
 | `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
 | `ferrofin-core` | the concrete manager implementations — the workhorse |

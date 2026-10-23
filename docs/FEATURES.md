@@ -100,8 +100,12 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     path into the `-init_hw_device` string unquoted, so a path with a space or quote breaks
     the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
     is passed exactly as Jellyfin passes it.
-- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed
-  DVR timers & recordings. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
+- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
+  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
+  program details and artwork, SD's error codes and daily limits); it is verified against
+  Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
+  Schedules Direct account**. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
   `discover.json`/`lineup.json`, UDP device discovery, the per-channel HTTP stream with
   its transcode profiles, and the legacy binary control protocol. **No physical HDHomeRun
   has been run against it** — it is verified against Jellyfin's own JSON fixtures, against
