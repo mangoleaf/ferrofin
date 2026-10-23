@@ -207,6 +207,9 @@ pub(crate) fn m3u_external_channel_id(tuner_url: &str, stream_url: &str) -> Stri
 pub struct M3uTunerHost {
     /// The HTTP/file seam the playlist is read through.
     fetcher: std::sync::Arc<dyn SourceFetcher>,
+    /// The server's local-network check, shared with the manager that sets it
+    /// once the network policy is wired; empty in unit tests.
+    local_network: std::sync::Arc<std::sync::OnceLock<crate::stream::LocalNetworkCheck>>,
 }
 
 impl std::fmt::Debug for M3uTunerHost {
@@ -219,7 +222,41 @@ impl M3uTunerHost {
     /// Creates the host over the given source fetcher.
     #[must_use]
     pub fn new(fetcher: std::sync::Arc<dyn SourceFetcher>) -> Self {
-        Self { fetcher }
+        Self {
+            fetcher,
+            local_network: std::sync::Arc::default(),
+        }
+    }
+
+    /// Reads the server's local-network check from `local_network` once it
+    /// is set; until then (unit tests) the stateless
+    /// [`is_in_local_network`](crate::stream::is_in_local_network) applies.
+    #[must_use]
+    pub fn sharing_local_network(
+        mut self,
+        local_network: std::sync::Arc<std::sync::OnceLock<crate::stream::LocalNetworkCheck>>,
+    ) -> Self {
+        self.local_network = local_network;
+        self
+    }
+
+    /// `M3UTunerHost.CreateMediaSourceInfo`'s `isRemote`: a source is remote
+    /// unless its URL's host is on the local network
+    /// (`!_networkManager.IsInLocalNetwork(uri.Host)`). The check resolves a
+    /// host name, which can block on DNS, so it runs off the async workers.
+    async fn is_remote(&self, path: &str) -> bool {
+        let Some(host) = crate::stream::url_host(path) else {
+            return true;
+        };
+        match self.local_network.get() {
+            Some(check) => {
+                let (check, host) = (std::sync::Arc::clone(check), host.to_owned());
+                tokio::task::spawn_blocking(move || !check(&host))
+                    .await
+                    .unwrap_or(true)
+            }
+            None => !crate::stream::is_in_local_network(host),
+        }
     }
 }
 
@@ -269,7 +306,8 @@ impl TunerHost for M3uTunerHost {
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         // `M3UTunerHost.GetChannelStreamMediaSources` returns the ONE source
         // `CreateMediaSourceInfo` builds from the playlist URL.
-        Ok(vec![m3u_channel_source(tuner, channel)?])
+        let is_remote = self.is_remote(&channel.path).await;
+        Ok(vec![m3u_channel_source(tuner, channel, is_remote)?])
     }
 
     async fn channel_stream(
@@ -280,8 +318,9 @@ impl TunerHost for M3uTunerHost {
     ) -> Result<ChannelStream, ServiceError> {
         // `M3UTunerHost.GetChannelStream` ignores the stream id: the playlist
         // offers exactly one source per channel.
+        let is_remote = self.is_remote(&channel.path).await;
         Ok(ChannelStream {
-            source: m3u_channel_source(tuner, channel)?,
+            source: m3u_channel_source(tuner, channel, is_remote)?,
             kind: ChannelStreamKind::Http,
         })
     }
@@ -297,6 +336,7 @@ impl TunerHost for M3uTunerHost {
 fn m3u_channel_source(
     tuner: &TunerHostInfo,
     channel: &StoredChannel,
+    is_remote: bool,
 ) -> Result<MediaSourceInfo, ServiceError> {
     if !is_valid_channel_url(&channel.path) {
         return Err(ServiceError::not_found(format!(
@@ -304,7 +344,7 @@ fn m3u_channel_source(
             channel.external_id
         )));
     }
-    let mut source = crate::stream::create_media_source_info(&channel.path, tuner);
+    let mut source = crate::stream::create_media_source_info(&channel.path, tuner, is_remote);
     crate::stream::normalize(&mut source);
     Ok(source)
 }
@@ -442,6 +482,53 @@ mod tests {
         // The playlist says nothing about the media, so neither does the host.
         assert_eq!(channels[0].is_hd, None);
         assert_eq!(channels[0].video_codec, None);
+    }
+
+    /// `IsInLocalNetwork(uri.Host)` is the server's network policy, which
+    /// resolves host names: a tuner addressed by name on the LAN is local,
+    /// one the policy calls remote is remote, and with no policy wired an
+    /// IPv4-mapped literal counts as the private IPv4 address it is.
+    #[tokio::test]
+    async fn an_m3u_source_is_remote_as_the_network_policy_says() {
+        let tuner = TunerHostInfo::default();
+        let channel = |path: &str| StoredChannel {
+            external_id: "m3u_abc".to_owned(),
+            path: path.to_owned(),
+            ..StoredChannel::default()
+        };
+        let policy = Arc::new(std::sync::OnceLock::new());
+        let check: crate::stream::LocalNetworkCheck =
+            Arc::new(|host: &str| host == "tvheadend.lan");
+        assert!(policy.set(check).is_ok());
+        let host = m3u_host("").sharing_local_network(Arc::clone(&policy));
+        for (path, remote) in [
+            ("http://tvheadend.lan:9981/stream/channel/1", false),
+            ("http://tv.example.com/bbc1.ts", true),
+            ("http://192.168.1.20/bbc1.ts", true),
+        ] {
+            let sources = host
+                .channel_media_sources(&tuner, &channel(path))
+                .await
+                .expect("sources");
+            assert_eq!(sources[0].is_remote, remote, "{path}");
+            let stream = host
+                .channel_stream(&tuner, &channel(path), None)
+                .await
+                .expect("stream");
+            assert_eq!(stream.source.is_remote, remote, "{path}");
+        }
+        let unwired = m3u_host("");
+        for (path, remote) in [
+            ("http://[::ffff:192.168.1.5]:8080/bbc1.ts", false),
+            ("http://192.168.1.20/bbc1.ts", false),
+            ("http://tvheadend.lan/bbc1.ts", true),
+        ] {
+            let sources = unwired
+                .channel_media_sources(&tuner, &channel(path))
+                .await
+                .expect("sources");
+            assert_eq!(sources[0].is_remote, remote, "no policy: {path}");
+        }
     }
 
     #[tokio::test]

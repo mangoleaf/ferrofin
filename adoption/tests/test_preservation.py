@@ -840,6 +840,77 @@ class SeededAdoptionTest(unittest.TestCase):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
+    def test_a_refused_matrix_leaves_the_last_report_alone(self):
+        # a refusal (no oracle; a recipe change; a previous run's copy still in work/) happens before any fixture starts,
+        # and starting a report forgets the previous one: the failure report the error tells the user to inspect must survive
+        from synthetic import recipe
+        work = self.dir / 'work'
+        work.mkdir()
+        (work / 'results.jsonl').write_text('{"event": "run", "title": "the earlier run", "started": 1}\n')
+        (work / 'report.html').write_text('<p>the earlier run</p>')
+        with self.assertRaisesRegex(CheckError, 'oracle missing'):
+            run_matrix(self.dir, 'unused-image', None, 0)
+        for name in (ORACLE, UPGRADED_FROM_10):
+            ready = self.dir / name
+            ready.mkdir()
+            (ready / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
+            (ready / 'preservation.json').write_text('{}')
+        stale = self.dir / VERSIONS[0][0]   # a fixture of an older recipe
+        stale.mkdir()
+        (stale / 'synthetic-ready.json').write_text(json.dumps({'fixture': VERSIONS[0][0], 'recipe': 'an older recipe'}))
+        with self.assertRaisesRegex(CheckError, 'recipe changed'):
+            run_matrix(self.dir, 'unused-image', VERSIONS[0][0], 0)
+        self.assertEqual((work / 'report.html').read_text(), '<p>the earlier run</p>')
+        self.assertIn('the earlier run', (work / 'results.jsonl').read_text())
+
+    def test_an_error_that_stops_the_matrix_is_a_failed_check_in_the_report_unless_a_check_recorded_it(self):
+        import adoption_report as report
+        from unittest import mock
+        import preservation
+        for error, recorded_already, expected in ((OSError('docker went away'), False, 'OSError: docker went away'),
+                                                  (CheckError('scan did not finish'), False, 'CheckError: scan did not finish'),
+                                                  (CheckError('already recorded'), True, None)):
+            with self.subTest(str(error)):
+                root = self.dir / ('case-' + str(abs(hash(str(error)))))
+                root.mkdir()
+                if recorded_already:
+                    error.recorded = True
+
+                def stops(root_, image, only, port, recorder, error=error):
+                    recorder.start('matrix')
+                    recorder.begin('fx', 'matrix', '12.2')
+                    recorder.where = ('fx', 'after scan')
+                    raise error
+
+                with mock.patch.object(preservation, '_run_matrix', stops), self.assertRaises(type(error)):
+                    preservation.run_matrix(root, 'unused-image', None, 0)
+                (row,) = report.load(root / 'work')[1]
+                stopped = [c for c in row['checks'] if c['check'] == 'run stopped']
+                self.assertEqual([(c['stage'], c['detail']) for c in stopped], [('after scan', expected)] if expected else [])
+                self.assertIn('INCOMPLETE', (root / 'work' / 'report.html').read_text())   # the page is built however it ended
+
+    def test_an_error_after_a_fixture_finished_is_not_charged_to_it(self):
+        # the end-of-run summary of a run where some fixture failed, and the refusal at the start of the next fixture,
+        # come after the last fixture's row: its passing page must stay passing
+        import adoption_report as report
+        from unittest import mock
+        import preservation
+
+        def two_fixtures_then_the_summary(root, image, only, port, recorder):
+            recorder.start('matrix')
+            for name, verdict in (('a', 'FAIL'), ('b', 'PASS')):
+                recorder.begin(name, 'matrix', '12.2')
+                recorder.where = (name, 'after scan')
+                recorder.check(name, 'after scan', 'user accounts', verdict)
+                recorder.row(name, 'matrix', '12.2', verdict)
+            raise CheckError('a after adoption: user accounts')
+
+        with mock.patch.object(preservation, '_run_matrix', two_fixtures_then_the_summary), self.assertRaises(CheckError):
+            preservation.run_matrix(self.dir, 'unused-image', None, 0)
+        rows = {r['fixture']: report.row_verdict(r) for r in report.load(self.dir / 'work')[1]}
+        self.assertEqual(rows, {'a': 'FAIL', 'b': 'PASS'})
+        self.assertFalse(any(c['check'] == 'run stopped' for r in report.load(self.dir / 'work')[1] for c in r['checks']))
+
     def test_the_matrix_skips_the_fresh_install_fixture(self):
         # A first-run install carries no seeds, so run_matrix skips it instead of raising
         # "lacks the database seeds" / "no completed baseline"; run.sh validates it live. The
@@ -852,8 +923,26 @@ class SeededAdoptionTest(unittest.TestCase):
             (ready / 'preservation.json').write_text('{}')
         (fresh,) = FRESH_INSTALL
         run_matrix(self.dir, 'unused-image', fresh, 0)  # must not raise, must start no container
-        self.assertFalse((self.dir / 'work').exists())
+        self.assertFalse((self.dir / 'work').exists())   # no copy of it was made, and nothing started a report
         self.assertFalse((self.dir / fresh).exists())
+
+    def test_the_matrix_records_each_comparison_and_a_check_that_raises_before_it_goes_on(self):
+        import adoption_report as report
+        from preservation import note, recorded
+        recorder = report.Recorder(self.dir / 'work')
+        recorder.start('matrix')
+        self.assertEqual(note(recorder, 'fx', 'adoption', 'user accounts', []), [])
+        self.assertEqual(note(recorder, 'fx', 'adoption', 'table digests', ['Peoples row lost', 'Chapters changed']),
+                         ['Peoples row lost', 'Chapters changed'])
+        self.assertEqual(recorded(recorder, 'fx', 'adoption', 'boot log', lambda value: value + 1, 41), 42)
+        def refuses():
+            raise CheckError('synthetic database integrity check failed')
+        with self.assertRaisesRegex(CheckError, 'integrity'):
+            recorded(recorder, 'fx', 'adoption', 'integrity_check', refuses)
+        checks = report.load(self.dir / 'work')[1][0]['checks']
+        self.assertEqual([(c['check'], c['verdict'], c['detail']) for c in checks],
+                         [('user accounts', 'PASS', ''), ('table digests', 'FAIL', 'Peoples row lost; Chapters changed'),
+                          ('boot log', 'PASS', ''), ('integrity_check', 'FAIL', 'synthetic database integrity check failed')])
 
     def test_every_release_maps_to_its_adopted_generation(self):
         self.assertEqual({version: GENERATIONS[version] for _, version, _ in VERSIONS},
