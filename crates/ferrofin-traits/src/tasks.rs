@@ -218,6 +218,10 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
         "MoveTrickplayImages",
         "MediaBrowser.Providers.Trickplay.TrickplayMoveImagesTask",
     ),
+    (
+        "TmdbRefreshUpcomingEpisodes",
+        "MediaBrowser.Providers.Plugins.Tmdb.TV.TmdbUpcomingEpisodesTask",
+    ),
     // src/Jellyfin.*/**
     (
         "KeyframeExtraction",
@@ -322,6 +326,16 @@ mod task_id_tests {
         for (key, expected) in JELLYFIN_10_11_8_TASK_IDS {
             assert_eq!(&task_id_for_key(key), expected, "task id for {key}");
         }
+    }
+
+    /// Jellyfin 12's TMDb task: the MD5 of its type's full name, as every
+    /// task id above is.
+    #[test]
+    fn the_tmdb_upcoming_episodes_task_has_jellyfins_id() {
+        assert_eq!(
+            task_id_for_key("TmdbRefreshUpcomingEpisodes"),
+            "1ee23a5dd39fb4225715375c91bc2990"
+        );
     }
 
     #[test]
