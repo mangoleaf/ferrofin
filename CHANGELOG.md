@@ -174,6 +174,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `MediaEncoder`: extraction failures are logged at WARN with the ffmpeg output and do not
   abort the transcode; ASS subtitles with missing `[Fonts]` or `[Graphics]` sections get
   the headers appended on write so libass renders them correctly
+- Trickplay frames and tiles are made in the server's temp directory (`{cache}/temp`), as
+  Jellyfin makes them in its own, instead of the system's `/tmp`. "Clean Cache Directory"
+  sweeps what a killed generation leaves there, and a small or read-only `/tmp` no longer
+  stops trickplay
 - Port `DownMixStereoAlgorithm` filter table: the 15-entry `(algorithm, channel_layout) →
   pan=stereo|…` lookup for Dave750, NightmodeDialogue, Rfc7845 and Ac4 algorithms, with
   7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
