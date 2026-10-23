@@ -10882,6 +10882,77 @@ mod tests {
         assert_eq!(paged.total_record_count, 1);
     }
 
+    /// Which row stands for a presentation-key group when the primary-version
+    /// preference does not decide: C# `ApplyGroupingFilter` takes
+    /// `g.Where(e => e.PrimaryVersionId == null).Min(e => (Guid?)e.Id) ??
+    /// g.Min(e => (Guid?)e.Id)`, so the smallest id among the primaries, and
+    /// the smallest id overall in a group with none.
+    ///
+    /// Each group's larger id is written first, so a pick that falls back on
+    /// SQLite's scan order (the first row reaching the `MIN`) lands on it.
+    #[tokio::test]
+    async fn a_presentation_group_is_represented_by_its_smallest_primary_id() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9C11);
+        let other_library = Uuid::from_u128(0x9C12);
+        // Two primaries share a key: two seasons of one series with the same
+        // number.
+        let (tie_big, tie_small) = (Uuid::from_u128(0x9C1B), Uuid::from_u128(0x9C1A));
+        // The keyless group: every row without a key is one group.
+        let (keyless_big, keyless_small) = (Uuid::from_u128(0x9C4B), Uuid::from_u128(0x9C4A));
+        // Alternates whose primary is gone: none of the group is a primary.
+        let (orphan_big, orphan_small) = (Uuid::from_u128(0x9C2B), Uuid::from_u128(0x9C2A));
+        let gone = Uuid::from_u128(0x9C2F);
+        // The primary wins over a smaller alternate. The alternate is in another
+        // library, where it is listed as an item of its own (an alternate beside
+        // its primary is hidden before grouping), so the two meet in one group.
+        let (primary, alternate) = (Uuid::from_u128(0x9C3B), Uuid::from_u128(0x9C3A));
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, other_library, BaseItemKind::CollectionFolder, "More").await;
+        for (id, key, primary_version, top_parent) in [
+            (tie_big, Some("tie"), None, library),
+            (tie_small, Some("tie"), None, library),
+            (keyless_big, None, None, library),
+            (keyless_small, None, None, library),
+            (orphan_big, Some("orphans"), Some(gone), library),
+            (orphan_small, Some("orphans"), Some(gone), library),
+            (primary, Some("mixed"), None, library),
+            (alternate, Some("mixed"), Some(primary), other_library),
+        ] {
+            let name = key.unwrap_or("keyless");
+            seed_top_parented_item(&db, id, BaseItemKind::Movie, name, top_parent).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2, "PrimaryVersionId" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(key)
+            .bind(primary_version.map(guid_to_db))
+            .execute(db.writer())
+            .await
+            .expect("set the key and the primary version");
+        }
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9C05)).await;
+
+        let mut found: Vec<String> = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user),
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse")
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [tie_small, orphan_small, primary, keyless_small].map(guid_to_db)
+        );
+    }
+
     /// Resume surfaces the version that was actually PLAYED, not the primary.
     ///
     /// Deliberate divergence from 10.11.8, which has this bug: the resume
