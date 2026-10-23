@@ -353,6 +353,17 @@ containers_gone() { # no container left in the fake docker, no server process le
   containers_gone
 }
 
+@test "run.sh: several request sets given with --requests are sent as one, in the order given" {
+  mkdir set
+  echo '{"id": "a", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > set/1.jsonl
+  echo '{"id": "e", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > edge.jsonl
+  run parity --requests edge.jsonl --requests set
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '[.requests[].id]' out/results.json)" = '["e","a"]' ]
+  [ "$(jq -r .requests_sha256 out/run.json)" = "$(cat edge.jsonl set/1.jsonl | sha256sum | cut -d' ' -f1)" ]
+  containers_gone
+}
+
 # ── writes ────────────────────────────────────────────────────────────────────────────────────
 @test "run.sh: each write runs after every read, on a fresh copy of the isolated configuration, followed by its read-backs" {
   printf '%s\n' '{"id": "fav-a", "method": "POST", "path": "/UserFavoriteItems/a", "readbacks": [{"id": "list", "path": "/favourites"}]}' \

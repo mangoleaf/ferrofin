@@ -74,6 +74,12 @@ class Requests(Scratch):
         (request,) = self.load('{"id": "a", "method": "GET", "path": "/Items/{name}/Caf\u00e9 x"}')
         self.assertEqual(diff.target(request, {**IDS, "name": "Am\u00e9lie"}), "/Items/Am%C3%A9lie/Caf%C3%A9%20x")
 
+    def test_an_integer_template_may_be_offset(self):
+        (request,) = self.load('{"id": "a", "method": "GET", "path": "/Items", "query": {"startIndex": "{counts.movies-1}", "n": "{counts.movies+2}"}}')
+        self.assertEqual(diff.target(request, {**IDS, "counts": {"movies": 3001}}), "/Items?startIndex=3000&n=3003")
+        with self.assertRaisesRegex(diff.ParityError, "`movie` is not an integer: it cannot be offset"):
+            diff.target(self.load('{"id": "b", "method": "GET", "path": "/{movie-1}"}')[0], IDS)
+
     def test_a_query_given_as_pairs_repeats_a_parameter(self):
         (request,) = self.load('{"id": "a", "method": "GET", "path": "/MediaSegments/{movie}", "query": [["t", "Intro"], ["t", "Outro"], ["u", "{user}"]]}')
         self.assertEqual(diff.target(request, IDS), "/MediaSegments/m1?t=Intro&t=Outro&u=u1")
@@ -90,13 +96,20 @@ class Requests(Scratch):
         write(self.dir, "set/a.jsonl", '{"id": "a1", "method": "GET", "path": "/a"}\n{"id": "a2", "method": "GET", "path": "/a"}\n')
         write(self.dir, "set/notes.txt", "not a request file")
         requests = diff.load_requests(self.dir / "set")
-        self.assertEqual([(r.id, r.file) for r in requests], [("a1", "a.jsonl"), ("a2", "a.jsonl"), ("b1", "b.jsonl")])
+        self.assertEqual([(r.id, r.file) for r in requests], [("a1", "set/a.jsonl"), ("a2", "set/a.jsonl"), ("b1", "set/b.jsonl")])
         write(self.dir, "set/c.jsonl", '{"id": "a1", "method": "GET", "path": "/c"}\n')
         with self.assertRaisesRegex(diff.ParityError, "c.jsonl:1: request id `a1` is used twice"):
             diff.load_requests(self.dir / "set")
         (self.dir / "empty").mkdir()
         with self.assertRaisesRegex(diff.ParityError, "no requests"):
             diff.load_requests(self.dir / "empty")
+
+    def test_several_request_sets_are_sent_as_one_in_the_order_given_and_ids_stay_unique(self):
+        a = write(self.dir, "a.jsonl", '{"id": "a1", "method": "GET", "path": "/a"}\n')
+        write(self.dir, "set/b.jsonl", '{"id": "b1", "method": "GET", "path": "/b"}\n')
+        self.assertEqual([r.id for r in diff.load_requests([str(self.dir / "set"), a])], ["b1", "a1"])
+        with self.assertRaisesRegex(diff.ParityError, "request id `a1` is used twice"):
+            diff.load_requests([a, a])
 
     def test_the_tracer_request_file_shipped_with_the_harness_is_valid(self):
         (request,) = diff.load_requests(diff.HERE / "requests" / "tracer.jsonl")
@@ -837,10 +850,13 @@ class Report(Scratch):
     def test_the_timing_is_broken_down_by_request_file(self):
         results = [{**self.result("a", "match"), "file": "contract.jsonl"}, {**self.result("b", "match"), "file": "combos.jsonl"},
                    {**self.result("c", "match"), "file": "contract.jsonl", "reset_s": 4.5}]
+        results.append({**self.result("d", "differences", [self.difference()], {"oracle": "{}", "ferrofin": "{}"}), "file": "edge.jsonl"})
         page = diff.render(self.summary(results))
-        section = page[page.index("Time by request file"):]
+        section = page[page.index("By request file"):]
         self.assertIn("contract.jsonl", section)
         self.assertIn("combos.jsonl", section)
+        self.assertEqual(diff.time_by_file(results)["edge.jsonl"]["states"], {"differences": 1})
+        self.assertEqual(diff.time_by_file(results)["contract.jsonl"]["states"], {"match": 2})
 
     def test_each_write_shows_its_reset_time_and_its_read_backs_and_the_resets_count_in_the_timing(self):
         write_result = {**self.result("fav", "match"), "method": "POST", "reset_s": 12.25}
@@ -1145,6 +1161,14 @@ class Live(Scratch):
         self.assertEqual(code, 2)
         self.assertIn("--reset-command", stderr.getvalue())
         self.assertFalse(out.exists())
+
+    def test_a_whole_run_takes_several_request_sets(self):
+        files = self.files()
+        second = write(self.dir, "edge.jsonl", '{"id": "e", "method": "GET", "path": "/Items/{movie}"}\n')
+        with serve({"/Items/m1": (200, {"Id": "m1"})}) as a, serve({"/Items/m1": (200, {"Id": "m1"})}) as b:
+            code, out = self.run_cli(a, b, files, "--requests", second)
+        summary = json.loads((out / "results.json").read_text())
+        self.assertEqual((code, [r["id"] for r in summary["requests"]]), (0, ["a", "e"]))
 
     def test_a_whole_run_discovers_names_from_the_oracle_and_records_the_timing(self):
         files = self.files('{"id": "g", "method": "GET", "path": "/Genres/{found.genre}"}\n')

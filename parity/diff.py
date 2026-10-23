@@ -70,7 +70,7 @@ RULE_KINDS = ("opaque", "opaque-keys", "unordered")
 #: The methods the harness sends; a write runs on a fresh database copy, after every read.
 WRITES = ("POST", "DELETE")
 METHODS = ("GET", "HEAD", *WRITES)
-PLACEHOLDER = re.compile(r"\{([A-Za-z_][\w.]*)\}")
+PLACEHOLDER = re.compile(r"\{([A-Za-z_][\w.]*)([+-]\d+)?\}")
 #: Templates under these prefixes are read from an answer on the same server: `{write.Id}` (in a
 #: read-back) from the write's, `{setup.<step>.Id}` (in a later step, the write or a read-back) from a setup step's.
 CAPTURES = ("write.", "setup.")
@@ -178,7 +178,15 @@ def lookup(ids, name, capture=NO_CAPTURE):
 
 
 def fill(text, ids, capture=NO_CAPTURE):
-    return PLACEHOLDER.sub(lambda found: lookup(ids, found.group(1), capture), text)
+    """`text` with each `{name}` filled; `{name-1}` (or `+2`) offsets an integer value (the last page's index)."""
+    def one(found):
+        value = lookup(ids, found.group(1), capture)
+        if not found.group(2):
+            return value
+        if not value.lstrip("-").isdigit():
+            raise ParityError(f"`{found.group(1)}` is not an integer: it cannot be offset")
+        return str(int(value) + int(found.group(2)))
+    return PLACEHOLDER.sub(one, text)
 
 
 SETUP_FIELDS = {"id", "method", "path", "query", "body", "source", "oracle_trap", "expect_status"}
@@ -236,18 +244,20 @@ def parse_request(row, where, of=None, kind=""):
                    tuple(children["setup"]))
 
 
-def request_lines(path):
-    """`(file name, where, line)` for every line of the request file `path`, or of every `*.jsonl` file in
-    the directory `path` in name order (a request set split into files)."""
-    path = Path(path)
-    for file in sorted(path.glob("*.jsonl")) if path.is_dir() else [path]:
-        for number, line in enumerate(file.read_text().splitlines(), 1):
-            yield file.name, f"{file}:{number}", line
+def request_lines(paths):
+    """`(file name, where, line)` for every line of each request set in `paths` (one or a list, in order):
+    a request file, or every `*.jsonl` file of a directory in name order (a request set split into files)."""
+    for path in [paths] if isinstance(paths, (str, Path)) else paths:
+        path = Path(path)
+        for file in sorted(path.glob("*.jsonl")) if path.is_dir() else [path]:
+            for number, line in enumerate(file.read_text().splitlines(), 1):
+                yield f"{file.parent.name}/{file.name}", f"{file}:{number}", line
 
 
 def load_requests(path, ids=None):
-    """The requests in `path` (a file or a directory of them); with `ids`, every template must also
-    resolve against it (`{write.…}` and `{setup.…}` are only known once those are answered)."""
+    """The requests in `path` (a file or a directory of them, or a list of those sent as one set); with
+    `ids`, every template must also resolve against it (`{write.…}` and `{setup.…}` are only known once
+    those are answered)."""
     requests, seen = [], set()
     for file, where, line in request_lines(path):
         if not line.strip():
@@ -264,7 +274,7 @@ def load_requests(path, ids=None):
         seen.add(request.id)
         requests.append(request)
     if not requests:
-        raise ParityError(f"{path}: no requests")
+        raise ParityError(f"{', '.join(map(str, [path] if isinstance(path, (str, Path)) else path))}: no requests")
     for request in requests if ids is not None else ():
         for step, available in scopes(request):
             target(step, ids, available)
@@ -321,7 +331,7 @@ def used_names(requests):
     for request in requests:
         for one in (request, *request.setup, *request.readbacks):
             text = json.dumps([one.path, one.query, one.body])
-            names |= {name.split(".", 1)[1] for name in PLACEHOLDER.findall(text) if name.startswith("found.")}
+            names |= {name.split(".", 1)[1] for name, _ in PLACEHOLDER.findall(text) if name.startswith("found.")}
     return names
 
 
@@ -1008,11 +1018,12 @@ def render(summary):
                                  for u in stale) + "</ul>" if stale else "<p class='mut'>None.</p>")
     files = time_by_file(results)
     if files:
-        out.append("<h2>Time by request file</h2><p class='mut'>Server time is the two servers' answer times added up; "
-                   "reads overlap PARITY_CONCURRENCY at a time, so it is more than the time the reads took.</p>")
-        out.append(table(["File", "Requests", "Jellyfin s", "Ferrofin s", "Resets s"],
-                         [[f"<code>{esc(name)}</code>", str(row["requests"]), f"{row['oracle_s']:.1f}", f"{row['ferrofin_s']:.1f}",
-                           f"{row['resets_s']:.1f}"] for name, row in files.items()]))
+        out.append("<h2>By request file</h2><p class='mut'>Each request file is a group of its own. Server time is the two servers' "
+                   "answer times added up; reads overlap PARITY_CONCURRENCY at a time, so it is more than the time the reads took.</p>")
+        out.append(table(["File", "Requests", "Identical", "Ledgered", "New differences", "Oracle failed", "Jellyfin s", "Ferrofin s", "Resets s"],
+                         [[f"<code>{esc(name)}</code>", str(row["requests"])]
+                          + [str(row["states"].get(state, 0)) for state in ("match", "ledgered", "differences", "oracle failed")]
+                          + [f"{row['oracle_s']:.1f}", f"{row['ferrofin_s']:.1f}", f"{row['resets_s']:.1f}"] for name, row in files.items()]))
     writes = [r for r in results if "reset_s" in r]
     if writes:   # each write on its fresh copy, with what its read-backs found
         out.append(f"<h2>Writes ({len(writes)})</h2>")
@@ -1030,13 +1041,15 @@ def render(summary):
 
 
 def time_by_file(results):
-    """`{file: {requests, oracle_s, ferrofin_s, resets_s}}` in the order the files were first sent."""
+    """`{file: {requests, oracle_s, ferrofin_s, resets_s, states}}` in the order the files were first sent;
+    `states` counts the results by state (`match`, `differences`, …), so each request set is its own group."""
     files = {}
     for r in results:
         if "file" not in r:
             continue
-        row = files.setdefault(r["file"], {"requests": 0, "oracle_s": 0.0, "ferrofin_s": 0.0, "resets_s": 0.0})
+        row = files.setdefault(r["file"], {"requests": 0, "oracle_s": 0.0, "ferrofin_s": 0.0, "resets_s": 0.0, "states": {}})
         row["requests"] += 1
+        row["states"][r["state"]] = row["states"].get(r["state"], 0) + 1
         row["oracle_s"] += r["oracle"]["seconds"]
         row["ferrofin_s"] += r["ferrofin"]["seconds"]
         row["resets_s"] += r.get("reset_s", 0.0)
@@ -1211,7 +1224,8 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
 
     def inputs(p):
-        p.add_argument("--requests", default=str(HERE / "requests" / "tracer.jsonl"))
+        p.add_argument("--requests", action="append", default=None,
+                       help="a request file or directory; repeat it to send several as one set (default: requests/tracer.jsonl)")
         p.add_argument("--normalise", default=str(HERE / "normalise.toml"))
         p.add_argument("--ledger", default=str(HERE / "ledger.toml"))
         p.add_argument("--source", default=None, help="the Rust file holding handlers::VERIFIED (tests)")
@@ -1244,6 +1258,8 @@ def build_parser():
 
 def main(argv):
     args = build_parser().parse_args(argv)
+    if hasattr(args, "requests"):
+        args.requests = args.requests or [str(HERE / "requests" / "tracer.jsonl")]
     try:
         if args.command == "run":
             return command_run(args)

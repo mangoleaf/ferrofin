@@ -14,12 +14,20 @@ The request sets:
   10.11.8 contract (`contract.jsonl`); one request per documented value of each enumerated or boolean
   parameter of the query-heavy operations (`combos.jsonl`: `/Items`, the by-name lists, `/Shows/*`, Latest,
   Resume); and jellyfin-web's request shapes from `bench/screens.js` (`screens.jsonl`).
+- `requests/edge/`, **the edge cases** (B7): two users with restrictions, each made on a fresh copy and asked
+  about by id in its read-backs (a user allowed up to PG-13, a user with a blocked tag), each also asked for the
+  one movie it must not see, which the oracle must refuse, so a restriction both servers ignored fails the run; paging at the first page,
+  the last, exactly at the end and past it; SortBy/SortOrder combinations; `Fields` with every documented
+  field; `EnableUserData=false`; `ImageTypeLimit` 0, 1 and many; and the item kinds that carry the fields the
+  TV clients require non-null (`ChildCount`, `ImageTags`, `ImageBlurHashes`): views, series, seasons, albums,
+  artists, episodes, a new box set, the root and the libraries. A template may offset an integer:
+  `{counts.movies-1}` is the last page's index on any corpus size.
 - `requests/writes.jsonl`: a starter set of writes with read-backs (played and unplayed, favourite and
   unfavourite, a resume position, a new playlist and a new collection).
 - `requests/tracer.jsonl`: the item-details call of `bench/screens.js` alone.
 
-The edge cases, the seeded ledger and the filing of new differences as issues extend this same path in
-later steps.
+A release run sends the sweep and the edge cases as one set; a new difference in either fails it. The seeded
+ledger and the filing of new differences as issues extend this same path in later steps.
 
 ```bash
 # needs docker, python3 (3.11+), jq, curl, timeout, taskset; the benchmark corpus, prepared for Jellyfin
@@ -28,7 +36,8 @@ bench/testdata/build.sh --prepare-jellyfin    # once: the corpus upgraded and sc
 docker build -t ferrofin:parity .             # the commit under test: REBUILD IT
 parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity
 parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity --requests parity/requests/writes.jsonl
-parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity --requests parity/requests/sweep   # the sweep
+parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity \
+  --requests parity/requests/sweep --requests parity/requests/edge                                  # the release run
 python3 bench/report.py --serve --parity-dir parity/runs      # list and compare runs
 ```
 
@@ -39,7 +48,7 @@ instead of warned about. The oracle is the same pinned image and the same stale-
 ## What a run does
 
 1. **Preflight.** Nothing is booted and no run directory is made if an input is refused (exit 2): the
-   request file, `normalise.toml` and `ledger.toml` must be valid, the corpus must be prepared for this
+   request sets, `normalise.toml` and `ledger.toml` must be valid, the corpus must be prepared for this
    oracle image, the oracle pin must be current (`--gate`), and the cores must be idle.
 2. **Boot.** Both servers boot at once, each on its own disposable copy of the **same** configuration (the one the
    pinned Jellyfin upgraded and scanned, `jellyfin/config`; the benchmark boots Ferrofin on the 10.11.8 source
@@ -86,12 +95,12 @@ isolation snapshots): remove the directory when you are done with the run.
 | `reset.sh` | puts both servers back on the boot snapshot before a write (`diff.py` runs it) |
 | `lib.sh` | what `run.sh` and `reset.sh` share: the wait bounds and the readiness check |
 | `diff.py` | the requests, the comparison, the ledger, the report (`diff.py --help`) |
-| `requests/*.jsonl`, `requests/sweep/` | the request sets; `--requests` takes a file or a directory (every `*.jsonl` in it, in name order) |
+| `requests/*.jsonl`, `requests/sweep/`, `requests/edge/` | the request sets; `--requests` takes a file or a directory (every `*.jsonl` in it, in name order), and repeats to send several as one set |
 | `generate.py`, `sweep.toml` | build `requests/sweep/contract.jsonl` and `combos.jsonl` from the vendored contract (see below) |
 | `discover.toml` | names the corpus does not record, read from the oracle at run start (`{found.<name>}`) |
 | `normalise.toml` | what the comparison treats as equal although two servers cannot agree |
 | `ledger.toml` | the accepted divergences |
-| `tests/` | `test_diff.py` (the comparison, over fixture pairs and local servers), `test_generate.py` (the sweep covers every operation and is current) and `parity.bats` (the runner, over a fake docker) |
+| `tests/` | `test_diff.py` (the comparison, over fixture pairs and local servers), `test_generate.py` (the sweep covers every operation and is current), `test_edge.py` (every edge category has requests) and `parity.bats` (the runner, over a fake docker) |
 
 ### Requests
 
@@ -219,8 +228,9 @@ Both servers serve the same library, so the oracle's answer serves both. A run's
 Reads run `PARITY_CONCURRENCY` at a time per server (a worker sends one read to the oracle, then to Ferrofin);
 writes run one at a time after every read. The report shows the time of each phase against the cap: the
 boot, the reads and their concurrency, the writes and how much of that went to resets. Each request file is a
-shard of the set: the report also gives each file's request count, both servers' answer times added up, and its
-resets (`results.json`: `timing.files`).
+shard of the set and a group of its own: the report's "By request file" table gives each file's requests by
+state (identical, ledgered, new differences, oracle failed), both servers' answer times added up, and its
+resets (`results.json`: `timing.files`), so the edge cases read apart from the sweep.
 
 ## Tests
 

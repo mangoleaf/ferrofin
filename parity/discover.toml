@@ -74,3 +74,21 @@ pick = "0.Name"
 [found.library_path]
 path = "/Library/VirtualFolders"
 pick = "0.Locations.0"
+
+# a tag the first movie carries, for the blocked-tags edge case
+[found.tag]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, sortBy = "SortName", limit = 1, fields = "Tags" }
+pick = "Items.0.Tags.0"
+
+# the first movie, which carries {found.tag}: the blocked-tags user must not see it
+[found.tagged_movie]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
+
+# an R-rated movie: the PG-13 user must not see it
+[found.r_movie]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, officialRatings = "R", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
