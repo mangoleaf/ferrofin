@@ -2,7 +2,7 @@
 //!
 //! Hand-port of `MediaBrowser.MediaEncoding.Subtitles`. The libse 4.0.12
 //! (`Nikse.SubtitleEdit`) library it depends on has no Rust equivalent, so the
-//! SubRip/SSA/ASS loaders and the writers Jellyfin 12's `SubtitleEncoder.TryGetWriter`
+//! SubRip/SSA/ASS/WebVTT loaders and the writers Jellyfin 12's `SubtitleEncoder.TryGetWriter`
 //! returns (libse's SubRip, WebVTT, SSA, ASS and TTML `ToText`, plus Jellyfin's own
 //! JSON writer) are ported directly onto a small in-memory [`model`]
 //! (`Subtitle`/`Paragraph`/`TimeCode`).

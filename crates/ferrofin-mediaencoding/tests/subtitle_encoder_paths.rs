@@ -278,6 +278,18 @@ async fn readable_file_external_vtt_is_parsed_not_converted() {
         .await
         .unwrap();
     assert!(String::from_utf8(srt).unwrap().contains("{\\an8}Top"));
+
+    // Only a request for the source's own format is served verbatim: `webvtt` is
+    // converted (`TryGetWriter` takes it as a WebVTT alias), so the cue gets libse's
+    // settings for `{\an8}`.
+    let webvtt = encoder
+        .get_subtitles(&source, &stream, "webvtt", 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(webvtt).unwrap(),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000 line:20%\nTop"
+    );
 }
 
 // -- extract_all_extractable_subtitles: arg building -----------------------

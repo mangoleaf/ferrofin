@@ -194,8 +194,8 @@ fn vtt_turns_font_colours_into_webvtt_classes(#[case] text: &str, #[case] expect
 
 #[test]
 fn vtt_keeps_a_webvtt_source_header_and_cue_region() {
-    // libse's writer keeps a WebVTT source's header and cue regions. The encoder never
-    // reaches this branch: it serves a WebVTT source verbatim for a WebVTT request.
+    // libse's writer keeps a WebVTT source's header and cue regions. The encoder serves
+    // a WebVTT source verbatim for `vtt`, so this is reached through the `webvtt` alias.
     let mut s = subtitle_with(&[("x", 0.0, 1_000.0)]);
     s.header = "WEBVTT - a title\n\nREGION\nid:top\n".to_owned();
     s.paragraphs[0].region = Some("top".to_owned());

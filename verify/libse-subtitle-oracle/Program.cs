@@ -1,7 +1,7 @@
 // Runs Jellyfin 12.2's subtitle conversion path over libse 4.0.12, the oracle for
 // Ferrofin's subtitle writers. .NET 10 SDK, with the Jellyfin image's locale:
 // LC_ALL=en_US.UTF-8 dotnet run --project verify/libse-subtitle-oracle -- \
-//     <input> <srt|ass|ssa> <out-dir> [startTicks endTicks preserve(0|1)] [--debug]
+//     <input> <srt|ass|ssa|vtt> <out-dir> [startTicks endTicks preserve(0|1)] [--debug]
 // writes one file per writer Jellyfin can reach from that source, named by format.
 // The outputs are checked in under crates/ferrofin-mediaencoding/tests/data/libse/
 // expected/<input>/<variant>/. --probe <file> dumps the .NET primitives the writers
@@ -147,7 +147,8 @@ if (debug)
 
 // SubtitleEncoder.TryGetWriter. GetSubtitles serves a source verbatim when the request
 // is its own format, or ASS for an SSA source, so those writers are never reached; an
-// SRT source reaches the SubRip writer through the `subrip` alias.
+// SRT source reaches the SubRip writer through the `subrip` alias, and a WebVTT source
+// the WebVTT writer through the `webvtt` alias.
 var writers = new (string Name, Func<SubtitleFormat> Make)[]
 {
     ("ass", () => new AdvancedSubStationAlpha()),
@@ -159,7 +160,7 @@ var writers = new (string Name, Func<SubtitleFormat> Make)[]
 };
 foreach (var (name, make) in writers)
 {
-    var verbatim = (ext.Equals(name, StringComparison.OrdinalIgnoreCase) && name != "srt")
+    var verbatim = (ext.Equals(name, StringComparison.OrdinalIgnoreCase) && name != "srt" && name != "vtt")
         || (ext.Equals("ssa", StringComparison.OrdinalIgnoreCase) && name == "ass");
     if (verbatim)
     {

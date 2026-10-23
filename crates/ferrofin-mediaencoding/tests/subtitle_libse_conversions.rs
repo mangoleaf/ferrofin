@@ -5,8 +5,9 @@
 //! `SubtitleEncoder.FilterEvents`, then the libse 4.0.12 writer `TryGetWriter`
 //! returns, encoded with `Encoding.UTF8.GetBytes`, run on .NET 10 for Linux with the
 //! image's `en-US` locale. Only the conversions Jellyfin can reach are listed: an SRT
-//! source reaches the SubRip writer only through the `subrip` alias, and an SSA or
-//! ASS source asked for its own format (or SSA asked for ASS) is served verbatim.
+//! source reaches the SubRip writer only through the `subrip` alias, a WebVTT source
+//! the WebVTT writer only through `webvtt`, and an SSA or ASS source asked for its own
+//! format (or SSA asked for ASS) is served verbatim.
 //!
 //! JSON is compared as parsed values: .NET's `Utf8JsonWriter` escapes `<`, `>`, `&`,
 //! `'`, `"`, `+` and every non-ASCII character as `\uXXXX`, and `serde_json` writes
@@ -49,6 +50,15 @@ fn targets(ext: &str) -> &'static [(&'static str, &'static str)] {
         "ssa" => &[
             ("srt", "srt"),
             ("vtt", "vtt"),
+            ("json", "json"),
+            ("ttml", "ttml"),
+        ],
+        // TODO(gl-816): add ("ass", "ass") once the ASS writer's `WebVttToAssa` branch
+        // is ported; Jellyfin's output for it is already under `expected/`.
+        "vtt" => &[
+            ("webvtt", "vtt"),
+            ("srt", "srt"),
+            ("ssa", "ssa"),
             ("json", "json"),
             ("ttml", "ttml"),
         ],
@@ -143,6 +153,7 @@ fn first_difference(actual: &str, expected: &str) -> String {
 #[case::markup_nested_two_hundred_deep("nested.srt", "plain", 0, 0, false)]
 #[case::name_prefixes_before_two_italic_lines("colons.srt", "plain", 0, 0, false)]
 #[case::dotnet_digit_and_letter_classes("charclass.srt", "plain", 0, 0, false)]
+#[case::webvtt_cue_settings_styles_and_a_fractional_timestamp_map("cues.vtt", "plain", 0, 0, false)]
 #[tokio::test]
 async fn conversion_matches_jellyfin_byte_for_byte(
     #[case] input: &str,

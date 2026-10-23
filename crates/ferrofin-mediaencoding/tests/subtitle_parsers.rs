@@ -234,6 +234,22 @@ fn vtt_x_timestamp_map_shifts_every_cue() {
     );
 }
 
+/// libse adds the `X-TIMESTAMP-MAP` shift to its `double` milliseconds
+/// (`TotalMilliseconds += addSeconds * 1000`), so a shift that is not a whole
+/// number of milliseconds is kept, and the writers read it back through
+/// `TimeSpan.FromMilliseconds`, which truncates.
+#[test]
+fn vtt_x_timestamp_map_keeps_a_sub_millisecond_shift() {
+    let parsed = vtt(
+        "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900009,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:02.000\nA",
+    );
+    let shift = 900_009.0 / 90_000.0 * 1000.0;
+    let cue = &parsed.paragraphs[0];
+    assert_eq!(cue.start_time.total_milliseconds(), 1_000.0 + shift);
+    assert_eq!(cue.end_time.total_milliseconds(), 2_000.0 + shift);
+    assert_eq!(cue.start_time.ticks(), 110_001_000);
+}
+
 /// The cue settings survive the load: `GetPositionInfo` turns `line`/`position`
 /// into an `{\anN}` tag on the text, `GetPositionInfoRaw` keeps the settings as
 /// the paragraph's style and `GetRegion` its region; the header keeps the

@@ -8,7 +8,8 @@
 //! source WebVTT header), then per cue its timing, the cue settings an `{\anN}` tag
 //! asks for, and the text with SSA tags removed, runs of line breaks collapsed,
 //! `<font color>` turned into WebVTT colour classes, and stray `<`, `>` and `&`
-//! escaped. No BOM, no region block, and no line end after the last cue.
+//! escaped. No BOM, no region block of its own (a WebVTT source's header, its regions
+//! included, is kept), and no line end after the last cue.
 
 use std::fmt::Write as _;
 use std::sync::LazyLock;
