@@ -328,12 +328,10 @@ fn warn_unsupported_accelerator(options: &EncodingOptions) {
 /// (100 s at the 30 fps ffmpeg encodes at) on such a file. ffmpeg's
 /// field-coding rule is not ported: it needs the codec frame rate, which
 /// ffprobe does not report, so a doubled-`tbr` source (`25 fps, 50 tbr`)
-/// still gets a GOP of two segments on the encoders that take a GOP alone.
+/// gets a GOP of two segments. No segment is cut by that GOP alone: libsvtav1
+/// also forces keyframes on time (`hls_video_key_frame_arguments`), and the
+/// encoders that take a GOP alone, AMF and RKMPP, are never selected.
 fn guessed_frame_rate(video: &MediaStream) -> Option<f32> {
-    // TODO(parity): the doubled-`tbr` case. Path: give libsvtav1 forced
-    // keyframes like NVENC/QSV (it honours them on ffmpeg n9.0.1 with
-    // SVT-AV1 4.2) once the oldest supported ffmpeg is checked, which leaves
-    // only AMF/RKMPP, never selected here, on a guessed GOP.
     match (video.real_frame_rate, video.average_frame_rate) {
         (Some(real), Some(average)) if real > 210.0 && average > 0.0 && average < 70.0 => {
             Some(average)
@@ -5738,8 +5736,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_libsvtav1_gop_is_one_segment_of_output_frames() {
-        // libsvtav1 takes the GOP alone, sized in output frames: the `-r` a
-        // `MaxFramerate` sets, else the rate ffmpeg guesses and encodes at.
+        // libsvtav1 forces a keyframe at every segment boundary, and keeps
+        // upstream's GOP, sized in output frames: the `-r` a `MaxFramerate`
+        // sets, else the rate ffmpeg guesses and encodes at.
         for (average, real, max_framerate, gop) in [
             (None, Some(23.976), None, Some(72)),
             (Some(59.94), Some(59.94), Some(30.0), Some(90)),
@@ -5795,7 +5794,10 @@ mod tests {
                 ),
                 None => assert!(!args.contains("-g:v:0"), "{case}"),
             }
-            assert!(!args.contains("-force_key_frames"), "{case}");
+            assert!(
+                args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+                "{case}"
+            );
         }
     }
 
