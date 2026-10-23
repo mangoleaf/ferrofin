@@ -961,7 +961,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             supported_video_codecs: supported_video_codecs.clone(),
             supported_audio_codecs: supported_audio_codecs.clone(),
             supported_subtitle_codecs,
-            // Settled after step (2), with the segment's start.
+            // Settled after step (2).
             segment_length_secs: 0,
             wait_for_path: None,
             segment_container: Some(segment_container.clone()),
@@ -2837,8 +2837,8 @@ mod tests {
         }
     }
 
-    /// `request` as the URL of `segment` of a 3 s equal-length playlist
-    /// carries it: `runtimeTicks` is where the segment starts.
+    /// `request` as the URL of `segment` carries it in a playlist with a
+    /// nominal 3 s spacing: `runtimeTicks` is where the segment starts.
     fn at_segment(request: HlsStreamRequest, segment: i64) -> HlsStreamRequest {
         HlsStreamRequest {
             current_runtime_ticks: segment * 3 * TICKS_PER_SECOND,
@@ -4674,8 +4674,7 @@ mod tests {
     /// `StreamState.SegmentLength` without a requested length: a copied video
     /// gets 6 s segments, 3 s when it is a live stream without a runtime
     /// unless an Apple user agent asks; a transcoded video gets 3 s. Every
-    /// reader sees that one value: `-hls_time`, the playlist's desired length
-    /// and a segment's seek.
+    /// reader sees that one value: `-hls_time`, the playlist and `MinSegments`.
     #[tokio::test]
     async fn plan_defaults_the_segment_length_by_the_output_video_codec() {
         let copied = |req: &mut HlsStreamRequest| {
@@ -4695,6 +4694,8 @@ mod tests {
         )]);
         let mut req = request("abc");
         copied(&mut req);
+        // Segment 2 of a 6 s playlist, whose URL carries its playlist time.
+        req.current_runtime_ticks = 12 * TICKS_PER_SECOND;
         let plan = p
             .plan(&req, false, Some(2), PlaylistKind::Vod)
             .await
@@ -4707,11 +4708,18 @@ mod tests {
             "{:?}",
             plan.arguments
         );
+        // Its playlist time, 12 s, plus the half second a remuxed HLS
+        // segment seeks late (the fake renders `-ss` in ticks).
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "125000000"]),
+            "{:?}",
+            plan.arguments
+        );
         assert!(
             plan.arguments
                 .windows(2)
-                .any(|w| w == ["-output_ts_offset", "12"]),
-            "segment 2 starts at 2 * 6 s: {:?}",
+                .any(|w| w == ["-output_ts_offset", "12.5"]),
+            "segment 2 of a 6 s playlist starts at its playlist time: {:?}",
             plan.arguments
         );
 
@@ -5049,7 +5057,7 @@ mod tests {
             plan.arguments
         );
         // ...and shift output timestamps to the segment's playlist time (2 * 3s =
-        // 12s) so the player can splice the seek-restarted segment (else PTS ~0
+        // 6s) so the player can splice the seek-restarted segment (else PTS ~0
         // → discontinuity → stall).
         assert!(
             plan.arguments
