@@ -2503,6 +2503,8 @@ pub async fn build_app_state(
             virtual_folders: Some(Arc::clone(&virtual_folders)),
             trickplay: Some(me_trickplay),
             sessions: Some(me_sessions),
+            // Remux playlists are cut on the stored or extracted keyframes.
+            keyframes: Some(Arc::clone(&keyframe_repository)),
         },
     );
     let state = state

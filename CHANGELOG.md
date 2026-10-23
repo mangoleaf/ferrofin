@@ -165,6 +165,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
   forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
   some clients produce on partial-GOP audio. As upstream, the default is off
+- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
+  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
+  the same store, trying the Matroska cues before ffprobe, and
+  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
+  the transcode at the segment's playlist time, half a second later for a copied video so
+  ffmpeg lands on the keyframe itself
 - Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
