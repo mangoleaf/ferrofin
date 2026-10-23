@@ -1133,6 +1133,19 @@ pub trait LibraryManager: Send + Sync {
         Ok(self.get_query_filters_legacy(query).await?.years)
     }
 
+    /// Gets the tag names of the matching items — the `Tags` facet of
+    /// `GET /Items/Filters2`.
+    ///
+    /// Port of `ILibraryManager.GetTagNames` (Jellyfin 12.1+, v12.2
+    /// `LibraryManager.cs:4203`): the `Tags` values (never `InheritedTags`) of
+    /// the items the query matches, one per clean value (its smallest
+    /// spelling), in value order. That is the legacy facet set's `tags`, which
+    /// the default reads; the repository-backed manager overrides it with the
+    /// one statement.
+    async fn get_tag_names(&self, query: &InternalItemsQuery) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(query).await?.tags)
+    }
+
     /// Gets the distinct language codes of the matching items' media streams of
     /// a given [`MediaStreamType`].
     ///
