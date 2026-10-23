@@ -431,12 +431,10 @@ impl FerrofinSessionManager {
     /// something that has not checked in for more than
     /// [`IDLE_PLAYBACK_MINUTES`] at `now` is stopped, at the position its
     /// client last reported (upstream PR #17631) and with its media source.
-    /// As upstream, the stop names no live stream, so it releases none.
-    ///
-    /// TODO(gl-368): the "has finished playing" activity entry upstream's
-    /// `PlaybackStopLogger` writes for this stop comes with moving the
-    /// playback loggers onto the session layer; today the HTTP stop handler
-    /// writes it, so this stop has none.
+    /// As upstream, the stop names no live stream, so it releases none. Its
+    /// stop event gets the dashboard's "has finished playing" entry from the
+    /// `PlaybackStopLogger` port (`crate::playback_activity`), as a client's
+    /// own stop does.
     pub async fn check_for_idle_playback(&self, now: DateTime<Utc>) {
         let window = chrono::Duration::minutes(IDLE_PLAYBACK_MINUTES.cast_signed());
         let idle: Vec<(String, PlaybackStopInfo)> = {
