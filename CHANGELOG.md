@@ -313,6 +313,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   "Allow subtitle extraction on the fly" setting now applies: with it off, other embedded
   subtitles are burned in during a transcode. Playback negotiation also asks the installed
   ffmpeg which audio encoders it has, instead of assuming a fixed list
+- The Playlists folder is created with Jellyfin's dates: created and modified from its
+  directory, and saved now. Before, it had no modified or saved date. A one-off startup
+  repair fills the dates missing from the Playlists folder and the Collections library
+  that earlier versions created, and leaves every other library alone
 
 ## [1.0.0] - 2026-09-05
 
