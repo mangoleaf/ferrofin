@@ -39,6 +39,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
   really a ZIP gets its cover too. The fallback page is the first in .NET's key order
   (case ignored first), not byte order. A real RAR `.cbr` still gets no cover
+- Give extras their owner's title metadata and dates, as Jellyfin's `RefreshExtras`
+  does. Trailers, featurettes and other extras take the movie's or series' genres,
+  studios, production locations, overview, ratings, year and premiere date when a
+  scan finds them new, renamed or gone, or on a full refresh, and the year and
+  premiere date on every scan. A video extra also takes the year in its file name until
+  its owner has one. Existing extras need one "Search for missing metadata" refresh to
+  get the rest; see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
   Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
   the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
