@@ -68,6 +68,7 @@ pub fn create_router(state: AppState) -> Router {
     // Mount the real First-Light handlers over the (now-skipped) stub slots.
     api = handlers::register(api);
 
+    let response_time_state = state.clone();
     api.layer(middleware::from_fn_with_state(
         state.clone(),
         auth_context_layer,
@@ -108,6 +109,12 @@ pub fn create_router(state: AppState) -> Router {
     // everything mounted under the base URL. Only the allow-listed media types
     // are touched, so images and the streaming paths are unaffected.
     .layer(compression_layer())
+    // `ResponseTimeMiddleware` sits outside compression in Startup, so every
+    // response, health and OpenAPI included, carries `X-Response-Time-ms`.
+    .layer(middleware::from_fn_with_state(
+        response_time_state,
+        crate::response_time::response_time_layer,
+    ))
 }
 
 /// Whether an OTLP endpoint is configured, i.e. whether a span exporter will

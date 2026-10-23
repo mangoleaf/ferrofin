@@ -218,7 +218,8 @@ class ReportTests(unittest.TestCase):
     def test_mixed_conditions_and_images_are_rejected(self):
         original = json.loads((self.b / 'run.json').read_text())
         for key, value in [('rate_loaded', 50), ('window_s', 5), ('memory_limit', '1g'),
-                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1)]:
+                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1),
+                           ('scan_policy', 1)]:
             with self.subTest(key=key):
                 self.write(self.b / 'run.json', {**original, key: value})
                 with self.assertRaisesRegex(ValueError, key):
@@ -587,6 +588,21 @@ class PreparationTests(unittest.TestCase):
         api.post.assert_called_once_with('/Library/Refresh')
         self.assertEqual(api.get.call_count, 4)
         self.assertEqual(sleep.call_count, 2)
+
+    @patch.object(seed.time, 'sleep')
+    def test_in_run_scan_waits_for_startup_tasks_then_records_the_completed_scan(self, sleep):
+        # Ferrofin gets the same one full scan the Jellyfin preparation gave its config.
+        done = self.task(end='2026-09-15T01:00:00Z')
+        api = Mock()
+        api.get.side_effect = [[{'Name': 'startup', 'State': 'Running'}], [self.task()],  # draining
+                               [self.task()], done]                                       # the scan
+        with tempfile.TemporaryDirectory() as tmp, patch.object(seed, 'Api', return_value=api):
+            ids, out = Path(tmp)/'ids.json', Path(tmp)/'scan.json'
+            ids.write_text(json.dumps({'token': 't'}))
+            seed.scan_library('http://server', str(ids), str(out))
+            self.assertEqual(json.loads(out.read_text())['scan'], done['LastExecutionResult'])
+        self.assertEqual(api.token, 't')
+        api.post.assert_called_once_with('/Library/Refresh')
 
     def test_failed_scan_is_not_ready(self):
         api = Mock()

@@ -104,6 +104,32 @@ impl ItemVisibility {
             .collect()
     }
 
+    /// `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)` for each row,
+    /// preserving input order: the rating, unrated and tag rules with no
+    /// folder or library access check. `Person.IsVisible(user)` is this with
+    /// the allowed-tags check skipped (`base.IsVisible(user, true)`).
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for cyclic hierarchy corruption.
+    pub async fn parentally_allowed(
+        &self,
+        items: &[BaseItemEntity],
+        user: &UserEntity,
+        skip_allowed_tags: bool,
+    ) -> Result<Vec<bool>, ServiceError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let context = self.load(items, Some(user)).await?;
+        items
+            .iter()
+            .map(|item| {
+                let item = context.rows.get(&row_id(item)).unwrap_or(item);
+                context.parental(item, skip_allowed_tags)
+            })
+            .collect()
+    }
+
     /// Applies Folder.GetChildren's child visibility and, for playlists and
     /// collections, GetLinkedChildren's owner/library check. Root children are
     /// supplied by the secure UserRootFolder loader; all hierarchy reads are
@@ -1010,6 +1036,36 @@ mod tests {
                 .await
                 .expect("visibility")[0]
         }
+    }
+
+    /// C# `Person.IsVisible(user)` is `base.IsVisible(user, skipAllowedTagsCheck:
+    /// true)`, the parental check alone: a blocked tag on the person hides it,
+    /// and an allowed-tags policy, which an untagged person cannot meet, is not
+    /// applied. The full check applies both.
+    #[tokio::test]
+    async fn a_person_is_parentally_allowed_without_the_allowed_tags_check() {
+        let f = Fixture::new().await;
+        let mut hidden = f.item(0x9101, BaseItemKind::Person, None, None).await;
+        hidden.tags = Some("Hidden".into());
+        f.save(&hidden).await;
+        let shown = f.item(0x9102, BaseItemKind::Person, None, None).await;
+        f.pref(PreferenceKind::BlockedTags, &["hidden"]).await;
+        f.pref(PreferenceKind::AllowedTags, &["Kids"]).await;
+        let rows = [hidden, shown];
+        assert_eq!(
+            f.service
+                .parentally_allowed(&rows, &f.user, true)
+                .await
+                .unwrap(),
+            [false, true]
+        );
+        assert_eq!(
+            f.service
+                .parentally_allowed(&rows, &f.user, false)
+                .await
+                .unwrap(),
+            [false, false]
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,9 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::configuration::XbmcMetadataOptions;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{UserDataManager, UserManager, VirtualFolderManager};
+use ferrofin_traits::library::{
+    SelfWrite, SelfWriteGuard, UserDataManager, UserManager, VirtualFolderManager,
+};
 use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{
@@ -80,6 +82,9 @@ pub struct NfoSaver {
     users: Option<(Arc<dyn UserManager>, Arc<dyn UserDataManager>)>,
     localization: Option<Arc<dyn LocalizationManager>>,
     locks: SaveLocks,
+    /// Brackets the files written beside the media (`ILibraryMonitor`).
+    /// `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl NfoSaver {
@@ -103,7 +108,18 @@ impl NfoSaver {
             users: None,
             localization: None,
             locks: Mutex::default(),
+            self_writes: None,
         }
+    }
+
+    /// Brackets each file this saver writes on `guard`, as upstream does
+    /// (`ReportFileSystemChangeBeginning`/`Complete` in `ProviderManager.SaveMetadataAsync`), so the
+    /// library monitor takes it for the server's own write. Called once by
+    /// the composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Attaches the selected user's playback/favorite data for NFO export.
@@ -257,6 +273,7 @@ impl NfoSaver {
         if old.as_deref() == Some(&xml) {
             return Ok(());
         }
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), path.to_string_lossy());
         tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;

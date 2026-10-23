@@ -1217,6 +1217,215 @@ impl ScheduledTask for LyricDownloadTask {
     }
 }
 
+/// `TmdbUpcomingEpisodesTask.DefaultIntervalDays`: the task's interval when
+/// the TMDb settings page's `MissingEpisodeRefreshIntervalDays` is not a
+/// positive number of days.
+const TMDB_UPCOMING_DEFAULT_INTERVAL_DAYS: i32 = 7;
+
+/// The "Refresh upcoming and missing episodes (TheMovieDb)" task — port of
+/// `TmdbUpcomingEpisodesTask` (v12.2,
+/// `MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbUpcomingEpisodesTask.cs`).
+///
+/// Re-runs the TMDb missing/unaired episode provider on the interval the TMDb
+/// settings page sets, so a series whose files never change still gains the
+/// episodes TMDb announces: each series with a TMDb id that has not ended,
+/// and each in a library not opted in (whatever its status, so the provider
+/// prunes what it created there), gets the refresh `ValidateChildren` gives
+/// it — a path-scoped refresh scan, whose closing pass runs the provider.
+/// With both options off or no library opted in, it removes every virtual
+/// episode the provider created, and every virtual season of its left empty.
+pub struct TmdbUpcomingEpisodesTask {
+    tmdb: Arc<ferrofin_providers::TmdbClient>,
+    library: Arc<dyn LibraryManager>,
+    interval_days: std::sync::atomic::AtomicI32,
+}
+
+impl TmdbUpcomingEpisodesTask {
+    /// Builds the task over the TMDb client (its settings) and the library
+    /// manager (the series, their refresh and the deletes).
+    #[must_use]
+    pub fn new(
+        tmdb: Arc<ferrofin_providers::TmdbClient>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            tmdb,
+            library,
+            interval_days: std::sync::atomic::AtomicI32::new(TMDB_UPCOMING_DEFAULT_INTERVAL_DAYS),
+        }
+    }
+
+    /// Takes the TMDb settings page's `MissingEpisodeRefreshIntervalDays`
+    /// for the default trigger (`GetDefaultTriggers`): a value that is not a
+    /// positive number of days keeps the default.
+    pub fn set_interval_days(&self, days: i32) {
+        let days = if days > 0 {
+            days
+        } else {
+            TMDB_UPCOMING_DEFAULT_INTERVAL_DAYS
+        };
+        self.interval_days
+            .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `RemoveAllVirtualItems`: every virtual episode with a TMDb id, then
+    /// every virtual season with a TMDb id that is left with no episode.
+    async fn remove_all_virtual_items(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        let options = ferrofin_traits::options::DeleteOptions {
+            delete_file_location: false,
+            ..ferrofin_traits::options::DeleteOptions::default()
+        };
+        let virtual_of = |kind| InternalItemsQuery {
+            include_item_types: vec![kind],
+            is_virtual_item: Some(true),
+            has_tmdb_id: Some(true),
+            recursive: true,
+            ..InternalItemsQuery::default()
+        };
+        let episodes = self
+            .library
+            .get_item_ids(&virtual_of(BaseItemKind::Episode))
+            .await?;
+        for (i, id) in episodes.iter().enumerate() {
+            tracing::info!(
+                item_id = %id,
+                "removing a virtual episode: the TMDb missing episode provider is disabled"
+            );
+            if let Err(err) = self.library.delete_item(*id, &options).await {
+                tracing::warn!(item_id = %id, %err, "could not remove the virtual episode");
+            }
+            #[allow(clippy::cast_precision_loss)] // a progress ratio
+            progress.report(95.0 * (i + 1) as f64 / episodes.len() as f64);
+        }
+        for season in self
+            .library
+            .get_item_ids(&virtual_of(BaseItemKind::Season))
+            .await?
+        {
+            let episodes = self
+                .library
+                .get_item_ids(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Episode],
+                    ancestor_ids: vec![season],
+                    recursive: true,
+                    limit: Some(1),
+                    ..InternalItemsQuery::default()
+                })
+                .await?;
+            if episodes.is_empty()
+                && let Err(err) = self.library.delete_item(season, &options).await
+            {
+                tracing::warn!(item_id = %season, %err, "could not remove the virtual season");
+            }
+        }
+        progress.report(100.0);
+        Ok(())
+    }
+
+    /// `IsEnabledForLibrary`: one of `series`' collection folders is opted in.
+    async fn library_enabled(
+        &self,
+        series: Uuid,
+        settings: &ferrofin_providers::tmdb::MissingEpisodeSettings,
+    ) -> Result<bool, ServiceError> {
+        Ok(self
+            .library
+            .get_ancestors(series)
+            .await?
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .any(|id| settings.library_enabled(id)))
+    }
+}
+
+#[allow(clippy::unnecessary_literal_bound)]
+#[async_trait]
+impl ScheduledTask for TmdbUpcomingEpisodesTask {
+    fn key(&self) -> &str {
+        "TmdbRefreshUpcomingEpisodes"
+    }
+    fn name(&self) -> &str {
+        "Refresh upcoming and missing episodes (TheMovieDb)"
+    }
+    fn description(&self) -> &str {
+        "Checks TheMovieDb for newly announced episodes and creates virtual entries for unaired and missing episodes, according to the TMDb plugin settings. When both options are disabled, removes any virtual entries previously created."
+    }
+    fn category(&self) -> &str {
+        LIBRARY
+    }
+    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
+        let days = self
+            .interval_days
+            .load(std::sync::atomic::Ordering::Relaxed);
+        vec![interval_hours(i64::from(days) * 24)]
+    }
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        let settings = self.tmdb.missing_episode_settings().await;
+        self.set_interval_days(settings.refresh_interval_days);
+        if !settings.imports() || settings.enabled_libraries.is_empty() {
+            return self.remove_all_virtual_items(progress).await;
+        }
+        let candidates = self
+            .library
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Series],
+                has_tmdb_id: Some(true),
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let mut series = Vec::new();
+        for row in candidates {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            // An ended series in an opted-in library cannot change.
+            let ended = crate::item_data::read_series_status(row.data.as_deref())
+                .is_some_and(|status| status.eq_ignore_ascii_case("Ended"));
+            if !ended || !self.library_enabled(id, &settings).await? {
+                series.push(row);
+            }
+        }
+        if series.is_empty() {
+            progress.report(100.0);
+            return Ok(());
+        }
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::Default,
+            image_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::ValidationOnly,
+            ..MetadataRefreshOptions::default()
+        };
+        for (i, row) in series.iter().enumerate() {
+            if let Some(path) = row.path.clone().filter(|p| !p.is_empty()) {
+                match self
+                    .library
+                    .run_refresh_scan(
+                        ferrofin_traits::library::ScanTarget::Paths(vec![path]),
+                        &options,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    // Stopped (the host shutting down): cancelled, not completed.
+                    Ok(false) => {
+                        progress.stopped();
+                        return Ok(());
+                    }
+                    Err(err) => tracing::warn!(
+                        item_id = %row.id,
+                        %err,
+                        "could not refresh the series' upcoming episodes"
+                    ),
+                }
+            }
+            #[allow(clippy::cast_precision_loss)] // a progress ratio
+            progress.report(100.0 * (i + 1) as f64 / series.len() as f64);
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Generate Trickplay Images
 // ---------------------------------------------------------------------------
@@ -3673,5 +3882,95 @@ mod tests {
 
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).expect("restore");
         drop(media);
+    }
+
+    /// `TmdbUpcomingEpisodesTask` with the TMDb settings at their defaults
+    /// (both options off): `RemoveAllVirtualItems` removes the provider's
+    /// virtual episodes (virtual, with a TMDb id) and its virtual season left
+    /// empty, and nothing else.
+    #[tokio::test]
+    async fn tmdb_upcoming_episodes_turned_off_removes_what_the_provider_created() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        let db = test_db().await;
+        let library = library_manager_over(db.clone());
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let (season, ours, theirs, file) = (
+            Uuid::from_u128(0x71),
+            Uuid::from_u128(0x72),
+            Uuid::from_u128(0x73),
+            Uuid::from_u128(0x74),
+        );
+        let row = |id: Uuid, kind: BaseItemKind, virtual_item: bool| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .expect("type")
+                .to_owned(),
+            name: Some(format!("{id}")),
+            is_virtual_item: virtual_item,
+            is_folder: kind == BaseItemKind::Season,
+            path: (!virtual_item).then(|| format!("/tv/Show/{id}.mkv")),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(&[
+                row(season, BaseItemKind::Season, true),
+                BaseItemEntity {
+                    parent_id: Some(guid_to_db(season)),
+                    ..row(ours, BaseItemKind::Episode, true)
+                },
+                row(theirs, BaseItemKind::Episode, true),
+                row(file, BaseItemKind::Episode, false),
+            ])
+            .await
+            .expect("save");
+        persistence
+            .set_ancestors(ours, &[season])
+            .await
+            .expect("ancestors");
+        for id in [season, ours, file] {
+            persistence
+                .save_provider_id(id, "Tmdb", "63057")
+                .await
+                .expect("tmdb id");
+        }
+
+        let task = TmdbUpcomingEpisodesTask::new(
+            Arc::new(ferrofin_providers::TmdbClient::new()),
+            Arc::clone(&library),
+        );
+        assert_eq!(task.key(), "TmdbRefreshUpcomingEpisodes");
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let alive = |id| {
+            let library = Arc::clone(&library);
+            async move { library.get_item_by_id(id).await.expect("read").is_some() }
+        };
+        assert!(!alive(ours).await, "the provider's virtual episode goes");
+        assert!(!alive(season).await, "and its emptied virtual season");
+        assert!(
+            alive(theirs).await,
+            "another provider's virtual episode stays"
+        );
+        assert!(alive(file).await, "a file's episode stays");
+    }
+
+    /// `GetDefaultTriggers`: every `MissingEpisodeRefreshIntervalDays` days,
+    /// 7 when the setting is not a positive number of days.
+    #[tokio::test]
+    async fn tmdb_upcoming_episodes_runs_on_the_settings_interval() {
+        let task = TmdbUpcomingEpisodesTask::new(
+            Arc::new(ferrofin_providers::TmdbClient::new()),
+            library_manager_over(test_db().await),
+        );
+        let days = |task: &TmdbUpcomingEpisodesTask| {
+            task.default_triggers()[0].interval_ticks.expect("interval")
+                / (24 * 3600 * TICKS_PER_SECOND)
+        };
+        assert_eq!(days(&task), 7);
+        task.set_interval_days(3);
+        assert_eq!(days(&task), 3);
+        task.set_interval_days(0);
+        assert_eq!(days(&task), 7);
     }
 }

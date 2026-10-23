@@ -197,7 +197,7 @@ pub struct InstanceSpec {
     /// Guest-call deadline in epoch ticks (1 tick = [`EPOCH_TICK`]).
     pub timeout_ticks: u64,
     /// The shared blocking HTTP client behind `http-fetch`.
-    pub http: Arc<reqwest::blocking::Client>,
+    pub http: Arc<crate::capabilities::GuestHttp>,
     /// Whether this plugin may reach private/loopback HTTP destinations.
     pub private_http_allowed: bool,
     /// The manager handles behind the E2 capabilities (installed post-load).

@@ -706,7 +706,7 @@ fn log_task_subscription(inbound: Inbound, session: bool) {
 async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
     if let Some((sid, bus, token)) = registration {
         end_session_if_last_socket(bus.as_ref(), &sid, token, || {
-            state.sessions.report_session_ended(&sid)
+            state.sessions.close_if_needed(&sid)
         })
         .await;
     }
@@ -1426,6 +1426,31 @@ mod tests {
             *bus.removed.lock().expect("fake bus mutex"),
             vec![("sess-1".to_owned(), 7)],
             "the closing socket removes its own registration by token"
+        );
+    }
+
+    /// The last socket's close ends the session through `close_if_needed` (C#
+    /// `CloseIfNeededAsync`, which releases the session's live stream first),
+    /// never through `report_session_ended`, which is a logout's and releases
+    /// nothing. `FakeSessions` answers `close_if_needed` and leaves
+    /// `report_session_ended` unimplemented, so the panic is the assertion:
+    /// the test passes only if the close never reports a logout.
+    #[tokio::test]
+    async fn the_last_socket_close_closes_the_session_rather_than_logging_it_out() {
+        let state = crate::test_support::fake_state();
+        let bus = std::sync::Arc::new(FakeBus {
+            still_connected: false,
+            removed: std::sync::Mutex::new(Vec::new()),
+        });
+        let registration: super::Registration = (
+            "sess-1".to_owned(),
+            bus.clone() as std::sync::Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>,
+            7,
+        );
+        super::unregister_socket(&state, Some(registration)).await;
+        assert_eq!(
+            *bus.removed.lock().expect("fake bus mutex"),
+            vec![("sess-1".to_owned(), 7)]
         );
     }
 
