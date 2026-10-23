@@ -176,6 +176,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Check the server directories at startup, as Jellyfin does. Before a scheduled restore is
+  applied or the database is opened, Ferrofin creates its configuration, log, plugins,
+  data, cache, `<data>/data` and `<data>/root` directories, and leaves Jellyfin's
+  `.jellyfin-<kind>` marker in each (the cache also gets `CACHEDIR.TAG`). A layout that
+  used to start now stops the boot with a clear error when a directory holds another
+  kind's marker (two of its paths point at one directory) or cannot be created or written
+  to. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

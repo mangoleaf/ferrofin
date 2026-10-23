@@ -389,8 +389,8 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         .expect("run exits cleanly");
 }
 
-/// `Program.StartApp` checks the server's directories before anything else
-/// touches them: a layout that points two of them at one directory stops the
+/// `Program.StartApp` checks the server's directories first (Ferrofin, once
+/// logging has started): a layout that points two of them at one directory stops the
 /// boot before a scheduled restore is applied or a database is opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clashing_layout_stops_the_boot_before_the_restore_and_the_database() {

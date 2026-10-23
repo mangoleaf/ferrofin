@@ -10,7 +10,7 @@ major-version upgrade.
 
 ## Unreleased — the server checks its directories at startup, as Jellyfin does
 
-Ferrofin now runs Jellyfin's startup check on its directories before a scheduled restore, the database open (an adopted Jellyfin database included) and the rest of startup. It creates each of these directories and leaves a small marker file in it, as Jellyfin does:
+Ferrofin now runs Jellyfin's startup check on its directories before a scheduled restore and the database open (an adopted Jellyfin database included). Only logging starts before it, and it creates the log directory itself. It creates each of these directories and leaves a small marker file in it, as Jellyfin does:
 
 | Directory | Marker |
 |---|---|
@@ -19,7 +19,7 @@ Ferrofin now runs Jellyfin's startup check on its directories before a scheduled
 | plugins (`<data>/plugins`) | `.jellyfin-plugin` |
 | data (`--data-dir` / `FERROFIN_DATA_DIR`), and `<data>/data` | `.jellyfin-data` |
 | cache (`FERROFIN_CACHE_DIR`, default `<data>/cache`), which also gets `CACHEDIR.TAG` | `.jellyfin-cache` |
-| library root (`<data>/root`) | `.jellyfin-root` |
+| root folder (`<data>/root`, Jellyfin's `RootFolderPath`) | `.jellyfin-root` |
 
 **Two layouts that used to start now refuse to.**
 - **Two of these paths point at one directory**, for example the configuration or cache directory set to the data directory. The second marker's check finds the first, and Ferrofin exits with:

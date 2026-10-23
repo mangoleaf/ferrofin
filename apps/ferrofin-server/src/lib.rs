@@ -254,8 +254,9 @@ async fn announce_shutdown(
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
 ///
-/// This is the whole composition root, in order: initialise logging, open +
-/// migrate the database, discover ffmpeg (non-fatal — the API still boots without
+/// This is the whole composition root, in order: initialise logging, check the
+/// server directories (Jellyfin's `MakeSanityCheckOrThrow`), open + migrate the
+/// database, discover ffmpeg (non-fatal — the API still boots without
 /// it, playback just 500s until configured), wire every concrete manager into the
 /// shared `AppState`, seed a default administrator when the install is fresh, mount
 /// the `ferrofin-api` router, and `axum::serve` on the configured bind address with
@@ -273,7 +274,8 @@ async fn announce_shutdown(
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened/migrated, manager wiring
+/// Returns an error if a server directory cannot be created or marked, or holds
+/// another kind's marker, if the database cannot be opened/migrated, manager wiring
 /// fails, seeding fails, the listener cannot bind the configured address, or the
 /// server loop errors.
 pub async fn run(config: Config) -> anyhow::Result<()> {

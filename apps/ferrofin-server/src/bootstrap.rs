@@ -382,7 +382,8 @@ pub fn application_paths(config: &Config) -> ferrofin_core::FerrofinServerApplic
 }
 
 /// Port of `ServerApplicationPaths.MakeSanityCheckOrThrow`, which
-/// `Program.StartApp` runs before anything else touches the paths: every
+/// `Program.StartApp` runs before anything else touches the paths (Ferrofin runs
+/// it once logging has started): every
 /// server directory exists and carries its `.jellyfin-<kind>` marker.
 ///
 /// # Errors
