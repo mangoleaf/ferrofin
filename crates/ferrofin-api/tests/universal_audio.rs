@@ -522,6 +522,10 @@ async fn an_unlisted_container_is_transcoded_progressively() {
     assert_eq!(req.max_audio_bit_depth, Some(16));
     assert_eq!(req.start_time_ticks, Some(50_000_000));
     assert_eq!(req.device_id.as_deref(), Some("dev1"));
+    assert!(
+        req.enable_audio_vbr_encoding,
+        "`enableAudioVbrEncoding` defaults to true"
+    );
     assert_eq!(
         req.context,
         Some(ferrofin_model::dlna::EncodingContext::Static)
@@ -547,6 +551,22 @@ async fn an_unlisted_container_is_transcoded_progressively() {
         "{:?}",
         req.transcode_reasons
     );
+}
+
+/// `enableAudioVbrEncoding=false` rides the universal request into the
+/// transcode, as `UniversalAudioController` passes it into its DTOs.
+#[tokio::test]
+async fn a_refused_vbr_encoding_reaches_the_transcode() {
+    let file = temp_file();
+    let (app, served) = router(vec![flac_source(ITEM_ID, &file.path, 900_000)], &file.path);
+    let resp = get(
+        app,
+        "container=mp3&transcodingContainer=mp3&audioCodec=mp3&maxStreamingBitrate=128000\
+         &enableAudioVbrEncoding=false",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!progressive(&served).enable_audio_vbr_encoding);
 }
 
 /// A listed container whose bitrate exceeds the client's cap is transcoded.

@@ -261,6 +261,9 @@ struct HlsQuery {
     /// Whether `-c:a copy` is permitted.
     #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
+    /// Whether the audio may be encoded VBR (`enableAudioVbrEncoding`).
+    #[serde(default)]
+    enable_audio_vbr_encoding: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
     #[serde(default, rename = "static")]
     is_static: Option<bool>,
@@ -442,6 +445,7 @@ fn build_request(
         max_framerate: query.max_framerate,
         allow_video_stream_copy: query.allow_video_stream_copy.unwrap_or(true),
         allow_audio_stream_copy: query.allow_audio_stream_copy.unwrap_or(true),
+        enable_audio_vbr_encoding: query.enable_audio_vbr_encoding.unwrap_or(true),
         is_static: query.is_static.unwrap_or(false),
         start_time_ticks: query.start_time_ticks,
         profile: query.profile,
@@ -1218,6 +1222,22 @@ mod tests {
         assert_eq!(req.live_stream_id, None);
     }
 
+    /// `enableAudioVbrEncoding=false` reaches the request, in either
+    /// spelling a client sends.
+    #[rstest::rstest]
+    #[case::camel("enableAudioVbrEncoding=false")]
+    #[case::pascal("EnableAudioVbrEncoding=false")]
+    fn build_request_carries_a_refused_vbr_encoding(#[case] query: &str) {
+        let query: HlsQuery = parse(query).expect("parses");
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            None,
+            HlsRequestContext::default(),
+        );
+        assert!(!req.enable_audio_vbr_encoding);
+    }
+
     #[test]
     fn build_request_maps_caps_and_defaults_allow_copy() {
         let query: HlsQuery = parse("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
@@ -1231,6 +1251,10 @@ mod tests {
         assert_eq!(req.video_bitrate, Some(4_000_000));
         assert!(req.allow_video_stream_copy, "copy allowed by default");
         assert!(req.allow_audio_stream_copy, "copy allowed by default");
+        assert!(
+            req.enable_audio_vbr_encoding,
+            "VBR allowed by default (`enableAudioVbrEncoding = true`)"
+        );
         assert_eq!(req.query_string, "?MaxWidth=1280");
         // The master-playlist DTO defaults.
         assert!(!req.enable_subtitles_in_manifest);

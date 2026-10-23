@@ -67,9 +67,6 @@ async fn get_audio_stream_by_container(
 
 /// The query parameters `GET /Audio/{itemId}/universal` accepts
 /// (`UniversalAudioController.GetUniversalAudioStream`).
-///
-/// TODO(gl-277): bind `enableAudioVbrEncoding` (default true) once the
-/// transcoder carries it; VBR audio encoding is not ported on any stream route.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UniversalAudioQuery {
@@ -105,6 +102,10 @@ struct UniversalAudioQuery {
     /// The bitrate to encode to, in bit/s.
     #[serde(default)]
     audio_bit_rate: Option<i32>,
+    /// Whether the audio may be encoded VBR (`enableAudioVbrEncoding`,
+    /// default true), passed into both the HLS and the progressive request.
+    #[serde(default)]
+    enable_audio_vbr_encoding: Option<bool>,
     /// The start offset in ticks.
     #[serde(default)]
     start_time_ticks: Option<i64>,
@@ -299,6 +300,7 @@ async fn get_universal_audio_stream(
     // Upstream: "SupportsDirectStream actually means can direct play" here.
     let is_static = source.supports_direct_stream;
     let mut req = crate::handlers::hls::universal_request(&state, item_id, &auth, &request);
+    req.enable_audio_vbr_encoding = query.enable_audio_vbr_encoding.unwrap_or(true);
     req.play_session_id = Some(negotiated.play_session_id.clone());
     req.media_source_id.clone_from(&query.media_source_id);
     req.device_id.clone_from(&query.device_id);
