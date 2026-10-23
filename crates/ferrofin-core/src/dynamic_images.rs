@@ -583,7 +583,7 @@ impl DynamicImageProviders {
             height: 0,
             blur_hash: None,
         };
-        self.fill_image_metadata(&mut info).await;
+        fill_image_metadata(self.processor.as_ref(), &mut info).await;
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         self.persistence.save_item_images(item_id, &images).await?;
@@ -826,23 +826,20 @@ impl DynamicImageProviders {
             .iter()
             .any(|i| i.image_type == ImageType::Primary))
     }
+}
 
-    /// Dimensions + blurhash for the written file, the way the scanner records
-    /// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`).
-    /// Best-effort: a decode failure leaves 0×0 / no hash.
-    async fn fill_image_metadata(&self, image: &mut ItemImageInfo) {
-        let Ok(dims) = self.processor.get_image_dimensions(&image.path).await else {
-            return;
-        };
-        image.width = dims.width;
-        image.height = dims.height;
-        if let Ok(hash) = self
-            .processor
-            .get_image_blur_hash_sized(&image.path, dims)
-            .await
-        {
-            image.blur_hash = Some(hash);
-        }
+/// Dimensions + blurhash for a written image file, the way the scanner records
+/// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
+/// what `LibraryManager.UpdateImagesAsync` fills for a saved image.
+/// Best-effort: a decode failure leaves the size the caller set, and no hash.
+pub(crate) async fn fill_image_metadata(processor: &dyn ImageProcessor, image: &mut ItemImageInfo) {
+    let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
+        return;
+    };
+    image.width = dims.width;
+    image.height = dims.height;
+    if let Ok(hash) = processor.get_image_blur_hash_sized(&image.path, dims).await {
+        image.blur_hash = Some(hash);
     }
 }
 
@@ -902,7 +899,7 @@ pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
 }
 
 /// The file's modification time, or now when it cannot be read.
-fn file_date_modified(path: &Path) -> DateTime<Utc> {
+pub(crate) fn file_date_modified(path: &Path) -> DateTime<Utc> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
