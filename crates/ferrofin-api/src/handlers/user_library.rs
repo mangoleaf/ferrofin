@@ -25,8 +25,8 @@
 //! the `UserData` reads/writes needs the un-ported per-user administration
 //! policy; the portable seam authenticates the caller (`RequireAuth`) and scopes
 //! to the resolved user. The person on-demand metadata refresh
-//! (`RefreshItemOnDemandIfNeeded`) is the filesystem/OOP-tree slice deferred
-//! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
+//! (`RefreshOnDemandIfNeeded`) runs in `items::get_item`, which both item
+//! routes reach; `GET /Items/Latest` is the full `GetLatestMedia` port (the
 //! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, State};
