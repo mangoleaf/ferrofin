@@ -499,6 +499,7 @@ mod tests {
             type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
             path: Some(path.to_string_lossy().into_owned()),
             name: Some("Movie".to_owned()),
+            media_type: Some("Video".to_owned()),
             ..Default::default()
         };
         crate::FerrofinItemPersistenceService::new(db.clone())
@@ -907,6 +908,69 @@ mod tests {
             .unwrap();
         task.execute(&TaskProgress::default()).await.unwrap();
         assert_eq!(h.provider.searches.load(Ordering::SeqCst), 1);
+    }
+
+    /// `SubtitleScheduledTask` queries with `IncludeOwnedItems`: a movie's
+    /// alternate version missing the language is searched too.
+    #[tokio::test]
+    async fn the_daily_task_searches_alternate_versions_too() {
+        use crate::scheduled_tasks::{ScheduledTask, TaskProgress};
+        use ferrofin_model::configuration::MediaPathInfo;
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let h = harness().await;
+        let movies = h.temp.path().join("movies");
+        std::fs::create_dir_all(&movies).unwrap();
+        let mut primary = h.video.clone();
+        primary.path = Some(movies.join("Heat.mkv").to_string_lossy().into_owned());
+        let mut alternate = primary.clone();
+        alternate.id = ferrofin_db::store::guid_to_db(Uuid::new_v4());
+        alternate.path = Some(
+            movies
+                .join("Heat - 2160p.mkv")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        alternate.owner_id = Some(primary.id.clone());
+        alternate.primary_version_id = Some(primary.id.clone());
+        for video in [&primary, &alternate] {
+            std::fs::write(video.path.as_ref().unwrap(), b"video").unwrap();
+        }
+        crate::FerrofinItemPersistenceService::new(h.db.clone())
+            .save_items(&[primary, alternate])
+            .await
+            .unwrap();
+        let folders = Arc::new(
+            crate::FerrofinVirtualFolderManager::new(h.temp.path().join("libraries"))
+                .with_item_store(Arc::new(crate::FerrofinItemPersistenceService::new(
+                    h.db.clone(),
+                ))),
+        );
+        folders
+            .add_virtual_folder(
+                "Movies",
+                Some(CollectionTypeOptions::movies),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: movies.to_string_lossy().into_owned(),
+                    }],
+                    subtitle_download_languages: Some(vec!["eng".to_owned()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let task = crate::scheduled_tasks::library::SubtitleDownloadTask::new(
+            crate::test_support::library_manager_over(h.db.clone()),
+            folders,
+            Arc::new(h.downloader),
+        );
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(
+            h.provider.searches.load(Ordering::SeqCst),
+            2,
+            "the primary and its alternate version"
+        );
     }
 
     #[tokio::test]

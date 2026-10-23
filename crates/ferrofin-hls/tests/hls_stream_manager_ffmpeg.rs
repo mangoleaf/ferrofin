@@ -266,6 +266,8 @@ impl StreamStatePlanner for FfmpegPlanner {
             segment_container: seg_ext.to_owned(),
             encoding_options: EncodingOptions::default(),
             min_segments: 3,
+            is_dovi_removed: false,
+            is_hdr10_plus_removed: false,
         })
     }
 }
