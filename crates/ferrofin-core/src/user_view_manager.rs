@@ -9,7 +9,7 @@
 //!
 //! "Latest" is a faithful port of `GetLatestItems` / `GetItemsForLatestItems`:
 //! one newest-first query across every parent (over-fetched `limit * 5`, or
-//! the tvshows/music grouped-threshold query), then grouped by each row's
+//! the tvshows/music query of its own), then grouped by each row's
 //! `LatestItemsIndexContainer` (episode → series, track → album, photo → photo
 //! album) until `limit` groups exist. The per-library collection types come
 //! from the injected [`VirtualFolderManager`] (C# `CollectionFolder.CollectionType`).
@@ -1433,8 +1433,8 @@ impl FerrofinUserViewManager {
     /// query that feeds the grouping in
     /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
     /// or, for a grouped request whose first typed parent is a library of one of
-    /// the two short-circuited types, that type's own query (the
-    /// grouped-threshold statement for tvshows, the newest albums for music).
+    /// the two short-circuited types, that type's own query (one card per
+    /// newest series for tvshows, the newest albums for music).
     async fn items_for_latest_items(
         &self,
         query: &LatestItemsQuery,
@@ -1514,10 +1514,10 @@ impl FerrofinUserViewManager {
             // and the `null` arm changes a MIXED library's answer for both
             // movies and episodes. They are also not the same size of job —
             // movies needs `GetLatestMovieItems` (`Querying.cs:233-256`) alone,
-            // while `null` (`:134-144`) needs that AND `GetLatestTvShowItems`
-            // (`:282+`), then their concat re-sorted `DateCreated DESC, Id
-            // DESC` and cut to `limit`. Either way the routing is one more arm
-            // on the match below.
+            // while `null` (`:134-144`) needs that beside the ported
+            // `GetLatestTvShowItems` (`latest_tv_repository`), then their
+            // concat re-sorted `DateCreated DESC, Id DESC` and cut to `limit`.
+            // Either way the routing is one more arm on the match below.
             let collection_type = parents
                 .iter()
                 .filter(|p| p.is_collection_folder() || p.is_user_view())
@@ -3110,16 +3110,16 @@ mod tests {
         );
     }
 
-    /// `parentId` = a tvshows library takes the grouped-threshold query, and
+    /// `parentId` = a tvshows library takes v12's `GetLatestTvShowItems`, and
     /// this is only provable where the plain path would answer differently:
     /// series A has TWELVE same-day episodes — more than the plain path's
     /// `limit * 5 = 10` row cap — so the plain query never reaches series B
-    /// at all, while the grouped query (limit caps GROUPS, rows are unpaged
-    /// above the threshold) returns all twelve plus B's episode. The
-    /// threshold is the smallest of the top-2 maxima (day 8): A's old
-    /// episode (day 2) and series C (day 3) fall below it.
+    /// at all, while the TV path (limit caps SERIES) answers one card for each
+    /// of the two newest series. Their episodes carry no season, so each card
+    /// is the series' newest episode (same day: the highest id), grouped under
+    /// its series; series C (day 3) is not among the newest two.
     #[tokio::test]
-    async fn latest_parent_tvshows_library_uses_grouped_threshold_query() {
+    async fn latest_parent_tvshows_library_answers_one_card_per_series() {
         let db = test_db().await;
         seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "Shows").await;
         let (sa, sb, sc) = (
@@ -3167,12 +3167,10 @@ mod tests {
             },
         )
         .await;
-        // Same-day ties break on SortName DESC: e12, e11, …, e01.
-        let mut a_desc = a_eps.clone();
-        a_desc.reverse();
+        // Same-day ties break on `Id DESC`: A's newest is its last episode.
         assert_eq!(
             shape(&groups),
-            vec![(Some(sa), a_desc), (Some(sb), vec![b_new])]
+            vec![(Some(sa), vec![a_eps[11]]), (Some(sb), vec![b_new])]
         );
 
         // The same request through a type-less parent (no virtual-folder

@@ -30,6 +30,7 @@ pub mod m3u;
 pub mod manager;
 pub mod mapping;
 pub mod projection;
+pub mod recording_metadata;
 pub mod schedules_direct;
 pub mod stream;
 pub mod tuner_host;
