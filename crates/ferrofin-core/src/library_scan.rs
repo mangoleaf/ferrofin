@@ -9133,6 +9133,9 @@ impl LibraryScanner {
             .iter()
             .filter_map(|p| p.entity.path.as_deref())
             .collect();
+        // Built only if a stale row's file is still on disk (rare): the
+        // planned paths by their case-folded spelling.
+        let planned_folded = std::sync::OnceLock::new();
         let superseded: std::collections::HashSet<&str> =
             superseded.iter().map(|dir| trimmed_dir(dir)).collect();
         // What this scan's planner excludes or takes in whole is its word
@@ -9146,7 +9149,7 @@ impl LibraryScanner {
                 (excluded.covers(path)
                     || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type)))
                     && !held_by_unscanned(path, folders, key_folders)
-            }) && self.still_on_disk(path, &planned_paths)
+            }) && self.still_on_disk(path, &planned_paths, &planned_folded)
         };
         // A row whose move to its new kind's id failed keeps the old one:
         // live, though nothing planned it.
@@ -9543,12 +9546,44 @@ impl LibraryScanner {
     /// it, and a row of a kind the planner never resolves (an adopted
     /// Jellyfin `Folder` for a plain subfolder) is not "gone" because no
     /// listing planned it.
-    fn still_on_disk(
+    ///
+    /// Unless the file still on disk is one a planned path names in another
+    /// case: a case-only rename on a case-insensitive mount (an SMB share, a
+    /// macOS volume), where the old spelling still resolves. Ids follow the
+    /// case-sensitive path, so the rename planned a new id, and upstream's
+    /// `Folder.ValidateChildrenInternal2` drops the old item. File identity,
+    /// not case-folded strings, decides it, so two files whose names differ
+    /// only in case on a case-sensitive filesystem stay two items.
+    /// `to_lowercase` only picks the candidates: where it folds differently
+    /// from the mount (NTFS's or APFS's tables, a name in another Unicode
+    /// normal form), the row is kept, as any file still on disk.
+    fn still_on_disk<'a>(
         &self,
         path: Option<&str>,
-        planned_paths: &std::collections::HashSet<&str>,
+        planned_paths: &std::collections::HashSet<&'a str>,
+        planned_folded: &std::sync::OnceLock<HashMap<String, Vec<&'a str>>>,
     ) -> bool {
-        path.is_some_and(|path| !planned_paths.contains(path) && self.file_system.path_exists(path))
+        path.is_some_and(|path| {
+            !planned_paths.contains(path)
+                && self.file_system.path_exists(path)
+                && !planned_folded
+                    .get_or_init(|| {
+                        let mut folded: HashMap<String, Vec<&str>> = HashMap::new();
+                        for planned in planned_paths {
+                            folded
+                                .entry(planned.to_lowercase())
+                                .or_default()
+                                .push(planned);
+                        }
+                        folded
+                    })
+                    .get(&path.to_lowercase())
+                    .is_some_and(|spellings| {
+                        spellings
+                            .iter()
+                            .any(|planned| self.file_system.same_file(path, planned))
+                    })
+        })
     }
 
     /// Fills each image's pixel dimensions + blurhash via the image-processor seam, so the
