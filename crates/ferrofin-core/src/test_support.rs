@@ -515,6 +515,31 @@ pub async fn seed_folder_item(
     .await;
 }
 
+/// [`seed_folder_item`] carrying a `Data` blob: a library's `CollectionType`,
+/// or a view's `ViewType` and `DisplayParentId`.
+pub async fn seed_folder_with_data(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    data: &str,
+    parent: Option<Uuid>,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            is_folder: true,
+            parent,
+            data: Some(data),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
 /// Inserts an `Episode` `BaseItems` row with the fields the next-up queries care
 /// about (series presentation key, season/episode numbers, virtual flag).
 pub async fn seed_episode(

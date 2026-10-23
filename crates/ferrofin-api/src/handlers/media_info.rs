@@ -490,12 +490,13 @@ async fn playback_info(
                 always_burn_in_subtitle_when_transcoding: request
                     .selection
                     .always_burn_in_subtitle_when_transcoding,
+                // Upstream passes the posted profile and `OpenMediaSource` falls
+                // back to the device's; this is that profile already resolved.
+                device_profile: request.profile.clone(),
                 direct_play_protocols: vec![ferrofin_model::media_info::MediaProtocol::Http],
             };
-            // The same open as `POST /LiveStreams/Open`, published the same way.
-            let mut opened = state.media_sources.open_live_stream(&open).await?;
-            publish_live_stream_path(state, client, &mut opened).await;
-            media_sources = vec![opened];
+            // The same open as `POST /LiveStreams/Open` (`OpenMediaSource`).
+            media_sources = vec![open_media_source(state, auth, client, &open).await?];
         }
     }
 
@@ -504,6 +505,90 @@ async fn playback_info(
         play_session_id: Some(play_session_id),
         error_code: None,
     })
+}
+
+/// `MediaInfoHelper.OpenMediaSource`: opens the live stream `request` names,
+/// publishes its path for the client, and negotiates the opened source against
+/// the request's device profile, else the one the device last reported, as
+/// PlaybackInfo negotiates a source (`SetDeviceSpecificData` with transcoding
+/// and stream copy allowed). Without either profile, an existing transcoding
+/// URL is tagged with the live stream. Last, the source's container list is
+/// narrowed to the one the profile plays (`NormalizeMediaSourceContainer`).
+async fn open_media_source(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    client: &RequestContext,
+    request: &LiveStreamRequest,
+) -> Result<MediaSourceInfo, ApiError> {
+    let mut source = state.media_sources.open_live_stream(request).await?;
+    publish_live_stream_path(state, client, &mut source).await;
+    let stored;
+    let profile = if let Some(profile) = &request.device_profile {
+        Some(profile)
+    } else {
+        stored = state
+            .devices
+            .get_capabilities(auth.device_id.as_deref())
+            .await?
+            .device_profile;
+        stored.as_ref()
+    };
+    if let Some(profile) = profile {
+        let item = state
+            .library
+            .get_item_by_id(request.item_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("item {}", request.item_id)))?;
+        let user = resolve_user_opt(state, auth, Some(request.user_id)).await?;
+        let negotiation = PlaybackRequest {
+            user_id: Some(request.user_id),
+            max_streaming_bitrate: request.max_streaming_bitrate,
+            // The track picks apply to the opened source (its own id).
+            media_source_id: source.id.clone(),
+            selection: StreamSelection {
+                audio_stream_index: request.audio_stream_index,
+                subtitle_stream_index: request.subtitle_stream_index,
+                max_audio_channels: request.max_audio_channels,
+                start_time_ticks: request.start_time_ticks,
+                always_burn_in_subtitle_when_transcoding: request
+                    .always_burn_in_subtitle_when_transcoding,
+            },
+            flags: PlaybackFlags {
+                enable_direct_play: request.enable_direct_play,
+                enable_direct_stream: request.enable_direct_stream,
+                ..PlaybackFlags::default()
+            },
+            ..PlaybackRequest::default()
+        };
+        set_device_specific_data(
+            state,
+            auth,
+            user.as_ref(),
+            request.user_id,
+            request.item_id,
+            item.media_type.as_deref(),
+            std::slice::from_mut(&mut source),
+            profile,
+            &negotiation,
+            request.play_session_id.as_deref().unwrap_or_default(),
+        )
+        .await?;
+    } else if let Some(url) = source
+        .transcoding_url
+        .as_mut()
+        .filter(|url| !url.trim().is_empty())
+    {
+        url.push_str("&LiveStreamId=");
+        url.push_str(source.live_stream_id.as_deref().unwrap_or_default());
+    }
+    source.container =
+        ferrofin_model::dlna::stream_builder::normalize_media_source_format_into_single_container(
+            source.container.as_deref(),
+            profile,
+            ferrofin_model::dlna::DlnaProfileType::Video,
+            None,
+        );
+    Ok(source)
 }
 
 /// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
@@ -1414,8 +1499,8 @@ struct OpenLiveStreamQuery {
 ///
 /// Every scalar the query carries may instead arrive here — jellyfin-web and the
 /// Android clients POST the whole request as a body — and the query wins where
-/// both are present (C# `openToken ?? openLiveStreamDto?.OpenToken`). The device
-/// profile it may also carry is not yet honoured.
+/// both are present (C# `openToken ?? openLiveStreamDto?.OpenToken`). Its device
+/// profile, which only the body carries, negotiates the opened source.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1456,6 +1541,8 @@ struct OpenLiveStreamDto {
     always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The protocols the client will direct-play.
     direct_play_protocols: Option<Vec<ferrofin_model::media_info::MediaProtocol>>,
+    /// The client's device profile, to negotiate the opened source against.
+    device_profile: Option<DeviceProfile>,
 }
 
 /// `POST /LiveStreams/Open` — open a media source and return its live stream.
@@ -1465,8 +1552,8 @@ struct OpenLiveStreamDto {
 /// [`LiveStreamRequest`] and handed to
 /// [`MediaSourceManager::open_live_stream`](ferrofin_traits::library::MediaSourceManager::open_live_stream),
 /// which redeems the open token — for a Live TV channel that opens the tuner —
-/// probes the result and registers it in the open-stream table. The posted
-/// device profile is not yet honoured.
+/// probes the result and registers it in the open-stream table; the opened
+/// source is then negotiated ([`open_media_source`]).
 #[utoipa::path(
     post,
     path = "/LiveStreams/Open",
@@ -1488,9 +1575,8 @@ async fn open_live_stream(
     // stream — and a tuner — under another account's identity.
     let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
     let request = live_stream_request(query, dto, effective);
-    let mut media_source = state.media_sources.open_live_stream(&request).await?;
     let client = super::system::context_from_parts(&state, &parts);
-    publish_live_stream_path(&state, &client, &mut media_source).await;
+    let media_source = open_media_source(&state, &auth, &client, &request).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
 }
 
@@ -1533,6 +1619,8 @@ fn live_stream_request(
             .always_burn_in_subtitle_when_transcoding
             .or(dto.always_burn_in_subtitle_when_transcoding)
             .unwrap_or(false),
+        // `openLiveStreamDto?.DeviceProfile`: the query has no such field.
+        device_profile: dto.device_profile,
         direct_play_protocols: dto
             .direct_play_protocols
             .unwrap_or_else(|| vec![ferrofin_model::media_info::MediaProtocol::Http]),
