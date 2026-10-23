@@ -755,11 +755,9 @@ pub(crate) async fn playlists_owned_by(
 
 /// A playlist's permissions from its `FerrofinPlaylists` and
 /// `FerrofinPlaylistShares` rows. The shares are those of users that still
-/// have a `Users` row (a deleted user's share stays on the playlist), in the
-/// order the `Data` `Shares` array lists them (the `Playlist.Shares` order
-/// upstream reads; Ferrofin writes the array in user-id order, a playlist
-/// Jellyfin wrote keeps its own until it changes), any share the array lacks
-/// after those, by user id. `None` when the playlist has no
+/// have a `Users` row (a deleted user's share stays on the playlist), in
+/// share order (the `Playlist.Shares` order upstream reads; see
+/// [`share_playlist_in`]). `None` when the playlist has no
 /// `FerrofinPlaylists` row.
 ///
 /// # Errors
@@ -769,8 +767,8 @@ pub(crate) async fn playlist_permissions_in(
     playlist: Uuid,
 ) -> Result<Option<PlaylistPermissions>, ServiceError> {
     let playlist_db = guid_to_db(playlist);
-    let row: Option<(Option<String>, bool, Option<String>)> = sqlx::query_as(
-        r#"SELECT p."OwnerUserId", p."OpenAccess", bi."Data"
+    let row: Option<(Option<String>, bool)> = sqlx::query_as(
+        r#"SELECT p."OwnerUserId", p."OpenAccess"
            FROM "FerrofinPlaylists" p JOIN "BaseItems" bi ON bi."Id" = p."PlaylistId"
            WHERE p."PlaylistId" = ?1"#,
     )
@@ -778,28 +776,20 @@ pub(crate) async fn playlist_permissions_in(
     .fetch_optional(&mut *conn)
     .await
     .map_err(db_err)?;
-    let Some((owner, open_access, data)) = row else {
+    let Some((owner, open_access)) = row else {
         return Ok(None);
     };
     let rows: Vec<(String, bool)> = sqlx::query_as(
         r#"SELECT s."UserId", s."CanEdit" FROM "FerrofinPlaylistShares" s
            WHERE s."PlaylistId" = ?1
              AND EXISTS (SELECT 1 FROM "Users" u WHERE u."Id" = s."UserId")
-           ORDER BY s."UserId""#,
+           ORDER BY s.rowid"#,
     )
     .bind(&playlist_db)
     .fetch_all(&mut *conn)
     .await
     .map_err(db_err)?;
-    let listed: Vec<Uuid> = parse_data(data.as_deref())
-        .get("Shares")
-        .cloned()
-        .and_then(|shares| serde_json::from_value::<Vec<ShareJson>>(shares).ok())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|share| Uuid::parse_str(&share.user_id).ok())
-        .collect();
-    let mut shares: Vec<_> = rows
+    let shares = rows
         .into_iter()
         .filter_map(|(user, can_edit)| {
             Uuid::parse_str(&user).ok().map(|user| {
@@ -807,12 +797,6 @@ pub(crate) async fn playlist_permissions_in(
             })
         })
         .collect();
-    shares.sort_by_key(|share| {
-        listed
-            .iter()
-            .position(|user| *user == share.user_id)
-            .unwrap_or(usize::MAX)
-    });
     Ok(Some(PlaylistPermissions {
         owner: owner.as_deref().and_then(|o| Uuid::parse_str(o).ok()),
         open_access,
@@ -848,7 +832,75 @@ pub(crate) async fn hand_playlist_to_in(
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
+    // `Shares = rankedShares.Skip(1)`: the rest, editors first, each group in
+    // its share order (`OrderByDescending(x => x.CanEdit)` is stable).
+    let mut rest: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    rest.sort_by_key(|(_, can_edit)| !can_edit);
+    sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+        .bind(&playlist_db)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    for (user, can_edit) in rest {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
+               VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(&playlist_db)
+        .bind(user)
+        .bind(can_edit)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    }
     sync_container_data_in(conn, playlist).await
+}
+
+/// Shares `playlist` with `user`, last in its share order, on a connection the
+/// caller holds, so it commits with its `Data` sync: C# `AddUserToShares`
+/// removes an existing entry and appends (a re-share moves the user to the
+/// end, with its new `CanEdit`).
+///
+/// The share order is the rows' `rowid` order. Every writer inserts in the
+/// order upstream's `Shares` list holds (a create or an update in the
+/// request's order, the boot re-import in `Data`'s, a hand-over editors
+/// first), and every reader and the `Data` sync read in it.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn share_playlist_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    user: Uuid,
+    can_edit: bool,
+) -> Result<(), ServiceError> {
+    let (playlist_db, user_db) = (guid_to_db(playlist), guid_to_db(user));
+    sqlx::query(
+        r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
+    )
+    .bind(&playlist_db)
+    .bind(&user_db)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    sqlx::query(
+        r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
+           VALUES (?1, ?2, ?3)"#,
+    )
+    .bind(&playlist_db)
+    .bind(&user_db)
+    .bind(can_edit)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// Folds a playlist's owner / open-access / shares cache rows into its parsed
@@ -873,7 +925,7 @@ async fn sync_playlist_meta(
     }
     let shares: Vec<(String, bool)> = sqlx::query_as(
         r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
-           WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
     )
     .bind(container_db)
     .fetch_all(&mut *conn)
