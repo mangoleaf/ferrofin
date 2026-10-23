@@ -1,6 +1,7 @@
 //! HLS `CODECS` attribute strings — port of
 //! `Jellyfin.Api/Helpers/HlsCodecStringHelpers.cs` (10.11.8), plus Jellyfin
-//! 12's `GetDoviString` (jellyfin#16362).
+//! 12's `GetDoviString` (jellyfin#16362) and its `HE-AAC`, TrueHD and DTS
+//! strings (jellyfin#15959, unchanged at v12.2).
 //!
 //! Helpers to generate HLS codec strings according to
 //! [RFC 6381 section 3.3](https://datatracker.ietf.org/doc/html/rfc6381#section-3.3)
@@ -25,18 +26,47 @@ pub const ALAC: &str = "alac";
 /// Codec name for OPUS (`HlsCodecStringHelpers.OPUS`).
 pub const OPUS: &str = "Opus";
 
-/// Gets an AAC codec string. Port of `GetAACString(profile)`: `HE`
-/// (case-insensitive) → `mp4a.40.5`, anything else (including an invalid or
-/// absent profile) → the LC default `mp4a.40.2`.
+/// Codec name for TrueHD (`HlsCodecStringHelpers.TRUEHD`, Jellyfin 12).
+pub const TRUEHD: &str = "mlpa";
+
+/// Gets an AAC codec string. Port of Jellyfin 12's `GetAACString(profile)`:
+/// ffprobe's `HE-AAC` (case-insensitive) → `mp4a.40.5`, anything else
+/// (including the bare `HE`, `HE-AACv2`, an invalid or an absent profile) →
+/// the LC default `mp4a.40.2`.
 #[must_use]
 pub fn aac_string(profile: Option<&str>) -> String {
-    let object_type = if profile.is_some_and(|p| p.eq_ignore_ascii_case("HE")) {
+    let object_type = if profile.is_some_and(|p| p.eq_ignore_ascii_case("HE-AAC")) {
         ".40.5"
     } else {
         // Default to LC if profile is invalid
         ".40.2"
     };
     format!("mp4a{object_type}")
+}
+
+/// Gets a DTS codec string. Port of Jellyfin 12's `GetDTSString(profile)`,
+/// over ffprobe's DTS profile names (case-insensitive): core, ES and 96/24 →
+/// `dtsc`; HD HRA, HD MA and the DTS:X variants → `dtsh`; Express → `dtse`;
+/// anything else (or none) → the DTS core default `dtsc`.
+#[must_use]
+pub fn dts_string(profile: Option<&str>) -> &'static str {
+    let is =
+        |names: &[&str]| profile.is_some_and(|p| names.iter().any(|n| p.eq_ignore_ascii_case(n)));
+    if is(&["DTS", "DTS-ES", "DTS 96/24"]) {
+        "dtsc"
+    } else if is(&[
+        "DTS-HD HRA",
+        "DTS-HD MA",
+        "DTS-HD MA + DTS:X",
+        "DTS-HD MA + DTS:X IMAX",
+    ]) {
+        "dtsh"
+    } else if is(&["DTS Express"]) {
+        "dtse"
+    } else {
+        // Default to DTS core if profile is invalid
+        "dtsc"
+    }
 }
 
 /// Gets a H.264 codec string. Port of `GetH264String(profile, level)`:
@@ -246,11 +276,35 @@ mod tests {
     #[case(None, "mp4a.40.2")]
     #[case(Some(""), "mp4a.40.2")]
     #[case(Some("LC"), "mp4a.40.2")]
-    #[case(Some("HE"), "mp4a.40.5")]
-    #[case(Some("he"), "mp4a.40.5")]
+    // Jellyfin 12 (jellyfin#15959) matches ffprobe's profile name `HE-AAC`,
+    // so the bare `HE` a client may request is LC now; `HE-AACv2` is not
+    // matched either.
+    #[case(Some("HE"), "mp4a.40.2")]
+    #[case(Some("he"), "mp4a.40.2")]
+    #[case(Some("HE-AAC"), "mp4a.40.5")]
+    #[case(Some("he-aac"), "mp4a.40.5")]
+    #[case(Some("HE-AACv2"), "mp4a.40.2")]
     #[case(Some("bogus"), "mp4a.40.2")]
     fn aac(#[case] profile: Option<&str>, #[case] expected: &str) {
         assert_eq!(aac_string(profile), expected);
+    }
+
+    /// `GetDTSString` (Jellyfin 12, jellyfin#15959): ffprobe's DTS profile
+    /// names, case-insensitive, with DTS core for anything else.
+    #[rstest]
+    #[case(None, "dtsc")]
+    #[case(Some(""), "dtsc")]
+    #[case(Some("DTS"), "dtsc")]
+    #[case(Some("dts-es"), "dtsc")]
+    #[case(Some("DTS 96/24"), "dtsc")]
+    #[case(Some("DTS-HD HRA"), "dtsh")]
+    #[case(Some("DTS-HD MA"), "dtsh")]
+    #[case(Some("DTS-HD MA + DTS:X"), "dtsh")]
+    #[case(Some("DTS-HD MA + DTS:X IMAX"), "dtsh")]
+    #[case(Some("DTS Express"), "dtse")]
+    #[case(Some("DTS-HD"), "dtsc")]
+    fn dts(#[case] profile: Option<&str>, #[case] expected: &str) {
+        assert_eq!(dts_string(profile), expected);
     }
 
     #[rstest]
@@ -331,6 +385,7 @@ mod tests {
 
     #[test]
     fn constants_match_upstream() {
+        assert_eq!(TRUEHD, "mlpa");
         assert_eq!(MP3, "mp4a.40.34");
         assert_eq!(AC3, "ac-3");
         assert_eq!(EAC3, "ec-3");
