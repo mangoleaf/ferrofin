@@ -176,6 +176,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
