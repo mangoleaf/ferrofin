@@ -1174,7 +1174,8 @@ impl FerrofinItemRepository {
 
     /// A library's `CollectionType`, from the same `Data` blob that carries its
     /// `PhysicalFolderIds` — `movies`, `tvshows`, … or `None` for an untyped
-    /// library, which upstream treats as matching any view.
+    /// library, which upstream treats as matching any view. A mixed library
+    /// (`mixed.collection`) is untyped, as upstream parses it.
     async fn collection_type_of(db: &Database, id: Uuid) -> Result<Option<String>, ServiceError> {
         let data: Option<Option<String>> =
             sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
@@ -1189,7 +1190,8 @@ impl FerrofinItemRepository {
                 v.get("CollectionType")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_ascii_lowercase)
-            }))
+            })
+            .filter(|collection_type| collection_type != "mixed"))
     }
 
     /// Runs a translated query in the requested shape, returning full rows.
@@ -11981,6 +11983,49 @@ mod tests {
                 .total_record_count,
             0
         );
+    }
+
+    /// A mixed library has no collection type upstream (`mixed.collection`
+    /// parses to none), so grouped, it joins a movies view and its items are
+    /// browsed there, as the views list puts it in that view.
+    #[tokio::test]
+    async fn a_grouped_mixed_library_is_browsed_in_a_movies_view() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, second, user_id, user) = two_libraries(&db).await;
+        set_collection_type(&db, first, "movies").await;
+        set_collection_type(&db, second, "mixed").await;
+        let view = Uuid::from_u128(0x9F91);
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            r#"{"ViewType":"movies"}"#,
+        )
+        .await;
+        set_folder_preference(
+            &db,
+            user_id,
+            PreferenceKind::GroupedFolders,
+            &[first, second],
+        )
+        .await;
+        let mut names: Vec<String> = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                user: Some(user),
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse")
+            .into_iter()
+            .filter_map(|r| r.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["In First", "In Second"]);
     }
 }
 
