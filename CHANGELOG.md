@@ -202,6 +202,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
   instead of being lifted to the level above. The next scan moves existing items under
   their folders; their ids, play state and playlist entries stay
+- A series refresh removes its missing episodes once you have them, as Jellyfin 12.2 does:
+  a missing episode whose number a file covers, one with no number, and one carrying the
+  provider id of an episode you have under another number are removed, so an adopted
+  library no longer lists those episodes twice (see `docs/UPGRADING.md`)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
