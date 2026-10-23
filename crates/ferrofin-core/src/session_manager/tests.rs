@@ -2841,6 +2841,70 @@ async fn progress_names_only_items_the_library_knows() {
     );
 }
 
+/// `LogSessionActivity` (`SessionManager.cs:244-292`) stamps the signed-in
+/// user's `LastActivityDate` when the user's own date is more than a minute
+/// old (never set counts as old), and not again within the minute, even
+/// though the caller still holds the entity it read before the stamp, as a
+/// request served from the auth cache does. A user active within the minute
+/// is left as is.
+#[tokio::test]
+async fn session_activity_stamps_the_users_last_activity_at_most_once_a_minute() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+    let stored = |id: Uuid| {
+        let users = &users;
+        async move {
+            users
+                .get_user_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_activity_date
+        }
+    };
+
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    assert_eq!(alice.last_activity_date, None);
+    let before = chrono::Utc::now();
+    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
+        .await
+        .unwrap();
+    let stamped = stored(alice_id).await.expect("stamped");
+    assert!(
+        stamped >= before - chrono::Duration::seconds(1),
+        "{stamped}"
+    );
+
+    let row_version = || async {
+        users
+            .get_user_by_id(alice_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .row_version
+    };
+    let written = row_version().await;
+    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored(alice_id).await,
+        Some(stamped),
+        "not again within the minute"
+    );
+    assert_eq!(row_version().await, written, "no write at all");
+
+    let bob_id = Uuid::new_v4();
+    let mut bob = seed_named_user(&db, bob_id, "bob").await;
+    bob.last_activity_date = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+    mgr.log_session_activity("Web", "1.0", "dev-2", "Chrome", "1.2.3.4", Some(&bob))
+        .await
+        .unwrap();
+    assert_eq!(stored(bob_id).await, None, "active within the minute");
+}
+
 // ---- idle and inactive playback (C# `CheckForIdlePlayback` / `CheckForInactiveSteams`).
 
 /// A session manager over `db` with its event manager exposed, for recording
@@ -3180,68 +3244,4 @@ fn the_idle_check_runs_every_fifth_minute() {
         .filter(|&minute| super::idle_check_due(minute))
         .collect();
     assert_eq!(due, [5, 10]);
-}
-
-/// `LogSessionActivity` (`SessionManager.cs:244-292`) stamps the signed-in
-/// user's `LastActivityDate` when the user's own date is more than a minute
-/// old (never set counts as old), and not again within the minute, even
-/// though the caller still holds the entity it read before the stamp, as a
-/// request served from the auth cache does. A user active within the minute
-/// is left as is.
-#[tokio::test]
-async fn session_activity_stamps_the_users_last_activity_at_most_once_a_minute() {
-    let db = test_db().await;
-    let mgr = manager(&db);
-    let users = crate::user_manager::FerrofinUserManager::new(db.clone());
-    let stored = |id: Uuid| {
-        let users = &users;
-        async move {
-            users
-                .get_user_by_id(id)
-                .await
-                .unwrap()
-                .unwrap()
-                .last_activity_date
-        }
-    };
-
-    let alice_id = Uuid::new_v4();
-    let alice = seed_named_user(&db, alice_id, "alice").await;
-    assert_eq!(alice.last_activity_date, None);
-    let before = chrono::Utc::now();
-    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
-        .await
-        .unwrap();
-    let stamped = stored(alice_id).await.expect("stamped");
-    assert!(
-        stamped >= before - chrono::Duration::seconds(1),
-        "{stamped}"
-    );
-
-    let row_version = || async {
-        users
-            .get_user_by_id(alice_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .row_version
-    };
-    let written = row_version().await;
-    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
-        .await
-        .unwrap();
-    assert_eq!(
-        stored(alice_id).await,
-        Some(stamped),
-        "not again within the minute"
-    );
-    assert_eq!(row_version().await, written, "no write at all");
-
-    let bob_id = Uuid::new_v4();
-    let mut bob = seed_named_user(&db, bob_id, "bob").await;
-    bob.last_activity_date = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
-    mgr.log_session_activity("Web", "1.0", "dev-2", "Chrome", "1.2.3.4", Some(&bob))
-        .await
-        .unwrap();
-    assert_eq!(stored(bob_id).await, None, "active within the minute");
 }
