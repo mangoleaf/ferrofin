@@ -364,17 +364,14 @@ pub trait ItemRepository: Send + Sync {
     /// The "latest media" rows of a **tvshows or music** library — port of C#
     /// `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The two types answer differently, and they track different upstream
-    /// versions — the music arm is v12's rewrite, the tvshows arm is still
-    /// 10.11.8's (v12 replaced that one too, with `GetLatestTvShowItems`;
-    /// porting it is its own work item):
+    /// The two types answer differently (both v12):
     ///
-    /// - **tvshows** (v10.11.8) — one grouped-threshold statement: the filter's predicates
-    ///   are grouped by `SeriesName`, the newest `filter.limit` groups'
-    ///   `MAX(DateCreated)` are taken, and every row at or above the *smallest*
-    ///   of those maxima is returned in the filter's `order_by`, unpaged — so
-    ///   `limit` caps groups, not rows, and the caller buckets the rows by
-    ///   container afterwards;
+    /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
+    ///   `filter.limit` series (by the newest row the filter matches, grouped
+    ///   by `SeriesName`): the Episode, Season or Series card chosen from that
+    ///   series' rows added within 24 hours of its newest one, a container the
+    ///   filter's parental limits hide replaced by the episode, newest first.
+    ///   The filter's `order_by` and `start_index` play no part;
     /// - **music** (v12) — the newest `filter.limit` `MusicAlbum` rows
     ///   themselves, ordered `DateCreated DESC, Id DESC`, scoped by the filter's
     ///   top parent ids — which reads no track at all — or, for an
@@ -491,6 +488,26 @@ pub trait ItemRepository: Send + Sync {
     /// layer serves or projects into an `ImageInfo` DTO. An item with no images
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
+
+    /// The image rows of several items in one read, keyed by item id, each
+    /// item's rows in the [`get_image_infos`](Self::get_image_infos) order; an
+    /// item without images is absent.
+    ///
+    /// The default reads one item at a time, so test doubles compile
+    /// unchanged; the concrete repository overrides it with a batched read.
+    async fn get_image_infos_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map = HashMap::new();
+        for &id in item_ids {
+            let images = self.get_image_infos(id).await?;
+            if !images.is_empty() {
+                map.insert(id, images);
+            }
+        }
+        Ok(map)
+    }
 
     /// [`Self::get_image_infos`] in the same read as whether the item's images
     /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s

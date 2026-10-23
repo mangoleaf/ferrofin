@@ -603,6 +603,152 @@ impl FerrofinUserDataManager {
         }
     }
 
+    /// Saves `row` after a report that changed only the remembered tracks:
+    /// the same save, announcement and played-state propagation as a report
+    /// with a position (`OnPlaybackProgress`'s `if (changed)` block).
+    async fn save_track_change(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        row: &UserDataEntity,
+        reason: UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        self.upsert_row(row).await?;
+        self.notify_saved(user_id, item_id, reason).await;
+        if row.played {
+            self.propagate_played_state(user_id, item_id, true, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Saves a play-state report — the shared body of
+    /// [`UserDataManager::update_play_state_with_reason`] and
+    /// [`UserDataManager::update_play_progress`]. With `streams`, the reported
+    /// tracks are kept as `UpdatePlaybackSettings` keeps them, in the same save,
+    /// and a report with no position saves when they change (jellyfin#16501's
+    /// `if (tracksChanged) changed = true`).
+    async fn save_play_state(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        reason: UserDataSaveReason,
+        streams: Option<ferrofin_traits::library::ReportedStreams>,
+    ) -> Result<bool, ServiceError> {
+        let config = self.config.configuration().await?;
+        let PlayStateItem {
+            runtime_ticks,
+            kind,
+            played_status,
+            resume,
+        } = self
+            .item_runtime_and_kind(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
+
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let tracks_changed = streams.is_some_and(|streams| {
+            streams.apply_to(&mut row.audio_stream_index, &mut row.subtitle_stream_index)
+        });
+
+        let Some(mut position_ticks) = reported_position_ticks else {
+            if reason == UserDataSaveReason::PlaybackFinished {
+                // Source SessionManager's successful stop without a position
+                // counts a completed play before its PlaybackFinished event.
+                row.play_count += 1;
+                row.played = played_status;
+                row.playback_position_ticks = 0;
+                row.last_played_date = Some(chrono::Utc::now());
+                self.upsert_row(&row).await?;
+                self.notify_saved(user_id, item_id, reason).await;
+                return Ok(true);
+            }
+            // jellyfin#16501: a report with no position still saves a
+            // changed track choice (`if (tracksChanged) changed = true`).
+            if tracks_changed {
+                self.save_track_change(user_id, item_id, &row, reason)
+                    .await?;
+            }
+            return Ok(false);
+        };
+        let has_runtime = runtime_ticks > 0;
+        let is_audiobook = matches!(kind, BaseItemKind::AudioBook);
+        let is_book = matches!(kind, BaseItemKind::Book);
+        let mut played_to_completion = false;
+
+        if position_ticks > 0 && has_runtime && !is_audiobook && !is_book {
+            #[allow(clippy::cast_precision_loss)]
+            let pct_in = (position_ticks as f64 / runtime_ticks as f64) * 100.0;
+
+            if pct_in < f64::from(config.min_resume_pct) {
+                position_ticks = 0;
+            } else if pct_in > f64::from(config.max_resume_pct)
+                || position_ticks >= runtime_ticks - TICKS_PER_SECOND
+            {
+                position_ticks = 0;
+                row.played = true;
+                played_to_completion = true;
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let duration_seconds = runtime_ticks as f64 / TICKS_PER_SECOND as f64;
+                if duration_seconds < f64::from(config.min_resume_duration_seconds) {
+                    position_ticks = 0;
+                    row.played = true;
+                    played_to_completion = true;
+                }
+            }
+        } else if position_ticks > 0 && has_runtime && is_audiobook {
+            #[allow(clippy::cast_precision_loss)]
+            let position_minutes = position_ticks as f64 / TICKS_PER_SECOND as f64 / 60.0;
+            #[allow(clippy::cast_precision_loss)]
+            let remaining_minutes =
+                (runtime_ticks - position_ticks) as f64 / TICKS_PER_SECOND as f64 / 60.0;
+            if position_minutes < f64::from(config.min_audiobook_resume) {
+                position_ticks = 0;
+            } else if remaining_minutes < f64::from(config.max_audiobook_resume)
+                || position_ticks >= runtime_ticks
+            {
+                position_ticks = 0;
+                row.played = true;
+                played_to_completion = true;
+            }
+        } else if !has_runtime {
+            row.played = true;
+            played_to_completion = true;
+            position_ticks = 0;
+        }
+
+        if !played_status {
+            position_ticks = 0;
+            row.played = false;
+        }
+        if !resume {
+            position_ticks = 0;
+        }
+
+        row.playback_position_ticks = position_ticks;
+        if played_to_completion || position_ticks > 0 {
+            row.last_played_date = Some(chrono::Utc::now());
+        }
+        self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, reason).await;
+        // "A completed version marks every alternate version played and
+        // clears their resume points" — `if (data.Played == true && item is
+        // Video playedVideo) playedVideo.PropagatePlayedState(user, true)`
+        // after the progress and the stop save (`SessionManager.cs:
+        // 1001-1006,1206-1211`).
+        if row.played {
+            self.propagate_played_state(user_id, item_id, true, true)
+                .await?;
+        }
+
+        Ok(played_to_completion)
+    }
+
     /// Gives every other version of a video the played state just set on
     /// it — port of `Video.PropagatePlayedState` (`Video.cs:370-410`), which
     /// `Video.MarkPlayed`/`MarkUnplayed` and the session's progress and stop
@@ -868,6 +1014,46 @@ impl FerrofinUserDataManager {
         counts.get_played_and_total_count(&query, id).await
     }
 
+    /// Folds the completion of `item`'s version played last into `dto`, its
+    /// own user data — `GetResumeUserData(user, item)?.ApplyTo(dto)`
+    /// (v12.2 `UserDataManager.cs:263-357, 424`). A video that is a version
+    /// itself, or that no row names as its primary, is left alone after at
+    /// most one indexed read; only a video with versions reads its group and
+    /// their user data.
+    async fn apply_version_resume(
+        &self,
+        dto: &mut UserItemDataDto,
+        item: &BaseItemEntity,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        use crate::video_versions::{DbVersionReader, VersionRows, resume_user_data};
+        if item.primary_version_id.is_some()
+            || !kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_video)
+        {
+            return Ok(());
+        }
+        let has_versions: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS (SELECT 1 FROM "BaseItems" x
+                              WHERE x."PrimaryVersionId" = ?1 AND x."Id" <> ?1)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if !has_versions {
+            return Ok(());
+        }
+        let versions = VersionRows::load(&DbVersionReader(&self.db), &[item]).await?;
+        let data = self
+            .get_user_data_dtos(&versions.all_version_ids(item), user_id)
+            .await?;
+        if let Some(resume) = resume_user_data(&versions, item, |id| data.get(&id)) {
+            resume.apply_to(dto);
+        }
+        Ok(())
+    }
+
     /// `item.FillUserDataDtoValues(dto, userData, null, user, options)` as
     /// `GetUserDataDto(item, user)` runs it (v12.2 UserDataManager.cs:411-427),
     /// chosen by class: a `Folder` (Folder.cs:2024-2081) takes its played
@@ -897,7 +1083,10 @@ impl FerrofinUserDataManager {
         // the folder gates below, as `supports_played_status` excludes it.
         if !crate::kinds::is_folder(kind) {
             crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
-            return Ok(());
+            // `GetResumeUserData(user, item)?.ApplyTo(dto)` (UserDataManager.cs:424).
+            return self
+                .apply_version_resume(dto, &item, item_id, user_id)
+                .await;
         }
         // No item DTO, so only the `SupportsPlayedStatus` half applies.
         if !(crate::kinds::supports_user_data_from_children(kind)
@@ -1419,108 +1608,31 @@ impl UserDataManager for FerrofinUserDataManager {
         reported_position_ticks: Option<i64>,
         reason: UserDataSaveReason,
     ) -> Result<bool, ServiceError> {
-        let config = self.config.configuration().await?;
-        let PlayStateItem {
-            runtime_ticks,
-            kind,
-            played_status,
-            resume,
-        } = self
-            .item_runtime_and_kind(item_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
+        self.save_play_state(user_id, item_id, reported_position_ticks, reason, None)
+            .await
+    }
 
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
-
-        let Some(mut position_ticks) = reported_position_ticks else {
-            if reason == UserDataSaveReason::PlaybackFinished {
-                // Source SessionManager's successful stop without a position
-                // counts a completed play before its PlaybackFinished event.
-                row.play_count += 1;
-                row.played = played_status;
-                row.playback_position_ticks = 0;
-                row.last_played_date = Some(chrono::Utc::now());
-                self.upsert_row(&row).await?;
-                self.notify_saved(user_id, item_id, reason).await;
-                return Ok(true);
-            }
-            return Ok(false);
-        };
-        let has_runtime = runtime_ticks > 0;
-        let is_audiobook = matches!(kind, BaseItemKind::AudioBook);
-        let is_book = matches!(kind, BaseItemKind::Book);
-        let mut played_to_completion = false;
-
-        if position_ticks > 0 && has_runtime && !is_audiobook && !is_book {
-            #[allow(clippy::cast_precision_loss)]
-            let pct_in = (position_ticks as f64 / runtime_ticks as f64) * 100.0;
-
-            if pct_in < f64::from(config.min_resume_pct) {
-                position_ticks = 0;
-            } else if pct_in > f64::from(config.max_resume_pct)
-                || position_ticks >= runtime_ticks - TICKS_PER_SECOND
-            {
-                position_ticks = 0;
-                row.played = true;
-                played_to_completion = true;
-            } else {
-                #[allow(clippy::cast_precision_loss)]
-                let duration_seconds = runtime_ticks as f64 / TICKS_PER_SECOND as f64;
-                if duration_seconds < f64::from(config.min_resume_duration_seconds) {
-                    position_ticks = 0;
-                    row.played = true;
-                    played_to_completion = true;
-                }
-            }
-        } else if position_ticks > 0 && has_runtime && is_audiobook {
-            #[allow(clippy::cast_precision_loss)]
-            let position_minutes = position_ticks as f64 / TICKS_PER_SECOND as f64 / 60.0;
-            #[allow(clippy::cast_precision_loss)]
-            let remaining_minutes =
-                (runtime_ticks - position_ticks) as f64 / TICKS_PER_SECOND as f64 / 60.0;
-            if position_minutes < f64::from(config.min_audiobook_resume) {
-                position_ticks = 0;
-            } else if remaining_minutes < f64::from(config.max_audiobook_resume)
-                || position_ticks >= runtime_ticks
-            {
-                position_ticks = 0;
-                row.played = true;
-                played_to_completion = true;
-            }
-        } else if !has_runtime {
-            row.played = true;
-            played_to_completion = true;
-            position_ticks = 0;
-        }
-
-        if !played_status {
-            position_ticks = 0;
-            row.played = false;
-        }
-        if !resume {
-            position_ticks = 0;
-        }
-
-        row.playback_position_ticks = position_ticks;
-        if played_to_completion || position_ticks > 0 {
-            row.last_played_date = Some(chrono::Utc::now());
-        }
-        self.upsert_row(&row).await?;
-        self.notify_saved(user_id, item_id, reason).await;
-        // "A completed version marks every alternate version played and
-        // clears their resume points" — `if (data.Played == true && item is
-        // Video playedVideo) playedVideo.PropagatePlayedState(user, true)`
-        // after the progress and the stop save (`SessionManager.cs:
-        // 1001-1006,1206-1211`).
-        if row.played {
-            self.propagate_played_state(user_id, item_id, true, true)
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ferrofin_traits::library::ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        let played = self
+            .save_play_state(
+                user_id,
+                item_id,
+                reported_position_ticks,
+                UserDataSaveReason::PlaybackProgress,
+                Some(streams),
+            )
+            .await?;
+        if streams.resets_selections() {
+            self.reset_playback_stream_selections(user_id, item_id)
                 .await?;
         }
-
-        Ok(played_to_completion)
+        Ok(played)
     }
 
     async fn mark_played(
@@ -4409,6 +4521,56 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A single read of a primary's user data — the one `UserDataChanged`
+    /// pushes and the played/favorite responses carry — takes its completion
+    /// from the version played last (`GetUserDataDto` →
+    /// `GetResumeUserData(user, item)?.ApplyTo(dto)`, UserDataManager.cs:424):
+    /// finished on the 4K copy after the versions were grouped, the movie
+    /// reads played, its own resume bar cleared. The version read directly
+    /// keeps its own data.
+    #[tokio::test]
+    async fn a_primary_read_takes_the_completion_of_the_version_played_last() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, _alt1, alt2) = version_group(&db).await;
+        let (mgr, _library) = container_manager(&db);
+        let finished = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        mgr.save_user_data(
+            user,
+            primary,
+            &UpdateUserItemDataDto {
+                playback_position_ticks: Some(36_000_000_000),
+                last_played_date: Some(finished - chrono::Duration::days(30)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        mgr.save_user_data(
+            user,
+            alt2,
+            &UpdateUserItemDataDto {
+                played: Some(true),
+                last_played_date: Some(finished),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let movie = data(&mgr, primary, user).await;
+        assert!(movie.played, "finished on the 4K version");
+        assert_eq!(movie.last_played_date, Some(finished));
+        assert_eq!(movie.playback_position_ticks, 0);
+        assert_eq!(movie.played_percentage, None);
+        let version = data(&mgr, alt2, user).await;
+        assert_eq!(version.item_id, alt2);
+        assert!(version.played);
     }
 
     /// Both alternate versions are marked played, and their positions reset

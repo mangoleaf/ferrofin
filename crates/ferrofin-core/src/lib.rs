@@ -41,6 +41,9 @@
 //!   ([`ferrofin_traits::persistence::PeopleRepository`]);
 //! - [`keyframe_repository`] — [`FerrofinKeyframeRepository`]
 //!   ([`ferrofin_traits::persistence::KeyframeRepository`]);
+//! - [`keyframe_extractors`] — the ffprobe and Matroska
+//!   [`ferrofin_traits::media_encoding::KeyframeExtractor`]s and the repository
+//!   cache in front of them;
 //! - [`linked_children_service`] — [`FerrofinLinkedChildrenService`]
 //!   ([`ferrofin_traits::persistence::LinkedChildrenService`]);
 //! - [`next_up_service`] — [`FerrofinNextUpService`]
@@ -197,8 +200,10 @@ pub mod item_repository;
 pub mod item_type_lookup;
 pub mod item_visibility;
 mod item_visibility_repository;
+pub mod keyframe_extractors;
 pub mod keyframe_repository;
 pub mod kinds;
+mod latest_tv_repository;
 pub mod library_changed_notifier;
 pub mod library_manager;
 pub mod library_monitor;
@@ -220,6 +225,7 @@ pub mod next_up_service;
 pub mod notify_watcher;
 pub mod path_manager;
 pub mod people_repository;
+pub mod playback_activity;
 pub mod playback_metrics;
 pub mod plugin_manager;
 mod query_restrictions;
@@ -246,6 +252,7 @@ pub mod text_util;
 pub mod translate_query;
 pub mod trickplay_manager;
 pub mod tv_series_manager;
+mod user_activity_repository;
 mod user_data_key_repository;
 pub mod user_data_keys;
 pub mod user_data_manager;

@@ -204,7 +204,8 @@ pub trait LibraryScanTrigger: Send + Sync {
 
 fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 
-/// Supplies the filesystem roots the monitor should watch.
+/// Supplies the filesystem roots the monitor should watch, and every library
+/// location, which its watcher's metadata-only filter treats as a root.
 ///
 /// Resolved fresh on every [`LibraryMonitor::start`], so a monitor restart
 /// after a library-structure change (folder added/removed, realtime option
@@ -216,6 +217,14 @@ fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 pub trait WatchRootsSource: Send + Sync {
     /// The root paths to watch right now.
     async fn watch_roots(&self) -> Vec<String>;
+
+    /// Every library location right now, real-time monitored or not: what a
+    /// change is attributed to, since a scan matches a changed path against
+    /// every library. A library without real-time monitoring can sit inside
+    /// a watched one. The default is [`Self::watch_roots`].
+    async fn library_locations(&self) -> Vec<String> {
+        self.watch_roots().await
+    }
 }
 
 #[async_trait]
@@ -229,6 +238,10 @@ impl WatchRootsSource for Vec<String> {
 impl<T: WatchRootsSource + ?Sized> WatchRootsSource for Arc<T> {
     async fn watch_roots(&self) -> Vec<String> {
         (**self).watch_roots().await
+    }
+
+    async fn library_locations(&self) -> Vec<String> {
+        (**self).library_locations().await
     }
 }
 
@@ -441,6 +454,12 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
         let mut roots = self.roots.watch_roots().await;
         roots.sort();
+        // Every library location is a library root to the metadata-only
+        // filter: the nested ones skipped below, and those of libraries
+        // without real-time monitoring inside a watched one. Read after the
+        // watch roots, whose listing refreshes the libraries it comes from.
+        self.watcher
+            .set_library_roots(&self.roots.library_locations().await);
         let mut watched_roots: Vec<String> = Vec::new();
         for root in roots {
             // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
