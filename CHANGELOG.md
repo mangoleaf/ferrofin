@@ -97,6 +97,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 - Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
   `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
   file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
@@ -176,10 +180,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
-- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
-  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
-  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
-  with no folder is left without an owner instead of joining an arbitrary video
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -191,6 +196,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
