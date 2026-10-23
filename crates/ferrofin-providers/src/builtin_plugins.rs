@@ -104,11 +104,15 @@ pub const TMDB: BuiltinPlugin = BuiltinPlugin {
     description: "Get metadata for movies and other video content from TheMovieDb.",
     configuration_file_name: "Jellyfin.Plugin.Tmdb.xml",
     // `Tmdb/Configuration/PluginConfiguration.cs` defaults. The five image-size
-    // properties are `string?` with no default, so upstream omits them.
+    // properties are `string?` with no default, so they start `null`; they must
+    // be in the document anyway, because a save keeps only the keys it holds
+    // (`project_config`).
     default_config: concat!(
         r#"{"TmdbApiKey":"","IncludeAdult":false,"ExcludeTagsSeries":false,"#,
         r#""ExcludeTagsMovies":false,"ImportSeasonName":false,"MaxCastMembers":15,"#,
-        r#""MaxCrewMembers":15,"HideMissingCastMembers":false,"HideMissingCrewMembers":false}"#
+        r#""MaxCrewMembers":15,"HideMissingCastMembers":false,"HideMissingCrewMembers":false,"#,
+        r#""PosterSize":null,"BackdropSize":null,"LogoSize":null,"ProfileSize":null,"#,
+        r#""StillSize":null}"#
     ),
     config_page: include_bytes!("../assets/plugins/tmdb.config.html"),
 };
@@ -209,6 +213,17 @@ mod tests {
         assert_eq!(v["MaxCrewMembers"], 15);
         assert_eq!(v["IncludeAdult"], false);
         assert_eq!(v["TmdbApiKey"], "");
-        assert!(v.get("PosterSize").is_none(), "unset sizes are omitted");
+        for size in [
+            "PosterSize",
+            "BackdropSize",
+            "LogoSize",
+            "ProfileSize",
+            "StillSize",
+        ] {
+            assert!(
+                v.get(size).is_some_and(serde_json::Value::is_null),
+                "{size} is in the schema, unset"
+            );
+        }
     }
 }
