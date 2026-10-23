@@ -176,6 +176,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- `GET /Items/Filters2?isAiring=false` lists the filters of the programmes not on now
+  (starting later or already ended), as Jellyfin 12 does. It returned an empty filter set,
+  because the predicate required a programme to start after now and also end before now
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
