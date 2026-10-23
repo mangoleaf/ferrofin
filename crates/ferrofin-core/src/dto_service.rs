@@ -2669,14 +2669,23 @@ impl FerrofinDtoService {
 
         dto.end_date = item.end_date;
 
-        // Container is always set from the file extension (C# `dto.Container = item.Container`,
-        // which resolution fills from the extension) — folders have none, so it stays absent.
-        dto.container = item
-            .path
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).extension())
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase);
+        // `dto.Container = item.Container` (`DtoService.cs:1125`): the container
+        // the probe stored (`FFProbeVideoInfo`/`AudioFileProber` are its only
+        // writers), so folders, by-name items, photos and books have none. A
+        // video or audio file not probed yet answers its extension where
+        // upstream answers null, so it keeps a label: one scanned before audio
+        // probes stored their container, or on a server without ffprobe.
+        dto.container = crate::item_data::stored_container(item.data.as_deref()).or_else(|| {
+            // A disc rip's path is its folder (`/m/Movie.2010`), which has
+            // no extension to give.
+            let media = matches!(item.media_type.as_deref(), Some("Video" | "Audio"));
+            (media && !item.is_folder && !crate::item_data::path_is_directory(item))
+                .then_some(item.path.as_deref())
+                .flatten()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+        });
 
         // Gated scalar defaults Jellyfin emits when the field is requested (item_detail, not lists).
         if options.contains_field(ItemFields::EnableMediaSourceDisplay) {
@@ -6288,6 +6297,73 @@ mod tests {
                 ),
                 (Some(VideoType::VideoFile), None, None),
             ]
+        );
+    }
+
+    /// `dto.Container = item.Container` (`DtoService.cs:1125`): the container
+    /// the probe stored (`FFProbeVideoInfo`/`AudioFileProber`), and nothing for
+    /// a folder, whatever dots its name has. A video or audio file not probed
+    /// yet falls back to its extension, unless it is a disc rip's folder; a
+    /// photo has no container.
+    #[tokio::test]
+    async fn the_dto_container_is_the_probed_one_and_folders_have_none() {
+        let db = test_db().await;
+        let mut rows = Vec::new();
+        for (kind, data, path, is_folder, media_type) in [
+            (BaseItemKind::Series, "{}", "/tv/Mr. Robot", true, None),
+            (
+                BaseItemKind::Movie,
+                r#"{"Container":"mkv"}"#,
+                "/m/Film.mp4",
+                false,
+                Some("Video"),
+            ),
+            (
+                BaseItemKind::Audio,
+                "{}",
+                "/music/Song.FLAC",
+                false,
+                Some("Audio"),
+            ),
+            (
+                BaseItemKind::Photo,
+                "{}",
+                "/photos/Shot.jpg",
+                false,
+                Some("Photo"),
+            ),
+            (
+                BaseItemKind::Audio,
+                r#"{"Container":"mp3"}"#,
+                "/music/Song.mp3",
+                false,
+                Some("Audio"),
+            ),
+            (
+                BaseItemKind::Movie,
+                r#"{"VideoType":"BluRay"}"#,
+                "/m/Movie.2010",
+                false,
+                Some("Video"),
+            ),
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_item_with_data(&db, id, kind, "X", data).await;
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.is_folder = is_folder;
+            row.media_type = media_type.map(str::to_owned);
+            rows.push(row);
+        }
+        let dtos = service(db.clone())
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            dtos.iter()
+                .map(|d| d.container.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("mkv"), Some("flac"), None, Some("mp3"), None]
         );
     }
 

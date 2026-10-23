@@ -10003,7 +10003,9 @@ impl LibraryScanner {
                 entity.data = Some(data);
             }
         }
-        if !media_is_audio && let Some(container) = source.container.as_deref() {
+        // `video.Container = mediaInfo.Container` (`FFProbeVideoInfo.cs:206`) and
+        // `audio.Container = mediaInfo.Container` (`AudioFileProber.cs:138`).
+        if let Some(container) = source.container.as_deref() {
             entity.data =
                 crate::item_data::set_data_field(entity.data.as_deref(), "Container", container);
         }
@@ -30129,6 +30131,28 @@ mod tests {
             Some(super::forced_sort_name(&saved, "Heat 1995").as_str())
         );
         assert_ne!(saved.sort_name.as_deref(), Some("heat"));
+    }
+
+    /// Both probes store the container they found (`FFProbeVideoInfo.cs:206`,
+    /// `AudioFileProber.cs:138`): the DTO's `Container` reads it.
+    #[test]
+    fn a_video_or_audio_probe_stores_its_container() {
+        for is_audio in [false, true] {
+            let mut info = ferrofin_model::media_info::MediaInfo::default();
+            info.media_source.container = Some("flac".to_owned());
+            let mut row = planned_movie();
+            super::LibraryScanner::apply_probe(
+                &mut row,
+                Some(&info),
+                is_audio,
+                super::FetcherPolicy::default(),
+            );
+            assert_eq!(
+                crate::item_data::stored_container(row.data.as_deref()).as_deref(),
+                Some("flac"),
+                "audio probe: {is_audio}"
+            );
+        }
     }
 
     /// The filter is video-only and uses the existing text/image classifier,
