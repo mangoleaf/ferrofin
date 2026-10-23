@@ -42,8 +42,13 @@ fn containing_folder(item: &BaseItemEntity) -> Option<&Path> {
         .unwrap_or_default();
     let disc = matches!(data["VideoType"].as_str(), Some("Dvd" | "BluRay"))
         && data["IsPlaceHolder"].as_bool() != Some(true);
-    // `Genre.cs:26`, `MusicGenre.cs:35`: `ContainingFolderPath => Path`.
-    let by_name = matches!(short_kind(item), "Genre" | "MusicGenre");
+    // `ContainingFolderPath => Path` (`Genre.cs:26`, `MusicGenre.cs:35`,
+    // `Person.cs:27`, `Studio.cs:25`, `Year.cs:31`, `MusicArtist.cs:56`): a
+    // by-name item's row is no folder, but its path is its folder.
+    let by_name = matches!(
+        short_kind(item),
+        "Genre" | "MusicGenre" | "Person" | "Studio" | "Year" | "MusicArtist"
+    );
     if item.is_folder || disc || by_name {
         Some(path)
     } else {
@@ -329,11 +334,12 @@ mod tests {
             vec![PathBuf::from("/music/Album/cdart.png")]
         );
     }
-    /// A genre's and a music genre's `ContainingFolderPath` is their own path,
-    /// though neither is a folder, so each keeps its own artwork.
+    /// A by-name item's `ContainingFolderPath` is its own path, though its row
+    /// is no folder, so each keeps its own artwork: genres, people, studios,
+    /// years (and by-name artists, below).
     #[test]
     fn genres_save_inside_their_own_path() {
-        for kind in ["Genre", "MusicGenre"] {
+        for kind in ["Genre", "MusicGenre", "Person", "Studio", "Year"] {
             let genre = row(kind, "/meta/Genre/Crime", false);
             assert_eq!(
                 destination(&genre, ImageSavingConvention::Legacy, ImageType::Primary),
@@ -349,6 +355,23 @@ mod tests {
             );
         }
     }
+    /// A by-name artist (`MusicArtist.ContainingFolderPath => Path`) keeps its
+    /// art in its own folder, named `folder` in both conventions, as every
+    /// artist's Primary is.
+    #[test]
+    fn a_by_name_artist_saves_inside_its_own_path() {
+        let artist = row("MusicArtist", "/meta/artists/Band", false);
+        for convention in [
+            ImageSavingConvention::Legacy,
+            ImageSavingConvention::Compatible,
+        ] {
+            assert_eq!(
+                destination(&artist, convention, ImageType::Primary),
+                vec![PathBuf::from("/meta/artists/Band/folder.png")]
+            );
+        }
+    }
+
     #[test]
     fn episodes_mixed_folders_and_discs_use_the_media_path() {
         let mut movie = row("Movie", "/media/Film.mkv", false);

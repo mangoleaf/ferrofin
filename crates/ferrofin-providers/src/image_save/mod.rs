@@ -193,18 +193,25 @@ impl ImageFileSaver {
         })
     }
 
-    /// Whether the item's own path lies in the server's data or internal
-    /// metadata directory (a genre's `{metadata}/Genre/<name>`, a playlist in
-    /// `{data}/playlists`) rather than in a media library. The check is
-    /// lexical, so a path it cannot match falls back to the library's setting.
+    /// Whether the item's own path lies in one of the server's own
+    /// directories rather than in a media library: the data directory (a
+    /// playlist in `{data}/playlists`, a box set in `{data}/collections`), the
+    /// internal metadata directory (a genre's `{metadata}/Genre/<name>`, a
+    /// person's `{metadata}/People/…`) or the libraries' root folder (a
+    /// library's own `root/default/<name>`). The check is lexical, so a path
+    /// it cannot match falls back to the library's setting.
     fn in_server_directories(&self, item: &BaseItemEntity) -> bool {
         let Some(path) = item.path.as_deref().map(Path::new) else {
             return false;
         };
         let paths = self.configuration.application_paths();
-        [paths.data_path(), paths.internal_metadata_path()]
-            .iter()
-            .any(|root| !root.is_empty() && path.starts_with(root))
+        [
+            paths.data_path(),
+            paths.internal_metadata_path(),
+            paths.root_folder_path(),
+        ]
+        .iter()
+        .any(|root| !root.is_empty() && path.starts_with(root))
     }
 
     async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {
@@ -222,20 +229,29 @@ impl ImageFileSaver {
         } else {
             None
         };
-        // `IsSaveLocalMetadataEnabled`: a genre, music genre or playlist
-        // overrides it to true (`Genre.cs:55`, `MusicGenre.cs:63`,
-        // `Playlist.cs:126`), so its artwork lives beside its own path, out of
-        // reach of the dynamic image providers. Accepted divergence: the
-        // override holds only while that path is in the server's own data or
-        // metadata directory. A playlist file or folder inside a media
-        // library follows the library's "Save artwork into media folders",
-        // so nothing is written into a media folder the library did not open
-        // to it. Upstream's other overrides (Person, Studio, Year, BoxSet, a
-        // by-name MusicArtist, CollectionFolder, UserView) are not ported yet,
-        // so their downloaded art stays in the internal metadata folder.
+        // `IsSaveLocalMetadataEnabled`: these kinds override it to true
+        // (`Genre.cs:55`, `MusicGenre.cs:63`, `Playlist.cs:126`, `Person.cs:89`,
+        // `Studio.cs:62`, `Year.cs:54`, `BoxSet.cs:112`, `MusicArtist.cs:106`
+        // when accessed by name, `CollectionFolder.cs:196`), so their artwork
+        // lives beside their own path, out of reach of the dynamic image
+        // providers. Accepted divergence (owner decision 2026-10-17): the
+        // override holds only while that path is in the server's own
+        // directories. A playlist file, a box-set folder or an artist folder
+        // inside a media library follows the library's "Save artwork into
+        // media folders", so nothing is written into a media folder the
+        // library did not open to it. `UserView` and `BasePluginFolder` are
+        // not given the override here (see gl-598).
         if !(matches!(
             policy::short_kind(item),
-            "Genre" | "MusicGenre" | "Playlist"
+            "Genre"
+                | "MusicGenre"
+                | "Playlist"
+                | "Person"
+                | "Studio"
+                | "Year"
+                | "BoxSet"
+                | "MusicArtist"
+                | "CollectionFolder"
         ) && self.in_server_directories(item))
         {
             let folders = self.folders.get_virtual_folders().await?;

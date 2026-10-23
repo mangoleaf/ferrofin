@@ -412,10 +412,12 @@ The real remaining gaps are **by design**, not un-ported routes:
 - **No artwork is written into a media library without the library's opt-in** — an owner
   decision (2026-10-17). Upstream's `IsSaveLocalMetadataEnabled()` overrides (Genre,
   MusicGenre, Playlist, Person, Studio, Year, BoxSet, …) save artwork "beside the item"
-  whatever the library says. Ferrofin ports them (Genre, MusicGenre and Playlist so far)
-  only while the item's own path is in its data or metadata directory (a genre's
-  `{metadata}/Genre/<name>`, a playlist in `{data}/playlists`). An item inside a media
-  library (an `.m3u` playlist file, a playlist folder) follows the library's "Save artwork
+  whatever the library says. Ferrofin ports them (Genre, MusicGenre, Playlist, Person,
+  Studio, Year, BoxSet, a by-name MusicArtist and a library's CollectionFolder; not yet
+  UserView) only while the item's own path is in its data or metadata directory or the
+  libraries' root folder (a genre's `{metadata}/Genre/<name>`, a playlist in
+  `{data}/playlists`, a library's `root/default/<name>`). An item inside a media library
+  (an `.m3u` playlist file, a playlist or box-set folder) follows the library's "Save artwork
   into media folders" (`SaveLocalMetadata`), so with it off the media folders stay
   untouched and need no write permission.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
