@@ -16,3 +16,234 @@
 # issue = 830
 
 version = 1
+
+# ── filed from the first sweep with the edge cases (gl-617, gl-618) ─────────────────────────────────
+# A request is matched by the first entry whose pattern, path and kind fit, so the specific filters come
+# first. A filter Ferrofin ignores shows as a different total (TotalRecordCount, value) and a different
+# page (Items, length) when the filtered page is not full. The last TotalRecordCount entry is a deliberate
+# catch-all: every other recursive /Items count is one higher on Ferrofin (the playlists folder, gl-826);
+# a new GetItems total difference therefore reads as gl-826 until it is filed above it.
+[[filed]]
+request = "GetItems.hasParentalRating.false"
+path = "TotalRecordCount"
+kind = "value"
+issue = 809
+
+[[filed]]
+request = "GetItems.hasOfficialRating.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 809
+
+[[filed]]
+request = "GetItems.isPlaceHolder.true"
+path = "TotalRecordCount"
+kind = "value"
+issue = 809
+
+[[filed]]
+request = "GetItems.isPlaceHolder.true"
+path = "Items"
+kind = "length"
+issue = 809
+
+[[filed]]
+request = "GetItems.seriesStatus.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 809
+
+[[filed]]
+request = "GetItems.seriesStatus.*"
+path = "Items"
+kind = "length"
+issue = 809
+
+[[filed]]
+request = "GetItems.studios.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 810
+
+[[filed]]
+request = "GetItems.studios.*"
+path = "Items"
+kind = "length"
+issue = 810
+
+[[filed]]
+request = "GetItems.videoTypes.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 225
+
+[[filed]]
+request = "GetItems.isMissing.true"
+path = "TotalRecordCount"
+kind = "value"
+issue = 80
+
+[[filed]]
+request = "GetItems.isMissing.true"
+path = "Items"
+kind = "length"
+issue = 80
+
+[[filed]]
+request = "GetItems.isUnaired.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 80
+
+[[filed]]
+request = "GetItems.isUnaired.*"
+path = "Items"
+kind = "length"
+issue = 80
+
+[[filed]]
+request = "GetItems.isNews.true"
+path = "TotalRecordCount"
+kind = "value"
+issue = 80
+
+[[filed]]
+request = "GetItems.isNews.true"
+path = "Items"
+kind = "length"
+issue = 80
+
+[[filed]]
+request = "GetItems.isKids.true"
+path = "TotalRecordCount"
+kind = "value"
+issue = 80
+
+[[filed]]
+request = "GetItems.isKids.true"
+path = "Items"
+kind = "length"
+issue = 80
+
+[[filed]]
+request = "GetItems.isSports.true"
+path = "TotalRecordCount"
+kind = "value"
+issue = 80
+
+[[filed]]
+request = "GetItems.isSports.true"
+path = "Items"
+kind = "length"
+issue = 80
+
+[[filed]]
+request = "Get*.includeItemTypes.program"
+path = "TotalRecordCount"
+kind = "value"
+issue = 823
+
+[[filed]]
+request = "Get*.includeItemTypes.program"
+path = "Items"
+kind = "length"
+issue = 823
+
+[[filed]]
+request = "Get*.includeItemTypes.recording"
+path = "TotalRecordCount"
+kind = "value"
+issue = 823
+
+[[filed]]
+request = "Get*.includeItemTypes.recording"
+path = "Items"
+kind = "length"
+issue = 823
+
+[[filed]]
+request = "Get*.includeItemTypes.channelfolderitem"
+path = "TotalRecordCount"
+kind = "value"
+issue = 823
+
+[[filed]]
+request = "Get*.includeItemTypes.channelfolderitem"
+path = "Items"
+kind = "length"
+issue = 823
+
+[[filed]]
+request = "Get*Artists.studios.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 824
+
+[[filed]]
+request = "Get*Artists.studios.*"
+path = "Items"
+kind = "length"
+issue = 824
+
+[[filed]]
+request = "GetSeasons.isMissing.true"
+path = "TotalRecordCount"
+kind = "value"
+issue = 825
+
+[[filed]]
+request = "GetSeasons.isMissing.true"
+path = "Items"
+kind = "length"
+issue = 825
+
+[[filed]]
+request = "GetItems.includeItemTypes.playlistsfolder"
+path = "TotalRecordCount"
+kind = "value"
+issue = 826
+
+[[filed]]
+request = "GetItems.includeItemTypes.playlistsfolder"
+path = "Items"
+kind = "length"
+issue = 826
+
+[[filed]]
+request = "GetItems.*"
+path = "TotalRecordCount"
+kind = "value"
+issue = 826
+
+# The PG-13 user sees every episode: adoption's boot repair clears the series score unrated episodes
+# inherit (gl-827). The fields of the one extra episode that search returns follow from it.
+[[filed]]
+request = "edge-parental-rating/counts"
+path = "EpisodeCount"
+kind = "value"
+issue = 827
+
+[[filed]]
+request = "edge-parental-rating/search"
+path = "TotalRecordCount"
+kind = "value"
+issue = 827
+
+[[filed]]
+request = "edge-parental-rating/search"
+path = "Items"
+kind = "length"
+issue = 827
+
+# /Items/Counts answers ItemCount 0; Jellyfin 12 returns the total of every type the query matched (gl-828)
+[[filed]]
+request = "GetItemCounts"
+path = "ItemCount"
+kind = "value"
+issue = 828
+
+[[filed]]
+request = "*/counts"
+path = "ItemCount"
+kind = "value"
+issue = 828
