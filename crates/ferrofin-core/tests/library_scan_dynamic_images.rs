@@ -557,6 +557,47 @@ async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
     );
 }
 
+/// A library tile is recorded as any saved image is: its size and blurhash
+/// read from the file (`LibraryManager.UpdateImagesAsync`), and the file's own
+/// modification time, so `/UserViews` carries `ImageBlurHashes.Primary`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_tile_is_recorded_with_its_blurhash_and_file_time() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let id = uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+        .expect("id");
+    let images = lib.items.get_image_infos(id).await.expect("images");
+    let tile = images
+        .iter()
+        .find(|i| i.image_type == ImageType::Primary)
+        .expect("a drawn tile");
+    let (width, height) = image::image_dimensions(&tile.path).expect("decodable");
+    assert_eq!(
+        (tile.width, tile.height),
+        (
+            i32::try_from(width).expect("width"),
+            i32::try_from(height).expect("height")
+        )
+    );
+    assert!(
+        tile.blur_hash.as_deref().is_some_and(|h| !h.is_empty()),
+        "the tile has a blurhash: {tile:?}"
+    );
+    let modified = std::fs::metadata(&tile.path)
+        .and_then(|m| m.modified())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .expect("mtime");
+    assert_eq!(
+        db_ticks(tile.date_modified),
+        db_ticks(modified),
+        "the row's date is the file's"
+    );
+}
+
+/// A date at the database's 100 ns precision.
+fn db_ticks(date: chrono::DateTime<chrono::Utc>) -> i64 {
+    date.timestamp_nanos_opt().expect("in range") / 100
+}
+
 /// gl-576: a library validation whose options run every provider redraws the
 /// albums it walked and the library tile past their date gates, where the
 /// default validation leaves both current images alone.

@@ -538,11 +538,22 @@ pub struct PreviousItemRequestDto {
 }
 
 /// Request body for `POST /SyncPlay/SetRepeatMode` — set repeat mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SetRepeatModeRequestDto {
     /// The repeat mode to apply.
     pub mode: GroupRepeatMode,
+}
+
+/// A body without `Mode` is `RepeatOne`: the C# property has no initializer,
+/// so it is the enum's `0`, not [`GroupRepeatMode`]'s `RepeatNone` default
+/// (which a new play queue starts in).
+impl Default for SetRepeatModeRequestDto {
+    fn default() -> Self {
+        Self {
+            mode: GroupRepeatMode::RepeatOne,
+        }
+    }
 }
 
 /// Request body for `POST /SyncPlay/SetShuffleMode` — set shuffle mode.
