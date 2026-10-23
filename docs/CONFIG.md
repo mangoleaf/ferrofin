@@ -48,6 +48,10 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
   the certificate and its private key, plus its password if it has one. At startup the server
   listens with HTTPS on `FERROFIN_HTTPS_PORT` on every address it listens with HTTP on.
   If the certificate does not load, the server logs why and serves HTTP only.
+  A certificate without a password must use the usual empty-password form, as OpenSSL writes
+  it (`openssl pkcs12 -export … -passout pass:`). The rarer NULL-password form, which some
+  Windows and Java tools write and Jellyfin accepts, does not load yet (gl-815).
+- HTTPS connections use HTTP/1.1; Jellyfin's also offer HTTP/2 (gl-814).
 - **Require HTTPS** answers every plain HTTP request with a `307` redirect to the same path on
   HTTPS, except `/health/live` and `/health/ready`. A request a known proxy forwarded with
   `X-Forwarded-Proto: https` counts as HTTPS.

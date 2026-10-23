@@ -88,6 +88,9 @@ impl HttpsServing {
             return None;
         }
         if tls_port != 0 && tls_port == plain_port {
+            // TODO(gl-554): Jellyfin resets both ports to their defaults here,
+            // since its ports come from the dashboard's InternalHttpPort and
+            // InternalHttpsPort, which Ferrofin does not read yet.
             tracing::error!(
                 port = tls_port,
                 "HTTPS is enabled on the HTTP port; set FERROFIN_HTTPS_PORT to another port. \
@@ -170,6 +173,9 @@ pub fn load_certificate(
         )));
     }
     // Don't use an empty string password.
+    // TODO(gl-815): .NET loads a blank password as `null`, which also accepts
+    // the NULL-password MAC form; p12-keystore accepts the empty-password form
+    // only.
     let password = if password.trim().is_empty() {
         ""
     } else {
@@ -200,6 +206,7 @@ pub fn load_certificate(
         .with_single_cert(certificates, key)
         .map_err(|e| CertificateError::Rejected(e.to_string()))?;
     // The server speaks HTTP/1.1 (axum is built without HTTP/2).
+    // TODO(gl-814): offer `h2` as well, as Kestrel's `Http1AndHttp2` does.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
