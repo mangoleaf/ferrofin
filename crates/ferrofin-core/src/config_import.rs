@@ -29,17 +29,11 @@
 //!
 //! ## The rest of `config/`
 //!
-//! - **`network.xml` is not imported yet, and that is an open work item, not a
-//!   decision.** It carries `BaseUrl` (a client-visible path prefix, so losing
-//!   it on adoption breaks every bookmark into a `/jellyfin`-style
-//!   deployment), `KnownProxies`, `EnableRemoteAccess`, and
-//!   `RemoteIPFilter`/`IsRemoteIPFilterBlacklist` — the last two being settings
-//!   nothing currently enforces, since `ferrofin-networking`'s `NetworkManager`
-//!   is not wired into request handling. It was blocked on that crate serving
-//!   four of those names in the wrong capitalization; that is fixed. What
-//!   remains is the import itself, and deciding which fields are
-//!   deployment-specific enough to deny — the ports are the open question,
-//!   `BaseUrl` should be carried.
+//! - **The named documents** (`encoding.xml`, `branding.xml`, `network.xml`,
+//!   `metadata.xml`, `xbmcmetadata.xml` and `livetv.xml`) are seeded as
+//!   `named/<key>.json` by `FerrofinServerConfigurationManager::load`, each
+//!   with its own deny list. `livetv.xml`'s tuners and listing providers go to
+//!   the database instead (`live_tv_import`).
 //! - **`database.xml` is deliberately skipped**: it selects Jellyfin's database
 //!   provider, and Ferrofin is SQLite-only, so there is nothing to carry over.
 
@@ -84,6 +78,23 @@ pub const BRANDING_XML_DENY: &[&str] = &["SplashscreenLocation"];
 /// `LocalNetworkSubnets`, `KnownProxies`, `EnableRemoteAccess` — and is exactly
 /// what adoption must not silently drop.
 pub const NETWORK_XML_DENY: &[&str] = &["CertificatePath", "CertificatePassword"];
+
+/// Fields of `livetv.xml` that must not be carried over: all three are
+/// recording paths inside the Jellyfin container's filesystem.
+pub const LIVETV_XML_DENY: &[&str] =
+    &["RecordingPath", "MovieRecordingPath", "SeriesRecordingPath"];
+
+/// Fields of `livetv.xml` left out of the seeded `named/livetv.json`: the
+/// recording paths of [`LIVETV_XML_DENY`], and the tuners and listing
+/// providers, which Ferrofin keeps in the database (`live_tv_import`) and
+/// merges into the document when it is served.
+pub const LIVETV_OPTIONS_XML_DENY: &[&str] = &[
+    "RecordingPath",
+    "MovieRecordingPath",
+    "SeriesRecordingPath",
+    "TunerHosts",
+    "ListingProviders",
+];
 
 /// How deep an imported document may nest.
 ///
@@ -498,6 +509,18 @@ fn backend(action: &str, err: &serde_json::Error) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    /// The seeded `named/livetv.json` leaves out at least what the tuner
+    /// import does: a recording path added to one list belongs in both.
+    #[test]
+    fn the_live_tv_options_seed_denies_every_recording_path() {
+        for field in super::LIVETV_XML_DENY {
+            assert!(
+                super::LIVETV_OPTIONS_XML_DENY.contains(field),
+                "{field} is missing from LIVETV_OPTIONS_XML_DENY"
+            );
+        }
+    }
+
     #[test]
     fn entity_text_is_joined_before_trimming() {
         let node = super::parse("<Name>  Fish &amp; Chips &#33;  </Name>").expect("valid XML");

@@ -393,14 +393,15 @@ impl VirtualFolderInfo {
             .max_by_key(|location| location.len())
     }
 
-    /// Whether `top_parent_id` (a stored `TopParentId`, any GUID form) is
-    /// this library's collection folder.
-    fn is_collection_folder(&self, top_parent_id: &str) -> bool {
+    /// Whether `id` (a stored item id such as a `TopParentId`, in any GUID
+    /// form) is this library's collection folder.
+    #[must_use]
+    pub fn is_collection_folder(&self, id: &str) -> bool {
         match (
             self.item_id
                 .as_deref()
                 .and_then(|id| uuid::Uuid::parse_str(id).ok()),
-            uuid::Uuid::parse_str(top_parent_id).ok(),
+            uuid::Uuid::parse_str(id).ok(),
         ) {
             (Some(own), Some(top)) => own == top,
             _ => false,
