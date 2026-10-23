@@ -1544,6 +1544,60 @@ pub trait UserDataSaveListener: Send + Sync {
     ) -> Result<(), ServiceError>;
 }
 
+/// The audio and subtitle tracks a playback progress report names, with the
+/// user's "Remember audio selections" / "Remember subtitle selections"
+/// settings, which decide what is kept of them (C#
+/// `SessionManager.UpdatePlaybackSettings`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedStreams {
+    /// `PlaybackProgressInfo.AudioStreamIndex`.
+    pub audio_stream_index: Option<i32>,
+    /// `PlaybackProgressInfo.SubtitleStreamIndex`.
+    pub subtitle_stream_index: Option<i32>,
+    /// `User.RememberAudioSelections`.
+    pub remember_audio: bool,
+    /// `User.RememberSubtitleSelections`.
+    pub remember_subtitles: bool,
+}
+
+impl ReportedStreams {
+    /// Whether the report names a track of a kind the user does not want
+    /// remembered, which resets both of the user's remembered tracks for the
+    /// item (`OnPlaybackProgress`'s `ResetPlaybackStreamSelections` call,
+    /// v12.2 `SessionManager.cs:1009-1013`).
+    ///
+    /// Deliberately as upstream: with one setting on and the other off, the
+    /// reset also drops the index of the remembered kind that the same report
+    /// just saved. Keeping it would diverge from v12.2, which is the owner's
+    /// call (gl-116), not a fix to make here.
+    #[must_use]
+    pub fn resets_selections(&self) -> bool {
+        (!self.remember_audio && self.audio_stream_index.is_some())
+            || (!self.remember_subtitles && self.subtitle_stream_index.is_some())
+    }
+
+    /// Applies the report to the remembered `(audio, subtitle)` indices,
+    /// returning whether either changed — `UpdatePlaybackSettings` (v12.2
+    /// `SessionManager.cs:1016-1055`): with a setting on, a reported index
+    /// replaces the remembered one and a report without one keeps it; with a
+    /// setting off, the remembered index is cleared.
+    pub fn apply_to(&self, audio: &mut Option<i32>, subtitle: &mut Option<i32>) -> bool {
+        fn apply(remember: bool, reported: Option<i32>, kept: &mut Option<i32>) -> bool {
+            let next = if remember { reported.or(*kept) } else { None };
+            let changed = next != *kept;
+            *kept = next;
+            changed
+        }
+        let audio_changed = apply(self.remember_audio, self.audio_stream_index, audio);
+        let subtitle_changed = apply(
+            self.remember_subtitles,
+            self.subtitle_stream_index,
+            subtitle,
+        );
+        audio_changed || subtitle_changed
+    }
+}
+
 /// Reads and writes per-user, per-item playback/rating data.
 ///
 /// Port of `IUserDataManager`. User/item arguments become [`Uuid`] identities;
@@ -1726,6 +1780,34 @@ pub trait UserDataManager: Send + Sync {
         let _ = reason;
         self.update_play_state(user_id, item_id, reported_position_ticks)
             .await
+    }
+
+    /// Records a playback progress report for one user, returning whether the
+    /// item is now played to completion — C# `SessionManager.OnPlaybackProgress
+    /// (user, item, info)`: the reported position as [`Self::update_play_state`]
+    /// takes it, the reported tracks as `UpdatePlaybackSettings` keeps them
+    /// ([`ReportedStreams`]), one save for both (also when the report carries no
+    /// position but changes a track), then
+    /// [`Self::reset_playback_stream_selections`] when
+    /// [`ReportedStreams::resets_selections`] holds.
+    ///
+    /// The default saves only the position before the reset, so fakes compile
+    /// unchanged; the concrete manager keeps the tracks too.
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        let played = self
+            .update_play_state(user_id, item_id, reported_position_ticks)
+            .await?;
+        if streams.resets_selections() {
+            self.reset_playback_stream_selections(user_id, item_id)
+                .await?;
+        }
+        Ok(played)
     }
 
     /// Records that playback of an item just started for a user.
@@ -2571,6 +2653,57 @@ mod tests {
         ] {
             assert!(!image_type_allows_multiple(other), "{other:?}");
         }
+    }
+
+    /// `UpdatePlaybackSettings` and the reset condition (v12.2
+    /// `SessionManager.cs:1009-1055`, jellyfin#16769 and #17044), for one kind
+    /// (audio): `(remember, reported, stored) → (kept, changed, resets)`.
+    #[test]
+    fn reported_streams_keep_and_reset_as_upstream() {
+        use super::ReportedStreams;
+        for (remember, reported, stored, kept, changed, resets) in [
+            // On: a new index is saved, the same one is no change, none keeps it.
+            (true, Some(2), Some(1), Some(2), true, false),
+            (true, Some(1), Some(1), Some(1), false, false),
+            (true, None, Some(1), Some(1), false, false),
+            (true, Some(2), None, Some(2), true, false),
+            // Off: the stored index is cleared; a reported one also resets.
+            (false, None, Some(1), None, true, false),
+            (false, None, None, None, false, false),
+            (false, Some(2), Some(1), None, true, true),
+            (false, Some(2), None, None, false, true),
+        ] {
+            let streams = ReportedStreams {
+                audio_stream_index: reported,
+                subtitle_stream_index: None,
+                remember_audio: remember,
+                remember_subtitles: true,
+            };
+            let (mut audio, mut subtitle) = (stored, None);
+            let case = format!("{remember} {reported:?} {stored:?}");
+            assert_eq!(
+                streams.apply_to(&mut audio, &mut subtitle),
+                changed,
+                "{case}"
+            );
+            assert_eq!(audio, kept, "{case}");
+            assert_eq!(subtitle, None, "{case}");
+            assert_eq!(streams.resets_selections(), resets, "{case}");
+        }
+
+        // Mixed: audio remembered, subtitles not, and the report names both.
+        // The audio index is kept by `apply_to` and the subtitle one cleared,
+        // and the report still resets both afterwards, as upstream.
+        let mixed = ReportedStreams {
+            audio_stream_index: Some(2),
+            subtitle_stream_index: Some(4),
+            remember_audio: true,
+            remember_subtitles: false,
+        };
+        let (mut audio, mut subtitle) = (Some(1), Some(3));
+        assert!(mixed.apply_to(&mut audio, &mut subtitle));
+        assert_eq!((audio, subtitle), (Some(2), None));
+        assert!(mixed.resets_selections());
     }
 
     #[test]

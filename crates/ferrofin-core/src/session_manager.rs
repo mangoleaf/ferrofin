@@ -1273,16 +1273,24 @@ impl SessionManager for FerrofinSessionManager {
         }
 
         // Persist play-state for every user on the session (C#
-        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`). A
-        // progress save is not announced (`UserDataChangeNotifier`).
+        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState` and
+        // `UpdatePlaybackSettings`, which keeps the reported tracks as the
+        // user's "Remember audio/subtitle selections" say). A progress save is
+        // not announced (`UserDataChangeNotifier`).
         if !info.item_id.is_nil() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
+                let streams = ferrofin_traits::library::ReportedStreams {
+                    audio_stream_index: info.audio_stream_index,
+                    subtitle_stream_index: info.subtitle_stream_index,
+                    remember_audio: user.remember_audio_selections,
+                    remember_subtitles: user.remember_subtitle_selections,
+                };
                 self.user_data_manager
-                    .update_play_state(user_id, progress_item, info.position_ticks)
+                    .update_play_progress(user_id, progress_item, info.position_ticks, streams)
                     .await?;
             }
         }
