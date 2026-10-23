@@ -4070,6 +4070,64 @@ mod tests {
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
 
+    /// The batched image read answers each item exactly as `get_image_infos`
+    /// does (by type, then insertion order), and leaves out an item with no
+    /// images.
+    #[tokio::test]
+    async fn image_infos_batch_matches_the_per_item_read() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+
+        let db = test_db().await;
+        let repo = repo(&db);
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let (first, second, bare) = (
+            Uuid::from_u128(0x9a01),
+            Uuid::from_u128(0x9a02),
+            Uuid::from_u128(0x9a03),
+        );
+        let image = |path: &str, image_type| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            date_modified: chrono::Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        for (id, name) in [(first, "First"), (second, "Second"), (bare, "Bare")] {
+            seed_named_item(&db, id, BaseItemKind::MusicAlbum, name).await;
+        }
+        store
+            .save_item_images(
+                first,
+                &[
+                    image("/m/a/backdrop.jpg", ImageType::Backdrop),
+                    image("/m/a/folder.jpg", ImageType::Primary),
+                    image("/m/a/backdrop2.jpg", ImageType::Backdrop),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .save_item_images(second, &[image("/m/b/cover.jpg", ImageType::Primary)])
+            .await
+            .unwrap();
+
+        let batched = repo
+            .get_image_infos_batch(&[first, second, bare])
+            .await
+            .unwrap();
+        assert_eq!(batched.len(), 2, "no entry for an item with no images");
+        for id in [first, second] {
+            let one = repo.get_image_infos(id).await.unwrap();
+            let paths = |images: &[ItemImageInfo]| {
+                images.iter().map(|i| i.path.clone()).collect::<Vec<_>>()
+            };
+            assert_eq!(paths(&batched[&id]), paths(&one), "{id}");
+        }
+    }
+
     /// A page's artist and music-video album links resolve through one
     /// `(Type, CleanName)` index search per chunk ([`item_ids_by_clean_name`]),
     /// never a scan of `BaseItems`.
