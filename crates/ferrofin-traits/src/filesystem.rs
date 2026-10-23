@@ -87,6 +87,14 @@ pub trait FileSystem: Send + Sync {
         self.file_exists(path) || self.directory_exists(path)
     }
 
+    /// Whether `a` and `b` name the same file or directory: two spellings of
+    /// one entry on a case-insensitive mount, say. Only a real filesystem can
+    /// tell; the default answers `false`, "not known to be the same".
+    fn same_file(&self, a: &str, b: &str) -> bool {
+        let _ = (a, b);
+        false
+    }
+
     /// Whether a regular file exists at the path.
     fn file_exists(&self, path: &str) -> bool;
 

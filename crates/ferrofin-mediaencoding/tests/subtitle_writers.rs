@@ -257,10 +257,12 @@ fn json_writer_empty_subtitle_has_empty_events() {
 #[test]
 fn parser_supports_expected_extensions() {
     let p = SubtitleEditParser::new();
-    for ext in ["srt", ".srt", "SRT", "subrip", "ssa", "ass"] {
+    for ext in ["srt", ".srt", "SRT", "subrip", "ssa", "ass", "vtt"] {
         assert!(p.supports_file_extension(ext), "{ext} should be supported");
     }
-    for ext in ["vtt", "webvtt", "sub", "unknown"] {
+    // Upstream keys formats by `Extension` only, so libse's `webvtt`
+    // alternate is not a key (the encoder normalises the codec to `vtt`).
+    for ext in ["webvtt", "sub", "unknown"] {
         assert!(
             !p.supports_file_extension(ext),
             "{ext} should be unsupported"

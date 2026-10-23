@@ -35,13 +35,15 @@
 //! | `Genre`/`MusicGenre`/`Person`/`Studio` | `[<TypeName>-<name>, id]` | `Genre.cs:37`, `Person.cs:40`, … |
 //! | `Year` | `[Year-<name>, id]` | `Year.cs:38` |
 //! | `Program` | `[imdb/tmdb…, id]` or `[Program-<name><episodeTitle>, id]` | `LiveTv/LiveTvProgram.cs:165` |
+//! | `TvChannel` | `[TvChannel-<name>, id]`, or `[id]` while `DisableLiveTvChannelUserDataName` | `LiveTv/LiveTvChannel.cs:91` |
 //!
-//! A **live TV channel** is keyed by its id alone. `LiveTvChannel.cs:91` would
-//! prepend `TvChannel-<Name>`, but only when
-//! `DisableLiveTvChannelUserDataName` is false — and that setting defaults to
-//! **true** (`ServerConfiguration.cs:91`), so a stock server never writes that
-//! key and would not read one. Emitting it would put a key Jellyfin ignores at
-//! the head of the list.
+//! A **live TV channel** takes its name key only when the server's
+//! `DisableLiveTvChannelUserDataName` is false. It defaults to **true**
+//! (`ServerConfiguration.cs:91`), so a stock server keys a channel by its id
+//! alone. The configuration manager publishes the setting
+//! ([`set_live_tv_channel_user_data_name_disabled`]) when it loads and on every
+//! save, as upstream reads it live, and callers carry it on
+//! [`KeySource::channel_name_key`].
 //!
 //! The `<name>` forms are **diacritic-stripped** (`RemoveDiacritics`), so
 //! "Beyoncé" and "Beyonce" share a row. `Year` is the exception and is not.
@@ -74,6 +76,25 @@ use ferrofin_util::string_extensions::remove_diacritics;
 use uuid::Uuid;
 
 use crate::kinds::is_video;
+
+/// `ServerConfiguration.DisableLiveTvChannelUserDataName` (default **true**).
+static DISABLE_LIVE_TV_CHANNEL_USER_DATA_NAME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Publishes `DisableLiveTvChannelUserDataName`. The configuration manager
+/// calls it when the configuration loads and whenever it changes, so the next
+/// key derivation sees the saved value as upstream's live read does. Rows
+/// already saved keep their keys.
+pub(crate) fn set_live_tv_channel_user_data_name_disabled(disabled: bool) {
+    DISABLE_LIVE_TV_CHANNEL_USER_DATA_NAME.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a Live TV channel's keys lead with `TvChannel-<Name>`: the saved
+/// `DisableLiveTvChannelUserDataName` is false. Fills
+/// [`KeySource::channel_name_key`].
+pub(crate) fn live_tv_channel_name_key_enabled() -> bool {
+    !DISABLE_LIVE_TV_CHANNEL_USER_DATA_NAME.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A provider id that is actually present.
 ///
@@ -152,6 +173,9 @@ pub struct KeySource<'a> {
     pub extra_type: Option<&'a str>,
     /// Runtime ticks, which disambiguate two extras of the same kind.
     pub run_time_ticks: Option<i64>,
+    /// Whether a Live TV channel leads with `TvChannel-<Name>`: the server's
+    /// `DisableLiveTvChannelUserDataName` is false. Ignored for other kinds.
+    pub channel_name_key: bool,
 }
 
 /// The item's `UserData` keys, most specific first.
@@ -249,6 +273,13 @@ pub fn user_data_keys(item: &KeySource<'_>, series: Option<&KeySource<'_>>) -> V
             // The one name-keyed kind that does NOT strip diacritics — a year's
             // name is digits, so upstream never needed to.
             vec![format!("Year-{}", item.name.unwrap_or_default()), own]
+        }
+        // `GetClientTypeName()` is "TvChannel" for a channel, and the name is
+        // concatenated raw, without the by-name kinds' `RemoveDiacritics`. A
+        // null Name concatenates as empty, so nameless channels share
+        // "TvChannel-", as upstream's do.
+        BaseItemKind::TvChannel | BaseItemKind::LiveTvChannel if item.channel_name_key => {
+            vec![format!("TvChannel-{}", item.name.unwrap_or_default()), own]
         }
         // `LiveTvProgram` and `TvProgram` share one stored type name and
         // `kind_from_type_name` resolves it to `LiveTvProgram` (its table hits
@@ -857,26 +888,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_tv_channel_is_keyed_by_its_id_alone() {
-        // `LiveTvChannel.cs:91` would prepend `TvChannel-<Name>`, but only when
-        // `DisableLiveTvChannelUserDataName` is false — and it defaults to
-        // TRUE (`ServerConfiguration.cs:91`). A stock server never writes that
-        // key, so emitting one would put a key Jellyfin ignores at the head of
-        // the list. Both spellings of the kind resolve the same way.
+    #[rstest::rstest]
+    // `DisableLiveTvChannelUserDataName` true, the default: the id alone.
+    #[case::stock(false, Some("BBC One"), &[])]
+    // False: `LiveTvChannel.cs:97` inserts `TvChannel-<Name>` at 0.
+    #[case::name_key(true, Some("BBC One"), &["TvChannel-BBC One"])]
+    // The raw Name, unlike the by-name kinds' `RemoveDiacritics`.
+    #[case::diacritics_kept(true, Some("Ça Télé"), &["TvChannel-Ça Télé"])]
+    // A null Name concatenates as empty.
+    #[case::no_name(true, None, &["TvChannel-"])]
+    fn a_tv_channel_leads_with_its_name_only_when_the_setting_allows(
+        #[case] channel_name_key: bool,
+        #[case] name: Option<&str>,
+        #[case] lead: &[&str],
+    ) {
+        // Both spellings of the kind resolve the same way.
         for kind in [BaseItemKind::TvChannel, BaseItemKind::LiveTvChannel] {
             let channel = KeySource {
                 item_id: id(12),
                 kind,
-                name: Some("BBC One"),
+                name,
+                channel_name_key,
                 ..KeySource::default()
             };
-            assert_eq!(
-                user_data_keys(&channel, None),
-                vec![id(12).to_string()],
-                "{kind:?}"
-            );
+            let mut expected: Vec<String> = lead.iter().map(|&key| key.to_owned()).collect();
+            expected.push(id(12).to_string());
+            assert_eq!(user_data_keys(&channel, None), expected, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn only_a_channel_reads_the_channel_name_setting() {
+        // A program or a by-name item carrying the flag keeps its own keys.
+        let program = KeySource {
+            item_id: id(11),
+            kind: BaseItemKind::LiveTvProgram,
+            name: Some("News"),
+            channel_name_key: true,
+            ..KeySource::default()
+        };
+        assert_eq!(user_data_keys(&program, None), vec![id(11).to_string()]);
+        let studio = KeySource {
+            kind: BaseItemKind::Studio,
+            ..program
+        };
+        assert_eq!(user_data_keys(&studio, None)[0], "Studio-News");
     }
 
     #[test]

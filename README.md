@@ -265,7 +265,7 @@ All 412 operations in the vendored Jellyfin 10.11.8 contract are implemented. Wo
 end-to-end: authentication, users and QuickConnect; library scan with live filesystem
 watching; browse and query; images; sessions, playstate and remote control; WebSocket push;
 playlists and collections; direct play and live HLS transcoding (NVENC, VAAPI and QSV
-hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; 19 scheduled tasks;
+hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; 20 scheduled tasks;
 metrics and tracing; trickplay, chapters, lyrics and media segments; photo and book
 libraries; backup and restore.
 

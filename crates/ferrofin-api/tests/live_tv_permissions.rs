@@ -117,6 +117,8 @@ impl LiveTvManager for CountingLiveTv {
     async fn save_listing_provider(
         &self,
         _info: ListingsProviderInfo,
+        _validate_login: bool,
+        _validate_listings: bool,
     ) -> Result<ListingsProviderInfo, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }

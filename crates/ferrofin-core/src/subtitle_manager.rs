@@ -29,7 +29,7 @@ use ferrofin_model::providers::{RemoteSubtitleInfo, SubtitleProviderInfo};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
+use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::subtitles::{
     SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
@@ -49,6 +49,10 @@ pub struct FerrofinSubtitleManager {
     /// Internal-metadata base (`{program-data}/metadata`). Subtitles are written
     /// here (`.../library/{id2}/{idN}/`) when SaveSubtitlesWithMedia is disabled.
     metadata_path: DirectoryPath,
+    /// Brackets the files written beside the media, so the library monitor
+    /// takes them for the server's own writes (`ILibraryMonitor`). `None` in
+    /// unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl std::fmt::Debug for FerrofinSubtitleManager {
@@ -78,7 +82,17 @@ impl FerrofinSubtitleManager {
             providers,
             virtual_folders: None,
             metadata_path: metadata_path.into(),
+            self_writes: None,
         }
+    }
+
+    /// Brackets each subtitle written or deleted, as `SubtitleManager` does
+    /// (`ReportFileSystemChangeBeginning`/`Complete`). Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Resolves the saved subtitle destination from the item's owning library.
@@ -224,7 +238,7 @@ impl FerrofinSubtitleManager {
         };
         // The pinned SubtitleManager selects one destination. An unwritable
         // media folder is an error, not permission to write into metadata.
-        let sidecar = write_sidecar(&destination, &response.content)
+        let sidecar = write_sidecar(&destination, &response.content, self.self_writes.as_ref())
             .await
             .map_err(|error| ServiceError::backend(error.to_string()))?;
         let sidecar_str = sidecar.to_string_lossy().into_owned();
@@ -286,7 +300,14 @@ fn subtitle_media_type(type_name: &str) -> Option<SubtitleMediaType> {
 /// Collisions use `{stem}.0.{extension}`, `{stem}.1.{extension}`, ... just as
 /// `SubtitleManager.TrySaveToFiles` does. CreateNew also guards the final open
 /// against concurrent uploads selecting the same available filename.
-async fn write_sidecar(path: &Path, content: &[u8]) -> std::io::Result<PathBuf> {
+///
+/// The free name it writes is bracketed on `self_writes`, as upstream
+/// brackets the name it settles on.
+async fn write_sidecar(
+    path: &Path,
+    content: &[u8],
+    self_writes: Option<&Arc<dyn SelfWriteGuard>>,
+) -> std::io::Result<PathBuf> {
     use tokio::io::AsyncWriteExt as _;
 
     if let Some(parent) = path.parent() {
@@ -304,12 +325,21 @@ async fn write_sidecar(path: &Path, content: &[u8]) -> std::io::Result<PathBuf> 
     let mut candidate = path.to_path_buf();
     let mut counter = 0_u64;
     loop {
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-            .await
-        {
+        // `File.Exists` first, as upstream settles on a free name before it
+        // brackets it; `create_new` still guards the race with a concurrent
+        // upload of the same name.
+        let taken = tokio::fs::try_exists(&candidate).await.unwrap_or(false);
+        let _write = (!taken).then(|| SelfWrite::begin(self_writes, candidate.to_string_lossy()));
+        let opened = if taken {
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        } else {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+                .await
+        };
+        match opened {
             Ok(mut file) => {
                 file.write_all(content).await?;
                 file.flush().await?;
@@ -496,6 +526,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
             && !path.is_empty()
         {
             // A missing file is fine — the goal is that it no longer exists.
+            let _write = SelfWrite::begin(self.self_writes.as_ref(), path);
             match tokio::fs::remove_file(path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1092,13 +1123,58 @@ mod tests {
         }
     }
 
+    /// A [`SelfWriteGuard`] recording each call, in order.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl ferrofin_traits::library::SelfWriteGuard for Recording {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// `TrySaveToFiles` brackets the subtitle file it writes
+    /// (`SubtitleManager.cs:270-303`): the free name it settles on, not a
+    /// name already taken.
+    #[tokio::test]
+    async fn a_sidecar_write_brackets_each_name_it_tries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("Movie.eng.srt");
+        std::fs::write(&path, b"taken").expect("existing");
+        let recording = std::sync::Arc::new(Recording::default());
+        let guard: std::sync::Arc<dyn ferrofin_traits::library::SelfWriteGuard> = recording.clone();
+        let written = write_sidecar(&path, b"new", Some(&guard))
+            .await
+            .expect("written");
+        let next = tmp.path().join("Movie.eng.0.srt");
+        assert_eq!(written, next);
+        let next = next.display();
+        assert_eq!(
+            recording.calls(),
+            [format!("begin {next}"), format!("complete {next} false")],
+            "only the free name it writes"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_sidecar_writes_do_not_replace_existing_bytes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("Movie.eng.srt");
         let (first, second) = tokio::join!(
-            write_sidecar(&path, b"first"),
-            write_sidecar(&path, b"second")
+            write_sidecar(&path, b"first", None),
+            write_sidecar(&path, b"second", None)
         );
         let first = first.unwrap();
         let second = second.unwrap();
@@ -1108,7 +1184,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
         let blocked = tmp.path().join("Movie.fra.srt");
         std::fs::create_dir(&blocked).unwrap();
-        assert!(write_sidecar(&blocked, b"content").await.is_err());
+        assert!(write_sidecar(&blocked, b"content", None).await.is_err());
         assert!(!tmp.path().join("Movie.fra.0.srt").exists());
     }
     #[tokio::test]
@@ -1589,10 +1665,17 @@ mod tests {
         .await
         .expect("save streams");
 
-        let mgr = manager(db.clone(), Vec::new());
+        let recording = Arc::new(Recording::default());
+        let mgr = manager(db.clone(), Vec::new()).with_self_writes(recording.clone());
         mgr.delete_subtitles(item, 2).await.expect("delete idx 2");
 
         assert!(!sidecar.exists(), "sidecar file should be removed");
+        let shown = sidecar.display();
+        assert_eq!(
+            recording.calls(),
+            [format!("begin {shown}"), format!("complete {shown} false")],
+            "the delete is bracketed (`SubtitleManager.cs:392-400`)"
+        );
         let remaining = repo
             .get_media_streams(&MediaStreamQuery {
                 item_id: item,

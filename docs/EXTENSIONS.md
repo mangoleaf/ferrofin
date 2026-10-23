@@ -391,7 +391,10 @@ removes the server-as-network-pivot risk; grant a specific trusted plugin privat
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
 The private-address check also **pins the vetted address on the connection
 itself** (the request resolves to the address that was checked, not a second
-DNS answer), closing the classic DNS-rebinding TOCTOU. (Referencing plugins by
+DNS answer), closing the classic DNS-rebinding TOCTOU. When the server's
+environment sets an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the proxy
+resolves the destination itself: the check then runs on the server's own DNS answer before
+the request is sent, and the pin covers the hosts the proxy settings exclude. (Referencing plugins by
 UUID in the allowlist is acknowledged UX debt — accepting plugin names is a
 planned improvement.)
 

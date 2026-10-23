@@ -252,6 +252,10 @@ impl FileSystem for DirectoryCache {
         self.file_system.path_exists(path)
     }
 
+    fn same_file(&self, a: &str, b: &str) -> bool {
+        self.file_system.same_file(a, b)
+    }
+
     fn file_exists(&self, path: &str) -> bool {
         self.file_system.file_exists(path)
     }
