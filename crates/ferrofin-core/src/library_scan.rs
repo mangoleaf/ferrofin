@@ -2713,8 +2713,10 @@ struct ItemState<'s, 'a> {
     probes: &'s mut ProbePipeline<'a>,
     folders: &'s [VirtualFolderInfo],
     refresh: &'s RefreshContext<'s>,
-    /// Set by [`LibraryScanner::scan_item`] for an extra whose stored name
-    /// it changes (`RefreshExtras`' `renamedExtraIds`).
+    /// Set by [`LibraryScanner::scan_item`] for an extra `FindExtras` renames
+    /// before its refresh ([`renamed_extra`]): `RefreshExtras`'
+    /// `renamedExtraIds`, the extras whose corrected name differs from the
+    /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
 }
 
@@ -6271,7 +6273,7 @@ impl LibraryScanner {
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
             let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
-            let renamed_extra = state.renamed_extra;
+            let extra_renamed = state.renamed_extra;
             if scope.is_some() && !matches!(saved, ItemSaved::Cancelled) {
                 let reason = if refresh.is_context(item, !is_new) {
                     "context"
@@ -6433,7 +6435,7 @@ impl LibraryScanner {
             {
                 // A row not stored before (or not readable) is a new extra.
                 let changed = match stored {
-                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || renamed_extra,
+                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || extra_renamed,
                     _ => true,
                 } || request.options.replace_all_metadata
                     || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh;
@@ -7098,6 +7100,7 @@ impl LibraryScanner {
         // replaces it as it would any stored name. Only the merge's base
         // takes it: the save compares the result with the stored row.
         let renamed = stored_row.and_then(|row| renamed_extra(row, item, locked_fields));
+        state.renamed_extra = renamed.is_some();
         let named_row = renamed.as_ref().or(stored_row);
         let mut video_base = named_row.filter(|_| video_info.is_some()).cloned();
         let embedded_title = if let Some(info) = video_info {
@@ -7534,9 +7537,6 @@ impl LibraryScanner {
             policy.options,
         ) {
             settle_sort_name(&mut entity);
-        }
-        if entity.extra_type.is_some() && stored_row.is_some_and(|row| row.name != entity.name) {
-            state.renamed_extra = true;
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;

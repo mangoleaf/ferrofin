@@ -2688,6 +2688,50 @@ async fn later_refreshes_copy_the_dates_and_only_a_full_one_or_a_removal_the_res
     );
 }
 
+/// Upstream `RefreshExtras` counts an extra `FindExtras` renames
+/// (`renamedExtraIds`): the refresh gives every extra the owner's title
+/// metadata again, as a full one does. Here the stored name is the raw file
+/// stem an older Ferrofin scan gave the trailer, which the rescan renews.
+#[tokio::test]
+async fn an_extra_find_extras_renames_takes_the_title_metadata_again() {
+    const TRAILER: &str = "Blade Runner (1982)/Blade Runner (1982)-trailer.mkv";
+    let f = Fixture::new(&[BR, TRAILER]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(TRAILER).await.name.as_deref(), Some("Trailer"));
+
+    write_movie_nfo(&f, "Second plot", 1982);
+    sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ? WHERE "Path" = ?"#)
+        .bind("Blade Runner (1982)-trailer")
+        .bind(f.media.join(TRAILER).to_string_lossy().as_ref())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row(TRAILER).await;
+    assert_eq!(trailer.name.as_deref(), Some("Trailer"));
+    assert_eq!(trailer.overview.as_deref(), Some("Second plot"));
+}
+
+/// A name an extra's own NFO changes is no `FindExtras` rename: the extra
+/// takes the new title, and the refresh gives it only the owner's dates.
+#[tokio::test]
+async fn an_extras_nfo_title_change_is_no_rename() {
+    let f = Fixture::new(&[BR, BR_FEATURETTE]).await;
+    let nfo = f.media.join("Blade Runner (1982)/featurettes/Making of.nfo");
+    std::fs::write(&nfo, "<movie><title>Old cut</title></movie>").unwrap();
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(BR_FEATURETTE).await.name.as_deref(), Some("Old cut"));
+
+    write_movie_nfo(&f, "Second plot", 1982);
+    std::fs::write(&nfo, "<movie><title>New cut</title></movie>").unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.name.as_deref(), Some("New cut"));
+    assert_eq!(featurette.overview.as_deref(), Some("First plot"));
+}
+
 /// A rescan that finds the owner and its extras as they were writes no
 /// extra: the copy writes only rows that differ, so the dates it gives are
 /// already theirs.
