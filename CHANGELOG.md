@@ -110,6 +110,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   for a folder's `playlist.xml` (#56)
 - Create the internal playlists folder at startup, as `CreateRootFolder` does: a server
   whose only playlists come from the library scan now lists the Playlists view
+- Check the server directories at startup, as Jellyfin does. Before a scheduled restore is
+  applied or the database is opened, Ferrofin creates its configuration, log, plugins,
+  data, cache, `<data>/data` and `<data>/root` directories, and leaves Jellyfin's
+  `.jellyfin-<kind>` marker in each (the cache also gets `CACHEDIR.TAG`). A layout that
+  used to start now stops the boot with a clear error when a directory holds another
+  kind's marker (two of its paths point at one directory) or cannot be created or written
+  to. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - The Playlists view lists every playlist the user may open, wherever it is, as Jellyfin
   12.2 does — not only the ones made in the app
 - Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in
@@ -176,14 +184,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
-- Check the server directories at startup, as Jellyfin does. Before a scheduled restore is
-  applied or the database is opened, Ferrofin creates its configuration, log, plugins,
-  data, cache, `<data>/data` and `<data>/root` directories, and leaves Jellyfin's
-  `.jellyfin-<kind>` marker in each (the cache also gets `CACHEDIR.TAG`). A layout that
-  used to start now stops the boot with a clear error when a directory holds another
-  kind's marker (two of its paths point at one directory) or cannot be created or written
-  to. See
-  [docs/UPGRADING.md](docs/UPGRADING.md)
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -195,6 +200,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
