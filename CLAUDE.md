@@ -58,7 +58,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-util` | leaf string/path/collection helpers |
 | `ferrofin-model` | all DTOs + enums (serde + utoipa) — the shared data universe; also the DLNA profile/StreamBuilder logic |
 | `ferrofin-naming` | filename → media parsing |
-| `ferrofin-keyframes` | keyframe extraction structures |
+| `ferrofin-keyframes` | keyframe extraction: the ffprobe output parser and the Matroska cue reader |
 | `ferrofin-chromaprint` | audio fingerprinting (chromaprint) for the intro-skipper extension |
 | `ferrofin-common` | config, app-paths, **password hashing** (real PBKDF2-HMAC-SHA512/SHA1, byte-compatible with Jellyfin) |
 | `ferrofin-networking` | bind / published-URL resolution |

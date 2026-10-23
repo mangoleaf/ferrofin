@@ -246,6 +246,8 @@ fn ok_auth_info() -> AuthorizationInfo {
             enable_video_playback_transcoding: false,
             enable_audio_playback_transcoding: false,
             enable_playback_remuxing: false,
+            // Upstream's default, so a remote peer reaches the route.
+            enable_remote_access: true,
             ..ferrofin_model::users::UserPolicy::default()
         })),
         is_authenticated: true,
@@ -843,6 +845,65 @@ async fn video_master_playlist_returns_m3u8() {
     assert_eq!(resp.headers().get("expires").unwrap(), "0");
     let body = body_string(resp).await;
     assert!(body.contains("#MASTER"));
+}
+
+/// `DynamicHlsHelper` decides locality from `GetNormalizedRemoteIP()` (the
+/// client behind a known proxy) with `INetworkManager.IsInLocalNetwork` (the
+/// configured LAN subnets), not from the raw TCP peer and a fixed private
+/// range: a client behind the proxy is remote, a private address outside the
+/// configured subnets is remote, and a connection with no peer address is
+/// not local.
+#[tokio::test]
+async fn master_playlist_locality_follows_the_network_policy() {
+    let config = ferrofin_networking::NetworkConfiguration {
+        known_proxies: vec!["10.0.0.1".to_owned()],
+        local_network_subnets: vec!["192.168.50.0/24".to_owned()],
+        ..ferrofin_networking::NetworkConfiguration::default()
+    };
+    let rec = Arc::new(Recorded::default());
+    let state = build_state(
+        ok_hls("/nonexistent", rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    )
+    .with_network(Arc::new(std::sync::RwLock::new(
+        ferrofin_networking::NetworkManager::with_defaults(config, ""),
+    )));
+    let router = create_router(state);
+    for (peer, forwarded, local) in [
+        (Some("10.0.0.1:5000"), Some("203.0.113.9"), false),
+        (Some("192.168.1.5:5000"), None, false),
+        (Some("192.168.50.7:5000"), None, true),
+        (Some("10.0.0.1:5000"), Some("192.168.50.7"), true),
+        (None, None, false),
+    ] {
+        let mut request = authed(
+            "GET",
+            &format!(
+                "/Videos/{ITEM_ID}/master.m3u8?deviceId=dev1&playSessionId=s1&mediaSourceId=src9"
+            ),
+        );
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().expect("peer"),
+            ));
+        }
+        if let Some(forwarded) = forwarded {
+            request
+                .headers_mut()
+                .insert("X-Forwarded-For", forwarded.parse().expect("header value"));
+        }
+        let resp = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let last = rec.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            last.is_in_local_network, local,
+            "peer {peer:?} forwarded {forwarded:?}"
+        );
+    }
 }
 
 /// The contract spells the caps `videoBitRate`/`audioBitRate` and the manifest
