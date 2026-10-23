@@ -126,9 +126,7 @@ Conventions:
   files it groups (`ItemPersistenceService::sync_local_versions`). An
   adopted database's plugin merges (owned, type 2) therefore read as local
   versions here. The linked-child reroute is not ported.
-- Accepted divergences (do NOT "fix" during sync): No
-  `VideoType`/`Video3DFormat` columns in Ferrofin's schema, so primary selection
-  cannot demote 3D/non-file videos (width ordering only). Upstream's
+- Accepted divergences (do NOT "fix" during sync): Upstream's
   `Parallel.ForEach` fire-and-forget async merges (error-dropping) run
   sequentially in Ferrofin. The episode merge key is scoped to the series
   *row* (`SeriesPresentationUniqueKey`), not the series name as upstream

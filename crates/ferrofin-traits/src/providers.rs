@@ -125,6 +125,12 @@ pub struct MetadataRefreshOptions {
     /// opening an item for playback with a probe allowed does
     /// (`MediaSourceManager.GetPlaybackMediaSources`).
     pub enable_remote_content_probe: bool,
+    /// `ImageRefreshOptions.IsAutomated`: `true` (the default) for a scan,
+    /// `false` only for `POST /Items/{itemId}/Refresh`
+    /// (`ItemRefreshController.cs:86`). A refresh that is not automated also
+    /// refreshes each album's artists known only by name
+    /// (`MusicAlbum.RefreshAllMetadata`, `MusicAlbum.cs:212-215`).
+    pub is_automated: bool,
 }
 
 impl Default for MetadataRefreshOptions {
@@ -140,6 +146,8 @@ impl Default for MetadataRefreshOptions {
             force_save: false,
             regenerate_trickplay: false,
             enable_remote_content_probe: false,
+            // `ImageRefreshOptions()` sets `IsAutomated = true`.
+            is_automated: true,
         }
     }
 }
@@ -147,8 +155,9 @@ impl Default for MetadataRefreshOptions {
 impl MetadataRefreshOptions {
     /// The options `POST /Items/{itemId}/Refresh` refreshes with — port of
     /// `ItemRefreshController.RefreshItem` (`ItemRefreshController.cs:76-89`):
-    /// `ForceSave` for a full refresh of either kind or any replace, and
-    /// `RemoveOldMetadata` exactly when replacing all metadata.
+    /// `ForceSave` for a full refresh of either kind or any replace,
+    /// `RemoveOldMetadata` exactly when replacing all metadata, and
+    /// `IsAutomated = false`.
     #[must_use]
     pub fn for_item_refresh(
         metadata_refresh_mode: MetadataRefreshMode,
@@ -170,6 +179,7 @@ impl MetadataRefreshOptions {
                 || replace_all_metadata,
             regenerate_trickplay,
             enable_remote_content_probe: false,
+            is_automated: false,
         }
     }
 }

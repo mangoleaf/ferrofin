@@ -147,7 +147,8 @@ class SessionTests(unittest.TestCase):
         for (name, _, _), s in zip(plan["schedule"], slopes):
             d = out / name / "ferrofin"
             d.mkdir(parents=True)
-            (d / "soak.json").write_text(json.dumps({"slope_mib_per_hour": s, "samples": 30000, "fit_from": 1.0, "fit_to": 2.0, "skip_s": 600, "soak_s": 3600, "rate": 5}))
+            (d / "soak.json").write_text(json.dumps({"slope_mib_per_hour": s, "samples": 30000, "fit_from": 1.0, "fit_to": 2.0, "skip_s": 600, "soak_s": 3600, "rate": 5,
+                                                     "peak_mib": 512.0, "reason": "too few samples"}))
         return out
 
     def test_the_gate_row_is_the_d7_limit(self):
@@ -172,6 +173,15 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(got, block, md)
                 self.assertEqual(json.loads((out / "verdict.json").read_text())["blocking"], block)
                 self.assertIn("MiB/h", (out / "report.html").read_text())
+
+    def test_the_soak_verdict_reaches_the_candidate_runs_in_the_viewer(self):
+        out = self.session([2.0, 31.0])
+        gate.render(str(out))
+        cells = report.load_verdicts([str(out / "02-b")])
+        self.assertEqual([(c["cell"], c["verdict"], c["baseline"], c["candidate"]) for c in cells],
+                         [("soak/slope", "regressed", 2.0, 31.0)])
+        self.assertIn("A/B gate — 1 regressed", (out / "02-b" / "report.html").read_text())
+        self.assertIsNone(report.load_verdicts([str(out / "01-a")]))  # the previous release is not judged
 
     def test_an_unmeasured_soak_blocks_because_it_cannot_be_judged(self):
         out = self.session([2.0, None])

@@ -23,7 +23,7 @@ pub use create_main_playlist_request::CreateMainPlaylistRequest;
 pub use dynamic_hls_playlist_generator::{
     DynamicHlsPlaylistGenerator, EncodingOptionsProvider, KeyframeExtractor, TICKS_PER_MILLISECOND,
     TICKS_PER_SECOND, compute_equal_length_segments, compute_segments,
-    is_extraction_allowed_for_file,
+    is_extraction_allowed_for_file, segment_start_ticks,
 };
 pub use error::HlsError;
 pub use hls_stream_manager::{
