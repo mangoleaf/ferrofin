@@ -2020,7 +2020,7 @@ impl FerrofinLiveTvManager {
     /// takes its listings from the programme's guide channel, classified against
     /// the listings provider's category lists as
     /// `XmlTvListingsProvider.GetProgramInfo` does. Returns the ids it wrote, for
-    /// the caller's `CleanDatabase` pass.
+    /// the caller's `CleanDatabase` pass, with each airing's artwork.
     ///
     /// The tuner-channel → guide-channel binding is
     /// `ListingsManager.GetEpgChannelFromTunerChannel`, so the provider's manual

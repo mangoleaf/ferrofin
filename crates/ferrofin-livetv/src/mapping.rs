@@ -37,8 +37,8 @@ pub struct EpgChannel {
     /// The guide's channel number, or [`id`](Self::id) when it carries none.
     pub number: String,
     /// The guide's channel logo (an XMLTV `<icon src>`, a Schedules Direct
-    /// station's logo), which
-    /// `ListingsManager.AddMetadata` gives a tuner channel matched to it.
+    /// station's logo), which `ListingsManager.AddMetadata` gives a tuner
+    /// channel matched to it.
     pub image_url: Option<String>,
 }
 
