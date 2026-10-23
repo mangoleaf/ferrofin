@@ -20,9 +20,11 @@
 //!   transliterated verbatim (it is the parity oracle for this unit — see the
 //!   xUnit `FFProbeVideoInfoTests`).
 //!
-//! The Blu-ray/DVD `.vob`/`.m2ts` disc paths, the embedded-info / people
-//! extraction, external subtitle/audio download, and the repository writes are
-//! deferred to the Wave 6 implementation.
+//! The rest of `Fetch` belongs to the library scan (`ferrofin-core`), which owns
+//! the item rows: the repository writes, the external streams, and the
+//! container tags and people (`FetchEmbeddedInfo` / `FetchPeople`, applied
+//! before the metadata providers merge). Probing a Blu-ray/DVD folder rip's
+//! `.vob`/`.m2ts` titles is an open work item (gl-87).
 
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{IsoType, MediaStreamType, Video3DFormat, VideoType};
@@ -146,8 +148,7 @@ impl<'a> FFProbeVideoInfo<'a> {
     /// total-bitrate / runtime (and, for disc sources, size) onto the item,
     /// re-indexes the streams `0..n`, then derives width / height /
     /// `DefaultVideoStreamIndex` / `HasSubtitles` from the video stream. The
-    /// external-audio/subtitle download, embedded-info/people extraction,
-    /// Blu-ray fixups, and repository writes are deferred.
+    /// rest of `Fetch` is the library scan's (see the module docs).
     #[must_use]
     pub fn fetch(
         &self,

@@ -611,6 +611,46 @@ async fn system_logs_list_and_fetch() {
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
 }
 
+/// Listing the log directory and reading a log file run on the blocking pool,
+/// never inline on a runtime worker: with the pool's only thread held busy
+/// neither request can finish, which an inline read would ignore. A debug
+/// server log or a long encode's ffmpeg log runs to hundreds of megabytes.
+#[test]
+fn log_listing_and_reading_go_through_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hog = tokio::task::spawn_blocking(move || {
+            busy_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        busy_rx.await.unwrap();
+
+        for uri in ["/System/Logs", "/System/Logs/Log?name=ferrofin.log"] {
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                get(elevated_full_state(), uri),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "{uri} answered with the blocking pool starved, so it read inline"
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+        let (status, body) = get(elevated_full_state(), "/System/Logs/Log?name=ferrofin.log").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8(body).unwrap(), "log body");
+    });
+}
+
 #[tokio::test]
 async fn system_endpoint_defaults_to_non_local() {
     let (status, body) = get(full_state(), "/System/Endpoint").await;

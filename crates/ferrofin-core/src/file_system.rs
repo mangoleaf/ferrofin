@@ -221,6 +221,30 @@ impl FileSystem for FerrofinFileSystem {
         stat_says_exists(path, fs::metadata(path).map(|m| m.is_file() || m.is_dir()))
     }
 
+    /// The same device and inode (Unix), or the same canonical path
+    /// elsewhere. A path that cannot be read is not known to be the same.
+    ///
+    /// A mount that makes up inode numbers per lookup (CIFS with
+    /// `noserverino`) answers `false` for two spellings of one file, so the
+    /// scan keeps an old spelling's row there as it did before.
+    fn same_file(&self, a: &str, b: &str) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            match (fs::metadata(a), fs::metadata(b)) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match (fs::canonicalize(a), fs::canonicalize(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        }
+    }
+
     fn validate_writable(&self, path: &str) -> Result<(), ServiceError> {
         let probe = Path::new(path).join(Uuid::new_v4().to_string());
         let result = fs::write(&probe, b"");
@@ -302,6 +326,32 @@ fn stat_says_exists(path: &str, stat: std::io::Result<bool>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// `same_file` is file identity, not path equality: one file reached
+    /// through two paths is the same (a hard link here; two spellings on a
+    /// case-insensitive mount), two files are not, and a missing path is not
+    /// known to be anything.
+    #[test]
+    fn same_file_compares_identity_not_spelling() {
+        use ferrofin_traits::filesystem::FileSystem as _;
+        let dir = tempfile::tempdir().expect("tmp");
+        let file = dir.path().join("Movie.mkv");
+        let other = dir.path().join("Other.mkv");
+        let link = dir.path().join("link.mkv");
+        fs::write(&file, b"a").expect("write");
+        fs::write(&other, b"b").expect("write");
+        fs::hard_link(&file, &link).expect("hard link");
+        let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let real = FerrofinFileSystem::new();
+
+        assert!(real.same_file(&path(&file), &path(&file)));
+        assert!(
+            real.same_file(&path(&file), &path(&link)),
+            "a hard link is the same file"
+        );
+        assert!(!real.same_file(&path(&file), &path(&other)), "two files");
+        assert!(!real.same_file(&path(&file), &path(&dir.path().join("missing.mkv"))));
+    }
+
     /// Only "not found" and "not a directory" mean gone; every other stat
     /// failure (EACCES, EIO, ESTALE, ENOTCONN, ETIMEDOUT) counts as present.
     #[test]

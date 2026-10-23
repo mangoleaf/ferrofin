@@ -1455,16 +1455,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             return Ok(Vec::new());
         }
 
-        // Recently-played movies (C#: IsPlayed, OrderBy DatePlayed desc, Limit 7).
-        let mut recent_played_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: vec![BaseItemKind::Movie],
-            recursive: true,
-            is_played: Some(true),
-            limit: Some(RECENTLY_PLAYED_LIMIT),
-            order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
-            ..Default::default()
-        };
+        let mut recent_played_q = recently_played_query(parent_id);
         recent_played_q.set_user(user.clone());
         let recently_played = self.items.get_item_list(&recent_played_q).await?;
 
@@ -1474,16 +1465,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             .filter_map(|m| Uuid::parse_str(&m.id).ok())
             .collect();
         let movie_kinds = self.movie_candidate_kinds().await;
-        let mut liked_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: movie_kinds.clone(),
-            is_movie: Some(true),
-            recursive: true,
-            is_favorite_or_liked: Some(true),
-            limit: Some(LIKED_LIMIT),
-            exclude_item_ids: played_ids.clone(),
-            ..Default::default()
-        };
+        let mut liked_q = liked_query(parent_id, movie_kinds.clone(), played_ids.clone());
         liked_q.set_user(user.clone());
         let liked = self.items.get_item_list(&liked_q).await?;
 
@@ -1538,6 +1520,45 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             },
         )
         .await
+    }
+}
+
+/// The recently-played baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:316-325`): played movies, most recently played
+/// first and ties shuffled, up to [`RECENTLY_PLAYED_LIMIT`].
+fn recently_played_query(parent_id: Uuid) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: vec![BaseItemKind::Movie],
+        recursive: true,
+        is_played: Some(true),
+        limit: Some(RECENTLY_PLAYED_LIMIT),
+        order_by: vec![
+            (ItemSortBy::DatePlayed, SortOrder::Descending),
+            (ItemSortBy::Random, SortOrder::Descending),
+        ],
+        ..Default::default()
+    }
+}
+
+/// The liked baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:335-347`): favourite or liked movies of `kinds`,
+/// a random [`LIKED_LIMIT`] of them, without the recently played ones.
+fn liked_query(
+    parent_id: Uuid,
+    kinds: Vec<BaseItemKind>,
+    played_ids: Vec<Uuid>,
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: kinds,
+        is_movie: Some(true),
+        recursive: true,
+        is_favorite_or_liked: Some(true),
+        limit: Some(LIKED_LIMIT),
+        exclude_item_ids: played_ids,
+        order_by: vec![(ItemSortBy::Random, SortOrder::Descending)],
+        ..Default::default()
     }
 }
 
@@ -2828,6 +2849,41 @@ mod tests {
         );
     }
 
+    /// `MovieSimilarItemsProvider` builds the seed's people as a `HashSet` of
+    /// person ids per item, so an actor credited in two roles on the seed
+    /// counts once (15), not once per credit row (30). The candidate sharing
+    /// two genres (20) therefore outranks the one sharing only that actor.
+    #[tokio::test]
+    async fn a_seed_actor_with_two_roles_counts_once() {
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x251);
+        let shares_actor = Uuid::from_u128(0x252);
+        let shares_genres = Uuid::from_u128(0x253);
+        seed_movie(&db, seed, "Seed", "SciFi|Horror").await;
+        seed_movie(&db, shares_actor, "SharesActor", "Romance").await;
+        seed_movie(&db, shares_genres, "SharesGenres", "SciFi|Horror").await;
+        let actor = |role: &str| PeopleEntity {
+            id: String::new(),
+            name: "Pat Actor".to_owned(),
+            person_type: Some("Actor".to_owned()),
+            role: Some(role.to_owned()),
+            ..PeopleEntity::default()
+        };
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(seed, &[actor("Twin A"), actor("Twin B")])
+            .await
+            .expect("credit two roles");
+        credit_person(&db, shares_actor, "Pat Actor", "Actor").await;
+
+        let similar = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
+        assert_eq!(names, ["SharesGenres", "SharesActor"]);
+    }
+
     #[tokio::test]
     async fn a_missing_seed_is_reported_as_absent_not_empty() {
         // C# `LibraryController.GetSimilarItems`: `if (item is null) return
@@ -2840,6 +2896,25 @@ mod tests {
             .await
             .expect("similar");
         assert!(similar.is_none());
+    }
+
+    /// `GetMovieRecommendationsAsync`'s baseline orders: recently played by
+    /// `DatePlayed` descending then `Random` (`:319`), liked by `Random` alone
+    /// (`:339`), so a user with more than ten favourites gets a different
+    /// liked set on each load.
+    #[test]
+    fn the_recommendation_baselines_order_as_upstream() {
+        assert_eq!(
+            super::recently_played_query(Uuid::nil()).order_by,
+            vec![
+                (ItemSortBy::DatePlayed, SortOrder::Descending),
+                (ItemSortBy::Random, SortOrder::Descending),
+            ]
+        );
+        assert_eq!(
+            super::liked_query(Uuid::nil(), vec![BaseItemKind::Movie], Vec::new()).order_by,
+            vec![(ItemSortBy::Random, SortOrder::Descending)]
+        );
     }
 
     #[tokio::test]

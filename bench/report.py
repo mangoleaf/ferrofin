@@ -665,9 +665,10 @@ CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
               "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
               "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
-              "testdata_counts", "user_isolation", "actors", "background_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
+              "testdata_counts", "user_isolation", "actors", "background_policy", "scan_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
               "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
-              "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s")
+              "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s",
+              "coldstart_attempt_timeout_ms")
 
 
 def image_id(d):
@@ -1809,11 +1810,18 @@ PICKER_CSS = """
 def list_runs(runs_dir):
     """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date.
     A `gate.py` session (a directory holding `gate.json`) is searched one level down, and the
-    runs found there are named `<session>/<run>`; a scan session's runs have no run.json."""
+    runs found there are named `<session>/<run>`; a scan session's runs have no run.json.
+    A session `gate.py render` wrote a report.html for is listed too, as `<session>`: the
+    gate's own page, which is the only one a scan session has."""
     out = []
     for session in os.listdir(runs_dir):
         top = os.path.join(runs_dir, session)
         nested = os.path.isfile(os.path.join(top, "gate.json"))
+        if nested and os.path.isfile(os.path.join(top, "report.html")):
+            plan = load(os.path.join(top, "gate.json"))
+            plan = plan if isinstance(plan, dict) else {}
+            date = str(plan.get("date", ""))
+            out.append((date, session, f"{session}  ·  {date[:16].replace('T', ' ')}  ·  gate {plan.get('mode', '?')}"))
         for name in ([f"{session}/{sub}" for sub in os.listdir(top)] if nested else [session]):
             d = os.path.join(runs_dir, name)
             meta = load(os.path.join(d, "run.json"))

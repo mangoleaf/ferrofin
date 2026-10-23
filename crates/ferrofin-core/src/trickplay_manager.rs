@@ -205,6 +205,12 @@ impl FerrofinTrickplayManager {
         self
     }
 
+    /// The server's scratch directory (`ApplicationPaths.TempDirectory`), where
+    /// frames and tiles are made before the tiles move into place.
+    fn temp_directory(&self) -> PathBuf {
+        PathBuf::from(self.config.application_paths().temp_path())
+    }
+
     /// Connects the live library-options reader before the server starts.
     pub fn attach_virtual_folders(&self, folders: Arc<dyn VirtualFolderManager>) {
         let _ = self.virtual_folders.set(folders);
@@ -217,7 +223,7 @@ impl FerrofinTrickplayManager {
         let Some(folders) = self.virtual_folders.get() else {
             return Ok(None);
         };
-        let folders = folders.get_virtual_folders().await?;
+        let folders = folders.library_folders().await?;
         Ok(ferrofin_model::entities_media::owning_library(
             &folders,
             entity.top_parent_id.as_deref(),
@@ -422,8 +428,11 @@ impl FerrofinTrickplayManager {
             item = %ctx.item_id,
             "creating trickplay files"
         );
-        let frames_dir =
-            std::env::temp_dir().join(format!("ferrofin_trickplay_{}", Uuid::new_v4().simple()));
+        // `MediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: under the
+        // server's temp directory, which "Clean Cache Directory" sweeps.
+        let frames_dir = self
+            .temp_directory()
+            .join(Uuid::new_v4().simple().to_string());
         let _frames_cleanup = TemporaryTrickplayDirectory(frames_dir.clone());
         let result = self
             .extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
@@ -458,6 +467,7 @@ impl FerrofinTrickplayManager {
                 max_width: actual_width,
                 qscale: options.qscale,
                 threads: options.process_threads,
+                priority: options.process_priority,
                 output_dir: &frames_dir.to_string_lossy(),
                 allow_hw_accel: options.enable_hw_acceleration,
                 enable_hw_encoding: options.enable_hw_encoding,
@@ -500,10 +510,9 @@ impl FerrofinTrickplayManager {
             ));
         }
 
-        let work_dir = std::env::temp_dir().join(format!(
-            "ferrofin_trickplay_tiles_{}",
-            Uuid::new_v4().simple()
-        ));
+        let work_dir = self
+            .temp_directory()
+            .join(format!("trickplay_{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&work_dir)
             .map_err(|e| ServiceError::backend(format!("cannot create tile work dir: {e}")))?;
 
@@ -1197,8 +1206,9 @@ impl TrickplayManager for FerrofinTrickplayManager {
         width: i32,
         index: i32,
     ) -> Result<Option<String>, ServiceError> {
-        // Resolve the library live, so toggling the option affects HTTP tile
-        // reads immediately. Existing data is moved by the migration task.
+        // Resolve the library on every read, from the snapshot each options
+        // save refreshes, so toggling the option affects HTTP tile reads
+        // immediately. Existing data is moved by the migration task.
         let resolutions = self.resolutions_for(item_id).await?;
         let Some(info) = resolutions.get(&width) else {
             return Ok(None);
@@ -1530,8 +1540,10 @@ mod tests {
     use ferrofin_drawing::ImageCrateEncoder;
     use ferrofin_model::entities::MediaStreamType;
     use ferrofin_traits::configuration::ServerConfigurationManager;
+    use ferrofin_traits::drawing::ImageEncoder;
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::media_encoding::TrickplayFrameExtractor;
+    use ferrofin_traits::options::ImageCollageOptions;
     use ferrofin_traits::persistence::MediaStreamRepository as _;
     use ferrofin_traits::system::PathManager;
     use ferrofin_traits::trickplay::TrickplayManager;
@@ -1550,12 +1562,13 @@ mod tests {
     /// A config manager returning a fixed [`TrickplayOptions`].
     struct FixedConfig {
         options: TrickplayOptions,
+        paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
     }
 
     #[async_trait]
     impl ServerConfigurationManager for FixedConfig {
         fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
-            unreachable!("not used in these tests")
+            Arc::clone(&self.paths)
         }
 
         async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
@@ -1586,6 +1599,99 @@ mod tests {
         }
     }
 
+    /// The real `image`-crate encoder, recording where each trickplay tile is
+    /// written.
+    struct RecordingEncoder {
+        inner: ImageCrateEncoder,
+        tiles: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ImageEncoder for RecordingEncoder {
+        fn supported_input_formats(&self) -> Vec<String> {
+            self.inner.supported_input_formats()
+        }
+        fn supported_output_formats(&self) -> Vec<ferrofin_model::drawing::ImageFormat> {
+            self.inner.supported_output_formats()
+        }
+        fn name(&self) -> String {
+            self.inner.name()
+        }
+        fn supports_image_collage_creation(&self) -> bool {
+            self.inner.supports_image_collage_creation()
+        }
+        fn supports_image_encoding(&self) -> bool {
+            self.inner.supports_image_encoding()
+        }
+        async fn get_image_size(
+            &self,
+            path: &str,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            self.inner.get_image_size(path).await
+        }
+        async fn get_image_blur_hash(
+            &self,
+            x_comp: i32,
+            y_comp: i32,
+            path: &str,
+        ) -> Result<String, ServiceError> {
+            self.inner.get_image_blur_hash(x_comp, y_comp, path).await
+        }
+        async fn encode_image(
+            &self,
+            input_path: &str,
+            date_modified: chrono::DateTime<chrono::Utc>,
+            output_path: &str,
+            auto_orient: bool,
+            orientation: Option<ferrofin_model::drawing::ImageOrientation>,
+            quality: i32,
+            options: &ferrofin_traits::options::ImageProcessingOptions,
+            output_format: ferrofin_model::drawing::ImageFormat,
+        ) -> Result<String, ServiceError> {
+            self.inner
+                .encode_image(
+                    input_path,
+                    date_modified,
+                    output_path,
+                    auto_orient,
+                    orientation,
+                    quality,
+                    options,
+                    output_format,
+                )
+                .await
+        }
+        async fn create_image_collage(
+            &self,
+            options: &ImageCollageOptions,
+            library_name: Option<&str>,
+        ) -> Result<(), ServiceError> {
+            self.inner.create_image_collage(options, library_name).await
+        }
+        async fn create_splashscreen(
+            &self,
+            posters: &[String],
+            backdrops: &[String],
+        ) -> Result<(), ServiceError> {
+            self.inner.create_splashscreen(posters, backdrops).await
+        }
+        async fn create_trickplay_tile(
+            &self,
+            options: &ImageCollageOptions,
+            quality: i32,
+            img_width: i32,
+            img_height: Option<i32>,
+        ) -> Result<i32, ServiceError> {
+            self.tiles
+                .lock()
+                .expect("lock")
+                .push(options.output_path.clone());
+            self.inner
+                .create_trickplay_tile(options, quality, img_width, img_height)
+                .await
+        }
+    }
+
     /// A frame-extraction fake writing real (decodable) JPEG frames of the
     /// requested width, recording its invocations.
     struct FakeExtractor {
@@ -1595,6 +1701,8 @@ mod tests {
         frame_height: u32,
         calls: AtomicUsize,
         last_request: Mutex<Option<(i32, i32)>>,
+        /// The priority the last request carried.
+        last_priority: Mutex<Option<ferrofin_model::configuration::ProcessPriorityClass>>,
         /// The video stream the last request carried, which is what decides
         /// whether the extractor can take the hardware path at all.
         last_stream: Mutex<Option<MediaStream>>,
@@ -1611,6 +1719,7 @@ mod tests {
                 frame_height,
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
+                last_priority: Mutex::new(None),
                 last_stream: Mutex::new(None),
                 last_streams: Mutex::new(Vec::new()),
                 last_output: Mutex::new(None),
@@ -1642,6 +1751,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_request.lock().expect("lock") =
                 Some((request.interval_ms, request.max_width));
+            *self.last_priority.lock().expect("lock") = Some(request.priority);
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
             *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
             let output_dir = request.output_dir;
@@ -1674,14 +1784,22 @@ mod tests {
         pm: Arc<dyn PathManager>,
         /// A directory for test media files inside the temp root.
         media_dir: PathBuf,
+        /// The application paths the manager's configuration reports.
+        paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
+        encoder: Arc<RecordingEncoder>,
     }
 
     fn rig(db: &Database, options: TrickplayOptions, extractor: FakeExtractor) -> Rig {
         let tmp = tempfile::tempdir().expect("tempdir");
         let media_dir = tmp.path().join("media");
         std::fs::create_dir_all(&media_dir).expect("media dir");
-        let paths = test_paths(tmp.path());
-        let pm: Arc<dyn PathManager> = Arc::new(FerrofinPathManager::new(paths));
+        let app_paths = test_paths(tmp.path());
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> = app_paths.clone();
+        let pm: Arc<dyn PathManager> = Arc::new(FerrofinPathManager::new(app_paths));
+        let encoder = Arc::new(RecordingEncoder {
+            inner: ImageCrateEncoder::new(),
+            tiles: Mutex::new(Vec::new()),
+        });
         let extractor = Arc::new(extractor);
         let items = Arc::new(FerrofinItemRepository::new(
             db.clone(),
@@ -1690,11 +1808,14 @@ mod tests {
         let mgr = FerrofinTrickplayManager::new(
             db.clone(),
             Arc::clone(&pm),
-            Arc::new(FixedConfig { options }),
+            Arc::new(FixedConfig {
+                options,
+                paths: Arc::clone(&paths),
+            }),
             items,
             Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone())),
             Arc::clone(&extractor) as Arc<dyn TrickplayFrameExtractor>,
-            Arc::new(ImageCrateEncoder::new()),
+            Arc::clone(&encoder) as Arc<dyn ImageEncoder>,
         );
         Rig {
             temp_dir: tmp,
@@ -1702,6 +1823,8 @@ mod tests {
             extractor,
             pm,
             media_dir,
+            paths,
+            encoder,
         }
     }
 
@@ -1906,6 +2029,46 @@ mod tests {
         assert_eq!(streams[1], video, "the video is the second stream: 0:1");
     }
 
+    /// Upstream writes both scratch directories under `TempDirectory`
+    /// (`MediaEncoder.ExtractVideoImagesOnIntervalAccelerated`,
+    /// `TrickplayManager.CreateTiles`), which "Clean Cache Directory" sweeps.
+    #[tokio::test]
+    async fn frames_and_tiles_are_scratched_under_the_configured_temp_path() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let temp = PathBuf::from(r.paths.temp_path());
+        let frames = PathBuf::from(r.extractor.last_output.lock().unwrap().clone().unwrap());
+        assert_eq!(
+            frames.parent(),
+            Some(temp.as_path()),
+            "frames: {}",
+            frames.display()
+        );
+        let tiles = r.encoder.tiles.lock().expect("lock").clone();
+        assert!(!tiles.is_empty(), "tiles were written");
+        for tile in &tiles {
+            let work_dir = Path::new(tile).parent().expect("tile directory");
+            assert_eq!(work_dir.parent(), Some(temp.as_path()), "tile: {tile}");
+            assert!(
+                work_dir
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("trickplay_")),
+                "tile: {tile}"
+            );
+        }
+        // Both scratch directories are gone once the generation is done.
+        assert!(!frames.exists());
+        assert!(tiles.iter().all(|tile| !Path::new(tile).exists()));
+    }
+
     #[tokio::test]
     async fn refresh_hands_the_extractor_the_video_stream() {
         // The hardware trickplay path cannot exist without this: choosing a
@@ -1983,6 +2146,30 @@ mod tests {
             "the caught per-width missing-video error never encodes"
         );
         assert!(r.extractor.last_stream().is_none());
+    }
+
+    /// The dashboard's "FFmpeg process priority" (`TrickplayOptions.ProcessPriority`)
+    /// reaches the extraction.
+    #[tokio::test]
+    async fn the_configured_ffmpeg_priority_reaches_the_extraction() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let options = TrickplayOptions {
+            process_priority: ferrofin_model::configuration::ProcessPriorityClass::Idle,
+            ..options_2x2(&[320])
+        };
+        let r = rig(&db, options, FakeExtractor::new(6, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            *r.extractor.last_priority.lock().expect("lock"),
+            Some(ferrofin_model::configuration::ProcessPriorityClass::Idle)
+        );
     }
 
     #[tokio::test]

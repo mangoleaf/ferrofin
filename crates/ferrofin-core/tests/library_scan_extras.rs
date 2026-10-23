@@ -18,6 +18,7 @@ use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use uuid::Uuid;
 
 struct Fixture {
@@ -2427,4 +2428,346 @@ async fn a_file_that_becomes_or_stops_being_an_extra_moves() {
         (row.extra_type, row.owner_id, row.parent_id),
         (None, None, planned.parent_id)
     );
+}
+
+impl Fixture {
+    /// The `(Type, ExtraType, OwnerId)` of every row stored at `relative`.
+    async fn kinds_at(&self, relative: &str) -> Vec<(String, Option<i64>, Option<String>)> {
+        sqlx::query_as(r#"SELECT "Type", "ExtraType", "OwnerId" FROM "BaseItems" WHERE "Path" = ?"#)
+            .bind(self.media.join(relative).to_string_lossy().as_ref())
+            .fetch_all(self.db.pool())
+            .await
+            .unwrap()
+    }
+}
+
+/// An episode in a folder of its own below its season (Jellyfin 12.0-rc5's
+/// `RefreshedOwnedItems`, `[InlineData(true, true)]`): a grouped one — two
+/// versions — owns the extras folder beside it; a single-file one owns
+/// nothing, and an extras folder below a non-top folder is ignored
+/// (`CoreResolutionIgnoreRule`) and an extra-named file set aside
+/// (`ResolveVideos`), so neither is ever planned as an episode.
+#[tokio::test]
+async fn extras_in_an_episodes_own_folder_are_its_own_or_nothing() {
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 01/Show S01E01.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 1080p.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 720p.mkv",
+            "Show/Season 01/S01E02/featurettes/Making of.mkv",
+            "Show/Season 01/S01E03/Show S01E03.mkv",
+            "Show/Season 01/S01E03/featurettes/Behind.mkv",
+            "Show/Season 01/S01E03/Show S01E03-trailer.mkv",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+
+    let episode = stored_type_name(BaseItemKind::Episode).unwrap();
+    let primaries: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "OwnerId" IS NULL
+             AND "Path" LIKE '%S01E02/Show S01E02%'"#,
+    )
+    .bind(episode)
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(primaries.len(), 1, "one primary of the version group");
+
+    let owned = f
+        .kinds_at("Show/Season 01/S01E02/featurettes/Making of.mkv")
+        .await;
+    assert_eq!(owned.len(), 1, "{owned:?}");
+    assert!(owned[0].1.is_some(), "an extra, not an episode: {owned:?}");
+    assert_eq!(owned[0].2.as_deref(), Some(primaries[0].as_str()));
+
+    for path in [
+        "Show/Season 01/S01E03/featurettes/Behind.mkv",
+        "Show/Season 01/S01E03/Show S01E03-trailer.mkv",
+    ] {
+        assert!(f.kinds_at(path).await.is_empty(), "{path}");
+    }
+    let episodes: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" = ?1 AND "OwnerId" IS NULL"#,
+    )
+    .bind(episode)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(episodes, 3, "S01E01, S01E02 and S01E03 only");
+}
+
+/// The guards around an episode's own extras: a scoped scan of the extra
+/// (the watcher's) keeps it, an episode row an older scan stored at a
+/// set-aside path goes, and a version group whose folder also holds a loose
+/// extra file is in a mixed folder and owns nothing.
+#[tokio::test]
+async fn an_episodes_own_extras_survive_scoped_scans_and_mixed_folders_own_none() {
+    let making_of = "Show/Season 01/S01E02/featurettes/Making of.mkv";
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 01/S01E02/Show S01E02 - 1080p.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 720p.mkv",
+            making_of,
+            "Show/Season 01/S01E03/Show S01E03.mkv",
+            "Show/Season 01/S01E03/featurettes/Behind.mkv",
+            "Show/Season 01/S01E04/Show S01E04 - 1080p.mkv",
+            "Show/Season 01/S01E04/Show S01E04 - 720p.mkv",
+            "Show/Season 01/S01E04/trailer.mkv",
+            "Show/Season 01/S01E04/featurettes/Clip.mkv",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let owned = f.kinds_at(making_of).await;
+    assert!(owned.len() == 1 && owned[0].1.is_some(), "{owned:?}");
+
+    // A scoped scan of the extra alone, and of its folder: still owned.
+    for root in [making_of, "Show/Season 01/S01E02/featurettes"] {
+        f.scanner
+            .scan_paths(&[f.media.join(root).to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        assert_eq!(f.kinds_at(making_of).await, owned, "after scanning {root}");
+    }
+
+    // An episode an older scan stored at a set-aside path is removed.
+    let mut phantom = f.row("Show/Season 01/S01E03/Show S01E03.mkv").await;
+    phantom.id = guid_to_db(Uuid::new_v4());
+    phantom.path = Some(
+        f.media
+            .join("Show/Season 01/S01E03/featurettes/Behind.mkv")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let phantom_id = phantom.id.clone();
+    f.store.save_items(&[phantom]).await.unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert!(!f.has(&phantom_id).await, "the phantom episode goes");
+
+    // A mixed folder (a version group beside a loose extra) owns nothing.
+    for path in [
+        "Show/Season 01/S01E04/trailer.mkv",
+        "Show/Season 01/S01E04/featurettes/Clip.mkv",
+    ] {
+        assert!(f.kinds_at(path).await.is_empty(), "{path}");
+    }
+}
+
+/// A loose episode's own extras: a version group in a non-season folder of
+/// the series (a virtual season's episode, whose container is the series)
+/// owns the extras folder beside it, saved after it.
+#[tokio::test]
+async fn a_loose_episodes_own_folder_extras_are_its_own() {
+    let making_of = "Show/Specials/Show S01E05/featurettes/Making of.mkv";
+    let f = Fixture::with_type(
+        &[
+            "Show/Specials/Show S01E05/Show S01E05 - 1080p.mkv",
+            "Show/Specials/Show S01E05/Show S01E05 - 720p.mkv",
+            making_of,
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let primary: String = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "OwnerId" IS NULL"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Episode).unwrap())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    let owned = f.kinds_at(making_of).await;
+    assert_eq!(owned.len(), 1, "{owned:?}");
+    assert!(owned[0].1.is_some());
+    assert_eq!(owned[0].2.as_deref(), Some(primary.as_str()));
+}
+
+const BR: &str = "Blade Runner (1982)/Blade Runner (1982).mkv";
+const BR_TRAILER: &str = "Blade Runner (1982)/trailers/trailer.mkv";
+const BR_FEATURETTE: &str = "Blade Runner (1982)/featurettes/Making of.mkv";
+
+/// Writes the Blade Runner folder's `movie.nfo` with `plot` and `year`.
+fn write_movie_nfo(f: &Fixture, plot: &str, year: i32) {
+    std::fs::write(
+        f.media.join("Blade Runner (1982)/movie.nfo"),
+        format!(
+            "<movie><title>Blade Runner</title><plot>{plot}</plot><genre>Sci-Fi</genre>\
+             <studio>Warner</studio><country>US</country><mpaa>R</mpaa>\
+             <rating>8.1</rating><year>{year}</year>\
+             <premiered>{year}-06-25</premiered></movie>"
+        ),
+    )
+    .unwrap();
+}
+
+/// The genres linked to `id` in `ItemValues`, which genre filters read.
+async fn genre_links(f: &Fixture, id: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        r#"SELECT v."Value" FROM "ItemValuesMap" m
+           JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+           WHERE m."ItemId" = ?1 AND v."Type" = 2"#,
+    )
+    .bind(id)
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap()
+}
+
+/// Upstream `BaseItem.RefreshExtras`: an owner's refresh that finds its
+/// extras new gives them its title metadata (`RefreshMetadataForOwnedItem`'s
+/// `copyTitleMetadata`) and its dates (`InheritDatesFromOwner`), so a
+/// trailer and a featurette are dated, rated and described like their movie.
+#[tokio::test]
+async fn new_extras_take_their_owners_title_metadata_and_dates() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    let movie = f.row(BR).await;
+    assert_eq!(movie.overview.as_deref(), Some("First plot"));
+    for extra in [BR_TRAILER, BR_FEATURETTE] {
+        let row = f.row(extra).await;
+        assert_eq!(row.genres, movie.genres, "{extra}");
+        assert_eq!(row.studios, movie.studios, "{extra}");
+        assert_eq!(
+            row.production_locations, movie.production_locations,
+            "{extra}"
+        );
+        assert_eq!(row.overview, movie.overview, "{extra}");
+        assert_eq!(row.official_rating.as_deref(), Some("R"), "{extra}");
+        assert_eq!(row.community_rating, movie.community_rating, "{extra}");
+        assert_eq!(row.production_year, Some(1982), "{extra}");
+        assert_eq!(row.premiere_date, movie.premiere_date, "{extra}");
+        assert_eq!(genre_links(&f, &row.id).await, ["Sci-Fi"], "{extra}");
+    }
+}
+
+/// Upstream `RefreshExtras` on a refresh that finds the extras as they were
+/// gives them only the owner's dates; a full refresh, or one that finds an
+/// extra gone, gives them its title metadata again.
+#[tokio::test]
+async fn later_refreshes_copy_the_dates_and_only_a_full_one_or_a_removal_the_rest() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+
+    write_movie_nfo(&f, "Second plot", 1983);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(BR).await.overview.as_deref(), Some("Second plot"));
+    let trailer = f.row(BR_TRAILER).await;
+    assert_eq!(trailer.overview.as_deref(), Some("First plot"));
+    assert_eq!(trailer.production_year, Some(1983));
+    assert_eq!(trailer.premiere_date, f.row(BR).await.premiere_date);
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner.scan_with(None, &full).await.unwrap();
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Second plot")
+    );
+
+    write_movie_nfo(&f, "Third plot", 1983);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Second plot")
+    );
+    std::fs::remove_file(f.media.join(BR_FEATURETTE)).unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Third plot")
+    );
+}
+
+/// A rescan that finds the owner and its extras as they were writes no
+/// extra: the copy writes only rows that differ, so the dates it gives are
+/// already theirs.
+#[tokio::test]
+async fn a_quiet_rescan_writes_no_extra() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    let before = [
+        f.row(BR_TRAILER).await.date_last_saved,
+        f.row(BR_FEATURETTE).await.date_last_saved,
+    ];
+    f.scanner.scan_all().await.unwrap();
+    let after = [
+        f.row(BR_TRAILER).await.date_last_saved,
+        f.row(BR_FEATURETTE).await.date_last_saved,
+    ];
+    assert_eq!(after, before);
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("First plot")
+    );
+}
+
+/// An extra named after an alternate version is owned by that version
+/// (`Video.GetOwnerIdForExtra`) and maintained by its primary
+/// (`GetOwnedVersionIds`), whose metadata it takes.
+#[tokio::test]
+async fn an_extra_of_an_alternate_version_takes_its_primarys_metadata() {
+    let f = Fixture::new(&[
+        "Film (2001)/Film (2001).mkv",
+        "Film (2001)/Film (2001) - 4K.mkv",
+        "Film (2001)/Film (2001) - 4K-trailer.mkv",
+    ])
+    .await;
+    std::fs::write(
+        f.media.join("Film (2001)/movie.nfo"),
+        "<movie><title>Film</title><plot>A plot</plot><genre>Drama</genre></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row("Film (2001)/Film (2001) - 4K-trailer.mkv").await;
+    assert_eq!(
+        trailer.owner_id,
+        Some(f.row("Film (2001)/Film (2001) - 4K.mkv").await.id)
+    );
+    assert_eq!(trailer.overview.as_deref(), Some("A plot"));
+    assert_eq!(trailer.genres.as_deref(), Some("Drama"));
+    assert_eq!(trailer.production_year, Some(2001));
+}
+
+/// Upstream `FindExtras_TrailerWithYearInFilename_SetsProductionYearFromFilename`:
+/// a video extra is resolved with its name parsed, so the year in its file
+/// name is its own while its owner has none to give it — for a movie's
+/// trailer and featurette, and for a series' trailer.
+#[tokio::test]
+async fn a_video_extra_takes_the_year_in_its_file_name() {
+    let f = Fixture::new(&[
+        "Up/Up.mkv",
+        "Up/trailers/Trailer 1 (2013).mkv",
+        "Up/featurettes/Making of (2009).mkv",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row("Up/trailers/Trailer 1 (2013).mkv").await;
+    assert_eq!(
+        trailer.extra_type,
+        Some(ferrofin_model::entities::ExtraType::Trailer.json_value())
+    );
+    assert_eq!(trailer.production_year, Some(2013));
+    let featurette = f.row("Up/featurettes/Making of (2009).mkv").await;
+    assert_eq!(featurette.production_year, Some(2009));
+
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 1/Show S01E01.mkv",
+            "Show/trailers/Trailer 1 (2013).mkv",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row("Show/trailers/Trailer 1 (2013).mkv").await;
+    assert!(trailer.owner_id.is_some());
+    assert_eq!(trailer.production_year, Some(2013));
 }

@@ -37,6 +37,10 @@
 //! | TMDb | `MaxCastMembers` / `HideMissingCastMembers` | cast cap + profile-less filter (`TmdbMovieProvider.cs:258`, `TmdbSeriesProvider.cs:329`, `TmdbEpisodeProvider.cs:212`) |
 //! | TMDb | `MaxCrewMembers` / `HideMissingCrewMembers` | crew cap + filter, after the wanted-kind filter (`TmdbMovieProvider.cs:300`) |
 //! | TMDb | `PosterSize`/`BackdropSize`/`LogoSize`/`ProfileSize`/`StillSize` | the CDN size segment, `original` when unset (`TmdbClientManager.cs:514-590`) |
+//! | TMDb | `ImportUnairedEpisodes` / `ImportMissingEpisodes` / `ImportSpecials` | which virtual episodes a series refresh creates (`TmdbMissingEpisodeProvider.FetchAsync`) |
+//! | TMDb | `EnabledMissingEpisodeLibraries` | the libraries those run for (`IsEnabledForLibrary`) |
+//! | TMDb | `UpcomingEpisodeGracePeriodDays` | how long a recently aired placeholder stays while missing episodes are off (`ShouldPrune`) |
+//! | TMDb | `MissingEpisodeRefreshIntervalDays` | the `TmdbRefreshUpcomingEpisodes` task's interval (`TmdbUpcomingEpisodesTask.GetDefaultTriggers`) |
 //! | OMDb | `CastAndCrew` | whether OMDb's director/writer/actors are imported (`OmdbProvider.cs:417`) |
 //! | MusicBrainz | `Server` | the web-service base URL (`MusicBrainzArtistProvider.ReloadConfig`) |
 //! | MusicBrainz | `RateLimit` | seconds between requests (same) |
@@ -104,11 +108,18 @@ pub const TMDB: BuiltinPlugin = BuiltinPlugin {
     description: "Get metadata for movies and other video content from TheMovieDb.",
     configuration_file_name: "Jellyfin.Plugin.Tmdb.xml",
     // `Tmdb/Configuration/PluginConfiguration.cs` defaults. The five image-size
-    // properties are `string?` with no default, so upstream omits them.
+    // properties are `string?` with no default, so they start `null`; they must
+    // be in the document anyway, because a save keeps only the keys it holds
+    // (`project_config`).
     default_config: concat!(
         r#"{"TmdbApiKey":"","IncludeAdult":false,"ExcludeTagsSeries":false,"#,
         r#""ExcludeTagsMovies":false,"ImportSeasonName":false,"MaxCastMembers":15,"#,
-        r#""MaxCrewMembers":15,"HideMissingCastMembers":false,"HideMissingCrewMembers":false}"#
+        r#""MaxCrewMembers":15,"HideMissingCastMembers":false,"HideMissingCrewMembers":false,"#,
+        r#""PosterSize":null,"BackdropSize":null,"LogoSize":null,"ProfileSize":null,"#,
+        r#""StillSize":null,"#,
+        r#""ImportUnairedEpisodes":false,"ImportMissingEpisodes":false,"ImportSpecials":false,"#,
+        r#""EnabledMissingEpisodeLibraries":[],"MissingEpisodeRefreshIntervalDays":7,"#,
+        r#""UpcomingEpisodeGracePeriodDays":7}"#
     ),
     config_page: include_bytes!("../assets/plugins/tmdb.config.html"),
 };
@@ -195,10 +206,12 @@ mod tests {
 
     #[test]
     fn config_pages_are_the_vendored_bytes() {
-        // The exact byte lengths of the 10.11.8 `Configuration/config.html`
-        // resources, which the live server serves verbatim.
+        // The exact byte lengths of the vendored `Configuration/config.html`
+        // resources, which the live server serves verbatim: 10.11.8's, but
+        // TMDb's is v12.2's (its unaired/missing episode options) without the
+        // Similar Items cache setting Ferrofin does not have yet (gl-220).
         let sizes: Vec<usize> = ALL.iter().map(|p| p.config_page.len()).collect();
-        assert_eq!(sizes, vec![11182, 2491, 2179, 3828, 2244]);
+        assert_eq!(sizes, vec![18097, 2491, 2179, 3828, 2244]);
         assert!(TMDB.config_page.starts_with(b"<!DOCTYPE html>"));
     }
 
@@ -209,6 +222,24 @@ mod tests {
         assert_eq!(v["MaxCrewMembers"], 15);
         assert_eq!(v["IncludeAdult"], false);
         assert_eq!(v["TmdbApiKey"], "");
-        assert!(v.get("PosterSize").is_none(), "unset sizes are omitted");
+        for size in [
+            "PosterSize",
+            "BackdropSize",
+            "LogoSize",
+            "ProfileSize",
+            "StillSize",
+        ] {
+            assert!(
+                v.get(size).is_some_and(serde_json::Value::is_null),
+                "{size} is in the schema, unset"
+            );
+        }
+        // `PluginConfiguration.cs:43-81`: the unaired/missing episode options.
+        assert_eq!(v["ImportUnairedEpisodes"], false);
+        assert_eq!(v["ImportMissingEpisodes"], false);
+        assert_eq!(v["ImportSpecials"], false);
+        assert_eq!(v["EnabledMissingEpisodeLibraries"], serde_json::json!([]));
+        assert_eq!(v["MissingEpisodeRefreshIntervalDays"], 7);
+        assert_eq!(v["UpcomingEpisodeGracePeriodDays"], 7);
     }
 }

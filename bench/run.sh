@@ -42,6 +42,7 @@ export HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S:-10}
 export STREAM_HTTP_TIMEOUT_S=${STREAM_HTTP_TIMEOUT_S:-120}
 export PHASE_TIMEOUT_S=${PHASE_TIMEOUT_S:-600}
 export CLEANUP_TIMEOUT_S=${CLEANUP_TIMEOUT_S:-30}
+export COLDSTART_ATTEMPT_TIMEOUT_MS=${COLDSTART_ATTEMPT_TIMEOUT_MS:-100}  # one cold-start readiness attempt
 SAMPLE_BRACKET_INTERVALS=${SAMPLE_BRACKET_INTERVALS:-2}
 SAMPLE_GAP_INTERVALS=${SAMPLE_GAP_INTERVALS:-5}
 CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}  # the server/client cores must be this idle before a run starts
@@ -94,7 +95,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
-for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS SOAK_S RATE_SOAK SOAK_SKIP_S; do
+for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S COLDSTART_ATTEMPT_TIMEOUT_MS MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS SOAK_S RATE_SOAK SOAK_SKIP_S; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
 # Reject bad selections before any fixture access or Docker command.
@@ -197,11 +198,11 @@ jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(base
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \
   --argjson ready "$READY_TIMEOUT_S" --argjson drain "$DRAIN_TIMEOUT_S" --argjson http "$HTTP_TIMEOUT_S" --argjson stream_http "$STREAM_HTTP_TIMEOUT_S" \
-  --argjson phase "$PHASE_TIMEOUT_S" --argjson cleanup "$CLEANUP_TIMEOUT_S" --argjson restarts "$RESTARTS" --argjson ttfs_reps "$TTFS_REPS" \
+  --argjson phase "$PHASE_TIMEOUT_S" --argjson cleanup "$CLEANUP_TIMEOUT_S" --argjson coldstart_attempt "$COLDSTART_ATTEMPT_TIMEOUT_MS" --argjson restarts "$RESTARTS" --argjson ttfs_reps "$TTFS_REPS" \
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" --argjson oracle "$ORACLE" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
-  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, scan_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, coldstart_attempt_timeout_ms:$coldstart_attempt, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, oracle:$oracle, date: (now|todate)}' > "$OUT/run.json"
 
@@ -534,6 +535,17 @@ PY_ISOLATION
   docker_cmd start "$CONTAINER" >/dev/null
   wait_ready || die "$NAME: isolation restart failed"
   verify_isolation || die "$NAME: $FAIL_REASON"
+  # Jellyfin boots the config its preparation scanned under 12.x; give Ferrofin the
+  # equivalent one full scan of its adopted copy, then a fresh process, as Jellyfin's scan
+  # ran in its preparation: no scan heap is left in the memory numbers.
+  if [ "$1" = ferrofin ]; then
+    PHASE_TIMEOUT_S=${PREPARE_TIMEOUT_S:-1800} client python3 bench/testdata/seed.py --scan "$URL" "$TESTDATA/ids.json" "$D/scan.json" \
+      || die "$NAME: library scan failed: ${FAIL_REASON:-see the traceback above, or $D/server.log}"
+    docker_cmd stop --time "$CLEANUP_TIMEOUT_S" "$CONTAINER" >/dev/null
+    docker_cmd start "$CONTAINER" >/dev/null
+    wait_ready || die "$NAME: post-scan restart failed"
+    verify_isolation || die "$NAME: $FAIL_REASON"
+  fi
   state startup completed; CURRENT_PHASE=""
   phase startup-drain drain || exit 1
   docker_cmd inspect -f '{{.Config.Image}} {{.Image}}' "$CONTAINER" > "$D/image.txt"

@@ -35,6 +35,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Take a comic's cover from `.cb7` (7z) and `.cbt` (tar) archives as well as `.cbz`, and open
+  every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
+  really a ZIP gets its cover too. The fallback page is the first in .NET's key order
+  (case ignored first), not byte order. A real RAR `.cbr` still gets no cover
+- Give extras their owner's title metadata and dates, as Jellyfin's `RefreshExtras`
+  does. Trailers, featurettes and other extras take the movie's or series' genres,
+  studios, production locations, overview, ratings, year and premiere date when a
+  scan finds them new, renamed or gone, or on a full refresh, and the year and
+  premiere date on every scan. A video extra also takes the year in its file name until
+  its owner has one. Existing extras need one "Search for missing metadata" refresh to
+  get the rest; see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
   Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
   the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
@@ -66,6 +77,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   content" and "Uncoded languages". External subtitle files named with these codes
   (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
   `GET /Items/Filters` is unchanged
+- `GET /Items/Filters2?isAiring=false` lists the filters of the programmes not on now
+  (starting later or already ended), as Jellyfin 12 does. It returned an empty filter set,
+  because the predicate required a programme to start after now and also end before now
 - Serve Jellyfin 12's `MediaStream.IsOriginal` (ffprobe's `original` disposition, always
   written), `LocalizedLanguage` and `LocalizedOriginal` (on every audio stream). An
   original audio track's `DisplayTitle` ends in " - Original" (localized). As upstream, a
@@ -93,6 +107,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 - Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
   `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
   file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
@@ -132,7 +150,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a kind a library saved no fetcher choices for, and an item in no library (an artist known
   only by name), now uses the server-wide metadata options — their disabled fetchers and
   their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
-  artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
+  OMDb for music videos. A music artist with no saved choices may use every metadata
+  downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- TheAudioDB descriptions return for music artists and albums, in the item's metadata
+  language when TheAudioDB has it, else in English
+- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
+  expires or the account changes (it was renewed for every subtitle). A rejected token is
+  renewed and the download retried once. The account's daily quota is tracked: once it is
+  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
+  OpenSubtitles until its reset time, and the remaining count is logged with each
+  download. A download without an account is refused before any request, and the error for
+  a download OpenSubtitles rejects carries its reply (a web page as `[html]`), as the
+  plugin's does
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'
@@ -147,6 +176,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
   forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
   some clients produce on partial-GOP audio. As upstream, the default is off
+- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
+  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
+  the same store, trying the Matroska cues before ffprobe, and
+  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
+  the transcode at the segment's playlist time, half a second later for a copied video so
+  ffmpeg lands on the keyframe itself
 - Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
@@ -159,6 +194,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `MediaEncoder`: extraction failures are logged at WARN with the ffmpeg output and do not
   abort the transcode; ASS subtitles with missing `[Fonts]` or `[Graphics]` sections get
   the headers appended on write so libass renders them correctly
+- Trickplay frames and tiles are made in the server's temp directory (`{cache}/temp`), as
+  Jellyfin makes them in its own, instead of the system's `/tmp`. "Clean Cache Directory"
+  sweeps what a killed generation leaves there, and a small or read-only `/tmp` no longer
+  stops trickplay
 - Port `DownMixStereoAlgorithm` filter table: the 15-entry `(algorithm, channel_layout) →
   pan=stereo|…` lookup for Dave750, NightmodeDialogue, Rfc7845 and Ac4 algorithms, with
   7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
@@ -169,6 +208,19 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
+- A series refresh removes its missing episodes once you have them, as Jellyfin 12.2 does:
+  a missing episode whose number a file covers, one with no number, and one carrying the
+  provider id of an episode you have under another number are removed, so an adopted
+  library no longer lists those episodes twice (see `docs/UPGRADING.md`)
+- Missing and unaired episodes from TheMovieDb, as Jellyfin 12 offers them: the TMDb
+  settings page's "Create unaired episodes", "Create missing episodes" and "Include
+  specials" options, its library list, refresh interval and grace period, and the "Refresh
+  upcoming and missing episodes (TheMovieDb)" scheduled task. Off by default
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -180,6 +232,19 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
+- A Live TV channel that drops out of the tuner lineup and comes back keeps its users'
+  favourites, likes and play state, as in Jellyfin. The guide refresh that recreates the
+  channel gives back the data its removal had set aside
+- Book metadata from an EPUB's or a sidecar's OPF follows Jellyfin's reader:
+  - the first description, publisher, language, date and identifier of each kind count;
+  - the first Calibre series, series index, rating and sort title count;
+  - Calibre's series index and rating round half to even (a `2.5` series index is book 2);
+  - a cover named by `<meta name="cover">` is also found under `Images/`.
+
+  Affected books change on their next metadata refresh
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
@@ -226,6 +291,28 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- An episode, season or music track stored without a sort name, which the startup repair
+  fills, now sorts by its numbers, as Jellyfin's own sort names do. Before, the repair gave
+  it an alphabetical key, which put episodes out of order and could break "next episode"
+- Collections and playlists take their genres and studios from their members, as in
+  Jellyfin. A collection also takes its earliest member's date and year, and a playlist's
+  runtime is the sum of its members'. Before, they took only a rating, so they had no
+  genres, studios, year or runtime and never matched a genre or studio filter. Locked
+  items and locked fields keep their values. A collection also keeps a current list of
+  the libraries its members are in, which decides who can see it
+- Adding, removing or renaming a library, or adding or removing one of its folders, can
+  fail part-way, for example on a full disk. When it does, the request still fails, but
+  the server now also refreshes its folder watch and runs the scan the request asked for,
+  as Jellyfin does. Before, both were skipped until the next scan
+- A library's folder shortcuts are written as Jellyfin writes them. They are named after
+  the folder without its extension (`Films.HD` gives `Films.mblink`), and a folder inside
+  the server's data directory is stored as `%AppDataPath%/…`, so it keeps working if the
+  data directory moves
+- During a transcode, PGS and VobSub subtitles a client can draw itself are delivered as
+  separate subtitle files, as in Jellyfin 12, instead of being burned into the video. The
+  "Allow subtitle extraction on the fly" setting now applies: with it off, other embedded
+  subtitles are burned in during a transcode. Playback negotiation also asks the installed
+  ffmpeg which audio encoders it has, instead of assuming a fixed list
 
 ## [1.0.0] - 2026-09-05
 

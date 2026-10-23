@@ -91,6 +91,10 @@ pub struct BaseEncodingJobOptions {
     pub allow_video_stream_copy: bool,
     /// Whether audio stream copy is allowed (`AllowAudioStreamCopy`).
     pub allow_audio_stream_copy: bool,
+    /// Whether the audio may be encoded VBR when the encoding options enable
+    /// it (`EnableAudioVbrEncoding`). The stream request sets it, true unless
+    /// the client says otherwise.
+    pub enable_audio_vbr_encoding: bool,
     /// The requested audio codec (`AudioCodec`).
     pub audio_codec: Option<String>,
     /// The requested audio sample rate (`AudioSampleRate`).
@@ -168,6 +172,9 @@ impl Default for BaseEncodingJobOptions {
             allow_video_stream_copy: true,
             allow_audio_stream_copy: true,
             context: EncodingContext::Streaming,
+            // Not a constructor initializer: the stream controllers' query
+            // default (`enableAudioVbrEncoding = true`) sets it per request.
+            enable_audio_vbr_encoding: false,
             audio_codec: None,
             audio_sample_rate: None,
             max_audio_bit_depth: None,
@@ -462,6 +469,17 @@ impl EncodingJobInfo {
         }
 
         force_if_interlaced
+    }
+
+    /// Whether the video filter chain deinterlaces: `doDeintH264 ||
+    /// doDeintHevc`, the source deinterlaced under either spelling of each
+    /// codec with an interlaced source forcing it. Port of
+    /// `EncodingHelper.IsDeinterlaceAvailable`.
+    #[must_use]
+    pub fn is_deinterlace_available(&self) -> bool {
+        ["h264", "avc", "h265", "hevc"]
+            .iter()
+            .any(|codec| self.deinterlace(Some(codec), true))
     }
 
     /// The client-requested video profiles for `codec`. Port of

@@ -4,6 +4,7 @@ from contextlib import closing
 from io import BytesIO
 import json
 import copy
+from functools import partial
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import uuid
 
 from PIL import Image, ImageStat
 
+import adoption_report
 from metadata import CheckError, connect
 from synthetic_fixture import USERS
 
@@ -54,6 +56,30 @@ def artwork(api, item):
         return {"size": list(rgb.size), "rgb": ImageStat.Stat(rgb).mean}
 
 
+#: Items asked for per request: the single page the snapshot used to read, so a small library
+#: is fetched exactly as before.
+PAGE_SIZE = 1000
+
+
+def all_items(api, **params):
+    """Every item `GET /Items` answers for `params`, read PAGE_SIZE at a time until the server's
+    TotalRecordCount is reached, so a library of any size is snapshotted whole. Anything that would
+    silently drop items is an error: a response without a count, a server that counts more than it
+    serves, or an item returned on two pages (the order moved between requests)."""
+    items = []
+    while True:
+        page = api.get("/Items", startIndex=len(items), limit=PAGE_SIZE, **params)
+        total = page["TotalRecordCount"]
+        items.extend(page["Items"])
+        if len(items) >= total:
+            break
+        if not page["Items"]:
+            raise CheckError(f"GET /Items served {len(items)} of the {total} items it counts")
+    if len({row["Id"] for row in items}) != len(items):
+        raise CheckError("GET /Items returned an item on two pages; the snapshot would miss others")
+    return items
+
+
 def snapshot(admin, manifest, images=None):
     """Use authenticated users for permissions and views, not an admin impersonation.
     images: the client user avatars are fetched as (user_accounts.snapshot)."""
@@ -64,8 +90,8 @@ def snapshot(admin, manifest, images=None):
     for library in admin.get("/Library/VirtualFolders"):
         if library["Name"] in manifest["libraries"]:
             result["libraries"][library["Name"]] = select(library["LibraryOptions"], LIBRARY_OPTIONS)
-    items = admin.get("/Items", userId=admin.user, recursive="true", limit=1000,
-                      includeItemTypes=TYPES, fields="Path,Overview,Genres,ProviderIds,MediaSources,MediaStreams")["Items"]
+    items = all_items(admin, userId=admin.user, recursive="true", includeItemTypes=TYPES,
+                      fields="Path,Overview,Genres,ProviderIds,MediaSources,MediaStreams")
     result["relationships"] = {row["Id"]: select(row, RELATIONS) for row in items}
     result["subtitles"] = {row["Id"]: sorted(
         (stream.get("Language"), stream.get("IsExternal"), stream.get("Codec"))
@@ -96,7 +122,7 @@ def snapshot(admin, manifest, images=None):
     }
     for name in USERS[1:]:
         api = admin.login(name)
-        visible = api.get("/Items", userId=api.user, recursive="true", includeItemTypes="Movie,Episode,Audio", limit=1000)["Items"]
+        visible = all_items(api, userId=api.user, recursive="true", includeItemTypes="Movie,Episode,Audio")
         result["visibility"][name] = sorted(ids(visible))
         # Negative read and write checks use the restricted user's own token.
         other = manifest["users"][USERS[1] if name == USERS[2] else USERS[2]]
@@ -120,7 +146,7 @@ def snapshot(admin, manifest, images=None):
             "resume": ids(api.get("/UserItems/Resume", userId=api.user, mediaTypes="Video", limit=100)["Items"]),
             "next_up": ids(api.get("/Shows/NextUp", userId=api.user, limit=100)["Items"]),
             "folders": {row["Id"]: select(row.get("UserData", {}), ("Played", "UnplayedItemCount"))
-                        for row in api.get("/Items", userId=api.user, recursive="true", includeItemTypes="Series,Season", limit=100)["Items"]},
+                        for row in all_items(api, userId=api.user, recursive="true", includeItemTypes="Series,Season")},
         }
     return normalize(result)
 
@@ -445,7 +471,41 @@ def verify_boot(work, version, stage, previous_logs):
         raise CheckError("synthetic " + stage + " boot checks failed; inspect the local boot log")
 
 
+def note(recorder, fixture, stage, check, found):
+    """Record one comparison's verdict for the report; `found` is its list of differences, returned as given."""
+    recorder.check(fixture, stage, check, "FAIL" if found else "PASS", adoption_report.joined(found))
+    return found
+
+
+def recorded(recorder, fixture, stage, check, call, *args):
+    """Run a check that raises CheckError when it fails, recording its verdict before the error goes on."""
+    try:
+        result = call(*args)
+    except CheckError as error:
+        recorder.check(fixture, stage, check, "FAIL", str(error))
+        error.recorded = True   # run_matrix need not record the same failure again
+        raise
+    recorder.check(fixture, stage, check, "PASS")
+    return result
+
+
 def run_matrix(root, image, only, port):
+    """The preservation matrix, with its report (WORK/report.html, adoption_report.py) built however it ends."""
+    recorder = adoption_report.Recorder(root / "work")
+    try:
+        _run_matrix(root, image, only, port, recorder)
+    except Exception as error:
+        # Whatever stopped the run (a scan that did not finish, a docker failure) is a failed check in the page,
+        # unless a check already recorded it.
+        if recorder.where and not getattr(error, "recorded", False):
+            recorder.check(*recorder.where, "run stopped", "FAIL", f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        if recorder.started:   # a run refused before its first fixture leaves the previous report alone
+            recorder.build()
+
+
+def _run_matrix(root, image, only, port, recorder):
     from synthetic import VERSIONS, FRESH_INSTALL, server, recipe
     import metadata
     import watch_history
@@ -482,6 +542,11 @@ def run_matrix(root, image, only, port):
         work = root / "work" / name
         if work.exists():
             raise CheckError("previous synthetic run remains; inspect it before rerunning")
+        # Every refusal above leaves the last report alone: only a fixture that really starts begins a new one.
+        if not recorder.started:
+            recorder.start("synthetic.py run: the preservation matrix", image=image)
+        recorder.begin(name, "matrix", version)
+        recorder.where = (name, "before the first stage")
         work.parent.mkdir(exist_ok=True)
         shutil.copytree(source, work)
         db = work / "data/jellyfin.db"
@@ -503,7 +568,12 @@ def run_matrix(root, image, only, port):
             api.post("/Plugins/4a3f8e216c944d17a2b80f5e9c3d7a10/Configuration",
                      {"ApiKey": "synthetic-unused-key"})
             previous_logs = 0
+            row_reasons = []   # each difference, for the fixture's row in the report (the error that ends the run keeps them whole)
             for stage in ("adoption", "restart", "scan", "second scan"):
+                label = "after " + stage   # the vocabulary run.sh's report uses
+                recorder.where = (name, label)
+                must = partial(recorded, recorder, name, label)
+                record = partial(note, recorder, name, label)
                 if stage == "restart":
                     previous_logs = len(container_log().splitlines())
                     subprocess.run(["docker", "restart", "synthetic-adoption"], check=True, stdout=subprocess.DEVNULL)
@@ -511,32 +581,41 @@ def run_matrix(root, image, only, port):
                     api.idle()
                 elif stage == "second scan":
                     from unchanged_scan import check
-                    check(api, db, (work, work.parent / (name + "-cache"), root / "media"))
+                    must("nothing is redone for an unchanged library", check, api, db,
+                         (work, work.parent / (name + "-cache"), root / "media"))
                 elif stage == "scan":
                     api.scan(300, interval=1)
-                verify_database(db)
+                must("integrity_check and foreign_key_check", verify_database, db)
                 if stage in ("adoption", "restart"):
-                    verify_boot(work, version, stage, previous_logs)
+                    must("boot log" if stage == "adoption" else "boot runs no repair", verify_boot, work, version, stage, previous_logs)
                 actual = snapshot(api, manifest)
-                changed = compare(comparable(expected, seeds, orphans), comparable(actual, seeds, orphans))
+                changed = record("API answers match Jellyfin's", compare(comparable(expected, seeds, orphans), comparable(actual, seeds, orphans)))
                 with closing(metadata.connect(db)) as conn, \
                         closing(metadata.connect(oracle_dir / "data/jellyfin.db")) as oracle_conn:
-                    changed += seed_failures(conn, actual, seeds, state, oracle_conn, oracle)
-                changed += user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db))
-                changed += table_digests.compare(
+                    changed += record("seeded states end as Jellyfin 12.2 left them",
+                                      seed_failures(conn, actual, seeds, state, oracle_conn, oracle))
+                changed += record("user accounts", user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db)))
+                table_changed = table_digests.compare(
                     tables_before, table_digests.snapshot(db, tables_before, reauthenticated=reauth))
-                changed += list(watch_history.compare_db(history, watch_history.snapshot(db)))
-                changed += list(watch_history.compare_api(history, metadata.Api(api.base, db)))
-                changed += list(metadata.compare(metadata_before, metadata.snapshot(db), "database"))
+                changed += record("table digests", table_changed)
+                if table_changed:
+                    recorder.attach(name, "tables:" + label, "\n".join(table_changed))
+                changed += record("watch history", list(watch_history.compare_db(history, watch_history.snapshot(db)))
+                                  + list(watch_history.compare_api(history, metadata.Api(api.base, db))))
                 metadata_api = metadata.Api(api.base, db)
-                changed += list(metadata.compare(metadata_before, metadata_api.snapshot(metadata_before), "API"))
-                metadata_api.images(metadata_before)
+                changed += record("metadata (database and API)",
+                                  list(metadata.compare(metadata_before, metadata.snapshot(db), "database"))
+                                  + list(metadata.compare(metadata_before, metadata_api.snapshot(metadata_before), "API")))
+                must("artwork", metadata_api.images, metadata_before)
+                row_reasons += [f"{stage}: {difference}" for difference in changed]
                 if changed:
                     failures.append(name + " " + stage + ": " + ", ".join(changed))
                     from synthetic import save
                     save(work / (stage.replace(" ", "-") + "-actual.json"), actual)
                 print(("FAIL " if changed else "PASS ") + name + " " + stage, flush=True)
-        if not any(row.startswith(name + " ") for row in failures):
+        found = [row for row in failures if row.startswith(name + " ")]
+        recorder.row(name, "matrix", version, "FAIL" if found else "PASS", adoption_report.joined(row_reasons))
+        if not found:
             shutil.rmtree(work)
             shutil.rmtree(work.parent / (name + "-cache"))
     if failures:

@@ -14,8 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 
 #: Listed in testdata/seed.py CONTROL_DEVICES, so the session check accounts for it.
 DEVICE = "bench-cold"
@@ -28,15 +27,40 @@ def started_at(container):
     return dt.datetime.fromisoformat(head).replace(tzinfo=dt.timezone.utc).timestamp() + int((frac or "0").ljust(9, "0")) / 1e9
 
 
+def attempt_timeout_s():
+    """Each readiness attempt's connect bound (`COLDSTART_ATTEMPT_TIMEOUT_MS`, set by run.sh).
+    A connect sent while the published port is still coming up can stall until TCP's 1 s SYN
+    retransmit; a short bound abandons it and the next poll goes out instead. The response
+    itself is not cut short: a slow first answer is still the server's first answer."""
+    return int(os.environ.get("COLDSTART_ATTEMPT_TIMEOUT_MS", "100")) / 1000
+
+
+def read_timeout_s():
+    return float(os.environ.get("HTTP_TIMEOUT_S", "10"))
+
+
+def attempt(url, headers, connect_s, read_s):
+    """One readiness request: its connect bounded by `connect_s`, its response by `read_s`."""
+    u = urllib.parse.urlsplit(url)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=connect_s)
+    try:
+        conn.connect()
+        conn.sock.settimeout(read_s)
+        conn.request("GET", u.path + (f"?{u.query}" if u.query else ""), headers=headers)
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
 def poll(url, headers, timeout_s, poll_s, stop, started):
     deadline = time.monotonic() + timeout_s
+    connect_s, read_s = min(attempt_timeout_s(), timeout_s), min(read_timeout_s(), timeout_s)
     started.set()
     while not stop.is_set() and time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=min(1, timeout_s)) as r:
-                if r.status == 200:
-                    return time.time()
-        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            if attempt(url, headers, connect_s, read_s) == 200:
+                return time.time()
+        except (OSError, http.client.HTTPException):
             pass
         stop.wait(poll_s)
     return None
@@ -67,7 +91,7 @@ def restart(container, url, headers, poll_s):
                 "home_ms": (t_home - t0) * 1000}
     finally:
         stop.set()
-        thread.join(2)  # each HTTP call is bounded by one second
+        thread.join(attempt_timeout_s() + read_timeout_s() + 1)  # one in-flight attempt at most
         if thread.is_alive():
             raise RuntimeError("readiness poller did not stop")
 
@@ -87,7 +111,7 @@ def main():
             rec = {"error": f"{type(e).__name__}: {e}"}
         runs.append(rec)
         with open(out + ".tmp", "w") as f:
-            json.dump({"validation": 1, "poll_ms": poll_s * 1000, "runs": runs}, f, indent=1)
+            json.dump({"validation": 1, "poll_ms": poll_s * 1000, "attempt_timeout_ms": int(os.environ.get("COLDSTART_ATTEMPT_TIMEOUT_MS", "100")), "runs": runs}, f, indent=1)
         os.replace(out + ".tmp", out)
         print(f"restart {i}: {rec}", flush=True)
         if rec.get("error"):

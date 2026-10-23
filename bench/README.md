@@ -85,10 +85,12 @@ warm-up at the same rate (different picks) that is discarded, and a window in wh
   checked non-2xx/3xx and transport failures only).
 - **Cold start** — milliseconds from the container process start (`docker inspect
   .State.StartedAt`) to the first authenticated `200` on `GET /UserViews` (the home-screen
-  query), polled every 10 ms, on a *restart* of a server that had already booted this
-  data, with host caches retained; stop completes before the poller starts, and polling
-  begins before `docker start`; stop duration and first provisioning/adoption are excluded,
-  and the median of 5 restarts is the run's number, not full-screen rendering.
+  query), polled every 10 ms with each attempt's connect abandoned after
+  `COLDSTART_ATTEMPT_TIMEOUT_MS` (the response is not cut short), on a *restart* of a
+  server that had already booted this data, with host caches retained; stop completes
+  before the poller starts, and polling begins before `docker start`; stop duration and
+  first provisioning/adoption are excluded, and the median of 5 restarts is the run's
+  number, not full-screen rendering.
 - **HLS first segment** — milliseconds from `POST PlaybackInfo` (a device profile that
   cannot direct-play the file: vp9/webm only, 2 Mbps cap on an 8 Mbps h264 source; no
   subtitle) through `master.m3u8` and the variant playlist to the last byte of the first
@@ -133,11 +135,16 @@ tmdb/imdb ids), locally drawn posters/fanart/logos, and five ffmpeg-generated te
 clips cloned under every name (real streams, no disk cost). It includes 40 multi-version
 movies, 50 HDR10 4K files, 300 multi-track files and one 3-minute 8 Mbps movie for the
 streaming numbers. **Jellyfin 10.11.8 itself scans it** with every remote fetcher off and
-is seeded over its own API (two users; 30 % of movies and 60 % of forty series played,
-5 % favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
+is seeded over its own API (two users; 30 % of movies and 60 % of forty series played, 5 %
+favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
 config directory is what Ferrofin boots a fresh copy of. Jellyfin boots a copy of the
-separately prepared config described below. Ferrofin adoption stays inside the run;
-media is mounted read-only for every server.
+separately prepared config described below. Ferrofin adoption stays inside the run: after
+its isolation restart, each run asks Ferrofin for one full library scan, waits for it to
+complete (`scan.json`) and restarts the server, outside every measured phase. That is the
+equivalent of the scan the Jellyfin preparation gave its config, so album-artist people
+and library view images exist on both sides, and no scan heap is left in the memory
+numbers. `scan_policy: 1` in `run.json` keeps these runs from pooling with earlier ones.
+Media is mounted read-only for every server.
 
 ## Shared picks and bounded validation
 
@@ -216,7 +223,8 @@ it is not all-endpoint coverage or a deep-parity score.
 - Before each drain, the runner verifies that triggers remain empty, library monitoring/
   fetchers remain off, and plugin states still satisfy the policy. Tasks drain to idle
   plus a 30 s settle before measurements. Fixture creation and the explicit Jellyfin 12
-  preparation scan remain enabled outside benchmark runs.
+  preparation scan remain enabled outside benchmark runs, and Ferrofin's one explicit
+  library scan runs during provisioning, followed by a restart, before every measured phase.
 - Ferrofin runs as **core Ferrofin**, with every plugin/compiled-in extension disabled;
   WASM files in the disposable config are rejected. Installed Jellyfin plugins are also
   disabled. Jellyfin's non-uninstallable bundled providers (AudioDB, MusicBrainz, OMDb,
@@ -259,6 +267,7 @@ The limits are explicit environment tunables at the top of `run.sh`:
 | `STREAM_HTTP_TIMEOUT_S` | 120 | each streaming HTTP request |
 | `PHASE_TIMEOUT_S` | 600 | each k6 or Python measurement client invocation |
 | `CLEANUP_TIMEOUT_S` | 30 | client/sampler termination and owned container removal |
+| `COLDSTART_ATTEMPT_TIMEOUT_MS` | 100 | the connect of each cold-start readiness attempt; a connect that stalls while the port comes up is abandoned instead of waiting out TCP's 1 s SYN retransmit, and the response keeps `HTTP_TIMEOUT_S` (runs before this setting bounded the whole attempt by 1 s and do not pool with newer ones) |
 | `SAMPLE_BRACKET_INTERVALS` | 2 | maximum distance from a window boundary to its bracketing sample |
 | `SAMPLE_GAP_INTERVALS` | 5 | maximum gap within that sample span |
 
@@ -266,7 +275,8 @@ These settings are recorded and checked before aggregation. Client process group
 TERM, then KILL if needed; container cleanup uses the ID created by this run. k6 retains
 its bounded default HTTP request timeout, with the outer client limit above. A drain can
 finish its last bounded HTTP call before reporting timeout. Fixture task drain/export
-uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes occur.
+uses `PREPARE_TIMEOUT_S` (1800 by default), and so does Ferrofin's in-run library
+scan. No global cleanup or host changes occur.
 
 The sampler saves `cpu_usec` beside its interval utilization fields. Sample timestamps
 retain sub-millisecond precision so catch-up observations do not collide through rounding.
@@ -284,7 +294,7 @@ validation, not full decoding or sustained playback evidence.
 | instrument | known answer | measured |
 |---|---|---|
 | memory sampler (`mem_sample.py`) | a container that allocates and touches exactly 512 MiB | 515.2 MiB anon (interpreter overhead ≈ 3 MiB), identical across 80 samples |
-| restart timer (`coldstart.py`) | a container sleeps 3.000 s before serving authenticated-view probes | 3,162–3,168 ms over 3 restarts; polling was active 55–58 ms before process start; Python startup accounts for the additional time |
+| restart timer (`coldstart.py`) | a container sleeps 3.000 s before serving authenticated-view probes | 3,144–3,190 ms over 3 restarts, re-measured with the 100 ms connect bound; polling was active 42–57 ms before process start; Python startup accounts for the additional time |
 | cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 
@@ -431,7 +441,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab` or `ramp` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp` or `soak` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -446,9 +456,11 @@ runs of different harnesses are never compared. If a benchmark run directory hol
 `improved`, and `reason` saying why a cell was not comparable), its
 `report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
 the blocking ones first; a malformed file is an error, not an omitted section. When several runs are rendered together the
-file of the first run that has one is used. `gate.py ab` (and `gate.py render`) writes the
-session's gated cells into every candidate run and rewrites that run's `report.html`, since a
-`report.html` written before the file existed does not show it.
+file of the first run that has one is used. `gate.py ab`, `ramp` and `soak` (and `gate.py
+render` of such a session) write the session's gated cells into every candidate run and
+rewrite that run's `report.html`, since a `report.html` written before the file existed does
+not show it. A soak cell's rule is a slope limit rather than a percentage, so its Change
+column shows `—`.
 
 On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the

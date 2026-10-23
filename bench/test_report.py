@@ -218,7 +218,8 @@ class ReportTests(unittest.TestCase):
     def test_mixed_conditions_and_images_are_rejected(self):
         original = json.loads((self.b / 'run.json').read_text())
         for key, value in [('rate_loaded', 50), ('window_s', 5), ('memory_limit', '1g'),
-                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1)]:
+                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1),
+                           ('scan_policy', 1)]:
             with self.subTest(key=key):
                 self.write(self.b / 'run.json', {**original, key: value})
                 with self.assertRaisesRegex(ValueError, key):
@@ -349,6 +350,11 @@ class ReportTests(unittest.TestCase):
         self.edit(self.a / 'run.json', lambda x: x.update(restarts=1))
         self.edit(self.a / 'ferrofin/coldstart.json', lambda x: x.update(runs=x['runs'][:1]))
         self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
+
+    def test_cold_start_attempt_bound_separates_run_sets(self):
+        self.assertFalse(report.incompatible([str(self.a), str(self.b)]))
+        self.edit(self.a / 'run.json', lambda x: x.update(coldstart_attempt_timeout_ms=100))
+        self.assertIn('coldstart_attempt_timeout_ms', report.incompatible([str(self.a), str(self.b)]))
 
     def test_swapped_counts_between_request_keys_fail(self):
         for server, counts in [('jellyfin', [1, 2]), ('ferrofin', [2, 1])]:
@@ -582,6 +588,21 @@ class PreparationTests(unittest.TestCase):
         api.post.assert_called_once_with('/Library/Refresh')
         self.assertEqual(api.get.call_count, 4)
         self.assertEqual(sleep.call_count, 2)
+
+    @patch.object(seed.time, 'sleep')
+    def test_in_run_scan_waits_for_startup_tasks_then_records_the_completed_scan(self, sleep):
+        # Ferrofin gets the same one full scan the Jellyfin preparation gave its config.
+        done = self.task(end='2026-09-15T01:00:00Z')
+        api = Mock()
+        api.get.side_effect = [[{'Name': 'startup', 'State': 'Running'}], [self.task()],  # draining
+                               [self.task()], done]                                       # the scan
+        with tempfile.TemporaryDirectory() as tmp, patch.object(seed, 'Api', return_value=api):
+            ids, out = Path(tmp)/'ids.json', Path(tmp)/'scan.json'
+            ids.write_text(json.dumps({'token': 't'}))
+            seed.scan_library('http://server', str(ids), str(out))
+            self.assertEqual(json.loads(out.read_text())['scan'], done['LastExecutionResult'])
+        self.assertEqual(api.token, 't')
+        api.post.assert_called_once_with('/Library/Refresh')
 
     def test_failed_scan_is_not_ready(self):
         api = Mock()
@@ -1111,6 +1132,34 @@ class InstrumentTests(unittest.TestCase):
                 coldstart.restart('owned','http://localhost',{},.01)
         self.assertTrue(finished.is_set())
 
+    def test_only_the_readiness_connect_is_bounded_by_the_attempt_timeout(self):
+        # A stalled connect must not hold the next attempt back for the whole TCP retransmit,
+        # but a slow first response is still the server's first response.
+        import threading
+        connects, reads, paths = [], [], []
+        class Conn:
+            def __init__(self, host, port, timeout):
+                connects.append(timeout)
+                self.sock = Mock(settimeout=reads.append)
+            def connect(self):
+                if len(connects) == 1:
+                    raise TimeoutError('stalled SYN')
+            def request(self, method, path, headers): paths.append(path)
+            def getresponse(self): return Mock(status=200)
+            def close(self): pass
+        with patch.dict(os.environ, {'COLDSTART_ATTEMPT_TIMEOUT_MS': '100', 'HTTP_TIMEOUT_S': '10'}), \
+             patch.object(coldstart.http.client, 'HTTPConnection', Conn):
+            self.assertIsNotNone(coldstart.poll('http://localhost:1/UserViews?userId=u', {}, 300, .001,
+                                                threading.Event(), threading.Event()))
+        self.assertEqual(connects, [.1, .1])
+        self.assertEqual(reads, [10.0])
+        self.assertEqual(paths, ['/UserViews?userId=u'])
+        connects.clear(); reads.clear()
+        with patch.dict(os.environ, {'COLDSTART_ATTEMPT_TIMEOUT_MS': '100', 'HTTP_TIMEOUT_S': '10'}), \
+             patch.object(coldstart.http.client, 'HTTPConnection', Conn):
+            coldstart.poll('http://localhost:1/UserViews?userId=u', {}, .05, .001, threading.Event(), threading.Event())
+        self.assertEqual((connects, reads), ([.05, .05], [.05]))  # neither bound outlasts the deadline
+
     def test_restart_poller_is_running_before_start_and_joined(self):
         import threading
         events=[]
@@ -1314,7 +1363,7 @@ class GateTests(unittest.TestCase):
             (out / name / 'report.html').write_text('<p>written by run.sh</p>')
         gate.render(str(out))
         runs = [n for n, _ in report.discover('benchmark', str(self.root))]
-        self.assertEqual(sorted(runs), [f'gate-ab/0{i}-{r}' for i, r in zip(range(1, 7), 'ababab')])
+        self.assertEqual(sorted(runs), ['gate-ab'] + [f'gate-ab/0{i}-{r}' for i, r in zip(range(1, 7), 'ababab')])
         status, tab = self.viewer('/benchmark')
         self.assertEqual(status, 200)
         self.assertIn("href='/report/benchmark/gate-ab/02-b'", tab)
@@ -1396,6 +1445,20 @@ class GateTests(unittest.TestCase):
         rows = json.loads((self.root / 'self' / 'verdict.json').read_text())['verdicts']
         self.assertEqual({r['verdict'] for r in rows.values()}, {'within noise'})
         self.assertEqual(set(rows), {c[0] for c in gate.SCAN_CELLS})
+
+    def test_a_rendered_gate_session_is_listed_with_its_own_report(self):
+        out = self.scan_session('gate-scan', [100, 100, 100])
+        self.assertEqual(report.discover('benchmark', str(self.root)), [])  # not rendered yet: nothing to open
+        gate.render(str(out))
+        listed = report.discover('benchmark', str(self.root))
+        self.assertEqual([n for n, _ in listed], ['gate-scan'])  # its runs hold scan.json, not run.json
+        self.assertIn('gate scan', listed[0][1])
+        status, tab = self.viewer('/benchmark')
+        self.assertIn("href='/report/benchmark/gate-scan'", tab)
+        status, page = self.viewer('/report/benchmark/gate-scan')
+        self.assertEqual(status, 200)
+        self.assertEqual(page, (out / 'report.html').read_text())
+        self.assertIn('scan/wall time', page)
 
     def test_scan_session_without_a_measurement_is_a_readable_error(self):
         out = self.scan_session('partial', [100, 100, 100])

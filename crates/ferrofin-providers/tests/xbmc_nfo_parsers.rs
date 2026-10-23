@@ -13,11 +13,13 @@ use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::entities::{ImageType, SeriesStatus, Video3DFormat};
 
 use ferrofin_providers::container_types::{FileSystemMetadata, MetadataResult};
+use ferrofin_providers::xbmc::base_parser::FetchError;
 use ferrofin_providers::xbmc::base_parser::{DirectoryService, NoDirectoryService};
 use ferrofin_providers::xbmc::config::NfoConfiguration;
 use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
 use ferrofin_providers::xbmc::{
-    StaticExternalIds, fetch_episode, fetch_movie, fetch_season, fetch_series, new_result,
+    StaticExternalIds, fetch_episode, fetch_movie, fetch_music, fetch_season, fetch_series,
+    new_result,
 };
 
 const TICKS_PER_SECOND: i64 = 10_000_000;
@@ -850,4 +852,126 @@ fn person_type_parses_like_enum_try_parse() {
             ("Empty", PersonKind::Unknown),
         ]
     );
+}
+
+/// `MovieNfoParser`'s `Fetch` (the `SupportsUrlAfterClosingXmlTag` path)
+/// swallows `XmlException`, so one malformed spot keeps every element read
+/// before it: here a bare `&` in `<plot>` keeps the title and the pinned
+/// TMDb id, and neither the plot nor anything after it.
+#[test]
+fn a_malformed_movie_nfo_keeps_the_elements_before_the_error() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "movie.nfo",
+        "<movie><title>Ronin</title><tmdbid>8195</tmdbid>\
+         <plot>Tom & Jerry</plot><year>1998</year></movie>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name.as_deref(), Some("Ronin"));
+    assert_eq!(get_provider_id(&result.item, "Tmdb"), Some("8195"));
+    assert_eq!(result.item.overview, None, "the element with the error");
+    assert_eq!(result.item.production_year, None, "nothing after it");
+}
+
+/// `EpisodeNfoParser.Fetch` swallows `XmlException` too: an `&nbsp;` (not an
+/// XML entity) in a late `<actor>` keeps the fields before it, and the actor
+/// it sits in is not added.
+#[test]
+fn a_malformed_episode_nfo_keeps_the_elements_before_the_error() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "episode.nfo",
+        "<episodedetails><title>Pilot</title><season>1</season><episode>2</episode>\
+         <actor><name>Ann&nbsp;Lee</name></actor></episodedetails>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name.as_deref(), Some("Pilot"));
+    assert_eq!(result.item.index_number, Some(2));
+    assert!(result.people.unwrap_or_default().is_empty());
+}
+
+/// The plain `Fetch` (`SeasonNfoParser`, and the album/artist parsers) does not
+/// catch `XmlException`: it reaches the provider, whose result is not used,
+/// so a malformed season NFO is a failed fetch rather than an empty success.
+#[test]
+fn a_malformed_season_nfo_is_a_failed_fetch() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Season);
+    let fetched = fetch_season(
+        &mut result,
+        "season.nfo",
+        "<season><title>Season 1</title><plot>a & b</plot></season>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    );
+    assert!(fetched.is_err(), "{fetched:?}");
+}
+
+/// `SeriesNfoParser` shares the movie's swallowing path: the elements before a
+/// malformed spot stand.
+#[test]
+fn a_malformed_series_nfo_keeps_the_elements_before_the_error() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Series);
+    fetch_series(
+        &mut result,
+        "tvshow.nfo",
+        "<tvshow><title>Show</title><plot>a &nbsp; b</plot><year>2001</year></tvshow>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name.as_deref(), Some("Show"));
+    assert_eq!(result.item.overview, None);
+    assert_eq!(result.item.production_year, None);
+}
+
+/// An `album.nfo`/`artist.nfo` reads through the plain `Fetch`, which does not
+/// recover from a malformed document.
+#[test]
+fn a_malformed_music_nfo_is_a_failed_fetch() {
+    let external_ids = StaticExternalIds::new(["MusicBrainzAlbum"]);
+    let mut result = new_result(NfoItemKind::MusicAlbum);
+    let fetched = fetch_music(
+        &mut result,
+        "album.nfo",
+        "<album><title>Kind of Blue</title><review>A & B</review></album>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    );
+    assert_eq!(fetched, Err(FetchError::MalformedXml));
+}
+
+/// With several `<episodedetails>` blocks, C# parses them all before merging,
+/// inside one `catch (XmlException)`: a malformed block ends the read before
+/// anything reaches the item.
+#[test]
+fn a_malformed_block_of_a_multi_episode_nfo_merges_nothing() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "episode.nfo",
+        "<episodedetails><title>One</title><episode>1</episode></episodedetails>\
+         <episodedetails><title>Two & a half</title><episode>2</episode></episodedetails>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name, None);
+    assert_eq!(result.item.index_number, None);
 }

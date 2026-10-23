@@ -12,21 +12,22 @@ use ferrofin_model::dto::SessionInfoDto;
 use ferrofin_traits::options::AuthorizationInfo;
 
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
 
 /// Resolves (and logs activity for) the caller's current session.
 ///
-/// Mirrors C# `RequestHelpers.GetSession`: resolve the authenticated user, then
+/// Mirrors C# `RequestHelpers.GetSession`: resolve the caller's user when it
+/// has one (`if (!userId.IsNullOrEmpty()) user = GetUserById(userId)`), then
 /// `LogSessionActivity` with the client/device fields from the request's
-/// [`AuthorizationInfo`]. A caller with no resolvable user is a `400` (via
-/// [`resolve_user`]); a session the manager cannot open surfaces its
-/// `ServiceError`.
+/// [`AuthorizationInfo`] and that user, possibly none. So an API key, which
+/// has no user, gets a user-less session and the request goes on. A session
+/// the manager cannot open surfaces its `ServiceError`.
 pub(crate) async fn current_session(
     state: &AppState,
     auth: &AuthorizationInfo,
 ) -> Result<SessionInfoDto, ApiError> {
-    let user = resolve_user(state, auth, None).await?;
+    let user = resolve_user_opt(state, auth, None).await?;
     let session = state
         .sessions
         .log_session_activity(
@@ -40,7 +41,7 @@ pub(crate) async fn current_session(
             // passing "" would blank the value the login recorded, because
             // `upsert_session` writes this field unconditionally.
             auth.remote_endpoint.as_deref().unwrap_or_default(),
-            Some(&user),
+            user.as_ref(),
         )
         .await?;
     Ok(session)
@@ -55,30 +56,4 @@ pub(crate) async fn current_session_id(
     session
         .id
         .ok_or_else(|| ApiError::NotFound("Session not found.".to_owned()))
-}
-
-/// Pushes a `UserDataChanged` message to every session of `user_id`, so the
-/// user's other signed-in devices refresh the item's play-state (resume
-/// position, played/favorite flags) live. Port of Jellyfin's
-/// `UserDataChangedNotifier`, which fires on every user-data save.
-/// Best-effort: a delivery failure must not fail the mutating request.
-pub(crate) async fn notify_user_data_changed(
-    state: &AppState,
-    user_id: uuid::Uuid,
-    dto: &ferrofin_model::dto::UserItemDataDto,
-) {
-    let info = ferrofin_model::session::UserDataChangeInfo {
-        user_id,
-        user_data_list: vec![dto.clone()],
-    };
-    if let Ok(data) = serde_json::to_string(&info) {
-        let _ = state
-            .sessions
-            .send_message_to_user_sessions(
-                &[user_id],
-                ferrofin_model::session::SessionMessageType::UserDataChanged,
-                &data,
-            )
-            .await;
-    }
 }

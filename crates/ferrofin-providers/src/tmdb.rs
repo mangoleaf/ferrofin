@@ -1382,6 +1382,44 @@ pub struct TmdbClient {
     image_root: Option<String>,
 }
 
+/// The TMDb settings page's unaired/missing episode options
+/// ([`TmdbClient::missing_episode_settings`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissingEpisodeSettings {
+    /// `ImportUnairedEpisodes`: create virtual episodes not aired yet.
+    pub import_unaired: bool,
+    /// `ImportMissingEpisodes`: create virtual episodes that aired but are
+    /// not in the library.
+    pub import_missing: bool,
+    /// `ImportSpecials`: include season 0.
+    pub import_specials: bool,
+    /// `EnabledMissingEpisodeLibraries`: the opted-in libraries' item ids.
+    pub enabled_libraries: Vec<String>,
+    /// `MissingEpisodeRefreshIntervalDays`: the scheduled task's interval.
+    pub refresh_interval_days: i32,
+    /// `UpcomingEpisodeGracePeriodDays`: how long a recently aired
+    /// episode's placeholder stays while missing episodes are off.
+    pub grace_period_days: i32,
+}
+
+impl MissingEpisodeSettings {
+    /// Whether either option is on (`importUnaired || importMissing`).
+    #[must_use]
+    pub fn imports(&self) -> bool {
+        self.import_unaired || self.import_missing
+    }
+
+    /// Whether library `library_id` is opted in (`IsEnabledForLibrary`:
+    /// its `N`-form id among the opted-in ones, ignoring case).
+    #[must_use]
+    pub fn library_enabled(&self, library_id: uuid::Uuid) -> bool {
+        let id = library_id.simple().to_string();
+        self.enabled_libraries
+            .iter()
+            .any(|enabled| enabled.eq_ignore_ascii_case(&id))
+    }
+}
+
 impl Default for TmdbClient {
     fn default() -> Self {
         Self::new()
@@ -1446,6 +1484,61 @@ impl TmdbClient {
     /// the name its folder or the season-zero setting gives it).
     pub async fn import_season_name(&self) -> bool {
         self.settings().await.import_season_name
+    }
+
+    /// The TMDb settings page's unaired/missing episode options, which
+    /// `TmdbMissingEpisodeProvider` and `TmdbUpcomingEpisodesTask` read
+    /// (`PluginConfiguration.cs:43-81`); per call, as every setting is.
+    pub async fn missing_episode_settings(&self) -> MissingEpisodeSettings {
+        let cfg = self.settings().await;
+        MissingEpisodeSettings {
+            import_unaired: cfg.import_unaired_episodes,
+            import_missing: cfg.import_missing_episodes,
+            import_specials: cfg.import_specials,
+            enabled_libraries: cfg.enabled_missing_episode_libraries,
+            refresh_interval_days: cfg.missing_episode_refresh_interval_days,
+            grace_period_days: cfg.upcoming_episode_grace_period_days,
+        }
+    }
+
+    /// The season numbers TMDb lists for series `tmdb_id` (`TvShow.Seasons`,
+    /// which `TmdbMissingEpisodeProvider` walks); [`None`] when the request
+    /// fails or TMDb has no such series.
+    pub async fn series_season_numbers(
+        &self,
+        tmdb_id: i64,
+        language: Option<&str>,
+    ) -> Option<Vec<i32>> {
+        #[derive(Deserialize)]
+        struct Series {
+            #[serde(default)]
+            seasons: Vec<Season>,
+        }
+        #[derive(Deserialize)]
+        struct Season {
+            season_number: i32,
+        }
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
+        let req = self
+            .http
+            .get(format!("{}/tv/{tmdb_id}", self.base_url))
+            .query(&[("api_key", key)]);
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let series = resp.counted_json::<Series>().await.ok()?;
+        Some(
+            series
+                .seasons
+                .into_iter()
+                .map(|s| s.season_number)
+                .collect(),
+        )
     }
 
     /// Points the artwork URLs at a different image root than TMDb's CDN
@@ -2519,10 +2612,9 @@ impl TmdbClient {
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", cfg.api_key(self.api_key.expose_secret())),
-                (
-                    "append_to_response",
-                    "images,external_ids,tv_credits,movie_credits",
-                ),
+                // `PersonMethods.Images | PersonMethods.ExternalIds`: Jellyfin
+                // 12.1 dropped the credits, which nothing reads.
+                ("append_to_response", "images,external_ids"),
             ]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
@@ -2558,10 +2650,9 @@ impl TmdbClient {
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", key),
-                (
-                    "append_to_response",
-                    "images,external_ids,tv_credits,movie_credits",
-                ),
+                // `PersonMethods.Images | PersonMethods.ExternalIds`: Jellyfin
+                // 12.1 dropped the credits, which nothing reads.
+                ("append_to_response", "images,external_ids"),
             ]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
@@ -2948,6 +3039,21 @@ mod tests {
         assert!(!values[5].contains_key("include_image_language"));
         assert_eq!(values[6].get("language").map(String::as_str), Some("fr-CA"));
         assert!(!values[6].contains_key("include_image_language"));
+        // Jellyfin 12.1 (jellyfin/jellyfin#17973) asks for a person's images
+        // and external ids only: nothing reads the credits it used to append.
+        let person_requests: Vec<_> = seen
+            .iter()
+            .zip(&values)
+            .filter(|(path, _)| path.starts_with("/person/"))
+            .collect();
+        assert_eq!(person_requests.len(), 4, "{seen:?}");
+        for (path, query) in person_requests {
+            assert_eq!(
+                query.get("append_to_response").map(String::as_str),
+                Some("images,external_ids"),
+                "{path}"
+            );
+        }
     }
 
     /// Source metadata clients append Images and use the same exact normalized

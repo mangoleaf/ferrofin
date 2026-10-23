@@ -35,7 +35,7 @@ use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::UserViewManager;
+use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, UserViewManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
@@ -356,6 +356,8 @@ pub struct FerrofinLiveTvManager {
     /// root builds the application host *after* this manager, and every clone
     /// must see it once it lands.
     local_api: Arc<OnceLock<Arc<dyn LocalApiAccess>>>,
+    /// The server's local-network check, shared with the M3U tuner host.
+    local_network: Arc<OnceLock<crate::stream::LocalNetworkCheck>>,
     /// The open live streams, keyed by `LiveStreamId` (C#
     /// `MediaSourceManager._openStreams`, whose values are the tuner-side
     /// `ILiveStream`s). Guarded by a `std::sync::Mutex`: the guard is always
@@ -376,6 +378,13 @@ pub struct FerrofinLiveTvManager {
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
+    /// Brackets each recording as it is written, so a recording inside a
+    /// watched library is not rescanned mid-write (`RecordingsManager`'s
+    /// `ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
+    /// The NFO options' `ReleaseDateFormat`, for a recording's sidecar NFO
+    /// ([`with_release_date_format`](Self::with_release_date_format)).
+    release_date_format: crate::recording_metadata::ReleaseDateFormat,
     /// Serializes "join or open", so two clients tuning the same channel at
     /// once cannot both miss the join and both dial the tuner.
     ///
@@ -662,9 +671,13 @@ impl FerrofinLiveTvManager {
         // then M3U. The ORDER of registration is not the advertised order —
         // `GetTunerHostTypes` sorts by name — but keeping it identical means a
         // future first-match rule cannot silently diverge.
+        let local_network = Arc::new(OnceLock::new());
         let hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>> = vec![
             Arc::new(crate::hdhomerun::HdHomerunHost::new(Arc::clone(&fetcher))),
-            Arc::new(crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))),
+            Arc::new(
+                crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))
+                    .sharing_local_network(Arc::clone(&local_network)),
+            ),
         ];
         let schedules_direct = SchedulesDirect::new(fetcher, cache_dir);
         Self {
@@ -679,16 +692,39 @@ impl FerrofinLiveTvManager {
             paths: LiveTvPaths::default(),
             tuner_source: Arc::new(crate::stream::ReqwestTunerSource::new()),
             local_api: Arc::new(OnceLock::new()),
+            local_network,
             live_streams: Arc::new(Mutex::new(HashMap::new())),
             active_recordings: Arc::new(Mutex::new(HashMap::new())),
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
+            self_writes: None,
+            release_date_format: crate::recording_metadata::default_release_date_format(),
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             schedules_direct,
             xmltv,
         }
+    }
+
+    /// Brackets each recording on `guard` from the moment its file is chosen
+    /// until it is settled, as `RecordingsManager.RecordStream` does. Called
+    /// once by the composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
+    }
+
+    /// Gives the M3U tuner host the server's local-network check
+    /// (`NetworkManager.IsInLocalNetwork(string)`), which decides whether a
+    /// channel's source is remote. Without it, only private IP literals count
+    /// as local.
+    #[must_use]
+    pub fn with_local_network(self, check: crate::stream::LocalNetworkCheck) -> Self {
+        // Set once, before the manager is shared; a second call keeps the first.
+        let _ = self.local_network.set(check);
+        self
     }
 
     /// Attaches the media encoder the encoded recorder runs ffmpeg through.
@@ -698,6 +734,18 @@ impl FerrofinLiveTvManager {
     #[must_use]
     pub fn with_encoder(mut self, encoder: Arc<dyn MediaEncoder>) -> Self {
         self.encoder = Some(encoder);
+        self
+    }
+
+    /// Writes a recording NFO's dates in the NFO options' `ReleaseDateFormat`
+    /// (the `xbmcmetadata` named configuration). Without one they are written
+    /// `yyyy-MM-dd`, that option's default.
+    #[must_use]
+    pub fn with_release_date_format(
+        mut self,
+        format: crate::recording_metadata::ReleaseDateFormat,
+    ) -> Self {
+        self.release_date_format = format;
         self
     }
 
@@ -831,24 +879,28 @@ impl FerrofinLiveTvManager {
             .iter()
             .map(|row| (row.id.to_uppercase(), row))
             .collect();
-        let mut save: Vec<BaseItemEntity> = Vec::new();
+        let mut created: Vec<BaseItemEntity> = Vec::new();
+        let mut updated: Vec<BaseItemEntity> = Vec::new();
         for row in &rows {
             let fresh = channel_entity(row, parse_dt, view_id);
             match by_id.get(&fresh.id.to_uppercase()) {
                 // `isNew` — the item did not exist, so `CreateItem` stores it
                 // whole.
-                None => save.push(fresh),
+                None => created.push(fresh),
                 // `forceUpdate` — the item exists, so only the fields the
                 // refresh owns are assigned onto the STORED row, and it is
                 // written back only if one of them actually changed. Writing
                 // `fresh` here instead would be a full-column upsert that
                 // reverts everything the metadata editor put on a channel.
-                Some(prev) => save.extend(channel_item_update(prev, &fresh)),
+                Some(prev) => updated.extend(channel_item_update(prev, &fresh)),
             }
         }
-        if !save.is_empty() {
-            store.persistence.save_items(&save).await?;
+        for batch in [&created, &updated] {
+            if !batch.is_empty() {
+                store.persistence.save_items(batch).await?;
+            }
         }
+        Self::reattach_channel_user_data(store, &created).await;
         // `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)`
         // (:145-148). The upstream guard is the `cleanDatabase` flag, which
         // ONLY a thrown `RefreshChannelsInternal` clears (:130-134) — an
@@ -879,6 +931,36 @@ impl FerrofinLiveTvManager {
             store.persistence.delete_items(&stale).await?;
         }
         Ok(())
+    }
+
+    /// Gives each channel item this guide refresh `created` back the user
+    /// data it parked on the deletion placeholder when it left the lineup.
+    ///
+    /// Upstream refreshes every channel (`GuideManager.cs:317`), and a created
+    /// item's first refresh re-attaches (`MetadataService.SaveItemAsync` with
+    /// `isFirstRefresh` → `ReattachUserDataAsync`). Ferrofin refreshes no
+    /// channel's metadata and never stamps its `DateLastRefreshed`, so the
+    /// item's creation stands in for that first refresh. Re-attaching every
+    /// unstamped channel would run on every refresh for all of them. A channel
+    /// that fails is skipped, as upstream catches each one; the failures are
+    /// logged once for the pass.
+    async fn reattach_channel_user_data(store: &LiveTvItemStore, created: &[BaseItemEntity]) {
+        let mut failed = 0_usize;
+        let mut first_error = None;
+        for entity in created {
+            if let Err(err) = store.persistence.reattach_user_data(entity).await {
+                tracing::debug!(item_id = %entity.id, %err, "live tv: could not re-attach a channel's user data");
+                failed += 1;
+                first_error.get_or_insert(err);
+            }
+        }
+        if let Some(err) = first_error {
+            tracing::warn!(
+                failed,
+                %err,
+                "live tv: could not re-attach the user data of some returning channels; the first error"
+            );
+        }
     }
 
     /// Mirrors the ingested guide into `BaseItems`.
@@ -2093,19 +2175,35 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // `Limit` must reach the query). The rows then project through the DTO
         // service exactly like `LiveTvManager.GetPrograms`: `RemoveFields` on
         // the list path, then the programme/recording post-passes.
-        // `SeriesTimerId` scopes the guide to one series timer's airings by the
-        // timer's `SeriesId`. Ferrofin's stored `SeriesTimerInfoDto` carries no
-        // series id, so the scope can never be built — and upstream is explicit
-        // about that case: "Better to return nothing than every program in the
-        // database" (`LiveTvManager.GetPrograms`), which is exactly what
-        // returning the unscoped guide would do.
-        if query
+        //
+        // `SeriesTimerId` scopes the guide to one series timer's airings: the
+        // timer whose internal id matches, ignoring case (stored ids are the
+        // lower-case `N` form), sets `ExternalSeriesId` to its `SeriesId`. An
+        // unknown timer, or one with no series id, answers nothing: "Better to
+        // return nothing than every program in the database".
+        let scoped;
+        let query = match query
             .series_timer_id
             .as_deref()
-            .is_some_and(|id| !id.trim().is_empty())
+            .filter(|id| !id.trim().is_empty())
         {
-            return Ok(QueryResult::default());
-        }
+            Some(id) => {
+                let series_id = self
+                    .stored_series_timer(&id.to_ascii_lowercase())
+                    .await?
+                    .and_then(|timer| timer.series_id)
+                    .filter(|series_id| !series_id.trim().is_empty());
+                let Some(series_id) = series_id else {
+                    return Ok(QueryResult::default());
+                };
+                scoped = InternalItemsQuery {
+                    external_series_id: Some(series_id),
+                    ..query.clone()
+                };
+                &scoped
+            }
+            None => query,
+        };
 
         // One clock for both the row query and the count query: an
         // `isAiring`/`hasAired` request must not see a programme flip state
@@ -4036,15 +4134,25 @@ impl FerrofinLiveTvManager {
         info: TimerRecordingInfo,
     ) -> Result<(), ServiceError> {
         let options = self.live_tv_options().await;
-        let (target, _series_path) =
+        let (target, series_path) =
             crate::dvr::recording_path(&info, &options, &self.paths.data_dir);
         let target = {
             let active: Vec<ActiveRecording> =
                 self.active_recordings_lock().values().cloned().collect();
             crate::dvr::ensure_file_unique(&target, &info.id, &active)
         };
+        // `ReportFileSystemChangeBeginning(recordingPath)`, completed once the
+        // empty-file cleanup and the refresh are done (`RecordingsManager.cs:342,400`).
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), target.to_string_lossy());
 
-        let capture = self.capture(&mut timer, &info, &target).await;
+        let capture = self
+            .capture(
+                &mut timer,
+                &info,
+                &target,
+                (series_path.as_deref(), &options),
+            )
+            .await;
         let (recording_id, outcome) = match capture {
             Ok(captured) => captured,
             // Nothing was ever opened or registered, so there is nothing to
@@ -4072,6 +4180,7 @@ impl FerrofinLiveTvManager {
         timer: &mut TimerInfoDto,
         info: &TimerRecordingInfo,
         target: &std::path::Path,
+        sidecars: (Option<&std::path::Path>, &LiveTvOptions),
     ) -> Result<(Option<Uuid>, Result<(), ServiceError>), ServiceError> {
         // The tuner source, opened if it needs opening.
         let sources = self.get_channel_media_sources(info.channel_id).await?;
@@ -4094,7 +4203,9 @@ impl FerrofinLiveTvManager {
 
         // From here on the tuner is open: every exit goes through
         // `finish_capture`, which closes it and de-registers.
-        let started = self.start_capture(timer, info, target, &opened).await;
+        let started = self
+            .start_capture(timer, info, target, &opened, sidecars)
+            .await;
         let (recording_id, outcome) = match started {
             Ok((recording_id, cancel)) => {
                 let outcome = self
@@ -4117,6 +4228,7 @@ impl FerrofinLiveTvManager {
         info: &TimerRecordingInfo,
         target: &std::path::Path,
         opened: &MediaSourceInfo,
+        (series, options): (Option<&std::path::Path>, &LiveTvOptions),
     ) -> Result<(Uuid, Arc<std::sync::atomic::AtomicBool>), ServiceError> {
         let _ = opened;
         let recording_id = Uuid::new_v4();
@@ -4134,6 +4246,42 @@ impl FerrofinLiveTvManager {
             .insert(info.id.clone(), recording);
         timer.status = RecordingStatus::InProgress;
         self.persist_timer(timer).await?;
+        // `SaveRecordingMetadata`, which upstream's `async void OnStarted`
+        // runs without the recorder waiting on it. A failure is logged, as
+        // its catch-all logs it: a sidecar never fails a recording.
+        if options.save_recording_nfo {
+            let info = info.clone();
+            let target = target.to_path_buf();
+            let series = series.map(std::path::Path::to_path_buf);
+            let release_date = Arc::clone(&self.release_date_format);
+            let span = tracing::info_span!("recording_nfo", timer_id = %info.id);
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(error) = crate::recording_metadata::save_recording_nfo(
+                        &info,
+                        &target,
+                        series.as_deref(),
+                        &release_date,
+                        Utc::now(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            path = %target.display(),
+                            %error,
+                            "live tv: could not save the recording's NFO"
+                        );
+                    }
+                },
+                span,
+            ));
+        }
+        // TODO(parity, open work item — NOT an accepted divergence; gl-749):
+        // with `save_recording_images`, upstream also copies the programme's
+        // artwork beside the recording (`SaveRecordingImages`), but the guide
+        // carries no programme images yet (gl-367). Un-defer path: once it
+        // does, port `SaveRecordingImages` into `recording_metadata` and call
+        // it here, gated on that option.
         Ok((recording_id, cancel))
     }
 
@@ -4429,7 +4577,7 @@ impl FerrofinLiveTvManager {
         let opened = match kind {
             crate::tuner_host::ChannelStreamKind::LegacyUdp(plan) => {
                 let base_url = self.local_api_url().await?;
-                let transcode_dir = self.transcode_dir()?;
+                let transcode_dir = self.transcode_dir().await?;
                 Some((
                     crate::hdhomerun::udp_stream::open_legacy_udp_stream(
                         plan,
@@ -4447,7 +4595,7 @@ impl FerrofinLiveTvManager {
                     && self.can_share_stream(path, source).await;
                 if share {
                     let base_url = self.local_api_url().await?;
-                    let transcode_dir = self.transcode_dir()?;
+                    let transcode_dir = self.transcode_dir().await?;
                     Some((
                         crate::stream::open_shared_http_stream(
                             self.tuner_source.as_ref(),
@@ -4569,21 +4717,16 @@ impl FerrofinLiveTvManager {
         }
     }
 
-    /// The directory a shared live stream's buffer is written to.
-    fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
+    /// The directory a shared live stream's buffer is written to, prepared on
+    /// the blocking pool: the preparation walks the whole transcode tree.
+    async fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
         let path = self.paths.transcode_dir.resolve();
         if path.as_os_str().is_empty() {
             return Err(ServiceError::Backend(
                 "live tv transcode path not wired".to_owned(),
             ));
         }
-        ferrofin_util::directory_path::prepare_transcode_directory(&path).map_err(|error| {
-            ServiceError::backend(format!(
-                "prepare transcode directory {}: {error}",
-                path.display()
-            ))
-        })?;
-        Ok(path)
+        ferrofin_traits::system::prepare_transcode_directory_off_runtime(path).await
     }
 
     /// The API base URL a live stream's buffered file is served from.
@@ -4712,10 +4855,8 @@ fn push_program_filters(
                 .push_bind(now_db)
                 .push(")");
         } else {
-            // Accepted divergence: upstream writes `StartDate > now && EndDate
-            // < now`, a contradiction that can never match a programme, so
-            // `isAiring=false` upstream returns nothing at all. Ferrofin reads
-            // it as the negation that was plainly meant.
+            // Not on now: `StartDate > now || EndDate < now`, as v12.2's
+            // `TranslateQuery` has it since jellyfin/jellyfin#17588.
             qb.push(r#"(p."StartDate" > "#)
                 .push_bind(now_db.clone())
                 .push(r#" OR p."EndDate" < "#)
@@ -4745,11 +4886,12 @@ fn push_program_filters(
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
-        // Upstream compares against the item's CleanName; the guide cache has
-        // no cleaned column, so this is a case-insensitive title match.
+        // Upstream compares the item's CleanName with `GetCleanValue(name)`
+        // (`TranslateQuery.cs:476-477`); the guide cache has no cleaned
+        // column, so the title is cleaned here.
         push_separator(qb, &mut first);
-        qb.push(r#"LOWER(p."Title") = "#)
-            .push_bind(name.to_lowercase());
+        qb.push(r#"ferrofin_clean_value(p."Title") = "#)
+            .push_bind(ferrofin_util::string_extensions::get_clean_value(name));
     }
 
     for (column, wanted) in [
@@ -4767,12 +4909,15 @@ fn push_program_filters(
 
     if !query.genres.is_empty() {
         // `Genres` holds the XMLTV `<category>` list as a JSON array; upstream
-        // matches any one of the requested genres.
+        // matches any one of the requested genres by clean value
+        // (`TranslateQuery.cs:658-662`).
         push_separator(qb, &mut first);
-        qb.push(r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE LOWER("value") IN ("#);
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE ferrofin_clean_value("value") IN ("#,
+        );
         let mut list = qb.separated(",");
         for genre in &query.genres {
-            list.push_bind(genre.to_lowercase());
+            list.push_bind(ferrofin_util::string_extensions::get_clean_value(genre));
         }
         qb.push("))");
     }
@@ -5341,6 +5486,12 @@ fn apply_program_to_recording_info(program: &GuideProgramRow, info: &mut TimerRe
     info.is_repeat = program.is_repeat;
     info.is_premiere = program.is_premiere;
     info.external_program_id.clone_from(&program.external_id);
+    info.genres = program
+        .genres
+        .as_deref()
+        .and_then(|g| serde_json::from_str(g).ok())
+        .unwrap_or_default();
+    info.official_rating.clone_from(&program.official_rating);
 }
 
 /// How far through a running capture is, as a percentage.
@@ -6481,13 +6632,7 @@ mod tests {
     /// so the airing/has-aired filters can be asserted without freezing the
     /// clock. Offsets are in minutes relative to the current instant.
     fn relative_guide() -> String {
-        use std::fmt::Write as _;
-        let now = chrono::Utc::now();
-        let mut xml = String::from(
-            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
-             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
-        );
-        for (channel, from, to, title, genre) in [
+        guide_of(&[
             // Already over, but inside the refresh's one-hour lead-in — an
             // airing that ended more than an hour ago is not in the guide
             // window at all, so upstream would not have it either and neither
@@ -6496,7 +6641,19 @@ mod tests {
             ("one.tv", -30, 30, "Now Playing", "Drama"),
             ("one.tv", 120, 180, "Later", "Comedy"),
             ("two.tv", -10, 50, "Two Now", "News"),
-        ] {
+        ])
+    }
+
+    /// A guide over the two [`M3U`] channels with `airings` as
+    /// `(channel, from, to, title, genre)`, offsets in minutes from now.
+    fn guide_of(airings: &[(&str, i64, i64, &str, &str)]) -> String {
+        use std::fmt::Write as _;
+        let now = chrono::Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        for &(channel, from, to, title, genre) in airings {
             let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
             let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
             let _ = write!(
@@ -6512,9 +6669,14 @@ mod tests {
     /// A manager whose guide holds [`relative_guide`] over the two [`M3U`]
     /// channels.
     async fn manager_with_relative_guide() -> FerrofinLiveTvManager {
+        manager_with_guide(relative_guide()).await
+    }
+
+    /// A manager whose guide is `guide` over the two [`M3U`] channels.
+    async fn manager_with_guide(guide: String) -> FerrofinLiveTvManager {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), relative_guide());
+        sources.insert("http://guide/xmltv.xml".to_owned(), guide);
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
             type_: Some("m3u".to_owned()),
@@ -6688,6 +6850,47 @@ mod tests {
             !after
                 .iter()
                 .any(|(id, ..)| Uuid::parse_str(id).ok() == Some(ghost))
+        );
+    }
+
+    /// A channel that left the lineup and comes back gets its users' data
+    /// back. `CleanDatabase` deleted its item, which parked the rows on the
+    /// deletion placeholder. Upstream's first refresh of the recreated item
+    /// re-attaches them (`MetadataService.SaveItemAsync` →
+    /// `ReattachUserDataAsync`), and so does creating the item here.
+    #[tokio::test]
+    async fn a_channel_that_returns_to_the_lineup_gets_its_user_data_back() {
+        use crate::guide_repository::test_support::{favorite_holder, seed_favorite};
+        let lab = channel_item_lab().await;
+        let (mgr, persistence) = (&lab.mgr, &lab.persistence);
+        mgr.refresh_guide().await.expect("refresh");
+        let users: Arc<dyn ferrofin_traits::library::UserManager> = Arc::new(
+            ferrofin_core::user_manager::FerrofinUserManager::new(mgr.db.clone()),
+        );
+        let user = users.create_user("couch").await.expect("user");
+        let channel = stored_channel_items(mgr).await[0].0.clone();
+        let key = channel.to_lowercase();
+        seed_favorite(&mgr.db, &channel, &user.id)
+            .await
+            .expect("favourite");
+
+        // The channel leaves the lineup: its item goes, the favourite is parked.
+        persistence
+            .delete_items(&[Uuid::parse_str(&channel).expect("guid")])
+            .await
+            .expect("delete");
+        let parked = favorite_holder(&mgr.db, &user.id, &key)
+            .await
+            .expect("read");
+        assert_ne!(parked.as_deref(), Some(channel.as_str()), "parked");
+
+        // It comes back: the recreated item takes the favourite again.
+        mgr.refresh_guide().await.expect("refresh again");
+        assert_eq!(
+            favorite_holder(&mgr.db, &user.id, &key)
+                .await
+                .expect("read"),
+            Some(channel)
         );
     }
 
@@ -7830,6 +8033,153 @@ mod tests {
         mgr.cancel_timer(&timer_id).await.expect("cancel");
     }
 
+    /// A self-write guard recording each call, in order.
+    #[derive(Default)]
+    struct RecordingWrites(std::sync::Mutex<Vec<String>>);
+
+    impl ferrofin_traits::library::SelfWriteGuard for RecordingWrites {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    /// `RecordingsManager.RecordStream` brackets the recording from the moment
+    /// its file is chosen until it is settled (`RecordingsManager.cs:342,400`):
+    /// begun while the capture runs, completed once it has stopped.
+    #[tokio::test]
+    async fn a_recording_is_bracketed_while_it_is_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writes = Arc::new(RecordingWrites::default());
+        let mgr = manager_with_dvr(dir.path())
+            .await
+            .with_self_writes(writes.clone());
+        let program = now_playing(&mgr).await;
+        let program_id = Uuid::parse_str(&program.id).expect("guid");
+        let defaults = mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+        })
+        .await
+        .expect("a capture is in progress");
+        assert_eq!(
+            writes.0.lock().unwrap().clone(),
+            [format!("begin {path}")],
+            "begun, not yet complete, while it records"
+        );
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+        let completed = wait_for(|| async {
+            writes
+                .0
+                .lock()
+                .unwrap()
+                .contains(&format!("complete {path} false"))
+                .then_some(())
+        })
+        .await;
+        assert!(completed.is_some(), "{:?}", writes.0.lock().unwrap());
+    }
+
+    /// `RecordingsManager.RecordStream`'s `OnStarted` saves the guide's
+    /// metadata beside the recording (`RecordingsMetadataManager
+    /// .SaveRecordingMetadata`, with "Save EPG metadata to NFO files" on by
+    /// default): a programme that is neither a series nor a movie gets a
+    /// locked `<movie>` NFO, dated in UTC.
+    #[tokio::test]
+    async fn a_started_recording_gets_its_guide_nfo_beside_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let defaults = mgr
+            .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults");
+        let before = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+        })
+        .await
+        .expect("a capture is in progress");
+        let nfo = std::path::Path::new(&path).with_extension("nfo");
+        let body = wait_for(|| async { tokio::fs::read_to_string(&nfo).await.ok() })
+            .await
+            .expect("the recording's NFO");
+        let after = chrono::Utc::now() + chrono::Duration::seconds(2);
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+
+        let head = "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n\
+                    <movie>\n  <title>Now Playing</title>\n  <dateadded>";
+        assert!(body.starts_with(head), "{body}");
+        let tail = "</dateadded>\n  <plot />\n  <genre>Drama</genre>\n  \
+                    <lockdata>true</lockdata>\n</movie>";
+        assert!(body.ends_with(tail), "{body}");
+        let added = chrono::NaiveDateTime::parse_from_str(
+            &body[head.len()..body.len() - tail.len()],
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .expect("dateadded")
+        .and_utc();
+        assert!(before <= added && added <= after, "{added} is not UTC now");
+    }
+
+    /// With "Save EPG metadata to NFO files" off, a recording gets no NFO.
+    #[tokio::test]
+    async fn a_recording_gets_no_nfo_when_the_option_is_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let named = dir.path().join("named");
+        std::fs::create_dir_all(&named).expect("mkdir");
+        let options = ferrofin_model::live_tv::LiveTvOptions {
+            save_recording_nfo: false,
+            ..ferrofin_model::live_tv::LiveTvOptions::default()
+        };
+        std::fs::write(
+            named.join("livetv.json"),
+            serde_json::to_string(&options).expect("serialize options"),
+        )
+        .expect("write options");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let defaults = mgr
+            .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults");
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+        })
+        .await
+        .expect("a capture is in progress");
+        // The NFO, when on, is written within a fraction of this.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+        assert!(!std::path::Path::new(&path).with_extension("nfo").exists());
+    }
+
     #[tokio::test]
     async fn a_timer_on_a_programme_airing_now_records_it_and_the_recording_is_playable() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -8000,8 +8350,8 @@ mod tests {
         };
         assert_eq!(titles(&mgr, &airing).await, ["Now Playing", "Two Now"]);
 
-        // Accepted divergence: upstream's `isAiring=false` predicate is a
-        // contradiction that matches nothing; Ferrofin reads it as "not on now".
+        // Not on now: `StartDate > now || EndDate < now`, as v12.2's
+        // `TranslateQuery` has it since jellyfin/jellyfin#17588.
         let not_airing = InternalItemsQuery {
             is_airing: Some(false),
             ..InternalItemsQuery::default()
@@ -8105,6 +8455,40 @@ mod tests {
         assert_eq!(titles(&mgr, &named).await, ["Two Now"]);
     }
 
+    /// Name and genre filters compare clean values on both sides, as upstream
+    /// matches `CleanName == GetCleanValue(name)` and genre `CleanValue`s
+    /// (`BaseItemRepository.TranslateQuery.cs:476-477,658-662`). SQLite's own
+    /// `LOWER()` folds ASCII only, so a Cyrillic or accented title never
+    /// matched, and punctuation still told titles apart.
+    #[tokio::test]
+    async fn program_name_and_genre_filters_match_clean_values() {
+        let mgr = manager_with_guide(guide_of(&[
+            ("one.tv", -10, 50, "Новости", "Новости"),
+            ("one.tv", 60, 120, "Élan vital", "Émission"),
+            ("two.tv", -10, 50, "Bob's Burgers", "Animation"),
+        ]))
+        .await;
+        for (name, expected) in [
+            ("Новости", "Новости"),
+            ("ÉLAN VITAL", "Élan vital"),
+            ("Bob\u{2019}s Burgers", "Bob's Burgers"),
+        ] {
+            let named = InternalItemsQuery {
+                name: Some(name.to_owned()),
+                ..InternalItemsQuery::default()
+            };
+            assert_eq!(titles(&mgr, &named).await, [expected], "name {name}");
+        }
+        for (genre, expected) in [("Новости", "Новости"), ("émission", "Élan vital")]
+        {
+            let genres = InternalItemsQuery {
+                genres: vec![genre.to_owned()],
+                ..InternalItemsQuery::default()
+            };
+            assert_eq!(titles(&mgr, &genres).await, [expected], "genre {genre}");
+        }
+    }
+
     #[tokio::test]
     async fn timer_crud_roundtrips() {
         use ferrofin_model::live_tv::{BaseTimerInfoDto, TimerInfoDto};
@@ -8170,25 +8554,7 @@ mod tests {
 
     /// A manager whose guide holds [`series_guide`] over the two [`M3U`] channels.
     async fn manager_with_series_guide() -> FerrofinLiveTvManager {
-        let mut sources = HashMap::new();
-        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), series_guide());
-        let mgr = manager_with(FakeFetcher(sources)).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            type_: Some("m3u".to_owned()),
-            url: Some("http://tuner/playlist.m3u".to_owned()),
-            ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
-        mgr.save_listing_provider(ListingsProviderInfo {
-            path: Some("http://guide/xmltv.xml".to_owned()),
-            ..ListingsProviderInfo::default()
-        })
-        .await
-        .expect("provider");
-        mgr.refresh_guide().await.expect("refresh");
-        mgr
+        manager_with_guide(series_guide()).await
     }
 
     /// The guide rows on the first channel whose title matches, start-date ascending.
@@ -9609,41 +9975,90 @@ mod tests {
         );
     }
 
-    /// `seriesTimerId` cannot be scoped (Ferrofin's series timers carry no
-    /// series id), so upstream's "better to return nothing than every program
-    /// in the database" branch applies — but a blank value must NOT blank the
-    /// guide, or an empty `?seriesTimerId=` query param would.
+    /// `LiveTvManager.GetPrograms`' `SeriesTimerId`: the series timer whose
+    /// internal id matches (ignoring case) scopes the guide to its `SeriesId`,
+    /// the listings series id its programme carried. An unknown timer, or one
+    /// with no series id, answers nothing ("Better to return nothing than
+    /// every program in the database"), and a blank value scopes nothing.
     #[tokio::test]
-    async fn series_timer_scope_returns_nothing_and_ignores_a_blank_value() {
-        let mgr = manager_with_relative_guide().await;
-        let scoped = mgr
-            .get_programs(
-                &InternalItemsQuery {
-                    series_timer_id: Some("st-x".to_owned()),
-                    ..InternalItemsQuery::default()
-                },
-                &DtoOptions::default(),
-            )
+    async fn series_timer_id_scopes_the_guide_to_the_timers_series() {
+        use std::fmt::Write as _;
+        let now = Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        // "Recurring" carries episode numbers, so its listings have a series
+        // id; "Movie Night" carries none.
+        for (channel, from, to, title, episode) in [
+            ("one.tv", 60, 120, "Recurring", Some("0.0.")),
+            ("one.tv", 1500, 1560, "Recurring", Some("0.1.")),
+            ("two.tv", 90, 150, "Recurring", Some("0.2.")),
+            ("one.tv", 200, 260, "Something Else", Some("0.0.")),
+            ("one.tv", 300, 400, "Movie Night", None),
+        ] {
+            let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
+            let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
+            let episode = episode.map_or_else(String::new, |e| {
+                format!("<episode-num system=\"xmltv_ns\">{e}</episode-num>")
+            });
+            let _ = write!(
+                xml,
+                "<programme start=\"{start} +0000\" stop=\"{stop} +0000\" channel=\"{channel}\">\
+                 <title>{title}</title>{episode}</programme>"
+            );
+        }
+        xml.push_str("</tv>");
+        let mgr = manager_with_guide(xml).await;
+        let titles = |query: InternalItemsQuery| {
+            let mgr = &mgr;
+            async move {
+                let mut names: Vec<String> = mgr
+                    .get_programs(&query, &DtoOptions::default())
+                    .await
+                    .expect("programs")
+                    .items
+                    .into_iter()
+                    .filter_map(|p| p.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        let scoped = |id: &str| InternalItemsQuery {
+            series_timer_id: Some(id.to_owned()),
+            ..InternalItemsQuery::default()
+        };
+
+        let first = airings_of(&mgr, "Recurring").await;
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, &first[0]).await)
             .await
-            .expect("scoped");
-        assert!(scoped.items.is_empty());
-        assert_eq!(scoped.total_record_count, 0);
-        assert_eq!(scoped.start_index, 0);
+            .expect("create st");
+        for id in [st_id.clone(), st_id.to_uppercase()] {
+            assert_eq!(
+                titles(scoped(&id)).await,
+                ["Recurring", "Recurring", "Recurring"],
+                "{id}"
+            );
+        }
+        assert!(
+            titles(scoped("not-a-timer")).await.is_empty(),
+            "unknown timer"
+        );
+
+        // A series timer whose programme carried no series id scopes nothing.
+        let movie = airings_of(&mgr, "Movie Night").await;
+        let movie_st = mgr
+            .create_series_timer(defaults_for(&mgr, &movie[0]).await)
+            .await
+            .expect("create movie st");
+        assert!(titles(scoped(&movie_st)).await.is_empty(), "no series id");
 
         for blank in ["", "   "] {
-            let unscoped = mgr
-                .get_programs(
-                    &InternalItemsQuery {
-                        series_timer_id: Some(blank.to_owned()),
-                        ..InternalItemsQuery::default()
-                    },
-                    &DtoOptions::default(),
-                )
-                .await
-                .expect("blank");
             assert_eq!(
-                unscoped.items.len(),
-                4,
+                titles(scoped(blank)).await.len(),
+                5,
                 "a blank seriesTimerId must not blank the guide ({blank:?})"
             );
         }

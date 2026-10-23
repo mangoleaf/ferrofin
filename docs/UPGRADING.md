@@ -8,6 +8,80 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — extras take their owner's metadata; refresh once to fill existing ones
+
+Trailers, featurettes and other extras now take their movie's or series' genres,
+studios, overview, ratings, year and premiere date, as in Jellyfin. A scan gives them
+the year and premiere date every time. It gives them the rest when it finds an extra
+new, renamed or gone, or when the refresh is a full one. Extras already in your
+libraries get only the dates from an ordinary scan.
+
+To fill the rest for existing extras, refresh each movie or TV library once with
+**Search for missing metadata** (Dashboard → Libraries → the library's menu → Refresh
+metadata), or refresh single items the same way. That is a full refresh, which is all
+the copy needs; **Replace all metadata** also works but re-fetches everything. New
+extras get everything on the scan that finds them.
+
+## Unreleased — missing episodes you now have are removed
+
+A database adopted from Jellyfin can hold **missing episodes**: placeholder rows with no
+file, which Jellyfin's TMDb option or the TheTVDB plugin added. They show to users with
+**Display missing episodes** on. Earlier versions kept every one forever, so when the
+file for one of them arrived, the episode was listed twice.
+
+Each library scan now does what Jellyfin does at the end of every series refresh. It
+removes a series' missing episode when:
+- a file in the same season covers its number;
+- it has no episode number;
+- it carries the TheTVDB, TMDb or other id of exactly one episode you have, under another
+  number. Aired, DVD and absolute orders number the same episode differently.
+
+The first scan after the upgrade does this for every series. Only placeholder rows go;
+no file is touched. A missing episode you still lack stays. A library monitor's event for
+a single file does not refresh its series, as in Jellyfin, so the next library scan
+removes its placeholder.
+
+## Unreleased — the server needs 2 GiB free to start, as Jellyfin does
+
+Ferrofin now checks free space at startup. It refuses to start when `{data_dir}/data`, the
+cache directory (`FERROFIN_CACHE_DIR`, default `{data_dir}/cache`) or `{data_dir}` itself
+has less than 2 GiB free, as Jellyfin does. A scheduled backup restore is checked the same
+way before it is applied. The log names the path and the shortfall: ``The path `…` has
+insufficient free space. Available: …, Required: 2GiB.``
+
+An install that started on a nearly full disk before will stop at boot after this
+upgrade. Free up space on that filesystem, or move the cache to another filesystem with
+`FERROFIN_CACHE_DIR`. A build that cannot read free space (non-Unix, such as Windows) logs
+a warning and starts.
+
+## Unreleased — TheAudioDB descriptions return, in the library's language
+
+TheAudioDB stopped filling its English-suffixed description fields, and earlier versions
+read only those, so music artists and albums got no description from it. Ferrofin now reads
+the description in the item's **preferred metadata language** (its own, else the
+library's, else the server's) when TheAudioDB has one, and the English text otherwise.
+That choice is limited to the languages TheAudioDB translates (German, English, Spanish,
+French, Hebrew, Hungarian, Italian, Japanese, Dutch, Norwegian, Polish, Portuguese,
+Russian, Swedish and Chinese).
+
+Descriptions appear on the next refresh that asks the providers.
+- **Search for missing metadata** fills only items with no description.
+- **Replace all metadata** replaces an existing one, and so does a refresh that is due
+  under the library's automatic refresh interval.
+
+**Music artists with no saved choices ask TheAudioDB again**, as Jellyfin 12.2 does. This
+covers artists known only by name, and artists in a library that never saved **Music
+Artists** downloader choices. The 1.3.0 note below says the server-wide options turn
+TheAudioDB off for these artists. For metadata that no longer holds: a music artist with no
+saved choices may use every metadata downloader, whatever the server-wide
+`MetadataOptions` disable. Image fetchers and albums still follow the server-wide options,
+which ship with TheAudioDB metadata off for albums.
+
+To stop TheAudioDB for a library's artists, open **Dashboard → Libraries** and choose
+**Manage library**. Under **Music Artists**, TheAudioDB shows unticked if the library never
+saved choices (save once to keep that) and ticked if it did (untick it, then save). Artists known only by name have no library, so there
+is no setting that stops TheAudioDB for them.
+
 ## Unreleased — rows of deleted users are removed, once
 
 A long-lived Jellyfin database can still hold rows of users deleted long ago (their

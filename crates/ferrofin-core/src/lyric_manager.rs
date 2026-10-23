@@ -64,7 +64,7 @@ use uuid::Uuid;
 
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::{LyricManager, LyricProvider};
 
@@ -98,6 +98,10 @@ pub struct FerrofinLyricManager {
     /// files read and deleted. Absent → the item has no lyrics (unit-test
     /// default).
     media_streams: Option<Arc<dyn MediaStreamRepository>>,
+    /// Brackets the files written beside the media, so the library monitor
+    /// takes them for the server's own writes (`ILibraryMonitor`). `None` in
+    /// unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl std::fmt::Debug for FerrofinLyricManager {
@@ -121,7 +125,17 @@ impl FerrofinLyricManager {
             metadata_path: None,
             virtual_folders: None,
             media_streams: None,
+            self_writes: None,
         }
+    }
+
+    /// Brackets each lyric file written or deleted, as `LyricManager` does
+    /// (`ReportFileSystemChangeBeginning`/`Complete`). Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Attaches the item store used to resolve an item's media path, enabling
@@ -190,12 +204,13 @@ impl FerrofinLyricManager {
     /// `LibraryOptions.SaveLyricsWithMedia` for the library that owns the
     /// item. Older collection-folder ids take precedence; adopted physical
     /// parent ids use the innermost matching location, as the shared library
-    /// resolver does for metadata. Options are read afresh for every save.
+    /// resolver does for metadata. Options come from the library snapshot,
+    /// which every library write refreshes.
     async fn save_with_media(&self, item: &BaseItemEntity) -> bool {
         let Some(folders) = &self.virtual_folders else {
             return false;
         };
-        let Ok(folders) = folders.get_virtual_folders().await else {
+        let Ok(folders) = folders.library_folders().await else {
             return false;
         };
         ferrofin_model::entities_media::owning_library(
@@ -413,10 +428,12 @@ pub(crate) fn save_targets(
 /// — port of `TrySaveToFiles`, which returns after the first successful write
 /// and only throws when every candidate failed. With no target at all,
 /// `TrySaveLyric` logs an error and saves nothing (`None`), without failing.
-pub(crate) fn try_save_to_files(
-    targets: &[PathBuf],
+/// Each path tried is bracketed on `self_writes`, as upstream brackets it.
+pub(crate) fn try_save_to_files<'a>(
+    targets: &'a [PathBuf],
     content: impl AsRef<[u8]>,
-) -> Result<Option<&Path>, ServiceError> {
+    self_writes: Option<&Arc<dyn SelfWriteGuard>>,
+) -> Result<Option<&'a Path>, ServiceError> {
     let content = content.as_ref();
     if targets.is_empty() {
         tracing::error!("lyric could not be saved because the resulting paths were invalid");
@@ -424,6 +441,7 @@ pub(crate) fn try_save_to_files(
     }
     let mut last_error: Option<std::io::Error> = None;
     for target in targets {
+        let _write = SelfWrite::begin(self_writes, target.to_string_lossy());
         let written = target
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
@@ -541,7 +559,7 @@ impl LyricManager for FerrofinLyricManager {
         let mut request = search_request_for(&item);
         request.is_automated = true;
         if let Some(folders) = &self.virtual_folders {
-            let folders = folders.get_virtual_folders().await?;
+            let folders = folders.library_folders().await?;
             if let Some(options) = ferrofin_model::entities_media::owning_library(
                 &folders,
                 item.top_parent_id.as_deref(),
@@ -591,7 +609,8 @@ impl LyricManager for FerrofinLyricManager {
         let targets = self
             .save_targets(item_id, &item, path, &response.format)
             .await;
-        if let Some(saved) = try_save_to_files(&targets, &response.text)? {
+        if let Some(saved) = try_save_to_files(&targets, &response.text, self.self_writes.as_ref())?
+        {
             tracing::info!(path = %saved.display(), "saved lyrics");
         }
         Ok(Some(dto))
@@ -633,7 +652,7 @@ impl LyricManager for FerrofinLyricManager {
             return Ok(None);
         };
         let targets = self.save_targets(item_id, &item, path, format).await;
-        if let Some(saved) = try_save_to_files(&targets, lyrics)? {
+        if let Some(saved) = try_save_to_files(&targets, lyrics, self.self_writes.as_ref())? {
             tracing::info!(path = %saved.display(), "saved lyrics");
         }
         Ok(Some(dto))
@@ -643,6 +662,7 @@ impl LyricManager for FerrofinLyricManager {
         // `DeleteLyricsAsync` deletes each lyric stream's file with no
         // `catch`: a failed unlink is an error, never a silent `204`.
         for file in self.lyric_files(item_id).await? {
+            let _write = SelfWrite::begin(self.self_writes.as_ref(), file.to_string_lossy());
             match std::fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1998,6 +2018,29 @@ mod tests {
         assert_eq!(std::fs::read(saved).expect("saved"), upload);
     }
 
+    /// `DeleteLyricsAsync` brackets each lyric file it deletes
+    /// (`LyricManager.cs:243-256`).
+    #[tokio::test]
+    async fn a_lyric_delete_brackets_each_file() {
+        let db = test_support::test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("song.flac");
+        std::fs::write(&media, b"flac").expect("write media");
+        let sidecar = media.with_extension("lrc");
+        std::fs::write(&sidecar, "[00:01.00]hi").expect("write sidecar");
+        let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        record_lyric_streams(&db, item_id, &[&sidecar]).await;
+        let recording = Arc::new(Recording::default());
+        let mgr = manager_over(&db, Vec::new()).with_self_writes(recording.clone());
+        mgr.delete_lyrics(item_id).await.expect("delete");
+        assert!(!sidecar.exists());
+        let shown = sidecar.display();
+        assert_eq!(
+            recording.calls(),
+            [format!("begin {shown}"), format!("complete {shown} false")]
+        );
+    }
+
     #[tokio::test]
     async fn delete_reports_a_failed_unlink() {
         let db = test_support::test_db().await;
@@ -2182,6 +2225,56 @@ mod tests {
         );
     }
 
+    /// A [`SelfWriteGuard`] recording each call, in order.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl ferrofin_traits::library::SelfWriteGuard for Recording {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// `TrySaveToFiles` brackets each path it tries (`LyricManager.cs:440-465`),
+    /// the one that fails as well as the one it writes.
+    #[test]
+    fn a_lyric_save_brackets_each_path_it_tries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("a file");
+        std::fs::write(&file, b"x").expect("file");
+        let blocked = file.join("Song.lrc");
+        let open = tmp.path().join("Song.lrc");
+        let recording = Arc::new(Recording::default());
+        let guard: Arc<dyn ferrofin_traits::library::SelfWriteGuard> = recording.clone();
+        let targets = [blocked.clone(), open.clone()];
+        let saved = super::try_save_to_files(&targets, "[00:01.00]hi", Some(&guard))
+            .expect("saved")
+            .expect("a path");
+        assert_eq!(saved, open.as_path());
+        let (blocked, open) = (blocked.display(), open.display());
+        assert_eq!(
+            recording.calls(),
+            [
+                format!("begin {blocked}"),
+                format!("complete {blocked} false"),
+                format!("begin {open}"),
+                format!("complete {open} false"),
+            ]
+        );
+    }
+
     #[test]
     fn save_targets_drop_paths_that_leave_their_folder() {
         // `TrySaveLyric` keeps a target only while `PathHelper.IsContainedIn`
@@ -2217,7 +2310,10 @@ mod tests {
             [PathBuf::from("/meta/library/ab/abcd/song.lrc")]
         );
         // No target left: `TrySaveLyric` logs and saves nothing, without failing.
-        assert_eq!(super::try_save_to_files(&[], "x").expect("no error"), None);
+        assert_eq!(
+            super::try_save_to_files(&[], "x", None).expect("no error"),
+            None
+        );
     }
 
     // ---------------------------------------------------------------- parsers

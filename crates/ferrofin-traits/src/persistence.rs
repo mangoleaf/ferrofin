@@ -364,17 +364,14 @@ pub trait ItemRepository: Send + Sync {
     /// The "latest media" rows of a **tvshows or music** library — port of C#
     /// `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The two types answer differently, and they track different upstream
-    /// versions — the music arm is v12's rewrite, the tvshows arm is still
-    /// 10.11.8's (v12 replaced that one too, with `GetLatestTvShowItems`;
-    /// porting it is its own work item):
+    /// The two types answer differently (both v12):
     ///
-    /// - **tvshows** (v10.11.8) — one grouped-threshold statement: the filter's predicates
-    ///   are grouped by `SeriesName`, the newest `filter.limit` groups'
-    ///   `MAX(DateCreated)` are taken, and every row at or above the *smallest*
-    ///   of those maxima is returned in the filter's `order_by`, unpaged — so
-    ///   `limit` caps groups, not rows, and the caller buckets the rows by
-    ///   container afterwards;
+    /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
+    ///   `filter.limit` series (by the newest row the filter matches, grouped
+    ///   by `SeriesName`): the Episode, Season or Series card chosen from that
+    ///   series' rows added within 24 hours of its newest one, a container the
+    ///   filter's parental limits hide replaced by the episode, newest first.
+    ///   The filter's `order_by` and `start_index` play no part;
     /// - **music** (v12) — the newest `filter.limit` `MusicAlbum` rows
     ///   themselves, ordered `DateCreated DESC, Id DESC`, scoped by the filter's
     ///   top parent ids — which reads no track at all — or, for an
@@ -491,6 +488,41 @@ pub trait ItemRepository: Send + Sync {
     /// layer serves or projects into an `ImageInfo` DTO. An item with no images
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
+
+    /// The image rows of several items in one read, keyed by item id, each
+    /// item's rows in the [`get_image_infos`](Self::get_image_infos) order; an
+    /// item without images is absent.
+    ///
+    /// The default reads one item at a time, so test doubles compile
+    /// unchanged; the concrete repository overrides it with a batched read.
+    async fn get_image_infos_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map = HashMap::new();
+        for &id in item_ids {
+            let images = self.get_image_infos(id).await?;
+            if !images.is_empty() {
+                map.insert(id, images);
+            }
+        }
+        Ok(map)
+    }
+
+    /// [`Self::get_image_infos`] in the same read as whether the item's images
+    /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
+    /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or
+    /// not `TopLeft`. The default reads the rows and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_image_infos_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_image_infos(item_id).await?, false))
+    }
 
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
@@ -615,6 +647,21 @@ pub trait ItemRepository: Send + Sync {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<i32>, ServiceError> {
         Ok(self.get_query_filters_legacy(filter).await?.years)
+    }
+
+    /// Gets the tag names of the matching items, one per clean value, in value
+    /// order — the one facet `/Items/Filters2` needs from the legacy set. See
+    /// [`LibraryManager::get_tag_names`].
+    ///
+    /// The default reads the whole legacy filter aggregate; an implementation
+    /// that can answer the tags alone should override this.
+    ///
+    /// [`LibraryManager::get_tag_names`]: crate::library::LibraryManager::get_tag_names
+    async fn get_tag_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(filter).await?.tags)
     }
 
     /// Reports whether all children of `id` are played for the given user.
@@ -853,6 +900,40 @@ pub trait ItemPersistenceService: Send + Sync {
         parts: bool,
     ) -> Result<usize, ServiceError> {
         let _ = (owner_ids, versions, parts);
+        Ok(0)
+    }
+
+    /// Gives the extras of each refreshed owner what its refresh gives them
+    /// upstream (`BaseItem.RefreshExtras`), and returns how many extras were
+    /// written. An owner's extras are those it owns (`OwnerId`, with an
+    /// `ExtraType`) and those its local alternate versions own, all of which
+    /// its primary maintains (`Video.GetOwnedVersionIds`) and whose metadata
+    /// they take; an alternate version linked rather than local refreshes no
+    /// extras (`Video.RefreshedOwnedItems`).
+    ///
+    /// - When a refresh of the group [`changed`](OwnerExtrasRefresh::changed)
+    ///   its extras or ran in full, or found fewer than are stored (one is
+    ///   gone), every extra takes the title metadata: genres, studios,
+    ///   production locations, community and critic rating, overview,
+    ///   official and custom rating, and the year and premiere date the owner
+    ///   has (`RefreshMetadataForOwnedItem`'s `copyTitleMetadata`).
+    /// - Otherwise each takes only the owner's year and premiere date
+    ///   (`InheritDatesFromOwner`), which an owner often learns after its
+    ///   extras were created.
+    ///
+    /// Each written row's parental score follows the ratings it was given,
+    /// and its genre and studio links follow its genres and studios. Only a
+    /// row that differs is written, so a quiet rescan writes nothing. The
+    /// default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn copy_owner_metadata_to_extras(
+        &self,
+        refreshes: &[OwnerExtrasRefresh],
+    ) -> Result<usize, ServiceError> {
+        let _ = refreshes;
         Ok(0)
     }
 
@@ -1544,6 +1625,20 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The ids of the unlocked `MusicArtist` rows accessed by name (no
+    /// `ParentId`) whose `CleanName` no artist or album-artist value an item
+    /// still maps to carries, in id order: the by-name artists the library
+    /// no longer credits (upstream `ArtistsValidator`'s dead artists).
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn dead_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
     /// Stamps `DateLastRefreshed = at` on existing rows, with the
     /// `DateLastSaved = at` of the save that records it, and nothing else —
     /// the record of a completed refresh of an item whose refresh wrote
@@ -2128,6 +2223,21 @@ pub struct ItemPathRow {
     /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
     /// for nothing else — an owned part or alternate version has none.
     pub extra_type: Option<i32>,
+}
+
+/// An owner whose extras a refresh reached
+/// ([`ItemPersistenceService::copy_owner_metadata_to_extras`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerExtrasRefresh {
+    /// The owner: a primary item, or one of its local alternate versions (an
+    /// extra is owned by the version it is named after).
+    pub owner: Uuid,
+    /// The extras of `owner` the refresh found, when it looked for all of
+    /// them (`FindExtras`, run by a library scan); `None` when it did not.
+    pub found: Option<Vec<Uuid>>,
+    /// Whether the refresh created, re-owned or renamed one of them, or
+    /// ran in full (`FullRefresh` or "Replace all metadata").
+    pub changed: bool,
 }
 
 /// One stored season with no folder of its own

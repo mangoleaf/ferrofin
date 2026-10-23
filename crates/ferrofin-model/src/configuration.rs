@@ -121,6 +121,24 @@ crate::json::enums::wire_enum! {
     }
 }
 
+impl ProcessPriorityClass {
+    /// The OS priority class this names, or `None` for an unnamed value,
+    /// which .NET refuses to set (`Process.PriorityClass` throws).
+    #[must_use]
+    pub fn os_priority(self) -> Option<ferrofin_util::process_priority::ProcessPriority> {
+        use ferrofin_util::process_priority::ProcessPriority;
+        match self {
+            Self::Normal => Some(ProcessPriority::Normal),
+            Self::Idle => Some(ProcessPriority::Idle),
+            Self::High => Some(ProcessPriority::High),
+            Self::RealTime => Some(ProcessPriority::RealTime),
+            Self::BelowNormal => Some(ProcessPriority::BelowNormal),
+            Self::AboveNormal => Some(ProcessPriority::AboveNormal),
+            Self::Unrecognized(_) => None,
+        }
+    }
+}
+
 /// The type of a metadata plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -435,6 +453,20 @@ pub struct PathSubstitution {
 
     /// Gets or sets the value to substitute with.
     pub to: String,
+}
+
+/// Port of `LibraryManager.GetPathAfterNetworkSubstitution`: `path` rewritten
+/// by the first substitution whose `from` is a leading sub path of it
+/// ([`try_replace_sub_path`](ferrofin_util::path_extensions::try_replace_sub_path)),
+/// else unchanged.
+#[must_use]
+pub fn path_after_network_substitution(path: &str, substitutions: &[PathSubstitution]) -> String {
+    substitutions
+        .iter()
+        .find_map(|map| {
+            ferrofin_util::path_extensions::try_replace_sub_path(path, &map.from, &map.to)
+        })
+        .unwrap_or_else(|| path.to_owned())
 }
 
 /// A metadata plugin (name plus type).
@@ -1168,6 +1200,27 @@ impl Default for EncodingOptions {
     }
 }
 
+/// `ServerConfiguration.SortReplaceCharacters`' initializer: each becomes a
+/// space in a sort name.
+#[must_use]
+pub fn default_sort_replace_characters() -> Vec<String> {
+    [".", "+", "%"].map(str::to_owned).to_vec()
+}
+
+/// `ServerConfiguration.SortRemoveCharacters`' initializer: each is deleted
+/// from a sort name.
+#[must_use]
+pub fn default_sort_remove_characters() -> Vec<String> {
+    [",", "&", "-", "{", "}", "'"].map(str::to_owned).to_vec()
+}
+
+/// `ServerConfiguration.SortRemoveWords`' initializer: the articles a sort
+/// name drops where they stand alone.
+#[must_use]
+pub fn default_sort_remove_words() -> Vec<String> {
+    ["the", "a", "an"].map(str::to_owned).to_vec()
+}
+
 /// The server configuration. Flattens the C# base
 /// `BaseApplicationConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -1226,13 +1279,19 @@ pub struct ServerConfiguration {
     /// Gets or sets the metadata country code.
     pub metadata_country_code: String,
 
-    /// Gets or sets the sort replace characters.
+    /// Gets or sets the sort replace characters. Absent from a document, it
+    /// takes Jellyfin's initializer list, as C# deserialization keeps it.
+    #[serde(default = "default_sort_replace_characters")]
     pub sort_replace_characters: Vec<String>,
 
-    /// Gets or sets the sort remove characters.
+    /// Gets or sets the sort remove characters. Absent from a document, it
+    /// takes Jellyfin's initializer list.
+    #[serde(default = "default_sort_remove_characters")]
     pub sort_remove_characters: Vec<String>,
 
-    /// Gets or sets the sort remove words.
+    /// Gets or sets the sort remove words. Absent from a document, it takes
+    /// Jellyfin's initializer list.
+    #[serde(default = "default_sort_remove_words")]
     pub sort_remove_words: Vec<String>,
 
     /// Gets or sets the minimum resume percentage.
@@ -1363,6 +1422,31 @@ pub struct ServerConfiguration {
 
 #[cfg(test)]
 mod tests {
+    use ferrofin_util::process_priority::ProcessPriority;
+
+    /// Every named class maps onto the OS class of the same name; an unnamed
+    /// value has none.
+    #[rstest::rstest]
+    #[case(super::ProcessPriorityClass::Normal, Some(ProcessPriority::Normal))]
+    #[case(super::ProcessPriorityClass::Idle, Some(ProcessPriority::Idle))]
+    #[case(super::ProcessPriorityClass::High, Some(ProcessPriority::High))]
+    #[case(super::ProcessPriorityClass::RealTime, Some(ProcessPriority::RealTime))]
+    #[case(
+        super::ProcessPriorityClass::BelowNormal,
+        Some(ProcessPriority::BelowNormal)
+    )]
+    #[case(
+        super::ProcessPriorityClass::AboveNormal,
+        Some(ProcessPriority::AboveNormal)
+    )]
+    #[case(super::ProcessPriorityClass::Unrecognized(7), None)]
+    fn process_priority_classes_map_to_os_classes(
+        #[case] class: super::ProcessPriorityClass,
+        #[case] os: Option<ProcessPriority>,
+    ) {
+        assert_eq!(class.os_priority(), os);
+    }
+
     use super::*;
 
     #[test]

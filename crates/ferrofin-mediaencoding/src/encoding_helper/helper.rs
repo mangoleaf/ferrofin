@@ -26,7 +26,8 @@ use std::fmt::Write as _;
 use ferrofin_model::configuration::{EncodingOptions, HlsAudioSeekStrategy};
 use ferrofin_model::data::VideoRangeType;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
-use ferrofin_model::entities::EncoderPreset;
+use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::entities::{EncoderPreset, MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
@@ -1294,6 +1295,86 @@ pub fn find_index(media_streams: &[MediaStream], stream_to_find: &MediaStream) -
     -1
 }
 
+/// The ffmpeg stream index of a subtitle track: [`find_index`], plus, for an
+/// embedded track of a Blu-ray source, the TrueHD and Atmos audio streams
+/// before it, which ffprobe does not list but ffmpeg counts. Port of
+/// `EncodingHelper.GetSubtitleStreamIndexForFfmpeg`; `-1` when the track is
+/// not among the source's streams.
+#[must_use]
+pub fn get_subtitle_stream_index_for_ffmpeg(
+    media_source: &MediaSourceInfo,
+    subtitle_stream: &MediaStream,
+) -> i32 {
+    let index = find_index(&media_source.media_streams, subtitle_stream);
+    if index == -1
+        || subtitle_stream.is_external
+        || media_source.video_type != Some(VideoType::BluRay)
+    {
+        return index;
+    }
+    let hidden_before = media_source
+        .media_streams
+        .iter()
+        .filter(|stream| {
+            stream.stream_type == MediaStreamType::Audio
+                && !stream.is_external
+                && stream.codec.as_deref().is_some_and(|codec| {
+                    codec.eq_ignore_ascii_case("truehd") || codec.eq_ignore_ascii_case("atmos")
+                })
+                && stream.index < subtitle_stream.index
+        })
+        .count();
+    index.saturating_add(i32::try_from(hidden_before).unwrap_or(i32::MAX))
+}
+
+/// The VBR arguments for `encoder` at `bitrate` over `channels`, or `None`
+/// when the encoder has no VBR mode here and is encoded at `-b:a`. Port of
+/// `EncodingHelper.GetAudioVbrModeParam`, thresholds verbatim, chosen by the
+/// bitrate per channel.
+#[must_use]
+pub fn audio_vbr_mode_param(encoder: &str, bitrate: i32, channels: i32) -> Option<String> {
+    let per_channel = bitrate / channels.max(1);
+    if encoder.eq_ignore_ascii_case("libfdk_aac") {
+        let mode = match per_channel {
+            ..32_000 => 1,
+            32_000..48_000 => 2,
+            48_000..64_000 => 3,
+            64_000..96_000 => 4,
+            _ => 5,
+        };
+        return Some(format!("-vbr:a {mode}"));
+    }
+    if encoder.eq_ignore_ascii_case("libmp3lame") {
+        // lame's VBR is only good for a certain bitrate range; below and
+        // above it, ABR.
+        if per_channel > 48_000 && per_channel < 122_500 {
+            let quality = match per_channel {
+                ..64_000 => 6,
+                64_000..88_000 => 4,
+                88_000..112_000 => 2,
+                _ => 0,
+            };
+            return Some(format!("-qscale:a {quality}"));
+        }
+        return Some(format!("-abr:a 1 -b:a {bitrate}"));
+    }
+    if encoder.eq_ignore_ascii_case("aac_at") {
+        // aac_at's CVBR mode.
+        return Some(format!("-aac_at_mode:a 2 -b:a {bitrate}"));
+    }
+    if encoder.eq_ignore_ascii_case("libvorbis") {
+        let quality = match per_channel {
+            ..40_000 => 0,
+            40_000..56_000 => 2,
+            56_000..80_000 => 4,
+            80_000..112_000 => 6,
+            _ => 8,
+        };
+        return Some(format!("-qscale:a {quality}"));
+    }
+    None
+}
+
 /// Whether the encoded output would embed a burnt-in subtitle. Port of
 /// `ShouldEncodeSubtitle`.
 #[must_use]
@@ -1385,9 +1466,10 @@ const FORCED_IDR_ENCODERS: [(&str, &str); 6] = [
 ];
 
 /// Upstream's encoders that cannot force a keyframe, so only a pinned GOP
-/// cuts segments. Kept verbatim; [`FORCED_IDR_ENCODERS`] is checked first and
-/// takes its NVENC and QSV entries.
-const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 11] = [
+/// cuts segments. Upstream's list but for `libsvtav1`, which forces keyframes
+/// (see [`hls_video_key_frame_arguments`]); [`FORCED_IDR_ENCODERS`] is checked
+/// first and takes its NVENC and QSV entries.
+const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 10] = [
     "h264_qsv",
     "h264_nvenc",
     "h264_amf",
@@ -1398,7 +1480,6 @@ const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 11] = [
     "av1_qsv",
     "av1_nvenc",
     "av1_amf",
-    "libsvtav1",
 ];
 
 /// Encoders that honour `-force_key_frames` and need no pinned GOP.
@@ -1430,6 +1511,13 @@ const FORCED_KEYFRAME_ENCODERS: [&str; 5] = [
 /// sources. NVENC is verified on real hardware; the QSV half rests on
 /// qsvenc's source (`forced_idr` marks a forced frame IDR) and has not yet
 /// been run on an Intel GPU.
+///
+/// Divergence: upstream gives `libsvtav1` the GOP alone too, which on a
+/// doubled-`tbr` source (`25 fps, 50 tbr`) spans two segments. libsvtav1
+/// honours `-force_key_frames` (ffmpeg n9.0.1 with SVT-AV1 4.2 cuts every
+/// segment on time), so it takes the unknown encoder's arm: the forced
+/// keyframes, and the GOP, which still cuts segments on an older ffmpeg
+/// whose libsvtav1 wrapper ignores a forced keyframe.
 ///
 /// The expression is unquoted because the result is split on whitespace into
 /// argv, not handed to a shell. Returns the arguments **with a leading
@@ -1990,6 +2078,44 @@ mod tests {
     }
 
     // ----- is_copy_codec -----------------------------------------------------
+
+    /// `GetAudioVbrModeParam`'s modes, at each threshold's edges, by the
+    /// bitrate per channel. An encoder without one (libopus, the native aac
+    /// encoder) has none, and is encoded at `-b:a`.
+    #[rstest]
+    #[case::fdk_lowest("libfdk_aac", 62_000, 2, Some("-vbr:a 1"))]
+    #[case::fdk_32k("libfdk_aac", 64_000, 2, Some("-vbr:a 2"))]
+    #[case::fdk_48k("libfdk_aac", 96_000, 2, Some("-vbr:a 3"))]
+    #[case::fdk_64k("libfdk_aac", 128_000, 2, Some("-vbr:a 4"))]
+    #[case::fdk_96k("libfdk_aac", 192_000, 2, Some("-vbr:a 5"))]
+    #[case::lame_abr_low("libmp3lame", 96_000, 2, Some("-abr:a 1 -b:a 96000"))]
+    #[case::lame_q6("libmp3lame", 98_000, 2, Some("-qscale:a 6"))]
+    #[case::lame_q4("libmp3lame", 128_000, 2, Some("-qscale:a 4"))]
+    #[case::lame_q2("libmp3lame", 176_000, 2, Some("-qscale:a 2"))]
+    #[case::lame_q0("libmp3lame", 224_000, 2, Some("-qscale:a 0"))]
+    #[case::lame_abr_high("libmp3lame", 245_000, 2, Some("-abr:a 1 -b:a 245000"))]
+    #[case::lame_mono("libmp3lame", 64_000, 1, Some("-qscale:a 4"))]
+    #[case::aac_at("aac_at", 128_000, 2, Some("-aac_at_mode:a 2 -b:a 128000"))]
+    #[case::vorbis_q0("libvorbis", 78_000, 2, Some("-qscale:a 0"))]
+    #[case::vorbis_q2("libvorbis", 80_000, 2, Some("-qscale:a 2"))]
+    #[case::vorbis_q4("libvorbis", 112_000, 2, Some("-qscale:a 4"))]
+    #[case::vorbis_q6("libvorbis", 160_000, 2, Some("-qscale:a 6"))]
+    #[case::vorbis_q8("libvorbis", 224_000, 2, Some("-qscale:a 8"))]
+    #[case::case_insensitive("LIBMP3LAME", 128_000, 2, Some("-qscale:a 4"))]
+    #[case::zero_channels("libfdk_aac", 128_000, 0, Some("-vbr:a 5"))]
+    #[case::opus("libopus", 128_000, 2, None)]
+    #[case::native_aac("aac", 128_000, 2, None)]
+    fn audio_vbr_mode_param_picks_the_encoders_mode(
+        #[case] encoder: &str,
+        #[case] bitrate: i32,
+        #[case] channels: i32,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            audio_vbr_mode_param(encoder, bitrate, channels).as_deref(),
+            expected
+        );
+    }
 
     #[test]
     fn is_copy_codec_matches_copy_case_insensitively() {
@@ -2975,7 +3101,9 @@ mod tests {
             codec: Some("av1".to_owned()),
             index: 0,
             stream_type: MediaStreamType::Video,
+            color_space: Some("bt2020nc".to_owned()),
             color_transfer: Some("smpte2084".to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
             dv_profile: Some(8),
             dv_bl_signal_compatibility_id: Some(1),
             rpu_present_flag: Some(1),
@@ -3360,14 +3488,23 @@ mod tests {
         false,
         " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
     )]
-    // Unable to force keyframes: the GOP alone, ceil(3 × 23.976) = 72.
-    #[case("libsvtav1", Some(23.976), false, " -g:v:0 72 -keyint_min:v:0 72")]
+    // Unable to force keyframes: the GOP alone, ceil(3 × 30) = 90.
     #[case("h264_amf", Some(30.0), false, " -g:v:0 90 -keyint_min:v:0 90")]
     // No frame rate, no GOP: nothing at all for these encoders.
-    #[case("libsvtav1", None, false, "")]
+    #[case("h264_amf", None, false, "")]
     // Nor from a rate that is no rate: never `-g:v:0 0` or `NaN`.
-    #[case("libsvtav1", Some(0.0), false, "")]
-    #[case("libsvtav1", Some(f32::NAN), false, "")]
+    #[case("h264_amf", Some(0.0), false, "")]
+    #[case("h264_amf", Some(f32::NAN), false, "")]
+    // libsvtav1 forces keyframes, which cut on time whatever the rate, and
+    // keeps upstream's GOP, ceil(3 × 23.976) = 72, for a build that ignores them.
+    #[case(
+        "libsvtav1",
+        Some(23.976),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -g:v:0 72 -keyint_min:v:0 72"
+    )]
+    #[case("libsvtav1", None, false, FORCED_3S)]
+    #[case("libsvtav1", Some(0.0), false, FORCED_3S)]
     #[case("mpeg4", Some(f32::INFINITY), false, FORCED_3S)]
     // Forced keyframes, and libx264 also loses its scene-cut detection.
     #[case(

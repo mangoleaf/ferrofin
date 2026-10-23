@@ -39,6 +39,50 @@ use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
 #[cfg(test)]
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// `MediaEncoder.DefaultSdrImageExtractionTimeout`: how long one frame
+/// extraction may run when `ImageExtractionTimeoutMs` is unset (0 or less).
+const DEFAULT_SDR_IMAGE_EXTRACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// `MediaEncoder.DefaultHdrImageExtractionTimeout`: the same for a tone-mapped
+/// frame, and the trickplay watchdog's window.
+pub(crate) const DEFAULT_HDR_IMAGE_EXTRACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// The configured `ImageExtractionTimeoutMs`, or `default` when it is unset
+/// (0 or less), as `ExtractImageInternal` and the trickplay watchdog read it.
+pub(crate) fn image_extraction_timeout(
+    configured: i32,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    u64::try_from(configured)
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map_or(default, std::time::Duration::from_millis)
+}
+
+/// Jellyfin's default `FFmpeg:analyzeduration` (`ConfigurationOptions.cs:19`):
+/// how long ffmpeg and ffprobe analyse an input to find its streams, when the
+/// source names no duration of its own.
+pub const DEFAULT_ANALYZE_DURATION: &str = "200M";
+
+/// Jellyfin's default `FFmpeg:probesize` (`ConfigurationOptions.cs:18`): how
+/// much of an input ffmpeg and ffprobe read to find its streams.
+pub const DEFAULT_PROBE_SIZE: &str = "1G";
+
+/// The `-analyzeduration` value upstream picks for an input
+/// (`EncodingHelper.GetFfmpegAnalyzeDurationArg` and
+/// `MediaEncoder.GetExtraArguments`): the source's own `AnalyzeDurationMs` in
+/// microseconds when it is positive, else `configured`. Empty when neither is
+/// set, which omits the flag.
+#[must_use]
+pub fn analyze_duration_value(source_ms: Option<i32>, configured: &str) -> String {
+    match source_ms {
+        Some(ms) if ms > 0 => (i64::from(ms) * 1000).to_string(),
+        _ => configured.to_owned(),
+    }
+}
+
 /// Tunable knobs read from the encoding configuration.
 ///
 /// Groups the handful of `IConfiguration`/`EncodingOptions`-derived values the
@@ -79,6 +123,7 @@ pub struct MediaEncoderImpl<T: Transcoder> {
     transcoder: Arc<T>,
     image_encoding_pool: Arc<tokio::sync::Semaphore>,
     chapter_image_resolution: Option<Arc<dyn Fn() -> ImageResolution + Send + Sync>>,
+    image_extraction_timeout_ms: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
     config: MediaEncoderConfig,
     paths: RwLock<Paths>,
     normalizer: ProbeResultNormalizer<Box<dyn ProbeLocalization + Send + Sync>>,
@@ -116,6 +161,50 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         self
     }
 
+    /// Reads the live `ImageExtractionTimeoutMs` before each image extraction.
+    /// Without it, or when it is 0 or less, upstream's default applies.
+    #[must_use]
+    pub fn with_image_extraction_timeout(
+        mut self,
+        read: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
+        self.image_extraction_timeout_ms = Some(Arc::new(read));
+        self
+    }
+
+    /// Runs one image-extraction ffmpeg, giving up when it outlives the
+    /// timeout: `ExtractImageInternal`'s `WaitForExitAsync(timeoutMs)`, then
+    /// `Kill`. Dropping the run kills the child (`kill_on_drop`), and the
+    /// caller's error return then frees its thumbnail-pool permit.
+    ///
+    /// Upstream takes the HDR default when it tone-maps the frame
+    /// (`enableHdrExtraction`). These arguments never tone-map (see
+    /// [`Self::extract_image_arguments`]), so the SDR default applies.
+    async fn run_image_extraction(
+        &self,
+        ffmpeg: &str,
+        args: &str,
+        input: &str,
+    ) -> Result<ProcessOutput, String> {
+        let configured = self
+            .image_extraction_timeout_ms
+            .as_ref()
+            .map_or(0, |read| read());
+        let timeout = image_extraction_timeout(configured, DEFAULT_SDR_IMAGE_EXTRACTION_TIMEOUT);
+        tokio::time::timeout(
+            timeout,
+            self.transcoder
+                .get_process_output(ffmpeg, args, true, None, &[]),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "ffmpeg image extraction timed out for `{input}` after {}ms",
+                timeout.as_millis()
+            ))
+        })
+    }
+
     /// Stamps probe output with the server's real localized labels and
     /// language display names, as Jellyfin's production normalizer does
     /// (`ProbeResultNormalizer` takes the live `ILocalizationManager`). Without
@@ -144,6 +233,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
             )),
             config,
             chapter_image_resolution: None,
+            image_extraction_timeout_ms: None,
             paths: RwLock::new(Paths {
                 ffmpeg: ffmpeg_path.into(),
                 ffprobe: ffprobe_path.into(),
@@ -164,18 +254,11 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         let ffmpeg_probe_size = self.config.probe_size.as_deref().unwrap_or_default();
         let source = &request.media_source;
 
-        let mut analyze_duration = String::new();
-        if source.analyze_duration_ms.unwrap_or(0) > 0 {
-            // C# multiplies the millisecond value by 1000 (into microseconds).
-            let micros = i64::from(source.analyze_duration_ms.unwrap_or(0)) * 1000;
-            analyze_duration = format!("-analyzeduration {micros}");
-        } else if !ffmpeg_analyze_duration.is_empty() {
-            analyze_duration = format!("-analyzeduration {ffmpeg_analyze_duration}");
-        }
-
+        let analyze_duration =
+            analyze_duration_value(source.analyze_duration_ms, ffmpeg_analyze_duration);
         let mut extra_args = String::new();
         if !analyze_duration.is_empty() {
-            extra_args = analyze_duration;
+            extra_args = format!("-analyzeduration {analyze_duration}");
         }
 
         if !ffmpeg_probe_size.is_empty() {
@@ -497,10 +580,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
-        let result = self
-            .transcoder
-            .get_process_output(&ffmpeg, &args, true, None, &[])
-            .await;
+        let result = self.run_image_extraction(&ffmpeg, &args, path).await;
         let output = match result {
             Ok(output) => output,
             Err(err) => {
@@ -599,12 +679,13 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
-        let stderr = self
-            .transcoder
-            .get_process_output(&ffmpeg, &args, true, None, &[])
-            .await
-            .map(ProcessOutput::into_output)
-            .map_err(MediaEncodingError::process)?;
+        let stderr = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
+            Ok(output) => output.into_output(),
+            Err(err) => {
+                let _ = std::fs::remove_file(&output_path);
+                return Err(MediaEncodingError::process(err).into());
+            }
+        };
         // The process runner mirrors the C# `GetProcessOutput` and ignores the
         // exit code, so a failed ffmpeg (unreadable input, no frame at the
         // offset) surfaces only as a missing output file — check it here so
@@ -687,12 +768,25 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                     .as_ref()
                     .map_or(ImageResolution::MatchSource, |read| read()),
             );
-            let output = self
-                .transcoder
-                .get_process_output(&ffmpeg, &args, true, None, &[])
-                .await
-                .map(ProcessOutput::into_output)
-                .map_err(MediaEncodingError::process)?;
+            // `ExtractImage` falls through to the standard attempt on any
+            // failure of the I-frame one, a timed-out run among them.
+            let output = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
+                Ok(output) => output.into_output(),
+                Err(err) => {
+                    let _ = std::fs::remove_file(&output_path);
+                    // A hung or unstartable ffmpeg is rare; the routine
+                    // "no image the quick way" fallback below stays quiet.
+                    if use_iframe {
+                        tracing::warn!(
+                            path = input_file,
+                            error = %err,
+                            "I-frame image extraction failed, retrying the standard way"
+                        );
+                    }
+                    last_error = err;
+                    continue;
+                }
+            };
             if std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
                 return Ok(output_path);
             }
@@ -851,6 +945,23 @@ mod tests {
         };
         let extra = enc.get_extra_arguments(&request);
         assert!(extra.contains("-rtsp_transport tcp+udp -rtsp_flags prefer_tcp"));
+    }
+
+    #[rstest::rstest]
+    #[case(Some(3000), "200M", "3000000")]
+    #[case(Some(0), "200M", "200M")]
+    #[case(Some(-1), "200M", "200M")]
+    #[case(None, "200M", "200M")]
+    #[case(None, "", "")]
+    fn analyze_duration_prefers_a_positive_source_value(
+        #[case] source_ms: Option<i32>,
+        #[case] configured: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            super::analyze_duration_value(source_ms, configured),
+            expected
+        );
     }
 
     #[test]
@@ -1165,6 +1276,213 @@ mod tests {
             index: 0,
             ..ferrofin_model::entities_media::MediaStream::default()
         }
+    }
+
+    /// A transcoder whose ffmpeg never exits for its first `hangs` runs, the
+    /// way one stalls on a dead network mount, and writes the output file on
+    /// later runs. A hung run that is given up on is counted in `abandoned`:
+    /// the real runner kills ffmpeg when its future is dropped.
+    struct HangingTranscoder {
+        hangs: std::sync::atomic::AtomicUsize,
+        runs: std::sync::atomic::AtomicUsize,
+        abandoned: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HangingTranscoder {
+        fn hanging(hangs: usize) -> Self {
+            Self {
+                hangs: hangs.into(),
+                runs: 0.into(),
+                abandoned: Arc::default(),
+            }
+        }
+
+        fn runs(&self) -> usize {
+            self.runs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn abandoned(&self) -> usize {
+            self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Counts a dropped (abandoned) run.
+    struct Abandoned(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Abandoned {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Transcoder for HangingTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            use std::sync::atomic::Ordering;
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let hang = self
+                .hangs
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if hang {
+                let _abandoned = Abandoned(Arc::clone(&self.abandoned));
+                std::future::pending::<()>().await;
+            }
+            let argv = crate::encoder::split_args(arguments)?;
+            let out = argv.last().expect("the output path is the last argument");
+            std::fs::write(out, b"jpg").expect("write frame");
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// An encoder over `transcoder` writing into `temp`, with one pool permit.
+    fn hanging_encoder(
+        transcoder: &Arc<HangingTranscoder>,
+        temp: &std::path::Path,
+        pool: &Arc<tokio::sync::Semaphore>,
+    ) -> MediaEncoderImpl<HangingTranscoder> {
+        MediaEncoderImpl::new(
+            Arc::clone(transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        )
+        .with_image_encoding_pool(Arc::clone(pool))
+    }
+
+    /// `ExtractImageInternal`: an ffmpeg that does not exit within the
+    /// timeout (10 s for an SDR frame when `ImageExtractionTimeoutMs` is
+    /// unset) is killed, the extraction fails, and its thumbnail-pool permit
+    /// is free again.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_frame_extraction_is_stopped_at_the_default_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_video_image(
+                "/media/stalled.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                Some(10 * TICKS_PER_SECOND),
+            ),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg");
+
+        let err = result.expect_err("a hung ffmpeg is a failure");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!(transcoder.abandoned(), 1, "the hung run is given up");
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// `ImageExtractionTimeoutMs` is read live; 0 or less takes the default.
+    #[rstest]
+    #[case::configured(2500, 2500)]
+    #[case::unset(0, 10_000)]
+    #[case::negative(-1, 10_000)]
+    #[tokio::test(start_paused = true)]
+    async fn the_configured_image_extraction_timeout_applies(
+        #[case] configured: i32,
+        #[case] expected_ms: u64,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool)
+            .with_image_extraction_timeout(move || configured);
+        let start = tokio::time::Instant::now();
+        let err = enc
+            .extract_video_image(
+                "/media/stalled.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a hung ffmpeg is a failure");
+
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(expected_ms)
+        );
+        assert!(
+            err.to_string().contains(&format!("after {expected_ms}ms")),
+            "{err}"
+        );
+    }
+
+    /// `ExtractImage`: a timed-out I-frame attempt falls through to the
+    /// standard one, as any other failure of it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_iframe_attempt_falls_back_to_the_standard_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_image_stream(
+                "/media/cover.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                2,
+                ImageFormat::Jpg,
+            ),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg")
+        .expect("the standard attempt extracts the image");
+
+        assert!(std::path::Path::new(&out).exists());
+        assert_eq!((transcoder.runs(), transcoder.abandoned()), (2, 1));
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// An audio cover extraction is bounded the same way, and leaves no
+    /// partial file behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_audio_image_extraction_is_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_audio_image("/media/song.flac", None),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg")
+        .expect_err("a hung ffmpeg is a failure");
+
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert_eq!(pool.available_permits(), 1);
     }
 
     // The extraction writes into the configured temp dir — NEVER next to the
@@ -1545,6 +1863,7 @@ mod tests {
                     max_width: 320,
                     qscale: 4,
                     threads: 1,
+                    priority: ferrofin_model::configuration::ProcessPriorityClass::BelowNormal,
                     output_dir: &output_dir,
                     allow_hw_accel: false,
                     enable_hw_encoding: false,

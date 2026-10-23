@@ -2569,10 +2569,14 @@ fn get_external_subtitle_profile(
         if !profile.supports_language(subtitle_stream.language.as_deref()) {
             continue;
         }
+        // A client-rendered graphical (PGS or VobSub) stream is delivered
+        // External even with extraction off (jellyfin#17512).
         if !subtitle_stream.is_external
             && play_method == PlayMethod::Transcode
             && !transcoder_support
                 .can_extract_subtitles(subtitle_stream.codec.as_deref().unwrap_or(""))
+            && !subtitle_stream.is_pgs_subtitle_stream()
+            && !subtitle_stream.is_vob_sub_subtitle_stream()
         {
             continue;
         }

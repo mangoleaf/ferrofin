@@ -171,6 +171,11 @@ fn fake_media_sources_methods_panic() {
     assert_panics(f.close_live_stream("id"));
 }
 
+#[tokio::test]
+async fn fake_sessions_close_a_last_socket_quietly() {
+    assert!(FakeSessions.close_if_needed("s").await.is_ok());
+}
+
 #[test]
 fn fake_sessions_methods_panic() {
     let f = FakeSessions;
@@ -199,8 +204,8 @@ fn fake_sessions_methods_panic() {
         ferrofin_model::session::SessionMessageType::ForceKeepAlive,
         "d",
     ));
-    // A no-op (not a panic): the user-data handlers push `UserDataChanged`
-    // through it best-effort on every played/favorite/rating write.
+    // A no-op (not a panic): the user-data manager's batched
+    // `UserDataChanged` goes out through it.
     assert!(
         tokio::runtime::Builder::new_current_thread()
             .build()

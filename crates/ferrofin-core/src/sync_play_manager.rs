@@ -15,11 +15,13 @@
 //! how Rust expresses the same table without method-overload dispatch.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration as StdDuration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use ferrofin_model::sync_play::{
@@ -33,7 +35,9 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::session_bus::SessionMessageBus;
-use ferrofin_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
+use ferrofin_traits::stubs::{
+    PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
+};
 use ferrofin_util::shuffle_extensions::shuffle;
 
 /// .NET tick resolution: 100-nanosecond units, so 10_000 ticks per millisecond.
@@ -60,6 +64,18 @@ const MAX_PLAYBACK_OFFSET_MS: i64 = 500;
 /// group position during the wait takes the tolerance away
 /// ([`Group::position_jumped`]).
 const MAX_CATCH_UP_OFFSET_MS: i64 = 60_000;
+
+/// `Group.DefaultGroupWaitTimeout` (12.1): how long a group waits for its
+/// members to report ready before it carries on without the ones that have
+/// not.
+const DEFAULT_GROUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+/// `SyncPlayManager.GroupWaitSweepInterval` (12.1): how often the manager
+/// looks for a group whose wait has run out, while any group exists.
+const GROUP_WAIT_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(1);
+
+/// The `task` field of the group-wait sweep's span and events.
+const SWEEP_TASK: &str = "sync_play_group_wait_sweep";
 
 /// A .NET tick count as a [`Duration`]. Ticks are 100 ns, so ten to the
 /// microsecond; going through microseconds keeps the full resolution that
@@ -559,6 +575,11 @@ struct Group {
     /// `Group.RunTimeTicks`, resolved once per item as it enters the queue.
     /// Keyed by item id, so re-pointing the queue needs no further lookups.
     item_runtimes: HashMap<Uuid, i64>,
+    /// `Group.GroupWaitTimeout` (12.1).
+    wait_timeout: StdDuration,
+    /// `Group.GroupWaitDeadline` (12.1): when the group gives up waiting for
+    /// its members, or `None` when it is not waiting for anyone.
+    wait_deadline: Option<Instant>,
 }
 
 impl Group {
@@ -576,6 +597,8 @@ impl Group {
             position_jumped: false,
             ignore_buffering: false,
             item_runtimes: HashMap::new(),
+            wait_timeout: DEFAULT_GROUP_WAIT_TIMEOUT,
+            wait_deadline: None,
         }
     }
 
@@ -648,6 +671,7 @@ impl Group {
 
     fn remove_member(&mut self, session_id: &str) {
         self.members.retain(|m| m.session_id != session_id);
+        self.update_group_wait_deadline(false);
     }
 
     /// Port of `IGroupStateContext.SetBuffering(session, buffering)`.
@@ -655,6 +679,7 @@ impl Group {
         if let Some(m) = self.member_mut(session_id) {
             m.is_buffering = buffering;
         }
+        self.update_group_wait_deadline(false);
     }
 
     /// Whether the group is still waiting on anybody — port of
@@ -690,6 +715,27 @@ impl Group {
         }
     }
 
+    /// The playing-session arm of `Group.CreateGroup` (Group.cs:298-316): the
+    /// group starts on the creator's item at its reported position, waiting,
+    /// and resumes once everyone is ready unless the creator was paused.
+    ///
+    /// The playlist is the reported queue. When the queue lacks the playing
+    /// item it is that item alone, as the open upstream fix
+    /// jellyfin/jellyfin#18198 does: v12.2 stores `NowPlayingQueue` only when
+    /// playback stops, so its queue is stale or empty and a missing item
+    /// leaves the group with nothing playing.
+    fn seed_from_now_playing(&mut self, now_playing: &SyncPlayNowPlaying) {
+        let item = now_playing.item_id;
+        let (ids, at) = match now_playing.queue.iter().position(|id| *id == item) {
+            Some(at) => (now_playing.queue.as_slice(), at),
+            None => (std::slice::from_ref(&item), 0),
+        };
+        self.queue.set(ids, i32::try_from(at).unwrap_or(0));
+        self.position_ticks = now_playing.position_ticks.unwrap_or(0);
+        self.resume_playing = !now_playing.is_paused;
+        self.set_state(GroupStateType::Waiting);
+    }
+
     /// `Group.RestartCurrentItem` (Group.cs:601-605) — rewind to the head of the
     /// item and restamp the group's clock.
     fn restart_current_item(&mut self, now: DateTime<Utc>) {
@@ -701,6 +747,76 @@ impl Group {
         for m in &mut self.members {
             m.is_buffering = buffering;
         }
+        // Resetting the status of every member starts a new waiting period.
+        self.update_group_wait_deadline(buffering);
+    }
+
+    /// Port of `Group.UpdateGroupWaitDeadline` (12.1): the group has a
+    /// deadline only while it is `Waiting` on a member that does not ignore
+    /// the wait. A running deadline covers the waiting period as a whole, so
+    /// members that keep reporting buffering while they load do not push it
+    /// back; only a new waiting period restarts it.
+    fn update_group_wait_deadline(&mut self, start_new_waiting_period: bool) {
+        if self.state != GroupStateType::Waiting || !self.is_buffering() {
+            self.wait_deadline = None;
+            return;
+        }
+        if self.wait_deadline.is_none() || start_new_waiting_period {
+            self.wait_deadline = Some(Instant::now() + self.wait_timeout);
+        }
+    }
+
+    /// Port of `Group.HandleGroupWaitTimeout` (12.1, `Group.cs:738-795`):
+    /// once the deadline has passed, the group stops waiting for the members
+    /// that have not reported ready. A group that was going to resume starts
+    /// playing without them (the waiting state's forced Unpause); any other
+    /// group settles into `Paused` where the wait started. Returns the session
+    /// acting for the group (any blocking one, as the recovery is broadcast to
+    /// the whole group) and the messages to deliver.
+    fn handle_group_wait_timeout(
+        &mut self,
+        now: Instant,
+        now_utc: DateTime<Utc>,
+    ) -> Option<(String, Vec<Outbound>)> {
+        let deadline = self.wait_deadline?;
+        if deadline > now {
+            return None;
+        }
+        self.wait_deadline = None;
+        if self.state != GroupStateType::Waiting {
+            return None;
+        }
+        let blocking: Vec<String> = self
+            .members
+            .iter()
+            .filter(|m| m.is_buffering && !m.ignore_wait)
+            .map(|m| m.session_id.clone())
+            .collect();
+        let session = blocking.first()?.clone();
+        let waited = self.wait_timeout + now.saturating_duration_since(deadline);
+        tracing::warn!(
+            group_id = %self.id,
+            waited_ms = waited.as_millis(),
+            session_ids = %blocking.join(", "),
+            "sync-play group gave up waiting for sessions to report ready"
+        );
+        if self.resume_playing {
+            // An Unpause in the waiting state means "start now, ignoring the
+            // sessions that are not ready".
+            return Some((
+                session,
+                self.handle_unpause(GroupStateType::Waiting, now_utc),
+            ));
+        }
+        // The members have been paused for the whole waiting period, so the
+        // playback position stays where the wait started.
+        self.set_all_buffering(false);
+        self.set_state(GroupStateType::Paused);
+        let outbound = vec![
+            Outbound::all(self.command_env(SendCommandType::Pause, self.last_activity, now_utc)),
+            Outbound::all(self.state_update_env(PlaybackRequestType::Pause)),
+        ];
+        Some((session, outbound))
     }
 
     /// The command's scheduled execution instant: `now` + a latency cushion
@@ -829,6 +945,7 @@ impl Group {
         if new_state != GroupStateType::Waiting {
             self.initial_state = None;
             self.position_jumped = false;
+            self.wait_deadline = None;
         }
         if new_state == GroupStateType::Playing {
             self.ignore_buffering = false;
@@ -1659,6 +1776,9 @@ struct Registry {
     session_to_group: HashMap<String, Uuid>,
     /// user id → count of that user's active member sessions.
     active_users: HashMap<Uuid, u32>,
+    /// Whether the group-wait sweep task is running. It runs only while a
+    /// group exists, as upstream arms its `_groupWaitTimer`.
+    sweeping: bool,
 }
 
 /// The user + library seams a group needs to answer "may this user see the
@@ -1670,8 +1790,13 @@ struct LibraryAccess {
 
 /// The real SyncPlay manager: a group registry plus a socket message bus.
 pub struct FerrofinSyncPlayManager {
-    registry: Mutex<Registry>,
+    registry: Arc<Mutex<Registry>>,
     bus: Arc<dyn SessionMessageBus>,
+    /// `SyncPlayManager.GroupWaitTimeout` (12.1), given to every new group.
+    group_wait_timeout: StdDuration,
+    /// How often the group-wait sweep runs; `None` runs no sweep task (tests
+    /// drive it by hand).
+    group_wait_sweep: Option<StdDuration>,
     /// When wired, group visibility and queue changes are gated on every
     /// affected member's access to the queued items. Absent (unit tests), every
     /// queue is treated as accessible.
@@ -1690,8 +1815,10 @@ impl FerrofinSyncPlayManager {
     #[must_use]
     pub fn new(bus: Arc<dyn SessionMessageBus>) -> Self {
         Self {
-            registry: Mutex::new(Registry::default()),
+            registry: Arc::new(Mutex::new(Registry::default())),
             bus,
+            group_wait_timeout: DEFAULT_GROUP_WAIT_TIMEOUT,
+            group_wait_sweep: Some(GROUP_WAIT_SWEEP_INTERVAL),
             access: None,
         }
     }
@@ -1814,17 +1941,9 @@ impl FerrofinSyncPlayManager {
         out
     }
 
-    /// The registry guard. A panic while it was held poisons the mutex, and
-    /// panicking on every later call would turn one bad request into a
-    /// server-wide SyncPlay outage until restart. So recover instead: this
-    /// trades a possibly half-applied mutation for keeping SyncPlay up, and the
-    /// poison is cleared so the error is logged once per panic, not per call.
+    /// The registry guard; see [`lock_registry`] for poison recovery.
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
-        self.registry.lock().unwrap_or_else(|poisoned| {
-            tracing::error!("sync-play registry lock was poisoned by a panic; recovering");
-            self.registry.clear_poison();
-            poisoned.into_inner()
-        })
+        lock_registry(&self.registry)
     }
 
     /// Delivers the plan from [`leave_locked_with_notices`] (after unlocking):
@@ -1843,18 +1962,141 @@ impl FerrofinSyncPlayManager {
     /// Delivers `outbound` to the resolved target sessions. Called after the
     /// registry lock is released (delivery is a non-blocking sink invocation).
     fn deliver(&self, members: &[(String, bool)], from_session: &str, outbound: &[Outbound]) {
-        for msg in outbound {
-            for (session_id, is_buffering) in members {
-                let deliver = match msg.target {
-                    Target::AllGroup => true,
-                    Target::CurrentSession => session_id == from_session,
-                    Target::AllExceptCurrentSession => session_id != from_session,
-                    Target::AllReady => !is_buffering,
-                };
-                if deliver {
-                    self.bus.send(session_id, msg.body.clone());
-                }
+        deliver_to(self.bus.as_ref(), members, from_session, outbound);
+    }
+
+    /// Starts the group-wait sweep unless it is running or disabled. Called
+    /// under the registry lock when a group is created; the task stops on its
+    /// own once no group is left. Outside a Tokio runtime nothing is armed.
+    fn arm_group_wait_sweep(&self, reg: &mut Registry) {
+        let Some(every) = self.group_wait_sweep else {
+            return;
+        };
+        if reg.sweeping {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(
+            run_group_wait_sweep(Arc::downgrade(&self.registry), self.bus.clone(), every)
+                .instrument(tracing::info_span!(
+                    parent: None,
+                    "sync_play_group_wait_sweep",
+                    task = SWEEP_TASK,
+                    trigger = "schedule"
+                )),
+        );
+        reg.sweeping = true;
+    }
+}
+
+/// The registry guard. A panic while it was held poisons the mutex, and
+/// panicking on every later call would turn one bad request into a
+/// server-wide SyncPlay outage until restart. So recover instead: this trades
+/// a possibly half-applied mutation for keeping SyncPlay up, and the poison is
+/// cleared so the error is logged once per panic, not per call.
+fn lock_registry(registry: &Mutex<Registry>) -> std::sync::MutexGuard<'_, Registry> {
+    registry.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("sync-play registry lock was poisoned by a panic; recovering");
+        registry.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// Delivers `outbound` to the resolved target sessions. Called after the
+/// registry lock is released (delivery is a non-blocking sink invocation).
+fn deliver_to(
+    bus: &dyn SessionMessageBus,
+    members: &[(String, bool)],
+    from_session: &str,
+    outbound: &[Outbound],
+) {
+    for msg in outbound {
+        for (session_id, is_buffering) in members {
+            let deliver = match msg.target {
+                Target::AllGroup => true,
+                Target::CurrentSession => session_id == from_session,
+                Target::AllExceptCurrentSession => session_id != from_session,
+                Target::AllReady => !is_buffering,
+            };
+            if deliver {
+                bus.send(session_id, msg.body.clone());
             }
+        }
+    }
+}
+
+/// What one group-wait sweep has to deliver: each recovered group's member
+/// targets, the session acting for it, and its messages.
+type GroupWaitDeliveries = Vec<(Vec<(String, bool)>, String, Vec<Outbound>)>;
+
+/// One pass of `SyncPlayManager.OnGroupWaitTimerTick` (12.1): every group
+/// whose wait has run out carries on without the members it was waiting for.
+/// `None`, with the sweep marked stopped, once no group is left.
+fn sweep_group_waits(
+    registry: &Mutex<Registry>,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+) -> Option<GroupWaitDeliveries> {
+    let mut reg = lock_registry(registry);
+    if reg.groups.is_empty() {
+        reg.sweeping = false;
+        return None;
+    }
+    Some(
+        reg.groups
+            .values_mut()
+            .filter_map(|group| {
+                let (from, outbound) = group.handle_group_wait_timeout(now, now_utc)?;
+                Some((member_targets(group), from, outbound))
+            })
+            .collect(),
+    )
+}
+
+/// Marks the sweep stopped if its task unwinds, so the next new group starts
+/// it again, and makes the panic visible (LOGGING.md: panics must be visible).
+struct SweepPanicGuard(Weak<Mutex<Registry>>);
+
+impl Drop for SweepPanicGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(
+                task = SWEEP_TASK,
+                "sync-play group-wait sweep panicked; the next new group restarts it"
+            );
+            if let Some(registry) = self.0.upgrade() {
+                lock_registry(&registry).sweeping = false;
+            }
+        }
+    }
+}
+
+/// The group-wait sweep task (`SyncPlayManager._groupWaitTimer`, 12.1). It
+/// holds the registry weakly, so it ends with the manager, and it delivers
+/// after releasing the lock, as the request paths do.
+async fn run_group_wait_sweep(
+    registry: Weak<Mutex<Registry>>,
+    bus: Arc<dyn SessionMessageBus>,
+    every: StdDuration,
+) {
+    let _panic_guard = SweepPanicGuard(registry.clone());
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes at once; the first sweep is one interval in.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        let Some(deliveries) = sweep_group_waits(&registry, Instant::now(), Utc::now()) else {
+            return;
+        };
+        drop(registry);
+        for (targets, from, outbound) in deliveries {
+            deliver_to(bus.as_ref(), &targets, &from, &outbound);
         }
     }
 }
@@ -1875,7 +2117,17 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         &self,
         session: &SyncPlaySession,
         group_name: &str,
+        now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
+        // Resolved off the registry lock, as `handle_request` does for a new queue.
+        let runtimes = match now_playing {
+            Some(np) => {
+                let mut ids = np.queue.clone();
+                ids.push(np.item_id);
+                self.item_run_times(&ids).await
+            }
+            None => HashMap::new(),
+        };
         let now = Utc::now();
         let (info, joined_env, targets, outbound, left) = {
             let mut reg = self.lock();
@@ -1884,13 +2136,19 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             let left = leave_locked_with_notices(&mut reg, session, now);
             let group_id = Uuid::new_v4();
             let mut group = Group::new(group_id, group_name.trim().to_owned(), now);
+            group.wait_timeout = self.group_wait_timeout;
             group.add_member(session);
+            if let Some(np) = now_playing {
+                group.item_runtimes = runtimes;
+                group.seed_from_now_playing(np);
+            }
             let joined = render_update(GroupUpdate::GroupJoined(GroupJoinedUpdate {
                 group_id,
                 data: group.info(now),
             }));
-            // `Group.CreateGroup` ends with the state hook — on a brand-new
-            // (Idle) group that is a Stop command to the creating session.
+            // `Group.CreateGroup` ends with the state hook: a Stop to the
+            // creator of an Idle group, or the Waiting arm's NewPlaylist for a
+            // creator that is playing.
             let outbound = group.session_joined(&session.session_id, now);
             // The HTTP response is a SECOND, LATER snapshot: `SyncPlayManager.NewGroup`
             // returns `group.GetInfo()` AFTER `CreateGroup` has run the state hook
@@ -1905,6 +2163,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             reg.session_to_group
                 .insert(session.session_id.clone(), group_id);
             *reg.active_users.entry(session.user_id).or_insert(0) += 1;
+            self.arm_group_wait_sweep(&mut reg);
             (info, joined, targets, outbound, left)
         };
         if let Some(n) = left {
@@ -2207,6 +2466,8 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     if let Some(m) = group.member_mut(&session.session_id) {
                         m.ignore_wait = *ignore_wait;
                     }
+                    // `Group.SetIgnoreGroupWait` (12.1).
+                    group.update_group_wait_deadline(false);
                 }
                 _ => {}
             }
@@ -2449,7 +2710,7 @@ mod tests {
     async fn new_group_creates_and_lists() {
         let (m, bus) = mgr();
         let s = session("s1", "alice");
-        let info = m.new_group(&s, "movie night").await.unwrap();
+        let info = m.new_group(&s, "movie night", None).await.unwrap();
         assert_eq!(info.group_name, "movie night");
         assert_eq!(info.participants, vec!["alice".to_string()]);
         assert_eq!(info.state, GroupStateType::Idle);
@@ -2468,7 +2729,7 @@ mod tests {
     async fn join_notifies_existing_members() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
 
@@ -2480,6 +2741,143 @@ mod tests {
         assert_eq!(bus.count_for("s2"), 2);
     }
 
+    fn now_playing(item: Uuid, position_ticks: i64, is_paused: bool) -> SyncPlayNowPlaying {
+        SyncPlayNowPlaying {
+            item_id: item,
+            position_ticks: Some(position_ticks),
+            is_paused,
+            queue: Vec::new(),
+        }
+    }
+
+    /// The `Data` of a `PlayQueue` group update.
+    fn queue_data(body: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["Data"]["Data"].clone()
+    }
+
+    /// `Group.CreateGroup` for a creator that is playing: the group starts
+    /// `Waiting` on the creator's item at its position. The creator gets
+    /// GroupJoined, then the Waiting arm's `NewPlaylist`, and never `Stop`; a
+    /// joiner is brought to the same item, and once both are ready the group
+    /// plays, because the creator was not paused.
+    #[tokio::test]
+    async fn a_playing_creator_starts_the_group_on_its_item() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let item = Uuid::new_v4();
+        let info = m
+            .new_group(&a, "g", Some(&now_playing(item, 42_000_000, false)))
+            .await
+            .unwrap();
+        assert_eq!(info.state, GroupStateType::Waiting);
+
+        let creator = bus.bodies_for("s1");
+        assert_eq!(creator.len(), 2, "{creator:?}");
+        assert!(creator[0].contains("GroupJoined") && creator[0].contains("\"State\":\"Waiting\""));
+        assert!(
+            !creator.iter().any(|b| b.contains("\"Stop\"")),
+            "{creator:?}"
+        );
+        let queue = queue_data(&creator[1]);
+        assert_eq!(queue["Reason"], "NewPlaylist");
+        assert_eq!(queue["PlayingItemIndex"], 0);
+        assert_eq!(queue["StartPositionTicks"], 42_000_000);
+        assert_eq!(
+            Uuid::parse_str(queue["Playlist"][0]["ItemId"].as_str().unwrap()).unwrap(),
+            item
+        );
+        {
+            // The creator is the member the group waits for, so the wait
+            // deadline runs (`SetBuffering` → `UpdateGroupWaitDeadline`).
+            let reg = m.lock();
+            let g = &reg.groups[&info.group_id];
+            assert!(g.members[0].is_buffering);
+            assert!(g.wait_deadline.is_some());
+        }
+
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let joiner = queue_data(
+            bus.bodies_for("s2")
+                .iter()
+                .find(|b| b.contains("\"PlayQueue\""))
+                .unwrap(),
+        );
+        assert_eq!(joiner["StartPositionTicks"], 42_000_000);
+        assert_eq!(joiner["Playlist"], queue["Playlist"]);
+
+        let pli = playing_item_id(&bus);
+        m.handle_request(&a, ready_at(pli, 42_000_000, false))
+            .await
+            .unwrap();
+        m.handle_request(&b, ready_at(pli, 42_000_000, false))
+            .await
+            .unwrap();
+        let g = m.get_group(&a, info.group_id).await.unwrap();
+        assert_eq!(g.state, GroupStateType::Playing);
+    }
+
+    /// A paused creator's group settles into `Paused` once it is ready
+    /// (`ResumePlaying = !PlayState.IsPaused`), and the playlist is the
+    /// reported queue with the playing item current.
+    #[tokio::test]
+    async fn a_paused_creator_keeps_its_queue_and_stays_paused() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let (first, item) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut playing = now_playing(item, 7, true);
+        playing.queue = vec![first, item];
+        let info = m.new_group(&a, "g", Some(&playing)).await.unwrap();
+        let queue = queue_data(&bus.bodies_for("s1")[1]);
+        assert_eq!(queue["PlayingItemIndex"], 1);
+        assert_eq!(queue["Playlist"].as_array().unwrap().len(), 2);
+
+        let pli = playing_item_id(&bus);
+        m.handle_request(&a, ready_at(pli, 7, false)).await.unwrap();
+        let g = m.get_group(&a, info.group_id).await.unwrap();
+        assert_eq!(g.state, GroupStateType::Paused);
+    }
+
+    /// A reported queue that lacks the playing item is replaced by the item
+    /// alone, as jellyfin/jellyfin#18198 does, so the group still plays it.
+    #[tokio::test]
+    async fn a_queue_without_the_playing_item_falls_back_to_the_item() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let item = Uuid::new_v4();
+        let mut playing = now_playing(item, 7, false);
+        playing.queue = vec![Uuid::new_v4()];
+        m.new_group(&a, "g", Some(&playing)).await.unwrap();
+        let queue = queue_data(&bus.bodies_for("s1")[1]);
+        assert_eq!(queue["PlayingItemIndex"], 0);
+        let ids: Vec<&str> = queue["Playlist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["ItemId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![item.simple().to_string()]);
+    }
+
+    /// A playing creator already in a group leaves it first, as any creator
+    /// does, and the new group is the one seeded from its playback.
+    #[tokio::test]
+    async fn a_playing_creator_in_a_group_leaves_it_for_the_seeded_one() {
+        let (m, _bus) = mgr();
+        let a = session("s1", "alice");
+        let old = m.new_group(&a, "old", None).await.unwrap();
+        let new = m
+            .new_group(&a, "new", Some(&now_playing(Uuid::new_v4(), 0, false)))
+            .await
+            .unwrap();
+        let groups = m.list_groups(&a).await.unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].group_id, new.group_id);
+        assert_ne!(new.group_id, old.group_id);
+        assert_eq!(groups[0].state, GroupStateType::Waiting);
+    }
+
     /// `Group.CreateGroup` / `Group.SessionJoin` both end with
     /// `_state.SessionJoined(...)`, which on an Idle group is a Stop command
     /// addressed to the joining session only. Ferrofin used to push nothing.
@@ -2487,7 +2885,7 @@ mod tests {
     async fn joining_an_idle_group_pushes_group_joined_then_stop() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
 
         let creator = bus.bodies_for("s1");
         assert_eq!(creator.len(), 2, "{creator:?}");
@@ -2515,7 +2913,7 @@ mod tests {
     async fn joining_a_playing_group_pushes_the_queue_and_pauses_the_ready() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         start_playing(&m, &bus, &[&a], 2).await;
         let before = bus.count_for("s1");
 
@@ -2543,7 +2941,7 @@ mod tests {
     async fn a_buffering_member_leaving_resumes_the_group() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         start_playing(&m, &bus, &[&a], 2).await;
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap(); // -> Waiting, bob buffering
@@ -2579,7 +2977,7 @@ mod tests {
     async fn buffering_from_waiting_keeps_resume_playing_armed() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let pli = start_playing(&m, &bus, &[&a], 2).await;
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap(); // Playing -> Waiting, resume armed
@@ -2615,7 +3013,7 @@ mod tests {
     async fn group_info_is_stamped_per_read_and_keeps_join_order() {
         let (m, _bus) = mgr();
         let z = session("s1", "zoe");
-        let info = m.new_group(&z, "g").await.unwrap();
+        let info = m.new_group(&z, "g", None).await.unwrap();
         let adam = session("s2", "adam");
         m.join_group(&adam, info.group_id).await.unwrap();
 
@@ -2647,7 +3045,7 @@ mod tests {
     async fn leave_removes_and_drops_empty_group() {
         let (m, _bus) = mgr();
         let s = session("s1", "alice");
-        let info = m.new_group(&s, "g").await.unwrap();
+        let info = m.new_group(&s, "g", None).await.unwrap();
         m.leave_group(&s).await.unwrap();
         assert!(m.list_groups(&s).await.unwrap().is_empty());
         assert!(!m.is_user_active(s.user_id).await.unwrap());
@@ -2671,7 +3069,7 @@ mod tests {
     async fn set_new_queue_waits_for_every_member_before_playing() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let before = bus.count_for("s2");
@@ -2724,7 +3122,7 @@ mod tests {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
         let b = session("s2", "bob");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.join_group(&b, info.group_id).await.unwrap();
         (m, bus, a, b, info.group_id)
     }
@@ -3528,7 +3926,7 @@ mod tests {
     async fn queue_move_remove_repeat_shuffle_mutate() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(1)).await.unwrap();
         m.handle_request(
             &a,
@@ -3586,7 +3984,7 @@ mod tests {
     async fn ping_seek_buffer_ready_flow() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let gid = info.group_id;
         m.handle_request(&a, PlaybackRequest::Ping { ping: 40 })
             .await
@@ -3890,7 +4288,7 @@ mod tests {
     async fn removing_the_playing_item_with_an_earlier_one_stays_in_the_queue() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(
             &a,
             PlaybackRequest::Play {
@@ -3927,7 +4325,7 @@ mod tests {
     async fn next_item_on_a_cleared_queue_changes_nothing() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         m.handle_request(
             &a,
@@ -3962,7 +4360,7 @@ mod tests {
     async fn clear_playlist_stops_group() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         m.handle_request(
             &a,
@@ -3988,7 +4386,7 @@ mod tests {
     async fn clearing_the_playlist_can_keep_the_playing_item() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         m.handle_request(
             &a,
@@ -4040,7 +4438,7 @@ mod tests {
     async fn a_new_queue_resets_shuffle_and_repeat() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(2)).await.unwrap();
         for r in [
             PlaybackRequest::SetRepeatMode {
@@ -4093,7 +4491,7 @@ mod tests {
         len: usize,
         position: i32,
     ) -> Vec<Uuid> {
-        m.new_group(a, "g").await.unwrap();
+        m.new_group(a, "g", None).await.unwrap();
         m.handle_request(
             a,
             PlaybackRequest::Play {
@@ -4350,7 +4748,7 @@ mod tests {
     async fn removing_a_non_playing_item_never_stops_the_group() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         let playing = playing_item_id(&bus);
         let other = last_playlist(&bus)
@@ -4386,7 +4784,7 @@ mod tests {
     async fn removing_the_playing_item_steps_back_one_slot() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         let items = last_playlist(&bus);
         // Point the queue at the middle item, then remove it.
@@ -4446,7 +4844,7 @@ mod tests {
     async fn queueing_nothing_pushes_nothing() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(1)).await.unwrap();
         let at = mark(&bus);
 
@@ -4473,7 +4871,7 @@ mod tests {
     async fn a_queue_change_that_fails_while_waiting_drops_to_idle() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(1)).await.unwrap(); // Idle -> Waiting
         assert_eq!(
             m.get_group(&a, info.group_id).await.unwrap().state,
@@ -4510,7 +4908,7 @@ mod tests {
         for pause_first in [false, true] {
             let (m, bus) = mgr();
             let a = session("s1", "alice");
-            let info = m.new_group(&a, "g").await.unwrap();
+            let info = m.new_group(&a, "g", None).await.unwrap();
             start_playing(&m, &bus, &[&a], 1).await;
             let want = if pause_first {
                 m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
@@ -4561,8 +4959,8 @@ mod tests {
     async fn creating_a_second_group_leaves_the_first() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        let first = m.new_group(&a, "one").await.unwrap();
-        let _second = m.new_group(&a, "two").await.unwrap();
+        let first = m.new_group(&a, "one", None).await.unwrap();
+        let _second = m.new_group(&a, "two", None).await.unwrap();
         // The first group is now empty and dropped.
         assert!(m.get_group(&a, first.group_id).await.is_err());
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
@@ -4575,7 +4973,7 @@ mod tests {
     async fn rejoining_your_own_group_as_its_only_member_restores_the_session() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let before = bus.count_for("s1");
 
         m.join_group(&a, info.group_id).await.unwrap();
@@ -4597,7 +4995,7 @@ mod tests {
     async fn rejoining_a_shared_group_keeps_one_membership() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let c = session("s3", "carol");
@@ -4628,7 +5026,7 @@ mod tests {
     async fn switching_groups_while_waiting_resumes_the_old_group(#[case] via_new: bool) {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let old = m.new_group(&a, "old").await.unwrap();
+        let old = m.new_group(&a, "old", None).await.unwrap();
         start_playing(&m, &bus, &[&a], 2).await;
         let b = session("s2", "bob");
         m.join_group(&b, old.group_id).await.unwrap(); // -> Waiting on bob
@@ -4636,10 +5034,10 @@ mod tests {
         let bob_before = bus.count_for("s2");
 
         if via_new {
-            m.new_group(&b, "new").await.unwrap();
+            m.new_group(&b, "new", None).await.unwrap();
         } else {
             let c = session("s3", "carol");
-            let other = m.new_group(&c, "other").await.unwrap();
+            let other = m.new_group(&c, "other", None).await.unwrap();
             m.join_group(&b, other.group_id).await.unwrap();
         }
 
@@ -4668,7 +5066,7 @@ mod tests {
     async fn a_poisoned_registry_recovers_instead_of_panicking_every_call() {
         let (m, _bus) = mgr();
         let s = session("s1", "alice");
-        m.new_group(&s, "g").await.unwrap();
+        m.new_group(&s, "g", None).await.unwrap();
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = m.registry.lock().unwrap();
             panic!("poison the sync-play registry");
@@ -4800,7 +5198,7 @@ mod tests {
         let other = db_session(&db, "s2", "bob").await;
         let movie = seed_movie(&db, "Movie").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         // An empty queue is accessible to everyone, so the group is visible.
         assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
         set_queue(&m, &owner, vec![movie]).await;
@@ -4824,7 +5222,7 @@ mod tests {
         let other = db_session(&db, "s2", "bob").await;
         let movie = seed_movie(&db, "Movie").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie]).await;
         delete_item(library.as_ref(), movie).await;
 
@@ -4853,7 +5251,7 @@ mod tests {
 
         let movie = seed_movie(&db, "Movie").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie]).await;
 
         assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
@@ -4878,7 +5276,7 @@ mod tests {
         let owner = db_session(&db, "s1", "alice").await;
         let other = db_session(&db, "s2", "bob").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         m.join_group(&other, info.group_id).await.unwrap();
         bus.sent.lock().unwrap().clear();
 
@@ -4963,7 +5361,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let group = m.new_group(&owner, "movie night").await.unwrap();
+        let group = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie_id]).await;
         assert!(m.list_groups(&guest).await.unwrap().is_empty());
         m.join_group(&guest, group.group_id).await.unwrap();
@@ -5014,7 +5412,7 @@ mod tests {
         // the suite exercises group mechanics without a database.
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(2)).await.unwrap();
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
         assert!(m.get_group(&a, info.group_id).await.is_ok());
@@ -5030,7 +5428,7 @@ mod tests {
     async fn ping_is_clamped_to_max() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, PlaybackRequest::Ping { ping: i64::MAX })
             .await
             .unwrap();
@@ -5043,7 +5441,7 @@ mod tests {
     async fn negative_ping_is_clamped_to_zero() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, PlaybackRequest::Ping { ping: -1 })
             .await
             .unwrap();
@@ -5051,5 +5449,318 @@ mod tests {
         let group = reg.groups.values().next().unwrap();
         let member = group.members.first().unwrap();
         assert_eq!(member.ping_ms, 0);
+    }
+
+    // ----- group-wait timeout (12.1) ---------------------------------------
+    //
+    // Transliterated from upstream's `WaitingGroupStateTests` and
+    // `SyncPlayManagerTests` (v12.2, jellyfin#17938). Upstream gives its
+    // groups a 200 ms wait and pumps `Group.HandleGroupWaitTimeout` by hand;
+    // here the sweep is pumped at an instant past the deadline instead of
+    // sleeping until it.
+
+    const TEST_GROUP_WAIT: StdDuration = StdDuration::from_millis(200);
+
+    /// A manager whose groups wait `TEST_GROUP_WAIT`, with no sweep task.
+    fn mgr_with_group_wait() -> (FerrofinSyncPlayManager, Arc<RecordingBus>) {
+        let (m, bus) = mgr();
+        (m.with_group_wait(TEST_GROUP_WAIT, None), bus)
+    }
+
+    /// Pumps the sweep once the group's wait has run out.
+    fn after_the_wait(m: &FerrofinSyncPlayManager) {
+        m.sweep_group_waits_at(Instant::now() + TEST_GROUP_WAIT + StdDuration::from_millis(1));
+    }
+
+    async fn state_of(
+        m: &FerrofinSyncPlayManager,
+        s: &SyncPlaySession,
+        id: Uuid,
+    ) -> GroupStateType {
+        m.get_group(s, id).await.unwrap().state
+    }
+
+    impl FerrofinSyncPlayManager {
+        /// Groups wait `timeout` for their members; the sweep runs every
+        /// `sweep`, or never for `None`.
+        fn with_group_wait(mut self, timeout: StdDuration, sweep: Option<StdDuration>) -> Self {
+            self.group_wait_timeout = timeout;
+            self.group_wait_sweep = sweep;
+            self
+        }
+
+        /// One sweep as of `now`, delivered as the sweep task delivers it.
+        fn sweep_group_waits_at(&self, now: Instant) {
+            if let Some(deliveries) = sweep_group_waits(&self.registry, now, Utc::now()) {
+                for (targets, from, outbound) in deliveries {
+                    self.deliver(&targets, &from, &outbound);
+                }
+            }
+        }
+    }
+
+    /// `SessionJoined_JoinerNeverReportsReady_GroupResumesWithoutIt`.
+    #[tokio::test]
+    async fn group_wait_resumes_without_a_joiner_that_never_reports_ready() {
+        let (m, bus) = mgr_with_group_wait();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
+
+        // A session joins while the group is playing: it pauses and waits.
+        let joiner = session("s3", "joiner");
+        let before_the_join = Instant::now();
+        m.join_group(&joiner, info.group_id).await.unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Waiting
+        );
+
+        // Nothing gives up before the deadline.
+        m.sweep_group_waits_at(before_the_join);
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Waiting
+        );
+
+        // The joiner never reports ready; the group carries on without it.
+        after_the_wait(&m);
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
+
+        // A late Buffer from the session that missed the deadline does not
+        // drag the group back into waiting.
+        m.handle_request(&joiner, buffer_at(pli, 0)).await.unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
+    }
+
+    /// `SessionJoined_GroupWasPaused_TimeoutLeavesTheGroupPaused`.
+    #[tokio::test]
+    async fn group_wait_leaves_a_paused_group_paused_where_it_was() {
+        let (m, bus) = mgr_with_group_wait();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        start_playing(&m, &bus, &[&a, &b], 1).await;
+        m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Paused
+        );
+        // The group has been sitting paused for a while before anyone joins.
+        m.lock()
+            .groups
+            .get_mut(&info.group_id)
+            .unwrap()
+            .last_activity = Utc::now() - Duration::minutes(2);
+        let position = m.lock().groups[&info.group_id].position_ticks;
+
+        let joiner = session("s3", "joiner");
+        m.join_group(&joiner, info.group_id).await.unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Waiting
+        );
+        let before: Vec<usize> = ["s1", "s2", "s3"]
+            .iter()
+            .map(|s| bus.count_for(s))
+            .collect();
+
+        // A group that was paused does not start playing because a member
+        // failed to report ready.
+        after_the_wait(&m);
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Paused
+        );
+        // Nor does giving up on the joiner move its playback position.
+        assert_eq!(m.lock().groups[&info.group_id].position_ticks, position);
+        // Every member is told the group is no longer waiting.
+        for (sid, from) in ["s1", "s2", "s3"].iter().zip(before) {
+            let after = &bus.bodies_for(sid)[from..];
+            assert!(after.iter().any(|x| is_cmd(x, "Pause")), "{sid}: {after:?}");
+            assert!(
+                after.iter().any(|x| is_state(x, "Paused", "Pause")),
+                "{sid}: {after:?}"
+            );
+        }
+    }
+
+    /// `Ready_ReportedBeforeTheDeadline_GroupDoesNotGiveUpOnAnyone`.
+    #[tokio::test]
+    async fn group_wait_ends_when_everyone_reports_ready_in_time() {
+        let (m, bus) = mgr_with_group_wait();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
+
+        let joiner = session("s3", "joiner");
+        m.join_group(&joiner, info.group_id).await.unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Waiting
+        );
+        assert!(m.lock().groups[&info.group_id].wait_deadline.is_some());
+
+        m.handle_request(&joiner, ready_at(pli, 0, true))
+            .await
+            .unwrap();
+
+        // Everyone reported ready, so no deadline is left to trip.
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
+        assert!(m.lock().groups[&info.group_id].wait_deadline.is_none());
+        after_the_wait(&m);
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
+    }
+
+    /// `SetPlaylistItem_AfterATimeout_GroupWaitsForEveryoneAgain`.
+    #[tokio::test]
+    async fn group_wait_gives_up_only_until_the_group_changes_item() {
+        let (m, bus) = mgr_with_group_wait();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
+
+        let joiner = session("s3", "joiner");
+        m.join_group(&joiner, info.group_id).await.unwrap();
+        after_the_wait(&m);
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::SetPlaylistItem {
+                playlist_item_id: pli,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Waiting
+        );
+        assert!(m.lock().groups[&info.group_id].wait_deadline.is_some());
+    }
+
+    /// Members that keep reporting buffering do not push the deadline back;
+    /// a new waiting period (every member reset) restarts it.
+    #[tokio::test]
+    async fn group_wait_deadline_covers_the_whole_waiting_period() {
+        let (m, bus) = mgr_with_group_wait();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
+        m.handle_request(&b, buffer_at(pli, 0)).await.unwrap();
+        let deadline = m.lock().groups[&info.group_id].wait_deadline;
+        assert!(deadline.is_some());
+
+        m.handle_request(&b, buffer_at(pli, 0)).await.unwrap();
+        assert_eq!(m.lock().groups[&info.group_id].wait_deadline, deadline);
+
+        // A new item resets every member: a new waiting period, a new deadline.
+        tokio::time::sleep(StdDuration::from_millis(2)).await;
+        m.handle_request(
+            &a,
+            PlaybackRequest::SetPlaylistItem {
+                playlist_item_id: pli,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(m.lock().groups[&info.group_id].wait_deadline > deadline);
+
+        // `SetIgnoreWait` takes the blocking members out: no deadline once
+        // nobody blocks.
+        m.handle_request(&a, PlaybackRequest::IgnoreWait { ignore_wait: true })
+            .await
+            .unwrap();
+        assert!(m.lock().groups[&info.group_id].wait_deadline.is_some());
+        m.handle_request(&b, PlaybackRequest::IgnoreWait { ignore_wait: true })
+            .await
+            .unwrap();
+        assert!(m.lock().groups[&info.group_id].wait_deadline.is_none());
+    }
+
+    /// The sweep task runs only while a group exists: it ends once the last
+    /// one is gone, and the next new group starts it again.
+    #[tokio::test]
+    async fn group_wait_sweep_runs_only_while_a_group_exists() {
+        let (m, _bus) = mgr();
+        let m = m.with_group_wait(TEST_GROUP_WAIT, Some(StdDuration::from_millis(20)));
+        let runtime = tokio::runtime::Handle::current();
+        let a = session("s1", "alice");
+        m.new_group(&a, "g", None).await.unwrap();
+        assert!(m.lock().sweeping);
+        assert_eq!(runtime.metrics().num_alive_tasks(), 1, "the sweep task");
+
+        m.leave_group(&a).await.unwrap();
+        assert!(m.lock().groups.is_empty());
+        let until = Instant::now() + StdDuration::from_secs(10);
+        while runtime.metrics().num_alive_tasks() > 0 && Instant::now() < until {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        assert_eq!(runtime.metrics().num_alive_tasks(), 0, "the task ended");
+        assert!(!m.lock().sweeping, "no group left, so the sweep stopped");
+
+        m.new_group(&a, "g2", None).await.unwrap();
+        assert!(m.lock().sweeping, "a new group starts it again");
+        assert_eq!(runtime.metrics().num_alive_tasks(), 1);
+    }
+
+    /// `HandleRequest_GroupWaitsForAMemberThatNeverReportsReady_RecoversOnItsOwn`:
+    /// the manager's own sweep, not a hand pump, brings the group out.
+    #[tokio::test]
+    async fn group_wait_sweep_recovers_a_group_on_its_own() {
+        let (m, _bus) = mgr();
+        let m = m.with_group_wait(TEST_GROUP_WAIT, Some(StdDuration::from_millis(20)));
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+
+        // Starting playback puts the group behind the ready barrier.
+        m.handle_request(&a, play(1)).await.unwrap();
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Waiting
+        );
+
+        // Neither session reports ready; the group comes out by itself.
+        let until = Instant::now() + StdDuration::from_secs(10);
+        while state_of(&m, &a, info.group_id).await != GroupStateType::Playing
+            && Instant::now() < until
+        {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        assert_eq!(
+            state_of(&m, &a, info.group_id).await,
+            GroupStateType::Playing
+        );
     }
 }

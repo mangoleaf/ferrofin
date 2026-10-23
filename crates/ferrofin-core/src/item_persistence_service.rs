@@ -322,7 +322,10 @@ async fn music_genre_row(
 /// the persisted row. Only the schema-required columns and the ones every save
 /// derives or stamps (keys, names, dates) are set; richer metadata is populated
 /// by later refreshes (mirrors how the C# path creates a stub item then
-/// refreshes it).
+/// refreshes it). Box sets and playlists are created through
+/// [`insert_named_item_in`] with their path in the same transaction; this is
+/// the tests' shortcut for a path-less row.
+#[cfg(test)]
 pub(crate) async fn insert_named_item(
     db: &Database,
     id: Uuid,
@@ -341,7 +344,7 @@ pub(crate) async fn insert_named_item(
         .map_err(db_err)
 }
 
-/// [`insert_named_item`]'s insert on a connection the caller holds, normally
+/// `insert_named_item`'s insert on a connection the caller holds, normally
 /// a writer transaction that commits the rest of the item with it.
 pub(crate) async fn insert_named_item_in(
     conn: &mut sqlx::SqliteConnection,
@@ -412,7 +415,7 @@ pub(crate) async fn insert_named_item_in(
     Ok(())
 }
 
-/// Renames the [`insert_named_item`] row `id` of `kind`, on a connection the
+/// Renames the `insert_named_item` row `id` of `kind`, on a connection the
 /// caller holds, the way a save after the C# `Name` setter does: `Name`, the
 /// `CleanName` the save derives (`BaseItemMapper.cs:279`), which is what a
 /// search by name matches, and the `SortName` the setter makes it re-derive
@@ -1658,20 +1661,10 @@ fn written_columns(item: &BaseItemEntity) -> Vec<(&'static str, Column)> {
     // => false` and keeps its name — or its forced sort name — verbatim.
     // Deriving the generic key for a `Person` here lower-cased rows the
     // people repository had written correctly.
-    let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
-    let sort_name = item.sort_name.clone().or_else(|| {
-        let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
-        match forced {
-            Some(f) => Some(match sort_kind {
-                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                None => ferrofin_util::sort_name::forced_sort_key(f),
-            }),
-            None => item.name.as_deref().map(|n| match sort_kind {
-                Some(kind) => crate::kinds::sort_name_for(kind, n),
-                None => ferrofin_util::sort_name::create_sort_name(n),
-            }),
-        }
-    });
+    let sort_name = item
+        .sort_name
+        .clone()
+        .or_else(|| crate::kinds::fallback_sort_name(item));
     columns_of(item, clean_name, presentation_unique_key, sort_name)
 }
 
@@ -2111,6 +2104,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
             query.execute(&mut *tx).await.map_err(db_err)?;
         }
+        // The deleted rows' `ItemValuesMap` rows went with them (`ON DELETE
+        // CASCADE`); the values nothing maps to any more go too.
+        sqlx::query(PRUNE_ORPHAN_ITEM_VALUES_SQL)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(closure
             .iter()
@@ -2243,6 +2242,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         parts: bool,
     ) -> Result<usize, ServiceError> {
         copy_owned_video_metadata(self, owner_ids, (versions, parts)).await
+    }
+
+    async fn copy_owner_metadata_to_extras(
+        &self,
+        refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+    ) -> Result<usize, ServiceError> {
+        copy_extras_metadata(self, refreshes).await
     }
 
     async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
@@ -3663,6 +3669,21 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(Vec::new());
         };
         let ids: Vec<String> = sqlx::query_scalar(SUPERSEDED_BY_NAME_ARTISTS_SQL)
+            .bind(type_name)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    async fn dead_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        let Some(type_name) = stored_type_name(BaseItemKind::MusicArtist) else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<String> = sqlx::query_scalar(DEAD_BY_NAME_ARTISTS_SQL)
             .bind(type_name)
             .fetch_all(self.db.pool())
             .await
@@ -5526,8 +5547,17 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
 /// # Errors
 /// Returns [`ServiceError`] if the read or the write fails.
 pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, ServiceError> {
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        r#"SELECT "Id", "Name", "ForcedSortName", "Type" FROM "BaseItems"
+    type Unsorted = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<i64>,
+    );
+    let rows: Vec<Unsorted> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "ForcedSortName", "Type", "IndexNumber", "ParentIndexNumber"
+           FROM "BaseItems"
            WHERE "SortName" IS NULL AND "Name" IS NOT NULL AND "Name" <> ''
              AND "Type" <> 'PLACEHOLDER'"#,
     )
@@ -5539,22 +5569,22 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for (id, name, forced, type_name) in &rows {
-        // `Type` is selected so the per-kind `GetSortName` branch applies to
-        // both the derived and the forced key: a `Person` keeps its name
-        // verbatim (`EnableAlphaNumericSorting => false`). Backfilling the
-        // generic key here wrote the WRONG value into exactly the rows this
-        // function exists to repair.
-        let kind = crate::item_type_lookup::kind_from_type_name(type_name);
-        let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
-            Some(f) => match kind {
-                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                None => ferrofin_util::sort_name::forced_sort_key(f),
-            },
-            None => match kind {
-                Some(kind) => crate::kinds::sort_name_for(kind, name),
-                None => ferrofin_util::sort_name::create_sort_name(name),
-            },
+    for (id, name, forced, type_name, index_number, parent_index_number) in &rows {
+        // `Type` and the numbers are selected so the per-kind rules apply
+        // to both the derived and the forced key: a `Person` keeps its name
+        // verbatim (`EnableAlphaNumericSorting => false`), and an episode,
+        // season or track sorts by its numbers (`CreateSortName`).
+        // Backfilling the generic key here wrote the WRONG value into
+        // exactly the rows this function exists to repair.
+        let Some(sort_name) = crate::kinds::fallback_sort_name(&BaseItemEntity {
+            name: Some(name.clone()),
+            forced_sort_name: forced.clone(),
+            type_: type_name.clone(),
+            index_number: *index_number,
+            parent_index_number: *parent_index_number,
+            ..BaseItemEntity::default()
+        }) else {
+            continue;
         };
         sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
             .bind(sort_name)
@@ -6237,6 +6267,35 @@ pub(crate) const SUPERSEDED_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "B
                     AND +f."TopParentId" IS NOT NULL AND +f."TopParentId" <> '')
    ORDER BY b."Id""#;
 
+/// [`ItemPersistenceService::dead_by_name_artists`] over the `MusicArtist`
+/// type bound as `?1`: the unlocked rows accessed by name (no `ParentId`,
+/// `MusicArtist.IsAccessedByName`) outside v12.2 `ArtistsValidator`'s live
+/// set, which is every artist and album-artist value an item maps to
+/// (`GetAllArtistNames`), resolved to its artist by `CleanName`
+/// (`FindArtists`). Sought by `Type`, the values by
+/// `IX_ItemValues_Type_CleanValue` and their maps by `PK_ItemValuesMap`;
+/// `EXPLAIN QUERY PLAN` pinned by `the_closing_pass_selections_seek_by_type`.
+pub(crate) const DEAD_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "BaseItems" AS b
+   WHERE b."Type" = ?1
+     AND b."ParentId" IS NULL
+     AND NOT b."IsLocked"
+     AND NOT EXISTS (SELECT 1 FROM "ItemValues" AS v
+                      -- ItemValueType::Artist (0), ItemValueType::AlbumArtist (1)
+                      WHERE v."Type" IN (0, 1) AND v."CleanValue" = b."CleanName"
+                        AND EXISTS (SELECT 1 FROM "ItemValuesMap" AS m
+                                     WHERE m."ItemValueId" = v."ItemValueId"))
+   ORDER BY b."Id""#;
+
+/// The `ItemValues` rows no item maps to any more, deleted with every
+/// deletion (`ItemPersistenceService.cs:149`), so a genre, studio or artist
+/// name only the deleted items carried is gone and its by-name row reads
+/// dead. One pass over `ItemValues` (a few rows per distinct name), each
+/// row's maps sought by `PK_ItemValuesMap`; `EXPLAIN QUERY PLAN` pinned by
+/// `the_item_values_prune_seeks_each_values_maps`.
+pub(crate) const PRUNE_ORPHAN_ITEM_VALUES_SQL: &str = r#"DELETE FROM "ItemValues"
+   WHERE NOT EXISTS (SELECT 1 FROM "ItemValuesMap" AS m
+                      WHERE m."ItemValueId" = "ItemValues"."ItemValueId")"#;
+
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
 /// unset), in id order — `PeopleValidator`'s new person items.
 ///
@@ -6381,7 +6440,8 @@ struct OwnedCopy {
     /// The row with the owner's metadata applied.
     row: BaseItemEntity,
     /// A local alternate version (the `Video.UpdateToRepositoryAsync` set);
-    /// else a stacked part (the `copyTitleMetadata` set).
+    /// else a stacked part or an extra (the `copyTitleMetadata` set, or the
+    /// dates alone).
     local: bool,
     /// Whether a `BaseItems` column changed.
     columns: bool,
@@ -6532,6 +6592,17 @@ async fn copy_owned_video_metadata(
     let copies = plan_owned_copies(&mut tx, owner_ids, which, localization).await?;
     write_owned_copies(&mut tx, &copies).await?;
     tx.commit().await.map_err(db_err)?;
+    relink_owned_copies(service, &copies).await?;
+    Ok(copies.len())
+}
+
+/// After [`write_owned_copies`] commits: re-links the genres and studios of
+/// the copies whose lists changed (`SaveItems` rewrites `ItemValues` with
+/// the row), and reports the rows as updated.
+async fn relink_owned_copies(
+    service: &FerrofinItemPersistenceService,
+    copies: &[OwnedCopy],
+) -> Result<(), ServiceError> {
     for copy in copies.iter().filter(|c| c.values) {
         if let Ok(id) = Uuid::parse_str(&copy.row.id) {
             service
@@ -6546,7 +6617,208 @@ async fn copy_owned_video_metadata(
         let rows: Vec<BaseItemEntity> = copies.iter().map(|c| c.row.clone()).collect();
         changed.record_updated(&rows);
     }
+    Ok(())
+}
+
+/// [`ItemPersistenceService::copy_owner_metadata_to_extras`]: decided on a
+/// reader first, so refreshes whose extras already match — every one on a
+/// quiet rescan — take no writer lock; decided again under the writer and
+/// written there.
+async fn copy_extras_metadata(
+    service: &FerrofinItemPersistenceService,
+    refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+) -> Result<usize, ServiceError> {
+    if refreshes.is_empty() {
+        return Ok(0);
+    }
+    let localization = service.localization.get().cloned();
+    let localization = localization.as_deref();
+    {
+        let mut conn = service.db.pool().acquire().await.map_err(db_err)?;
+        if plan_extra_copies(&mut conn, refreshes, localization)
+            .await?
+            .is_empty()
+        {
+            return Ok(0);
+        }
+    }
+    let mut tx = service
+        .db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    let copies = plan_extra_copies(&mut tx, refreshes, localization).await?;
+    write_owned_copies(&mut tx, &copies).await?;
+    tx.commit().await.map_err(db_err)?;
+    relink_owned_copies(service, &copies).await?;
     Ok(copies.len())
+}
+
+/// The primaries the refreshes stand for, each with how they reached its
+/// extras ([`plan_extra_copies`]): an owner that is a local version stands
+/// for its primary (`GetOwnedVersionIds`), and one that is a linked version
+/// for none (`Video.RefreshedOwnedItems` returns for any version).
+fn extras_groups(
+    refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+    rows: &HashMap<Uuid, BaseItemEntity>,
+) -> HashMap<Uuid, ExtrasGroup> {
+    use crate::video_versions::is_local_version_of;
+    let mut groups: HashMap<Uuid, ExtrasGroup> = HashMap::new();
+    for refresh in refreshes {
+        let Some(row) = rows.get(&refresh.owner) else {
+            continue;
+        };
+        let primary = match row
+            .primary_version_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        {
+            None => refresh.owner,
+            Some(primary) if is_local_version_of(row, primary) => primary,
+            Some(_) => continue,
+        };
+        let group = groups.entry(primary).or_insert_with(|| ExtrasGroup {
+            title: false,
+            found: Some(std::collections::HashSet::new()),
+        });
+        group.title |= refresh.changed;
+        match (&mut group.found, &refresh.found) {
+            (Some(all), Some(found)) => all.extend(found),
+            (found, _) => *found = None,
+        }
+    }
+    groups
+}
+
+/// The extras each of `primaries` maintains, keyed by it: those it owns and
+/// those its local versions own (one query on `OwnerId` for the primaries,
+/// and one for their versions only when there are any).
+async fn maintained_extras(
+    conn: &mut sqlx::SqliteConnection,
+    primaries: &[Uuid],
+) -> Result<Vec<(Uuid, BaseItemEntity)>, ServiceError> {
+    use crate::item_repository::select_item_rows_on;
+    use crate::video_versions::is_local_version_of;
+    let parse = |id: Option<&str>| id.and_then(|id| Uuid::parse_str(id).ok());
+    let mut extras: Vec<(Uuid, BaseItemEntity)> = Vec::new();
+    let mut versions: HashMap<Uuid, Uuid> = HashMap::new();
+    for row in select_item_rows_on(&mut *conn, r#""OwnerId""#, primaries).await? {
+        let Some(owner) = parse(row.owner_id.as_deref()) else {
+            continue;
+        };
+        if row.extra_type.is_some() {
+            extras.push((owner, row));
+        } else if is_local_version_of(&row, owner)
+            && let Ok(id) = Uuid::parse_str(&row.id)
+        {
+            versions.insert(id, owner);
+        }
+    }
+    if !versions.is_empty() {
+        let ids: Vec<Uuid> = versions.keys().copied().collect();
+        for row in select_item_rows_on(&mut *conn, r#""OwnerId""#, &ids).await? {
+            if row.extra_type.is_some()
+                && let Some(&primary) =
+                    parse(row.owner_id.as_deref()).and_then(|o| versions.get(&o))
+            {
+                extras.push((primary, row));
+            }
+        }
+    }
+    Ok(extras)
+}
+
+/// How a refresh reached one primary's extras ([`plan_extra_copies`]).
+struct ExtrasGroup {
+    /// Whether they take the title metadata, not only the dates.
+    title: bool,
+    /// The extras the refreshes found, when every one of them looked.
+    found: Option<std::collections::HashSet<Uuid>>,
+}
+
+/// The extras of the refreshed owners that differ from what their primary
+/// gives them ([`copy_extras_metadata`]'s reads): the owners, the primaries
+/// they stand for (an owner that is a local version stands for its primary,
+/// `GetOwnedVersionIds`), the rows those primaries own (their extras and
+/// local versions, one query on `OwnerId`), and — only when there are local
+/// versions — the extras those own. Each extra is planned as a part is: the
+/// `copyTitleMetadata` columns, or only the dates.
+async fn plan_extra_copies(
+    conn: &mut sqlx::SqliteConnection,
+    refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+    localization: Option<&dyn ferrofin_traits::localization::LocalizationManager>,
+) -> Result<Vec<OwnedCopy>, ServiceError> {
+    use crate::item_repository::select_item_rows_on;
+    use crate::video_versions::{copy_title_metadata, inherit_dates_from_owner};
+    let mut owner_ids: Vec<Uuid> = refreshes.iter().map(|r| r.owner).collect();
+    owner_ids.sort_unstable();
+    owner_ids.dedup();
+    let mut rows: HashMap<Uuid, BaseItemEntity> =
+        select_item_rows_on(&mut *conn, r#""Id""#, &owner_ids)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect();
+    let mut groups = extras_groups(refreshes, &rows);
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut primaries: Vec<Uuid> = groups.keys().copied().collect();
+    primaries.sort_unstable();
+    let missing: Vec<Uuid> = primaries
+        .iter()
+        .filter(|id| !rows.contains_key(id))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        rows.extend(
+            select_item_rows_on(&mut *conn, r#""Id""#, &missing)
+                .await?
+                .into_iter()
+                .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row))),
+        );
+    }
+    let extras = maintained_extras(conn, &primaries).await?;
+    // `extrasChanged`: the stored extras are not the ones found — one is
+    // gone (a new one is already stored, and marked `changed`).
+    for (primary, group) in &mut groups {
+        if let Some(found) = &group.found {
+            let stored: std::collections::HashSet<Uuid> = extras
+                .iter()
+                .filter(|(owner, _)| owner == primary)
+                .filter_map(|(_, row)| Uuid::parse_str(&row.id).ok())
+                .collect();
+            group.title |= stored != *found;
+        }
+    }
+    let mut copies = Vec::new();
+    for (primary, row) in extras {
+        let (Some(group), Some(owner)) = (groups.get(&primary), rows.get(&primary)) else {
+            continue;
+        };
+        let mut copy = OwnedCopy {
+            row: row.clone(),
+            local: false,
+            columns: false,
+            values: false,
+            provider_ids: None,
+            images: None,
+        };
+        copy.columns = if group.title {
+            copy_title_metadata(owner, &mut copy.row)
+        } else {
+            inherit_dates_from_owner(owner, &mut copy.row)
+        };
+        copy.values = copy.row.genres != row.genres || copy.row.studios != row.studios;
+        if let Some(localization) = localization {
+            copy.columns |= settle_rating_score(&mut copy.row, localization);
+        }
+        if copy.columns {
+            copies.push(copy);
+        }
+    }
+    Ok(copies)
 }
 
 /// The owned rows of `owner_ids` that differ from what their owner gives
@@ -6655,9 +6927,9 @@ async fn plan_owned_copies(
 
 /// Writes the planned copies on `tx`: for a local version only the columns
 /// `Video.UpdateToRepositoryAsync` copies (`Video.cs:704-726`), its provider
-/// ids and its images; for a part only the `copyTitleMetadata` columns and
-/// the dates (`BaseItem.cs:2805-2858`) — each with the parental score its
-/// ratings now give.
+/// ids and its images; for a part or an extra only the `copyTitleMetadata`
+/// columns and the dates (`BaseItem.cs:2805-2858`) — each with the parental
+/// score its ratings now give.
 async fn write_owned_copies(
     tx: &mut sqlx::SqliteConnection,
     copies: &[OwnedCopy],
@@ -7939,6 +8211,50 @@ mod tests {
             Some("rock"),
             "every other kind still gets the alphanumeric key"
         );
+    }
+
+    /// A row saved without a sort name, and one the boot backfill repairs,
+    /// gets its kind's `CreateSortName` as the writers settle it: an episode,
+    /// season or track sorts by its numbers, never by its title.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Episode, Some(1), Some(4), "Pilot", "001 - 0004 - Pilot")]
+    #[case(BaseItemKind::Season, None, Some(3), "Season 3", "0003")]
+    #[case(BaseItemKind::Audio, Some(2), Some(5), "Song", "0002 - 0005 - Song")]
+    #[tokio::test]
+    async fn a_missing_sort_name_takes_the_kinds_create_sort_name(
+        #[case] kind: BaseItemKind,
+        #[case] parent_index_number: Option<i64>,
+        #[case] index_number: Option<i64>,
+        #[case] name: &str,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: stored_type_name(kind).expect("type").to_owned(),
+            parent_index_number,
+            index_number,
+            ..named(name)
+        };
+        assert_eq!(
+            persisted_sort_name(&db, entity.clone()).await.as_deref(),
+            Some(expected),
+            "save_items"
+        );
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" = ?1"#)
+            .bind(&entity.id)
+            .execute(db.writer())
+            .await
+            .expect("null it out");
+        super::backfill_missing_sort_names(&db)
+            .await
+            .expect("backfill");
+        let repaired: Option<String> =
+            sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&entity.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("query");
+        assert_eq!(repaired.as_deref(), Some(expected), "backfill");
     }
 
     // A caller-supplied sort name wins: that is what carries the per-kind
@@ -11723,6 +12039,45 @@ mod tests {
                 && s.contains("CleanName=?")),
             "the folder twin by Type and CleanName, got: {plan:?}"
         );
+
+        // The dead by-name artists: the artists by Type, each one's values
+        // by Type and CleanValue, and each value's maps by its id.
+        let plan = query_plan(&db, super::DEAD_BY_NAME_ARTISTS_SQL, 1).await;
+        assert!(
+            !plan.iter().any(|s| s.starts_with("SCAN")),
+            "no scan of any table, got: {plan:?}"
+        );
+        for (table, index) in [
+            ("b ", "(Type=?"),
+            (
+                "v ",
+                "IX_ItemValues_Type_CleanValue (Type=? AND CleanValue=?)",
+            ),
+            ("m ", "(ItemValueId=?)"),
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH") && s.contains(table) && s.contains(index)),
+                "{table}sought by {index}, got: {plan:?}"
+            );
+        }
+    }
+
+    /// The `ItemValues` prune every deletion runs reads each value's maps
+    /// through the map's primary key, never a scan of `ItemValuesMap`.
+    #[tokio::test]
+    async fn the_item_values_prune_seeks_each_values_maps() {
+        let db = test_db().await;
+        let plan = query_plan(&db, super::PRUNE_ORPHAN_ITEM_VALUES_SQL, 0).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH m") && s.contains("(ItemValueId=?)")),
+            "the maps sought by ItemValueId, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.starts_with("SCAN m")),
+            "never a scan of the maps, got: {plan:?}"
+        );
     }
 
     /// The two persisted selections over real rows: a never-refreshed row of
@@ -11784,6 +12139,82 @@ mod tests {
             svc.superseded_by_name_artists().await.unwrap(),
             vec![Uuid::from_u128(0x22)],
             "only the by-name twin of a library artist"
+        );
+    }
+
+    /// A deletion drops the `ItemValues` rows only the deleted items mapped
+    /// to (`ItemPersistenceService.cs:149`), and the dead-artist selection
+    /// then names the by-name artist no item credits any more: never one a
+    /// remaining item credits, a locked one, or a library artist.
+    #[tokio::test]
+    async fn a_deletion_prunes_unmapped_values_and_the_dead_artists_follow() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let row = |id: u128, kind: BaseItemKind, name: &str, parent: Option<u128>| {
+            ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid_to_db(Uuid::from_u128(id)),
+                type_: stored_type_name(kind).unwrap_or_default().to_owned(),
+                name: Some(name.to_owned()),
+                clean_name: Some(crate::text_util::get_clean_value(name)),
+                is_folder: kind != BaseItemKind::Audio,
+                parent_id: parent.map(|p| guid_to_db(Uuid::from_u128(p))),
+                ..Default::default()
+            }
+        };
+        let (kept, gone) = (Uuid::from_u128(0x41), Uuid::from_u128(0x42));
+        svc.save_items(&[
+            row(0x10, BaseItemKind::Folder, "Jazz", None),
+            row(0x41, BaseItemKind::Audio, "So What", Some(0x10)),
+            row(0x42, BaseItemKind::Audio, "Alone Together", Some(0x10)),
+            row(0x43, BaseItemKind::MusicArtist, "Art Pepper", Some(0x10)),
+        ])
+        .await
+        .expect("seed");
+        svc.save_item_values(kept, &[(1, "Miles Davis".to_owned())])
+            .await
+            .expect("values");
+        svc.save_item_values(gone, &[(0, "Chet Baker".to_owned())])
+            .await
+            .expect("values");
+        let by_name = |name: &'static str| {
+            let svc = &svc;
+            async move {
+                svc.ensure_by_name_item(BaseItemKind::MusicArtist, name, "/metadata/artists")
+                    .await
+                    .expect("by-name artist")
+                    .expect("an id")
+            }
+        };
+        let chet = by_name("Chet Baker").await;
+        by_name("Miles Davis").await;
+        let bill = by_name("Bill Evans").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(bill))
+            .execute(db.pool())
+            .await
+            .expect("lock");
+        assert_eq!(
+            svc.dead_by_name_artists().await.unwrap(),
+            Vec::<Uuid>::new(),
+            "every unlocked by-name artist is still credited"
+        );
+
+        svc.delete_items(&[gone]).await.expect("delete");
+
+        let values: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Value" FROM "ItemValues" ORDER BY 1"#)
+                .fetch_all(db.pool())
+                .await
+                .expect("values");
+        assert_eq!(
+            values,
+            ["Miles Davis"],
+            "only the value an item still maps to stays"
+        );
+        assert_eq!(
+            svc.dead_by_name_artists().await.unwrap(),
+            vec![chet],
+            "the artist only the deleted track credited"
         );
     }
 

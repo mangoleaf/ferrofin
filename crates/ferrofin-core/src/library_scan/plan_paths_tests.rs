@@ -214,6 +214,7 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "Lists/playlist.xml",
         "Lists/y.mp3",
         "Artist A/Album 1/Best Of [playlist]/z.mp3",
+        "Rock/Artist C/albums/Album 3/01 - Three.mp3",
     ] {
         touch(&music, rel);
     }
@@ -477,6 +478,9 @@ async fn plan_paths_matches_the_filtered_full_plan() {
         "music/Artist A/Album 1/Best Of [playlist]/z.mp3",
         "books/Reading [playlist]/novel.epub",
         "music/Lists/y.mp3",
+        "music/Rock",
+        "music/Rock/Artist C/albums",
+        "music/Rock/Artist C/albums/Album 3",
         "tv/Mixtape [playlist]/a.mkv",
         "tv/Firefly (2002)/Season 01/Gag Reel [playlist]/a.mkv",
         "tv/Flat Show/bonus/deeper [playlist]/b.mkv",
@@ -559,7 +563,8 @@ async fn playlists_resolve_before_every_other_resolver() {
             at("music/Artist A/Album 1").id,
         ),
         // Music files: in an album, a disc folder, an artist (`Compilations`
-        // holds an album), a folder that is neither, the root.
+        // holds an album), a folder that is neither (a `Folder` of its own),
+        // the root.
         (
             "music/Artist A/Album 1/Album 1.m3u",
             at("music/Artist A/Album 1").id,
@@ -574,7 +579,7 @@ async fn playlists_resolve_before_every_other_resolver() {
         ),
         ("music/Artist A/artist mix.m3u8", at("music/Artist A").id),
         ("music/Compilations/top.zpl", at("music/Compilations").id),
-        ("music/Mixtapes/side.m3u", library(3)),
+        ("music/Mixtapes/side.m3u", at("music/Mixtapes").id),
         ("music/root list.m3u", library(3)),
         // Books, home videos (inside a photo album), untyped.
         ("books/Reading [playlist]", library(4)),
@@ -886,4 +891,59 @@ async fn plan_follows_linked_folders_and_stops_at_a_loop() {
         !paths.iter().any(|path| path.contains("/loop")),
         "a link back to the library root is not descended: {paths:#?}"
     );
+}
+
+/// `DotIgnoreIgnoreRule` (`LibraryManager.IgnoreFile`): a `.ignore` file hides
+/// what lies beneath its folder from the plan, everything when it is empty
+/// and otherwise what its gitignore lines match. The plan records the hidden
+/// entries as excluded, so stored rows under them are pruned.
+#[tokio::test]
+async fn dot_ignore_files_hide_paths_from_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("movies");
+    for rel in [
+        "Heat (1995)/Heat (1995).mkv",
+        "Ronin (1998)/Ronin (1998).mkv",
+        "Private/.ignore",
+        "Private/Home Video (2001)/Home Video (2001).mkv",
+        "Drafts/Cut (2020)/Cut (2020).mkv",
+    ] {
+        touch(&movies, rel);
+    }
+    std::fs::write(movies.join(".ignore"), "# work in progress\ndrafts/\n").unwrap();
+    let folders = vec![library(1, Some(CollectionTypeOptions::movies), &movies)];
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default())).await;
+    let plan = scanner.plan_in(
+        &folders,
+        &folders,
+        PlanScope::ALL,
+        super::DateAdded::default(),
+        None,
+        None,
+    );
+    let planned: Vec<String> = plan
+        .items
+        .iter()
+        .filter_map(|p| p.entity.path.clone())
+        .collect();
+    let root = movies.to_string_lossy();
+    for kept in [
+        "Heat (1995)/Heat (1995).mkv",
+        "Ronin (1998)/Ronin (1998).mkv",
+    ] {
+        let path = format!("{root}/{kept}");
+        assert!(planned.contains(&path), "{kept} not planned: {planned:?}");
+    }
+    for hidden in ["Private", "Drafts"] {
+        let path = format!("{root}/{hidden}");
+        assert!(
+            planned.iter().all(|p| !p.starts_with(&path)),
+            "{hidden} planned: {planned:?}"
+        );
+        assert!(
+            plan.excluded.contains(&path),
+            "{hidden} not excluded: {:?}",
+            plan.excluded
+        );
+    }
 }
