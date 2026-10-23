@@ -18,6 +18,9 @@
 //! the persistence layer where portable and otherwise left to later waves; the
 //! handler maps the request faithfully onto the query struct.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -27,8 +30,10 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, ItemCounts};
+use ferrofin_model::entities::ImageType;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -826,7 +831,15 @@ async fn get_item(
             .await?
             .ok_or_else(|| ApiError::NotFound("user root folder".into()))?
     } else {
-        require_visible_item(&state, item_id, Some(&user)).await?
+        let item = require_visible_item(&state, item_id, Some(&user)).await?;
+        // A refresh that finished rewrote the row: answer with what it found.
+        // Upstream refreshes the object it already checked and builds the DTO
+        // from it, so the access check is not asked again.
+        if refresh_on_demand_if_needed(&state, item_id, &item).await? {
+            state.library.get_item_by_id(item_id).await?.unwrap_or(item)
+        } else {
+            item
+        }
     };
     // A single-item fetch backs a detail page, so return the full DTO (overview,
     // genres, people, studios, tags, …) — the field-gated data jellyfin-web's
@@ -838,6 +851,137 @@ async fn get_item(
         .get_base_item_dto(&item, &options, Some(&user), None)
         .await?;
     Ok(Json(dto))
+}
+
+/// `UserLibraryController.RefreshOnDemandTimeout`: how long a page view waits
+/// for a person's on-demand refresh.
+const REFRESH_ON_DEMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long ago a person must have been refreshed for its page view to
+/// refresh it again (C# `(DateTime.UtcNow - item.DateLastRefreshed).TotalDays
+/// < 3` skips it).
+const REFRESH_ON_DEMAND_AFTER: chrono::TimeDelta = chrono::TimeDelta::days(3);
+
+/// The persons whose on-demand refresh is running. A page view of one of
+/// them starts no second refresh; upstream's would run its own beside it.
+static PERSON_REFRESHES: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
+
+/// A person's place in [`PERSON_REFRESHES`], given up when its refresh ends.
+struct PersonRefresh(Uuid);
+
+impl PersonRefresh {
+    /// Claims `item_id`, or `None` while a refresh of it is running.
+    fn claim(item_id: Uuid) -> Option<Self> {
+        let mut running = PERSON_REFRESHES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // `then`, not `then_some`: a claim built and dropped here, as an
+        // eager one is when the person is taken, would lock the set again.
+        running.insert(item_id).then(|| Self(item_id))
+    }
+}
+
+impl Drop for PersonRefresh {
+    fn drop(&mut self) {
+        PERSON_REFRESHES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Port of `UserLibraryController.RefreshOnDemandIfNeeded`: a person shown
+/// without an overview or a primary image, and not refreshed for three days,
+/// is refreshed in full (metadata and images, saved) before its page is
+/// answered, for at most [`REFRESH_ON_DEMAND_TIMEOUT`].
+///
+/// The refresh runs on a task of its own, which the page only waits for.
+/// Upstream cancels the refresh when the timeout fires or the client hangs
+/// up, and on the timeout queues a new one at high priority. Dropping the
+/// refresh part way here could leave its image files written without their
+/// rows, or its row saved without its provider ids, so a page that stops
+/// waiting leaves the refresh to finish instead, with no second one queued.
+/// While it runs, another view of the person is answered at once, without
+/// starting another ([`PERSON_REFRESHES`]). The task logs a failure itself
+/// only when no page is left to report it.
+///
+/// Returns whether the refresh finished in time, so the caller re-reads the
+/// row it rewrote.
+async fn refresh_on_demand_if_needed(
+    state: &AppState,
+    item_id: Uuid,
+    item: &BaseItemEntity,
+) -> Result<bool, ApiError> {
+    if BaseItemKind::from_stored_type_name(&item.type_) != Some(BaseItemKind::Person) {
+        return Ok(false);
+    }
+    let refreshed_lately = item
+        .date_last_refreshed
+        .is_some_and(|at| Utc::now() - at < REFRESH_ON_DEMAND_AFTER);
+    if refreshed_lately {
+        return Ok(false);
+    }
+    let has_overview = item
+        .overview
+        .as_deref()
+        .is_some_and(|overview| !overview.trim().is_empty());
+    let has_metadata = has_overview
+        && state
+            .library
+            .get_item_images(item_id)
+            .await?
+            .iter()
+            .any(|image| image.image_type == ImageType::Primary);
+    if has_metadata {
+        return Ok(false);
+    }
+    let Some(claim) = PersonRefresh::claim(item_id) else {
+        return Ok(false);
+    };
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        force_save: true,
+        ..MetadataRefreshOptions::default()
+    };
+    let providers = Arc::clone(&state.providers);
+    let (outcome, waiting) = tokio::sync::oneshot::channel();
+    // Background work starts its own trace (LOGGING.md §4).
+    let span = tracing::info_span!(
+        parent: None,
+        "person_refresh",
+        item_id = %item_id,
+        trigger = "item_page"
+    );
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            let _claim = claim;
+            let refreshed = providers.refresh_single_item(item_id, &options).await;
+            // A provider's failure is counted inside the refresh, not
+            // returned, so an error here is the store's: the queued
+            // refresh's `warn!` ("queued metadata refresh failed").
+            if let Err(Err(error)) = outcome.send(refreshed) {
+                tracing::warn!(%error, "on-demand person refresh failed");
+            }
+        },
+        span,
+    ));
+    match tokio::time::timeout(REFRESH_ON_DEMAND_TIMEOUT, waiting).await {
+        Ok(Ok(refreshed)) => {
+            refreshed?;
+            Ok(true)
+        }
+        Ok(Err(_ended)) => Err(ApiError::Service(
+            ferrofin_traits::error::ServiceError::Backend("person refresh task panicked".into()),
+        )),
+        Err(_elapsed) => {
+            tracing::debug!(
+                %item_id,
+                "person refresh still running; answering the page without it"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// `LibraryController.DeleteItem`'s gate (`LibraryController.cs:386-389` at

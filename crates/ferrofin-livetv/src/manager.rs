@@ -35,7 +35,7 @@ use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::UserViewManager;
+use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, UserViewManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
@@ -378,6 +378,10 @@ pub struct FerrofinLiveTvManager {
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
+    /// Brackets each recording as it is written, so a recording inside a
+    /// watched library is not rescanned mid-write (`RecordingsManager`'s
+    /// `ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
     /// The NFO options' `ReleaseDateFormat`, for a recording's sidecar NFO
     /// ([`with_release_date_format`](Self::with_release_date_format)).
     release_date_format: crate::recording_metadata::ReleaseDateFormat,
@@ -860,6 +864,7 @@ impl FerrofinLiveTvManager {
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
+            self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -867,6 +872,15 @@ impl FerrofinLiveTvManager {
             schedules_direct,
             xmltv,
         }
+    }
+
+    /// Brackets each recording on `guard` from the moment its file is chosen
+    /// until it is settled, as `RecordingsManager.RecordStream` does. Called
+    /// once by the composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Gives the M3U tuner host the server's local-network check
@@ -4587,6 +4601,9 @@ impl FerrofinLiveTvManager {
                 self.active_recordings_lock().values().cloned().collect();
             crate::dvr::ensure_file_unique(&target, &info.id, &active)
         };
+        // `ReportFileSystemChangeBeginning(recordingPath)`, completed once the
+        // empty-file cleanup and the refresh are done (`RecordingsManager.cs:342,400`).
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), target.to_string_lossy());
 
         let capture = self
             .capture(
@@ -8561,6 +8578,67 @@ mod tests {
             "a failed attempt leaves no fileless recording"
         );
         mgr.cancel_timer(&timer_id).await.expect("cancel");
+    }
+
+    /// A self-write guard recording each call, in order.
+    #[derive(Default)]
+    struct RecordingWrites(std::sync::Mutex<Vec<String>>);
+
+    impl ferrofin_traits::library::SelfWriteGuard for RecordingWrites {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    /// `RecordingsManager.RecordStream` brackets the recording from the moment
+    /// its file is chosen until it is settled (`RecordingsManager.cs:342,400`):
+    /// begun while the capture runs, completed once it has stopped.
+    #[tokio::test]
+    async fn a_recording_is_bracketed_while_it_is_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writes = Arc::new(RecordingWrites::default());
+        let mgr = manager_with_dvr(dir.path())
+            .await
+            .with_self_writes(writes.clone());
+        let program = now_playing(&mgr).await;
+        let program_id = Uuid::parse_str(&program.id).expect("guid");
+        let defaults = mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+        })
+        .await
+        .expect("a capture is in progress");
+        assert_eq!(
+            writes.0.lock().unwrap().clone(),
+            [format!("begin {path}")],
+            "begun, not yet complete, while it records"
+        );
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+        let completed = wait_for(|| async {
+            writes
+                .0
+                .lock()
+                .unwrap()
+                .contains(&format!("complete {path} false"))
+                .then_some(())
+        })
+        .await;
+        assert!(completed.is_some(), "{:?}", writes.0.lock().unwrap());
     }
 
     /// `RecordingsManager.RecordStream`'s `OnStarted` saves the guide's

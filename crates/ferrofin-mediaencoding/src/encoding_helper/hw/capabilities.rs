@@ -433,6 +433,14 @@ impl EncoderCapabilities for FfmpegCapabilities {
     }
 }
 
+/// The same `SupportsEncoder`, on the service seam the playback negotiation
+/// (`ITranscoderSupport`) reads.
+impl ferrofin_traits::media_encoding::EncoderSupport for FfmpegCapabilities {
+    fn supports_encoder(&self, encoder: &str) -> bool {
+        contains_ignore_case(&self.encoders, encoder)
+    }
+}
+
 /// `StringComparer.OrdinalIgnoreCase` membership, which is how every C#
 /// `Supports*` list lookup is written.
 fn contains_ignore_case(haystack: &[String], needle: &str) -> bool {

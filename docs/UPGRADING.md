@@ -28,6 +28,20 @@ Saving a listings provider is now checked the way Jellyfin checks it:
 
 Providers already saved are not touched.
 
+## Unreleased — extras take their owner's metadata; refresh once to fill existing ones
+
+Trailers, featurettes and other extras now take their movie's or series' genres,
+studios, overview, ratings, year and premiere date, as in Jellyfin. A scan gives them
+the year and premiere date every time. It gives them the rest when it finds an extra
+new, renamed or gone, or when the refresh is a full one. Extras already in your
+libraries get only the dates from an ordinary scan.
+
+To fill the rest for existing extras, refresh each movie or TV library once with
+**Search for missing metadata** (Dashboard → Libraries → the library's menu → Refresh
+metadata), or refresh single items the same way. That is a full refresh, which is all
+the copy needs; **Replace all metadata** also works but re-fetches everything. New
+extras get everything on the scan that finds them.
+
 ## Unreleased — missing episodes you now have are removed
 
 A database adopted from Jellyfin can hold **missing episodes**: placeholder rows with no

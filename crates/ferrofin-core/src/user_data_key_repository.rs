@@ -61,6 +61,7 @@ impl KeyRow {
             album_artist: self.album_artist.as_deref(),
             extra_type: self.extra_type.as_deref(),
             run_time_ticks: self.run_time_ticks,
+            channel_name_key: crate::user_data_keys::live_tv_channel_name_key_enabled(),
         }
     }
 }

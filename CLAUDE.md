@@ -382,8 +382,8 @@ response-shape pass is one of those supporting probes, not the parity number.)
 Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
-burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 19 registered
-scheduled tasks (17 shown in a stock install — the two guide/channel refreshers hide
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 20 registered
+scheduled tasks (18 shown in a stock install — the two guide/channel refreshers hide
 themselves until a tuner exists),
 metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
 (EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered

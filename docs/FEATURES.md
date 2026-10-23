@@ -116,10 +116,16 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — 19 of Jellyfin's scheduled tasks (including the Live TV guide
+- **Scheduled tasks** — 20 of Jellyfin's scheduled tasks (including the Live TV guide
   refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
-  collections and playlists" is gone, as in Jellyfin 12; Jellyfin 12's "Refresh upcoming
-  and missing episodes (TheMovieDb)" task is not ported yet.
+  collections and playlists" is gone, as in Jellyfin 12, and Jellyfin 12's "Refresh
+  upcoming and missing episodes (TheMovieDb)" is there.
+- **Missing and unaired episodes** — the TMDb settings page's options from Jellyfin 12:
+  for the TV libraries opted in, a series refresh adds a virtual entry for each episode
+  TheMovieDb lists that has not aired yet and/or each aired one the library lacks (and a
+  virtual season when the library has nothing of a season), keeps them in step with
+  TheMovieDb, and removes them once a file arrives, they age out, or the option is turned
+  off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half

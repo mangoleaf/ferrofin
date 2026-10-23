@@ -1817,7 +1817,7 @@ impl TranscoderSupport for ConfigurableTranscoderSupport {
     false,
     false,
     PlayMethod::Transcode,
-    SubtitleDeliveryMethod::Encode
+    SubtitleDeliveryMethod::External
 )]
 #[case(
     "pgssub",
@@ -1932,7 +1932,7 @@ fn get_subtitle_profile_respects_extraction_setting(
 
 #[rstest]
 #[case(false, None, true, SubtitleDeliveryMethod::External)]
-#[case(false, None, false, SubtitleDeliveryMethod::Encode)]
+#[case(false, None, false, SubtitleDeliveryMethod::External)]
 #[case(true, Some("/media/sub.mks"), true, SubtitleDeliveryMethod::External)]
 #[case(true, Some("/media/sub.idx"), true, SubtitleDeliveryMethod::Encode)]
 #[case(true, Some("/media/sub.sub"), true, SubtitleDeliveryMethod::Encode)]
@@ -2098,4 +2098,61 @@ fn get_subtitle_profile_returns_expected_delivery_method(
     );
 
     assert_eq!(expected_method, result.method);
+}
+
+/// `BuildVideoItemWithSecondaryAudioAndExternalGraphicalSubtitleKeepsVideoCopy`
+/// (jellyfin#17512): with extraction off, an embedded PGS or VobSub stream is
+/// still delivered External during a transcode for the secondary audio, so
+/// the video stays a copy and the URL asks for no subtitle.
+#[rstest]
+#[case("pgssub", None)]
+#[case("vobsub", Some("mks"))]
+fn build_video_item_with_secondary_audio_and_external_graphical_subtitle_keeps_video_copy(
+    #[case] subtitle_codec: &str,
+    #[case] subtitle_container: Option<&str>,
+) {
+    let mut options = get_media_options("Chrome", "mp4-h264-ac3-aac-srt-2600k");
+    let subtitle_stream = options.media_sources[0]
+        .media_streams
+        .last_mut()
+        .expect("subtitle stream");
+    subtitle_stream.codec = Some(subtitle_codec.to_owned());
+    subtitle_stream.is_external = false;
+    subtitle_stream.supports_external_stream = true;
+    subtitle_stream.path = None;
+    let subtitle_index = subtitle_stream.index;
+    options.profile.subtitle_profiles = vec![SubtitleProfile {
+        format: Some(subtitle_codec.to_owned()),
+        container: subtitle_container.map(str::to_owned),
+        method: SubtitleDeliveryMethod::External,
+        ..SubtitleProfile::default()
+    }];
+    options.audio_stream_index = Some(2);
+    options.subtitle_stream_index = Some(subtitle_index);
+
+    // `GetStreamBuilder(enableSubtitleExtraction: false)`.
+    let support = MockTranscoderSupport;
+    let stream_info = StreamBuilder::new(&support)
+        .get_optimal_video_stream(&options)
+        .expect("stream info");
+
+    assert_eq!(stream_info.play_method, PlayMethod::Transcode);
+    assert_eq!(
+        stream_info.transcode_reasons,
+        R::SECONDARY_AUDIO_NOT_SUPPORTED
+    );
+    assert_eq!(
+        stream_info.subtitle_delivery_method,
+        SubtitleDeliveryMethod::External
+    );
+    assert!(stream_info.video_codecs.iter().any(|c| c == "h264"));
+    assert!(stream_info.audio_codecs.iter().any(|c| c == "aac"));
+    let url = stream_info.to_url(Some("media:"), Some("ACCESSTOKEN"), None);
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    for name in ["SubtitleStreamIndex=", "SubtitleMethod="] {
+        assert!(
+            !query.split('&').any(|pair| pair.starts_with(name)),
+            "{name} in {query}"
+        );
+    }
 }
