@@ -21,13 +21,13 @@
 //! the [`UserDataManager`](ferrofin_traits::library::UserDataManager), and returns
 //! the refreshed [`UserItemDataDto`].
 //!
-//! Faithfulness notes / deferrals: the C# `AssertCanUpdateUser` policy gate on
-//! the `UserData` reads/writes needs the un-ported per-user administration
-//! policy; the portable seam authenticates the caller (`RequireAuth`) and scopes
-//! to the resolved user. The person on-demand metadata refresh
-//! (`RefreshItemOnDemandIfNeeded`) is the filesystem/OOP-tree slice deferred
-//! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
-//! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
+//! The `UserData` reads and writes check `AssertCanUpdateUser` with the
+//! user-preference restriction, as `ItemsController` does
+//! ([`super::users::assert_can_update_user`]). TODO(parity, open work item
+//! gl-174): the person on-demand metadata refresh
+//! (`RefreshItemOnDemandIfNeeded`) is not ported. `GET /Items/Latest` is the
+//! full `GetLatestMedia` port (the grouping lives in the
+//! [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
@@ -42,7 +42,6 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
-use crate::handlers::session_ctx::notify_user_data_changed;
 use crate::state::AppState;
 
 /// The default `GET /Items/Latest` return limit (C# `limit = 20`).
@@ -120,21 +119,19 @@ async fn save_and_return(
         .get_user_data_dto(item_id, user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user data for item {item_id}")))?;
-    notify_user_data_changed(state, user_id, &dto).await;
     Ok(Json(dto))
 }
 
-/// Sets — or clears — the user's like for an item, pushing the refreshed data
-/// to the user's other sessions before returning it (the shared body of the
-/// four rating routes).
-async fn set_likes_and_notify(
+/// Sets — or clears — the user's like for an item and returns the refreshed
+/// data (the shared body of the four rating routes). The user-data manager
+/// announces the save to the user's sessions.
+async fn apply_likes(
     state: &AppState,
     user_id: Uuid,
     item_id: Uuid,
     likes: Option<bool>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let dto = state.user_data.set_likes(user_id, item_id, likes).await?;
-    notify_user_data_changed(state, user_id, &dto).await;
     Ok(Json(dto))
 }
 
@@ -228,7 +225,7 @@ async fn update_rating_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
-    set_likes_and_notify(&state, user_uuid, resolved_item, query.likes).await
+    apply_likes(&state, user_uuid, resolved_item, query.likes).await
 }
 
 /// `DELETE /Users/{userId}/Items/{itemId}/Rating` — legacy per-user clear-like.
@@ -240,7 +237,7 @@ async fn delete_rating_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
-    set_likes_and_notify(&state, user_uuid, resolved_item, None).await
+    apply_likes(&state, user_uuid, resolved_item, None).await
 }
 
 /// Shared favourite toggle for the mark/unmark handlers.
@@ -307,7 +304,7 @@ async fn update_rating(
         resolve_user_and_item(&state, &auth, query.user_id, item_id).await?;
     // C# assigns `userData.Likes = likes` (clearing when the query param is
     // absent), so use the explicit like setter rather than the merge path.
-    set_likes_and_notify(&state, user_uuid, resolved_item, query.likes).await
+    apply_likes(&state, user_uuid, resolved_item, query.likes).await
 }
 
 /// `DELETE /UserItems/{itemId}/Rating` — clears the like rating for an item.
@@ -332,7 +329,7 @@ async fn delete_rating(
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, query.user_id, item_id).await?;
     // Persist the cleared like (C# saves `Likes = null`), then return the row.
-    set_likes_and_notify(&state, user_uuid, resolved_item, None).await
+    apply_likes(&state, user_uuid, resolved_item, None).await
 }
 
 /// `GET /UserItems/{itemId}/UserData` — reads an item's user data.
@@ -344,6 +341,7 @@ async fn delete_rating(
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 200, description = "User data returned (UserItemDataDto)", body = UserItemDataDto),
+        (status = 403, description = "The user may not view this item user data"),
         (status = 404, description = "Item or user not found")
     ),
     tag = "ferrofin"
@@ -355,6 +353,8 @@ async fn get_item_user_data(
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    // C# `AssertCanUpdateUser(User, user, true)`, before the item lookup.
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     let user_uuid = user_uuid(&user)?;
     // C# `GetItemById<BaseItem>` requires a real item (no empty-guid fallback).
     state
@@ -380,6 +380,7 @@ async fn get_item_user_data(
     request_body = UpdateUserItemDataDto,
     responses(
         (status = 200, description = "User data updated (UserItemDataDto)", body = UserItemDataDto),
+        (status = 403, description = "The user may not update this item user data"),
         (status = 404, description = "Item or user not found")
     ),
     tag = "ferrofin"
@@ -392,6 +393,8 @@ async fn update_item_user_data(
     JsonBody(update): JsonBody<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    // C# `AssertCanUpdateUser(User, user, true)`, before the item lookup.
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     let user_uuid = user_uuid(&user)?;
     state
         .library
