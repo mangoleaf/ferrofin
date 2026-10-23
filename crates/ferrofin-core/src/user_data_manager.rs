@@ -868,6 +868,46 @@ impl FerrofinUserDataManager {
         counts.get_played_and_total_count(&query, id).await
     }
 
+    /// Folds the completion of `item`'s version played last into `dto`, its
+    /// own user data — `GetResumeUserData(user, item)?.ApplyTo(dto)`
+    /// (v12.2 `UserDataManager.cs:263-357, 424`). A video that is a version
+    /// itself, or that no row names as its primary, is left alone after at
+    /// most one indexed read; only a video with versions reads its group and
+    /// their user data.
+    async fn apply_version_resume(
+        &self,
+        dto: &mut UserItemDataDto,
+        item: &BaseItemEntity,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        use crate::video_versions::{DbVersionReader, VersionRows, resume_user_data};
+        if item.primary_version_id.is_some()
+            || !kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_video)
+        {
+            return Ok(());
+        }
+        let has_versions: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS (SELECT 1 FROM "BaseItems" x
+                              WHERE x."PrimaryVersionId" = ?1 AND x."Id" <> ?1)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if !has_versions {
+            return Ok(());
+        }
+        let versions = VersionRows::load(&DbVersionReader(&self.db), &[item]).await?;
+        let data = self
+            .get_user_data_dtos(&versions.all_version_ids(item), user_id)
+            .await?;
+        if let Some(resume) = resume_user_data(&versions, item, |id| data.get(&id)) {
+            resume.apply_to(dto);
+        }
+        Ok(())
+    }
+
     /// `item.FillUserDataDtoValues(dto, userData, null, user, options)` as
     /// `GetUserDataDto(item, user)` runs it (v12.2 UserDataManager.cs:411-427),
     /// chosen by class: a `Folder` (Folder.cs:2024-2081) takes its played
@@ -897,7 +937,10 @@ impl FerrofinUserDataManager {
         // the folder gates below, as `supports_played_status` excludes it.
         if !crate::kinds::is_folder(kind) {
             crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
-            return Ok(());
+            // `GetResumeUserData(user, item)?.ApplyTo(dto)` (UserDataManager.cs:424).
+            return self
+                .apply_version_resume(dto, &item, item_id, user_id)
+                .await;
         }
         // No item DTO, so only the `SupportsPlayedStatus` half applies.
         if !(crate::kinds::supports_user_data_from_children(kind)
@@ -4409,6 +4452,56 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A single read of a primary's user data — the one `UserDataChanged`
+    /// pushes and the played/favorite responses carry — takes its completion
+    /// from the version played last (`GetUserDataDto` →
+    /// `GetResumeUserData(user, item)?.ApplyTo(dto)`, UserDataManager.cs:424):
+    /// finished on the 4K copy after the versions were grouped, the movie
+    /// reads played, its own resume bar cleared. The version read directly
+    /// keeps its own data.
+    #[tokio::test]
+    async fn a_primary_read_takes_the_completion_of_the_version_played_last() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, _alt1, alt2) = version_group(&db).await;
+        let (mgr, _library) = container_manager(&db);
+        let finished = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        mgr.save_user_data(
+            user,
+            primary,
+            &UpdateUserItemDataDto {
+                playback_position_ticks: Some(36_000_000_000),
+                last_played_date: Some(finished - chrono::Duration::days(30)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        mgr.save_user_data(
+            user,
+            alt2,
+            &UpdateUserItemDataDto {
+                played: Some(true),
+                last_played_date: Some(finished),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let movie = data(&mgr, primary, user).await;
+        assert!(movie.played, "finished on the 4K version");
+        assert_eq!(movie.last_played_date, Some(finished));
+        assert_eq!(movie.playback_position_ticks, 0);
+        assert_eq!(movie.played_percentage, None);
+        let version = data(&mgr, alt2, user).await;
+        assert_eq!(version.item_id, alt2);
+        assert!(version.played);
     }
 
     /// Both alternate versions are marked played, and their positions reset

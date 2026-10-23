@@ -740,6 +740,18 @@ impl std::fmt::Display for RestoreFailure {
 
 impl std::error::Error for RestoreFailure {}
 
+/// Whether `POST /Backup/Restore` has scheduled a restore that the next boot's
+/// [`apply_pending_restore`] will apply.
+#[must_use]
+pub fn restore_pending(roots: &TreeRoots) -> bool {
+    roots
+        .program_data
+        .join("data")
+        .join(BACKUPS_DIR)
+        .join(RESTORE_PENDING_FILE)
+        .is_file()
+}
+
 /// Applies a restore scheduled by `POST /Backup/Restore`, if one is pending.
 ///
 /// The composition root calls this at boot BEFORE the database is opened: it
@@ -1227,7 +1239,9 @@ mod tests {
             &boot_root.join("config"),
             &boot_root.join("ferrofin.db"),
         );
+        assert!(super::restore_pending(&boot_roots), "the marker is seen");
         let applied = super::apply_pending_restore(&boot_roots).unwrap();
+        assert!(!super::restore_pending(&boot_roots), "nothing pends after");
         assert_eq!(
             applied.as_deref(),
             Some(boot_backups.join(archive.file_name().unwrap()).as_path())

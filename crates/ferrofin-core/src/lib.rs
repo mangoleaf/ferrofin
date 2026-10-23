@@ -199,6 +199,7 @@ pub mod item_visibility;
 mod item_visibility_repository;
 pub mod keyframe_repository;
 pub mod kinds;
+mod latest_tv_repository;
 pub mod library_changed_notifier;
 pub mod library_manager;
 pub mod library_monitor;
