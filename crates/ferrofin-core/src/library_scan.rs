@@ -2713,8 +2713,10 @@ struct ItemState<'s, 'a> {
     probes: &'s mut ProbePipeline<'a>,
     folders: &'s [VirtualFolderInfo],
     refresh: &'s RefreshContext<'s>,
-    /// Set by [`LibraryScanner::scan_item`] for an extra whose stored name
-    /// it changes (`RefreshExtras`' `renamedExtraIds`).
+    /// Set by [`LibraryScanner::scan_item`] for an extra `FindExtras` renames
+    /// before its refresh ([`renamed_extra`]): `RefreshExtras`'
+    /// `renamedExtraIds`, the extras whose corrected name differs from the
+    /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
 }
 
@@ -2880,6 +2882,11 @@ struct Planned {
     entity: BaseItemEntity,
     /// The ancestor closure (`ParentId` chain up to the collection folder).
     ancestors: Vec<Uuid>,
+    /// For an extra, every name `LibraryManager.FindExtras` may have given
+    /// it on an earlier scan (`IsGeneratedExtraName`, see [`NamedExtra`]): a
+    /// stored name among them is the scan's own and takes `entity.name`
+    /// ([`renamed_extra`]). Empty for every other item.
+    generated_names: Vec<String>,
 }
 
 /// Which paths a plan pass resolves: every one (a library scan), or the items
@@ -6332,7 +6339,7 @@ impl LibraryScanner {
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
             let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
-            let renamed_extra = state.renamed_extra;
+            let extra_renamed = state.renamed_extra;
             if scope.is_some() && !matches!(saved, ItemSaved::Cancelled) {
                 let reason = if refresh.is_context(item, !is_new) {
                     "context"
@@ -6494,7 +6501,7 @@ impl LibraryScanner {
             {
                 // A row not stored before (or not readable) is a new extra.
                 let changed = match stored {
-                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || renamed_extra,
+                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || extra_renamed,
                     _ => true,
                 } || request.options.replace_all_metadata
                     || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh;
@@ -7154,7 +7161,14 @@ impl LibraryScanner {
             .and_then(|info| info.show_name.as_ref())
             .filter(|name| !name.is_empty());
         let mut entity = item.entity.clone();
-        let mut video_base = stored_row.filter(|_| video_info.is_some()).cloned();
+        // `FindExtras` names a stored extra before its refresh, so the
+        // merge below starts from that name and a local reader's title
+        // replaces it as it would any stored name. Only the merge's base
+        // takes it: the save compares the result with the stored row.
+        let renamed = stored_row.and_then(|row| renamed_extra(row, item, locked_fields));
+        state.renamed_extra = renamed.is_some();
+        let named_row = renamed.as_ref().or(stored_row);
+        let mut video_base = named_row.filter(|_| video_info.is_some()).cloned();
         let embedded_title = if let Some(info) = video_info {
             let base = video_base.as_mut().unwrap_or(&mut entity);
             apply_video_metadata(base, info, policy, locked, locked_fields, options, naming);
@@ -7197,7 +7211,7 @@ impl LibraryScanner {
             }
             _ => None,
         };
-        let metadata_stored = video_base.as_ref().or(season_base.as_ref()).or(stored_row);
+        let metadata_stored = video_base.as_ref().or(season_base.as_ref()).or(named_row);
         // The providers fill a row that starts WITHOUT the resolver's
         // path guesses (upstream's `temp` starts empty), so every value
         // they leave on it is one they supplied. The guesses ride along
@@ -7589,14 +7603,6 @@ impl LibraryScanner {
             policy.options,
         ) {
             settle_sort_name(&mut entity);
-        }
-        // FindExtras names extras from their files before refresh; a prober
-        // that ran can then apply a permitted embedded title.
-        if embedded_title.is_none() {
-            settle_extra_name(&mut entity, &item.entity, locked_fields);
-        }
-        if entity.extra_type.is_some() && stored_row.is_some_and(|row| row.name != entity.name) {
-            state.renamed_extra = true;
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
@@ -13847,6 +13853,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors: vec![aggregate],
+                generated_names: Vec::new(),
             },
         );
         (out.len() > before).then_some((id, aggregate))
@@ -14030,35 +14037,97 @@ impl LibraryScanner {
             &mut extras,
             &mut movies_by_dir,
         );
-        for MovieExtra {
-            path,
-            extra_type,
-            in_mixed_folder,
-        } in extras
+        // `FindExtras` names an owner's extras together, so every candidate
+        // is named before the scope drops any.
+        let extra_names = self.movie_extra_names(&extras, &movies_by_dir, ctx);
+        for (
+            MovieExtra {
+                path,
+                in_mixed_folder,
+                ..
+            },
+            named,
+        ) in extras.into_iter().zip(extra_names)
         {
             if !ctx.scope.keeps(&path) {
                 continue;
             }
-            let Some(owner) = owner_for_extra(&path, &movies_by_dir, ctx.naming) else {
+            let (Some(owner), Some(named)) =
+                (owner_for_extra(&path, &movies_by_dir, ctx.naming), named)
+            else {
                 // This candidate was listed, but no eligible containing movie
                 // searches for it. Reconcile legacy rows at this exact path.
                 ctx.excluded.borrow_mut().push(path);
                 continue;
             };
             let first = out.len();
-            self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+            self.emit_extra(&path, named, owner, cf, ctx, out);
             for item in &mut out[first..] {
                 item.entity.is_in_mixed_folder = in_mixed_folder;
             }
         }
     }
 
+    /// Names the movie walk's `extras` as `LibraryManager.FindExtras` does,
+    /// once per owner: the movie (or disc rip, or album) whose folder, or
+    /// extras folder, holds them, its primary version — the item `FindExtras`
+    /// runs for, before `Video.GetOwnerIdForExtra` hands an extra to the
+    /// version it is named after. `None` for an extra no owner searches for.
+    fn movie_extra_names(
+        &self,
+        extras: &[MovieExtra],
+        movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
+        ctx: &PlanCtx<'_>,
+    ) -> Vec<Option<NamedExtra>> {
+        let naming = ctx.naming;
+        let mut by_owner: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, extra) in extras.iter().enumerate() {
+            if let Some((dir, _)) = extras_owners(&extra.path, movies_by_dir, naming) {
+                by_owner.entry(dir).or_default().push(index);
+            }
+        }
+        let mut names: Vec<Option<NamedExtra>> = extras.iter().map(|_| None).collect();
+        for (dir, members) in by_owner {
+            let Some(&(primary, _)) = movies_by_dir.get(dir).and_then(|movies| movies.first())
+            else {
+                continue;
+            };
+            // `VideoResolver.Resolve(owner.Path, isFolder, …)`: a movie's path
+            // is its file; a disc rip's (and a photo album's) is a folder.
+            let owner_path = ctx.owner_paths.borrow().get(&primary).cloned();
+            let owner = match owner_path {
+                Some(path) => {
+                    let is_folder = !video_resolver::is_video_file(&path, naming);
+                    video_resolver::resolve(Some(&path), is_folder, naming, true, Some(dir))
+                }
+                None => video_resolver::resolve_directory(Some(dir), naming, true, Some(dir)),
+            };
+            let candidates: Vec<_> = members
+                .iter()
+                .map(|&index| ExtraCandidate {
+                    path: &extras[index].path,
+                    extra_type: extras[index].extra_type,
+                    rule: extras[index].rule,
+                })
+                .collect();
+            let owner_name = owner.as_ref().map(|owner| owner.name.as_str());
+            for (index, named) in
+                members
+                    .iter()
+                    .zip(self.name_extras(&candidates, owner_name, dir, naming))
+            {
+                names[*index] = Some(named);
+            }
+        }
+        names
+    }
+
     /// Emit the same owned media shape for movies, series, physical seasons,
-    /// music artists and music albums.
+    /// music artists and music albums, named as `FindExtras` names it.
     fn emit_extra(
         &self,
         path: &str,
-        extra_type: ferrofin_model::entities::ExtraType,
+        named: NamedExtra,
         owner: Uuid,
         cf: Uuid,
         ctx: &PlanCtx<'_>,
@@ -14077,14 +14146,17 @@ impl LibraryScanner {
         // `GET /Trailers` and `/Items?includeItemTypes=Trailer`; an `Audio`
         // theme song is what makes `/Items/{id}/ThemeMedia` return it under
         // `ThemeSongsResult` rather than as a stray Video row.
+        let NamedExtra {
+            extra_type,
+            name,
+            generated,
+        } = named;
         let (kind, media_type) = match extra_type {
             ferrofin_model::entities::ExtraType::Trailer => (BaseItemKind::Trailer, "Video"),
             ferrofin_model::entities::ExtraType::ThemeSong => (BaseItemKind::Audio, "Audio"),
             _ => (BaseItemKind::Video, "Video"),
         };
-        let Some((id, mut entity)) =
-            self.base_item(ctx, kind, cf, cf, file_stem(path), path, false)
-        else {
+        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, cf, name, path, false) else {
             return;
         };
         entity.media_type = Some(media_type.to_owned());
@@ -14114,6 +14186,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors: vec![cf],
+                generated_names: generated,
             },
         );
     }
@@ -14187,7 +14260,7 @@ impl LibraryScanner {
             }
         }
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut counts = HashMap::new();
+        let mut found = Vec::new();
         for (path, mixed) in candidates {
             let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
                 &path,
@@ -14204,31 +14277,112 @@ impl LibraryScanner {
                 continue;
             }
             consumed.insert(path.clone());
-            let mut name = video_resolver::resolve_file(Some(&path), ctx.naming, Some(owner_dir))
-                .map_or_else(|| file_stem(&path), |info| info.name);
-            let named_after_owner = extra.rule.is_some_and(|rule| match rule.rule_type {
-                ferrofin_naming::video::ExtraRuleType::Filename => true,
-                ferrofin_naming::video::ExtraRuleType::Suffix => {
-                    name.eq_ignore_ascii_case(&owner_info.name)
-                }
-                _ => false,
-            });
-            if named_after_owner {
-                let count = counts.entry(extra_type.json_value()).or_insert(0);
-                *count += 1;
-                name = self.extra_type_name(extra_type, *count);
-            }
-            if ctx.scope.keeps(&path) {
+            found.push((path, mixed, extra_type, rule.rule_type));
+        }
+        let candidates: Vec<_> = found
+            .iter()
+            .map(|(path, _, extra_type, rule)| ExtraCandidate {
+                path,
+                extra_type: *extra_type,
+                rule: Some(*rule),
+            })
+            .collect();
+        let names = self.name_extras(&candidates, Some(&owner_info.name), owner_dir, ctx.naming);
+        for ((path, mixed, ..), named) in found.iter().zip(names) {
+            if ctx.scope.keeps(path) {
                 ctx.excluded.borrow_mut().push(path.clone());
                 let first = out.len();
-                self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+                self.emit_extra(path, named, owner, cf, ctx, out);
                 for item in &mut out[first..] {
-                    item.entity.name = Some(name.clone());
-                    item.entity.is_in_mixed_folder = mixed;
+                    item.entity.is_in_mixed_folder = *mixed;
                 }
             }
         }
         consumed
+    }
+
+    /// `LibraryManager.FindExtras`' naming of one owner's `candidates`, in
+    /// their order: each is named in ordinal path order (`GetExtraName`), so
+    /// the numbers handed out do not depend on the listing. An extra named
+    /// after its owner — a `Filename` rule (`trailer.mkv`, `theme.mp3`), or a
+    /// `Suffix` rule whose cleaned name is the owner's (`Up (2009)-trailer.mkv`
+    /// beside `Up (2009).mkv`, `owner_name` `Up`) — takes its type's
+    /// localized name, numbered per type (`GetNumberedExtraName`); any other
+    /// keeps the resolver's name for its file (`CleanDateTime` and
+    /// `CleanString`; an audio file's stem).
+    fn name_extras(
+        &self,
+        candidates: &[ExtraCandidate<'_>],
+        owner_name: Option<&str>,
+        owner_dir: &str,
+        naming: &NamingOptions,
+    ) -> Vec<NamedExtra> {
+        use ferrofin_naming::video::ExtraRuleType;
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|&a, &b| candidates[a].path.cmp(candidates[b].path));
+        // `IsGeneratedExtraName`: any number of its type may have been
+        // handed out, as the order shifts when files appear beside it or
+        // are taken away — one per candidate of the type.
+        let mut counts: HashMap<i32, (ferrofin_model::entities::ExtraType, i32)> = HashMap::new();
+        for candidate in candidates {
+            counts
+                .entry(candidate.extra_type.json_value())
+                .or_insert((candidate.extra_type, 0))
+                .1 += 1;
+        }
+        let type_names: HashMap<i32, Vec<String>> = counts
+            .into_iter()
+            .map(|(key, (extra_type, count))| {
+                let names = (1..=count)
+                    .map(|seen| self.extra_type_name(extra_type, seen))
+                    .collect();
+                (key, names)
+            })
+            .collect();
+        let mut seen: HashMap<i32, usize> = HashMap::new();
+        let mut named: Vec<Option<NamedExtra>> = candidates.iter().map(|_| None).collect();
+        for index in order {
+            let candidate = &candidates[index];
+            let stem = file_stem(candidate.path);
+            let resolved =
+                video_resolver::resolve_file(Some(candidate.path), naming, Some(owner_dir))
+                    .map_or_else(|| stem.clone(), |info| info.name);
+            let named_after_owner = match candidate.rule {
+                Some(ExtraRuleType::Filename) => true,
+                Some(ExtraRuleType::Suffix) => {
+                    // `StringComparison.OrdinalIgnoreCase`, which folds
+                    // case beyond ASCII (`Léon` and `LÉON`).
+                    owner_name.is_some_and(|owner| {
+                        ferrofin_util::string_extensions::upper_invariant(&resolved)
+                            == ferrofin_util::string_extensions::upper_invariant(owner)
+                    })
+                }
+                _ => false,
+            };
+            let key = candidate.extra_type.json_value();
+            let numbered = type_names.get(&key).map_or(&[][..], Vec::as_slice);
+            let name = if named_after_owner {
+                let seen = seen.entry(key).or_insert(0);
+                *seen += 1;
+                // One number per candidate of the type, so never past the end.
+                numbered.get(*seen - 1).cloned().unwrap_or_default()
+            } else {
+                resolved.clone()
+            };
+            // The file's own name is what an extra was called before it was
+            // named after its type; Ferrofin stored the raw file stem before
+            // it named a movie's extras, so that counts too (it would
+            // otherwise read as a name the user chose, and stand forever).
+            let mut generated = numbered.to_vec();
+            generated.push(resolved);
+            generated.push(stem);
+            named[index] = Some(NamedExtra {
+                extra_type: candidate.extra_type,
+                name,
+                generated,
+            });
+        }
+        named.into_iter().flatten().collect()
     }
 
     fn extra_type_name(&self, extra: ferrofin_model::entities::ExtraType, count: i32) -> String {
@@ -14788,6 +14942,7 @@ impl LibraryScanner {
             id,
             entity,
             ancestors,
+            generated_names: Vec::new(),
         })
     }
 
@@ -14813,6 +14968,7 @@ impl LibraryScanner {
                 id: series_id,
                 entity: series,
                 ancestors: vec![cf],
+                generated_names: Vec::new(),
             },
         );
         self.plan_series(dir, cf, series_id, &name, &series_key, ctx, out);
@@ -14865,6 +15021,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors,
+                generated_names: Vec::new(),
             },
         );
     }
@@ -14951,6 +15108,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors,
+                generated_names: Vec::new(),
             },
         );
         Some((id, below))
@@ -15231,6 +15389,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors,
+                generated_names: Vec::new(),
             },
         );
         let rip = RipFolder {
@@ -15305,6 +15464,7 @@ impl LibraryScanner {
                 id,
                 entity: primary,
                 ancestors,
+                generated_names: Vec::new(),
             });
         }
         let rip = RipFolder {
@@ -15582,6 +15742,7 @@ impl LibraryScanner {
                 id: series_id,
                 entity: series,
                 ancestors: ancestors.clone(),
+                generated_names: Vec::new(),
             },
         );
         self.plan_series(dir, cf, series_id, &series_name, &series_key, ctx, out);
@@ -15860,6 +16021,7 @@ impl LibraryScanner {
                 id: season_id,
                 entity: e,
                 ancestors: vec![cf, series_id],
+                generated_names: Vec::new(),
             },
         );
         self.plan_episodes(
@@ -16017,6 +16179,7 @@ impl LibraryScanner {
                     id: season_id,
                     entity: e,
                     ancestors: vec![cf, series_id],
+                    generated_names: Vec::new(),
                 },
             );
             season_ids.insert(num, season_id);
@@ -16306,6 +16469,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors: ancestors.clone(),
+                generated_names: Vec::new(),
             });
         }
     }
@@ -16366,6 +16530,7 @@ impl LibraryScanner {
             id,
             entity,
             ancestors,
+            generated_names: Vec::new(),
         })
     }
 
@@ -16710,6 +16875,7 @@ impl LibraryScanner {
                             id: album_id,
                             entity: album,
                             ancestors: chain.to_vec(),
+                            generated_names: Vec::new(),
                         },
                     );
                     let mut ancestors = chain.to_vec();
@@ -16744,6 +16910,7 @@ impl LibraryScanner {
                     id,
                     entity,
                     ancestors: ancestors.clone(),
+                    generated_names: Vec::new(),
                 },
             );
         }
@@ -16817,6 +16984,7 @@ impl LibraryScanner {
                     id: artist_id,
                     entity: artist,
                     ancestors: ancestors.to_vec(),
+                    generated_names: Vec::new(),
                 },
             );
             let below = [ancestors, &[artist_id]].concat();
@@ -16864,6 +17032,7 @@ impl LibraryScanner {
                         id,
                         entity,
                         ancestors: ancestors.to_vec(),
+                        generated_names: Vec::new(),
                     },
                 );
                 [ancestors, &[id]].concat()
@@ -16995,6 +17164,7 @@ impl LibraryScanner {
                 id: album_id,
                 entity: album,
                 ancestors: album_ancestors.clone(),
+                generated_names: Vec::new(),
             },
         );
         // Its extras (a theme song); its tracks are none of them.
@@ -17030,6 +17200,7 @@ impl LibraryScanner {
                     id,
                     entity,
                     ancestors: ancestors.clone(),
+                    generated_names: Vec::new(),
                 },
             );
         }
@@ -17116,6 +17287,7 @@ impl LibraryScanner {
                     id,
                     entity,
                     ancestors: ancestors.clone(),
+                    generated_names: Vec::new(),
                 },
             );
         }
@@ -17372,6 +17544,7 @@ impl LibraryScanner {
             id,
             entity,
             ancestors: vec![cf],
+            generated_names: Vec::new(),
         });
     }
 
@@ -17411,6 +17584,7 @@ impl LibraryScanner {
             id,
             entity,
             ancestors: vec![cf],
+            generated_names: Vec::new(),
         });
     }
 }
@@ -18723,6 +18897,7 @@ fn movie_walk_extra(
     extra.extra_type.map(|extra_type| MovieExtra {
         path: entry.path.clone(),
         extra_type,
+        rule: extra.rule.as_ref().map(|rule| rule.rule_type),
         // False beside its owner (`LibraryManager.cs:3478`);
         // more than one file in its extras folder (`:3464`).
         in_mixed_folder: folder.extras_folder_mixed,
@@ -18910,12 +19085,37 @@ fn is_dvd_file(entry: &FileSystemEntryInfo) -> bool {
     entry.type_ != FileSystemEntryType::Directory && entry.name.eq_ignore_ascii_case("video_ts.ifo")
 }
 
+/// One extra `FindExtras` found for an owner, before it is named
+/// ([`LibraryScanner::name_extras`]).
+struct ExtraCandidate<'a> {
+    /// The extra's file.
+    path: &'a str,
+    /// What kind of extra the naming rules make it.
+    extra_type: ferrofin_model::entities::ExtraType,
+    /// The kind of rule that took it (`ExtraRule.RuleType`).
+    rule: Option<ferrofin_naming::video::ExtraRuleType>,
+}
+
+/// An extra as `LibraryManager.FindExtras` names it.
+struct NamedExtra {
+    /// What kind of extra the naming rules make it.
+    extra_type: ferrofin_model::entities::ExtraType,
+    /// The name it gets (`GetExtraName`).
+    name: String,
+    /// Every name `FindExtras` may have given it on an earlier scan
+    /// (`IsGeneratedExtraName`): each number of its type for its owner, the
+    /// resolver's name for its file, and the raw file stem.
+    generated: Vec<String>,
+}
+
 /// An extra the movie walk found, before its owner is known.
 struct MovieExtra {
     /// The extra's file.
     path: String,
     /// What kind of extra the naming rules make it.
     extra_type: ferrofin_model::entities::ExtraType,
+    /// The kind of rule that took it (`ExtraRule.RuleType`).
+    rule: Option<ferrofin_naming::video::ExtraRuleType>,
     /// Its stored `IsInMixedFolder`.
     in_mixed_folder: bool,
 }
@@ -19159,26 +19359,43 @@ fn owner_for_extra(
     movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
     naming: &NamingOptions,
 ) -> Option<Uuid> {
-    let dir = Path::new(path).parent()?;
-    if let Some(movies) = dir.to_str().and_then(|dir| movies_by_dir.get(dir)) {
-        let stem = file_stem(path).to_lowercase();
-        let mut owner = movies.first()?.0;
-        let mut matched = 0;
-        for (id, name) in movies {
-            let name = name.to_lowercase();
-            if name.len() > matched
-                && let Some(rest) = stem.strip_prefix(&name)
-                && rest.starts_with([' ', '-', '_', '.'])
-            {
-                owner = *id;
-                matched = name.len();
-            }
-        }
+    let (dir, beside) = extras_owners(path, movies_by_dir, naming)?;
+    let movies = movies_by_dir.get(dir)?;
+    let mut owner = movies.first()?.0;
+    if !beside {
         return Some(owner);
     }
-    // One level up only from an extras-named folder: `FindExtras` searches
-    // the owner's folder and those subfolders, no other
-    // (`LibraryManager.cs:3459`).
+    let stem = file_stem(path).to_lowercase();
+    let mut matched = 0;
+    for (id, name) in movies {
+        let name = name.to_lowercase();
+        if name.len() > matched
+            && let Some(rest) = stem.strip_prefix(&name)
+            && rest.starts_with([' ', '-', '_', '.'])
+        {
+            owner = *id;
+            matched = name.len();
+        }
+    }
+    Some(owner)
+}
+
+/// The folder whose owners search for the extra at `path` — its own, or
+/// the one above an extras-named folder: `FindExtras` searches the owner's
+/// folder and those subfolders, no other (`LibraryManager.cs:3459`) — as
+/// its key in `movies_by_dir`, and whether the extra sits beside them.
+fn extras_owners<'a>(
+    path: &str,
+    movies_by_dir: &'a std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    naming: &NamingOptions,
+) -> Option<(&'a str, bool)> {
+    let dir = Path::new(path).parent()?;
+    if let Some((key, _)) = dir
+        .to_str()
+        .and_then(|dir| movies_by_dir.get_key_value(dir))
+    {
+        return Some((key.as_str(), true));
+    }
     let dir_name = dir.file_name()?.to_str()?;
     if !naming
         .all_extras_types_folder_names
@@ -19187,9 +19404,8 @@ fn owner_for_extra(
         return None;
     }
     movies_by_dir
-        .get(dir.parent()?.to_str()?)?
-        .first()
-        .map(|(id, _)| *id)
+        .get_key_value(dir.parent()?.to_str()?)
+        .map(|(key, _)| (key.as_str(), false))
 }
 
 /// `ExtraResolver.TryGetExtraTypeForOwner`: filename prefix first, then
@@ -20964,28 +21180,45 @@ fn is_stacked_part(entity: &BaseItemEntity) -> bool {
     entity.owner_id.is_some() && entity.extra_type.is_none() && entity.primary_version_id.is_none()
 }
 
-/// Gives a saved extra the planner's name (and the sort key that follows
-/// it): `FindExtras` re-derives an extra's name from its file name on every
-/// scan, even on an existing item, unless the `Name` field is locked (the
-/// only opt-out upstream). A stacked part or a local alternate version is
-/// owned too, but is no `FindExtras` item: its primary refreshes it
+/// The stored extra `stored` with the planner's name (and the sort key that
+/// follows it), when `FindExtras` renames it before its refresh
+/// (`PrepareExtra`, v12.2): its `Name` field is unlocked and its stored name
+/// is one the scan gave it ([`Planned::generated_names`]). A name that came
+/// from anywhere else — a local metadata file, an edit — is the user's and
+/// stands. `None` when nothing changes.
+///
+/// A stacked part or a local alternate version is owned too, but is no
+/// `FindExtras` item (it has no generated names): its primary refreshes it
 /// (`Video.RefreshedOwnedItems` → `RefreshMetadataForOwnedVideo` /
 /// `RefreshMetadataForVersions`, `Video.cs:528-700`), and that refresh only
 /// fills an empty `Name` — `copyTitleMetadata` (`BaseItem.cs:2805-2858`)
 /// never copies the name, and an alternate refreshes without it
 /// (`Video.cs:565`) — so its saved name stands.
-fn settle_extra_name(
-    entity: &mut BaseItemEntity,
-    planned: &BaseItemEntity,
+fn renamed_extra(
+    stored: &BaseItemEntity,
+    planned: &Planned,
     locked_fields: &[MetadataField],
-) {
-    if entity.owner_id.is_some()
-        && entity.extra_type.is_some()
-        && !locked_fields.contains(&MetadataField::Name)
+) -> Option<BaseItemEntity> {
+    let name = planned
+        .entity
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())?;
+    let generated = match stored.name.as_deref() {
+        // A row with no name has none to keep.
+        None | Some("") => true,
+        Some(current) => current != name && planned.generated_names.iter().any(|g| g == current),
+    };
+    if planned.generated_names.is_empty()
+        || locked_fields.contains(&MetadataField::Name)
+        || !generated
     {
-        entity.name.clone_from(&planned.name);
-        settle_sort_name(entity);
+        return None;
     }
+    let mut row = stored.clone();
+    row.name = Some(name.to_owned());
+    settle_sort_name(&mut row);
+    Some(row)
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
@@ -23089,6 +23322,7 @@ mod tests {
             id: primary,
             entity: row(primary, paths[0], None),
             ancestors: Vec::new(),
+            generated_names: Vec::new(),
         }];
         let links = FerrofinLinkedChildrenService::new(db.clone());
         let items = FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()));
@@ -23792,6 +24026,7 @@ mod tests {
                 is_folder: folder,
                 ..Default::default()
             },
+            generated_names: Vec::new(),
         };
         let mut refresh = super::RefreshContext::of(super::ScanRun::defaults());
         refresh.date_added =
@@ -25691,6 +25926,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             entity: ferrofin_db::entities::base_items::BaseItemEntity::default(),
             ancestors: vec![library],
+            generated_names: Vec::new(),
         };
         let own = super::policy_for(&planned(music), &policies, outside);
         assert_eq!(own.metadata_language(), "de");
@@ -28903,41 +29139,72 @@ mod tests {
     }
 
     /// On a rescan, a stored owned row takes the planner's name only when it
-    /// is an extra (`FindExtras`) whose `Name` field is not locked; a stacked
-    /// part or a local alternate keeps its stored name, locked or not.
+    /// is an extra (`FindExtras`) whose `Name` field is not locked and whose
+    /// stored name the scan gave it (`PrepareExtra` / `IsGeneratedExtraName`,
+    /// v12.2): a number of its type, the resolver's name for its file, or
+    /// the raw file stem Ferrofin stored before it named a movie's extras.
+    /// Any other name — an NFO title, an edit — stands. A stacked part or a
+    /// local alternate keeps its stored name, locked or not. The rename
+    /// lands on the merge's base, so it survives a locked item's save.
     #[rstest::rstest]
-    #[case::extra("extra", &[], true)]
-    #[case::extra_name_locked("extra", &[ferrofin_model::entities::MetadataField::Name], false)]
-    #[case::extra_other_lock("extra", &[ferrofin_model::entities::MetadataField::Overview], true)]
-    #[case::part("part", &[], false)]
-    #[case::alternate("alternate", &[], false)]
-    fn only_an_extra_takes_the_planners_name(
+    #[case::numbered("extra", "Trailer 2", &[], true)]
+    #[case::resolver_name("extra", "Heat", &[], true)]
+    #[case::legacy_stem("extra", "Heat (1995)-trailer", &[], true)]
+    #[case::no_name("extra", "", &[], true)]
+    #[case::own_title("extra", "Heat (Part Two)", &[], false)]
+    #[case::other_case("extra", "trailer 2", &[], false)]
+    #[case::name_locked("extra", "Trailer 2", &[ferrofin_model::entities::MetadataField::Name], false)]
+    #[case::other_lock("extra", "Trailer 2", &[ferrofin_model::entities::MetadataField::Overview], true)]
+    #[case::part("part", "Trailer 2", &[], false)]
+    #[case::alternate("alternate", "Trailer 2", &[], false)]
+    fn only_an_extra_with_a_generated_name_takes_the_planners_name(
         #[case] shape: &str,
+        #[case] stored_name: &str,
         #[case] locked_fields: &[ferrofin_model::entities::MetadataField],
         #[case] renamed: bool,
     ) {
-        let planned = owned_row(shape);
+        let planned = super::Planned {
+            id: uuid::Uuid::nil(),
+            entity: BaseItemEntity {
+                name: Some("Trailer".into()),
+                ..owned_row(shape)
+            },
+            ancestors: Vec::new(),
+            generated_names: if shape == "extra" {
+                ["Trailer", "Trailer 2", "Heat", "Heat (1995)-trailer"]
+                    .map(str::to_owned)
+                    .to_vec()
+            } else {
+                Vec::new()
+            },
+        };
         let stored = BaseItemEntity {
-            name: Some("Heat (Part Two)".into()),
-            sort_name: Some("heat (part two)".into()),
+            name: Some(stored_name.into()).filter(|name: &String| !name.is_empty()),
+            sort_name: Some(stored_name.to_lowercase()),
             ..owned_row(shape)
         };
+        let base = super::renamed_extra(&stored, &planned, locked_fields);
+        assert_eq!(base.is_some(), renamed, "{shape}, {stored_name:?}");
+        let base = base.unwrap_or_else(|| stored.clone());
         let noop = |_: &mut BaseItemEntity, _: &super::ResolverGuesses| {};
         for locked in [false, true] {
-            let mut saved =
-                save_with_locks(Some(&stored), &planned, noop, locked, locked_fields, false);
-            super::settle_extra_name(&mut saved, &planned, locked_fields);
-            let (name, sort_name) = if renamed {
-                ("Heat cd2", "heat cd0000000002")
-            } else {
-                ("Heat (Part Two)", "heat (part two)")
-            };
+            let saved = save_with_locks(
+                Some(&base),
+                &planned.entity,
+                noop,
+                locked,
+                locked_fields,
+                false,
+            );
+            let name = if renamed { "Trailer" } else { stored_name };
             assert_eq!(
-                saved.name.as_deref(),
-                Some(name),
+                saved.name.as_deref().unwrap_or_default(),
+                name,
                 "{shape}, locked {locked}"
             );
-            assert_eq!(saved.sort_name.as_deref(), Some(sort_name));
+            if renamed {
+                assert_eq!(saved.sort_name.as_deref(), Some("trailer"));
+            }
         }
     }
 
@@ -29721,6 +29988,7 @@ mod tests {
                 ..BaseItemEntity::default()
             },
             ancestors: Vec::new(),
+            generated_names: Vec::new(),
         };
         assert!(
             scope.covers(&at(0xA, "/music/Artist A")),
@@ -29762,6 +30030,7 @@ mod tests {
                 ..BaseItemEntity::default()
             },
             ancestors: Vec::new(),
+            generated_names: Vec::new(),
         };
         let planned = [
             row(1, "Twins.mkv", None, "primary"),
@@ -29833,6 +30102,7 @@ mod tests {
                 ..BaseItemEntity::default()
             },
             ancestors: Vec::new(),
+            generated_names: Vec::new(),
         };
         assert!(
             refresh
@@ -34561,6 +34831,7 @@ mod tests {
                     ..Default::default()
                 },
                 ancestors: Vec::new(),
+                generated_names: Vec::new(),
             }]
         };
         let probe = Arc::new(GatedProbe {
@@ -34603,6 +34874,7 @@ mod tests {
                 ..Default::default()
             },
             ancestors: Vec::new(),
+            generated_names: Vec::new(),
         };
         let planned = vec![track(1), track(2)];
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeProbe);
@@ -38003,7 +38275,9 @@ mod tests {
             .map(|i| i.name.as_deref().unwrap_or(""))
             .collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["Heat (1995)-trailer", "alt"]);
+        // `FindExtras` names the one named after its owner by its type; the
+        // one in `trailers/` keeps its file's name.
+        assert_eq!(names, vec!["Trailer", "alt"]);
 
         // A non-trailer, non-theme extra keeps the `Video` kind
         // (`_videoResolvers`).
@@ -38623,6 +38897,7 @@ mod tests {
             id,
             entity: row(id, kind, true, None),
             ancestors: Vec::new(),
+            generated_names: Vec::new(),
         };
         let plan = vec![
             planned(album, BaseItemKind::MusicAlbum),
