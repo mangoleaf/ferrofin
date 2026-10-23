@@ -100,6 +100,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 - Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
   `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
   file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
