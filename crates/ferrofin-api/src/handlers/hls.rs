@@ -332,23 +332,33 @@ struct HlsRequestContext {
     /// it: `false` on the master routes, `true` on `live.m3u8` (upstream's
     /// per-DTO defaults).
     subtitles_in_manifest_default: bool,
+    /// The request's `User-Agent` header (`StreamState.UserAgent`).
+    user_agent: Option<String>,
 }
 
 impl HlsRequestContext {
-    /// Reads the token and the client's locality off the request parts.
+    /// Reads the token, the client's locality and its user agent off the
+    /// request parts.
     fn from_parts(
         state: &AppState,
         auth: &ferrofin_traits::options::AuthorizationInfo,
         parts: &axum::http::request::Parts,
         subtitles_in_manifest_default: bool,
     ) -> Self {
-        Self::from_extensions(
-            state,
-            auth,
-            &parts.extensions,
-            &parts.headers,
-            subtitles_in_manifest_default,
-        )
+        Self {
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            ..Self::from_extensions(
+                state,
+                auth,
+                &parts.extensions,
+                &parts.headers,
+                subtitles_in_manifest_default,
+            )
+        }
     }
 
     /// Reads the token and the client's locality off the request extensions
@@ -375,6 +385,7 @@ impl HlsRequestContext {
                     state.is_in_local_network(client)
                 }),
             subtitles_in_manifest_default,
+            user_agent: None,
         }
     }
 }
@@ -408,6 +419,7 @@ fn build_request(
         output_container: query.container,
         context: query.context,
         segment_length: query.segment_length,
+        user_agent: ctx.user_agent,
         current_runtime_ticks: query.runtime_ticks,
         actual_segment_length_ticks: query.actual_segment_length_ticks,
         audio_codec: query.audio_codec,
@@ -1254,8 +1266,13 @@ mod tests {
             playback_permissions: None,
             is_in_local_network: true,
             subtitles_in_manifest_default: false,
+            user_agent: Some("AppleCoreMedia/1.0 (iPhone)".to_owned()),
         };
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
+        assert_eq!(
+            req.user_agent.as_deref(),
+            Some("AppleCoreMedia/1.0 (iPhone)")
+        );
         assert_eq!(req.profile.as_deref(), Some("high"));
         assert_eq!(req.level.as_deref(), Some("41"));
         assert_eq!(req.framerate, Some(30.0));
@@ -1282,6 +1299,7 @@ mod tests {
             playback_permissions: None,
             is_in_local_network: false,
             subtitles_in_manifest_default: true,
+            user_agent: None,
         };
         let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
         assert!(req.enable_subtitles_in_manifest);
