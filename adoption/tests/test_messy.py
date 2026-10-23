@@ -3,6 +3,7 @@ comparison against Jellyfin 12.2's record and the written divergences (no docker
 
 import contextlib
 from contextlib import closing
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -237,6 +238,55 @@ class Comparison(unittest.TestCase):
                 (fixture / "messy-oracle.json").write_text(json.dumps(self.oracle(
                     duplicate_paths=self.booted("duplicate_paths", {"original": True, "duplicate": False}))))
                 self.assertEqual(len(messy.check(db, fixture)), 1)
+
+    def test_shape_results_give_each_shapes_end_state_expectation_source_and_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            db = fixture / "jellyfin.db"
+            with closing(sqlite3.connect(db)) as conn:
+                conn.executescript(SCHEMA)
+            entry = {"lineage": "test", "shapes": {"duplicate_paths": {"path": "/p", "original": "a" * 32, "duplicate": "b" * 32}}}
+            (fixture / "messy.json").write_text(json.dumps(entry))
+            for kept, verdict in ((False, "PASS"), (True, "FAIL")):
+                (fixture / "messy-oracle.json").write_text(json.dumps(self.oracle(
+                    duplicate_paths=self.booted("duplicate_paths", {"original": kept, "duplicate": False}))))
+                with mock.patch.object(messy, "SHAPES", ("duplicate_paths",)):
+                    results, failures = messy.shape_results(db, fixture)
+                self.assertEqual(results, [{"shape": "duplicate_paths", "got": {"original": False, "duplicate": False},
+                                            "want": {"original": kept, "duplicate": False}, "source": "Jellyfin 12.2", "verdict": verdict}])
+                self.assertEqual(len(failures), 0 if verdict == "PASS" else 1)   # the same judgement as check
+                with mock.patch.object(messy, "SHAPES", ("duplicate_paths",)):
+                    self.assertEqual(messy.check(db, fixture), failures)
+
+    def test_a_shape_jellyfin_refused_is_a_failed_shape_in_the_results_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            db = fixture / "jellyfin.db"
+            with closing(sqlite3.connect(db)) as conn:
+                conn.executescript(SCHEMA)
+            entry = {"lineage": "test", "shapes": {"duplicate_paths": {"path": "/p", "original": "a" * 32, "duplicate": "b" * 32}}}
+            (fixture / "messy.json").write_text(json.dumps(entry))
+            (fixture / "messy-oracle.json").write_text(json.dumps(self.oracle(
+                duplicate_paths={"outcome": "refused", "reason": "constraint", "state": {}})))
+            with mock.patch.object(messy, "SHAPES", ("duplicate_paths",)):
+                (result,), _ = messy.shape_results(db, fixture)
+            self.assertEqual((result["verdict"], result["want"]), ("FAIL", None))
+            self.assertIn("refused", result["source"])
+
+    def test_the_shapes_command_prints_the_results_as_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            db = fixture / "jellyfin.db"
+            with closing(sqlite3.connect(db)) as conn:
+                conn.executescript(SCHEMA)
+            entry = {"lineage": "test", "shapes": {"duplicate_paths": {"path": "/p", "original": "a" * 32, "duplicate": "b" * 32}}}
+            (fixture / "messy.json").write_text(json.dumps(entry))
+            (fixture / "messy-oracle.json").write_text(json.dumps(self.oracle(
+                duplicate_paths=self.booted("duplicate_paths", {"original": False, "duplicate": False}))))
+            out = io.StringIO()
+            with mock.patch.object(messy, "SHAPES", ("duplicate_paths",)), contextlib.redirect_stdout(out):
+                self.assertEqual(messy.main(["shapes", str(db), str(fixture)]), 0)
+            self.assertEqual(json.loads(out.getvalue())[0]["verdict"], "PASS")
 
     def test_a_fixture_built_with_other_shapes_is_refused_rather_than_partly_checked(self):
         with tempfile.TemporaryDirectory() as directory:

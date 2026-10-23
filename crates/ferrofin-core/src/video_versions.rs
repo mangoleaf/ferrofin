@@ -638,29 +638,111 @@ pub fn put_resumed_version_first<'a>(
     if sources.len() < 2 || queried.primary_version_id.is_some() {
         return;
     }
-    let mut winner: Option<(usize, chrono::DateTime<chrono::Utc>)> = None;
-    for (index, source) in sources.iter().enumerate() {
-        let Some(user_data) = source
-            .id
-            .as_deref()
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .and_then(&user_data_of)
-        else {
+    let winner = select_most_recently_played(
+        0..sources.len(),
+        |index| {
+            sources[*index]
+                .id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(&user_data_of)
+        },
+        |user_data| user_data.playback_position_ticks > 0,
+    );
+    if let Some(index) = winner {
+        sources[..=index].rotate_right(1);
+    }
+}
+
+/// The candidate whose user data was played last, among those `is_eligible`
+/// accepts; the first one on an exact tie, and `None` when none qualifies —
+/// `VersionPlaybackSelector.SelectMostRecentlyPlayed`
+/// (`VersionPlaybackSelector.cs:27-57`), the one definition the resume tile,
+/// the media-source order and Next Up share, each with its own eligibility.
+pub fn select_most_recently_played<'a, T>(
+    items: impl IntoIterator<Item = T>,
+    user_data_of: impl Fn(&T) -> Option<&'a ferrofin_model::dto::UserItemDataDto>,
+    is_eligible: impl Fn(&ferrofin_model::dto::UserItemDataDto) -> bool,
+) -> Option<T> {
+    let mut winner: Option<(T, chrono::DateTime<chrono::Utc>)> = None;
+    for item in items {
+        let Some(user_data) = user_data_of(&item).filter(|data| is_eligible(data)) else {
             continue;
         };
-        if user_data.playback_position_ticks <= 0 {
-            continue;
-        }
         let date = user_data
             .last_played_date
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-        if winner.is_none_or(|(_, best)| date > best) {
-            winner = Some((index, date));
+        if winner.as_ref().is_none_or(|(_, best)| date > *best) {
+            winner = Some((item, date));
         }
     }
-    if let Some((index, _)) = winner {
-        sources[..=index].rotate_right(1);
+    winner.map(|(item, _)| item)
+}
+
+/// The user data of the most recently played version of a multi-version
+/// video, which drives the video's completion state — `VersionResumeData`
+/// (`VersionResumeData.cs`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionResumeData {
+    /// The version that owns [`Self::user_data`].
+    pub version_id: Uuid,
+    /// That version's user data.
+    pub user_data: ferrofin_model::dto::UserItemDataDto,
+}
+
+impl VersionResumeData {
+    /// Folds the version's completion into `dto`, a video's own user data
+    /// (`VersionResumeData.ApplyTo`): played on any version is played on the
+    /// video, the later `LastPlayedDate` wins, and when a *different* version
+    /// was finished (played, no resume point of its own) the video's own stale
+    /// resume position is cleared. An in-progress resume position stays on
+    /// the version that owns it, which leads the video's sources
+    /// ([`put_resumed_version_first`]).
+    pub fn apply_to(&self, dto: &mut ferrofin_model::dto::UserItemDataDto) {
+        let version = &self.user_data;
+        dto.played = dto.played || version.played;
+        let never = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        if version.last_played_date.unwrap_or(never) > dto.last_played_date.unwrap_or(never) {
+            dto.last_played_date = version.last_played_date;
+        }
+        if self.version_id != dto.item_id && version.played && version.playback_position_ticks <= 0
+        {
+            dto.playback_position_ticks = 0;
+            dto.played_percentage = None;
+        }
     }
+}
+
+/// The version of `queried` that drives its completion, with its user data —
+/// one item of `UserDataManager.GetResumeUserDataBatch`
+/// (`UserDataManager.cs:269-357`). Only a video that is no version itself and
+/// has at least one other version has one; the winner is the version played
+/// last among those part-way through or finished
+/// ([`select_most_recently_played`]), over the group `versions` read for it.
+pub fn resume_user_data<'a>(
+    versions: &VersionRows,
+    queried: &BaseItemEntity,
+    user_data_of: impl Fn(Uuid) -> Option<&'a ferrofin_model::dto::UserItemDataDto>,
+) -> Option<VersionResumeData> {
+    if queried.primary_version_id.is_some()
+        || !crate::item_type_lookup::kind_from_type_name(&queried.type_)
+            .is_some_and(crate::kinds::is_video)
+    {
+        return None;
+    }
+    let group = versions.all_version_ids(queried);
+    if group.len() < 2 {
+        return None;
+    }
+    let version_id = select_most_recently_played(
+        group,
+        |id| user_data_of(*id),
+        |data| data.playback_position_ticks > 0 || data.played,
+    )?;
+    Some(VersionResumeData {
+        version_id,
+        user_data: user_data_of(version_id)?.clone(),
+    })
 }
 
 /// Orders the sources `BaseItem.GetMediaSources` returns (`BaseItem.cs:
@@ -856,6 +938,26 @@ fn disc_terms(format: crate::item_data::VideoFormat) -> Vec<&'static str> {
         _ => {}
     }
     terms
+}
+
+/// The index of the item a merge makes primary when none of `items` already
+/// has versions: 3D and disc (not `VideoType::VideoFile`) videos after plain
+/// files, then the widest, the first of equals — the fallback of
+/// `VideosController.MergeVersions` (`VideosController.cs:204-217`) and of
+/// the MergeVersions plugin. The item's `Width` column stands in for its
+/// default video stream's width. `0` for an empty slice.
+#[must_use]
+pub fn preferred_primary_version(items: &[BaseItemEntity]) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, item)| {
+            let format = crate::item_data::video_format(item.data.as_deref());
+            let demoted = format.video3d_format.is_some()
+                || format.video_type != ferrofin_model::entities::VideoType::VideoFile;
+            (demoted, std::cmp::Reverse(item.width.unwrap_or(0)))
+        })
+        .map_or(0, |(index, _)| index)
 }
 
 /// The prefix the media source items' file names share, or `None` when
