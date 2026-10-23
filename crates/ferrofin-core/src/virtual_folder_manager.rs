@@ -860,6 +860,55 @@ impl FerrofinVirtualFolderManager {
         ServiceError::backend(format!("{context}: {err}"))
     }
 
+    /// Whether `root` lists `current`'s and `target`'s names as two entries:
+    /// a case-only rename onto another library on a case-sensitive filesystem.
+    /// A case-insensitive one lists one entry for both spellings, so a true
+    /// case-only rename there is never taken for a conflict.
+    async fn lists_both(root: &Path, current: &Path, target: &Path) -> Result<bool, ServiceError> {
+        let (Some(current), Some(target)) = (current.file_name(), target.file_name()) else {
+            return Ok(false);
+        };
+        if current == target {
+            return Ok(false);
+        }
+        let mut entries = tokio::fs::read_dir(root)
+            .await
+            .map_err(|e| Self::io_err("list libraries", &e))?;
+        let (mut has_current, mut has_target) = (false, false);
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Self::io_err("list libraries", &e))?
+        {
+            let name = entry.file_name();
+            has_current |= name == current;
+            has_target |= name == target;
+        }
+        Ok(has_current && has_target)
+    }
+
+    /// Moves `current` to `target` through `temp`, so a case-insensitive
+    /// filesystem does not treat a case-only rename as a no-op (C# path). When
+    /// the second move fails, the folder is moved back to `current` rather
+    /// than left under the temporary name.
+    async fn case_hop(current: &Path, temp: &Path, target: &Path) -> Result<(), ServiceError> {
+        tokio::fs::rename(current, temp)
+            .await
+            .map_err(|e| Self::io_err("rename (case hop)", &e))?;
+        if let Err(err) = tokio::fs::rename(temp, target).await {
+            if let Err(back) = tokio::fs::rename(temp, current).await {
+                tracing::error!(
+                    error = %back,
+                    path = %temp.display(),
+                    library = %current.file_name().unwrap_or_default().to_string_lossy(),
+                    "a library folder could not be moved back after a failed rename"
+                );
+            }
+            return Err(Self::io_err("rename (case hop 2)", &err));
+        }
+        Ok(())
+    }
+
     /// Reads the [`LibraryOptions`] stored in a folder's `options.json`, or the
     /// default when the file is absent or unreadable (matching C#
     /// `LoadLibraryOptions`, which falls back to `new LibraryOptions()`).
@@ -1421,7 +1470,15 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             .to_string_lossy()
             .eq_ignore_ascii_case(&target.to_string_lossy());
 
-        if !same_case_insensitive && tokio::fs::try_exists(&target).await.unwrap_or(false) {
+        // Upstream skips the check for a case-only rename. On a case-sensitive
+        // filesystem the target's spelling can be another library, which its
+        // second hop then fails on, the folder left under the temporary name.
+        let taken = if same_case_insensitive {
+            Self::lists_both(&self.root, &current, &target).await?
+        } else {
+            tokio::fs::try_exists(&target).await.unwrap_or(false)
+        };
+        if taken {
             return Err(ServiceError::conflict(format!(
                 "the media library already exists at {}.",
                 target.display()
@@ -1441,12 +1498,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // case-insensitive filesystem does not treat it as a no-op (C# path).
         if same_case_insensitive {
             let temp = self.root.join(uuid::Uuid::new_v4().simple().to_string());
-            tokio::fs::rename(&current, &temp)
-                .await
-                .map_err(|e| Self::io_err("rename (case hop)", &e))?;
-            tokio::fs::rename(&temp, &target)
-                .await
-                .map_err(|e| Self::io_err("rename (case hop 2)", &e))?;
+            Self::case_hop(&current, &temp, &target).await?;
         } else {
             tokio::fs::rename(&current, &target)
                 .await
@@ -2903,6 +2955,66 @@ mod tests {
             .filter_map(|f| f.name)
             .collect();
         assert_eq!(names, vec!["Lib".to_owned()]);
+    }
+
+    /// On a case-sensitive filesystem `lib` and `Lib` can be two libraries. A
+    /// rename of one onto the other's exact spelling is a conflict like any
+    /// other: both stay as they were, and nothing is left under a temporary
+    /// name. (Upstream takes its case-only hop there and fails half-way.)
+    #[tokio::test]
+    async fn a_case_only_rename_onto_another_librarys_spelling_is_a_conflict() {
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "m");
+        let opts = opts_with_paths(&[media]);
+        mgr.add_virtual_folder("lib", None, &opts).await.unwrap();
+        if mgr.add_virtual_folder("Lib", None, &opts).await.is_err() {
+            // Needs a case-sensitive filesystem: a case-insensitive one holds
+            // one library for both names, which `rename_case_only_succeeds`
+            // covers.
+            return;
+        }
+        let entries = || {
+            let mut names: Vec<String> = std::fs::read_dir(&mgr.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(entries(), ["Lib", "lib"]);
+
+        let err = mgr.rename_virtual_folder("lib", "Lib").await.unwrap_err();
+        assert!(matches!(err, ServiceError::Conflict(_)), "{err:?}");
+        assert_eq!(entries(), ["Lib", "lib"], "both libraries where they were");
+        let names: Vec<_> = mgr
+            .get_virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|f| f.name)
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    /// A case hop whose second move fails moves the folder back from its
+    /// temporary name instead of stranding it there.
+    #[tokio::test]
+    async fn a_failed_case_hop_moves_the_folder_back() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("lib");
+        let hop = root.path().join("hop");
+        let target = root.path().join("other");
+        for folder in [&current, &target] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join(OPTIONS_FILE), b"x").unwrap();
+        }
+        let err = FerrofinVirtualFolderManager::case_hop(&current, &hop, &target)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "{err:?}");
+        assert!(current.join(OPTIONS_FILE).is_file(), "moved back");
+        assert!(!hop.exists());
+        assert!(target.join(OPTIONS_FILE).is_file(), "the target untouched");
     }
 
     #[tokio::test]
