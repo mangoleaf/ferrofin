@@ -2546,6 +2546,16 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_image_infos(item_id).await
     }
 
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ferrofin_traits::options::ItemImageInfo>, bool), ServiceError> {
+        if item_id.is_nil() {
+            return Ok((Vec::new(), false));
+        }
+        self.items.get_image_infos_with_auto_orient(item_id).await
+    }
+
     async fn get_chapter_image(
         &self,
         item_id: Uuid,
@@ -3134,6 +3144,23 @@ impl LibraryManager for FerrofinLibraryManager {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        // `if (!item.SupportsPeople) return;`
+        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+            .is_some_and(crate::kinds::supports_people)
+        {
+            return Ok(());
+        }
+        let Ok(item_id) = Uuid::parse_str(&item.id) else {
+            return Ok(());
+        };
+        self.people.update_people(item_id, people).await.map(|_| ())
     }
 
     async fn get_people(

@@ -2953,6 +2953,8 @@ struct PlanCtx<'a> {
     /// the walk's own [`LibraryScanner::list`] of the folder takes one
     /// instead of listing it again.
     prelisted: std::cell::RefCell<HashMap<String, Vec<FileSystemEntryInfo>>>,
+    /// The pass's `.ignore` lookups, cached for its length.
+    dot_ignore: std::cell::RefCell<crate::dot_ignore::DotIgnoreRule>,
     /// Each resolved primary's local alternate version paths
     /// ([`PlanOutput::local_versions`]).
     local_versions: std::cell::RefCell<Vec<(Uuid, Vec<String>)>>,
@@ -3011,6 +3013,7 @@ impl<'a> PlanCtx<'a> {
             owner_paths: std::cell::RefCell::new(HashMap::new()),
             rip_folds: std::cell::RefCell::new(Vec::new()),
             prelisted: std::cell::RefCell::new(HashMap::new()),
+            dot_ignore: std::cell::RefCell::default(),
             local_versions: std::cell::RefCell::new(Vec::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             episode_folders: std::cell::RefCell::new(HashMap::new()),
@@ -3227,9 +3230,30 @@ impl PlanCtx<'_> {
     }
 }
 
+/// The dead by-name sweep's genre and studio selections: the unlocked
+/// `Genre`/`MusicGenre` rows `IsDeadGenre` names
+/// (`GenresValidator.cs:107-112`) and the unlocked `Studio` rows
+/// `IsDeadStudio` names (`StudiosValidator.cs:108-113`).
+pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
+    [
+        InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Genre, BaseItemKind::MusicGenre],
+            is_dead_genre: Some(true),
+            is_locked: Some(false),
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Studio],
+            is_dead_studio: Some(true),
+            is_locked: Some(false),
+            ..InternalItemsQuery::default()
+        },
+    ]
+}
+
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 10;
+const POST_SCAN_PASSES: u32 = 11;
 
 /// How long each closing pass of one library validation took, logged once
 /// at its end and recorded on `ferrofin_library_scan_pass_duration_seconds`.
@@ -3239,6 +3263,7 @@ struct PassTimings {
     album_covers: std::time::Duration,
     years: std::time::Duration,
     artists: std::time::Duration,
+    dead_by_name: std::time::Duration,
     aggregates: std::time::Duration,
     by_name_paths: std::time::Duration,
     studios: std::time::Duration,
@@ -3256,6 +3281,7 @@ impl PassTimings {
             album_covers,
             years,
             artists,
+            dead_by_name,
             aggregates,
             by_name_paths,
             studios,
@@ -3268,6 +3294,7 @@ impl PassTimings {
             (album_covers, self.album_covers),
             (years, self.years),
             (artists, self.artists),
+            (dead_by_name, self.dead_by_name),
             (aggregates, self.aggregates),
             (by_name_paths, self.by_name_paths),
             (studios, self.studios),
@@ -3282,6 +3309,7 @@ impl PassTimings {
             album_covers_ms = ms(self.album_covers),
             years_ms = ms(self.years),
             artists_ms = ms(self.artists),
+            dead_by_name_ms = ms(self.dead_by_name),
             aggregates_ms = ms(self.aggregates),
             by_name_paths_ms = ms(self.by_name_paths),
             studios_ms = ms(self.studios),
@@ -6908,13 +6936,25 @@ impl LibraryScanner {
         if nfo_locked {
             entity.is_locked = true;
         }
-        // Sidecar ids first, then any this row already carries: both are
-        // `info.GetProviderId`, which the fetchers resolve by before they
-        // ever search by title.
+        // A new item's resolver read the ids its name carries
+        // (`SetProviderIdsFromPath`): the item's own before any provider
+        // runs.
+        let resolved_ids = if matches!(stored, Stored::New) {
+            crate::resolvers::path_provider_ids(&item.entity)
+        } else {
+            Vec::new()
+        };
+        // Sidecar ids first, then any this row already carries, then a new
+        // item's own: all are `info.GetProviderId`, which the fetchers
+        // resolve by before they ever search by title. (A scan's pass
+        // replaces ids, so the sidecar's lead the settled set too.)
         let known_ids = match search {
             Some(_) if series_child => Vec::new(),
             Some(result) => search_result_ids(result),
-            None => known_provider_ids(&nfo_ids, state.art_cache, &entity.id),
+            None => merge_provider_ids(
+                known_provider_ids(&nfo_ids, state.art_cache, &entity.id),
+                resolved_ids.clone(),
+            ),
         };
         // The identified item itself — the one at the refresh's own path —
         // takes the chosen ids as its own (the controller's
@@ -7233,6 +7273,7 @@ impl LibraryScanner {
         let mut settled_ids = settle_provider_ids(
             state.art_cache,
             &entity.id,
+            &resolved_ids,
             replaced_ids,
             filled_ids,
             &tag_provider_ids,
@@ -8176,6 +8217,7 @@ impl LibraryScanner {
     /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
     /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
+    /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
@@ -8243,6 +8285,16 @@ impl LibraryScanner {
             tracing::warn!(%err, "by-name artist pass failed");
         }
         timings.artists = started.elapsed();
+        if !self.between_passes(run, &mut done).await {
+            return false;
+        }
+        // The validators' closing sweep: the by-name rows nothing in the
+        // library names any more.
+        let started = std::time::Instant::now();
+        if let Err(err) = self.delete_dead_by_name_items().await {
+            tracing::warn!(%err, "dead by-name sweep failed");
+        }
+        timings.dead_by_name = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -8389,6 +8441,43 @@ impl LibraryScanner {
             "retiring by-name MusicArtist rows superseded by resolved artist folders"
         );
         self.persistence.delete_items(&stale).await.map(|_| ())
+    }
+
+    /// The by-name validators' closing sweep: deletes the unlocked `Genre`,
+    /// `MusicGenre` and `Studio` rows whose name no item value carries any
+    /// more (`GenresValidator.cs:107-119` and `StudiosValidator.cs:108-120`,
+    /// over `IsDeadGenre`/`IsDeadStudio`), and the by-name `MusicArtist` rows
+    /// no item credits (`ArtistsValidator.cs:130-143`). Each goes through the
+    /// deletion path, so its user data follows the retention rules. A failed
+    /// read deletes nothing.
+    ///
+    /// A genre or studio reads dead once no `ItemValues` row carries its name,
+    /// and those rows go only with a deletion (as upstream's do), so a name a
+    /// retag alone dropped is swept after the next deletion. A save landing
+    /// between the selection and the delete loses the by-name row until its
+    /// next save or scan recreates it.
+    async fn delete_dead_by_name_items(&self) -> Result<(), ServiceError> {
+        let artists = self.persistence.dead_by_name_artists().await?;
+        let [genre_query, studio_query] = dead_by_name_queries();
+        let (genres, studios) = match &self.item_repository {
+            Some(items) => (
+                items.get_item_ids(&genre_query).await?,
+                items.get_item_ids(&studio_query).await?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        if artists.is_empty() && genres.is_empty() && studios.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            genres = genres.len(),
+            studios = studios.len(),
+            artists = artists.len(),
+            "deleting by-name rows nothing in the library names any more"
+        );
+        let dead: Vec<Uuid> = genres.into_iter().chain(studios).chain(artists).collect();
+        tracing::debug!(ids = ?dead, "dead by-name rows");
+        self.persistence.delete_items(&dead).await.map(|_| ())
     }
 
     /// The dynamic image providers over this scanner's stores, when it has all
@@ -13181,18 +13270,17 @@ impl LibraryScanner {
                         .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
                         .count(),
                 );
-                // TODO(parity): only `IgnorePatterns` filters here; upstream's
-                // `DotIgnoreIgnoreRule` (`.ignore` files) has no port yet. It
-                // filters the resolver chain (`IgnoreFile`), `FindExtras`
-                // (`LibraryManager.cs:3445`) and the library monitor
-                // (`LibraryMonitor.cs:388`). Un-defer path: port the rule
-                // (gitignore matching per directory, cached by mtime), apply
-                // it here, in `plan_folder_extras`, and in
-                // `FerrofinLibraryMonitor::report_change`.
+                // `LibraryManager.IgnoreFile`: the `IgnorePatterns` table and
+                // `DotIgnoreIgnoreRule` (`.ignore` files). Every listing of the
+                // walk comes through here, `FindExtras`' own filter included.
+                let mut dot_ignore = ctx.dot_ignore.borrow_mut();
                 entries
                     .into_iter()
                     .filter(|entry| {
-                        if crate::resolvers::should_ignore_path(&entry.path) {
+                        let is_dir = entry.type_ == FileSystemEntryType::Directory;
+                        if crate::resolvers::should_ignore_path(&entry.path)
+                            || dot_ignore.should_ignore(&entry.path, is_dir)
+                        {
                             ctx.excluded.borrow_mut().push(entry.path.clone());
                             false
                         } else {
@@ -13458,6 +13546,9 @@ impl LibraryScanner {
                 if is_extras_dir(entry, ctx.naming) {
                     consumed.insert(entry.path.clone());
                     ctx.excluded.borrow_mut().push(entry.path.clone());
+                    // `list` applies the ignore rules here too; upstream's
+                    // `GetFiles` of an extras folder applies none (gl-755,
+                    // awaiting the owner: Jellyfin bug or behaviour to port).
                     let files: Vec<_> = self
                         .list(&entry.path, ctx)
                         .into_iter()
@@ -20142,7 +20233,8 @@ struct IdSettle {
 }
 
 /// The item's provider ids after this pass, from the ids the scan pre-read
-/// for it:
+/// for it — or, for an item with none recorded, the ids its resolver read
+/// from its name (`resolved`, the new item's own):
 ///
 /// 1. the probe's tag ids first — `AudioFileProber`, a pre-refresh custom
 ///    provider, sets each MusicBrainz id only when the item has none of that
@@ -20164,13 +20256,14 @@ struct IdSettle {
 fn settle_provider_ids(
     art_cache: &mut ArtworkCache,
     entity_id: &str,
+    resolved: &[(String, String)],
     pass_ids: &[(String, String)],
     fill_ids: &[(String, String)],
     tag_ids: &[(String, String)],
     rule: IdSettle,
 ) -> SettledProviderIds {
     let stored = art_cache.item_provider_ids.get(entity_id);
-    let mut ids: Vec<(String, String)> = stored.cloned().unwrap_or_default();
+    let mut ids: Vec<(String, String)> = stored.cloned().unwrap_or_else(|| resolved.to_vec());
     for (key, value) in tag_ids {
         let has = ids
             .iter()
@@ -29431,6 +29524,7 @@ mod tests {
         let settled = super::settle_provider_ids(
             &mut cache,
             "ID",
+            &[],
             &pairs(pass),
             &[],
             &pairs(tags),
@@ -29464,6 +29558,7 @@ mod tests {
             super::settle_provider_ids(
                 cache,
                 "ID",
+                &[],
                 pass,
                 &[],
                 &[],
