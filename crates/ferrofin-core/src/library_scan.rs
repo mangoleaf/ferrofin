@@ -15790,9 +15790,10 @@ impl LibraryScanner {
     }
 
     /// One subfolder of a series: a season, planned with its episodes, or a
-    /// folder whose videos are collected into `loose` as loose episodes
-    /// (grouped into virtual seasons by [`Self::plan_loose_episodes`]), the
-    /// extras such an episode owns into `owned_extras`, for after them.
+    /// folder `SeasonResolver` declines, whose videos are collected into
+    /// `loose` as loose episodes (grouped into virtual seasons by
+    /// [`Self::plan_loose_episodes`]), the extras such an episode owns into
+    /// `owned_extras`, for after them.
     #[allow(clippy::too_many_arguments)]
     fn plan_series_subfolder(
         &self,
@@ -15805,11 +15806,18 @@ impl LibraryScanner {
         (loose, owned_extras): (&mut Vec<String>, &mut Vec<Planned>),
     ) {
         let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
-        if !(season.season_number.is_some() || season.is_season_folder) {
+        // `SeasonResolver`: every folder under a series is a season, numbered
+        // or not (an unnumbered one is named after its folder), unless it is
+        // not a numbered season folder and its name reads as an episode (a
+        // season and an episode number) or no video lies anywhere below it.
+        let declined = (season.season_number.is_none() || !season.is_season_folder)
+            && (folder_names_an_episode(&entry.name, ctx.naming)
+                || !self.holds_any_video(&entry.path, ctx));
+        if declined {
             // `SeasonResolver` takes no such folder, so `PlaylistResolver`
-            // (priority First) may. A season folder stays a season: both
-            // resolvers have priority First, and a `[playlist]` season is
-            // too rare to bet on their registration order.
+            // (priority First) may. A season stays a season: both resolvers
+            // have priority First, and a `[playlist]` season is too rare to
+            // bet on their registration order.
             let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
             let home = (series_id, vec![cf, series_id]);
             if self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
@@ -15865,6 +15873,22 @@ impl LibraryScanner {
             ctx,
             out,
         );
+    }
+
+    /// Whether any video file lies anywhere below `dir`, whatever the plan's
+    /// scope: `SeasonResolver`'s `Directory.EnumerateFiles(path, "*",
+    /// SearchOption.AllDirectories)` test, stopping at the first video. It
+    /// reads the walk's own listings, so ignored paths (dot-files, `@eaDir`)
+    /// count for nothing, as they do everywhere else in the walk; upstream's
+    /// raw enumeration counts a video hidden under one.
+    fn holds_any_video(&self, dir: &str, ctx: &PlanCtx<'_>) -> bool {
+        self.list(dir, ctx).into_iter().any(|entry| {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.holds_any_video(&entry.path, ctx)
+            } else {
+                video_resolver::is_video_file(&entry.path, ctx.naming)
+            }
+        })
     }
 
     /// Collects every video file under `dir` (recursively) into `out_paths` —
@@ -18627,6 +18651,16 @@ fn group_files(video: &ferrofin_naming::video::VideoInfo) -> impl Iterator<Item 
         .chain(&video.alternate_versions)
         .flat_map(|version| &version.files)
         .map(|file| file.path.as_str())
+}
+
+/// `SeasonResolver`'s first test for a series subfolder that is not a
+/// numbered season folder: whether its name, resolved as a directory, carries
+/// both a season and an episode number (`EpisodeResolver.Resolve(@"\\test\" +
+/// folderName, true)`). Such a folder is no season.
+fn folder_names_an_episode(folder_name: &str, naming: &NamingOptions) -> bool {
+    EpisodeResolver::new(naming)
+        .resolve_simple(&format!(r"\\test\{folder_name}"), true)
+        .is_some_and(|info| info.season_number.is_some() && info.episode_number.is_some())
 }
 
 /// Whether the TV walk plans the episode file at `path`: the scope keeps it
