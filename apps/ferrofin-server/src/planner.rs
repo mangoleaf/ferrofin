@@ -5085,7 +5085,7 @@ mod tests {
         req.segment_container = Some("ts".to_owned());
         req.video_codec = Some("hevc".to_owned());
         let plan = p
-            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .plan(&at_segment(req, 2), false, Some(2), PlaylistKind::Vod)
             .await
             .unwrap();
         assert!(
@@ -5103,11 +5103,18 @@ mod tests {
         req.segment_container = Some("mp4".to_owned());
         req.video_codec = Some("hevc".to_owned());
         let plan = p
-            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .plan(&at_segment(req, 2), false, Some(2), PlaylistKind::Vod)
             .await
             .unwrap();
         assert!(
             plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        // It still seeks, half a second past the segment start as any HLS
+        // remux does.
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "65000000"]),
             "{:?}",
             plan.arguments
         );
