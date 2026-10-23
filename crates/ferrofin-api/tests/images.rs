@@ -278,6 +278,8 @@ struct StubLibrary {
     /// (`get_item_by_id` or `item_exists`). The served path must make none: the
     /// image row it found already proves the item exists.
     item_reads: Mutex<usize>,
+    /// Whether [`ITEM_ID`] is a photo whose images are auto-oriented.
+    photo: bool,
 }
 
 impl StubLibrary {
@@ -318,6 +320,16 @@ impl LibraryManager for StubLibrary {
         // about *any* item read on the hot path, not about which one.
         *self.item_reads.lock().expect("lock") += 1;
         Ok(id == ITEM_ID || id == GENRE_ID)
+    }
+
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((
+            self.get_item_images(item_id).await?,
+            self.photo && item_id == ITEM_ID,
+        ))
     }
 
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
@@ -781,6 +793,86 @@ struct Stubs {
     restricted: bool,
     /// Whether the caller is an API key with no user (see [`OkAuth`]).
     userless: bool,
+    /// The image processor wired into the state, if any.
+    processor: Option<Arc<RecordingProcessor>>,
+}
+
+/// An image processor that records the `auto_orient` of each request and
+/// serves the original file.
+#[derive(Default)]
+struct RecordingProcessor {
+    auto_orient: Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
+    fn supported_input_formats(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn supports_image_collage_creation(&self) -> bool {
+        false
+    }
+    fn supported_image_output_formats(&self) -> Vec<ferrofin_model::drawing::ImageFormat> {
+        Vec::new()
+    }
+    async fn get_image_dimensions(
+        &self,
+        _path: &str,
+    ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+        unreachable!("not read by the image routes")
+    }
+    async fn get_item_image_dimensions(
+        &self,
+        _item_id: Uuid,
+        _info: &ItemImageInfo,
+    ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+        unreachable!("not read by the image routes")
+    }
+    async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
+        unreachable!("not read by the image routes")
+    }
+    async fn get_image_blur_hash_sized(
+        &self,
+        _path: &str,
+        _size: ferrofin_model::drawing::ImageDimensions,
+    ) -> Result<String, ServiceError> {
+        unreachable!("not read by the image routes")
+    }
+    async fn get_image_cache_tag(
+        &self,
+        _item_id: Uuid,
+        _image: &ItemImageInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn get_image_cache_tag_for_path(
+        &self,
+        _base_item_path: &str,
+        _image_date_modified: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn process_image(
+        &self,
+        options: &ferrofin_traits::options::ImageProcessingOptions,
+    ) -> Result<ferrofin_traits::drawing::ProcessedImage, ServiceError> {
+        self.auto_orient
+            .lock()
+            .expect("lock")
+            .push(options.auto_orient);
+        Ok(ferrofin_traits::drawing::ProcessedImage {
+            path: options.image.path.clone(),
+            mime_type: None,
+            date_modified: options.image.date_modified,
+        })
+    }
+    async fn create_image_collage(
+        &self,
+        _options: &ferrofin_traits::options::ImageCollageOptions,
+        _library_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        unreachable!("not read by the image routes")
+    }
 }
 
 /// Builds the image stubs, serving `image_path` for item/by-name images and
@@ -791,6 +883,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             image_path,
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
+            photo: false,
         }),
         users: Arc::new(StubUsers {
             profile_path,
@@ -805,6 +898,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
         elevated: false,
         restricted: false,
         userless: false,
+        processor: None,
     }
 }
 
@@ -819,7 +913,7 @@ fn elevated_stubs(image_path: String, profile_path: String) -> Stubs {
 
 /// Builds an [`AppState`] wired with the image stubs.
 fn state(s: &Stubs) -> AppState {
-    AppState::new(
+    let state = AppState::new(
         s.library.clone(),
         s.users.clone(),
         Arc::new(FakeUserViews),
@@ -860,7 +954,11 @@ fn state(s: &Stubs) -> AppState {
         Arc::new(FakeActivity),
         Arc::new(FakeFileSystem),
         Arc::new(FakeTasks),
-    )
+    );
+    match &s.processor {
+        Some(processor) => state.with_image_processor(processor.clone()),
+        None => state,
+    }
 }
 
 /// Drives one authenticated request through the router, with an optional
@@ -931,6 +1029,47 @@ async fn get_item_image_serves_the_local_file() {
     let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Primary"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"PNGDATA");
+}
+
+/// `ImageProcessor.ProcessImage`: a photo's image goes through the processor
+/// with `autoOrient` even when nothing else is asked for, and so does a
+/// resize; another item's plain request still serves the file untouched.
+#[tokio::test]
+async fn a_photos_image_is_processed_with_auto_orientation() {
+    let img = TempImage::new(b"JPEGDATA");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(processor.clone());
+    let plain = format!("/Items/{ITEM_ID}/Images/Primary");
+    let resized = format!("/Items/{ITEM_ID}/Images/Primary?maxWidth=50");
+
+    let (status, body) = send(&s, "GET", &plain, None).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"JPEGDATA"[..])
+    );
+    assert!(processor.auto_orient.lock().expect("lock").is_empty());
+    send(&s, "GET", &resized, None).await;
+    assert_eq!(*processor.auto_orient.lock().expect("lock"), [false]);
+
+    let photo = Arc::new(RecordingProcessor::default());
+    let s = Stubs {
+        library: Arc::new(StubLibrary {
+            image_path: img.path(),
+            swaps: Mutex::new(Vec::new()),
+            item_reads: Mutex::new(0),
+            photo: true,
+        }),
+        processor: Some(photo.clone()),
+        ..stubs(img.path(), String::new())
+    };
+    let (status, body) = send(&s, "GET", &plain, None).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"JPEGDATA"[..])
+    );
+    send(&s, "GET", &resized, None).await;
+    assert_eq!(*photo.auto_orient.lock().expect("lock"), [true, true]);
 }
 
 #[tokio::test]

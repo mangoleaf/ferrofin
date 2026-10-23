@@ -250,7 +250,8 @@ impl ScheduledTask for CleanActivityLogTask {
 
 /// "Clean Cache Directory" — deletes cache files no longer needed by the
 /// system. Port of `DeleteCacheFileTask`: cache files older than 30 days, temp
-/// files (`{cache}/temp`) older than 1 day, then empty-folder pruning.
+/// files ([`ServerApplicationPaths::temp_path`], `{cache}/temp`) older than 1
+/// day, then empty-folder pruning.
 pub struct DeleteCacheFileTask {
     paths: Arc<dyn ServerApplicationPaths>,
 }
@@ -289,7 +290,7 @@ impl ScheduledTask for DeleteCacheFileTask {
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let cache = PathBuf::from(self.paths.cache_path());
-        let temp = cache.join("temp");
+        let temp = PathBuf::from(self.paths.temp_path());
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let now = SystemTime::now();
@@ -464,7 +465,8 @@ pub struct OptimizeDatabaseTask {
 }
 
 impl OptimizeDatabaseTask {
-    /// Builds the task over the database handle, the session manager (the
+    /// Builds the task over the database handle (skipped while a backup
+    /// snapshot holds its maintenance turn), the session manager (the
     /// vacuum is skipped while anything is playing — `VACUUM` and the
     /// truncating checkpoint take exclusive locks that fail live requests; a
     /// real mid-playback black-screen traced to exactly this window) and the
@@ -525,6 +527,15 @@ impl ScheduledTask for OptimizeDatabaseTask {
             tracing::info!("skipping database optimize/vacuum: playback is active");
             return Ok(());
         }
+        // A backup snapshot holds a read for its whole copy: the truncating
+        // checkpoint would wait on it through the busy timeout holding the
+        // one writer, and the vacuum would grow the WAL by the database's
+        // size. Skipped like the guards above. A snapshot asked for while
+        // this pass runs waits for it.
+        let Some(_turn) = self.db.try_maintenance_turn() else {
+            tracing::info!("skipping database optimization: a database snapshot is running");
+            return Ok(());
+        };
         tracing::info!("optimizing and vacuuming the database");
         for (statement, pct) in [
             ("PRAGMA optimize", 25.0),
@@ -1207,6 +1218,29 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "a run during a library scan must not have executed the vacuum steps"
         );
+    }
+
+    /// While a backup snapshot holds the database's maintenance turn, the
+    /// optimize run is skipped: its truncating checkpoint would wait on the
+    /// snapshot's read through the busy timeout, holding the one writer.
+    #[tokio::test]
+    async fn optimize_database_skips_while_a_snapshot_runs() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
+        let snapshot = db.try_maintenance_turn().expect("free");
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "a run during a snapshot must not have executed the vacuum steps"
+        );
+        drop(snapshot);
+        task.execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

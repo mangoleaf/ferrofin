@@ -55,3 +55,6 @@ adoption/fixtures/
 **/*.smoke.txt
 **/*.smoke2.txt
 **/*.smoke-scan.txt
+
+# Parity replay run output (parity/run.sh): reports and server logs, never committed.
+parity/runs/
