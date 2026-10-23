@@ -5008,12 +5008,78 @@ impl LibraryScanner {
                         tracing::warn!(%err, library = %library, "could not record the library's completed scan");
                     }
                 }
+                self.refresh_box_sets(&folders, run).await;
             }
         }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;
         result
+    }
+
+    /// Refreshes the box sets of each Collections (`boxsets`) library in
+    /// `folders` with the scan's options: upstream's
+    /// `Folder.ValidateChildrenInternal2` → `RefreshMetadataRecursive` runs
+    /// `BoxSetMetadataService` for every child of the library, as for any
+    /// library. A box set has no file to resolve, so the walk plans none; its
+    /// children are the box sets in the library's locations
+    /// (`{data}/collections/<name> [boxset]`). The single-item refresh decides
+    /// what runs, as for any item: a plain scan fetches only for a box set
+    /// never refreshed or past the library's `AutomaticRefreshIntervalDays`,
+    /// within the library's fetcher settings. A failure is logged and the
+    /// next box set refreshed; a cancelled scan stops between two. Both the
+    /// stored box-set paths and the library locations are expanded first: an
+    /// adopted row stores `%AppDataPath%/collections/<name> [boxset]`.
+    ///
+    /// TODO(gl-796): only a scan of whole libraries reaches this pass. A
+    /// scoped scan under a Collections library's location (a watcher-reported
+    /// change in `{data}/collections`, a folder refresh there) refreshes no box
+    /// set, where upstream refreshes the ones in the folder it validates; the
+    /// path is to run this pass over the box sets under the scope's paths in
+    /// `scan_scoped`/`scan_changed` too.
+    async fn refresh_box_sets(&self, folders: &[VirtualFolderInfo], run: ScanRun<'_>) {
+        let (Some(providers), Some(items)) = (&self.metadata_savers, &self.item_repository) else {
+            return;
+        };
+        let locations: Vec<PathBuf> = folders
+            .iter()
+            .filter(|folder| folder.collection_type == Some(CollectionTypeOptions::boxsets))
+            .flat_map(|folder| folder.locations.iter())
+            .map(|location| PathBuf::from(self.virtual_paths.expand(location)))
+            .collect();
+        if locations.is_empty() {
+            return;
+        }
+        let box_sets = match items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::BoxSet],
+                ..InternalItemsQuery::default()
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "could not list the box sets to refresh");
+                return;
+            }
+        };
+        for row in box_sets {
+            if run.cancel.is_cancelled() {
+                return;
+            }
+            let in_library = row.path.as_deref().is_some_and(|path| {
+                let path = self.virtual_paths.expand(path);
+                locations
+                    .iter()
+                    .any(|root| Path::new(&path).starts_with(root))
+            });
+            let Some(id) = in_library.then(|| Uuid::parse_str(&row.id).ok()).flatten() else {
+                continue;
+            };
+            if let Err(err) = providers.refresh_single_item(id, run.options).await {
+                tracing::warn!(%err, item_id = %id, "could not refresh a box set");
+            }
+        }
     }
 
     /// Scans the library monitor's reported `changed` filesystem paths —
@@ -13705,7 +13771,9 @@ impl LibraryScanner {
                         self.plan_movies(location, location, cf, walk, &ctx, &mut out);
                     }
                     // `boxsets` is the only type left: a BoxSet's members are
-                    // curated through the collection API, not resolved off disk.
+                    // curated through the collection API, not resolved off
+                    // disk. Its box sets are refreshed once the walk is done
+                    // (`refresh_box_sets`).
                     Some(_) => {}
                 }
                 if let Some((location_folder, aggregate)) = placed {
@@ -15722,9 +15790,10 @@ impl LibraryScanner {
     }
 
     /// One subfolder of a series: a season, planned with its episodes, or a
-    /// folder whose videos are collected into `loose` as loose episodes
-    /// (grouped into virtual seasons by [`Self::plan_loose_episodes`]), the
-    /// extras such an episode owns into `owned_extras`, for after them.
+    /// folder `SeasonResolver` declines, whose videos are collected into
+    /// `loose` as loose episodes (grouped into virtual seasons by
+    /// [`Self::plan_loose_episodes`]), the extras such an episode owns into
+    /// `owned_extras`, for after them.
     #[allow(clippy::too_many_arguments)]
     fn plan_series_subfolder(
         &self,
@@ -15737,11 +15806,18 @@ impl LibraryScanner {
         (loose, owned_extras): (&mut Vec<String>, &mut Vec<Planned>),
     ) {
         let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
-        if !(season.season_number.is_some() || season.is_season_folder) {
+        // `SeasonResolver`: every folder under a series is a season, numbered
+        // or not (an unnumbered one is named after its folder), unless it is
+        // not a numbered season folder and its name reads as an episode (a
+        // season and an episode number) or no video lies anywhere below it.
+        let declined = (season.season_number.is_none() || !season.is_season_folder)
+            && (folder_names_an_episode(&entry.name, ctx.naming)
+                || !self.holds_any_video(&entry.path, ctx));
+        if declined {
             // `SeasonResolver` takes no such folder, so `PlaylistResolver`
-            // (priority First) may. A season folder stays a season: both
-            // resolvers have priority First, and a `[playlist]` season is
-            // too rare to bet on their registration order.
+            // (priority First) may. A season stays a season: both resolvers
+            // have priority First, and a `[playlist]` season is too rare to
+            // bet on their registration order.
             let holds_xml = || playlists::holds_playlist_xml(&self.prelist(&entry.path, ctx));
             let home = (series_id, vec![cf, series_id]);
             if self.plan_playlist_folder(&entry.path, holds_xml, cf, home, ctx, out) {
@@ -15797,6 +15873,22 @@ impl LibraryScanner {
             ctx,
             out,
         );
+    }
+
+    /// Whether any video file lies anywhere below `dir`, whatever the plan's
+    /// scope: `SeasonResolver`'s `Directory.EnumerateFiles(path, "*",
+    /// SearchOption.AllDirectories)` test, stopping at the first video. It
+    /// reads the walk's own listings, so ignored paths (dot-files, `@eaDir`)
+    /// count for nothing, as they do everywhere else in the walk; upstream's
+    /// raw enumeration counts a video hidden under one.
+    fn holds_any_video(&self, dir: &str, ctx: &PlanCtx<'_>) -> bool {
+        self.list(dir, ctx).into_iter().any(|entry| {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.holds_any_video(&entry.path, ctx)
+            } else {
+                video_resolver::is_video_file(&entry.path, ctx.naming)
+            }
+        })
     }
 
     /// Collects every video file under `dir` (recursively) into `out_paths` —
@@ -18559,6 +18651,16 @@ fn group_files(video: &ferrofin_naming::video::VideoInfo) -> impl Iterator<Item 
         .chain(&video.alternate_versions)
         .flat_map(|version| &version.files)
         .map(|file| file.path.as_str())
+}
+
+/// `SeasonResolver`'s first test for a series subfolder that is not a
+/// numbered season folder: whether its name, resolved as a directory, carries
+/// both a season and an episode number (`EpisodeResolver.Resolve(@"\\test\" +
+/// folderName, true)`). Such a folder is no season.
+fn folder_names_an_episode(folder_name: &str, naming: &NamingOptions) -> bool {
+    EpisodeResolver::new(naming)
+        .resolve_simple(&format!(r"\\test\{folder_name}"), true)
+        .is_some_and(|info| info.season_number.is_some() && info.episode_number.is_some())
 }
 
 /// Whether the TV walk plans the episode file at `path`: the scope keeps it

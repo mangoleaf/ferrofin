@@ -1,0 +1,25 @@
+1
+00:00:01,000 --> 00:00:03,500
+Plain line
+second line
+
+2
+00:00:04,000 --> 00:00:05,550
+{\an8}{\b1}SIGN{\b0} text
+
+3
+00:00:06,000 --> 00:00:07,000
+{\i1}Italic{\i0} and {\c&H0000FF&}red{\c} end
+
+4
+00:00:08,000 --> 00:00:09,990
+{\fad(200,200)}Fading, with, commas\hand hard space
+
+5
+00:00:10,000 --> 00:00:11,000
+{\fnTimes New Roman}Font{\fn} and {\fs20}size{\fs}
+
+6
+01:02:03,040 --> 01:02:05,060
+{\an1}Bottom left & <tag>
+

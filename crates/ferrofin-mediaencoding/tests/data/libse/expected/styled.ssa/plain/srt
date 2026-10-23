@@ -1,0 +1,17 @@
+1
+00:00:01,000 --> 00:00:02,500
+Hello <i>world</i>
+next
+
+2
+00:00:03,000 --> 00:00:04,000
+<font color="#00ff00">green</font> text
+
+3
+00:00:05,000 --> 00:00:06,000
+<font face="Courier">mono</font> <b>bold</b>
+
+4
+00:00:07,000 --> 00:00:08,000
+<font size="30"><i>big italic</font> done</i>
+

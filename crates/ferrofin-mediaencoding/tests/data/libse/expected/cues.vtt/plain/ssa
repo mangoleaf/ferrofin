@@ -1,0 +1,19 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:11.00,0:00:12.50,*Default,NTP,0000,0000,0000,,{\an7}Top left & early
+Dialogue: Marked=0,0:00:13.00,0:00:14.00,*Default,NTP,0000,0000,0000,,{\an3\i1}Bottom{\i0} {\b1}right{\b0} {\u1}under{\u0}
+Dialogue: Marked=0,0:00:15.00,0:00:16.00,*Default,NTP,0000,0000,0000,,<c.yellow>Yellow class</c>
+Dialogue: Marked=0,0:00:17.00,0:00:18.00,*Default,NTP,0000,0000,0000,,{\an8}<v Bob>Top by line number\Nsecond <line>
+Dialogue: Marked=0,0:00:19.00,0:00:20.00,*Default,NTP,0000,0000,0000,,<c.big.yellow>Big</c> and <c.red>red</c>
+Dialogue: Marked=0,0:00:21.00,0:00:22.00,*Default,NTP,0000,0000,0000,,{\an5}Middle
