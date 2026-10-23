@@ -583,7 +583,7 @@ impl DynamicImageProviders {
             height: 0,
             blur_hash: None,
         };
-        self.fill_image_metadata(&mut info).await;
+        fill_image_metadata(self.processor.as_ref(), &mut info).await;
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         self.persistence.save_item_images(item_id, &images).await?;
@@ -826,23 +826,20 @@ impl DynamicImageProviders {
             .iter()
             .any(|i| i.image_type == ImageType::Primary))
     }
+}
 
-    /// Dimensions + blurhash for the written file, the way the scanner records
-    /// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`).
-    /// Best-effort: a decode failure leaves 0×0 / no hash.
-    async fn fill_image_metadata(&self, image: &mut ItemImageInfo) {
-        let Ok(dims) = self.processor.get_image_dimensions(&image.path).await else {
-            return;
-        };
-        image.width = dims.width;
-        image.height = dims.height;
-        if let Ok(hash) = self
-            .processor
-            .get_image_blur_hash_sized(&image.path, dims)
-            .await
-        {
-            image.blur_hash = Some(hash);
-        }
+/// Dimensions + blurhash for a written image file, the way the scanner records
+/// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
+/// what `LibraryManager.UpdateImagesAsync` fills for a saved image.
+/// Best-effort: a decode failure leaves the size the caller set, and no hash.
+pub(crate) async fn fill_image_metadata(processor: &dyn ImageProcessor, image: &mut ItemImageInfo) {
+    let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
+        return;
+    };
+    image.width = dims.width;
+    image.height = dims.height;
+    if let Ok(hash) = processor.get_image_blur_hash_sized(&image.path, dims).await {
+        image.blur_hash = Some(hash);
     }
 }
 
@@ -864,14 +861,16 @@ fn has_changed_by_date(image: &ItemImageInfo) -> bool {
 }
 
 /// An item's own art folders under the metadata `root`: Ferrofin's
-/// `{root}/{ID}`, and the `{root}/{xx}/{id:N}` folder Jellyfin's
+/// `{root}/{ID}` ([`own_art_dir`]), the [`legacy_art_dir`] older scans wrote
+/// some art to, and the `{root}/{xx}/{id:N}` folder Jellyfin's
 /// `BaseItem.GetInternalMetadataPath` uses (`BaseItem.cs:927-937`), which an
 /// adopted database's images keep.
 #[must_use]
-pub(crate) fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 2] {
+pub(crate) fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 3] {
     let simple = item_id.simple().to_string();
     [
         own_art_dir(root, item_id),
+        legacy_art_dir(root, item_id),
         root.join(&simple[..2]).join(&simple),
     ]
 }
@@ -880,6 +879,16 @@ pub(crate) fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 2]
 #[must_use]
 pub(crate) fn own_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
     root.join(guid_to_db(item_id))
+}
+
+/// `{root}/{id}`, the item's id lower-cased: where older scans wrote music,
+/// person, studio and embedded-cover art, beside [`own_art_dir`]. Nothing is
+/// written there any more. It is read and cleaned so that art already there
+/// is found, pruned and removed with the item, and its stored paths keep
+/// working.
+#[must_use]
+pub(crate) fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
+    root.join(item_id.hyphenated().to_string())
 }
 
 /// Whether `image` is the item's own (`BaseDynamicImageProvider.FetchAsync` /
@@ -902,7 +911,7 @@ pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
 }
 
 /// The file's modification time, or now when it cannot be read.
-fn file_date_modified(path: &Path) -> DateTime<Utc> {
+pub(crate) fn file_date_modified(path: &Path) -> DateTime<Utc> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)

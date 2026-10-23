@@ -10,7 +10,11 @@
 //! on every auth-relevant mutation (device delete/rename/options, user
 //! update/delete, password/policy/configuration change). Clearing wholesale
 //! instead of per-entry keeps the invalidation story impossible to get wrong;
-//! the price is one 2-query re-read per live token afterwards.
+//! the price is one 2-query re-read per live token afterwards. The one
+//! exception is a login attempt that does not lock the account out: it writes
+//! only that user's row, so it drops only that user's entries
+//! ([`AuthCache::invalidate_user`]), and wrong passwords for one account
+//! cannot keep every other user's cache cold.
 //!
 //! The TTL bounds staleness for anything that *isn't* hooked (e.g. a row
 //! edited by hand in the DB); it is deliberately short. A revoked token never
@@ -92,7 +96,8 @@ struct CachedUserDto {
 #[derive(Debug)]
 pub struct AuthCache {
     ttl: Duration,
-    /// Bumped by [`AuthCache::clear`] before it empties the maps. A `put` whose
+    /// Bumped by [`AuthCache::clear`] and [`AuthCache::invalidate_user`] before
+    /// they touch the maps. A `put` whose
     /// caller-captured generation no longer matches is dropped — see the module
     /// docs for why a read-through cache needs this on top of the clear.
     generation: AtomicU64,
@@ -249,6 +254,30 @@ impl AuthCache {
             .clear();
     }
 
+    /// Drops `user_id`'s cached token resolutions and user DTO, leaving every
+    /// other user's in place.
+    ///
+    /// For a write to that user's own row alone (a login attempt's counter and
+    /// dates), where [`clear`](Self::clear) would send every live token back to
+    /// the database. The generation is bumped first, as a clear bumps it, so a
+    /// read of this user taken before the write cannot be stored after it; the
+    /// price is that the other in-flight reads skip storing their result once.
+    pub fn invalidate_user(&self, user_id: &str) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.entries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, hit| {
+                hit.user
+                    .as_ref()
+                    .is_none_or(|user| !user.id.eq_ignore_ascii_case(user_id))
+            });
+        self.user_dtos
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, _| !id.eq_ignore_ascii_case(user_id));
+    }
+
     /// The number of live entries (TTL-expired entries included until evicted).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -365,6 +394,51 @@ mod tests {
         assert!(
             cache.get_user_dto(&entity).is_none(),
             "a stale policy assembly must not survive the clear that raced it"
+        );
+    }
+
+    /// Invalidating one user drops that user's tokens and DTO, whatever the id's
+    /// case, keeps every other user's and a user-less (API key) token, and
+    /// still cancels a read-through write that was in flight across it.
+    #[tokio::test]
+    async fn invalidating_a_user_drops_only_that_users_entries() {
+        let db = crate::test_support::test_db().await;
+        let tried =
+            crate::test_support::seed_named_user(&db, uuid::Uuid::from_u128(0x71), "tried").await;
+        let other =
+            crate::test_support::seed_named_user(&db, uuid::Uuid::from_u128(0x72), "other").await;
+        let cache = AuthCache::default();
+        let generation = cache.generation();
+        cache.put(
+            generation,
+            "tried",
+            device("tried"),
+            Some(tried.clone()),
+            None,
+        );
+        cache.put(
+            generation,
+            "other",
+            device("other"),
+            Some(other.clone()),
+            None,
+        );
+        cache.put(generation, "api-key", device("api-key"), None, None);
+        cache.put_user_dto(generation, &tried, UserDto::default());
+        cache.put_user_dto(generation, &other, UserDto::default());
+
+        let in_flight = cache.generation();
+        cache.invalidate_user(&tried.id.to_ascii_lowercase());
+        cache.put(in_flight, "late", device("late"), Some(other.clone()), None);
+
+        assert!(cache.get("tried").is_none());
+        assert!(cache.get_user_dto(&tried).is_none());
+        assert!(cache.get("other").is_some());
+        assert!(cache.get_user_dto(&other).is_some());
+        assert!(cache.get("api-key").is_some());
+        assert!(
+            cache.get("late").is_none(),
+            "a read taken before the invalidation is not stored after it"
         );
     }
 
