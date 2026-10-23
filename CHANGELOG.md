@@ -226,6 +226,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   settings page's "Create unaired episodes", "Create missing episodes" and "Include
   specials" options, its library list, refresh interval and grace period, and the "Refresh
   upcoming and missing episodes (TheMovieDb)" scheduled task. Off by default
+- Convert subtitles with Jellyfin 12's writers (SubtitleEdit's libse 4.0.12), byte for byte:
+  converted WebVTT, SubRip, SSA and ASS lose the byte-order mark, and WebVTT loses the fixed
+  region block and `line:90%` on every cue. An `{\anN}` sign is placed where it asks to be
+  (`{\an8}` at the top), other SSA/ASS override tags are removed instead of shown as text,
+  and `<font color>` becomes a WebVTT colour class. An ASS script converted to SSA keeps its
+  styles and comments. `Stream.ttml` now serves TTML (`application/ttml+xml`; it was a 500).
+  An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
+  Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
+  file converted to ASS does not get Jellyfin's style conversion yet
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

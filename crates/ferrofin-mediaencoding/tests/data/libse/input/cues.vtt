@@ -1,0 +1,32 @@
+WEBVTT - cues
+X-TIMESTAMP-MAP=MPEGTS:900009,LOCAL:00:00:00.000
+
+STYLE
+::cue(.yellow) { color: yellow; }
+::cue(.big) { font-size: 30px; font-weight: bold; }
+
+REGION
+id:top width:40% lines:3 regionanchor:0%,100% viewportanchor:10%,90%
+
+NOTE a block before the first cue joins the header
+
+1
+00:01.000 --> 00:02.500 region:top line:10% align:start position:10%
+Top left &amp; early
+
+2
+00:00:03.000 --> 00:00:04.000 line:90% position:90%
+<i>Bottom</i> <b>right</b> <u>under</u>
+
+00:00:05.000 --> 00:00:06.000
+<c.yellow>Yellow class</c>
+
+00:00:07.000 --> 00:00:08.000 line:0
+<v Bob>Top by line number
+second &lt;line&gt;
+
+00:00:09.000 --> 00:00:10.000 align:end size:50%
+<c.big.yellow>Big</c> and <c.red>red</c>
+
+00:00:11.000 --> 00:00:12.000 line:50%
+Middle

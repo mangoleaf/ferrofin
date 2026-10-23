@@ -1,0 +1,78 @@
+1
+00:00:02,000 --> 00:00:03,500
+<i><b>both</b></i> after
+
+2
+00:00:04,000 --> 00:00:05,500
+<i>line one
+line two</i>
+
+3
+00:00:06,000 --> 00:00:07,500
+<x>unknown</x> and <ruby-base>ruby</ruby-base> <bouten-dot>dot</bouten-dot>
+
+4
+00:00:08,000 --> 00:00:09,500
+<font color="red" face="Arial">order</font> <font color='blue'>single</font>
+
+5
+00:00:10,000 --> 00:00:11,500
+a <!-- note --> b
+
+6
+00:00:12,000 --> 00:00:13,500
+odd ]]> end
+
+7
+00:00:14,000 --> 00:00:15,500
+<ns:tag>undeclared</ns:tag>
+
+8
+00:00:16,000 --> 00:00:17,500
+nbsp&nbsp;here &amp; amp
+
+9
+00:00:18,000 --> 00:00:19,500
+<i>unclosed italic
+
+10
+00:00:20,000 --> 00:00:21,500
+closing only</i>
+
+11
+00:00:22,000 --> 00:00:23,500
+<i>Foo</i>
+<i>Bar</i>
+
+12
+00:00:24,000 --> 00:00:25,500
+FALCONE:<i> I didn't think</i>
+<i>it was going to be you,</i>
+
+13
+00:00:26,000 --> 00:00:27,500
+<I>upper</I> and < i >spaced</ i >
+
+14
+00:00:28,000 --> 00:00:29,500
+{\an8}
+
+15
+00:00:30,000 --> 00:00:31,500
+Tabs	and  double  spaces
+
+16
+00:00:32,000 --> 00:00:33,500
+日本語のテキスト <b>太字</b>
+
+17
+00:00:34,000 --> 00:00:35,500
+<b>x</b> <i>y</i> <u>z</u>
+
+18
+00:00:36,000 --> 00:00:37,500
+<i/>empty italic tag
+
+19
+00:00:38,000 --> 00:00:39,500
+<span>raw span</span>

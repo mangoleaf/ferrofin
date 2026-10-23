@@ -2233,6 +2233,23 @@ pub(crate) fn page<T>(rows: Vec<T>, filter: &InternalItemsQuery) -> Vec<T> {
     rows.into_iter().skip(start).take(take).collect()
 }
 
+/// The limit half of `BaseItemRepository.PrepareFilterQuery`
+/// (`BaseItemRepository.cs:135-138`), which `GetItemIdsList`, `GetItems`,
+/// `GetItemList` and `GetLatestItemList` run first: a limited query whose
+/// caller de-duplicates by metadata key reads 4 more rows for it to drop.
+/// `None` leaves the filter as it is. Unlike upstream, which raises the
+/// caller's `Limit` in place, the caller's filter is never changed.
+fn grouped_by_metadata_key(filter: &InternalItemsQuery) -> Option<InternalItemsQuery> {
+    if !filter.enable_group_by_metadata_key {
+        return None;
+    }
+    let limit = filter.limit?;
+    Some(InternalItemsQuery {
+        limit: Some(limit.saturating_add(4)),
+        ..filter.clone()
+    })
+}
+
 /// Pages an in-memory result as the SQL builder's `LIMIT`/`OFFSET` would
 /// (`ApplyQueryPaging`): a `limit` of 0 takes nothing, a negative one is
 /// SQLite's "no limit".
@@ -3128,6 +3145,8 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let prepared = grouped_by_metadata_key(filter);
+        let filter = prepared.as_ref().unwrap_or(filter);
         // C# `ItemsController.GetItems` does NOT query when the parent is the
         // user root and the request is neither recursive nor id-scoped — see
         // [`Self::user_root_children`].
@@ -3204,14 +3223,17 @@ impl ItemRepository for FerrofinItemRepository {
     }
 
     async fn get_item_ids(&self, filter: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        self.fetch_ids(filter).await
+        let prepared = grouped_by_metadata_key(filter);
+        self.fetch_ids(prepared.as_ref().unwrap_or(filter)).await
     }
 
     async fn get_item_list(
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.fetch_rows(filter, QueryShape::FullRows).await
+        let prepared = grouped_by_metadata_key(filter);
+        self.fetch_rows(prepared.as_ref().unwrap_or(filter), QueryShape::FullRows)
+            .await
     }
 
     async fn get_folder_children(
@@ -3280,6 +3302,8 @@ impl ItemRepository for FerrofinItemRepository {
         // (grouping is on by default for tvshows and music), so it needs the
         // same view translation as every other browse — without it, Latest for
         // a TV or Music library on an adopted database comes back empty.
+        let prepared = grouped_by_metadata_key(filter);
+        let filter = prepared.as_ref().unwrap_or(filter);
         let resolved = self.resolve_views(filter).await?;
         let filter = resolved.as_ref().unwrap_or(filter);
         if collection_type == CollectionType::tvshows {
@@ -6395,6 +6419,54 @@ mod tests {
         assert_eq!(res.items.len(), 1);
     }
 
+    /// `PrepareFilterQuery`: a limited query grouped by metadata key reads 4
+    /// rows past its limit on every list entry point; one without a limit, or
+    /// without the flag, reads what it asked for. A counted page still totals
+    /// every match.
+    #[rstest::rstest]
+    #[case::grouped(Some(2), true, 6)]
+    #[case::not_grouped(Some(2), false, 2)]
+    #[case::grouped_but_unlimited(None, true, 10)]
+    #[tokio::test]
+    async fn grouping_by_metadata_key_reads_four_rows_past_the_limit(
+        #[case] limit: Option<i32>,
+        #[case] grouped: bool,
+        #[case] rows: usize,
+    ) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        for i in 0..10u128 {
+            seed_named_item(
+                &db,
+                Uuid::from_u128(0x7050 + i),
+                BaseItemKind::Movie,
+                &format!("Film {i:02}"),
+            )
+            .await;
+        }
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            limit,
+            enable_group_by_metadata_key: grouped,
+            ..InternalItemsQuery::default()
+        };
+
+        let list = repository.get_item_list(&query).await.expect("list");
+        let ids = repository.get_item_ids(&query).await.expect("ids");
+        let page = repository
+            .get_items(&InternalItemsQuery {
+                enable_total_record_count: true,
+                ..query.clone()
+            })
+            .await
+            .expect("page");
+        assert_eq!(page.total_record_count, 10, "the total counts every match");
+        assert_eq!(
+            (list.len(), ids.len(), page.items.len()),
+            (rows, rows, rows)
+        );
+    }
+
     /// A page shorter than its own `LIMIT` skips the `COUNT(*)` and derives the
     /// total from the page — which must still be the TOTAL, not the page length.
     /// Every case below is one the short-circuit can get wrong: a short first
@@ -9172,6 +9244,54 @@ mod tests {
                 .all(|r| r.type_.ends_with("MusicAlbum") && r.is_folder),
             "the music arm returns album rows, not tracks"
         );
+    }
+
+    /// `GetLatestItemList` runs `PrepareFilterQuery` too: grouped by metadata
+    /// key, a limit of 1 reads 5 albums.
+    #[rstest::rstest]
+    #[case::grouped(true, 5)]
+    #[case::not_grouped(false, 1)]
+    #[tokio::test]
+    async fn latest_albums_grouped_by_metadata_key_read_four_past_the_limit(
+        #[case] grouped: bool,
+        #[case] albums: usize,
+    ) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = music_library();
+        for i in 0..6_u32 {
+            let id = 0xD301_u128 + u128::from(i);
+            let name = format!("Album {i}");
+            seed_latest_album(&db, Uuid::from_u128(id), &name, Some(library), day(i + 1)).await;
+            seed_latest_row(
+                &db,
+                Uuid::from_u128(id + 0x1000),
+                BaseItemKind::Audio,
+                &format!("{name} t1"),
+                &name,
+                day(i + 1),
+            )
+            .await;
+        }
+        let filter = InternalItemsQuery {
+            media_types: vec![ferrofin_model::data::MediaType::Audio],
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            limit: Some(1),
+            top_parent_ids: vec![library],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::DateCreated,
+                ferrofin_model::dto::SortOrder::Descending,
+            )],
+            enable_group_by_metadata_key: grouped,
+            ..InternalItemsQuery::default()
+        };
+
+        let rows = repository
+            .get_latest_item_list(&filter, CollectionType::music)
+            .await
+            .expect("latest music albums");
+        assert_eq!(rows.len(), albums);
     }
 
     /// `Id DESC` is the tiebreaker on equal `DateCreated`
