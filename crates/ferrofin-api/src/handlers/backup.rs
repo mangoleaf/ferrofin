@@ -42,9 +42,12 @@ const BACKUP_ENGINE_VERSION: &str = "1.0.0";
 /// the next boot (Jellyfin keeps the same intent in `RestoreBackupPath`).
 const RESTORE_PENDING_FILE: &str = "restore-pending";
 
-/// The on-disk roots of everything an archive holds: the directory of the
-/// database file (archived under `data/`) and the four trees, each archived
-/// under its own prefix. `config` is always included; the others follow
+/// The on-disk roots of everything an archive holds: the database file
+/// (archived under `data/`), the scheduled tasks' last results, and the
+/// trees, each archived under its own prefix. `config`, the library root and
+/// the box-set and playlist folders are always included, as upstream's
+/// `CreateBackupAsync` always copies `Root`, `Data/collections`,
+/// `Data/playlists` and `Data/ScheduledTasks`; the others follow
 /// `BackupOptions`. Built from the live application paths (so a configured
 /// `FERROFIN_CONFIG_DIR` / `MetadataPath` is honoured, as Jellyfin archives
 /// `ConfigurationDirectoryPath` / `InternalMetadataPath`), or from the default
@@ -64,6 +67,16 @@ pub struct TreeRoots {
     pub trickplay: PathBuf,
     /// The subtitle cache directory (`subtitles/`).
     pub subtitles: PathBuf,
+    /// The library root (`root/`): each library's folder with its `.mblink`
+    /// locations and `options.json` (upstream's `Root`).
+    pub root: PathBuf,
+    /// The box-set folders (`data/collections/`).
+    pub collections: PathBuf,
+    /// The playlist folders (`data/playlists/`).
+    pub playlists: PathBuf,
+    /// The scheduled tasks' last results ([`TASK_RESULTS_ENTRY`]; upstream's
+    /// `Data/ScheduledTasks`).
+    pub task_results: PathBuf,
 }
 
 impl TreeRoots {
@@ -77,6 +90,10 @@ impl TreeRoots {
             metadata: PathBuf::from(paths.internal_metadata_path()),
             trickplay: data.join("trickplay"),
             subtitles: data.join("subtitles"),
+            root: PathBuf::from(paths.root_folder_path()),
+            collections: data.join("collections"),
+            playlists: data.join("playlists"),
+            task_results: PathBuf::from(paths.program_data_path()).join("task_results.json"),
         }
     }
 
@@ -92,16 +109,23 @@ impl TreeRoots {
             metadata: program_data.join("metadata"),
             trickplay: program_data.join("data").join("trickplay"),
             subtitles: program_data.join("data").join("subtitles"),
+            root: program_data.join("root"),
+            collections: program_data.join("data").join("collections"),
+            playlists: program_data.join("data").join("playlists"),
+            task_results: program_data.join("task_results.json"),
         }
     }
 
     /// (archive prefix, on-disk root) for each tree.
-    fn trees(&self) -> [(&'static str, &Path); 4] {
+    fn trees(&self) -> [(&'static str, &Path); 7] {
         [
             ("config", &self.config),
             ("metadata", &self.metadata),
             ("trickplay", &self.trickplay),
             ("subtitles", &self.subtitles),
+            ("root", &self.root),
+            ("data/collections", &self.collections),
+            ("data/playlists", &self.playlists),
         ]
     }
 }
@@ -148,6 +172,10 @@ const BACKUP_MIN_FREE_SPACE: i64 = 5_368_709_115;
 /// shape. An archive without it predates the entry, so it is no newer than
 /// any build that reads it.
 const SCHEMA_HEAD_ENTRY: &str = "ferrofin-schema-head";
+
+/// The archive entry holding the scheduled tasks' last results, always
+/// archived (upstream's `Data/ScheduledTasks`).
+const TASK_RESULTS_ENTRY: &str = "data/task_results.json";
 
 /// The manifest entry stored inside each archive (as `manifest.json`) and returned
 /// by the list/create/inspect routes. Port of `BackupManifestDto`.
@@ -201,7 +229,7 @@ impl BackupOptions {
     /// Whether the tree stored under `prefix` is selected by these options.
     fn includes(&self, prefix: &str) -> bool {
         match prefix {
-            "config" => true,
+            "config" | "root" | "data/collections" | "data/playlists" => true,
             "metadata" => self.metadata,
             "trickplay" => self.trickplay,
             "subtitles" => self.subtitles,
@@ -626,7 +654,12 @@ fn write_archive(
         let _ = std::fs::remove_file(snapshot);
     }
 
-    // The configuration tree, plus every optional tree the options select.
+    if let Ok(mut file) = std::fs::File::open(&roots.task_results) {
+        zip.start_file(TASK_RESULTS_ENTRY, opts)?;
+        std::io::copy(&mut file, &mut zip)?;
+    }
+
+    // The trees always archived, plus every optional tree the options select.
     for (prefix, dir) in roots.trees() {
         if manifest.options.includes(prefix) && dir.is_dir() {
             add_dir_to_zip(&mut zip, dir, prefix, opts)?;
@@ -706,6 +739,18 @@ impl std::fmt::Display for RestoreFailure {
 }
 
 impl std::error::Error for RestoreFailure {}
+
+/// Whether `POST /Backup/Restore` has scheduled a restore that the next boot's
+/// [`apply_pending_restore`] will apply.
+#[must_use]
+pub fn restore_pending(roots: &TreeRoots) -> bool {
+    roots
+        .program_data
+        .join("data")
+        .join(BACKUPS_DIR)
+        .join(RESTORE_PENDING_FILE)
+        .is_file()
+}
 
 /// Applies a restore scheduled by `POST /Backup/Restore`, if one is pending.
 ///
@@ -807,14 +852,17 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
                 std::fs::rename(&tmp, &roots.database)?;
                 continue;
             }
-            let dest =
-                if let Some((root, rest)) = roots.trees().into_iter().find_map(|(prefix, root)| {
-                    enclosed.strip_prefix(prefix).ok().map(|r| (root, r))
-                }) {
-                    root.join(rest)
-                } else {
-                    continue;
-                };
+            let dest = if enclosed == Path::new(TASK_RESULTS_ENTRY) {
+                roots.task_results.clone()
+            } else if let Some((root, rest)) = roots
+                .trees()
+                .into_iter()
+                .find_map(|(prefix, root)| enclosed.strip_prefix(prefix).ok().map(|r| (root, r)))
+            {
+                root.join(rest)
+            } else {
+                continue;
+            };
             if entry.is_dir() {
                 continue;
             }
@@ -1191,7 +1239,9 @@ mod tests {
             &boot_root.join("config"),
             &boot_root.join("ferrofin.db"),
         );
+        assert!(super::restore_pending(&boot_roots), "the marker is seen");
         let applied = super::apply_pending_restore(&boot_roots).unwrap();
+        assert!(!super::restore_pending(&boot_roots), "nothing pends after");
         assert_eq!(
             applied.as_deref(),
             Some(boot_backups.join(archive.file_name().unwrap()).as_path())
@@ -1244,6 +1294,62 @@ mod tests {
         assert_eq!(listed[0].path, m2.path, "newest first");
         // A missing directory lists nothing.
         assert!(list_backups_in(&tmp.path().join("nope")).is_empty());
+    }
+
+    /// `CreateBackupAsync` always archives the library definitions (`Root`)
+    /// and the box-set and playlist folders (`Data/collections`,
+    /// `Data/playlists`), and `RestoreBackupAsync` puts them back, so a
+    /// restore onto a new host brings back the libraries and their options.
+    #[test]
+    fn backup_then_restore_round_trips_libraries_box_sets_and_playlists() {
+        use super::{restore_archive, write_backup};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("program");
+        let files = [
+            "root/default/Movies/movies.mblink",
+            "root/default/Movies/options.json",
+            "data/collections/Saga [boxset]/poster.jpg",
+            "data/playlists/Road Trip/poster.jpg",
+            "task_results.json",
+        ];
+        for rel in files {
+            let path = program_data.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, rel).unwrap();
+        }
+        std::fs::write(program_data.join("ferrofin.db"), b"DB").unwrap();
+        let roots = TreeRoots::defaults(
+            &program_data,
+            &program_data.join("config"),
+            &program_data.join("ferrofin.db"),
+        );
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+        let manifest = write_backup(
+            &tmp.path().join("backups"),
+            &roots,
+            BackupOptions::default(),
+            now,
+            None,
+        )
+        .unwrap();
+
+        // A new host's data directory, empty.
+        let restored = tmp.path().join("restored");
+        std::fs::create_dir_all(&restored).unwrap();
+        let restore_roots = TreeRoots::defaults(
+            &restored,
+            &restored.join("config"),
+            &restored.join("ferrofin.db"),
+        );
+        restore_archive(std::path::Path::new(&manifest.path), &restore_roots).unwrap();
+        for rel in files {
+            assert_eq!(
+                std::fs::read(restored.join(rel)).ok().as_deref(),
+                Some(rel.as_bytes()),
+                "{rel}"
+            );
+        }
     }
 
     /// Every `/Backup*` route is `RequiresElevation` in the contract (each

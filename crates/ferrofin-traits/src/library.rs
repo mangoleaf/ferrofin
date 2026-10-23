@@ -290,6 +290,50 @@ pub trait LibraryManager: Send + Sync {
         Ok(Some(item))
     }
 
+    /// `BaseItem.ContainingFolderPath`: the folder a folder content-type
+    /// override for `item` is keyed on. That is the item's own path for a
+    /// folder, a disc rip that is no placeholder and a by-name item, a
+    /// playlist file's directory, and the directory of its file (of the first
+    /// part, for a stack) otherwise. `None` for an item without a path.
+    ///
+    /// The default knows only folders and files.
+    async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
+        let path = item.path.as_deref()?;
+        if item.is_folder {
+            return Some(path.to_owned());
+        }
+        std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .map(str::to_owned)
+    }
+
+    /// `LibraryManager.GetInheritedContentType(item)`: the collection type of
+    /// the library `item`'s top folder belongs to, else the configured type
+    /// ([`Self::get_configured_content_type`]) of the parent farthest from
+    /// `item` that has one.
+    ///
+    /// The default finds none, for a seam without libraries.
+    async fn get_inherited_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(None)
+    }
+
+    /// `LibraryManager.GetConfiguredContentType(item)`: a library's own
+    /// collection type for its `CollectionFolder`, else the folder
+    /// content-type override (`ServerConfiguration.ContentTypes`) naming
+    /// `item`'s [`containing folder`](Self::containing_folder_path) exactly.
+    ///
+    /// The default finds none, for a seam without a configuration.
+    async fn get_configured_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(None)
+    }
+
     /// The [`InternalPeopleQuery::access_filter`] for `user`: `None` when
     /// nothing is hidden from them (`PersonsController.BuildAccessFilter`).
     /// Managers must supply policy evaluation; the default fails closed.
@@ -396,6 +440,21 @@ pub trait LibraryManager: Send + Sync {
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
         let _ = item_id;
         Ok(Vec::new())
+    }
+
+    /// [`Self::get_item_images`] in the same read as whether they are
+    /// auto-oriented when served; delegates to
+    /// [`ItemRepository::get_image_infos_with_auto_orient`](crate::persistence::ItemRepository::get_image_infos_with_auto_orient).
+    /// The default reads the images and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_item_images(item_id).await?, false))
     }
 
     /// The image of the item's `index`-th chapter, if it has one.
@@ -697,6 +756,23 @@ pub trait LibraryManager: Send + Sync {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let _ = (video, user);
         Err(ServiceError::backend("get_additional_parts not supported"))
+    }
+
+    /// Replaces `item`'s cast and crew with `people` when its kind credits
+    /// any (`LibraryManager.UpdatePeople`, gated on `SupportsPeople`),
+    /// creating the `Person` item each new name needs. The default writes
+    /// nothing (stub and fake libraries).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[ferrofin_db::entities::base_items::PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        let _ = (item, people);
+        Ok(())
     }
 
     /// Gets the people rows attached to an item.
@@ -1376,6 +1452,27 @@ pub trait UserManager: Send + Sync {
     /// Persists changes to a user row.
     async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError>;
 
+    /// The user write of `SessionManager.LogSessionActivity`
+    /// (`SessionManager.cs:262-275`): stamps `user`'s `LastActivityDate` with
+    /// `at`, never moving it backwards, and leaves the rest of the row as
+    /// stored. Upstream saves the whole user (`UpdateUserAsync`) to change
+    /// that one column.
+    ///
+    /// The default stamps nothing, so impls without a user store compile
+    /// unchanged; the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error the concrete write surfaces.
+    async fn record_user_activity(
+        &self,
+        user: &UserEntity,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ServiceError> {
+        let _ = (user, at);
+        Ok(())
+    }
+
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
@@ -1502,6 +1599,60 @@ pub trait UserDataSaveListener: Send + Sync {
         item_id: Uuid,
         reason: ferrofin_model::entities::UserDataSaveReason,
     ) -> Result<(), ServiceError>;
+}
+
+/// The audio and subtitle tracks a playback progress report names, with the
+/// user's "Remember audio selections" / "Remember subtitle selections"
+/// settings, which decide what is kept of them (C#
+/// `SessionManager.UpdatePlaybackSettings`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedStreams {
+    /// `PlaybackProgressInfo.AudioStreamIndex`.
+    pub audio_stream_index: Option<i32>,
+    /// `PlaybackProgressInfo.SubtitleStreamIndex`.
+    pub subtitle_stream_index: Option<i32>,
+    /// `User.RememberAudioSelections`.
+    pub remember_audio: bool,
+    /// `User.RememberSubtitleSelections`.
+    pub remember_subtitles: bool,
+}
+
+impl ReportedStreams {
+    /// Whether the report names a track of a kind the user does not want
+    /// remembered, which resets both of the user's remembered tracks for the
+    /// item (`OnPlaybackProgress`'s `ResetPlaybackStreamSelections` call,
+    /// v12.2 `SessionManager.cs:1009-1013`).
+    ///
+    /// Deliberately as upstream: with one setting on and the other off, the
+    /// reset also drops the index of the remembered kind that the same report
+    /// just saved. Keeping it would diverge from v12.2, which is the owner's
+    /// call (gl-116), not a fix to make here.
+    #[must_use]
+    pub fn resets_selections(&self) -> bool {
+        (!self.remember_audio && self.audio_stream_index.is_some())
+            || (!self.remember_subtitles && self.subtitle_stream_index.is_some())
+    }
+
+    /// Applies the report to the remembered `(audio, subtitle)` indices,
+    /// returning whether either changed — `UpdatePlaybackSettings` (v12.2
+    /// `SessionManager.cs:1016-1055`): with a setting on, a reported index
+    /// replaces the remembered one and a report without one keeps it; with a
+    /// setting off, the remembered index is cleared.
+    pub fn apply_to(&self, audio: &mut Option<i32>, subtitle: &mut Option<i32>) -> bool {
+        fn apply(remember: bool, reported: Option<i32>, kept: &mut Option<i32>) -> bool {
+            let next = if remember { reported.or(*kept) } else { None };
+            let changed = next != *kept;
+            *kept = next;
+            changed
+        }
+        let audio_changed = apply(self.remember_audio, self.audio_stream_index, audio);
+        let subtitle_changed = apply(
+            self.remember_subtitles,
+            self.subtitle_stream_index,
+            subtitle,
+        );
+        audio_changed || subtitle_changed
+    }
 }
 
 /// Reads and writes per-user, per-item playback/rating data.
@@ -1688,6 +1839,34 @@ pub trait UserDataManager: Send + Sync {
             .await
     }
 
+    /// Records a playback progress report for one user, returning whether the
+    /// item is now played to completion — C# `SessionManager.OnPlaybackProgress
+    /// (user, item, info)`: the reported position as [`Self::update_play_state`]
+    /// takes it, the reported tracks as `UpdatePlaybackSettings` keeps them
+    /// ([`ReportedStreams`]), one save for both (also when the report carries no
+    /// position but changes a track), then
+    /// [`Self::reset_playback_stream_selections`] when
+    /// [`ReportedStreams::resets_selections`] holds.
+    ///
+    /// The default saves only the position before the reset, so fakes compile
+    /// unchanged; the concrete manager keeps the tracks too.
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        let played = self
+            .update_play_state(user_id, item_id, reported_position_ticks)
+            .await?;
+        if streams.resets_selections() {
+            self.reset_playback_stream_selections(user_id, item_id)
+                .await?;
+        }
+        Ok(played)
+    }
+
     /// Records that playback of an item just started for a user.
     ///
     /// Port of the user-data half of C# `SessionManager.OnPlaybackStart`:
@@ -1829,8 +2008,8 @@ pub trait UserViewManager: Send + Sync {
     /// folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
     /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
     /// its own per-collection-type query instead
-    /// ([`ItemRepository::get_latest_item_list`] — the grouped-threshold form
-    /// for tvshows, the newest albums for music).
+    /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or
+    /// Series card per newest series for tvshows, the newest albums for music).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
     /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,
@@ -2531,6 +2710,57 @@ mod tests {
         ] {
             assert!(!image_type_allows_multiple(other), "{other:?}");
         }
+    }
+
+    /// `UpdatePlaybackSettings` and the reset condition (v12.2
+    /// `SessionManager.cs:1009-1055`, jellyfin#16769 and #17044), for one kind
+    /// (audio): `(remember, reported, stored) → (kept, changed, resets)`.
+    #[test]
+    fn reported_streams_keep_and_reset_as_upstream() {
+        use super::ReportedStreams;
+        for (remember, reported, stored, kept, changed, resets) in [
+            // On: a new index is saved, the same one is no change, none keeps it.
+            (true, Some(2), Some(1), Some(2), true, false),
+            (true, Some(1), Some(1), Some(1), false, false),
+            (true, None, Some(1), Some(1), false, false),
+            (true, Some(2), None, Some(2), true, false),
+            // Off: the stored index is cleared; a reported one also resets.
+            (false, None, Some(1), None, true, false),
+            (false, None, None, None, false, false),
+            (false, Some(2), Some(1), None, true, true),
+            (false, Some(2), None, None, false, true),
+        ] {
+            let streams = ReportedStreams {
+                audio_stream_index: reported,
+                subtitle_stream_index: None,
+                remember_audio: remember,
+                remember_subtitles: true,
+            };
+            let (mut audio, mut subtitle) = (stored, None);
+            let case = format!("{remember} {reported:?} {stored:?}");
+            assert_eq!(
+                streams.apply_to(&mut audio, &mut subtitle),
+                changed,
+                "{case}"
+            );
+            assert_eq!(audio, kept, "{case}");
+            assert_eq!(subtitle, None, "{case}");
+            assert_eq!(streams.resets_selections(), resets, "{case}");
+        }
+
+        // Mixed: audio remembered, subtitles not, and the report names both.
+        // The audio index is kept by `apply_to` and the subtitle one cleared,
+        // and the report still resets both afterwards, as upstream.
+        let mixed = ReportedStreams {
+            audio_stream_index: Some(2),
+            subtitle_stream_index: Some(4),
+            remember_audio: true,
+            remember_subtitles: false,
+        };
+        let (mut audio, mut subtitle) = (Some(1), Some(3));
+        assert!(mixed.apply_to(&mut audio, &mut subtitle));
+        assert_eq!((audio, subtitle), (Some(2), None));
+        assert!(mixed.resets_selections());
     }
 
     #[test]
