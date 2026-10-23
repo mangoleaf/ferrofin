@@ -2786,7 +2786,8 @@ pub fn setup_complete_state(auth: Arc<dyn AuthService>) -> AppState {
 }
 
 /// [`fake_state`] with the given auth service and configuration manager.
-fn fake_state_with(
+#[must_use]
+pub fn fake_state_with(
     auth: Arc<dyn AuthService>,
     config: Arc<dyn ServerConfigurationManager>,
 ) -> AppState {
