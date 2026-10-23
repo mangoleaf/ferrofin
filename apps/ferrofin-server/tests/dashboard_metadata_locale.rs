@@ -3532,6 +3532,17 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
         .find(|task| task["Key"] == "RefreshLibrary")
         .expect("registered refresh task");
     let task_id = task["Id"].as_str().unwrap();
+    // The test's first `/Library/Refresh` may still be in its closing passes:
+    // starting the task again before it is idle is refused.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let task = loop {
+        let task = api.get(&format!("/ScheduledTasks/{task_id}")).await;
+        if task["State"] == "Idle" {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "refresh task never idle: {task}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
     api.post(&format!("/ScheduledTasks/Running/{task_id}"), &Value::Null)
         .await;

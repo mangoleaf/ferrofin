@@ -306,6 +306,12 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
 const RED: [u8; 3] = [180, 30, 30];
 const BLUE: [u8; 3] = [30, 30, 180];
 
+/// `colour` under the black rectangle at alpha `0x78` a library tile (a thumb
+/// collage) draws over its backdrop, as `StripCollageBuilder` does.
+fn dimmed(colour: [u8; 3]) -> [u8; 3] {
+    colour.map(|c| u8::try_from((u16::from(c) * (255 - 0x78) + 127) / 255).unwrap_or(u8::MAX))
+}
+
 /// A solid `colour` photo at `{dir}/a.png`.
 fn write_photo(dir: &Path, colour: [u8; 3]) {
     image::RgbImage::from_pixel(40, 60, image::Rgb(colour))
@@ -607,7 +613,7 @@ async fn a_full_refresh_validation_redraws_albums_and_the_library_tile() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        RED
+        dimmed(RED)
     );
     write_photo(&lib.album_dir, BLUE);
 
@@ -619,7 +625,7 @@ async fn a_full_refresh_validation_redraws_albums_and_the_library_tile() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        RED
+        dimmed(RED)
     );
 
     let full = MetadataRefreshOptions {
@@ -638,7 +644,7 @@ async fn a_full_refresh_validation_redraws_albums_and_the_library_tile() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        BLUE
+        dimmed(BLUE)
     );
 }
 
@@ -688,7 +694,7 @@ async fn a_library_refresh_redraws_its_tile_unless_locked(
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        want
+        dimmed(want)
     );
 }
 
@@ -954,7 +960,7 @@ async fn a_library_tile_jellyfin_drew_is_its_own(
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        want
+        dimmed(want)
     );
 }
 
@@ -981,6 +987,6 @@ async fn a_library_whose_tile_file_is_gone_is_drawn_again() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        RED
+        dimmed(RED)
     );
 }

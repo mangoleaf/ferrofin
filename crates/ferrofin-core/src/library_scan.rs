@@ -3313,7 +3313,65 @@ pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
 
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 11;
+const POST_SCAN_PASSES: u32 = 12;
+
+/// How many items the splashscreen draws its posters (and, separately, its
+/// thumbs or backdrops) from: `GetItemsWithImageType`'s `Limit = 30`.
+const SPLASHSCREEN_IMAGE_LIMIT: i32 = 30;
+
+/// The highest parental rating score an item on the splashscreen may have
+/// (PG-13): `GetItemsWithImageType`'s `MaxParentalRating = new(13, null)`.
+/// Unrated items are included, as upstream sets no `BlockUnratedItems`.
+const SPLASHSCREEN_MAX_PARENTAL_SCORE: i32 = 13;
+
+/// The first `image_type` image path of up to [`SPLASHSCREEN_IMAGE_LIMIT`]
+/// random movies and series rated at most [`SPLASHSCREEN_MAX_PARENTAL_SCORE`].
+/// Port of `GetItemsWithImageType(imageType)` and its
+/// `GetImages(imageType).FirstOrDefault()?.Path` projection. A failed read
+/// is logged and counts as no image.
+async fn splashscreen_images(items: &dyn ItemRepository, image_type: ImageType) -> Vec<String> {
+    let query = InternalItemsQuery {
+        recursive: true,
+        image_types: vec![image_type],
+        limit: Some(SPLASHSCREEN_IMAGE_LIMIT),
+        max_parental_rating: Some(ferrofin_model::entities_media::ParentalRatingScore::new(
+            SPLASHSCREEN_MAX_PARENTAL_SCORE,
+            None,
+        )),
+        order_by: vec![(
+            ferrofin_model::live_tv::ItemSortBy::Random,
+            ferrofin_model::dto::SortOrder::Ascending,
+        )],
+        include_item_types: vec![BaseItemKind::Movie, BaseItemKind::Series],
+        ..InternalItemsQuery::default()
+    };
+    let rows = match items.get_item_list(&query).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, ?image_type, "could not list the splashscreen's items");
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Ok(id) = Uuid::parse_str(&row.id) else {
+            continue;
+        };
+        match items.get_image_infos(id).await {
+            Ok(images) => paths.extend(
+                images
+                    .into_iter()
+                    .find(|image| image.image_type == image_type)
+                    .map(|image| image.path)
+                    .filter(|path| !path.is_empty()),
+            ),
+            Err(err) => {
+                tracing::warn!(%err, item_id = %id, "could not read a splashscreen item's images");
+            }
+        }
+    }
+    paths
+}
 
 /// How long each closing pass of one library validation took, logged once
 /// at its end and recorded on `ferrofin_library_scan_pass_duration_seconds`.
@@ -3330,6 +3388,7 @@ struct PassTimings {
     library_images: std::time::Duration,
     dynamic_images: std::time::Duration,
     collections: std::time::Duration,
+    splashscreen: std::time::Duration,
 }
 
 impl PassTimings {
@@ -3348,6 +3407,7 @@ impl PassTimings {
             library_images,
             dynamic_images,
             collections,
+            splashscreen,
         ] = crate::scan_metrics::SCAN_PASSES;
         crate::scan_metrics::passes_finished(&[
             (music, self.music),
@@ -3361,6 +3421,7 @@ impl PassTimings {
             (library_images, self.library_images),
             (dynamic_images, self.dynamic_images),
             (collections, self.collections),
+            (splashscreen, self.splashscreen),
         ]);
         let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
@@ -3376,6 +3437,7 @@ impl PassTimings {
             library_images_ms = ms(self.library_images),
             dynamic_images_ms = ms(self.dynamic_images),
             collections_ms = ms(self.collections),
+            splashscreen_ms = ms(self.splashscreen),
             "post-scan passes complete"
         );
     }
@@ -3731,6 +3793,9 @@ pub struct LibraryScanner {
     /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
     /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
+    /// The image encoder the post-scan splashscreen pass builds
+    /// `{data}/splashscreen.png` with. `None` in unit tests: no splashscreen.
+    image_encoder: Option<Arc<dyn ferrofin_traits::drawing::ImageEncoder>>,
     /// Maps `OfficialRating` strings to the numeric parental score persisted
     /// in `InheritedParentalRatingValue` (what the Parental Rating sort and
     /// the max-parental-rating filters read). `None` in minimal unit tests.
@@ -3977,6 +4042,7 @@ impl LibraryScanner {
             chapters: None,
             media_attachments: None,
             image_processor: None,
+            image_encoder: None,
             localization: None,
             rating_resolver: None,
             default_metadata_language: "en".to_owned(),
@@ -4394,6 +4460,17 @@ impl LibraryScanner {
         image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
     ) -> Self {
         self.image_processor = Some(image_processor);
+        self
+    }
+
+    /// Attaches the image encoder the post-scan splashscreen pass uses
+    /// (upstream's `SplashscreenPostScanTask` takes `IImageEncoder`).
+    #[must_use]
+    pub fn with_image_encoder(
+        mut self,
+        image_encoder: Arc<dyn ferrofin_traits::drawing::ImageEncoder>,
+    ) -> Self {
+        self.image_encoder = Some(image_encoder);
         self
     }
 
@@ -8519,6 +8596,7 @@ impl LibraryScanner {
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
     /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
+    /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
     // One straight sequence of the closing passes, each timed; a helper per
     // pass would only scatter the table above.
     #[allow(clippy::too_many_lines)]
@@ -8693,6 +8771,12 @@ impl LibraryScanner {
             tracing::warn!(%err, "automatic collection pass failed");
         }
         timings.collections = started.elapsed();
+        if !self.between_passes(run, &mut done).await {
+            return false;
+        }
+        let started = std::time::Instant::now();
+        self.refresh_splashscreen().await;
+        timings.splashscreen = started.elapsed();
         if run.cancel.is_cancelled() {
             return false;
         }
@@ -8700,6 +8784,34 @@ impl LibraryScanner {
         // Every pass ran: a cancellation landing now skipped nothing.
         self.between_passes(run, &mut done).await;
         true
+    }
+
+    /// The splashscreen pass, port of `SplashscreenPostScanTask.Run`: random
+    /// movie and series posters, and their thumbs (their backdrops when no
+    /// item has a thumb), handed to the encoder, which writes
+    /// `{data}/splashscreen.png` when there is at least one of each. A failure
+    /// is logged; the previous splashscreen stays.
+    async fn refresh_splashscreen(&self) {
+        let (Some(encoder), Some(items)) = (&self.image_encoder, &self.item_repository) else {
+            return;
+        };
+        let posters = splashscreen_images(items.as_ref(), ImageType::Primary).await;
+        let mut backdrops = splashscreen_images(items.as_ref(), ImageType::Thumb).await;
+        if backdrops.is_empty() {
+            // Thumb images fit better because they include the title in the
+            // image, but TMDb provides none: backdrops make an image at all.
+            tracing::debug!("no thumb images found, using backdrops for the splashscreen");
+            backdrops = splashscreen_images(items.as_ref(), ImageType::Backdrop).await;
+        }
+        // Without one of each the encoder draws nothing and keeps the old file.
+        tracing::debug!(
+            posters = posters.len(),
+            backdrops = backdrops.len(),
+            "building the splashscreen"
+        );
+        if let Err(err) = encoder.create_splashscreen(&posters, &backdrops).await {
+            tracing::warn!(%err, "splashscreen pass failed");
+        }
     }
 
     /// Between two closing passes: reports the one just done, serves the
