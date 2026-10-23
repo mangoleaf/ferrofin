@@ -16618,14 +16618,20 @@ fn parent_folder_name(path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The album name the tracks agree on: the `Album` tag every tagged track
-/// shares, or `None` when they disagree or none is tagged.
-fn album_name_consensus(tracks: &[BaseItemEntity]) -> Option<String> {
-    let mut names = tracks
+/// The first track's `Album` tag, in the order `tracks` come in
+/// (`children.Select(i => i.Album).FirstOrDefault(i =>
+/// !string.IsNullOrEmpty(i))`, `AlbumMetadataService.cs:83`).
+///
+/// The music pass loads an album's tracks in `SortName` order, which is
+/// disc and track order for numbered tracks. TODO(gl-812): upstream walks
+/// disc folders depth-first instead, which differs for unnumbered tracks in
+/// disc folders and for loose tracks beside them.
+fn first_album_tag(tracks: &[BaseItemEntity]) -> Option<String> {
+    tracks
         .iter()
-        .filter_map(|t| t.album.as_deref().map(str::trim).filter(|s| !s.is_empty()));
-    let first = names.next()?.to_owned();
-    names.all(|n| n == first).then_some(first)
+        .filter_map(|t| t.album.as_deref().map(str::trim))
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 /// The item kinds a library's tile collage samples — port of
@@ -20821,14 +20827,13 @@ fn apply_album_child_metadata(
         changed |= update_premiere_date(&mut updated, tracks);
     }
     // The album row's name starts as the folder stem, which is usually
-    // release noise ("RHCP - Californication (1999) FLAC"). The tracks'
-    // ALBUM tag is authoritative when they agree — upstream's album
-    // metadata comes from the tags, not the directory. Upstream renames
-    // only an unlocked album without a `Name` field lock
+    // release noise ("RHCP - Californication (1999) FLAC"). The first tagged
+    // track names it, even when later tracks carry another tag. Upstream
+    // renames only an unlocked album without a `Name` field lock
     // (`AlbumMetadataService.cs:77-92`).
     if !album.is_locked
         && !locked_fields.contains(&MetadataField::Name)
-        && let Some(tagged) = album_name_consensus(tracks)
+        && let Some(tagged) = first_album_tag(tracks)
         && updated.name.as_deref() != Some(tagged.as_str())
     {
         updated.sort_name = Some(create_sort_name(&tagged));
@@ -25246,32 +25251,48 @@ mod tests {
         assert_eq!(row.date_last_refreshed, None, "a failed lookup is retried");
     }
 
+    /// `AlbumMetadataService.UpdateMetadataFromChildren`: `children.Select(i
+    /// => i.Album).FirstOrDefault(i => !string.IsNullOrEmpty(i))`. The first
+    /// tagged track names the album, even when later tracks disagree.
     #[test]
-    fn album_name_consensus_needs_agreement() {
+    fn an_album_is_named_by_its_first_tagged_track() {
+        use super::apply_album_child_metadata;
         use ferrofin_db::entities::base_items::BaseItemEntity;
+        let album = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            is_folder: true,
+            name: Some("RHCP - Californication (1999) FLAC".to_owned()),
+            ..Default::default()
+        };
         let track = |album: Option<&str>| BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
             album: album.map(ToOwned::to_owned),
             ..Default::default()
         };
-        // All tagged the same → that name wins over the folder stem.
+        let named =
+            |tracks: &[BaseItemEntity]| apply_album_child_metadata(&album, tracks, &[]).0.name;
+
         assert_eq!(
-            super::album_name_consensus(&[
+            named(&[
+                track(None),
+                track(Some("Californication (Remastered)")),
                 track(Some("Californication")),
+            ]),
+            Some("Californication (Remastered)".to_owned()),
+            "the first tagged track wins, though the tags disagree"
+        );
+        assert_eq!(
+            named(&[
                 track(Some("Californication")),
+                track(Some("Californication"))
             ]),
             Some("Californication".to_owned())
         );
-        // Untagged tracks don't veto the consensus.
+        // Nothing tagged: the folder-derived name stays.
         assert_eq!(
-            super::album_name_consensus(&[track(Some("Californication")), track(None)]),
-            Some("Californication".to_owned())
+            named(&[track(None), track(Some(""))]),
+            Some("RHCP - Californication (1999) FLAC".to_owned())
         );
-        // Disagreement (or nothing tagged) leaves the folder-derived name.
-        assert_eq!(
-            super::album_name_consensus(&[track(Some("A")), track(Some("B"))]),
-            None
-        );
-        assert_eq!(super::album_name_consensus(&[track(None)]), None);
     }
 
     #[tokio::test]
