@@ -776,7 +776,8 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, 
         qb.push(format!(
             r#" AND ferrofin_upper_invariant({alias}."Name") LIKE "#
         ));
-        qb.push_bind(format!("%{}%", upper_invariant(contains)));
+        qb.push_bind(format!("%{}%", like_literal(&upper_invariant(contains))));
+        qb.push(r" ESCAPE '\'");
     }
     if let Some(prefix) = filter
         .name_starts_with
@@ -786,7 +787,8 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, 
         qb.push(format!(
             r#" AND ferrofin_upper_invariant({alias}."Name") LIKE "#
         ));
-        qb.push_bind(format!("{}%", upper_invariant(prefix)));
+        qb.push_bind(format!("{}%", like_literal(&upper_invariant(prefix))));
+        qb.push(r" ESCAPE '\'");
     }
     if let Some(less) = filter
         .name_less_than
@@ -1655,6 +1657,15 @@ pub(crate) async fn people_row_count(db: &Database) -> i64 {
         .expect("count people rows")
 }
 
+/// `term` as the body of a `LIKE … ESCAPE '\'` pattern that matches it
+/// literally: `\`, `%` and `_` are escaped, as EF Core's literal
+/// `Contains`/`StartsWith` translations treat them (`PeopleRepository`).
+fn like_literal(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 #[cfg(test)]
 mod tests {
     /// `Person` is the only 10.11.8 entity with
@@ -1847,6 +1858,58 @@ mod tests {
         let people = batched.get(&movie).expect("item present");
         assert_eq!(role_of(people, "Bob Parity"), Some("Lead".to_owned()));
         assert_eq!(role_of(people, "Carol Ferrofin"), Some(String::new()));
+    }
+
+    /// Upstream filters with `Name.ToUpper().Contains(x)` / `StartsWith(x)`
+    /// (`PeopleRepository.ApplyQueryFilter`), literal matches: a `%`, `_` or
+    /// `\` in the term matches only itself, never as a `LIKE` wildcard.
+    #[tokio::test]
+    async fn people_name_filters_match_wildcard_characters_literally() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(
+            movie,
+            &[
+                person("Ann_Lee", "Actor"),
+                person("AnnXLee", "Actor"),
+                person("100% Pure", "Actor"),
+                person("1000 Pure", "Actor"),
+                person(r"Back\Slash", "Actor"),
+            ],
+        )
+        .await
+        .unwrap();
+        let names = |query: InternalPeopleQuery| {
+            let repo = &repo;
+            async move {
+                let mut names: Vec<String> = repo
+                    .get_people(&query)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        let contains = |term: &str| InternalPeopleQuery {
+            name_contains: Some(term.to_owned()),
+            ..Default::default()
+        };
+        let starts = |term: &str| InternalPeopleQuery {
+            name_starts_with: Some(term.to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(names(contains("n_l")).await, ["Ann_Lee"]);
+        assert_eq!(names(contains("%")).await, ["100% Pure"]);
+        assert_eq!(names(contains("_")).await, ["Ann_Lee"]);
+        assert_eq!(names(contains(r"k\s")).await, [r"Back\Slash"]);
+        assert_eq!(names(starts("100%")).await, ["100% Pure"]);
+        assert_eq!(names(starts("ann_")).await, ["Ann_Lee"]);
     }
 
     #[rstest::rstest]

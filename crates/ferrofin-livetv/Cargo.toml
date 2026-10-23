@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Live TV for Ferrofin — M3U tuners, XMLTV guide, DVR timers, Schedules Direct country list."
+description = "Live TV for Ferrofin — M3U and HDHomeRun tuners, XMLTV and Schedules Direct guides, DVR timers."
 
 [lints]
 workspace = true

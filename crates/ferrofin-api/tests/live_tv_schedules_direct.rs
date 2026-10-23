@@ -1,5 +1,6 @@
-//! `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` through the real
-//! router.
+//! The Schedules Direct routes through the real router: the country list,
+//! saving a provider (`POST /LiveTv/ListingProviders`) and its lineups
+//! (`GET /LiveTv/ListingProviders/Lineups`).
 //!
 //! Port of `LiveTvController.GetSchedulesDirectCountries`: the handler streams
 //! the raw JSON document the [`LiveTvManager`] hands back (which the manager
@@ -10,8 +11,8 @@
 //! byte-exact passthrough, and the `500` an upstream fetch failure becomes
 //! (`EnsureSuccessStatusCode` throwing upstream).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -38,11 +39,16 @@ const ROUTE: &str = "/LiveTv/ListingProviders/SchedulesDirect/Countries";
 const SD_COUNTRIES: &[u8] = br#"{ "North America": [ {"fullName":"United States","shortName":"USA","postalCodeExample":"22206","postalCode":"/\\d{5}/"} ],
  "Europe": [ {"fullName":"United Kingdom","shortName":"GBR","postalCodeExample":"SW1A","postalCode":"/^[A-Z]{1,2}[0-9][A-Z0-9]?$/"} ] }"#;
 
-/// A [`LiveTvManager`] whose only live method is the Schedules Direct country
-/// list; it counts calls so the test can prove the handler asked the seam once.
+/// A [`LiveTvManager`] whose live methods are the Schedules Direct country
+/// list, the provider save and the lineups; it counts and records calls so
+/// the test can prove what the handler asked the seam for.
 struct CountriesLiveTv {
     document: Option<Vec<u8>>,
     calls: AtomicUsize,
+    /// Every `save_listing_provider` call: the info and the two flags.
+    saved: Mutex<Vec<(ListingsProviderInfo, bool, bool)>>,
+    /// Every `get_lineups` call: id, type, country, location.
+    lineups: Mutex<Vec<[Option<String>; 4]>>,
 }
 
 impl CountriesLiveTv {
@@ -50,6 +56,8 @@ impl CountriesLiveTv {
         Arc::new(Self {
             document: Some(document.to_vec()),
             calls: AtomicUsize::new(0),
+            saved: Mutex::new(Vec::new()),
+            lineups: Mutex::new(Vec::new()),
         })
     }
 
@@ -57,6 +65,8 @@ impl CountriesLiveTv {
         Arc::new(Self {
             document: None,
             calls: AtomicUsize::new(0),
+            saved: Mutex::new(Vec::new()),
+            lineups: Mutex::new(Vec::new()),
         })
     }
 }
@@ -108,18 +118,34 @@ impl LiveTvManager for CountriesLiveTv {
     }
     async fn save_listing_provider(
         &self,
-        _info: ListingsProviderInfo,
+        info: ListingsProviderInfo,
+        validate_login: bool,
+        validate_listings: bool,
     ) -> Result<ListingsProviderInfo, ServiceError> {
-        unreachable!()
+        self.saved
+            .lock()
+            .unwrap()
+            .push((info.clone(), validate_login, validate_listings));
+        Ok(ListingsProviderInfo {
+            id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            ..info
+        })
     }
     async fn get_lineups(
         &self,
-        _provider_id: Option<&str>,
-        _provider_type: Option<&str>,
-        _country: Option<&str>,
-        _location: Option<&str>,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+        country: Option<&str>,
+        location: Option<&str>,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
-        unreachable!()
+        self.lineups
+            .lock()
+            .unwrap()
+            .push([provider_id, provider_type, country, location].map(|v| v.map(str::to_owned)));
+        Ok(vec![ferrofin_model::dto::NameIdPair {
+            name: Some("Antenna".to_owned()),
+            id: Some("USA-OTA-90210".to_owned()),
+        }])
     }
     async fn get_channel_mapping_options(
         &self,
@@ -171,8 +197,9 @@ impl LiveTvManager for CountriesLiveTv {
     async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }
+    /// The refresh a provider save queues; nothing to rebuild here.
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
-        unreachable!()
+        Ok(())
     }
     async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
         unreachable!()
@@ -301,4 +328,143 @@ async fn is_elevation_gated() {
     let (status, _, _) = get(authed_fake_state().with_live_tv(manager.clone())).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(manager.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Sends `method uri` with an optional JSON body to the real router.
+async fn send(
+    state: AppState,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut request = Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+    }
+    let response = create_router(state)
+        .oneshot(
+            request
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, body.to_vec())
+}
+
+/// jellyfin-web's Schedules Direct login step
+/// (`src/components/tvproviders/schedulesdirect.js`): the plain password in the
+/// body, `ValidateLogin=true` in PascalCase. The flag reaches the manager and
+/// the password is stored as given.
+#[tokio::test]
+async fn the_dashboard_login_save_forwards_validate_login_and_keeps_the_password() {
+    let manager = CountriesLiveTv::serving(SD_COUNTRIES);
+    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let (status, body) = send(
+        state,
+        "POST",
+        "/LiveTv/ListingProviders?ValidateLogin=true",
+        Some(r#"{"Type":"SchedulesDirect","Username":"user","EnableAllTuners":true,"Password":"plain"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let saved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(saved["Id"], "0123456789abcdef0123456789abcdef");
+
+    let calls = manager.saved.lock().unwrap();
+    let (info, validate_login, validate_listings) = &calls[0];
+    assert_eq!((*validate_login, *validate_listings), (true, false));
+    assert_eq!(info.type_.as_deref(), Some("SchedulesDirect"));
+    assert_eq!(
+        info.password
+            .as_ref()
+            .map(ferrofin_model::secret::Secret::expose),
+        Some("plain")
+    );
+}
+
+/// `AddListingProvider`'s `pw`: a non-empty one replaces the body's password
+/// with its lowercase SHA1 hex (jellyfin/jellyfin#17174); `validateListings`
+/// is forwarded; an empty `pw` changes nothing; absent flags are `false`.
+#[tokio::test]
+async fn pw_is_stored_as_its_lowercase_sha1_and_validate_listings_is_forwarded() {
+    let manager = CountriesLiveTv::serving(SD_COUNTRIES);
+    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let body = r#"{"Type":"SchedulesDirect","Username":"user","Password":"body"}"#;
+    let (status, _) = send(
+        state.clone(),
+        "POST",
+        "/LiveTv/ListingProviders?pw=secret&validateListings=true",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(state, "POST", "/LiveTv/ListingProviders?pw=", Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let calls = manager.saved.lock().unwrap();
+    assert_eq!(
+        calls[0]
+            .0
+            .password
+            .as_ref()
+            .map(ferrofin_model::secret::Secret::expose),
+        Some("e5e9fa1ba31ecd1ae84f75caaa474f3a663f05f4")
+    );
+    assert_eq!((calls[0].1, calls[0].2), (false, true));
+    assert_eq!(
+        calls[1]
+            .0
+            .password
+            .as_ref()
+            .map(ferrofin_model::secret::Secret::expose),
+        Some("body")
+    );
+    assert_eq!((calls[1].1, calls[1].2), (false, false));
+}
+
+/// `RequiresElevation`: a plain user cannot save a provider.
+#[tokio::test]
+async fn saving_a_provider_is_elevation_gated() {
+    let manager = CountriesLiveTv::serving(SD_COUNTRIES);
+    let (status, _) = send(
+        authed_fake_state().with_live_tv(manager.clone()),
+        "POST",
+        "/LiveTv/ListingProviders?ValidateLogin=true",
+        Some(r#"{"Type":"SchedulesDirect"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(manager.saved.lock().unwrap().is_empty());
+}
+
+/// jellyfin-web's lineup picker: `Id`, `Location` (the postal code) and
+/// `Country` reach the manager, whatever their casing.
+#[tokio::test]
+async fn lineups_forward_the_id_location_and_country() {
+    let manager = CountriesLiveTv::serving(SD_COUNTRIES);
+    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let (status, body) = send(
+        state,
+        "GET",
+        "/LiveTv/ListingProviders/Lineups?Id=p1&Location=90210&Country=USA",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let lineups: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(lineups[0]["Id"], "USA-OTA-90210");
+    assert_eq!(
+        manager.lineups.lock().unwrap()[0],
+        [
+            Some("p1".to_owned()),
+            None,
+            Some("USA".to_owned()),
+            Some("90210".to_owned())
+        ]
+    );
 }
