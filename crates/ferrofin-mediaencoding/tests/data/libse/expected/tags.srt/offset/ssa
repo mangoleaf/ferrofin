@@ -1,0 +1,20 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:00.99,0:00:03.49,*Default,NTP,0000,0000,0000,,{\i1}Italic line{\i0}\N{\b1}bold{\b0} and {\u1}under{\u0}
+Dialogue: Marked=0,0:00:03.99,0:00:05.99,*Default,NTP,0000,0000,0000,,{\c&H0000ff&}red hex{\c} {\c&H0000ff&}red name{\c}\N{\c&H0000ff&}Red name{\c} {\c&H00ff00&}eight
+Dialogue: Marked=0,0:00:06.49,0:00:08.24,*Default,NTP,0000,0000,0000,,{\an8}Top centred sign
+Dialogue: Marked=0,0:00:08.99,0:00:09.99,*Default,NTP,0000,0000,0000,,{\pos(100,200)}Positioned & "quoted" <odd> a<b
+Dialogue: Marked=0,0:00:09.99,0:00:09.99,*Default,NTP,0000,0000,0000,,Zero length
+Dialogue: Marked=0,0:00:11.12,0:00:12.98,*Default,NTP,0000,0000,0000,,First paragraph\N\Nsecond after a blank line
+Dialogue: Marked=0,25:01:02.34,25:01:04.00,*Default,NTP,0000,0000,0000,,{\fs20\fnArial}Face and size{\fn\fs} &amp; done
