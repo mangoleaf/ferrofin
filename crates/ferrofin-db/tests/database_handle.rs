@@ -217,6 +217,44 @@ async fn snapshot_runs_while_both_pools_are_busy() {
     );
 }
 
+/// A snapshot and the database's own maintenance (a vacuum and a truncating
+/// checkpoint) take turns: a snapshot started mid-maintenance waits for it,
+/// and maintenance finds the turn taken while a snapshot runs.
+#[tokio::test]
+async fn a_snapshot_waits_for_the_maintenance_turn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite://{}", dir.path().join("live.db").display());
+    let db = Database::connect_sized(&url, Some(1))
+        .await
+        .expect("file connect");
+    db.meta_set("snapshot_probe", "committed")
+        .await
+        .expect("write before snapshot");
+
+    let turn = db.try_maintenance_turn().expect("no snapshot runs");
+    assert!(db.try_maintenance_turn().is_none(), "one turn at a time");
+    let dest = dir.path().join("backup.db");
+    let mut snapshot = tokio::spawn({
+        let db = db.clone();
+        let dest = dest.clone();
+        async move { db.snapshot_to(&dest).await }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut snapshot)
+            .await
+            .is_err(),
+        "the snapshot waits while maintenance holds the turn"
+    );
+    assert!(!dest.exists());
+    drop(turn);
+    snapshot.await.expect("join").expect("snapshot");
+    assert!(dest.exists());
+    assert!(
+        db.try_maintenance_turn().is_some(),
+        "the snapshot gave it back"
+    );
+}
+
 #[tokio::test]
 async fn close_is_idempotent_and_observable() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod compression;
 mod contract_routes;
+mod cors;
 pub mod error;
 pub mod extract;
 pub mod handlers;

@@ -667,7 +667,7 @@ impl SessionManager for RecordingSessions {
         _m: SessionMessageType,
         _d: &str,
     ) -> Result<(), ServiceError> {
-        // The played/favorite/progress handlers push `UserDataChanged` here;
+        // The user-data manager's batched `UserDataChanged` goes out here;
         // delivery is covered by the ferrofin-core session-manager tests.
         Ok(())
     }
