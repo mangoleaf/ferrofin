@@ -22,11 +22,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         limits: wasmtime::StoreLimitsBuilder::new().build(),
         memory_limit_bytes: 1024 * 1024,
         http: Arc::new(
-            reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            ferrofin_wasm::capabilities::GuestHttp::new(std::time::Duration::from_secs(5)).unwrap(),
         ),
         http_timeout: std::time::Duration::from_secs(5),
         state_path: None,

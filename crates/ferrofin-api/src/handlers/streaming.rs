@@ -35,6 +35,9 @@ pub(crate) struct StaticSource {
     /// Whether the source is an opened live stream, whose shared buffer is
     /// read directly (upstream's `state.DirectStreamProvider`).
     pub is_live_stream: bool,
+    /// Whether the source is still being written (`IsInfiniteStream`): a file
+    /// that keeps growing while it is read.
+    pub is_infinite_stream: bool,
     /// The `User-Agent` the source requires (an IPTV tuner's), sent when a
     /// remote target is relayed.
     pub user_agent: Option<String>,
@@ -79,6 +82,7 @@ pub(crate) async fn static_source(
         protocol,
         video_type: source.video_type,
         is_live_stream: source.live_stream_id.is_some(),
+        is_infinite_stream: source.is_infinite_stream,
         user_agent,
     })
 }
@@ -103,30 +107,28 @@ pub(crate) async fn static_or_transcode(
         )
         .await?;
         if is_audio || !matches!(source.video_type, Some(VideoType::BluRay | VideoType::Dvd)) {
-            return serve_static_source(state, source, request).await;
+            return serve_static_source(state, source, req.output_container.as_deref(), request)
+                .await;
         }
     }
     transcode_stream_fallback(state, item_id, is_audio, req, request).await
 }
 
 /// Serves a static source: an open shared live stream from its buffer, a file
-/// with `Range` support, an HTTP(S) target by proxying it, anything else is
-/// refused.
+/// with `Range` support or, while it is still being written, as it grows, an
+/// HTTP(S) target by proxying it; anything else is refused.
 ///
-/// Port of the static branches of `VideosController.GetVideoStream`: the
-/// `DirectStreamProvider` is read as `file.ts`, an HTTP input goes through
-/// `GetStaticRemoteStreamResult`, any other non-file protocol is
-/// `400 Input protocol … cannot be streamed statically`.
-///
-/// TODO: upstream serves a `File` source with `IsInfiniteStream` and no encoder
-/// path (an in-progress recording has one and is relayed) as a
-/// `ProgressiveFileStream` that follows the file as it grows; here it is
-/// served as the bytes on disk at request time. Fix path: carry
-/// `is_infinite_stream` in [`StaticSource`] and serve it through `live_tv`'s
-/// progressive body, typed by the output container.
+/// Port of the static branches of `VideosController.GetVideoStream` and
+/// `AudioHelper.GetAudioStream`: the `DirectStreamProvider` is read as
+/// `file.ts`, an HTTP input goes through `GetStaticRemoteStreamResult`, any
+/// other non-file protocol is `400 Input protocol … cannot be streamed
+/// statically`, and a file with `IsInfiniteStream` is a `ProgressiveFileStream`
+/// typed by `output_container` (an in-progress recording names an encoder
+/// path, so it is relayed instead).
 pub(crate) async fn serve_static_source(
     state: &AppState,
     source: StaticSource,
+    output_container: Option<&str>,
     request: Request,
 ) -> Result<Response, ApiError> {
     use ferrofin_model::media_info::MediaProtocol;
@@ -136,6 +138,13 @@ pub(crate) async fn serve_static_source(
         return crate::handlers::live_tv::live_stream_buffer(state, unique_id, "file.ts").await;
     }
     match source.protocol {
+        MediaProtocol::File if source.is_infinite_stream => {
+            Ok(crate::handlers::live_tv::progressive_response(
+                std::path::PathBuf::from(&source.path),
+                0,
+                infinite_stream_content_type(output_container, &source.path),
+            ))
+        }
         MediaProtocol::File => serve_static_file(&source.path, request).await,
         MediaProtocol::Http => {
             serve_remote_static(&source.path, source.user_agent.as_deref(), request).await
@@ -144,6 +153,16 @@ pub(crate) async fn serve_static_source(
             "Input protocol {other:?} cannot be streamed statically"
         ))),
     }
+}
+
+/// The type of a file stream still being written: `state.GetMimeType("." +
+/// state.OutputContainer, false) ?? state.GetMimeType(state.MediaPath)`, where
+/// the container of a request naming none is `ts`, as
+/// `StreamingHelpers.GetStreamingState` sets it for an infinite source.
+fn infinite_stream_content_type(output_container: Option<&str>, path: &str) -> &'static str {
+    use ferrofin_model::net::mime_types::{get_mime_type, get_mime_type_or};
+    let container = output_container.filter(|c| !c.is_empty()).unwrap_or("ts");
+    get_mime_type_or(&format!(".{container}"), None).unwrap_or_else(|| get_mime_type(path))
 }
 
 /// The unique id of the shared buffer a live source reads, from the

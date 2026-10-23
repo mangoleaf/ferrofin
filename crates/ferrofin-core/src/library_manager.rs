@@ -3443,6 +3443,10 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_distinct_years(query).await
     }
 
+    async fn get_tag_names(&self, query: &InternalItemsQuery) -> Result<Vec<String>, ServiceError> {
+        self.items.get_tag_names(query).await
+    }
+
     async fn get_media_stream_languages(
         &self,
         stream_type: MediaStreamType,

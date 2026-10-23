@@ -39,6 +39,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
   really a ZIP gets its cover too. The fallback page is the first in .NET's key order
   (case ignored first), not byte order. A real RAR `.cbr` still gets no cover
+- Give extras their owner's title metadata and dates, as Jellyfin's `RefreshExtras`
+  does. Trailers, featurettes and other extras take the movie's or series' genres,
+  studios, production locations, overview, ratings, year and premiere date when a
+  scan finds them new, renamed or gone, or on a full refresh, and the year and
+  premiere date on every scan. A video extra also takes the year in its file name until
+  its owner has one. Existing extras need one "Search for missing metadata" refresh to
+  get the rest; see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
   Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
   the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
@@ -210,6 +217,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a missing episode whose number a file covers, one with no number, and one carrying the
   provider id of an episode you have under another number are removed, so an adopted
   library no longer lists those episodes twice (see `docs/UPGRADING.md`)
+- Missing and unaired episodes from TheMovieDb, as Jellyfin 12 offers them: the TMDb
+  settings page's "Create unaired episodes", "Create missing episodes" and "Include
+  specials" options, its library list, refresh interval and grace period, and the "Refresh
+  upcoming and missing episodes (TheMovieDb)" scheduled task. Off by default
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -227,6 +238,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - A Live TV channel that drops out of the tuner lineup and comes back keeps its users'
   favourites, likes and play state, as in Jellyfin. The guide refresh that recreates the
   channel gives back the data its removal had set aside
+- Book metadata from an EPUB's or a sidecar's OPF follows Jellyfin's reader:
+  - the first description, publisher, language, date and identifier of each kind count;
+  - the first Calibre series, series index, rating and sort title count;
+  - Calibre's series index and rating round half to even (a `2.5` series index is book 2);
+  - a cover named by `<meta name="cover">` is also found under `Images/`.
+
+  Affected books change on their next metadata refresh
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
@@ -290,6 +308,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the folder without its extension (`Films.HD` gives `Films.mblink`), and a folder inside
   the server's data directory is stored as `%AppDataPath%/…`, so it keeps working if the
   data directory moves
+- During a transcode, PGS and VobSub subtitles a client can draw itself are delivered as
+  separate subtitle files, as in Jellyfin 12, instead of being burned into the video. The
+  "Allow subtitle extraction on the fly" setting now applies: with it off, other embedded
+  subtitles are burned in during a transcode. Playback negotiation also asks the installed
+  ffmpeg which audio encoders it has, instead of assuming a fixed list
 - The Playlists folder is created with Jellyfin's dates: created and modified from its
   directory, and saved now. Before, it had no modified or saved date. A one-off startup
   repair fills the dates missing from the Playlists folder and the Collections library

@@ -1133,6 +1133,19 @@ pub trait LibraryManager: Send + Sync {
         Ok(self.get_query_filters_legacy(query).await?.years)
     }
 
+    /// Gets the tag names of the matching items — the `Tags` facet of
+    /// `GET /Items/Filters2`.
+    ///
+    /// Port of `ILibraryManager.GetTagNames` (Jellyfin 12.1+, v12.2
+    /// `LibraryManager.cs:4203`): the `Tags` values (never `InheritedTags`) of
+    /// the items the query matches, one per clean value (its smallest
+    /// spelling), in value order. That is the legacy facet set's `tags`, which
+    /// the default reads; the repository-backed manager overrides it with the
+    /// one statement.
+    async fn get_tag_names(&self, query: &InternalItemsQuery) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(query).await?.tags)
+    }
+
     /// Gets the distinct language codes of the matching items' media streams of
     /// a given [`MediaStreamType`].
     ///
@@ -2356,6 +2369,106 @@ pub trait LibraryMonitor: Send + Sync {
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 
+/// The server's own file writes, which the library monitor must not take for
+/// a change to rescan: `ILibraryMonitor.ReportFileSystemChangeBeginning` and
+/// `ReportFileSystemChangeComplete` as upstream's writers call them around a
+/// subtitle, lyric, NFO or image save, and around a collection's or a
+/// playlist's folder. Synchronous, so a blocking write can bracket itself; a
+/// [`SelfWrite`] span ends a write on every way out, as upstream's `finally`.
+pub trait SelfWriteGuard: Send + Sync {
+    /// The server starts writing `path`: a change to it, under it, or to the
+    /// folder holding it is ignored until it completes.
+    fn begin(&self, path: &str);
+
+    /// The write to `path` is over. The change stays ignored a while longer,
+    /// since filesystem events often arrive late; with `refresh_path` the path
+    /// is then reported as changed.
+    fn complete(&self, path: &str, refresh_path: bool);
+}
+
+fn _assert_object_safe_self_write_guard(_: &dyn SelfWriteGuard) {}
+
+/// A [`SelfWriteGuard`] the composition root fills once the library monitor
+/// exists. The writers are built before the monitor, so they hold this slot;
+/// a write before it is filled is not bracketed, and the monitor watches
+/// nothing yet then.
+#[derive(Default)]
+pub struct SelfWriteSlot {
+    guard: std::sync::OnceLock<std::sync::Arc<dyn SelfWriteGuard>>,
+}
+
+impl std::fmt::Debug for SelfWriteSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfWriteSlot")
+            .field("filled", &self.guard.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SelfWriteSlot {
+    /// Fills the slot with the monitor's guard. The composition root fills
+    /// it once; a second call is ignored (and asserted against in debug
+    /// builds, as a wiring mistake).
+    pub fn set(&self, guard: std::sync::Arc<dyn SelfWriteGuard>) {
+        let first = self.guard.set(guard).is_ok();
+        debug_assert!(first, "SelfWriteSlot filled twice");
+    }
+}
+
+impl SelfWriteGuard for SelfWriteSlot {
+    fn begin(&self, path: &str) {
+        if let Some(guard) = self.guard.get() {
+            guard.begin(path);
+        }
+    }
+
+    fn complete(&self, path: &str, refresh_path: bool) {
+        if let Some(guard) = self.guard.get() {
+            guard.complete(path, refresh_path);
+        }
+    }
+}
+
+/// One server write under `path`: begun when created, completed (without a
+/// refresh, as every upstream writer does) when dropped, so an early return
+/// or an error still ends it. With no guard it does nothing.
+#[must_use = "the write is complete as soon as this is dropped"]
+pub struct SelfWrite {
+    guard: Option<std::sync::Arc<dyn SelfWriteGuard>>,
+    path: String,
+}
+
+impl std::fmt::Debug for SelfWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfWrite")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SelfWrite {
+    /// Begins the write of `path` on `guard`, when there is one.
+    pub fn begin(
+        guard: Option<&std::sync::Arc<dyn SelfWriteGuard>>,
+        path: impl Into<String>,
+    ) -> Self {
+        let path = path.into();
+        let guard = guard.cloned();
+        if let Some(guard) = &guard {
+            guard.begin(&path);
+        }
+        Self { guard, path }
+    }
+}
+
+impl Drop for SelfWrite {
+    fn drop(&mut self) {
+        if let Some(guard) = &self.guard {
+            guard.complete(&self.path, false);
+        }
+    }
+}
+
 /// Manages the on-disk **virtual-folder** tree that backs the library-structure
 /// admin routes (`/Library/VirtualFolders*`, `/Library/PhysicalPaths`).
 ///
@@ -2677,6 +2790,52 @@ mod tests {
     };
     use ferrofin_model::dto::RecommendationType;
     use ferrofin_model::entities::ImageType;
+    use std::sync::Arc;
+
+    use super::{SelfWrite, SelfWriteGuard, SelfWriteSlot};
+
+    /// A [`SelfWriteGuard`] recording each call, in order.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl SelfWriteGuard for Recording {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A [`SelfWrite`] begins when made and completes, without a refresh,
+    /// when dropped; the slot forwards only once filled, and no guard is no
+    /// bracketing.
+    #[test]
+    fn a_self_write_completes_when_dropped_and_the_slot_forwards_once_filled() {
+        let slot = Arc::new(SelfWriteSlot::default());
+        let guard: Arc<dyn SelfWriteGuard> = slot.clone();
+        drop(SelfWrite::begin(Some(&guard), "/media/a.srt"));
+        let recording = Arc::new(Recording::default());
+        slot.set(recording.clone());
+        {
+            let _write = SelfWrite::begin(Some(&guard), "/media/b.srt");
+            assert_eq!(recording.calls(), ["begin /media/b.srt"]);
+        }
+        drop(SelfWrite::begin(None, "/media/c.srt"));
+        assert_eq!(
+            recording.calls(),
+            ["begin /media/b.srt", "complete /media/b.srt false"]
+        );
+    }
 
     #[test]
     fn only_backdrop_and_chapter_allow_multiple_images() {
