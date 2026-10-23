@@ -12,13 +12,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=parity/lib.sh
 source parity/lib.sh
-[ $# -eq 1 ] && [ -d "$1" ] || { echo "usage: reset.sh RUN_DIR" >&2; exit 2; }
+if [ $# -ne 1 ] || [ ! -d "$1" ]; then echo "usage: reset.sh RUN_DIR" >&2; exit 2; fi
 RUN=$1
 
 reset_server() {   # reset_server NAME: runs in a background subshell; says what failed on stdout, one line
   local name=$1 d=$RUN/$1
   URL=$(cat "$d/url") || { echo "$name: no url recorded at boot"; return 1; }
-  [ -d "$d/pristine/config" ] && [ -d "$d/pristine/cache" ] || { echo "$name: no snapshot taken at boot"; return 1; }
+  if [ ! -d "$d/pristine/config" ] || [ ! -d "$d/pristine/cache" ]; then echo "$name: no snapshot taken at boot"; return 1; fi
   stop_container "parity-$name" || { echo "$name: could not stop it"; return 1; }
   rm -rf -- "${d:?}/config" "${d:?}/cache" || { echo "$name: cannot remove the state the last write left"; return 1; }
   if ! cp -r --reflink=auto "$d/pristine/config" "$d/config" || ! cp -r --reflink=auto "$d/pristine/cache" "$d/cache"; then
