@@ -8,9 +8,14 @@
 //! already applied one of them refuses the other (`VersionMismatch`). This test fails CI
 //! instead, naming both.
 //!
-//! Fixing it: give the migration that is not yet on `main` or a `release/*` branch the next
-//! free number, and regenerate its checksum line (`migration_immutability.rs`). A migration
-//! already on one of those branches is never renumbered.
+//! Fixing it, so that every database runs the chain in number order:
+//! - a pull request merged into its base: the one that merged second renumbers its own
+//!   migration above the base's last migration and every open pull request's into that base;
+//! - `main` merged into a release branch: `main`'s keeps its number, and the release branch's
+//!   unreleased migrations move above `main`'s last migration, keeping their order.
+//!
+//! Update every reference to a moved number (`REBUILD_MIGRATIONS`, `.pre-00NN` snapshot names,
+//! docs) and regenerate its checksum line (`migration_immutability.rs`).
 
 use std::collections::BTreeMap;
 
@@ -35,8 +40,12 @@ fn no_two_migrations_share_a_version() {
         .map(|(v, names)| {
             format!(
                 "migration version {v:04} is used by {} migrations ({}; the files in migrations/ numbered {v}). \
-                 Renumber the one not yet on main or a release/* branch to the next free number \
-                 and regenerate its checksum line.",
+                 A pull request that merged second renumbers its own above the base's last migration and \
+                 every open pull request's into that base; when main merges into a release branch, main's \
+                 keeps its number and the release branch's unreleased migrations move above main's last \
+                 migration, in order. Update every reference to a moved number (REBUILD_MIGRATIONS, \
+                 .pre-00NN snapshot names, docs) and regenerate each moved migration's checksum line \
+                 (migration_immutability.rs; crates/ferrofin-db/tests/migration_versions.rs explains).",
                 names.len(),
                 names.join(", ")
             )

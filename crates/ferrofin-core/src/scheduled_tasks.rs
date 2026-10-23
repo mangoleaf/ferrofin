@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Local, MappedLocalTime, NaiveDateTime, Offset as _, TimeZone, Utc,
+};
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::tasks::{
     TaskCompletionStatus, TaskInfo, TaskResult, TaskState, TaskTriggerInfo, TaskTriggerInfoType,
@@ -1314,40 +1316,121 @@ fn trigger_due(
             now - base >= ticks_to_chrono(interval)
         }
         TaskTriggerInfoType::DailyTrigger | TaskTriggerInfoType::WeeklyTrigger => {
-            let Some(time_of_day) = trigger.time_of_day_ticks else {
+            calendar_trigger_due(
+                &Local,
+                trigger,
+                now,
+                last_fire,
+                scheduler_start,
+                triggers_since,
+            )
+        }
+    }
+}
+
+/// [`trigger_due`] for a `DailyTrigger` or `WeeklyTrigger`, read on the wall clock
+/// of `tz`: the host's [`Local`] zone in production, a fixed zone in tests.
+///
+/// Today's occurrence is the one considered, plus yesterday's when it reads on
+/// today's date. That happens only for a time in a spring-forward gap at the end of
+/// a day (Greenland jumps from 23:00 to 00:00), which fires just after midnight.
+/// Any other occurrence of yesterday's, one missed while the host was suspended for
+/// example, is not caught up.
+fn calendar_trigger_due<Tz: TimeZone>(
+    tz: &Tz,
+    trigger: &TaskTriggerInfo,
+    now: DateTime<Utc>,
+    last_fire: Option<DateTime<Utc>>,
+    scheduler_start: DateTime<Utc>,
+    triggers_since: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(time_of_day) = trigger.time_of_day_ticks else {
+        return false;
+    };
+    let weekday = if trigger.type_ == TaskTriggerInfoType::WeeklyTrigger {
+        let Some(day) = trigger.day_of_week.and_then(weekday_of) else {
+            return false;
+        };
+        Some(day)
+    } else {
+        None
+    };
+    let seconds_of_day = time_of_day / TICKS_PER_SECOND;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (h, m, s) = (
+        (seconds_of_day / 3600) as u32 % 24,
+        ((seconds_of_day / 60) % 60) as u32,
+        (seconds_of_day % 60) as u32,
+    );
+    // An occurrence that predates scheduler start — or the moment the
+    // trigger set was last saved — never fires: booting at noon must
+    // not immediately run every daily-at-3am task, and saving the
+    // schedule at 20:00 must not re-run this morning's occurrence (the
+    // C# DailyTrigger schedules the *next* occurrence in both cases).
+    let floor = triggers_since.map_or(scheduler_start, |since| since.max(scheduler_start));
+    let today = now.with_timezone(tz).date_naive();
+    [today.pred_opt(), Some(today)]
+        .into_iter()
+        .flatten()
+        .any(|date| {
+            if weekday.is_some_and(|day| date.weekday() != day) {
                 return false;
-            };
-            let local_now = now.with_timezone(&Local);
-            if trigger.type_ == TaskTriggerInfoType::WeeklyTrigger {
-                let Some(day) = trigger.day_of_week else {
-                    return false;
-                };
-                if Some(local_now.weekday()) != weekday_of(day) {
-                    return false;
-                }
             }
-            let seconds_of_day = time_of_day / TICKS_PER_SECOND;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let (h, m, s) = (
-                (seconds_of_day / 3600) as u32 % 24,
-                ((seconds_of_day / 60) % 60) as u32,
-                (seconds_of_day % 60) as u32,
-            );
-            let Some(scheduled_local) = local_now
-                .date_naive()
-                .and_hms_opt(h, m, s)
-                .and_then(|naive| Local.from_local_datetime(&naive).earliest())
-            else {
+            let Some(naive) = date.and_hms_opt(h, m, s) else {
                 return false;
             };
-            let scheduled = scheduled_local.with_timezone(&Utc);
-            // An occurrence that predates scheduler start — or the moment the
-            // trigger set was last saved — never fires: booting at noon must
-            // not immediately run every daily-at-3am task, and saving the
-            // schedule at 20:00 must not re-run this morning's occurrence (the
-            // C# DailyTrigger schedules the *next* occurrence in both cases).
-            let floor = triggers_since.map_or(scheduler_start, |since| since.max(scheduler_start));
-            now >= scheduled && scheduled >= floor && last_fire.is_none_or(|f| f < scheduled)
+            let scheduled = wall_clock_occurrence(tz, naive);
+            let reads_today = date == today || scheduled.with_timezone(tz).date_naive() == today;
+            reads_today
+                && now >= scheduled
+                && scheduled >= floor
+                && last_fire.is_none_or(|f| f < scheduled)
+        })
+}
+
+/// The instant a daily or weekly trigger fires for the wall-clock time `naive` in
+/// `tz`.
+///
+/// `DailyTrigger.Start` and `WeeklyTrigger.Start` arm a timer for `triggerDate -
+/// DateTime.Now`, a difference of local wall-clock values, which fires at the
+/// trigger time read with the offset in effect when the timer was armed. Ferrofin
+/// reads a time the way that timer does in the two cases the clock leaves open:
+/// - A time in a fall-back overlap happens twice. It fires at its first occurrence
+///   (02:30 CEST, not the second 02:30, in CET).
+/// - A time inside a spring-forward gap does not exist on that day's clock. It
+///   still fires, at that instant read with the pre-gap offset, just after the
+///   jump: 02:30 in the CET → CEST gap is 01:30 UTC, which the clock shows as 03:30.
+///
+/// Every other time fires when the clock shows it. Upstream's timer, armed before
+/// the change, also shifts the times after the change by it on that one day; that
+/// drift is not ported. Booting the scheduler, or saving the triggers, within the changed hour
+/// can differ from upstream by one fire that day: upstream compares the wall-clock
+/// time of day at that moment, Ferrofin the instants.
+fn wall_clock_occurrence<Tz: TimeZone>(tz: &Tz, naive: NaiveDateTime) -> DateTime<Utc> {
+    match tz.from_local_datetime(&naive) {
+        MappedLocalTime::Single(at) => at.with_timezone(&Utc),
+        MappedLocalTime::Ambiguous(a, b) => {
+            // chrono's `Local` lists the two instants by offset, not by time, so
+            // compare the instants. It also reports the instant the clock falls
+            // back at as ambiguous, with a candidate that never occurred (its offset
+            // is not the zone's offset at that instant), so keep only real ones.
+            let real = |at: &DateTime<Tz>| {
+                tz.offset_from_utc_datetime(&at.naive_utc()).fix() == at.offset().fix()
+            };
+            let (a_utc, b_utc) = (a.with_timezone(&Utc), b.with_timezone(&Utc));
+            match (real(&a), real(&b)) {
+                (true, false) => a_utc,
+                (false, true) => b_utc,
+                _ => a_utc.min(b_utc),
+            }
+        }
+        MappedLocalTime::None => {
+            // The offset a day earlier is the one before the gap: no zone changes
+            // its offset twice within a day.
+            let before = tz
+                .offset_from_utc_datetime(&(naive - chrono::TimeDelta::days(1)))
+                .fix();
+            (naive - chrono::TimeDelta::seconds(i64::from(before.local_minus_utc()))).and_utc()
         }
     }
 }
@@ -1488,7 +1571,10 @@ mod tests {
 
     use ferrofin_traits::error::ServiceError;
 
-    use super::{FerrofinTaskManager, ScheduledTask, TICKS_PER_SECOND, TaskProgress, trigger_due};
+    use super::{
+        FerrofinTaskManager, ScheduledTask, TICKS_PER_SECOND, TaskProgress, calendar_trigger_due,
+        trigger_due, wall_clock_occurrence,
+    };
 
     struct CountingTask {
         runs: Arc<AtomicU32>,
@@ -3197,5 +3283,327 @@ mod tests {
             .unwrap();
         assert_eq!(task.captured.lock().unwrap()[2], "sv");
         task.release.notify_one();
+    }
+
+    /// A zone with one standard and one daylight offset and a single pair of
+    /// transitions, so the DST edges are testable on any host. It maps wall-clock
+    /// times the way chrono's `Local` does on real tzdata, so the tests pin what
+    /// production sees:
+    /// - a time strictly inside the spring-forward gap is `None`;
+    /// - the gap's start reads with the standard offset;
+    /// - the whole fall-back overlap, both ends included, is `Ambiguous`, its two
+    ///   instants listed by offset, smaller first.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DstZone {
+        standard: i32,
+        daylight: i32,
+        /// The UTC instants daylight time starts and ends.
+        spring: chrono::NaiveDateTime,
+        fall: chrono::NaiveDateTime,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DstOffset {
+        zone: DstZone,
+        seconds: i32,
+    }
+
+    impl chrono::Offset for DstOffset {
+        fn fix(&self) -> chrono::FixedOffset {
+            chrono::FixedOffset::east_opt(self.seconds).unwrap()
+        }
+    }
+
+    /// The wall-clock time `seconds` east of UTC shows at the UTC instant `utc`.
+    fn wall_at(utc: chrono::NaiveDateTime, seconds: i32) -> chrono::NaiveDateTime {
+        utc + chrono::TimeDelta::seconds(seconds.into())
+    }
+
+    impl DstZone {
+        fn offset(self, seconds: i32) -> DstOffset {
+            DstOffset {
+                zone: self,
+                seconds,
+            }
+        }
+
+        fn in_daylight(self, utc: chrono::NaiveDateTime) -> bool {
+            if self.spring < self.fall {
+                (self.spring..self.fall).contains(&utc)
+            } else {
+                // Southern hemisphere: daylight time spans the new year.
+                utc >= self.spring || utc < self.fall
+            }
+        }
+    }
+
+    impl chrono::TimeZone for DstZone {
+        type Offset = DstOffset;
+
+        fn from_offset(offset: &DstOffset) -> Self {
+            offset.zone
+        }
+
+        fn offset_from_local_date(
+            &self,
+            local: &chrono::NaiveDate,
+        ) -> chrono::MappedLocalTime<DstOffset> {
+            self.offset_from_local_datetime(&local.and_time(chrono::NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::MappedLocalTime<DstOffset> {
+            let (standard, daylight) = (self.offset(self.standard), self.offset(self.daylight));
+            let gap = (
+                wall_at(self.spring, self.standard),
+                wall_at(self.spring, self.daylight),
+            );
+            let overlap = (
+                wall_at(self.fall, self.standard),
+                wall_at(self.fall, self.daylight),
+            );
+            if gap.0 < *local && *local < gap.1 {
+                chrono::MappedLocalTime::None
+            } else if overlap.0 <= *local && *local <= overlap.1 {
+                chrono::MappedLocalTime::Ambiguous(standard, daylight)
+            } else if self.in_daylight(*local - chrono::TimeDelta::seconds(self.daylight.into())) {
+                // Outside the gap and the overlap exactly one offset round-trips.
+                chrono::MappedLocalTime::Single(daylight)
+            } else {
+                chrono::MappedLocalTime::Single(standard)
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> DstOffset {
+            self.offset_from_utc_datetime(&utc.and_time(chrono::NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> DstOffset {
+            self.offset(if self.in_daylight(*utc) {
+                self.daylight
+            } else {
+                self.standard
+            })
+        }
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Utc> {
+        at(y, mo, d, h, mi).and_utc()
+    }
+
+    /// Europe/Berlin in 2026: CET +1, CEST +2 from 29 March to 25 October, both at
+    /// 01:00 UTC.
+    const BERLIN: DstZone = DstZone {
+        standard: 3600,
+        daylight: 7200,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 3, 29)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+    };
+    /// America/New_York in 2026: EST −5, EDT −4 from 8 March 07:00 UTC to 1
+    /// November 06:00 UTC.
+    const NEW_YORK: DstZone = DstZone {
+        standard: -5 * 3600,
+        daylight: -4 * 3600,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+            .unwrap()
+            .and_hms_opt(7, 0, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(6, 0, 0)
+            .unwrap(),
+    };
+    /// Australia/Lord_Howe in 2026: +10:30, +11 from 4 October (02:00 local, 3
+    /// October 15:30 UTC) to 5 April (02:00 local daylight, 4 April 15:00 UTC); a
+    /// 30-minute change, with daylight time spanning the new year.
+    const LORD_HOWE: DstZone = DstZone {
+        standard: 10 * 3600 + 1800,
+        daylight: 11 * 3600,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 10, 3)
+            .unwrap()
+            .and_hms_opt(15, 30, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 4, 4)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap(),
+    };
+    /// America/Nuuk in 2026: −2, −1 from 28 March 23:00 local (29 March 01:00 UTC),
+    /// a gap at the end of the local day.
+    const NUUK: DstZone = DstZone {
+        standard: -2 * 3600,
+        daylight: -3600,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 3, 29)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+    };
+
+    fn at_time_of_day(type_: TaskTriggerInfoType, hours: i64, minutes: i64) -> TaskTriggerInfo {
+        TaskTriggerInfo {
+            type_,
+            time_of_day_ticks: Some((hours * 3600 + minutes * 60) * TICKS_PER_SECOND),
+            day_of_week: Some(ferrofin_model::dto::DayOfWeek::Sunday),
+            ..TaskTriggerInfo::default()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::berlin_summer(BERLIN, at(2026, 7, 1, 2, 30), utc(2026, 7, 1, 0, 30))]
+    #[case::berlin_winter(BERLIN, at(2026, 1, 15, 2, 30), utc(2026, 1, 15, 1, 30))]
+    // Inside the gap: read with CET, so 01:30 UTC, which the clock shows as 03:30.
+    #[case::berlin_gap(BERLIN, at(2026, 3, 29, 2, 30), utc(2026, 3, 29, 1, 30))]
+    #[case::berlin_gap_start(BERLIN, at(2026, 3, 29, 2, 0), utc(2026, 3, 29, 1, 0))]
+    // The overlap's first occurrence, in CEST.
+    #[case::berlin_overlap(BERLIN, at(2026, 10, 25, 2, 30), utc(2026, 10, 25, 0, 30))]
+    // 03:00 is the instant the clock falls back at; its CEST reading never happened.
+    #[case::berlin_overlap_end(BERLIN, at(2026, 10, 25, 3, 0), utc(2026, 10, 25, 2, 0))]
+    #[case::new_york_gap(NEW_YORK, at(2026, 3, 8, 2, 30), utc(2026, 3, 8, 7, 30))]
+    #[case::new_york_overlap(NEW_YORK, at(2026, 11, 1, 1, 30), utc(2026, 11, 1, 5, 30))]
+    #[case::new_york_overlap_end(NEW_YORK, at(2026, 11, 1, 2, 0), utc(2026, 11, 1, 7, 0))]
+    // A 30-minute change: 02:15 sits in the 02:00–02:30 gap, read with +10:30.
+    #[case::lord_howe_gap(LORD_HOWE, at(2026, 10, 4, 2, 15), utc(2026, 10, 3, 15, 45))]
+    #[case::lord_howe_overlap(LORD_HOWE, at(2026, 4, 5, 1, 45), utc(2026, 4, 4, 14, 45))]
+    #[case::lord_howe_overlap_end(LORD_HOWE, at(2026, 4, 5, 2, 0), utc(2026, 4, 4, 15, 30))]
+    fn a_wall_clock_time_reads_as_the_clock_shows_it_or_as_upstreams_timer_reads_a_gap_or_overlap(
+        #[case] zone: DstZone,
+        #[case] wall: chrono::NaiveDateTime,
+        #[case] expected: chrono::DateTime<Utc>,
+    ) {
+        assert_eq!(wall_clock_occurrence(&zone, wall), expected);
+    }
+
+    #[test]
+    fn daily_and_weekly_triggers_in_the_spring_forward_gap_fire_just_after_the_jump() {
+        let boot = utc(2026, 3, 28, 12, 0);
+        // 29 March 2026 is a Sunday, so the weekly trigger falls on the gap day too.
+        for type_ in [
+            TaskTriggerInfoType::DailyTrigger,
+            TaskTriggerInfoType::WeeklyTrigger,
+        ] {
+            let trigger = at_time_of_day(type_, 2, 30);
+            let due = |now, last_fire| {
+                calendar_trigger_due(&BERLIN, &trigger, now, last_fire, boot, None)
+            };
+            // 03:00 CEST, just after the jump: 02:30 CET (01:30 UTC) is still ahead.
+            assert!(!due(utc(2026, 3, 29, 1, 0), None), "{type_:?}");
+            // 03:31 CEST: due, where the gap used to skip the day.
+            assert!(due(utc(2026, 3, 29, 1, 31), None), "{type_:?}");
+            // Once fired, not again that day, nor the next.
+            assert!(
+                !due(utc(2026, 3, 29, 5, 0), Some(utc(2026, 3, 29, 1, 31))),
+                "{type_:?}"
+            );
+            assert!(
+                !due(utc(2026, 3, 29, 22, 30), Some(utc(2026, 3, 29, 1, 31))),
+                "{type_:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_at_the_end_of_the_day_fires_just_after_midnight() {
+        // Nuuk jumps from 23:00 to 00:00, so 23:30 on Saturday 28 March reads as
+        // 00:30 on Sunday 29 March. The weekly trigger is for Saturday.
+        let boot = utc(2026, 3, 28, 12, 0);
+        for type_ in [
+            TaskTriggerInfoType::DailyTrigger,
+            TaskTriggerInfoType::WeeklyTrigger,
+        ] {
+            let trigger = TaskTriggerInfo {
+                day_of_week: Some(ferrofin_model::dto::DayOfWeek::Saturday),
+                ..at_time_of_day(type_, 23, 30)
+            };
+            let due =
+                |now, last_fire| calendar_trigger_due(&NUUK, &trigger, now, last_fire, boot, None);
+            assert!(!due(utc(2026, 3, 29, 1, 29), None), "{type_:?}");
+            assert!(due(utc(2026, 3, 29, 1, 31), None), "{type_:?}");
+            assert!(
+                !due(utc(2026, 3, 29, 2, 0), Some(utc(2026, 3, 29, 1, 31))),
+                "{type_:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_occurrence_missed_yesterday_is_not_caught_up() {
+        // The host was suspended across yesterday's 22:00 (and Sunday 03:00): on
+        // resume nothing fires until today's own occurrence.
+        let boot = utc(2026, 7, 1, 12, 0);
+        let daily = at_time_of_day(TaskTriggerInfoType::DailyTrigger, 22, 0);
+        let weekly = at_time_of_day(TaskTriggerInfoType::WeeklyTrigger, 3, 0);
+        // Suspended from Friday 3 July to Monday 6 July 07:00 UTC (09:00 CEST).
+        let last = Some(utc(2026, 7, 2, 20, 0));
+        assert!(!calendar_trigger_due(
+            &BERLIN,
+            &daily,
+            utc(2026, 7, 6, 7, 0),
+            last,
+            boot,
+            None
+        ));
+        // Monday 00:30 CEST, the day after the weekly trigger's Sunday.
+        assert!(!calendar_trigger_due(
+            &BERLIN,
+            &weekly,
+            utc(2026, 7, 5, 22, 30),
+            None,
+            boot,
+            None
+        ));
+        // Today's own occurrence still fires.
+        assert!(calendar_trigger_due(
+            &BERLIN,
+            &daily,
+            utc(2026, 7, 6, 20, 1),
+            last,
+            boot,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_daily_trigger_in_the_fall_back_overlap_fires_once_at_the_first_occurrence() {
+        let boot = utc(2026, 10, 24, 12, 0);
+        let trigger = at_time_of_day(TaskTriggerInfoType::DailyTrigger, 2, 30);
+        let due =
+            |now, last_fire| calendar_trigger_due(&BERLIN, &trigger, now, last_fire, boot, None);
+        assert!(!due(utc(2026, 10, 25, 0, 29), None));
+        assert!(due(utc(2026, 10, 25, 0, 31), None));
+        // The second 02:30 (CET, 01:30 UTC) does not fire again.
+        assert!(!due(
+            utc(2026, 10, 25, 1, 31),
+            Some(utc(2026, 10, 25, 0, 31))
+        ));
+    }
+
+    #[test]
+    fn a_trigger_at_the_instant_the_clock_falls_back_keeps_its_time() {
+        // Generate Trickplay's default 03:00: on 25 October the clock reads 03:00
+        // only once, at 02:00 UTC (CET), not an hour earlier.
+        let boot = utc(2026, 10, 24, 12, 0);
+        let trigger = at_time_of_day(TaskTriggerInfoType::DailyTrigger, 3, 0);
+        let due = |now| calendar_trigger_due(&BERLIN, &trigger, now, None, boot, None);
+        assert!(!due(utc(2026, 10, 25, 1, 30)));
+        assert!(due(utc(2026, 10, 25, 2, 0)));
     }
 }

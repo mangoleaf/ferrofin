@@ -283,7 +283,9 @@ pub struct InternalItemsQuery {
     /// When set, a non-recursive `parent_id` browse matches only PHYSICAL children
     /// (`bi.ParentId = parent_id`) and does NOT merge the parent's `LinkedChildren`
     /// members. Used by delete-cascade so removing a box-set/playlist never deletes
-    /// the referenced items (linked children are references, not owned children).
+    /// the referenced items (linked children are references, not owned children),
+    /// and by the `/Items/Filters2` facets, whose `Parent` upstream matches as a
+    /// strict `ParentId` equality (`TranslateQuery.cs:320-322`).
     pub physical_children_only: bool,
     /// The physical folders [`Self::parent_id`] stands for, when it names a
     /// Jellyfin `CollectionFolder`.

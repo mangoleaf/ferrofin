@@ -100,8 +100,12 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     path into the `-init_hw_device` string unquoted, so a path with a space or quote breaks
     the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
     is passed exactly as Jellyfin passes it.
-- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed
-  DVR timers & recordings. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
+- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
+  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
+  program details and artwork, SD's error codes and daily limits); it is verified against
+  Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
+  Schedules Direct account**. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
   `discover.json`/`lineup.json`, UDP device discovery, the per-channel HTTP stream with
   its transcode profiles, and the legacy binary control protocol. **No physical HDHomeRun
   has been run against it** — it is verified against Jellyfin's own JSON fixtures, against
@@ -112,10 +116,16 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — 19 of Jellyfin's scheduled tasks (including the Live TV guide
+- **Scheduled tasks** — 20 of Jellyfin's scheduled tasks (including the Live TV guide
   refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
-  collections and playlists" is gone, as in Jellyfin 12; Jellyfin 12's "Refresh upcoming
-  and missing episodes (TheMovieDb)" task is not ported yet.
+  collections and playlists" is gone, as in Jellyfin 12, and Jellyfin 12's "Refresh
+  upcoming and missing episodes (TheMovieDb)" is there.
+- **Missing and unaired episodes** — the TMDb settings page's options from Jellyfin 12:
+  for the TV libraries opted in, a series refresh adds a virtual entry for each episode
+  TheMovieDb lists that has not aired yet and/or each aired one the library lacks (and a
+  virtual season when the library has nothing of a season), keeps them in step with
+  TheMovieDb, and removes them once a file arrives, they age out, or the option is turned
+  off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half

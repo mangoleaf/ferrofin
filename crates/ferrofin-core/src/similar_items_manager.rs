@@ -1458,18 +1458,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             return Ok(Vec::new());
         }
 
-        // Recently-played movies (C#: IsPlayed, OrderBy DatePlayed desc, Limit 7,
-        // EnableGroupByMetadataKey, so PrepareFilterQuery reads 4 more).
-        let mut recent_played_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: vec![BaseItemKind::Movie],
-            recursive: true,
-            is_played: Some(true),
-            limit: Some(RECENTLY_PLAYED_LIMIT),
-            order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
-            enable_group_by_metadata_key: true,
-            ..Default::default()
-        };
+        let mut recent_played_q = recently_played_query(parent_id);
         recent_played_q.set_user(user.clone());
         let recently_played = self.items.get_item_list(&recent_played_q).await?;
 
@@ -1480,17 +1469,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             .filter_map(|m| Uuid::parse_str(&m.id).ok())
             .collect();
         let movie_kinds = self.movie_candidate_kinds().await;
-        let mut liked_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: movie_kinds.clone(),
-            is_movie: Some(true),
-            recursive: true,
-            is_favorite_or_liked: Some(true),
-            limit: Some(LIKED_LIMIT),
-            exclude_item_ids: played_ids.clone(),
-            enable_group_by_metadata_key: true,
-            ..Default::default()
-        };
+        let mut liked_q = liked_query(parent_id, movie_kinds.clone(), played_ids.clone());
         liked_q.set_user(user.clone());
         let liked = self.items.get_item_list(&liked_q).await?;
 
@@ -1545,6 +1524,50 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             },
         )
         .await
+    }
+}
+
+/// The recently-played baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:316-325`): played movies, most recently played
+/// first and ties shuffled, up to [`RECENTLY_PLAYED_LIMIT`]. It is grouped by
+/// metadata key (`EnableGroupByMetadataKey`), so `PrepareFilterQuery` reads 4
+/// more.
+fn recently_played_query(parent_id: Uuid) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: vec![BaseItemKind::Movie],
+        recursive: true,
+        is_played: Some(true),
+        limit: Some(RECENTLY_PLAYED_LIMIT),
+        order_by: vec![
+            (ItemSortBy::DatePlayed, SortOrder::Descending),
+            (ItemSortBy::Random, SortOrder::Descending),
+        ],
+        enable_group_by_metadata_key: true,
+        ..Default::default()
+    }
+}
+
+/// The liked baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:335-347`): favourite or liked movies of `kinds`,
+/// a random [`LIKED_LIMIT`] of them, without the recently played ones.
+/// Grouped by metadata key too, so 4 more are read.
+fn liked_query(
+    parent_id: Uuid,
+    kinds: Vec<BaseItemKind>,
+    played_ids: Vec<Uuid>,
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: kinds,
+        is_movie: Some(true),
+        recursive: true,
+        is_favorite_or_liked: Some(true),
+        limit: Some(LIKED_LIMIT),
+        exclude_item_ids: played_ids,
+        order_by: vec![(ItemSortBy::Random, SortOrder::Descending)],
+        enable_group_by_metadata_key: true,
+        ..Default::default()
     }
 }
 
@@ -2882,6 +2905,25 @@ mod tests {
             .await
             .expect("similar");
         assert!(similar.is_none());
+    }
+
+    /// `GetMovieRecommendationsAsync`'s baseline orders: recently played by
+    /// `DatePlayed` descending then `Random` (`:319`), liked by `Random` alone
+    /// (`:339`), so a user with more than ten favourites gets a different
+    /// liked set on each load.
+    #[test]
+    fn the_recommendation_baselines_order_as_upstream() {
+        assert_eq!(
+            super::recently_played_query(Uuid::nil()).order_by,
+            vec![
+                (ItemSortBy::DatePlayed, SortOrder::Descending),
+                (ItemSortBy::Random, SortOrder::Descending),
+            ]
+        );
+        assert_eq!(
+            super::liked_query(Uuid::nil(), vec![BaseItemKind::Movie], Vec::new()).order_by,
+            vec![(ItemSortBy::Random, SortOrder::Descending)]
+        );
     }
 
     #[tokio::test]

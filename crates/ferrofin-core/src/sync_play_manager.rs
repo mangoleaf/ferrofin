@@ -35,7 +35,9 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::session_bus::SessionMessageBus;
-use ferrofin_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
+use ferrofin_traits::stubs::{
+    PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
+};
 use ferrofin_util::shuffle_extensions::shuffle;
 
 /// .NET tick resolution: 100-nanosecond units, so 10_000 ticks per millisecond.
@@ -711,6 +713,27 @@ impl Group {
             GroupStateType::Paused => self.resume_playing = false,
             GroupStateType::Waiting | GroupStateType::Idle => {}
         }
+    }
+
+    /// The playing-session arm of `Group.CreateGroup` (Group.cs:298-316): the
+    /// group starts on the creator's item at its reported position, waiting,
+    /// and resumes once everyone is ready unless the creator was paused.
+    ///
+    /// The playlist is the reported queue. When the queue lacks the playing
+    /// item it is that item alone, as the open upstream fix
+    /// jellyfin/jellyfin#18198 does: v12.2 stores `NowPlayingQueue` only when
+    /// playback stops, so its queue is stale or empty and a missing item
+    /// leaves the group with nothing playing.
+    fn seed_from_now_playing(&mut self, now_playing: &SyncPlayNowPlaying) {
+        let item = now_playing.item_id;
+        let (ids, at) = match now_playing.queue.iter().position(|id| *id == item) {
+            Some(at) => (now_playing.queue.as_slice(), at),
+            None => (std::slice::from_ref(&item), 0),
+        };
+        self.queue.set(ids, i32::try_from(at).unwrap_or(0));
+        self.position_ticks = now_playing.position_ticks.unwrap_or(0);
+        self.resume_playing = !now_playing.is_paused;
+        self.set_state(GroupStateType::Waiting);
     }
 
     /// `Group.RestartCurrentItem` (Group.cs:601-605) — rewind to the head of the
@@ -2094,7 +2117,17 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         &self,
         session: &SyncPlaySession,
         group_name: &str,
+        now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
+        // Resolved off the registry lock, as `handle_request` does for a new queue.
+        let runtimes = match now_playing {
+            Some(np) => {
+                let mut ids = np.queue.clone();
+                ids.push(np.item_id);
+                self.item_run_times(&ids).await
+            }
+            None => HashMap::new(),
+        };
         let now = Utc::now();
         let (info, joined_env, targets, outbound, left) = {
             let mut reg = self.lock();
@@ -2105,12 +2138,17 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             let mut group = Group::new(group_id, group_name.trim().to_owned(), now);
             group.wait_timeout = self.group_wait_timeout;
             group.add_member(session);
+            if let Some(np) = now_playing {
+                group.item_runtimes = runtimes;
+                group.seed_from_now_playing(np);
+            }
             let joined = render_update(GroupUpdate::GroupJoined(GroupJoinedUpdate {
                 group_id,
                 data: group.info(now),
             }));
-            // `Group.CreateGroup` ends with the state hook — on a brand-new
-            // (Idle) group that is a Stop command to the creating session.
+            // `Group.CreateGroup` ends with the state hook: a Stop to the
+            // creator of an Idle group, or the Waiting arm's NewPlaylist for a
+            // creator that is playing.
             let outbound = group.session_joined(&session.session_id, now);
             // The HTTP response is a SECOND, LATER snapshot: `SyncPlayManager.NewGroup`
             // returns `group.GetInfo()` AFTER `CreateGroup` has run the state hook
@@ -2672,7 +2710,7 @@ mod tests {
     async fn new_group_creates_and_lists() {
         let (m, bus) = mgr();
         let s = session("s1", "alice");
-        let info = m.new_group(&s, "movie night").await.unwrap();
+        let info = m.new_group(&s, "movie night", None).await.unwrap();
         assert_eq!(info.group_name, "movie night");
         assert_eq!(info.participants, vec!["alice".to_string()]);
         assert_eq!(info.state, GroupStateType::Idle);
@@ -2691,7 +2729,7 @@ mod tests {
     async fn join_notifies_existing_members() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
 
@@ -2703,6 +2741,143 @@ mod tests {
         assert_eq!(bus.count_for("s2"), 2);
     }
 
+    fn now_playing(item: Uuid, position_ticks: i64, is_paused: bool) -> SyncPlayNowPlaying {
+        SyncPlayNowPlaying {
+            item_id: item,
+            position_ticks: Some(position_ticks),
+            is_paused,
+            queue: Vec::new(),
+        }
+    }
+
+    /// The `Data` of a `PlayQueue` group update.
+    fn queue_data(body: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["Data"]["Data"].clone()
+    }
+
+    /// `Group.CreateGroup` for a creator that is playing: the group starts
+    /// `Waiting` on the creator's item at its position. The creator gets
+    /// GroupJoined, then the Waiting arm's `NewPlaylist`, and never `Stop`; a
+    /// joiner is brought to the same item, and once both are ready the group
+    /// plays, because the creator was not paused.
+    #[tokio::test]
+    async fn a_playing_creator_starts_the_group_on_its_item() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let item = Uuid::new_v4();
+        let info = m
+            .new_group(&a, "g", Some(&now_playing(item, 42_000_000, false)))
+            .await
+            .unwrap();
+        assert_eq!(info.state, GroupStateType::Waiting);
+
+        let creator = bus.bodies_for("s1");
+        assert_eq!(creator.len(), 2, "{creator:?}");
+        assert!(creator[0].contains("GroupJoined") && creator[0].contains("\"State\":\"Waiting\""));
+        assert!(
+            !creator.iter().any(|b| b.contains("\"Stop\"")),
+            "{creator:?}"
+        );
+        let queue = queue_data(&creator[1]);
+        assert_eq!(queue["Reason"], "NewPlaylist");
+        assert_eq!(queue["PlayingItemIndex"], 0);
+        assert_eq!(queue["StartPositionTicks"], 42_000_000);
+        assert_eq!(
+            Uuid::parse_str(queue["Playlist"][0]["ItemId"].as_str().unwrap()).unwrap(),
+            item
+        );
+        {
+            // The creator is the member the group waits for, so the wait
+            // deadline runs (`SetBuffering` → `UpdateGroupWaitDeadline`).
+            let reg = m.lock();
+            let g = &reg.groups[&info.group_id];
+            assert!(g.members[0].is_buffering);
+            assert!(g.wait_deadline.is_some());
+        }
+
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let joiner = queue_data(
+            bus.bodies_for("s2")
+                .iter()
+                .find(|b| b.contains("\"PlayQueue\""))
+                .unwrap(),
+        );
+        assert_eq!(joiner["StartPositionTicks"], 42_000_000);
+        assert_eq!(joiner["Playlist"], queue["Playlist"]);
+
+        let pli = playing_item_id(&bus);
+        m.handle_request(&a, ready_at(pli, 42_000_000, false))
+            .await
+            .unwrap();
+        m.handle_request(&b, ready_at(pli, 42_000_000, false))
+            .await
+            .unwrap();
+        let g = m.get_group(&a, info.group_id).await.unwrap();
+        assert_eq!(g.state, GroupStateType::Playing);
+    }
+
+    /// A paused creator's group settles into `Paused` once it is ready
+    /// (`ResumePlaying = !PlayState.IsPaused`), and the playlist is the
+    /// reported queue with the playing item current.
+    #[tokio::test]
+    async fn a_paused_creator_keeps_its_queue_and_stays_paused() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let (first, item) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut playing = now_playing(item, 7, true);
+        playing.queue = vec![first, item];
+        let info = m.new_group(&a, "g", Some(&playing)).await.unwrap();
+        let queue = queue_data(&bus.bodies_for("s1")[1]);
+        assert_eq!(queue["PlayingItemIndex"], 1);
+        assert_eq!(queue["Playlist"].as_array().unwrap().len(), 2);
+
+        let pli = playing_item_id(&bus);
+        m.handle_request(&a, ready_at(pli, 7, false)).await.unwrap();
+        let g = m.get_group(&a, info.group_id).await.unwrap();
+        assert_eq!(g.state, GroupStateType::Paused);
+    }
+
+    /// A reported queue that lacks the playing item is replaced by the item
+    /// alone, as jellyfin/jellyfin#18198 does, so the group still plays it.
+    #[tokio::test]
+    async fn a_queue_without_the_playing_item_falls_back_to_the_item() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let item = Uuid::new_v4();
+        let mut playing = now_playing(item, 7, false);
+        playing.queue = vec![Uuid::new_v4()];
+        m.new_group(&a, "g", Some(&playing)).await.unwrap();
+        let queue = queue_data(&bus.bodies_for("s1")[1]);
+        assert_eq!(queue["PlayingItemIndex"], 0);
+        let ids: Vec<&str> = queue["Playlist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["ItemId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![item.simple().to_string()]);
+    }
+
+    /// A playing creator already in a group leaves it first, as any creator
+    /// does, and the new group is the one seeded from its playback.
+    #[tokio::test]
+    async fn a_playing_creator_in_a_group_leaves_it_for_the_seeded_one() {
+        let (m, _bus) = mgr();
+        let a = session("s1", "alice");
+        let old = m.new_group(&a, "old", None).await.unwrap();
+        let new = m
+            .new_group(&a, "new", Some(&now_playing(Uuid::new_v4(), 0, false)))
+            .await
+            .unwrap();
+        let groups = m.list_groups(&a).await.unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].group_id, new.group_id);
+        assert_ne!(new.group_id, old.group_id);
+        assert_eq!(groups[0].state, GroupStateType::Waiting);
+    }
+
     /// `Group.CreateGroup` / `Group.SessionJoin` both end with
     /// `_state.SessionJoined(...)`, which on an Idle group is a Stop command
     /// addressed to the joining session only. Ferrofin used to push nothing.
@@ -2710,7 +2885,7 @@ mod tests {
     async fn joining_an_idle_group_pushes_group_joined_then_stop() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
 
         let creator = bus.bodies_for("s1");
         assert_eq!(creator.len(), 2, "{creator:?}");
@@ -2738,7 +2913,7 @@ mod tests {
     async fn joining_a_playing_group_pushes_the_queue_and_pauses_the_ready() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         start_playing(&m, &bus, &[&a], 2).await;
         let before = bus.count_for("s1");
 
@@ -2766,7 +2941,7 @@ mod tests {
     async fn a_buffering_member_leaving_resumes_the_group() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         start_playing(&m, &bus, &[&a], 2).await;
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap(); // -> Waiting, bob buffering
@@ -2802,7 +2977,7 @@ mod tests {
     async fn buffering_from_waiting_keeps_resume_playing_armed() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let pli = start_playing(&m, &bus, &[&a], 2).await;
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap(); // Playing -> Waiting, resume armed
@@ -2838,7 +3013,7 @@ mod tests {
     async fn group_info_is_stamped_per_read_and_keeps_join_order() {
         let (m, _bus) = mgr();
         let z = session("s1", "zoe");
-        let info = m.new_group(&z, "g").await.unwrap();
+        let info = m.new_group(&z, "g", None).await.unwrap();
         let adam = session("s2", "adam");
         m.join_group(&adam, info.group_id).await.unwrap();
 
@@ -2870,7 +3045,7 @@ mod tests {
     async fn leave_removes_and_drops_empty_group() {
         let (m, _bus) = mgr();
         let s = session("s1", "alice");
-        let info = m.new_group(&s, "g").await.unwrap();
+        let info = m.new_group(&s, "g", None).await.unwrap();
         m.leave_group(&s).await.unwrap();
         assert!(m.list_groups(&s).await.unwrap().is_empty());
         assert!(!m.is_user_active(s.user_id).await.unwrap());
@@ -2894,7 +3069,7 @@ mod tests {
     async fn set_new_queue_waits_for_every_member_before_playing() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let before = bus.count_for("s2");
@@ -2947,7 +3122,7 @@ mod tests {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
         let b = session("s2", "bob");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.join_group(&b, info.group_id).await.unwrap();
         (m, bus, a, b, info.group_id)
     }
@@ -3751,7 +3926,7 @@ mod tests {
     async fn queue_move_remove_repeat_shuffle_mutate() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(1)).await.unwrap();
         m.handle_request(
             &a,
@@ -3809,7 +3984,7 @@ mod tests {
     async fn ping_seek_buffer_ready_flow() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let gid = info.group_id;
         m.handle_request(&a, PlaybackRequest::Ping { ping: 40 })
             .await
@@ -4113,7 +4288,7 @@ mod tests {
     async fn removing_the_playing_item_with_an_earlier_one_stays_in_the_queue() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(
             &a,
             PlaybackRequest::Play {
@@ -4150,7 +4325,7 @@ mod tests {
     async fn next_item_on_a_cleared_queue_changes_nothing() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         m.handle_request(
             &a,
@@ -4185,7 +4360,7 @@ mod tests {
     async fn clear_playlist_stops_group() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         m.handle_request(
             &a,
@@ -4211,7 +4386,7 @@ mod tests {
     async fn clearing_the_playlist_can_keep_the_playing_item() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         m.handle_request(
             &a,
@@ -4263,7 +4438,7 @@ mod tests {
     async fn a_new_queue_resets_shuffle_and_repeat() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(2)).await.unwrap();
         for r in [
             PlaybackRequest::SetRepeatMode {
@@ -4316,7 +4491,7 @@ mod tests {
         len: usize,
         position: i32,
     ) -> Vec<Uuid> {
-        m.new_group(a, "g").await.unwrap();
+        m.new_group(a, "g", None).await.unwrap();
         m.handle_request(
             a,
             PlaybackRequest::Play {
@@ -4573,7 +4748,7 @@ mod tests {
     async fn removing_a_non_playing_item_never_stops_the_group() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         let playing = playing_item_id(&bus);
         let other = last_playlist(&bus)
@@ -4609,7 +4784,7 @@ mod tests {
     async fn removing_the_playing_item_steps_back_one_slot() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(3)).await.unwrap();
         let items = last_playlist(&bus);
         // Point the queue at the middle item, then remove it.
@@ -4669,7 +4844,7 @@ mod tests {
     async fn queueing_nothing_pushes_nothing() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(1)).await.unwrap();
         let at = mark(&bus);
 
@@ -4696,7 +4871,7 @@ mod tests {
     async fn a_queue_change_that_fails_while_waiting_drops_to_idle() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(1)).await.unwrap(); // Idle -> Waiting
         assert_eq!(
             m.get_group(&a, info.group_id).await.unwrap().state,
@@ -4733,7 +4908,7 @@ mod tests {
         for pause_first in [false, true] {
             let (m, bus) = mgr();
             let a = session("s1", "alice");
-            let info = m.new_group(&a, "g").await.unwrap();
+            let info = m.new_group(&a, "g", None).await.unwrap();
             start_playing(&m, &bus, &[&a], 1).await;
             let want = if pause_first {
                 m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
@@ -4784,8 +4959,8 @@ mod tests {
     async fn creating_a_second_group_leaves_the_first() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        let first = m.new_group(&a, "one").await.unwrap();
-        let _second = m.new_group(&a, "two").await.unwrap();
+        let first = m.new_group(&a, "one", None).await.unwrap();
+        let _second = m.new_group(&a, "two", None).await.unwrap();
         // The first group is now empty and dropped.
         assert!(m.get_group(&a, first.group_id).await.is_err());
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
@@ -4798,7 +4973,7 @@ mod tests {
     async fn rejoining_your_own_group_as_its_only_member_restores_the_session() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let before = bus.count_for("s1");
 
         m.join_group(&a, info.group_id).await.unwrap();
@@ -4820,7 +4995,7 @@ mod tests {
     async fn rejoining_a_shared_group_keeps_one_membership() {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let c = session("s3", "carol");
@@ -4851,7 +5026,7 @@ mod tests {
     async fn switching_groups_while_waiting_resumes_the_old_group(#[case] via_new: bool) {
         let (m, bus) = mgr();
         let a = session("s1", "alice");
-        let old = m.new_group(&a, "old").await.unwrap();
+        let old = m.new_group(&a, "old", None).await.unwrap();
         start_playing(&m, &bus, &[&a], 2).await;
         let b = session("s2", "bob");
         m.join_group(&b, old.group_id).await.unwrap(); // -> Waiting on bob
@@ -4859,10 +5034,10 @@ mod tests {
         let bob_before = bus.count_for("s2");
 
         if via_new {
-            m.new_group(&b, "new").await.unwrap();
+            m.new_group(&b, "new", None).await.unwrap();
         } else {
             let c = session("s3", "carol");
-            let other = m.new_group(&c, "other").await.unwrap();
+            let other = m.new_group(&c, "other", None).await.unwrap();
             m.join_group(&b, other.group_id).await.unwrap();
         }
 
@@ -4891,7 +5066,7 @@ mod tests {
     async fn a_poisoned_registry_recovers_instead_of_panicking_every_call() {
         let (m, _bus) = mgr();
         let s = session("s1", "alice");
-        m.new_group(&s, "g").await.unwrap();
+        m.new_group(&s, "g", None).await.unwrap();
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = m.registry.lock().unwrap();
             panic!("poison the sync-play registry");
@@ -5023,7 +5198,7 @@ mod tests {
         let other = db_session(&db, "s2", "bob").await;
         let movie = seed_movie(&db, "Movie").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         // An empty queue is accessible to everyone, so the group is visible.
         assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
         set_queue(&m, &owner, vec![movie]).await;
@@ -5047,7 +5222,7 @@ mod tests {
         let other = db_session(&db, "s2", "bob").await;
         let movie = seed_movie(&db, "Movie").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie]).await;
         delete_item(library.as_ref(), movie).await;
 
@@ -5076,7 +5251,7 @@ mod tests {
 
         let movie = seed_movie(&db, "Movie").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie]).await;
 
         assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
@@ -5101,7 +5276,7 @@ mod tests {
         let owner = db_session(&db, "s1", "alice").await;
         let other = db_session(&db, "s2", "bob").await;
 
-        let info = m.new_group(&owner, "movie night").await.unwrap();
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
         m.join_group(&other, info.group_id).await.unwrap();
         bus.sent.lock().unwrap().clear();
 
@@ -5186,7 +5361,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let group = m.new_group(&owner, "movie night").await.unwrap();
+        let group = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie_id]).await;
         assert!(m.list_groups(&guest).await.unwrap().is_empty());
         m.join_group(&guest, group.group_id).await.unwrap();
@@ -5237,7 +5412,7 @@ mod tests {
         // the suite exercises group mechanics without a database.
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, play(2)).await.unwrap();
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
         assert!(m.get_group(&a, info.group_id).await.is_ok());
@@ -5253,7 +5428,7 @@ mod tests {
     async fn ping_is_clamped_to_max() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, PlaybackRequest::Ping { ping: i64::MAX })
             .await
             .unwrap();
@@ -5266,7 +5441,7 @@ mod tests {
     async fn negative_ping_is_clamped_to_zero() {
         let (m, _bus) = mgr();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         m.handle_request(&a, PlaybackRequest::Ping { ping: -1 })
             .await
             .unwrap();
@@ -5329,7 +5504,7 @@ mod tests {
     async fn group_wait_resumes_without_a_joiner_that_never_reports_ready() {
         let (m, bus) = mgr_with_group_wait();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
@@ -5375,7 +5550,7 @@ mod tests {
     async fn group_wait_leaves_a_paused_group_paused_where_it_was() {
         let (m, bus) = mgr_with_group_wait();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         start_playing(&m, &bus, &[&a, &b], 1).await;
@@ -5428,7 +5603,7 @@ mod tests {
     async fn group_wait_ends_when_everyone_reports_ready_in_time() {
         let (m, bus) = mgr_with_group_wait();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
@@ -5463,7 +5638,7 @@ mod tests {
     async fn group_wait_gives_up_only_until_the_group_changes_item() {
         let (m, bus) = mgr_with_group_wait();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
@@ -5497,7 +5672,7 @@ mod tests {
     async fn group_wait_deadline_covers_the_whole_waiting_period() {
         let (m, bus) = mgr_with_group_wait();
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
         let pli = start_playing(&m, &bus, &[&a, &b], 1).await;
@@ -5540,7 +5715,7 @@ mod tests {
         let m = m.with_group_wait(TEST_GROUP_WAIT, Some(StdDuration::from_millis(20)));
         let runtime = tokio::runtime::Handle::current();
         let a = session("s1", "alice");
-        m.new_group(&a, "g").await.unwrap();
+        m.new_group(&a, "g", None).await.unwrap();
         assert!(m.lock().sweeping);
         assert_eq!(runtime.metrics().num_alive_tasks(), 1, "the sweep task");
 
@@ -5553,7 +5728,7 @@ mod tests {
         assert_eq!(runtime.metrics().num_alive_tasks(), 0, "the task ended");
         assert!(!m.lock().sweeping, "no group left, so the sweep stopped");
 
-        m.new_group(&a, "g2").await.unwrap();
+        m.new_group(&a, "g2", None).await.unwrap();
         assert!(m.lock().sweeping, "a new group starts it again");
         assert_eq!(runtime.metrics().num_alive_tasks(), 1);
     }
@@ -5565,7 +5740,7 @@ mod tests {
         let (m, _bus) = mgr();
         let m = m.with_group_wait(TEST_GROUP_WAIT, Some(StdDuration::from_millis(20)));
         let a = session("s1", "alice");
-        let info = m.new_group(&a, "g").await.unwrap();
+        let info = m.new_group(&a, "g", None).await.unwrap();
         let b = session("s2", "bob");
         m.join_group(&b, info.group_id).await.unwrap();
 
