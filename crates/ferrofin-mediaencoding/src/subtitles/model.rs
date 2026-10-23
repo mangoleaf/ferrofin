@@ -53,7 +53,8 @@ impl TimeCode {
 /// A single subtitle cue: its ordinal number, text, and start/end timecodes.
 ///
 /// Port of the fields of `Nikse.SubtitleEdit.Core.Common.Paragraph` the encoder
-/// reads: `Number`, `Text`, `StartTime`, `EndTime`.
+/// reads (`Number`, `Text`, `StartTime`, `EndTime`) and the ones the WebVTT
+/// loader fills (`Style`, `Region`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Paragraph {
     /// The 1-based cue number (`Paragraph.Number`).
@@ -64,6 +65,11 @@ pub struct Paragraph {
     pub start_time: TimeCode,
     /// The cue end timecode.
     pub end_time: TimeCode,
+    /// `Paragraph.Style`: for a WebVTT cue, its raw cue settings
+    /// (`line:10% align:start`), empty when it has none.
+    pub style: String,
+    /// `Paragraph.Region`: the WebVTT region the cue names, if any.
+    pub region: Option<String>,
 }
 
 impl Paragraph {
@@ -75,6 +81,8 @@ impl Paragraph {
             text,
             start_time,
             end_time,
+            style: String::new(),
+            region: None,
         }
     }
 }
@@ -82,11 +90,14 @@ impl Paragraph {
 /// A parsed subtitle: an ordered list of [`Paragraph`] cues.
 ///
 /// Port of `Nikse.SubtitleEdit.Core.Common.Subtitle`, reduced to the paragraph
-/// list and the renumbering behaviour the parsers rely on.
+/// list, the header and the renumbering behaviour the parsers rely on.
 #[derive(Debug, Clone, Default)]
 pub struct Subtitle {
     /// The subtitle cues, in document order.
     pub paragraphs: Vec<Paragraph>,
+    /// `Subtitle.Header`: for WebVTT, the signature line and the `STYLE`,
+    /// `REGION` and `NOTE` blocks before the first cue.
+    pub header: Option<String>,
 }
 
 impl Subtitle {

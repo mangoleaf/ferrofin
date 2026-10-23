@@ -15,11 +15,10 @@
 //!   are dropped for v1.
 //! - Streams (`Task<Stream>`) become `Result<Vec<u8>, ServiceError>` — the trait
 //!   returns the produced bytes rather than leaking `std::io::Stream` shapes.
-//! - The deeply ffmpeg-internal hardware-capability probes
-//!   (`IsVaapiDevice*`/`SupportsEncoder`/…) and the `EncodingJobInfo`/`StreamState`
-//!   coupled command-building methods are **not** ported here: they depend on
-//!   un-ported encoding-state structs and belong to the `ferrofin-core` encoder
-//!   implementation (Wave 6), not the DI seam.
+//! - The deeply ffmpeg-internal hardware-capability probes (`IsVaapiDevice*`/…)
+//!   and the `EncodingJobInfo`/`StreamState` coupled command-building methods
+//!   live with the encoder implementation, not on this seam. `SupportsEncoder`
+//!   is the exception the playback negotiation needs: [`EncoderSupport`].
 //!
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 //!
@@ -219,6 +218,27 @@ pub trait MediaEncoder: Send + Sync {
 
 /// Compile-time assertion that [`MediaEncoder`] is object-safe.
 fn _assert_object_safe_media_encoder(_: &dyn MediaEncoder) {}
+
+/// The encoders the probed ffmpeg build has, as the playback negotiation
+/// reads them (`IMediaEncoder.SupportsEncoder`).
+pub trait EncoderSupport: Send + Sync {
+    /// Whether the encoder named `encoder` (an ffmpeg encoder name such as
+    /// `libopus`) is available, compared ignoring case.
+    fn supports_encoder(&self, encoder: &str) -> bool;
+}
+
+/// Compile-time assertion that [`EncoderSupport`] is object-safe.
+fn _assert_object_safe_encoder_support(_: &dyn EncoderSupport) {}
+
+/// No encoders: what a server without a usable ffmpeg has.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEncoders;
+
+impl EncoderSupport for NoEncoders {
+    fn supports_encoder(&self, _encoder: &str) -> bool {
+        false
+    }
+}
 
 /// Extracts evenly spaced trickplay thumbnail frames from a video file.
 ///
@@ -534,6 +554,9 @@ pub struct HlsStreamRequest {
     pub context: Option<ferrofin_model::dlna::EncodingContext>,
     /// The desired segment length in seconds (`segmentLength`).
     pub segment_length: Option<i32>,
+    /// The request's `User-Agent` header (`StreamState.UserAgent`): without a
+    /// `segment_length`, it picks a copied video's segment length.
+    pub user_agent: Option<String>,
     /// This segment's starting position from the playlist's runtimeTicks query.
     pub current_runtime_ticks: i64,
     /// This segment's exact duration from actualSegmentLengthTicks.
@@ -569,6 +592,9 @@ pub struct HlsStreamRequest {
     pub allow_video_stream_copy: bool,
     /// Whether `-c:a copy` is permitted (`allowAudioStreamCopy`; default true).
     pub allow_audio_stream_copy: bool,
+    /// Whether the audio may be encoded VBR when the server's encoding options
+    /// enable it (`enableAudioVbrEncoding`; default true).
+    pub enable_audio_vbr_encoding: bool,
     /// Whether the client asked for a static (direct) stream (`static`).
     pub is_static: bool,
     /// The resume offset in ticks (`startTimeTicks`), when the client is resuming.
@@ -675,6 +701,7 @@ impl Default for HlsStreamRequest {
             is_head_request: false,
             context: None,
             segment_length: None,
+            user_agent: None,
             current_runtime_ticks: 0,
             actual_segment_length_ticks: 0,
             audio_codec: None,
@@ -690,6 +717,7 @@ impl Default for HlsStreamRequest {
             // (the C# request DTO defaults both to true).
             allow_video_stream_copy: true,
             allow_audio_stream_copy: true,
+            enable_audio_vbr_encoding: true,
             is_static: false,
             start_time_ticks: None,
             profile: None,
