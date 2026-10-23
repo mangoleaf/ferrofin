@@ -98,7 +98,7 @@ class Requests(Scratch):
             "unknown field": ['{"id": "a", "method": "GET", "path": "/x", "bogus": 1}'],
             "`id` is a non-empty string": ['{"method": "GET", "path": "/x"}'],
             "used twice": ['{"id": "a", "method": "GET", "path": "/x"}', '{"id": "a", "method": "GET", "path": "/y"}'],
-            "is not sent yet": ['{"id": "a", "method": "POST", "path": "/x"}'],
+            "is not a method the harness sends": ['{"id": "a", "method": "PUT", "path": "/x"}'],
             "starts with a slash": ['{"id": "a", "method": "GET", "path": "x"}'],
             "`query` is an object": ['{"id": "a", "method": "GET", "path": "/x", "query": [1]}'],
             "carries no body": ['{"id": "a", "method": "GET", "path": "/x", "body": {}}'],
@@ -109,6 +109,87 @@ class Requests(Scratch):
                 self.load(*lines)
         with self.assertRaisesRegex(diff.ParityError, "no requests"):
             self.load("")
+
+
+class Writes(Scratch):
+    def load(self, *lines, ids=None):
+        return diff.load_requests(write(self.dir, "w.jsonl", "\n".join(lines) + "\n"), ids)
+
+    def test_a_write_carries_a_body_and_read_backs_whose_ids_are_qualified_by_the_write(self):
+        (request,) = self.load('{"id": "fav", "method": "POST", "path": "/UserFavoriteItems/{movie}", "query": {"userId": "{user}"}, '
+                               '"body": {"Ids": ["{movie}"], "Name": "x {user}", "N": 3}, '
+                               '"readbacks": [{"id": "data", "path": "/UserItems/{movie}/UserData", "expect_status": 200}, '
+                               '{"id": "list", "path": "/Items", "query": {"IsFavorite": true}}]}', ids=IDS)
+        self.assertTrue(request.is_write)
+        self.assertEqual([r.id for r in request.readbacks], ["fav/data", "fav/list"])
+        self.assertEqual({r.of for r in request.readbacks}, {"fav"})
+        self.assertEqual(diff.target(request, IDS), "/UserFavoriteItems/m1?userId=u1")
+        self.assertEqual(json.loads(diff.body_of(request, IDS)), {"Ids": ["m1"], "Name": "x u1", "N": 3})
+        self.assertEqual(diff.target(request.readbacks[1], IDS), "/Items?IsFavorite=true")
+
+    def test_a_write_may_set_up_its_fresh_copy_with_writes_of_its_own(self):
+        (request,) = self.load('{"id": "unfav", "method": "DELETE", "path": "/UserFavoriteItems/{movie}", '
+                               '"setup": [{"id": "fav", "method": "POST", "path": "/UserFavoriteItems/{movie}", "body": {"A": "{user}"}}]}', ids=IDS)
+        (setup,) = request.setup
+        self.assertEqual((setup.id, setup.of, setup.method, diff.target(setup, IDS)), ("unfav/fav", "unfav", "POST", "/UserFavoriteItems/m1"))
+        self.assertEqual(diff.every_id([request]), ["unfav", "unfav/fav"])
+        cases = {
+            "a setup step is a write": '{"id": "a", "method": "POST", "path": "/x", "setup": [{"id": "s", "method": "GET", "path": "/y"}]}',
+            "only a write has setup steps": '{"id": "a", "method": "GET", "path": "/x", "setup": [{"id": "s", "method": "POST", "path": "/y"}]}',
+            "setup: unknown field": '{"id": "a", "method": "POST", "path": "/x", "setup": [{"id": "s", "method": "POST", "path": "/y", "readbacks": []}]}',
+            "id `s` is used twice": '{"id": "a", "method": "POST", "path": "/x", "setup": [{"id": "s", "method": "POST", "path": "/y"}], "readbacks": [{"id": "s", "path": "/z"}]}',
+            "`setup` is a list": '{"id": "a", "method": "POST", "path": "/x", "setup": {}}',
+        }
+        for message, line in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(diff.ParityError, message):
+                self.load(line)
+
+    def test_a_delete_and_a_write_without_a_body_or_read_backs_are_writes_too(self):
+        (request,) = self.load('{"id": "d", "method": "DELETE", "path": "/UserPlayedItems/{movie}"}')
+        self.assertEqual((request.is_write, request.readbacks, request.setup, diff.body_of(request, IDS)), (True, (), (), None))
+
+    def test_a_read_back_reads_what_each_server_answered_to_the_write(self):
+        (request,) = self.load('{"id": "pl", "method": "POST", "path": "/Playlists", "readbacks": '
+                               '[{"id": "items", "path": "/Playlists/{write.Id}/Items", "query": {"userId": "{user}", "x": "{write.Nested.N}"}}]}', ids=IDS)
+        readback = request.readbacks[0]
+        self.assertEqual(diff.target(readback, IDS, {"Id": "p-oracle", "Nested": {"N": 4}}), "/Playlists/p-oracle/Items?userId=u1&x=4")
+        self.assertEqual(diff.target(readback, IDS, {"Id": "p-ferrofin", "Nested": {"N": 4}}), "/Playlists/p-ferrofin/Items?userId=u1&x=4")
+        for answer in (None, {}, {"Id": None}, {"Id": {"a": 1}}, [1]):
+            with self.subTest(answer), self.assertRaisesRegex(diff.CaptureMissing, "write.Id"):
+                diff.target(readback, IDS, answer)
+
+    def test_write_captures_are_only_for_read_backs(self):
+        for line in ('{"id": "a", "method": "POST", "path": "/X/{write.Id}"}',
+                     '{"id": "a", "method": "POST", "path": "/X", "body": {"A": "{write.Id}"}}',
+                     '{"id": "a", "method": "GET", "path": "/X/{write.Id}"}'):
+            with self.subTest(line), self.assertRaisesRegex(diff.ParityError, "only in a write's read-backs"):
+                self.load(line, ids=IDS)
+
+    def test_invalid_writes_and_read_backs_are_refused(self):
+        cases = {
+            "only a write has read-backs": '{"id": "a", "method": "GET", "path": "/x", "readbacks": [{"id": "r", "path": "/y"}]}',
+            "`readbacks` is a list": '{"id": "a", "method": "POST", "path": "/x", "readbacks": {}}',
+            "read-back is a JSON object": '{"id": "a", "method": "POST", "path": "/x", "readbacks": [1]}',
+            "read-back: unknown field": '{"id": "a", "method": "POST", "path": "/x", "readbacks": [{"id": "r", "path": "/y", "method": "POST"}]}',
+            "read-back: `id` is a non-empty string": '{"id": "a", "method": "POST", "path": "/x", "readbacks": [{"path": "/y"}]}',
+            "id `r` is used twice": '{"id": "a", "method": "POST", "path": "/x", "readbacks": [{"id": "r", "path": "/y"}, {"id": "r", "path": "/z"}]}',
+            "read-back: `path` starts with a slash": '{"id": "a", "method": "POST", "path": "/x", "readbacks": [{"id": "r", "path": "y"}]}',
+            "`body` is a JSON object, an array or null": '{"id": "a", "method": "POST", "path": "/x", "body": "text"}',
+            "has no `/` in it": '{"id": "a/b", "method": "GET", "path": "/x"}',
+        }
+        for message, line in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(diff.ParityError, message):
+                self.load(line)
+
+    def test_the_starter_write_set_shipped_with_the_harness_is_valid_and_covers_the_listed_kinds(self):
+        requests = diff.load_requests(diff.HERE / "requests" / "writes.jsonl",
+                                      {**IDS, "hdr_movie": "m2", "episode": "e1", "series": "s1"})
+        self.assertTrue(all(r.is_write and r.readbacks for r in requests))
+        # a DELETE clears state its setup step made on the fresh copy: it is never a no-op
+        self.assertTrue(all(r.setup for r in requests if r.method == "DELETE"))
+        paths = " ".join(r.path for r in requests)
+        for kind in ("/UserPlayedItems/", "/UserFavoriteItems/", "/UserData", "/Playlists", "/Collections"):
+            self.assertIn(kind, paths)
 
 
 class Comparison(Scratch):
@@ -196,6 +277,31 @@ class RuleFile(Scratch):
             with self.subTest(message), self.assertRaisesRegex(diff.ParityError, message):
                 self.rules(toml)
 
+    def test_a_rule_scoped_to_requests_applies_to_those_requests_only(self):
+        rules = self.rules('[[rule]]\npaths = ["Id"]\nkind = "opaque"\nrequests = ["pl", "pl/*"]\nreason = "a new id per server"\n'
+                           '[[rule]]\npaths = ["ServerId"]\nkind = "opaque"\nreason = "per server"\n')
+        self.assertEqual([r.paths for r in diff.rules_for(rules, "pl/items")], [("Id",), ("ServerId",)])
+        self.assertEqual([r.paths for r in diff.rules_for(rules, "detail-item")], [("ServerId",)])
+        self.assertEqual(pair({"Id": "a"}, {"Id": "b"}, diff.rules_for(rules, "pl"))[0], [])
+        self.assertEqual(kinds(pair({"Id": "a"}, {"Id": "b"}, diff.rules_for(rules, "other"))[0]), [("Id", "value")])
+
+    def test_invalid_request_scopes_are_refused(self):
+        cases = {
+            "`requests` lists request ids or globs": '[[rule]]\npaths = ["A"]\nkind = "opaque"\nrequests = []\nreason = "r"\n',
+            "is already a path of rule 1 for every request": ('[[rule]]\npaths = ["A"]\nkind = "opaque"\nreason = "r"\n'
+                                                              '[[rule]]\npaths = ["A"]\nkind = "opaque"\nrequests = ["x"]\nreason = "r"\n'),
+        }
+        for message, toml in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(diff.ParityError, message):
+                self.rules(toml)
+
+    def test_two_scoped_rules_may_share_a_path_but_never_on_the_same_request(self):
+        rules = self.rules('[[rule]]\npaths = ["A"]\nkind = "opaque"\nrequests = ["x*"]\nreason = "r"\n'
+                           '[[rule]]\npaths = ["A"]\nkind = "opaque"\nrequests = ["y"]\nreason = "r"\n')
+        diff.check_rule_scopes(rules, ["x1", "y", "z"])
+        with self.assertRaisesRegex(diff.ParityError, "`A` of request `xy` is a path of rules 1 and 3"):
+            diff.check_rule_scopes(rules + self.rules('[[rule]]\npaths = ["A"]\nkind = "opaque"\nrequests = ["xy"]\nreason = "r"\n'), ["xy"])
+
 
 class Ledger(Scratch):
     def test_the_ledger_shipped_with_the_harness_is_valid(self):
@@ -253,11 +359,13 @@ class Ledger(Scratch):
 class FakeServers:
     """Two servers' worth of canned answers: `send(base, method, path, headers, timeout, now)`."""
 
-    def __init__(self, answers):
+    def __init__(self, answers, events=None):
         self.answers, self.sent = answers, []
+        self.events = [] if events is None else events   # every call in order, with resets when a test shares the list
 
-    def __call__(self, base, method, path, headers, timeout, now=None):
+    def __call__(self, base, method, path, headers, timeout, now=None, body=None):
         self.sent.append((base, path, timeout))
+        self.events.append((base, method, path, headers["Authorization"].rsplit('Token="', 1)[-1].rstrip('"'), body))
         answer = self.answers[(base, path)]
         return answer if isinstance(answer, diff.Response) else diff.Response(200, json.dumps(answer).encode(), 0.01)
 
@@ -269,7 +377,7 @@ def request(id="r1", trap=""):
 class RunRequests(Scratch):
     def run_one(self, oracle, ferrofin, entries=(), trap="", rules=()):
         servers = FakeServers({("o", "/r1"): oracle, ("f", "/r1"): ferrofin})
-        results, used, cap = diff.run_requests([request(trap=trap)], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, list(rules),
+        results, used, cap, _ = diff.run_requests([request(trap=trap)], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, list(rules),
                                                list(entries), 30, None, send=servers)
         return results[0], cap
 
@@ -307,7 +415,7 @@ class RunRequests(Scratch):
         self.assertEqual([(d["at"], d["oracle"]) for d in result["differences"]], [("$status", "500 (expected 200)")])
         servers = FakeServers({("o", "/r1"): broken(), ("f", "/r1"): broken()})
         expecting = diff.Request("r1", "GET", "/r1", {}, None, "", "", 500)
-        results, _, _ = diff.run_requests([expecting], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, None, send=servers)
+        results, _, _, _ = diff.run_requests([expecting], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, None, send=servers)
         self.assertEqual(results[0]["state"], "match")
 
     def test_an_oracle_that_fails_instead_of_stalling_on_a_known_trap_is_an_oracle_failure(self):
@@ -316,11 +424,11 @@ class RunRequests(Scratch):
 
     def test_a_request_the_cap_cut_short_is_no_ferrofin_difference_and_ends_the_run(self):
         servers = FakeServers({("o", "/r1"): diff.Response(None, b"", 5.0, "timeout"), ("f", "/r1"): {}})
-        results, _, cap = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 105.0,
+        results, _, cap, _ = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 105.0,
                                             wall=lambda: 100.0, send=servers)
         self.assertEqual((results, cap), ([], True))
         servers = FakeServers({("o", "/r1"): diff.Response(None, b"", 30.0, "timeout"), ("f", "/r1"): {}})
-        results, _, cap = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 500.0,
+        results, _, cap, _ = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 500.0,
                                             wall=lambda: 100.0, send=servers)
         self.assertEqual((len(results), cap), (1, False))   # a real timeout well inside the cap still counts
 
@@ -346,7 +454,7 @@ class RunRequests(Scratch):
     def test_the_cap_stops_the_run_before_the_next_request_and_is_a_failure(self):
         servers = FakeServers({("o", "/r1"): {}, ("f", "/r1"): {}, ("o", "/r2"): {}, ("f", "/r2"): {}})
         clock = iter([100.0, 100.0, 200.0, 200.0])
-        results, _, cap = diff.run_requests([request("r1"), request("r2")], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 150.0,
+        results, _, cap, _ = diff.run_requests([request("r1"), request("r2")], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 150.0,
                                             wall=lambda: next(clock), send=servers)
         self.assertEqual(([r["id"] for r in results], cap), (["r1"], True))
         self.assertEqual(diff.verdict_of(results, cap)[0], "run failed")
@@ -354,7 +462,7 @@ class RunRequests(Scratch):
 
     def test_the_cap_passed_before_the_first_request_sends_nothing(self):
         servers = FakeServers({})
-        results, _, cap = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 10.0,
+        results, _, cap, _ = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 10.0,
                                             wall=lambda: 20.0, send=servers)
         self.assertEqual((results, cap, servers.sent), ([], True, []))
 
@@ -367,15 +475,143 @@ class RunRequests(Scratch):
     def test_when_the_oracle_call_spends_the_cap_ferrofin_is_not_called(self):
         servers = FakeServers({("o", "/r1"): {}, ("f", "/r1"): {}})
         clock = iter([100.0, 106.0, 106.0])
-        results, _, cap = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 105.0,
+        results, _, cap, _ = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 105.0,
                                             wall=clock.__next__, send=servers)
         self.assertEqual(([url for url, _, _ in servers.sent], results, cap), (["o"], [], True))
 
     def test_a_run_that_finishes_every_request_exactly_at_the_cap_is_not_a_failure(self):
         servers = FakeServers({("o", "/r1"): {}, ("f", "/r1"): {}})
-        results, _, cap = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 100.0,
+        results, _, cap, _ = diff.run_requests([request()], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 100.0,
                                             wall=iter([50.0, 50.0, 100.0]).__next__, send=servers)
         self.assertEqual((len(results), cap), (1, False))
+
+
+class WriteRuns(Scratch):
+    def load(self, *lines):
+        return diff.load_requests(write(self.dir, "w.jsonl", "\n".join(lines) + "\n"), IDS)
+
+    def resetter(self, events, tokens=("o2", "f2"), error=None):
+        calls = []
+
+        def reset(timeout):
+            calls.append(timeout)
+            events.append(("reset", timeout))
+            if error:
+                raise error
+            return {"oracle": tokens[0], "ferrofin": tokens[1]}
+        return reset, calls
+
+    def run_writes(self, requests, answers, reset, rules=(), deadline=None, wall=time.time, events=None):
+        servers = FakeServers(answers, events)
+        return diff.run_requests(requests, IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, list(rules), [], 30, deadline,
+                                 wall=wall, send=servers, reset=reset)
+
+    def test_reads_run_first_then_each_write_on_a_fresh_reset_followed_by_its_read_backs(self):
+        requests = self.load('{"id": "w1", "method": "POST", "path": "/w1", "body": {"A": "{movie}"}, "readbacks": [{"id": "r", "path": "/r"}]}',
+                             '{"id": "a", "method": "GET", "path": "/a"}',
+                             '{"id": "w2", "method": "DELETE", "path": "/w2", "readbacks": [{"id": "r", "path": "/r"}]}')
+        events = []
+        reset, _ = self.resetter(events)
+        answers = {(side, path): {} for side in "of" for path in ("/a", "/w1", "/w2", "/r")}
+        outcome = self.run_writes(requests, answers, reset, events=events)
+        self.assertEqual([r["id"] for r in outcome.results], ["a", "w1", "w1/r", "w2", "w2/r"])
+        self.assertEqual([r["state"] for r in outcome.results], ["match"] * 5)
+        order = [e[0] if e[0] == "reset" else f"{e[0]} {e[1]} {e[2]} {e[3]}" for e in events]
+        self.assertEqual(order, ["o GET /a t", "f GET /a t", "reset",
+                                 "o POST /w1 o2", "f POST /w1 f2", "o GET /r o2", "f GET /r f2", "reset",
+                                 "o DELETE /w2 o2", "f DELETE /w2 f2", "o GET /r o2", "f GET /r f2"])
+        self.assertEqual(json.loads(events[3][4]), {"A": "m1"})
+        self.assertIsNone(events[8][4])
+        writes = [r for r in outcome.results if r["method"] != "GET"]
+        self.assertTrue(all(isinstance(r["reset_s"], float) for r in writes))
+        self.assertEqual([r.get("of") for r in outcome.results], [None, None, "w1", None, "w2"])
+        self.assertEqual((outcome.cap_exceeded, outcome.failure), (False, ""))
+
+    def test_a_read_back_follows_the_id_each_server_gave_and_a_scoped_rule_accepts_the_new_ids(self):
+        (request,) = self.load('{"id": "pl", "method": "POST", "path": "/p", "readbacks": [{"id": "items", "path": "/p/{write.Id}"}]}')
+        rules = self.rules('[[rule]]\npaths = ["Id"]\nkind = "opaque"\nrequests = ["pl"]\nreason = "a new id on each server"\n')
+        reset, _ = self.resetter([])
+        answers = {("o", "/p"): {"Id": "po"}, ("f", "/p"): {"Id": "pf"}, ("o", "/p/po"): {"N": 1}, ("f", "/p/pf"): {"N": 1}}
+        outcome = self.run_writes([request], answers, reset, rules)
+        self.assertEqual([(r["id"], r["state"]) for r in outcome.results], [("pl", "match"), ("pl/items", "match")])
+        self.assertEqual((outcome.results[1]["target"], outcome.results[1]["ferrofin_target"]), ("/p/po", "/p/pf"))
+
+    def test_a_read_back_a_server_gave_nothing_to_capture_for_is_a_difference(self):
+        (request,) = self.load('{"id": "pl", "method": "POST", "path": "/p", "readbacks": [{"id": "items", "path": "/p/{write.Id}"}]}')
+        reset, _ = self.resetter([])
+        answers = {("o", "/p"): {"Id": "po"}, ("f", "/p"): {}, ("o", "/p/po"): {"N": 1}}
+        outcome = self.run_writes([request], answers, reset)
+        readback = outcome.results[1]
+        self.assertEqual(readback["state"], "differences")
+        self.assertEqual([(d["at"], d["kind"], d["oracle"]) for d in readback["differences"]], [("$status", "status", "200")])
+        self.assertIn("not sent: the write's answer has no `write.Id`", readback["differences"][0]["ferrofin"])
+
+    def test_setup_steps_run_on_the_fresh_copy_before_the_write_and_are_compared(self):
+        (request,) = self.load('{"id": "unfav", "method": "DELETE", "path": "/f", "setup": [{"id": "fav", "method": "POST", "path": "/f", "body": {"A": 1}}], '
+                               '"readbacks": [{"id": "r", "path": "/r"}]}')
+        events = []
+        reset, _ = self.resetter(events)
+        answers = {(side, path): {} for side in "of" for path in ("/f", "/r")}
+        answers[("f", "/f")] = {"Odd": True}   # answered by both the setup POST and the DELETE
+        outcome = self.run_writes([request], answers, reset, events=events)
+        order = [e[0] if e[0] == "reset" else f"{e[0]} {e[1]} {e[2]}" for e in events]
+        self.assertEqual(order, ["reset", "o POST /f", "f POST /f", "o DELETE /f", "f DELETE /f", "o GET /r", "f GET /r"])
+        self.assertEqual([(r["id"], r["state"], r.get("of")) for r in outcome.results],
+                         [("unfav/fav", "differences", "unfav"), ("unfav", "differences", None), ("unfav/r", "match", "unfav")])
+        self.assertIn("reset_s", outcome.results[1])
+        self.assertEqual(json.loads(events[1][4]), {"A": 1})
+
+    def test_a_setup_step_the_oracle_fails_on_a_known_trap_skips_the_write_and_its_read_backs(self):
+        (request,) = self.load('{"id": "w", "method": "DELETE", "path": "/f", "setup": [{"id": "s", "method": "POST", "path": "/s", "oracle_trap": "slow"}], '
+                               '"readbacks": [{"id": "r", "path": "/r"}]}')
+        events = []
+        reset, _ = self.resetter(events)
+        answers = {("o", "/s"): diff.Response(None, b"", 30.0, "timeout"), ("f", "/s"): {}}
+        outcome = self.run_writes([request], answers, reset, events=events)
+        self.assertEqual([(r["id"], r["state"]) for r in outcome.results], [("w/s", "oracle failed"), ("w", "oracle failed"), ("w/r", "oracle failed")])
+        self.assertEqual([e[2] for e in events if e[0] != "reset"], ["/s", "/s"])
+        self.assertIn("reset_s", outcome.results[1])
+
+    def test_a_trap_does_not_hide_a_read_back_a_server_was_not_asked(self):
+        (request,) = self.load('{"id": "pl", "method": "POST", "path": "/p", "readbacks": [{"id": "items", "path": "/p/{write.Id}", "oracle_trap": "slow"}]}')
+        reset, _ = self.resetter([])
+        outcome = self.run_writes([request], {("o", "/p"): {}, ("f", "/p"): {"Id": "pf"}, ("f", "/p/pf"): {}}, reset)
+        self.assertEqual(outcome.results[1]["state"], "differences")
+
+    def test_a_write_the_oracle_fails_on_a_known_trap_skips_its_read_backs(self):
+        (request,) = self.load('{"id": "bk", "method": "POST", "path": "/b", "oracle_trap": "locks the database", "readbacks": [{"id": "r", "path": "/r"}]}')
+        events = []
+        reset, _ = self.resetter(events)
+        answers = {("o", "/b"): diff.Response(None, b"", 30.0, "timeout"), ("f", "/b"): {}}
+        outcome = self.run_writes([request], answers, reset, events=events)
+        self.assertEqual([(r["id"], r["state"]) for r in outcome.results], [("bk", "oracle failed"), ("bk/r", "oracle failed")])
+        self.assertNotIn("/r", [e[2] for e in events if e[0] != "reset"])
+
+    def test_a_reset_that_fails_fails_the_run_and_sends_nothing_more(self):
+        requests = self.load('{"id": "w1", "method": "POST", "path": "/w1"}', '{"id": "w2", "method": "POST", "path": "/w2"}')
+        events = []
+        reset, _ = self.resetter(events, error=diff.ResetError("ferrofin: did not answer /System/Ping"))
+        outcome = self.run_writes(requests, {}, reset, events=events)
+        self.assertEqual((outcome.results, len(events)), ([], 1))
+        self.assertIn("resetting the servers before `w1` failed: ferrofin: did not answer /System/Ping", outcome.failure)
+        self.assertEqual(diff.verdict_of(outcome.results, outcome.cap_exceeded, outcome.failure)[0], "run failed")
+
+    def test_a_reset_gets_what_is_left_of_the_cap_and_one_the_cap_cuts_short_is_cap_exceeded(self):
+        (request,) = self.load('{"id": "w1", "method": "POST", "path": "/w1"}')
+        reset, calls = self.resetter([], error=diff.ResetError("killed at the deadline", timed_out=True))
+        outcome = self.run_writes([request], {}, reset, deadline=160.0, wall=lambda: 100.0)
+        self.assertEqual((calls, outcome.cap_exceeded, outcome.failure), ([60.0], True, ""))
+
+    def test_without_a_deadline_a_reset_is_unbounded_here_and_bounded_by_the_reset_script(self):
+        (request,) = self.load('{"id": "w1", "method": "POST", "path": "/w1"}')
+        reset, calls = self.resetter([])
+        self.run_writes([request], {("o", "/w1"): {}, ("f", "/w1"): {}}, reset)
+        self.assertEqual(calls, [None])
+
+    def test_a_write_needs_a_reset(self):
+        (request,) = self.load('{"id": "w1", "method": "POST", "path": "/w1"}')
+        with self.assertRaisesRegex(diff.ParityError, "a write needs a fresh database copy"):
+            self.run_writes([request], {}, None)
 
 
 class Verdict(unittest.TestCase):
@@ -442,6 +678,17 @@ class Report(Scratch):
         self.assertIn("Oracle failures (1)", page)
         self.assertIn("timeout", page)
 
+    def test_each_write_shows_its_reset_time_and_its_read_backs_and_the_resets_count_in_the_timing(self):
+        write_result = {**self.result("fav", "match"), "method": "POST", "reset_s": 12.25}
+        readbacks = [{**self.result("fav/data", "match"), "of": "fav"},
+                     {**self.result("fav/list", "differences", [self.difference()], {"oracle": "{}", "ferrofin": "{}"}), "of": "fav"}]
+        page = diff.render(self.summary([self.result("read", "match"), write_result, *readbacks]))
+        section = page[page.index("Writes (1)"):]
+        self.assertIn("12.2 s", section)
+        self.assertIn("fav/data", section)
+        self.assertIn("fav/list", section)
+        self.assertIn("1 reset, 12.2 s in all", page)
+
     def test_the_text_of_a_response_cannot_inject_markup(self):
         page = diff.render(self.summary([self.result("bad", "differences", [self.difference()], {"oracle": "<script>x</script>", "ferrofin": "{}"})]))
         self.assertNotIn("<script>x", page)
@@ -483,7 +730,10 @@ class Handler(BaseHTTPRequestHandler):
             default = {"AccessToken": "tok-" + str(self.server.server_port)}
             self.respond(self.login_status, default if self.login is UNSET else self.login)
         else:
-            self.respond(404, {})
+            self.respond(*self.routes.get("POST " + self.path, (404, {})))
+
+    def do_DELETE(self):
+        self.respond(*self.routes.get("DELETE " + self.path, (404, {})))
 
     def do_GET(self):
         route = self.routes.get(self.path)
@@ -673,6 +923,52 @@ class Live(Scratch):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(diff.main(["failure", "--out", str(out), "--reason", "early failure"]), 1)
                 self.assertIn("early failure", (out / "report.html").read_text())
+
+    WRITE = '{"id": "fav", "method": "POST", "path": "/Fav/{movie}", "readbacks": [{"id": "data", "path": "/Items/{movie}"}]}\n'
+
+    def test_a_whole_run_with_a_write_resets_the_servers_with_the_reset_command_and_signs_in_again(self):
+        resets = self.dir / "resets"
+        command = f"{sys.executable} -c \"import sys; open(sys.argv[1], 'a').write('reset\\n')\" {resets}"
+        routes = {"POST /Fav/m1": (200, {"IsFavorite": True}), "/Items/m1": (200, {"Name": "x"})}
+        with serve(routes) as a, serve(routes) as b:
+            code, out = self.run_cli(a, b, self.files(self.WRITE), "--reset-command", command)
+        self.assertEqual(code, 0)
+        self.assertEqual(resets.read_text(), "reset\n")
+        summary = json.loads((out / "results.json").read_text())
+        self.assertEqual([(r["id"], r["state"]) for r in summary["requests"]], [("fav", "match"), ("fav/data", "match")])
+        self.assertEqual((summary["resets"], summary["requests"][0]["reset_s"] >= 0), (1, True))
+
+    def test_a_reset_command_that_fails_fails_the_run_with_its_message(self):
+        command = f"{sys.executable} -c \"import sys; sys.exit('ferrofin: docker start failed')\""
+        with serve({}) as a, serve({}) as b:
+            code, out = self.run_cli(a, b, self.files(self.WRITE), "--reset-command", command)
+        self.assertEqual(code, 1)
+        summary = json.loads((out / "results.json").read_text())
+        self.assertEqual(summary["verdict"], "run failed")
+        self.assertIn("ferrofin: docker start failed", summary["reason"])
+
+    def test_a_reset_command_that_overruns_the_cap_is_killed_with_what_it_started(self):
+        marker = self.dir / "survivor"
+        script = write(self.dir, "slow_reset.sh", f"#!/bin/sh\n(sleep 3; touch {marker}) &\nsleep 30\n")
+        Path(script).chmod(0o755)
+        started = time.monotonic()
+        with serve({}) as a, serve({}) as b:
+            code, out = self.run_cli(a, b, self.files(self.WRITE), "--reset-command", script, "--deadline", str(time.time() + 1.5))
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual((code, json.loads((out / "results.json").read_text())["cap_exceeded"]), (1, True))
+        time.sleep(3)
+        self.assertFalse(marker.exists())   # the reset's own children went with it
+
+    def test_stopping_a_reset_command_when_none_is_running_does_nothing(self):
+        diff.ResetCommand("true").stop()
+
+    def test_writes_without_a_reset_command_are_refused_before_anything_is_sent(self):
+        stderr = io.StringIO()
+        with serve({}) as a, serve({}) as b, contextlib.redirect_stderr(stderr):
+            code, out = self.run_cli(a, b, self.files(self.WRITE))
+        self.assertEqual(code, 2)
+        self.assertIn("--reset-command", stderr.getvalue())
+        self.assertFalse(out.exists())
 
     def test_check_validates_the_shipped_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
