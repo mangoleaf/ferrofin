@@ -207,6 +207,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
   while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
   database write for up to 30 seconds when the two overlapped
+- A Live TV channel that drops out of the tuner lineup and comes back keeps its users'
+  favourites, likes and play state, as in Jellyfin. The guide refresh that recreates the
+  channel gives back the data its removal had set aside
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See

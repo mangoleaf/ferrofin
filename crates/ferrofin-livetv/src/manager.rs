@@ -865,24 +865,28 @@ impl FerrofinLiveTvManager {
             .iter()
             .map(|row| (row.id.to_uppercase(), row))
             .collect();
-        let mut save: Vec<BaseItemEntity> = Vec::new();
+        let mut created: Vec<BaseItemEntity> = Vec::new();
+        let mut updated: Vec<BaseItemEntity> = Vec::new();
         for row in &rows {
             let fresh = channel_entity(row, parse_dt, view_id);
             match by_id.get(&fresh.id.to_uppercase()) {
                 // `isNew` — the item did not exist, so `CreateItem` stores it
                 // whole.
-                None => save.push(fresh),
+                None => created.push(fresh),
                 // `forceUpdate` — the item exists, so only the fields the
                 // refresh owns are assigned onto the STORED row, and it is
                 // written back only if one of them actually changed. Writing
                 // `fresh` here instead would be a full-column upsert that
                 // reverts everything the metadata editor put on a channel.
-                Some(prev) => save.extend(channel_item_update(prev, &fresh)),
+                Some(prev) => updated.extend(channel_item_update(prev, &fresh)),
             }
         }
-        if !save.is_empty() {
-            store.persistence.save_items(&save).await?;
+        for batch in [&created, &updated] {
+            if !batch.is_empty() {
+                store.persistence.save_items(batch).await?;
+            }
         }
+        Self::reattach_channel_user_data(store, &created).await;
         // `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)`
         // (:145-148). The upstream guard is the `cleanDatabase` flag, which
         // ONLY a thrown `RefreshChannelsInternal` clears (:130-134) — an
@@ -913,6 +917,36 @@ impl FerrofinLiveTvManager {
             store.persistence.delete_items(&stale).await?;
         }
         Ok(())
+    }
+
+    /// Gives each channel item this guide refresh `created` back the user
+    /// data it parked on the deletion placeholder when it left the lineup.
+    ///
+    /// Upstream refreshes every channel (`GuideManager.cs:317`), and a created
+    /// item's first refresh re-attaches (`MetadataService.SaveItemAsync` with
+    /// `isFirstRefresh` → `ReattachUserDataAsync`). Ferrofin refreshes no
+    /// channel's metadata and never stamps its `DateLastRefreshed`, so the
+    /// item's creation stands in for that first refresh. Re-attaching every
+    /// unstamped channel would run on every refresh for all of them. A channel
+    /// that fails is skipped, as upstream catches each one; the failures are
+    /// logged once for the pass.
+    async fn reattach_channel_user_data(store: &LiveTvItemStore, created: &[BaseItemEntity]) {
+        let mut failed = 0_usize;
+        let mut first_error = None;
+        for entity in created {
+            if let Err(err) = store.persistence.reattach_user_data(entity).await {
+                tracing::debug!(item_id = %entity.id, %err, "live tv: could not re-attach a channel's user data");
+                failed += 1;
+                first_error.get_or_insert(err);
+            }
+        }
+        if let Some(err) = first_error {
+            tracing::warn!(
+                failed,
+                %err,
+                "live tv: could not re-attach the user data of some returning channels; the first error"
+            );
+        }
     }
 
     /// Mirrors the ingested guide into `BaseItems`.
@@ -6801,6 +6835,47 @@ mod tests {
             !after
                 .iter()
                 .any(|(id, ..)| Uuid::parse_str(id).ok() == Some(ghost))
+        );
+    }
+
+    /// A channel that left the lineup and comes back gets its users' data
+    /// back. `CleanDatabase` deleted its item, which parked the rows on the
+    /// deletion placeholder. Upstream's first refresh of the recreated item
+    /// re-attaches them (`MetadataService.SaveItemAsync` →
+    /// `ReattachUserDataAsync`), and so does creating the item here.
+    #[tokio::test]
+    async fn a_channel_that_returns_to_the_lineup_gets_its_user_data_back() {
+        use crate::guide_repository::test_support::{favorite_holder, seed_favorite};
+        let lab = channel_item_lab().await;
+        let (mgr, persistence) = (&lab.mgr, &lab.persistence);
+        mgr.refresh_guide().await.expect("refresh");
+        let users: Arc<dyn ferrofin_traits::library::UserManager> = Arc::new(
+            ferrofin_core::user_manager::FerrofinUserManager::new(mgr.db.clone()),
+        );
+        let user = users.create_user("couch").await.expect("user");
+        let channel = stored_channel_items(mgr).await[0].0.clone();
+        let key = channel.to_lowercase();
+        seed_favorite(&mgr.db, &channel, &user.id)
+            .await
+            .expect("favourite");
+
+        // The channel leaves the lineup: its item goes, the favourite is parked.
+        persistence
+            .delete_items(&[Uuid::parse_str(&channel).expect("guid")])
+            .await
+            .expect("delete");
+        let parked = favorite_holder(&mgr.db, &user.id, &key)
+            .await
+            .expect("read");
+        assert_ne!(parked.as_deref(), Some(channel.as_str()), "parked");
+
+        // It comes back: the recreated item takes the favourite again.
+        mgr.refresh_guide().await.expect("refresh again");
+        assert_eq!(
+            favorite_holder(&mgr.db, &user.id, &key)
+                .await
+                .expect("read"),
+            Some(channel)
         );
     }
 
