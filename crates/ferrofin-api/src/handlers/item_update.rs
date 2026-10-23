@@ -32,7 +32,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
-use ferrofin_model::data::{BaseItemKind, PersonKind};
+use ferrofin_model::data::{BaseItemKind, CollectionType, PersonKind};
 use ferrofin_model::dto::{DayOfWeek, MetadataEditorInfo, NameGuidPair, NameValuePair};
 use ferrofin_model::entities::{MetadataField, SeriesStatus, Video3DFormat};
 use ferrofin_traits::library::ScanTarget;
@@ -920,9 +920,10 @@ struct ContentTypeQuery {
 /// `POST /Items/{itemId}/ContentType` — sets the folder content-type override.
 ///
 /// Port of `ItemUpdateController.UpdateItemContentType`. A missing item is a
-/// `404`; on success the server configuration's `ContentTypes` list is rewritten
-/// (dropping any prior entry for this folder, adding the new one when non-blank)
-/// and persisted, returning `204`.
+/// `404`. Otherwise the server configuration's `ContentTypes` list is saved
+/// without the entry for the item's `ContainingFolderPath` (its own folder for
+/// a folder, its file's directory for a file), with the new type added under
+/// that folder unless it is blank, and the answer is `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/ContentType",
@@ -944,40 +945,17 @@ async fn update_item_content_type(
         .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    let folder = containing_folder_path(item.path.as_deref());
+    let folder = state.library.containing_folder_path(&item).await;
 
     let mut configuration = (*state.config.configuration().await?).clone();
-    configuration.content_types.retain(|pair| {
-        pair.name
-            .as_deref()
-            .is_some_and(|name| !name.is_empty() && !name.eq_ignore_ascii_case(&folder))
-    });
-    if let Some(content_type) = query
-        .content_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        configuration.content_types.push(NameValuePair {
-            name: Some(folder),
-            value: Some(content_type.to_owned()),
-        });
-    }
+    configuration.content_types =
+        ferrofin_model::content_type_overrides::with_content_type_override(
+            &configuration.content_types,
+            folder.as_deref(),
+            query.content_type.as_deref(),
+        );
     state.config.update_configuration(&configuration).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// The containing-folder path of a file path (its parent directory), or an empty
-/// string when unknown. Mirrors C# `BaseItem.ContainingFolderPath`.
-fn containing_folder_path(path: Option<&str>) -> String {
-    let Some(path) = path else {
-        return String::new();
-    };
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    match trimmed.rfind(['/', '\\']) {
-        Some(idx) => trimmed[..idx].to_owned(),
-        None => String::new(),
-    }
 }
 
 /// Query parameters for `POST /Items/{itemId}/Refresh`.
@@ -1306,14 +1284,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// when absent), then assembles the reference data — parental ratings, countries,
 /// cultures (deduped by display name, name-ordered case-insensitively via the
 /// shared [`crate::handlers::localization::distinct_ordered_cultures`]), the item's external-id
-/// descriptors, and the per-item content-type options.
-///
-/// Port note — content type: C# refines `ContentType`/`ContentTypeOptions` from
-/// the folder's inherited vs configured collection type
-/// (`GetInheritedContentType`/`GetConfiguredContentType`), which need the
-/// un-ported collection-folder tree. The portable seam always offers the full
-/// per-item option set with an unset `ContentType`; the descriptor shape and the
-/// reference lists are already the final ones.
+/// descriptors, and the item's content type ([`content_type_editor`]).
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/MetadataEditor",
@@ -1329,14 +1300,11 @@ async fn get_metadata_editor(
     RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
-    if state
+    let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound(format!("item {item_id}")));
-    }
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
     let external_id_infos = state.providers.get_external_id_infos(item_id).await?;
 
@@ -1346,19 +1314,130 @@ async fn get_metadata_editor(
     let cultures =
         crate::handlers::localization::distinct_ordered_cultures(state.localization.get_cultures());
 
+    let (content_type, content_type_options) = content_type_editor(&state, &item).await?;
     let info = MetadataEditorInfo {
         parental_rating_options: state.localization.get_parental_ratings(),
         countries: state.localization.get_countries(),
         cultures,
         external_id_infos,
-        content_type: None,
-        // Jellyfin's GetMetadataEditorInfo only populates ContentTypeOptions for a collection-folder
-        // whose content type is configurable; a plain library item (e.g. a Movie) gets an empty list.
-        // Ferrofin doesn't model the configurable-content-type folder tree here, so a plain item — the
-        // common case this endpoint serves — matches Jellyfin's empty array.
-        content_type_options: Vec::new(),
+        content_type,
+        content_type_options,
     };
     Ok(Json(info))
+}
+
+/// The editor's `ContentType` and `ContentTypeOptions` for `item`
+/// (`GetMetadataEditorInfo`, v12.2 `ItemUpdateController.cs:167-193`).
+///
+/// Only a library's own item offers the selector: not a virtual item, a library
+/// (`ICollectionFolder`), a user view, the aggregate folder, a Live TV channel
+/// or program, a channel or one of its items, a by-name item, or a recording
+/// still being written. It is offered where the inherited type is unknown (a
+/// mixed library), or where the item already has an override, which it then
+/// shows. Where the inherited type is unknown, movies or shows, only Inherit,
+/// Movies and Shows are offered.
+async fn content_type_editor(
+    state: &AppState,
+    item: &BaseItemEntity,
+) -> Result<(Option<CollectionType>, Vec<NameValuePair>), ApiError> {
+    if !offers_content_type(state, item).await? {
+        return Ok((None, Vec::new()));
+    }
+    let inherited = state.library.get_inherited_content_type(item).await?;
+    let configured = state.library.get_configured_content_type(item).await?;
+    if inherited.is_some() && configured.is_none() {
+        return Ok((None, Vec::new()));
+    }
+    let mut options = content_type_options(state);
+    if matches!(
+        inherited,
+        None | Some(CollectionType::tvshows | CollectionType::movies)
+    ) {
+        options.retain(|option| {
+            option.value.as_deref().is_none_or(|value| {
+                value.trim().is_empty()
+                    || equals_ordinal_ignore_case(value, "TvShows")
+                    || equals_ordinal_ignore_case(value, "Movies")
+            })
+        });
+    }
+    Ok((configured, options))
+}
+
+/// Whether `item` may carry a folder content-type override: the guard of
+/// `GetMetadataEditorInfo` (`ItemUpdateController.cs:167-173`).
+async fn offers_content_type(state: &AppState, item: &BaseItemEntity) -> Result<bool, ApiError> {
+    if item.is_virtual_item || item.channel_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        return Ok(false);
+    }
+    // `BaseItemKind::from_stored_type_name` names every kind the guard
+    // excludes; a type it cannot name is none of them.
+    if BaseItemKind::from_stored_type_name(&item.type_).is_some_and(|kind| {
+        matches!(
+            kind,
+            BaseItemKind::CollectionFolder
+                | BaseItemKind::BasePluginFolder
+                | BaseItemKind::PlaylistsFolder
+                | BaseItemKind::ManualPlaylistsFolder
+                | BaseItemKind::UserView
+                | BaseItemKind::AggregateFolder
+                | BaseItemKind::TvChannel
+                | BaseItemKind::LiveTvChannel
+                | BaseItemKind::TvProgram
+                | BaseItemKind::LiveTvProgram
+                | BaseItemKind::Channel
+                | BaseItemKind::Genre
+                | BaseItemKind::MusicGenre
+                | BaseItemKind::Studio
+                | BaseItemKind::Year
+                | BaseItemKind::Person
+                | BaseItemKind::MusicArtist
+        )
+    }) {
+        return Ok(false);
+    }
+    // `Video.SourceType` is `LiveTV` while a recording still writes the file.
+    let video = BaseItemKind::from_stored_type_name(&item.type_).is_some_and(|kind| {
+        matches!(
+            kind,
+            BaseItemKind::Movie
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Trailer
+                | BaseItemKind::Video
+        )
+    });
+    if video
+        && let (Some(live_tv), Some(path)) = (&state.live_tv, item.path.as_deref())
+        && live_tv
+            .active_recording_paths()
+            .await?
+            .iter()
+            .any(|recording| recording == path)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// `ItemUpdateController.GetContentTypeOptions(isForItem: true)`: Inherit,
+/// then the item content types, each name localized.
+fn content_type_options(state: &AppState) -> Vec<NameValuePair> {
+    [
+        ("Inherit", ""),
+        ("Movies", "movies"),
+        ("Music", "music"),
+        ("Shows", "tvshows"),
+        ("HomeVideos", "homevideos"),
+        ("MusicVideos", "musicvideos"),
+        ("Photos", "photos"),
+    ]
+    .into_iter()
+    .map(|(name, value)| NameValuePair {
+        name: Some(state.localization.get_localized_string(name)),
+        value: Some(value.to_owned()),
+    })
+    .collect()
 }
 
 crate::query::query_parameters! {
@@ -1368,9 +1447,7 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        UpdateItemRequest, containing_folder_path, join_distinct, non_empty, propagate_rating,
-    };
+    use super::{UpdateItemRequest, join_distinct, non_empty, propagate_rating};
     use rstest::rstest;
 
     /// `ItemUpdateController.UpdateItem` (v12.2 :417-420): a video
@@ -1573,15 +1650,5 @@ mod tests {
         assert_eq!(non_empty(Some("  x ")), Some("x".to_owned()));
         assert_eq!(non_empty(Some("   ")), None);
         assert_eq!(non_empty(None), None);
-    }
-
-    #[test]
-    fn containing_folder_is_parent_dir() {
-        assert_eq!(
-            containing_folder_path(Some("/media/movies/Blade/Blade.mkv")),
-            "/media/movies/Blade"
-        );
-        assert_eq!(containing_folder_path(Some("Blade.mkv")), "");
-        assert_eq!(containing_folder_path(None), "");
     }
 }
