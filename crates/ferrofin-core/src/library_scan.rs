@@ -12193,14 +12193,17 @@ impl LibraryScanner {
                 tracing::warn!(%err, library = %cf, "failed to composite the library image");
                 continue;
             }
-            let info = ItemImageInfo {
+            // Recorded as any saved image is: the file's own modification
+            // time, and its size and blurhash read back from it.
+            let mut info = ItemImageInfo {
                 path: options.output_path.clone(),
                 image_type: ImageType::Primary,
-                date_modified: Utc::now(),
+                date_modified: crate::dynamic_images::file_date_modified(&out),
                 width: options.width,
                 height: options.height,
                 blur_hash: None,
             };
+            crate::dynamic_images::fill_image_metadata(processor.as_ref(), &mut info).await;
             // `ProviderManager.SaveImage` replaces the Primary only; the
             // library's other images stay.
             let mut images = match items.get_image_infos(cf).await {
