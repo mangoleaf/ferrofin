@@ -1250,6 +1250,11 @@ impl SessionManager for FakeSessions {
     async fn report_session_ended(&self, _session_id: &str) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    /// A socket's last close ends quietly here, so a socket test can close its
+    /// last socket. A logout (`report_session_ended`) stays unimplemented.
+    async fn close_if_needed(&self, _session_id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn send_general_command(
         &self,
         _controlling_session_id: &str,
