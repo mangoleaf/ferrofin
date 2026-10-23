@@ -23014,10 +23014,11 @@ mod tests {
             super::season_sort_name(Some(0), "Specials")
                 < super::season_sort_name(Some(1), "Season 1")
         );
-        // No number → the name pipeline.
+        // No number → the name as it is (`Season.CreateSortName` returns
+        // `Name`), not the article-stripping, lower-casing name pipeline.
         assert_eq!(
             super::season_sort_name(None, "Season Unknown"),
-            super::create_sort_name("Season Unknown")
+            "Season Unknown"
         );
     }
 
