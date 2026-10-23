@@ -70,6 +70,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   content" and "Uncoded languages". External subtitle files named with these codes
   (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
   `GET /Items/Filters` is unchanged
+- `GET /Items/Filters2?isAiring=false` lists the filters of the programmes not on now
+  (starting later or already ended), as Jellyfin 12 does. It returned an empty filter set,
+  because the predicate required a programme to start after now and also end before now
 - Serve Jellyfin 12's `MediaStream.IsOriginal` (ffprobe's `original` disposition, always
   written), `LocalizedLanguage` and `LocalizedOriginal` (on every audio stream). An
   original audio track's `DisplayTitle` ends in " - Original" (localized). As upstream, a
