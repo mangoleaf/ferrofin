@@ -30,6 +30,7 @@ reset_server() {   # reset_server NAME: runs in a background subshell; says what
 
 # A signal stops the two resets (not what they are waiting on: diff.py and run.sh kill this whole session
 # for that, the docker calls included).
+# shellcheck disable=SC2317,SC2329  # invoked by the trap (SC2317 is the code before shellcheck 0.11)
 stop_resets() { local job; for job in $(jobs -p); do kill "$job" 2>/dev/null; done; exit 143; }
 trap stop_resets TERM INT HUP
 # Each server's one-line verdict goes to reset.out, what the tools said on the way to reset.log.
