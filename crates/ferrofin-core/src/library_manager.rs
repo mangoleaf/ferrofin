@@ -2005,9 +2005,10 @@ impl FerrofinLibraryManager {
 
     /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
     /// before the item's files: each row's internal metadata folder
-    /// (`{metadata}/library/{id2}/{id}`, and Ferrofin's own
-    /// `{metadata}/library/{GUID}`). A folder that cannot be removed is
-    /// logged and passed over, as upstream.
+    /// (`{metadata}/library/{id2}/{id}`), Ferrofin's own
+    /// `{metadata}/library/{GUID}`, and the lower-cased one older scans also
+    /// wrote art to ([`crate::item_folders::item_art_folders`]). A folder that
+    /// cannot be removed is logged and passed over, as upstream.
     ///
     /// Upstream's list also names a video's internal extracted data
     /// (trickplay tiles, chapter images, subtitle and attachment caches);
@@ -2017,8 +2018,9 @@ impl FerrofinLibraryManager {
     async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
         if let Some(paths) = &self.app_paths {
             use ferrofin_traits::system::ServerApplicationPaths as _;
-            // Both layouts: Ferrofin's `{metadata}/library/{GUID}` and
-            // Jellyfin's `{metadata}/library/{xx}/{idN}` an adopted item has.
+            // Every layout: Ferrofin's `{metadata}/library/{GUID}` (and its
+            // older lower-cased spelling) and Jellyfin's
+            // `{metadata}/library/{xx}/{idN}` an adopted item has.
             let art_root = std::path::Path::new(&paths.internal_metadata_path()).join("library");
             let folders: Vec<std::path::PathBuf> = rows
                 .iter()

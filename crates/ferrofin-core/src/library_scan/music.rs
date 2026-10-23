@@ -1887,9 +1887,8 @@ impl LibraryScanner {
             );
         }
         sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
-        let key = work.id.to_string();
         let meta_root = meta_root.resolve();
-        let dir = meta_root.join(&key);
+        let dir = crate::dynamic_images::own_art_dir(&meta_root, work.id);
         let mut images: Vec<_> = stored
             .iter()
             .filter(|image| {
@@ -1932,7 +1931,8 @@ impl LibraryScanner {
             }
         }
         if fetch.images == ImageFetch::All {
-            super::artwork::prune_old_backdrops(&dir, &images);
+            let legacy = crate::dynamic_images::legacy_art_dir(&meta_root, work.id);
+            super::artwork::prune_old_backdrops_in(&[dir.clone(), legacy], &images);
             let acquired: HashSet<_> = images.iter().map(|image| image.image_type).collect();
             images.extend(
                 stored
