@@ -37,7 +37,8 @@ use ferrofin_traits::options::{
 };
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use ferrofin_traits::stubs::{
-    DisabledAttachmentExtractor, PlaybackRequest, SyncPlayManager, SyncPlaySession,
+    DisabledAttachmentExtractor, PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying,
+    SyncPlaySession,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -667,7 +668,7 @@ impl SessionManager for RecordingSessions {
         _m: SessionMessageType,
         _d: &str,
     ) -> Result<(), ServiceError> {
-        // The played/favorite/progress handlers push `UserDataChanged` here;
+        // The user-data manager's batched `UserDataChanged` goes out here;
         // delivery is covered by the ferrofin-core session-manager tests.
         Ok(())
     }
@@ -993,6 +994,7 @@ impl SyncPlayManager for FakeSyncPlay {
         &self,
         session: &SyncPlaySession,
         group_name: &str,
+        _now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
         Ok(GroupInfoDto {
             group_id: GROUP_ID,
@@ -1176,6 +1178,7 @@ impl SyncPlayManager for GatedSyncPlay {
         &self,
         _s: &SyncPlaySession,
         _n: &str,
+        _p: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
         self.touch();
         Ok(GroupInfoDto::default())

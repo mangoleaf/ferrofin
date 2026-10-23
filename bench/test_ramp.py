@@ -207,7 +207,8 @@ class SessionTests(unittest.TestCase):
         for (name, _, _), c in zip(plan["schedule"], ceilings):
             d = out / name / "ferrofin"
             d.mkdir(parents=True)
-            (d / "ramp.json").write_text(json.dumps({"ceiling": c, "limit": "p95", "reason": "r", "stopped_at": c + 10, "steps": []}))
+            (d / "ramp.json").write_text(json.dumps({"start": 25, "step": 10, "step_s": 30, "cap": 400, "bound_ms": BOUND, "warmup_s": 30,
+                                                     "ceiling": c, "limit": "p95", "reason": "r", "stopped_at": c + 10, "steps": []}))
         return out
 
     def test_schedule_runs_only_the_ramp_and_dry_run_starts_nothing(self):
@@ -226,6 +227,17 @@ class SessionTests(unittest.TestCase):
         self.assertIn("**BLOCKED**", md)
         self.assertIn("class='delta bad'>regressed", (out / "report.html").read_text())
         self.assertEqual(json.loads((out / "verdict.json").read_text())["blocking"], block)
+
+    def test_the_ramp_verdict_reaches_the_candidate_runs_in_the_viewer(self):
+        out = self.session([185, 135, 185, 135, 185, 135])
+        gate.render(str(out))
+        for name in ("02-b", "04-b", "06-b"):
+            with self.subTest(name):
+                cells = report.load_verdicts([str(out / name)])
+                self.assertEqual([(c["cell"], c["verdict"], c["baseline"], c["candidate"]) for c in cells],
+                                 [("ramp/ceiling", "regressed", 185, 135)])
+                self.assertIn("A/B gate — 1 regressed", (out / name / "report.html").read_text())
+        self.assertIsNone(report.load_verdicts([str(out / "01-a")]))  # the previous release is not judged
 
     def test_self_ab_reports_no_regression(self):
         md, block = gate.render(str(self.session([185] * 6)))

@@ -13,15 +13,16 @@
 //! - `GET /Libraries/AvailableOptions`
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_api::AppState;
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::{
-    ApiKeyAuthService, AuthedAuthService, FakeAuthService, FakeVirtualFolders,
-    authed_state_with_virtual_folders, elevated_state_with_virtual_folders, fake_state,
-    setup_complete_state,
+    ApiKeyAuthService, AuthedAuthService, CountingScans, FakeAuthService, FakeVirtualFolders,
+    authed_state_with_library_and_monitor, authed_state_with_virtual_folders,
+    elevated_state_with_virtual_folders, fake_state, setup_complete_state,
 };
 use tower::ServiceExt;
 
@@ -901,4 +902,160 @@ async fn structure_routes_require_an_administrator_once_setup_is_complete() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A [`LibraryMonitor`](ferrofin_traits::library::LibraryMonitor) that counts
+/// its restarts.
+#[derive(Default)]
+struct CountingMonitor(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::LibraryMonitor for CountingMonitor {
+    async fn start(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn stop(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_change_beginning(
+        &self,
+        _path: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_change_complete(
+        &self,
+        _path: &str,
+        _refresh_path: bool,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_changed(
+        &self,
+        _path: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+}
+
+/// Sends `method uri` (with an optional JSON `body`) to a router whose
+/// virtual folders are `vf`, and returns `(status, monitor restarts, queued
+/// scans)`.
+async fn structure_request(
+    vf: FakeVirtualFolders,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+) -> (StatusCode, usize, usize) {
+    let scans = Arc::new(CountingScans::default());
+    let monitor = Arc::new(CountingMonitor::default());
+    let state = authed_state_with_library_and_monitor(scans.clone(), monitor.clone())
+        .with_virtual_folders(Arc::new(vf));
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Emby-Token", TOKEN);
+    if body.is_some() {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+    }
+    let status = create_router(state)
+        .oneshot(
+            request
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    (
+        status,
+        monitor.0.load(Ordering::SeqCst),
+        scans.0.load(Ordering::SeqCst),
+    )
+}
+
+/// Upstream makes each structure change in a `try` and restarts the monitor
+/// or queues the requested refresh in `finally`, after its argument,
+/// existence and conflict checks: a change that fails part-way still gets
+/// both, and the request still fails.
+#[rstest::rstest]
+#[case::add_library(
+    "POST",
+    "/Library/VirtualFolders?name=Movies&refreshLibrary=true",
+    None
+)]
+#[case::remove_library(
+    "DELETE",
+    "/Library/VirtualFolders?name=Movies&refreshLibrary=true",
+    None
+)]
+#[case::rename_library(
+    "POST",
+    "/Library/VirtualFolders/Name?name=Movies&newName=Films&refreshLibrary=true",
+    None
+)]
+#[case::add_media_path(
+    "POST",
+    "/Library/VirtualFolders/Paths?refreshLibrary=true",
+    Some(r#"{"Name":"Movies","Path":"/media/movies"}"#)
+)]
+#[case::remove_media_path(
+    "DELETE",
+    "/Library/VirtualFolders/Paths?name=Movies&path=/media/movies&refreshLibrary=true",
+    None
+)]
+#[tokio::test]
+async fn a_structure_change_that_fails_part_way_still_restarts_and_refreshes(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: Option<&str>,
+) {
+    // Every manager step fails with a backend error, as one after the change.
+    let (status, restarts, scans) =
+        structure_request(FakeVirtualFolders::failing(), method, uri, body).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(restarts, 1, "monitor restarted");
+    assert_eq!(scans, 1, "requested scan queued");
+}
+
+/// A change refused by upstream's checks before its `try` (a missing
+/// library, 404; a taken name, 409; a bad argument, 400) changes nothing,
+/// so nothing is restarted or scanned.
+#[rstest::rstest]
+#[case::missing_library(
+    "DELETE",
+    "/Library/VirtualFolders?name=Gone&refreshLibrary=true",
+    StatusCode::NOT_FOUND
+)]
+#[case::taken_name(
+    "POST",
+    "/Library/VirtualFolders/Name?name=Movies&newName=Films&refreshLibrary=true",
+    StatusCode::CONFLICT
+)]
+#[case::bad_name(
+    "POST",
+    "/Library/VirtualFolders?name=%20Movies&refreshLibrary=true",
+    StatusCode::BAD_REQUEST
+)]
+#[tokio::test]
+async fn a_structure_change_refused_up_front_neither_restarts_nor_refreshes(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] expected: StatusCode,
+) {
+    let vf = FakeVirtualFolders::working();
+    for name in ["Movies", "Films"] {
+        ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+            &vf,
+            name,
+            None,
+            &ferrofin_model::configuration::LibraryOptions::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let (status, restarts, scans) = structure_request(vf, method, uri, None).await;
+    assert_eq!(status, expected);
+    assert_eq!((restarts, scans), (0, 0));
 }

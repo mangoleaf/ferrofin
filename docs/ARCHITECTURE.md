@@ -37,7 +37,7 @@ injects them into the API's `AppState`.
 | `ferrofin-util` | Jellyfin.Extensions | leaf utils; string/path/natural-sort |
 | `ferrofin-model` | MediaBrowser.Model | DTOs/enums (serde + utoipa); keeps the DLNA profile/StreamBuilder logic |
 | `ferrofin-naming` | Emby.Naming | filename→media parsing; rich `[Theory]` test corpus transliterated |
-| `ferrofin-keyframes` | Jellyfin.MediaEncoding.Keyframes | keyframe extraction structures |
+| `ferrofin-keyframes` | Jellyfin.MediaEncoding.Keyframes | keyframe extraction: the ffprobe output parser and the Matroska cue reader |
 | `ferrofin-common` | MediaBrowser.Common | config, app-paths, password hashing (PBKDF2-HMAC-SHA512/SHA1, byte-compatible with Jellyfin) |
 | `ferrofin-networking` | Jellyfin.Networking | bind / published-URL resolution |
 | `ferrofin-health` | (new) | lean liveness/readiness router |
