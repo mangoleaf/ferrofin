@@ -108,11 +108,21 @@ impl<'de> Visitor<'de> for RawMembers {
     }
 }
 
+/// The maximum nesting depth a request body may reach, mirroring
+/// `System.Text.Json`'s default `MaxDepth` of 64. Every value counts as a level
+/// (a scalar leaf included), so this is marginally stricter than STJ's
+/// container-only count — immaterial, since real clients never nest this deep. A
+/// body past the bound is rejected before its deepest level is built. The parser
+/// still re-reads each container's raw text per level, so a lower bound also
+/// caps the adversarial cost of a deeply nested body (tracked for a true
+/// single-pass rewrite in the follow-up to gl-32).
+const MAX_BODY_DEPTH: usize = 64;
+
 impl<const FOLD: bool> Doc<FOLD> {
     /// Builds the ordered tree while retaining numeric lexemes. Raw values
     /// borrow the request only during parsing; the completed tree owns its data.
     fn from_raw(raw: &str, depth: usize) -> Result<Self, Error> {
-        if depth >= 128 {
+        if depth >= MAX_BODY_DEPTH {
             return Err(de::Error::custom("recursion limit exceeded"));
         }
         match raw.as_bytes()[0] {
@@ -818,8 +828,20 @@ mod tests {
                 Doc::Number(raw.into())
             );
         }
-        let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
-        assert!(serde_json::from_str::<Doc>(&nested).is_err());
+        // The cap matches System.Text.Json's default MaxDepth (64): a value
+        // nested at `MAX_BODY_DEPTH` is rejected, one level shallower is kept.
+        let at_cap = format!(
+            "{}0{}",
+            "[".repeat(MAX_BODY_DEPTH),
+            "]".repeat(MAX_BODY_DEPTH)
+        );
+        assert!(serde_json::from_str::<Doc>(&at_cap).is_err());
+        let under_cap = format!(
+            "{}0{}",
+            "[".repeat(MAX_BODY_DEPTH - 1),
+            "]".repeat(MAX_BODY_DEPTH - 1)
+        );
+        assert!(serde_json::from_str::<Doc>(&under_cap).is_ok());
         assert!(serde_json::from_str::<Doc>("[1,]").is_err());
     }
     #[test]
