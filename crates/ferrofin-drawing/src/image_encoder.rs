@@ -10,11 +10,11 @@
 //! file when options are default" short-circuit.
 //!
 //! Port rules applied:
-//! - The Skia-only input formats (`dng`, `astc`, `ktx`, raw camera formats, `svg`)
-//!   are dropped: this encoder advertises only the decodable subset the `image`
-//!   crate is compiled with (`jpeg`/`jpg`/`png`/`webp`), plus the container names
-//!   Skia lists that map onto those decoders. Requesting an unsupported input
-//!   returns the input path untouched (mirrors `EncodeImage`).
+//! - This encoder advertises the subset of Skia's input formats the `image`
+//!   crate is compiled to decode (`jpeg`/`jpg`/`png`/`webp`/`gif`/`bmp`/`ico`).
+//!   The rest of Skia's list (raw `dng`/`cr2`/`nef`/`arw`, `wbmp`,
+//!   `astc`/`ktx`/`pkm`, `svg`) has no decoder yet (gl-802). Requesting an
+//!   unsupported input returns the input path untouched (mirrors `EncodeImage`).
 //! - The C# `throw` sites (`FileNotFoundException`, `InvalidDataException`,
 //!   `ArgumentException`, `InvalidOperationException`) become
 //!   [`ServiceError`] variants: [`ServiceError::NotFound`] for a missing input,
@@ -174,8 +174,8 @@ impl ImageCrateEncoder {
 
     /// Chooses the writer format from an output *path* extension. Port of
     /// `StripCollageBuilder.GetEncodedFormat` (jpg/jpeg → JPEG, webp → WebP,
-    /// default → PNG); gif/bmp are not writable by this build, so they too fall
-    /// back to PNG.
+    /// default → PNG); gif/bmp fall back to PNG as upstream's do, although
+    /// this build could write them.
     fn format_for_path(path: &str) -> CrateFormat {
         match Self::input_format(path).as_str() {
             "jpg" | "jpeg" => CrateFormat::Jpeg,
@@ -566,10 +566,13 @@ fn get_new_image_size(
 /// The decodable input extensions this encoder advertises.
 ///
 /// The subset of `SkiaEncoder.SupportedInputFormats` the `image` crate is
-/// compiled to decode (`jpeg`/`png`/`webp`), with the alias `jpg` for `jpeg`.
-/// The Skia-only formats (`dng`/`astc`/`ktx`/raw/`svg`/`gif`/`bmp`/`ico`) are
-/// dropped because this build cannot decode them.
-const SUPPORTED_INPUT_FORMATS: [&str; 4] = ["jpeg", "jpg", "png", "webp"];
+/// compiled to decode (`jpeg`/`png`/`webp`/`gif`/`bmp`/`ico`), with the alias
+/// `jpg` for `jpeg`. A GIF decodes to its first frame, as Skia's does.
+///
+/// TODO(gl-802): the rest of Skia's list (`dng`/`cr2`/`nef`/`arw`, `wbmp`,
+/// `astc`/`ktx`/`pkm`, `svg`) has no decoder in the `image` crate; each needs
+/// its own decoder dependency before it can join this list.
+const SUPPORTED_INPUT_FORMATS: [&str; 7] = ["jpeg", "jpg", "png", "webp", "gif", "bmp", "ico"];
 
 /// The widest or tallest image libwebp can write, its `WEBP_MAX_DIMENSION`
 /// (the bitstream's 14-bit size fields), which the `webp` crate does not
@@ -579,7 +582,7 @@ const WEBP_MAX_DIMENSION: u32 = 16_383;
 #[async_trait]
 impl ImageEncoder for ImageCrateEncoder {
     /// Port of `SupportedInputFormats` — the decodable subset
-    /// (`jpeg`/`jpg`/`png`/`webp`).
+    /// (`jpeg`/`jpg`/`png`/`webp`/`gif`/`bmp`/`ico`).
     fn supported_input_formats(&self) -> Vec<String> {
         SUPPORTED_INPUT_FORMATS
             .iter()
@@ -1024,12 +1027,7 @@ mod tests {
         let enc = ImageCrateEncoder::new();
         assert_eq!(
             enc.supported_input_formats(),
-            vec![
-                "jpeg".to_owned(),
-                "jpg".to_owned(),
-                "png".to_owned(),
-                "webp".to_owned()
-            ]
+            ["jpeg", "jpg", "png", "webp", "gif", "bmp", "ico"].map(str::to_owned)
         );
         assert_eq!(
             enc.supported_output_formats(),
@@ -1107,6 +1105,54 @@ mod tests {
 
         let dims = enc.get_image_size(&output).await.expect("probe out");
         assert_eq!(dims, ImageDimensions::new(960, 540));
+    }
+
+    /// The formats Skia decodes beyond jpeg/png/webp (`SkiaEncoder.
+    /// SupportedInputFormats`) that the `image` crate can: their size and
+    /// blurhash are read and a resize is encoded, not served as the original.
+    #[rstest]
+    #[case::bmp("poster.bmp")]
+    #[case::ico("poster.ico")]
+    #[case::gif("poster.gif")]
+    #[tokio::test]
+    async fn bmp_ico_and_gif_inputs_are_decoded_and_resized(#[case] name: &str) {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, name, 200, 100);
+        let output = out_path(&dir, "small.png");
+        let enc = ImageCrateEncoder::new();
+        assert_eq!(
+            enc.get_image_size(&input).await.expect("probe in"),
+            ImageDimensions::new(200, 100)
+        );
+        assert!(
+            !enc.get_image_blur_hash(4, 3, &input)
+                .await
+                .expect("blurhash")
+                .is_empty()
+        );
+        let options = ImageProcessingOptions {
+            max_width: Some(100),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let written = enc
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        assert_eq!(written, output);
+        assert_eq!(
+            enc.get_image_size(&output).await.expect("probe out"),
+            ImageDimensions::new(100, 50)
+        );
     }
 
     /// An EXIF block holding only `Orientation = 6` (rotate 90° clockwise),
