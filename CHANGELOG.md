@@ -140,6 +140,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
 - TheAudioDB descriptions return for music artists and albums, in the item's metadata
   language when TheAudioDB has it, else in English
+- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
+  expires or the account changes (it was renewed for every subtitle). A rejected token is
+  renewed and the download retried once. The account's daily quota is tracked: once it is
+  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
+  OpenSubtitles until its reset time, and the remaining count is logged after each
+  download. A download without an account is refused before any request, and the error for
+  a refused download carries the API's reply (a web page as `[html]`), as the plugin's does
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'
@@ -176,13 +183,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
-- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
-  expires or the account changes (it was renewed for every subtitle). A rejected token is
-  renewed and the download retried once. The account's daily quota is tracked: once it is
-  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
-  OpenSubtitles until its reset time, and the remaining count is logged after each
-  download. A download without an account is refused before any request, and the error for
-  a refused download carries the API's reply (a web page as `[html]`), as the plugin's does
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -194,6 +199,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See

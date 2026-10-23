@@ -88,7 +88,8 @@ impl PluginManager for RecordingPlugins {
     }
     async fn get_plugin_configuration(&self, id: Uuid) -> Result<Vec<u8>, ServiceError> {
         if id == known_id() {
-            Ok(br#"{"k":1}"#.to_vec())
+            // An unset `string?` at the top level and inside a listed object.
+            Ok(br#"{"k":1,"PosterSize":null,"Items":[{"a":null,"b":2},null]}"#.to_vec())
         } else {
             Err(Self::not_found(id))
         }
@@ -186,7 +187,10 @@ async fn get_configuration_known_and_unknown() {
         .await
         .expect("resp");
     assert_eq!(ok.status(), StatusCode::OK);
-    assert_eq!(body_string(ok).await, r#"{"k":1}"#);
+    // `JsonIgnoreCondition.WhenWritingNull`: a null property is left out,
+    // an array element is not.
+    let body: serde_json::Value = serde_json::from_str(&body_string(ok).await).expect("json");
+    assert_eq!(body, serde_json::json!({"k": 1, "Items": [{"b": 2}, null]}));
 
     let missing = router(fake)
         .oneshot(authed(
