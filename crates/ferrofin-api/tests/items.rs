@@ -37,7 +37,7 @@ use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use ferrofin_traits::providers::{
-    ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -365,6 +365,7 @@ const PHYSICAL_PATH: &str = "/media/movies-real";
 /// With `adopted_tree` set it also models a tree scanned by Jellyfin: the item
 /// parents to a physical `Folder` under the `AggregateFolder`, while the
 /// library's `CollectionFolder` parents to the `UserRootFolder`.
+#[derive(Default)]
 struct OkLibrary {
     item_id: Uuid,
     adopted_tree: bool,
@@ -376,6 +377,10 @@ struct OkLibrary {
     /// When set, `delete_item` signals it has started and waits to be
     /// released before it records the delete.
     gate: Option<Arc<DeleteGate>>,
+    /// A Person item `get_item_by_id` also resolves, shared with the
+    /// provider fake that refreshes it, and its images.
+    person: SharedRow,
+    person_images: Vec<ferrofin_traits::options::ItemImageInfo>,
 }
 
 /// Holds a fake delete half way, so a test can drop the request meanwhile.
@@ -387,6 +392,22 @@ struct DeleteGate {
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn get_item_images(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
+        let is_person = self
+            .person
+            .lock()
+            .expect("person")
+            .as_ref()
+            .is_some_and(|p| Uuid::parse_str(&p.id).ok() == Some(item_id));
+        Ok(if is_person {
+            self.person_images.clone()
+        } else {
+            Vec::new()
+        })
+    }
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -403,6 +424,15 @@ impl LibraryManager for OkLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let person = self
+            .person
+            .lock()
+            .expect("person")
+            .clone()
+            .filter(|p| Uuid::parse_str(&p.id).ok() == Some(id));
+        if person.is_some() {
+            return Ok(person);
+        }
         if id == SEASON_VIEW_ID {
             let mut view = item_entity(SEASON_VIEW_ID, "Season view", BaseItemKind::UserView);
             view.data = Some(serde_json::json!({"DisplayParentId":SEASON_BROWSE_ID}).to_string());
@@ -665,6 +695,7 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
     BaseItemDto {
         id: Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil()),
         name: item.name.clone(),
+        overview: item.overview.clone(),
         ..BaseItemDto::default()
     }
 }
@@ -781,6 +812,7 @@ fn ok_state(item_id: Uuid) -> AppState {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     })
 }
 
@@ -810,6 +842,23 @@ fn ok_state_full(
     dto: Arc<dyn DtoService>,
     (auth_context, auth_service): Auth,
 ) -> AppState {
+    ok_state_providers(
+        library,
+        users,
+        dto,
+        (auth_context, auth_service),
+        Arc::new(FakeProviders),
+    )
+}
+
+/// [`ok_state_full`] over a caller-chosen [`ProviderManager`].
+fn ok_state_providers(
+    library: OkLibrary,
+    users: Arc<dyn UserManager>,
+    dto: Arc<dyn DtoService>,
+    (auth_context, auth_service): Auth,
+    providers: Arc<dyn ProviderManager>,
+) -> AppState {
     let item_id = library.item_id;
     AppState::new(
         Arc::new(library),
@@ -821,7 +870,7 @@ fn ok_state_full(
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         Arc::new(FakeConfig),
-        Arc::new(FakeProviders),
+        providers,
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
@@ -1136,6 +1185,414 @@ impl ProviderManager for StubProviders {
     }
 }
 
+/// A row the library fake serves and the provider fake rewrites.
+type SharedRow = Arc<std::sync::Mutex<Option<BaseItemEntity>>>;
+
+/// A [`ProviderManager`] recording the refreshes it is asked for. A refresh
+/// writes [`FETCHED_BIO`] into `row`, as a provider that found the person
+/// would.
+#[derive(Default)]
+struct RecordingProviders {
+    row: SharedRow,
+    /// When set, a refresh waits for a permit before it finishes.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// A refresh fails instead.
+    fail: bool,
+    /// A refresh panics instead.
+    panic: bool,
+    refreshed: std::sync::Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
+    finished: std::sync::Mutex<Vec<Uuid>>,
+    queued: std::sync::Mutex<Vec<(Uuid, RefreshPriority)>>,
+}
+
+/// The overview a refresh by [`RecordingProviders`] writes, stamping the
+/// row refreshed as the real one does.
+const FETCHED_BIO: &str = "Fetched bio.";
+
+#[async_trait]
+impl ProviderManager for RecordingProviders {
+    async fn get_external_id_infos(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::ExternalIdInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn queue_refresh(
+        &self,
+        item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+        priority: RefreshPriority,
+    ) -> Result<(), ServiceError> {
+        self.queued
+            .lock()
+            .expect("queued")
+            .push((item_id, priority));
+        Ok(())
+    }
+    async fn refresh_full_item(
+        &self,
+        _i: Uuid,
+        _o: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn refresh_single_item(
+        &self,
+        item_id: Uuid,
+        options: &MetadataRefreshOptions,
+    ) -> Result<ItemUpdateType, ServiceError> {
+        self.refreshed
+            .lock()
+            .expect("refreshed")
+            .push((item_id, options.clone()));
+        if let Some(gate) = &self.gate {
+            let _permit = gate.acquire().await.expect("gate");
+        }
+        assert!(!self.panic, "a provider bug");
+        if self.fail {
+            return Err(ServiceError::Backend("store down".into()));
+        }
+        if let Some(row) = self.row.lock().expect("row").as_mut() {
+            row.overview = Some(FETCHED_BIO.to_owned());
+            row.date_last_refreshed = Some(chrono::Utc::now());
+        }
+        self.finished.lock().expect("finished").push(item_id);
+        Ok(ItemUpdateType::default())
+    }
+    async fn save_image_from_url(
+        &self,
+        _i: Uuid,
+        _u: &str,
+        _t: ferrofin_model::entities::ImageType,
+        _x: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn save_image(
+        &self,
+        _i: Uuid,
+        _c: &[u8],
+        _m: &str,
+        _t: ferrofin_model::entities::ImageType,
+        _x: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_available_remote_images(
+        &self,
+        _i: Uuid,
+        _q: &ferrofin_model::providers::RemoteImageQuery,
+    ) -> Result<Vec<ferrofin_model::providers::RemoteImageInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_remote_image_provider_info(
+        &self,
+        _i: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::ImageProviderInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn save_metadata(&self, _i: Uuid, _u: ItemUpdateType) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_all_metadata_plugins(
+        &self,
+    ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_metadata_options(
+        &self,
+        _i: Uuid,
+    ) -> Result<ferrofin_model::configuration::MetadataOptions, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// `kind`'s stored `BaseItems.Type` name.
+fn stored(kind: BaseItemKind) -> String {
+    kind.stored_type_name().expect("stored name").to_owned()
+}
+
+/// A stored row of `kind`: `overview` and the last refresh as given.
+fn person_row(
+    id: Uuid,
+    kind: BaseItemKind,
+    overview: Option<&str>,
+    refreshed_days_ago: Option<i64>,
+) -> SharedRow {
+    let mut row = item_entity(id, "Someone", kind);
+    // As the database stores it, which is what the handler reads.
+    row.type_ = stored(kind);
+    row.overview = overview.map(str::to_owned);
+    row.date_last_refreshed =
+        refreshed_days_ago.map(|days| chrono::Utc::now() - chrono::TimeDelta::days(days));
+    Arc::new(std::sync::Mutex::new(Some(row)))
+}
+
+/// A primary image, or none.
+fn primary_images(primary: bool) -> Vec<ferrofin_traits::options::ItemImageInfo> {
+    if !primary {
+        return Vec::new();
+    }
+    vec![ferrofin_traits::options::ItemImageInfo {
+        path: "/people/someone/folder.jpg".into(),
+        image_type: ImageType::Primary,
+        date_modified: chrono::Utc::now(),
+        width: 1,
+        height: 1,
+        blur_hash: None,
+    }]
+}
+
+/// A library serving `row` with `images`, and a state over `providers`.
+fn person_state(
+    row: &SharedRow,
+    images: Vec<ferrofin_traits::options::ItemImageInfo>,
+    providers: Arc<RecordingProviders>,
+) -> AppState {
+    ok_state_providers(
+        OkLibrary {
+            item_id: Uuid::from_u128(0xABCD),
+            person: Arc::clone(row),
+            person_images: images,
+            ..Default::default()
+        },
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        providers,
+    )
+}
+
+/// The item page on `uri`: its status and its `Overview`.
+async fn get_person(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let overview = if status == StatusCode::OK {
+        json_body(response).await["Overview"].clone()
+    } else {
+        serde_json::Value::Null
+    };
+    (status, overview)
+}
+
+/// C# `UserLibraryController.RefreshOnDemandIfNeeded`: a person shown without
+/// an overview or without a primary image (`!IsNullOrWhiteSpace(Overview) &&
+/// HasImage(Primary)` is false), and not refreshed for three days, is
+/// refreshed in full (metadata and images, saved) before its page is
+/// answered, on `/Items/{id}` and the legacy `/Users/{userId}/Items/{id}`.
+/// The page shows what the refresh wrote.
+#[rstest::rstest]
+#[case::no_metadata("/Items/{id}", None, false, Some(4))]
+#[case::legacy_route("/Users/{user}/Items/{id}", None, false, Some(4))]
+#[case::overview_without_image("/Items/{id}", Some("A bio."), false, Some(4))]
+#[case::image_without_overview("/Items/{id}", None, true, Some(4))]
+#[case::blank_overview_with_image("/Items/{id}", Some("  "), true, Some(4))]
+#[case::never_refreshed("/Items/{id}", None, false, None)]
+#[tokio::test]
+async fn a_person_without_metadata_is_refreshed_before_its_page(
+    #[case] route: &str,
+    #[case] overview: Option<&str>,
+    #[case] primary_image: bool,
+    #[case] refreshed_days_ago: Option<i64>,
+) {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, overview, refreshed_days_ago);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, primary_images(primary_image), Arc::clone(&providers));
+    let uri = route
+        .replace("{id}", &person.to_string())
+        .replace("{user}", &USER_ID.to_string());
+    let (status, shown) = get_person(state, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shown, FETCHED_BIO, "the page shows the refreshed row");
+    let refreshed = providers.refreshed.lock().expect("refreshed").clone();
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+    let (id, options) = &refreshed[0];
+    assert_eq!(*id, person);
+    assert_eq!(
+        options.metadata_refresh_mode,
+        MetadataRefreshMode::FullRefresh
+    );
+    assert_eq!(options.image_refresh_mode, MetadataRefreshMode::FullRefresh);
+    assert!(options.force_save);
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// A person with an overview and a primary image (whenever it was last
+/// refreshed), or refreshed in the last three days, is not refreshed;
+/// neither is anything but a person.
+#[rstest::rstest]
+#[case::has_metadata(Some("A bio."), true, None, BaseItemKind::Person)]
+#[case::refreshed_lately(None, false, Some(2), BaseItemKind::Person)]
+#[case::not_a_person(None, false, None, BaseItemKind::Movie)]
+#[tokio::test]
+async fn a_person_with_metadata_or_refreshed_lately_is_not_refreshed(
+    #[case] overview: Option<&str>,
+    #[case] primary_image: bool,
+    #[case] refreshed_days_ago: Option<i64>,
+    #[case] kind: BaseItemKind,
+) {
+    let id = Uuid::new_v4();
+    let row = person_row(id, kind, overview, refreshed_days_ago);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, primary_images(primary_image), Arc::clone(&providers));
+    let (status, shown) = get_person(state, &format!("/Items/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shown, serde_json::json!(overview));
+    assert!(providers.refreshed.lock().expect("refreshed").is_empty());
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// A refresh still running after the three seconds the page waits for is
+/// left to finish: the page is answered without it, and no second refresh
+/// is queued (upstream cancels it and queues one at high priority; a dropped
+/// refresh could stop between its writes).
+#[tokio::test(start_paused = true)]
+async fn a_slow_on_demand_refresh_finishes_after_the_page() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        gate: Some(Arc::clone(&gate)),
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, Vec::new(), Arc::clone(&providers));
+    let started = tokio::time::Instant::now();
+    let (status, shown) = get_person(state, &format!("/Items/{person}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        shown,
+        serde_json::Value::Null,
+        "answered without the refresh"
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+    assert!(providers.finished.lock().expect("finished").is_empty());
+    gate.add_permits(1);
+    wait_for_finish(&providers).await;
+    assert_eq!(*providers.finished.lock().expect("finished"), [person]);
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// While a person's refresh runs, another view of it is answered at once and
+/// starts no second refresh.
+#[tokio::test(start_paused = true)]
+async fn a_second_view_starts_no_second_refresh() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        gate: Some(Arc::clone(&gate)),
+        ..RecordingProviders::default()
+    });
+    let uri = format!("/Items/{person}");
+    let state = person_state(&row, Vec::new(), Arc::clone(&providers));
+    assert_eq!(get_person(state.clone(), &uri).await.0, StatusCode::OK);
+    let started = tokio::time::Instant::now();
+    assert_eq!(get_person(state, &uri).await.0, StatusCode::OK);
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(providers.refreshed.lock().expect("refreshed").len(), 1);
+    gate.add_permits(1);
+    wait_for_finish(&providers).await;
+}
+
+/// A client that hangs up while its page waits leaves the refresh to finish,
+/// with nothing queued.
+#[tokio::test(start_paused = true)]
+async fn a_hang_up_leaves_the_refresh_to_finish() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        gate: Some(Arc::clone(&gate)),
+        ..RecordingProviders::default()
+    });
+    let page = create_router(person_state(&row, Vec::new(), Arc::clone(&providers))).oneshot(
+        Request::builder()
+            .uri(format!("/Items/{person}"))
+            .header("X-Emby-Token", "valid")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let hung_up = tokio::time::timeout(std::time::Duration::from_secs(1), page).await;
+    assert!(hung_up.is_err(), "the page was still waiting");
+    gate.add_permits(1);
+    wait_for_finish(&providers).await;
+    assert_eq!(
+        row.lock()
+            .expect("row")
+            .as_ref()
+            .unwrap()
+            .overview
+            .as_deref(),
+        Some(FETCHED_BIO)
+    );
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// A refresh that panics fails the page instead of hanging it.
+#[tokio::test]
+async fn a_panicking_on_demand_refresh_fails_the_page() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        panic: true,
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, Vec::new(), providers);
+    let (status, _) = get_person(state, &format!("/Items/{person}")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Waits until a gated refresh has finished.
+async fn wait_for_finish(providers: &RecordingProviders) {
+    for _ in 0..100 {
+        if !providers.finished.lock().expect("finished").is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(providers.finished.lock().expect("finished").len(), 1);
+}
+
+/// A refresh that fails within the wait fails the page, as an exception
+/// escaping C# `RefreshMetadata` does (a provider's failure is counted inside
+/// the refresh in both, so this is the store failing).
+#[tokio::test]
+async fn a_failed_on_demand_refresh_fails_the_page() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        fail: true,
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, Vec::new(), providers);
+    let (status, _) = get_person(state, &format!("/Items/{person}")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
 /// A [`UserViewManager`] returning one view.
 struct StubUserViews;
 
@@ -1263,6 +1720,7 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let get = |state: AppState, uri: &'static str| async move {
         let response = create_router(state)
@@ -1429,6 +1887,7 @@ async fn get_items_forwards_the_artist_id_filters() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1470,6 +1929,7 @@ async fn playlists_view_browses_list_its_playlists() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1536,6 +1996,7 @@ async fn filtered_user_root_and_typed_library_browses_run_recursively() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1601,6 +2062,7 @@ async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1651,6 +2113,7 @@ async fn get_items_orders_a_search_by_sort_name_before_the_callers_keys() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1704,6 +2167,7 @@ async fn get_items_forwards_the_image_types_filter() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
     // Wholphin's request, verbatim apart from the ids.
@@ -1749,6 +2213,7 @@ async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1855,6 +2320,7 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1912,6 +2378,7 @@ async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -2305,6 +2772,7 @@ fn two_item_state(item_id: Uuid, dto: Arc<dyn DtoService>, auth: Auth) -> (AppSt
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let deleted = Arc::clone(&library.deleted);
     (
@@ -2440,6 +2908,7 @@ async fn a_dropped_request_still_finishes_its_delete() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: Some(Arc::clone(&gate)),
+            ..Default::default()
         };
         let deleted = Arc::clone(&library.deleted);
         let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice());
@@ -2471,6 +2940,7 @@ async fn default_season_view_preserves_actual_parent_for_live_aired_selection_an
                 last_query: Arc::default(),
                 deleted: Arc::default(),
                 gate: None,
+                ..Default::default()
             };
             let seen = library.last_query.clone();
             let router = create_router(ok_state_with(library));
@@ -2539,6 +3009,7 @@ async fn items_http_name_boundaries_bind_blank_to_null_and_preserve_nonblank() {
                 last_query: Arc::default(),
                 deleted: Arc::default(),
                 gate: None,
+                ..Default::default()
             };
             let seen = Arc::clone(&library.last_query);
             let uri = format!(
@@ -2574,6 +3045,7 @@ async fn capture_items_filter_query(uri: &str) -> (StatusCode, Option<InternalIt
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
     let response = create_router(ok_state_with(library))
@@ -2824,6 +3296,7 @@ async fn capture_items_date_socket_query(uri: &str) -> (StatusCode, Option<Inter
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
