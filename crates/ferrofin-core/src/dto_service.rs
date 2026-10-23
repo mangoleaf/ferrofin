@@ -176,9 +176,13 @@ struct Prefetched {
     /// a user, on a page holding versions); `None` means every one.
     version_visible: Option<std::collections::HashSet<Uuid>>,
     /// The user's data for the page's version groups (populated only for a
-    /// user, with `MediaSources`, on a page holding versions), which puts the
-    /// version being resumed first.
+    /// user, with `MediaSources` or user data, on a page holding versions),
+    /// which puts the version being resumed first.
     version_user_data: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto>,
+    /// For each page video with versions (and user data, for a user), the
+    /// version played last, whose completion its `UserData` takes
+    /// (`GetResumeUserDataBatch`).
+    version_resume: HashMap<Uuid, crate::video_versions::VersionResumeData>,
     /// The `(AudioStreamIndex, SubtitleStreamIndex)` the user remembers for
     /// each page video (populated only for a user, with `MediaSources`; an
     /// item remembering neither is absent) — `SetDefaultAudioAndSubtitle
@@ -2337,6 +2341,11 @@ impl FerrofinDtoService {
                     && let Some(ud) = dto.user_data.as_mut()
                 {
                     fill_leaf_played_percentage(ud, item.run_time_ticks);
+                    // `resumeData?.ApplyTo(dto.UserData)` (DtoService.cs:680):
+                    // a video's completion follows its version played last.
+                    if let Some(resume) = prefetched.version_resume.get(&item_id) {
+                        resume.apply_to(ud);
+                    }
                 }
                 // Folder UserData carries UnplayedItemCount = unplayed leaf
                 // descendants; leaf items leave it unset. The branch keys on the
@@ -4327,14 +4336,55 @@ impl FerrofinDtoService {
             }
             _ => None,
         };
-        // `SetAlternateVersionResumeStates`: with a user, the version they are
-        // part-way through leads a primary's sources — the user data of every
-        // version on or reached from the page, in one read, and only when the
-        // page holds a version group.
+        // `GetResumeUserDataBatch` (DtoService.cs:176-180): with a user and
+        // user data, a page video that is no version itself takes its
+        // completion from the version played last. Its group is in
+        // `versions` when the page read them (for the sources, or for a
+        // user's `MediaSourceCount`); otherwise one read for the page's
+        // videos finds the groups — none on a page without a video.
+        let resume_candidates: Vec<&BaseItemEntity> = match user {
+            Some(_) if options.enable_user_data => items
+                .iter()
+                .filter(|i| kinds::is_video(row_kind(i)) && i.primary_version_id.is_none())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let resume_versions = if resume_candidates.is_empty()
+            || want_sources
+            || options.contains_field(ItemFields::MediaSourceCount)
+        {
+            None
+        } else {
+            Some(
+                crate::video_versions::VersionRows::load(
+                    &DtoVersionReader {
+                        db: &self.db,
+                        media_sources: self.media_sources.as_ref(),
+                    },
+                    &resume_candidates,
+                )
+                .await?,
+            )
+        };
+        let groups = resume_versions.as_ref().unwrap_or(&versions);
+        // `SetAlternateVersionResumeStates` and `GetResumeUserDataBatch`: the
+        // user data of every version on or reached from the page, in one
+        // read, and only when the page holds a version group. With the
+        // sources, the version the user is part-way through leads them.
         let version_user_data = match user {
-            Some(user) if want_sources && versions.ids().next().is_some() => {
-                let mut wanted: Vec<Uuid> =
-                    media_ids.iter().copied().chain(versions.ids()).collect();
+            Some(user)
+                if (want_sources || !resume_candidates.is_empty())
+                    && groups.ids().next().is_some() =>
+            {
+                // The page's own rows as well, since a group's winner may be
+                // the queried video itself: every media row for the sources,
+                // only the resume candidates otherwise.
+                let page: Vec<Uuid> = if want_sources {
+                    media_ids.clone()
+                } else {
+                    resume_candidates.iter().map(|item| row_id(item)).collect()
+                };
+                let mut wanted: Vec<Uuid> = page.into_iter().chain(groups.ids()).collect();
                 wanted.sort_unstable();
                 wanted.dedup();
                 self.user_data
@@ -4343,6 +4393,20 @@ impl FerrofinDtoService {
             }
             _ => HashMap::new(),
         };
+        let version_resume: HashMap<Uuid, crate::video_versions::VersionResumeData> =
+            if version_user_data.is_empty() {
+                HashMap::new()
+            } else {
+                resume_candidates
+                    .iter()
+                    .filter_map(|item| {
+                        crate::video_versions::resume_user_data(groups, item, |id| {
+                            version_user_data.get(&id)
+                        })
+                        .map(|resume| (row_id(item), resume))
+                    })
+                    .collect()
+            };
         // `GetStaticMediaSources(item, true, user)`'s per-user tail
         // (`MediaSourceManager.cs:397-421`, reached from `DtoService.cs:410`)
         // reads, per item, the user's remembered streams and the item's
@@ -4883,6 +4947,7 @@ impl FerrofinDtoService {
             versions,
             version_visible,
             version_user_data,
+            version_resume,
             remembered_streams,
             series_original_languages,
             playback_permissions,
@@ -6206,6 +6271,136 @@ mod tests {
             ]
         );
         assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
+    }
+
+    /// A movie watched to the end on another version shows watched, with that
+    /// version's last-played date and no stale resume bar of its own
+    /// (`resumeData?.ApplyTo(dto.UserData)`, DtoService.cs:179, 680) — on a
+    /// page without `MediaSources`, as the grid and the home rows ask. Here
+    /// the versions were grouped after the watch, so nothing propagated the
+    /// played state to the primary's own row.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_movie_finished_on_another_version_shows_played() {
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let (primary, alternate) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_named_item(&db, primary, BaseItemKind::Movie, "Movie").await;
+        seed_named_item(&db, alternate, BaseItemKind::Movie, "Movie").await;
+        for (id, path) in [
+            (primary, "/Movies/Movie/Movie.mkv"),
+            (alternate, "/Movies/Movie/Movie - 4K.mkv"),
+        ] {
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.media_type = Some("Video".to_owned());
+            row.run_time_ticks = Some(1_000);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        link_alternate_version(&db, alternate, primary).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let user_data = Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+            db.clone(),
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/unused",
+                "/unused",
+            )
+            .await,
+        ));
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            user_data.clone(),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let finished = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Part-way through the primary long ago, then the 4K copy to the end.
+        user_data
+            .save_user_data(
+                user_id,
+                primary,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    playback_position_ticks: Some(500),
+                    last_played_date: Some(finished - chrono::Duration::days(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        user_data
+            .save_user_data(
+                user_id,
+                alternate,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    played: Some(true),
+                    last_played_date: Some(finished),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The groups come from the page's own version read with the sources
+        // or a user's `MediaSourceCount` (the grid asks for that), and from
+        // a read of their own otherwise; the fold is the same each way.
+        let page = [
+            fetch_item(&db, primary).await,
+            fetch_item(&db, alternate).await,
+        ];
+        for fields in [
+            vec![],
+            vec![ItemFields::MediaSources],
+            vec![ItemFields::MediaSourceCount],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dtos = svc
+                .get_base_item_dtos(&page, &options, Some(&user), None, true)
+                .await
+                .unwrap();
+            let ud = dtos[0].user_data.as_ref().expect("user data");
+            assert!(ud.played, "finished on the 4K version ({fields:?})");
+            assert_eq!(ud.last_played_date, Some(finished), "{fields:?}");
+            assert_eq!(
+                ud.playback_position_ticks, 0,
+                "no stale resume bar ({fields:?})"
+            );
+            assert_eq!(ud.played_percentage, None, "{fields:?}");
+            // The version on the page is read as itself.
+            let own = dtos[1].user_data.as_ref().expect("user data");
+            assert_eq!(own.item_id, alternate);
+            assert!(own.played);
+        }
+        // No user data asked for: none folded, none sent.
+        let dtos = svc
+            .get_base_item_dtos(
+                &page,
+                &DtoOptions {
+                    enable_user_data: false,
+                    ..DtoOptions::default()
+                },
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(dtos[0].user_data.is_none());
     }
 
     /// v12 assigns `Chapters` outside the `item is Video` block

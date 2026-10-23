@@ -290,6 +290,20 @@ pub async fn build_app_state(
             .context("failed to persist resolved ffmpeg path")?;
     }
     let server_config = config_mgr.snapshot();
+    // `GetSortName` reads `SortRemoveWords` / `SortRemoveCharacters` /
+    // `SortReplaceCharacters` from the configuration on every call: install
+    // them now and again on each save, before the boot repairs, the scans
+    // and the request paths derive one. Two things ran earlier, in
+    // `open_database`, on Jellyfin's defaults: the migrations (whose SQLite
+    // sort functions are fixed on the defaults anyway), and the backfill of
+    // the NULL `SortName`s rows from before the persistence service derived
+    // them carry, which an item's next refresh re-derives on these rules.
+    ferrofin_util::sort_name::install_sort_rules(sort_rules(&server_config));
+    config_mgr.add_configuration_listener(Arc::new(|update| {
+        if let ferrofin_traits::configuration::ConfigurationUpdate::Server(config) = update {
+            ferrofin_util::sort_name::install_sort_rules(sort_rules(config));
+        }
+    }));
     let metadata_root = {
         let paths = Arc::clone(&paths);
         ferrofin_util::directory_path::DirectoryPath::live(move || {
@@ -824,6 +838,21 @@ pub async fn build_app_state(
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
         // back to when a tuner is not a transport stream).
         .with_encoder(Arc::clone(&media_encoder))
+        // A recording NFO's dates, in the `xbmcmetadata` options'
+        // `ReleaseDateFormat`, as the NFO savers write theirs.
+        .with_release_date_format({
+            let nfo = Arc::new(ferrofin_providers::xbmc::config::NfoConfigurationFile::new(
+                std::path::PathBuf::from(paths.user_configuration_directory_path())
+                    .join("named/xbmcmetadata.json"),
+            ));
+            Arc::new(move |date| {
+                ferrofin_providers::xbmc::dotnet_date::format_date_time(
+                    date,
+                    &nfo.current().release_date_format,
+                )
+                .unwrap_or_else(|| date.format("%Y-%m-%d").to_string())
+            })
+        })
         // Where a shared tuner stream buffers, where the DVR records, and where
         // the dashboard's Live TV options live (C# `GetTranscodePath()`,
         // `CommonApplicationPaths.DataPath`, the `livetv` named config).
@@ -2806,6 +2835,18 @@ fn subscribe_intro_skipper(
             ferrofin_core::event_manager::consumer_done()
         }),
     );
+}
+
+/// The sort-name lists of `config` (`SortRemoveWords`, `SortRemoveCharacters`,
+/// `SortReplaceCharacters`), as every sort-name derivation reads them.
+fn sort_rules(
+    config: &ferrofin_model::configuration::ServerConfiguration,
+) -> ferrofin_util::sort_name::SortRules {
+    ferrofin_util::sort_name::SortRules {
+        remove_words: config.sort_remove_words.clone(),
+        remove_characters: config.sort_remove_characters.clone(),
+        replace_characters: config.sort_replace_characters.clone(),
+    }
 }
 
 /// The server's stable id (`ApplicationHost.SystemId`), persisted across
