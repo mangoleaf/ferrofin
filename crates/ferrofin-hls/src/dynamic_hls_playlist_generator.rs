@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ferrofin_keyframes::keyframe_data::KeyframeData;
 use ferrofin_model::configuration::EncodingOptions;
 use uuid::Uuid;
@@ -26,47 +27,27 @@ pub const TICKS_PER_SECOND: i64 = 10_000_000;
 /// The number of ticks in a millisecond (mirrors `TimeSpan.TicksPerMillisecond`).
 pub const TICKS_PER_MILLISECOND: i64 = 10_000;
 
-/// Extracts keyframe timing for a file behind a mockable boundary.
-///
-/// Port of `Extractors.IKeyframeExtractor`. The C# generator holds an array of
-/// `IKeyframeExtractor` and the real ffprobe / Matroska spawn is un-mockable
-/// process I/O. This trait keeps that I/O out of the parity/coverage numbers:
-/// real implementations shell out to ffprobe, while unit tests supply a fake.
-/// Returning `None` mirrors the C# loop returning `false` from every extractor.
-///
-/// Concrete extractor impls (`FfProbeKeyframeExtractor`, `MatroskaKeyframeExtractor`)
-/// are deferred and out of scope for this unit.
-pub trait KeyframeExtractor: Send + Sync {
-    /// Whether the extractor is based on container metadata.
-    ///
-    /// Mirrors `IKeyframeExtractor.IsMetadataBased`. The generator retains only
-    /// metadata-based extractors at construction (see
-    /// [`DynamicHlsPlaylistGenerator::new`]).
-    fn is_metadata_based(&self) -> bool;
-
-    /// Attempts to extract keyframe data for the given media item.
-    ///
-    /// Returns `None` when the extractor could not produce keyframes (mirrors the
-    /// C# `TryExtractKeyframes` returning `false`).
-    fn try_extract_keyframes(&self, item_id: Uuid, file_path: &str) -> Option<KeyframeData>;
-}
+pub use ferrofin_traits::media_encoding::KeyframeExtractor;
 
 /// Reads the current encoding options.
 ///
 /// Models `IServerConfigurationManager.GetEncodingOptions()`: the generator calls
 /// this per request so that the set of on-demand-allowed extensions reflects live
 /// server configuration rather than a value captured at construction. Any
-/// `Fn() -> EncodingOptions` (e.g. a closure over a config manager) satisfies it.
+/// `Fn() -> EncodingOptions` (e.g. a closure returning fixed options) satisfies
+/// it; the server reads its configuration manager.
+#[async_trait]
 pub trait EncodingOptionsProvider: Send + Sync {
     /// Returns a snapshot of the current encoding options.
-    fn get_encoding_options(&self) -> EncodingOptions;
+    async fn get_encoding_options(&self) -> EncodingOptions;
 }
 
+#[async_trait]
 impl<F> EncodingOptionsProvider for F
 where
     F: Fn() -> EncodingOptions + Send + Sync,
 {
-    fn get_encoding_options(&self) -> EncodingOptions {
+    async fn get_encoding_options(&self) -> EncodingOptions {
         self()
     }
 }
@@ -112,25 +93,11 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
     ///
     /// Returns [`HlsError::InvalidOperation`] when equal-length segments are
     /// required but the desired segment length or total runtime is zero.
-    pub fn create_main_playlist(
+    pub async fn create_main_playlist(
         &self,
         request: &CreateMainPlaylistRequest,
     ) -> Result<String, HlsError> {
-        // For video transcodes it is sufficient with equal length segments as
-        // ffmpeg will create new keyframes.
-        let segments: Vec<f64> = if request.is_remuxing_video
-            && request.media_source_id.is_some()
-            && let Some(keyframe_data) = self.try_extract_keyframes(
-                request.media_source_id.unwrap_or_default(),
-                &request.file_path,
-            ) {
-            compute_segments(&keyframe_data, request.desired_segment_length_ms)
-        } else {
-            compute_equal_length_segments(
-                request.desired_segment_length_ms,
-                request.total_runtime_ticks,
-            )?
-        };
+        let segments = self.segment_lengths(request).await?;
 
         let segment_extension = get_segment_file_extension(&request.segment_container);
 
@@ -181,9 +148,7 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
 
         let mut current_runtime_in_seconds: i64 = 0;
         for (index, length) in segments.iter().enumerate() {
-            // Manually convert to ticks to avoid precision loss when converting double.
-            #[allow(clippy::cast_precision_loss)]
-            let length_ticks = convert_to_i64(length * TICKS_PER_SECOND as f64);
+            let length_ticks = segment_length_ticks(*length);
             builder.push_str("#EXTINF:");
             push_six_decimals(&mut builder, *length);
             builder.push_str(", nodesc\n");
@@ -205,11 +170,44 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
         Ok(builder)
     }
 
+    /// The playlist's segment lengths in seconds, as [`Self::create_main_playlist`]
+    /// lists them: cut on the keyframes for a remuxed video whose keyframes an
+    /// extractor yields, of equal length otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlsError::InvalidOperation`] when equal-length segments are
+    /// required but the desired segment length or total runtime is zero.
+    pub async fn segment_lengths(
+        &self,
+        request: &CreateMainPlaylistRequest,
+    ) -> Result<Vec<f64>, HlsError> {
+        // For video transcodes it is sufficient with equal length segments as
+        // ffmpeg will create new keyframes.
+        let keyframe_data = match request.media_source_id {
+            Some(media_source_id) if request.is_remuxing_video => {
+                self.try_extract_keyframes(media_source_id, &request.file_path)
+                    .await
+            }
+            _ => None,
+        };
+        match keyframe_data {
+            Some(keyframe_data) => Ok(compute_segments(
+                &keyframe_data,
+                request.desired_segment_length_ms,
+            )),
+            None => compute_equal_length_segments(
+                request.desired_segment_length_ms,
+                request.total_runtime_ticks,
+            ),
+        }
+    }
+
     /// Mirrors the C# private `TryExtractKeyframes`: gated on the file extension
     /// being permitted (read live from the config accessor), then returns the
     /// first extractor that yields keyframes.
-    fn try_extract_keyframes(&self, item_id: Uuid, file_path: &str) -> Option<KeyframeData> {
-        let options = self.config.get_encoding_options();
+    async fn try_extract_keyframes(&self, item_id: Uuid, file_path: &str) -> Option<KeyframeData> {
+        let options = self.config.get_encoding_options().await;
         if !is_extraction_allowed_for_file(
             file_path,
             &options.allow_on_demand_metadata_based_keyframe_extraction_for_extensions,
@@ -218,10 +216,36 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
         }
 
         // First extractor that yields keyframes wins (mirrors the C# loop).
-        self.extractors
-            .iter()
-            .find_map(|extractor| extractor.try_extract_keyframes(item_id, file_path))
+        for extractor in &self.extractors {
+            if let Some(keyframe_data) = extractor.try_extract_keyframes(item_id, file_path).await {
+                return Some(keyframe_data);
+            }
+        }
+        None
     }
+}
+
+/// A segment length in seconds as the playlist's ticks: converted by hand, as
+/// upstream does, to avoid the precision loss of converting the double.
+fn segment_length_ticks(length: f64) -> i64 {
+    #[allow(clippy::cast_precision_loss)]
+    convert_to_i64(length * TICKS_PER_SECOND as f64)
+}
+
+/// Where each segment of a playlist with `segments` (lengths in seconds)
+/// starts, in ticks: the `runtimeTicks` [`DynamicHlsPlaylistGenerator::create_main_playlist`]
+/// writes into each segment URL, which a seek restarts the transcode at.
+#[must_use]
+pub fn segment_start_ticks(segments: &[f64]) -> Vec<i64> {
+    let mut start = 0i64;
+    segments
+        .iter()
+        .map(|&length| {
+            let this = start;
+            start += segment_length_ticks(length);
+            this
+        })
+        .collect()
 }
 
 /// Mirrors `EncodingHelper.GetSegmentFileExtension`: `"." + container`, or
@@ -550,6 +574,15 @@ mod tests {
     }
 
     #[test]
+    fn segment_starts_are_the_playlists_runtime_ticks() {
+        assert_eq!(
+            segment_start_ticks(&[7.12, 1.88, 4.32, 2.023]),
+            vec![0, 71_200_000, 90_000_000, 133_200_000]
+        );
+        assert!(segment_start_ticks(&[]).is_empty());
+    }
+
+    #[test]
     fn convert_to_i64_uses_bankers_rounding() {
         assert_eq!(convert_to_i64(0.5), 0);
         assert_eq!(convert_to_i64(2.5), 2);
@@ -595,12 +628,17 @@ mod tests {
     /// equal-length path. Metadata-based so it survives the construction filter.
     struct NoKeyframes;
 
+    #[async_trait]
     impl KeyframeExtractor for NoKeyframes {
         fn is_metadata_based(&self) -> bool {
             true
         }
 
-        fn try_extract_keyframes(&self, _item_id: Uuid, _file_path: &str) -> Option<KeyframeData> {
+        async fn try_extract_keyframes(
+            &self,
+            _item_id: Uuid,
+            _file_path: &str,
+        ) -> Option<KeyframeData> {
             None
         }
     }
@@ -608,12 +646,17 @@ mod tests {
     /// A keyframe extractor that always returns the given keyframe data.
     struct FixedKeyframes(KeyframeData);
 
+    #[async_trait]
     impl KeyframeExtractor for FixedKeyframes {
         fn is_metadata_based(&self) -> bool {
             true
         }
 
-        fn try_extract_keyframes(&self, _item_id: Uuid, _file_path: &str) -> Option<KeyframeData> {
+        async fn try_extract_keyframes(
+            &self,
+            _item_id: Uuid,
+            _file_path: &str,
+        ) -> Option<KeyframeData> {
             Some(self.0.clone())
         }
     }
@@ -627,8 +670,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_main_playlist_equal_length_ts_no_map() {
+    #[tokio::test]
+    async fn create_main_playlist_equal_length_ts_no_map() {
         let generator = DynamicHlsPlaylistGenerator::new(
             config_with_extensions(Vec::new()),
             vec![Arc::new(NoKeyframes)],
@@ -660,11 +703,14 @@ hls1/main/2.ts?api_key=abc&runtimeTicks=120000000&actualSegmentLengthTicks=10000
 #EXT-X-ENDLIST
 ";
 
-        assert_eq!(generator.create_main_playlist(&request).unwrap(), expected);
+        assert_eq!(
+            generator.create_main_playlist(&request).await.unwrap(),
+            expected
+        );
     }
 
-    #[test]
-    fn create_main_playlist_fmp4_emits_version7_and_map_line() {
+    #[tokio::test]
+    async fn create_main_playlist_fmp4_emits_version7_and_map_line() {
         // Single keyframe → compute_segments yields [10.0]; container "mp4".
         let kd = KeyframeData::new(ms_to_ticks(10000), vec![0]);
         let generator = DynamicHlsPlaylistGenerator::new(
@@ -694,11 +740,14 @@ hls1/main/0.mp4?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=100000000
 #EXT-X-ENDLIST
 ";
 
-        assert_eq!(generator.create_main_playlist(&request).unwrap(), expected);
+        assert_eq!(
+            generator.create_main_playlist(&request).await.unwrap(),
+            expected
+        );
     }
 
-    #[test]
-    fn create_main_playlist_blank_container_defaults_to_ts() {
+    #[tokio::test]
+    async fn create_main_playlist_blank_container_defaults_to_ts() {
         let generator = DynamicHlsPlaylistGenerator::new(
             config_with_extensions(Vec::new()),
             vec![Arc::new(NoKeyframes)],
@@ -713,14 +762,14 @@ hls1/main/0.mp4?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=100000000
             "?q=1",
             false,
         );
-        let playlist = generator.create_main_playlist(&request).unwrap();
+        let playlist = generator.create_main_playlist(&request).await.unwrap();
         assert!(playlist.contains("#EXT-X-VERSION:3\n"));
         assert!(playlist.contains("p/0.ts?q=1&runtimeTicks=0&actualSegmentLengthTicks=60000000\n"));
         assert!(!playlist.contains("#EXT-X-MAP"));
     }
 
-    #[test]
-    fn create_main_playlist_no_segments_targets_desired_length() {
+    #[tokio::test]
+    async fn create_main_playlist_no_segments_targets_desired_length() {
         // total_runtime 0 with is_remuxing false would error; use a keyframe
         // extractor path that yields an empty segment list instead.
         let kd = KeyframeData::new(0, Vec::new());
@@ -738,7 +787,7 @@ hls1/main/0.mp4?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=100000000
             "?q=1",
             true,
         );
-        let playlist = generator.create_main_playlist(&request).unwrap();
+        let playlist = generator.create_main_playlist(&request).await.unwrap();
         // No segments → target duration is ceil(desiredSegmentLengthMs) = 6000.
         assert!(playlist.contains("#EXT-X-TARGETDURATION:6000\n"));
         assert!(playlist.ends_with("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-ENDLIST\n"));

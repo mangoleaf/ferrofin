@@ -1315,7 +1315,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             .map_err(db_err)?;
             // Seed the share list from the request (C# `Shares = options.Users`).
             for share in &request.users {
-                upsert_share(&mut tx, id, share.user_id, share.can_edit).await?;
+                item_data::share_playlist_in(&mut tx, id, share.user_id, share.can_edit).await?;
             }
             write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
             crate::item_persistence_service::stamp_playlist_in(
@@ -1418,7 +1418,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .await
                 .map_err(db_err)?;
             for share in users {
-                upsert_share(&mut tx, request.id, share.user_id, share.can_edit).await?;
+                item_data::share_playlist_in(&mut tx, request.id, share.user_id, share.can_edit)
+                    .await?;
             }
         }
         if let Some(entries) = &entries {
@@ -1530,7 +1531,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // the shares from `Data`.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
-        upsert_share(
+        item_data::share_playlist_in(
             &mut tx,
             request.id,
             request.user_id,
@@ -1567,7 +1568,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
     ) -> Result<Vec<PlaylistUserPermissions>, ServiceError> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
-               WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
+               WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
         )
         .bind(guid_to_db(playlist_id))
         .fetch_all(self.db.pool())
@@ -1848,27 +1849,6 @@ async fn write_entries_in(
         .await
         .map_err(db_err)?;
     }
-    Ok(())
-}
-
-/// Upserts one share row (POST is idempotent: re-sharing updates `CanEdit`),
-/// on a connection the caller holds, so it commits with its `Data` sync.
-async fn upsert_share(
-    conn: &mut sqlx::SqliteConnection,
-    playlist: Uuid,
-    user: Uuid,
-    can_edit: bool,
-) -> Result<(), ServiceError> {
-    sqlx::query(
-        r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
-           ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
-    )
-    .bind(guid_to_db(playlist))
-    .bind(guid_to_db(user))
-    .bind(i64::from(can_edit))
-    .execute(&mut *conn)
-    .await
-    .map_err(db_err)?;
     Ok(())
 }
 
@@ -3516,6 +3496,93 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Shares keep the order they were given, as upstream's `Shares` list
+    /// does: a create and an update store the request's order, a re-share
+    /// moves the user to the end (`AddUserToShares`), and `Data` lists them
+    /// the same way. User-id order would be amy, mid, zed.
+    #[tokio::test]
+    async fn playlist_shares_keep_the_order_they_were_given() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+        use ferrofin_model::playlists::PlaylistUserUpdateRequest;
+
+        async fn data_order(db: &ferrofin_db::Database, playlist: Uuid) -> Vec<String> {
+            let data = crate::test_support::fetch_item(db, playlist).await.data;
+            crate::item_data::parse_data(data.as_deref())["Shares"]
+                .as_array()
+                .expect("Shares")
+                .iter()
+                .map(|share| share["UserId"].as_str().expect("UserId").to_owned())
+                .collect()
+        }
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db);
+        let (amy, mid, zed) = (
+            Uuid::from_u128(0x1),
+            Uuid::from_u128(0x8),
+            Uuid::from_u128(0xF),
+        );
+        let owner = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Ordered".to_owned()),
+                user_id: owner,
+                users: vec![Share::new(zed, false), Share::new(amy, true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let guids = |users: &[Uuid]| {
+            users
+                .iter()
+                .map(|user| crate::item_data::json_guid(*user))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![Share::new(zed, false), Share::new(amy, true)]
+        );
+        assert_eq!(data_order(&db, playlist_id).await, guids(&[zed, amy]));
+
+        // A re-share moves the user to the end; a new share goes after it.
+        for (user, can_edit) in [(zed, true), (mid, false)] {
+            mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
+                id: playlist_id,
+                user_id: user,
+                can_edit: Some(can_edit),
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![
+                Share::new(amy, true),
+                Share::new(zed, true),
+                Share::new(mid, false)
+            ]
+        );
+        assert_eq!(data_order(&db, playlist_id).await, guids(&[amy, zed, mid]));
+
+        // An update stores the request's order.
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist_id,
+            user_id: owner,
+            users: Some(vec![Share::new(mid, true), Share::new(amy, false)]),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("update");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![Share::new(mid, true), Share::new(amy, false)]
+        );
+        assert_eq!(data_order(&db, playlist_id).await, guids(&[mid, amy]));
     }
 
     /// A re-rate saves only the rating: a share revoked between the re-rate's

@@ -193,6 +193,14 @@ pub trait SessionManager: Send + Sync {
         data: &str,
     ) -> Result<(), ServiceError>;
 
+    /// Whether any session of `user_id` could receive a pushed message, so a
+    /// sender can skip building one nobody would hear (upstream's
+    /// `SendMessageToUserSessions` builds its data only when the user has a
+    /// session). The default answers `true`.
+    async fn has_listener_for_user(&self, _user_id: Uuid) -> bool {
+        true
+    }
+
     /// Sends a pre-serialized JSON message to every session with a signed-in
     /// user (the delivery target of Jellyfin's library/server notifiers, e.g.
     /// `LibraryChanged`). Defaulted to a no-op so lightweight test doubles need

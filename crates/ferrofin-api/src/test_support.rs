@@ -576,9 +576,6 @@ macro_rules! fake_library_manager {
             ) -> Result<Vec<String>, ServiceError> {
                 unimplemented!("fake")
             }
-            async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-                unimplemented!("fake")
-            }
         }
     };
 }
@@ -587,6 +584,9 @@ macro_rules! fake_library_manager {
 pub struct FakeLibrary;
 
 fake_library_manager!(FakeLibrary {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -609,8 +609,23 @@ fake_library_manager!(FakeLibrary {
 pub struct ScanningLibrary;
 
 fake_library_manager!(ScanningLibrary {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
     fn is_scan_running(&self) -> bool {
         true
+    }
+});
+
+/// [`FakeLibrary`] that counts the library scans queued through it, scoped
+/// or not, for the routes whose requested refresh is under test.
+#[derive(Default)]
+pub struct CountingScans(pub std::sync::atomic::AtomicUsize);
+
+fake_library_manager!(CountingScans {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 });
 
@@ -1262,8 +1277,8 @@ impl SessionManager for FakeSessions {
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        // The played/favorite/rating/user-data handlers push `UserDataChanged`
-        // here best-effort; delivery is covered by ferrofin-core's tests.
+        // The user-data manager's batched `UserDataChanged` goes out here;
+        // delivery is covered by ferrofin-core's tests.
         Ok(())
     }
     async fn send_message_to_user_device_sessions(

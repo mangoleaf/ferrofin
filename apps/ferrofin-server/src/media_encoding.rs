@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
-use ferrofin_hls::{DynamicHlsPlaylistGenerator, HlsStreamManagerImpl};
+use ferrofin_hls::{DynamicHlsPlaylistGenerator, EncodingOptionsProvider, HlsStreamManagerImpl};
 use ferrofin_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
 use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
@@ -39,6 +39,7 @@ use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, HlsStreamManager, MediaEncoder, MediaInfoRequest,
 };
+use ferrofin_traits::persistence::KeyframeRepository;
 use ferrofin_traits::system::PathManager;
 use uuid::Uuid;
 
@@ -63,6 +64,47 @@ pub struct MediaEncodingExtras {
     pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
     /// Releases the live stream a killed job was reading.
     pub sessions: Option<Arc<dyn ferrofin_traits::session::SessionManager>>,
+    /// Stores the keyframes remux playlists are cut on. Without it the
+    /// playlist generator has no keyframe extractor, and every playlist uses
+    /// equal-length segments.
+    pub keyframes: Option<Arc<dyn KeyframeRepository>>,
+}
+
+/// The playlist generator's encoding options: the live configuration, as
+/// upstream reads `GetEncodingOptions()` on every playlist request.
+struct GeneratorEncodingOptions {
+    config: Arc<dyn ServerConfigurationManager>,
+    reader: EncodingOptionsReader,
+}
+
+#[async_trait]
+impl EncodingOptionsProvider for GeneratorEncodingOptions {
+    async fn get_encoding_options(&self) -> EncodingOptions {
+        self.reader.read(self.config.as_ref()).await
+    }
+}
+
+/// Port of `AddHlsPlaylistGenerator`: the HLS playlist generator over the live
+/// encoding options and the cached ffprobe and Matroska keyframe extractors,
+/// of which it keeps the metadata-based (Matroska) one. Without a keyframe
+/// repository it has no extractor.
+fn playlist_generator(
+    config: &Arc<dyn ServerConfigurationManager>,
+    encoder: &Arc<dyn MediaEncoder>,
+    keyframes: Option<Arc<dyn KeyframeRepository>>,
+) -> Arc<DynamicHlsPlaylistGenerator<GeneratorEncodingOptions>> {
+    let extractors = keyframes
+        .map(|repository| {
+            ferrofin_core::keyframe_extractors::keyframe_extractors(repository, Arc::clone(encoder))
+        })
+        .unwrap_or_default();
+    Arc::new(DynamicHlsPlaylistGenerator::new(
+        GeneratorEncodingOptions {
+            config: Arc::clone(config),
+            reader: EncodingOptionsReader::new("playlist generator"),
+        },
+        extractors,
+    ))
 }
 
 /// The one thing job teardown needs from the session layer: release a live
@@ -239,6 +281,7 @@ pub fn build_media_encoding(
     Arc<dyn SubtitleEncoder>,
 ) {
     let library = extras.library;
+    let generator = playlist_generator(&config, &encoder, extras.keyframes);
     // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
     // Built first: the planner also consumes it, resolving a burned text
     // subtitle to its cached extracted file so the `subtitles` filter doesn't
@@ -302,15 +345,6 @@ pub fn build_media_encoding(
                 .run_idle_reaper(std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS)),
         );
     }
-    // The generator reads live encoding options per request; First-Light returns
-    // the defaults (the persisted named-config accessor is not yet threaded
-    // through `ServerConfigurationManager`).
-    let generator_config: Box<dyn Fn() -> EncodingOptions + Send + Sync> =
-        Box::new(EncodingOptions::default);
-    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(
-        generator_config,
-        Vec::new(),
-    ));
     let mut hls_impl = HlsStreamManagerImpl::new(
         planner,
         transcoder,
@@ -955,6 +989,7 @@ mod tests {
                 virtual_folders: None,
                 trickplay: None,
                 sessions: None,
+                keyframes: None,
             },
         );
     }
@@ -999,6 +1034,7 @@ mod tests {
                 virtual_folders: None,
                 trickplay: None,
                 sessions: None,
+                keyframes: None,
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1305,6 +1341,7 @@ mod tests {
                 virtual_folders: None,
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
+                keyframes: None,
             },
         );
 
@@ -1325,6 +1362,133 @@ mod tests {
         assert!(
             playlist.contains("#EXT-X-IMAGE-STREAM-INF"),
             "the trickplay manager the chain was given must reach the playlist: {playlist}"
+        );
+    }
+
+    /// A keyframe repository holding rows in memory.
+    #[derive(Default)]
+    struct StoredKeyframes(
+        std::sync::Mutex<
+            std::collections::HashMap<Uuid, ferrofin_db::entities::base_items::KeyframeDataEntity>,
+        >,
+    );
+
+    #[async_trait]
+    impl KeyframeRepository for StoredKeyframes {
+        async fn get_keyframe_data(
+            &self,
+            item_id: Uuid,
+        ) -> Result<Vec<ferrofin_db::entities::base_items::KeyframeDataEntity>, ServiceError>
+        {
+            Ok(self
+                .0
+                .lock()
+                .expect("rows")
+                .get(&item_id)
+                .cloned()
+                .into_iter()
+                .collect())
+        }
+        async fn save_keyframe_data(
+            &self,
+            item_id: Uuid,
+            data: &ferrofin_db::entities::base_items::KeyframeDataEntity,
+        ) -> Result<(), ServiceError> {
+            self.0.lock().expect("rows").insert(item_id, data.clone());
+            Ok(())
+        }
+        async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
+            self.0.lock().expect("rows").remove(&item_id);
+            Ok(())
+        }
+    }
+
+    /// The `#EXTINF` lengths of a playlist.
+    fn segment_lengths(playlist: &str) -> Vec<&str> {
+        playlist
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXTINF:"))
+            .filter_map(|rest| rest.strip_suffix(", nodesc"))
+            .collect()
+    }
+
+    /// The playlist for a 12 s `file` whose stored keyframes are at 0, 4.2,
+    /// 6.5 and 11 s, cut into 6 s segments.
+    async fn playlist_for(file: &str, remux: bool, options: EncodingOptions) -> String {
+        let item = Uuid::from_u128(0x4B);
+        let repository = Arc::new(StoredKeyframes::default());
+        repository
+            .save_keyframe_data(
+                item,
+                &ferrofin_db::entities::base_items::KeyframeDataEntity {
+                    item_id: ferrofin_db::store::guid_to_db(item),
+                    keyframe_ticks: Some("[0,42000000,65000000,110000000]".to_owned()),
+                    total_duration: 120_000_000,
+                },
+            )
+            .await
+            .expect("seed");
+        let (_, paths) = config_and_paths();
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(paths, options));
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
+        let generator = playlist_generator(
+            &config,
+            &encoder,
+            Some(repository as Arc<dyn KeyframeRepository>),
+        );
+        let request = ferrofin_hls::CreateMainPlaylistRequest::new(
+            Some(item),
+            file,
+            6000,
+            120_000_000,
+            "ts",
+            "hls1/main/",
+            "?static=true",
+            remux,
+        );
+        generator
+            .create_main_playlist(&request)
+            .await
+            .expect("playlist")
+    }
+
+    #[tokio::test]
+    async fn a_remuxed_mkv_is_cut_on_its_keyframes() {
+        let playlist = playlist_for("/media/movie.mkv", true, EncodingOptions::default()).await;
+
+        // The first keyframe at or after 6 s is at 6.5 s; the rest runs to 12 s.
+        assert_eq!(
+            segment_lengths(&playlist),
+            ["6.500000", "5.500000"],
+            "{playlist}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::a_transcode_makes_its_own_keyframes("/media/movie.mkv", true, false)]
+    #[case::the_extension_is_not_allowed("/media/movie.mp4", true, true)]
+    #[case::extraction_is_switched_off("/media/movie.mkv", false, true)]
+    #[tokio::test]
+    async fn other_playlists_use_equal_length_segments(
+        #[case] file: &str,
+        #[case] allow_mkv: bool,
+        #[case] remux: bool,
+    ) {
+        let options = EncodingOptions {
+            allow_on_demand_metadata_based_keyframe_extraction_for_extensions: if allow_mkv {
+                vec!["mkv".to_owned()]
+            } else {
+                Vec::new()
+            },
+            ..EncodingOptions::default()
+        };
+
+        let playlist = playlist_for(file, remux, options).await;
+
+        assert_eq!(
+            segment_lengths(&playlist),
+            ["6.000000", "6.000000"],
+            "{playlist}"
         );
     }
 

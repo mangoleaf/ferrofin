@@ -66,7 +66,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayCommand,
     PlayRequest, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
-    SessionMessageType, SessionUserInfo, TranscodingInfo, UserDataChangeInfo,
+    SessionMessageType, SessionUserInfo, TranscodingInfo,
 };
 use ferrofin_util::shuffle_extensions::shuffle;
 
@@ -84,6 +84,11 @@ use ferrofin_traits::session_bus::SessionMessageBus;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::has_permission;
+
+/// How long a user's `LastActivityDate` stands before session activity
+/// stamps it again (`SessionManager.cs:265`, `TotalSeconds > 60`). Upstream
+/// hardcodes it, with no setting.
+const USER_ACTIVITY_STAMP_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
 
 /// The default device name applied when a client reports an empty one (C#
 /// `CreateSessionInfo` → `"Network Device"`).
@@ -265,6 +270,10 @@ pub struct FerrofinSessionManager {
     /// default (`0` = unlimited, what every user has unless an admin says
     /// otherwise) still logs in with no added serialization.
     session_limit_gate: Arc<Mutex<()>>,
+    /// When session activity last stamped each user's `LastActivityDate`
+    /// ([`Self::stamp_user_activity`]). The user a request carries can be the
+    /// auth cache's copy, read before that stamp.
+    user_activity: Arc<std::sync::Mutex<HashMap<Uuid, DateTime<Utc>>>>,
     /// The session message bus the HTTP WebSocket handler registers client
     /// sinks on. A bus-registered socket counts as a live controller (it drives
     /// `SupportsRemoteControl`) and is the delivery path for remote-control
@@ -319,6 +328,7 @@ impl FerrofinSessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             active_live_stream_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_limit_gate: Arc::new(Mutex::new(())),
+            user_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_sources: None,
             music_manager: None,
             bus: None,
@@ -543,8 +553,47 @@ impl FerrofinSessionManager {
             // registered on the injected event manager.
             let _ = self.event_manager.publish("SessionStarted", &payload).await;
         }
+        // Upstream saves the user after `GetSessionInfo` has registered (and
+        // announced) the session, and a failed save fails the request; only a
+        // concurrency conflict, which this write cannot raise, is swallowed.
+        if let Some(user) = user {
+            self.stamp_user_activity(user, user_id, now).await?;
+        }
 
         Ok(dto)
+    }
+
+    /// `LogSessionActivity`'s user stamp (`SessionManager.cs:262-275`): when
+    /// the user was last active more than [`USER_ACTIVITY_STAMP_INTERVAL`]
+    /// before `now` (never counts), their `LastActivityDate` becomes `now`.
+    /// Upstream reads that date from its in-memory user, which its own save
+    /// keeps current; `user` here can be the auth cache's copy, read before
+    /// the last stamp, so the later of its date and the last stamp this
+    /// manager made decides.
+    async fn stamp_user_activity(
+        &self,
+        user: &UserEntity,
+        user_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        let stamped = self
+            .user_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&user_id)
+            .copied();
+        if stamped
+            .max(user.last_activity_date)
+            .is_some_and(|last| now - last <= USER_ACTIVITY_STAMP_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.user_manager.record_user_activity(user, now).await?;
+        self.user_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(user_id, now);
+        Ok(())
     }
 
     /// Looks up a live session by its **session id** (not key), cloning a
@@ -661,30 +710,6 @@ impl FerrofinSessionManager {
         Ok(())
     }
 
-    /// Whether any of `user_id`'s sessions could actually receive a pushed
-    /// message: an open WebSocket connection on the session, or a sink
-    /// registered on the session bus for its id (the `/socket` handler's path).
-    /// Exactly the two delivery routes [`Self::broadcast`] uses, so a `false`
-    /// here means the broadcast would reach nobody.
-    async fn has_listener_for_user(&self, user_id: Uuid) -> bool {
-        let bus_candidates: Vec<String> = {
-            let sessions = self.sessions.lock().await;
-            let mut ids = Vec::new();
-            for session in sessions.values().filter(|s| s.contains_user(user_id)) {
-                if session.connections.iter().any(|c| c.is_open()) {
-                    return true;
-                }
-                ids.push(session.id.clone());
-            }
-            ids
-        };
-        self.bus.as_ref().is_some_and(|bus| {
-            bus_candidates
-                .iter()
-                .any(|id| bus.is_connected(id.as_str()))
-        })
-    }
-
     /// The item a playback report's user data is kept against — port of
     /// `SessionManager.GetProgressItem` (`SessionManager.cs:742-756`): a
     /// client playing another version of the item it shows reports the shown
@@ -721,8 +746,8 @@ impl FerrofinSessionManager {
     }
 
     /// The final play-state save of a stop, per session user (C#
-    /// `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`), each
-    /// change pushed to the user's other devices.
+    /// `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`); the
+    /// user-data manager announces each save to the user's devices.
     async fn save_stopped_play_state(
         &self,
         session: &SessionInfo,
@@ -741,46 +766,8 @@ impl FerrofinSessionManager {
                     ferrofin_model::entities::UserDataSaveReason::PlaybackFinished,
                 )
                 .await?;
-            self.push_user_data_changed(user_id, progress_item).await;
         }
         Ok(())
-    }
-
-    /// Pushes the user's refreshed play-state for `item_id` to every session
-    /// belonging to that user (`UserDataChanged`), so their other signed-in
-    /// devices update resume position / played flags live instead of showing
-    /// stale progress until re-login. Port of Jellyfin's
-    /// `UserDataChangedNotifier` (which fires on every user-data save).
-    /// Best-effort: a delivery failure must not fail the playback report.
-    async fn push_user_data_changed(&self, user_id: Uuid, item_id: Uuid) {
-        // Building the payload costs a `UserData` read, and every play-state
-        // report triggers one. When the user has no session that could receive
-        // the push — no open WebSocket and no registered bus sink — `broadcast`
-        // would drop it, so skip the read instead of paying for a message
-        // nobody is listening for. (A session with either delivery path still
-        // gets the push, unchanged.)
-        if !self.has_listener_for_user(user_id).await {
-            return;
-        }
-        let Ok(Some(dto)) = self
-            .user_data_manager
-            .get_user_data_dto(item_id, user_id)
-            .await
-        else {
-            return;
-        };
-        let info = UserDataChangeInfo {
-            user_id,
-            user_data_list: vec![dto],
-        };
-        let Ok(data) = serde_json::to_string(&info) else {
-            return;
-        };
-        let _ = self
-            .broadcast(SessionMessageType::UserDataChanged, &data, |s| {
-                s.contains_user(user_id)
-            })
-            .await;
     }
 
     /// Expands one cast item id into the ids a client can actually play — port
@@ -1238,18 +1225,26 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        if item.is_some() {
+        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
+        // logged here so every route that reports a start logs it once.
+        if let Some(item) = &item {
             info!(
-                user = ?session.user_name,
-                client = ?session.client,
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.name.as_deref(),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
                 "user started playback",
             );
         }
 
         // Record the start on every session user's data (C# OnPlaybackStart:
-        // PlayCount++ and the LastPlayedDate stamp Next Up filters on), then
-        // push the change to the user's other devices. Only for a library
-        // item: C# `if (libraryItem is not null)`.
+        // PlayCount++ and the LastPlayedDate stamp Next Up filters on); the
+        // user-data manager announces the save to the user's devices. Only for
+        // a library item: C# `if (libraryItem is not null)`.
         if item.is_some() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
@@ -1259,7 +1254,6 @@ impl SessionManager for FerrofinSessionManager {
                 self.user_data_manager
                     .record_playback_start(user_id, progress_item)
                     .await?;
-                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 
@@ -1316,19 +1310,26 @@ impl SessionManager for FerrofinSessionManager {
         }
 
         // Persist play-state for every user on the session (C#
-        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`), then
-        // push the change to the user's other devices. Only for a library
-        // item: C# `if (libraryItem is not null …)`.
+        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState` and
+        // `UpdatePlaybackSettings`, which keeps the reported tracks as the
+        // user's "Remember audio/subtitle selections" say). A progress save is
+        // not announced (`UserDataChangeNotifier`). Only for a library item:
+        // C# `if (libraryItem is not null …)`.
         if now_playing.is_some() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
+                let streams = ferrofin_traits::library::ReportedStreams {
+                    audio_stream_index: info.audio_stream_index,
+                    subtitle_stream_index: info.subtitle_stream_index,
+                    remember_audio: user.remember_audio_selections,
+                    remember_subtitles: user.remember_subtitle_selections,
+                };
                 self.user_data_manager
-                    .update_play_state(user_id, progress_item, info.position_ticks)
+                    .update_play_progress(user_id, progress_item, info.position_ticks, streams)
                     .await?;
-                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 
@@ -1399,6 +1400,41 @@ impl SessionManager for FerrofinSessionManager {
             Ok(_) => Ok(()),
             Err(error) => Err(error),
         };
+
+        // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
+        // ({3} {4})", for a stop whose item resolves. `position_ms` is left out
+        // when the client sent no position (upstream writes "unknown"; a numeric
+        // field cannot). The lookup only names the item in this line, so its
+        // failure must not fail the stop report.
+        let stopped_item = if info.item_id.is_nil() {
+            None
+        } else {
+            match self.library_manager.get_item_by_id(info.item_id).await {
+                Ok(item) => item,
+                Err(error) => {
+                    tracing::debug!(
+                        item_id = %info.item_id,
+                        %error,
+                        "playback stop: item lookup failed"
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(item) = stopped_item {
+            info!(
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.name.as_deref(),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
+                "user stopped playback",
+            );
+        }
 
         // C# `OnPlaybackStopped`: the live stream the client was playing is
         // closed here, not only by an explicit `/LiveStreams/Close`. A client that
@@ -1580,6 +1616,29 @@ impl SessionManager for FerrofinSessionManager {
             user_ids.iter().any(|id| s.contains_user(*id))
         })
         .await
+    }
+
+    /// An open WebSocket connection on one of the user's sessions, or a sink
+    /// registered on the session bus for its id (the `/socket` handler's
+    /// path): exactly the two delivery routes `broadcast` uses, so a `false`
+    /// here means a broadcast would reach nobody.
+    async fn has_listener_for_user(&self, user_id: Uuid) -> bool {
+        let bus_candidates: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            let mut ids = Vec::new();
+            for session in sessions.values().filter(|s| s.contains_user(user_id)) {
+                if session.connections.iter().any(|c| c.is_open()) {
+                    return true;
+                }
+                ids.push(session.id.clone());
+            }
+            ids
+        };
+        self.bus.as_ref().is_some_and(|bus| {
+            bus_candidates
+                .iter()
+                .any(|id| bus.is_connected(id.as_str()))
+        })
     }
 
     async fn send_message_to_all_sessions(
@@ -2350,7 +2409,14 @@ fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
 
-/// The JSON payload for a playback-progress event.
+/// .NET ticks (100 ns each) in a millisecond.
+const TICKS_PER_MILLISECOND: i64 = 10_000;
+
+/// The JSON payload for a playback event. The user name, device name and
+/// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and
+/// `ClientName`: the playback activity loggers read the first two
+/// ([`crate::playback_activity`]), and plugins receive all three, as
+/// upstream's event consumers do.
 fn playback_event_payload(
     session: &SessionInfo,
     item_id: Uuid,
@@ -2359,6 +2425,9 @@ fn playback_event_payload(
     serde_json::json!({
         "SessionId": session.id,
         "UserId": session.user_id,
+        "UserName": session.user_name,
+        "DeviceName": session.device_name,
+        "ClientName": session.client,
         "ItemId": item_id,
         "PositionTicks": position_ticks,
     })
