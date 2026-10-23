@@ -100,6 +100,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 - Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
   `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
   file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
@@ -211,6 +215,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
   instead of being lifted to the level above. The next scan moves existing items under
   their folders; their ids, play state and playlist entries stay
+- A series refresh removes its missing episodes once you have them, as Jellyfin 12.2 does:
+  a missing episode whose number a file covers, one with no number, and one carrying the
+  provider id of an episode you have under another number are removed, so an adopted
+  library no longer lists those episodes twice (see `docs/UPGRADING.md`)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -283,6 +291,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   genres, studios, year or runtime and never matched a genre or studio filter. Locked
   items and locked fields keep their values. A collection also keeps a current list of
   the libraries its members are in, which decides who can see it
+- Adding, removing or renaming a library, or adding or removing one of its folders, can
+  fail part-way, for example on a full disk. When it does, the request still fails, but
+  the server now also refreshes its folder watch and runs the scan the request asked for,
+  as Jellyfin does. Before, both were skipped until the next scan
 
 ## [1.0.0] - 2026-09-05
 

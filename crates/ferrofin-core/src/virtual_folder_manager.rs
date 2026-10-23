@@ -1559,17 +1559,20 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // `refreshLibrary=false` still converges. Legacy children were moved
         // transactionally before the directory rename; the physical hierarchy
         // survives deletion of the old collection folder.
-        if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
-            persistence.delete_items(std::slice::from_ref(&id)).await?;
-            if let Ok(mut set) = self.parented.lock() {
-                set.remove(&id);
+        let cleaned = async {
+            if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
+                persistence.delete_items(std::slice::from_ref(&id)).await?;
+                if let Ok(mut set) = self.parented.lock() {
+                    set.remove(&id);
+                }
             }
+            // …and sweep anything else whose directory has since vanished, so a
+            // rename also converges a root that drifted for some other reason.
+            self.prune_orphan_collection_folders().await.map(drop)
         }
-        // …and sweep anything else whose directory has since vanished, so a rename
-        // also converges a root that drifted for some other reason.
-        self.prune_orphan_collection_folders().await?;
+        .await;
 
-        remapped
+        rename_outcome(remapped, cleaned)
     }
 
     async fn add_media_path(
@@ -1663,9 +1666,26 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     }
 }
 
+/// A rename's result once its directory has moved: the preference remap's
+/// failure is the caller's; a failure of the row cleanup that runs after it
+/// anyway is logged, not returned in its place.
+fn rename_outcome(
+    remapped: Result<(), ServiceError>,
+    cleaned: Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    match (remapped, cleaned) {
+        (Err(first), Err(error)) => {
+            tracing::warn!(%error, "could not clean up the renamed library's old row");
+            Err(first)
+        }
+        (Err(first), Ok(())) => Err(first),
+        (Ok(()), cleaned) => cleaned,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FerrofinVirtualFolderManager, OPTIONS_FILE};
+    use super::{FerrofinVirtualFolderManager, OPTIONS_FILE, rename_outcome};
     use crate::item_persistence_service::FerrofinItemPersistenceService;
     use ferrofin_db::Database;
     use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -1837,6 +1857,20 @@ mod tests {
         crate::user_entity_ext::get_preference(db.pool(), user, kind)
             .await
             .expect("preference")
+    }
+
+    /// A failed preference remap stays the rename's error when the row
+    /// cleanup after it fails too; with the remap done, the cleanup's
+    /// result is the rename's.
+    #[test]
+    fn a_rename_reports_its_first_failure() {
+        let remap = || Err(ServiceError::backend("remap"));
+        let cleanup = || Err(ServiceError::backend("cleanup"));
+        let message = |result: Result<(), ServiceError>| result.unwrap_err().to_string();
+        assert!(message(rename_outcome(remap(), cleanup())).contains("remap"));
+        assert!(message(rename_outcome(remap(), Ok(()))).contains("remap"));
+        assert!(message(rename_outcome(Ok(()), cleanup())).contains("cleanup"));
+        assert!(rename_outcome(Ok(()), Ok(())).is_ok());
     }
 
     /// Jellyfin 12.2 `LibraryStructureControllerTests.
