@@ -1230,6 +1230,218 @@ async fn a_by_name_artist_whose_lookup_failed_is_retried_by_a_quiet_rescan() {
     assert!(fx.music.take().is_empty(), "then never again");
 }
 
+/// `MusicAlbum.RefreshAllMetadata` ends a refresh that is not automated
+/// (`POST /Items/{id}/Refresh`) by refreshing the album's artists known only
+/// by name (`RefreshArtists`, `MusicAlbum.cs:212-236`). The same refresh run
+/// by a scan is automated and leaves them, and the album's folder-backed
+/// artist is never refreshed through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_album_refresh_refreshes_its_artists_known_only_by_name() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    fx.scan().await;
+    // Gil Evans, credited on every track and so on the album, known only by
+    // name and never refreshed yet.
+    for track in ["01 - So What.mp3", "02 - Blue in Green.mp3"] {
+        let id = derive_item_id(
+            BaseItemKind::Audio,
+            &fx.album_dir.join(track).to_string_lossy(),
+        )
+        .expect("id");
+        let row = fx.row(id).await;
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                artists: Some("Gil Evans".into()),
+                ..row
+            }])
+            .await
+            .expect("credit the track");
+        fx.persistence
+            .save_item_values(id, &[(1, "Gil Evans".into())])
+            .await
+            .expect("materialize");
+    }
+    let album = fx.row(fx.album_id()).await;
+    fx.persistence
+        .save_items(&[BaseItemEntity {
+            artists: Some("Gil Evans".into()),
+            ..album
+        }])
+        .await
+        .expect("credit the album");
+    let gil = by_name_artist(&fx, "Gil Evans").await;
+    assert!(fx.row(gil).await.date_last_refreshed.is_none());
+    let miles = fx.row(fx.artist_id()).await.date_last_refreshed;
+    fx.music.take();
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let refresh_album = |options: MetadataRefreshOptions| {
+        let scanner = &fx.scanner;
+        let target = ScanTarget::Paths(vec![fx.album_dir.to_string_lossy().into_owned()]);
+        let none = none.clone();
+        async move {
+            let cancel = ScanCancel::new();
+            scanner
+                .scan_target(
+                    &target,
+                    ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+                )
+                .await
+                .expect("refresh")
+        }
+    };
+
+    refresh_album(MetadataRefreshOptions::default()).await;
+    assert!(
+        fx.row(gil).await.date_last_refreshed.is_none(),
+        "an automated refresh leaves the album's artists: {:?}",
+        fx.music.take()
+    );
+
+    refresh_album(MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::Default,
+        MetadataRefreshMode::Default,
+        false,
+        false,
+        false,
+    ))
+    .await;
+    let asked = fx.music.take();
+    assert!(
+        fx.row(gil).await.date_last_refreshed.is_some(),
+        "the by-name artist refreshes with the album: {asked:?}"
+    );
+    assert!(
+        searches(&asked).iter().any(|l| l.contains("Gil")),
+        "searched by its name: {asked:?}"
+    );
+    assert_eq!(
+        fx.row(fx.artist_id()).await.date_last_refreshed,
+        miles,
+        "the folder-backed artist is not refreshed through its album"
+    );
+}
+
+/// A manual refresh of a folder artist covers both of its albums: an artist
+/// known only by name that both albums credit refreshes once, and a credited
+/// name with no artist row yet gets one (`LibraryManager.GetArtist` →
+/// `CreateItemByName`), which refreshes too.
+#[tokio::test(flavor = "multi_thread")]
+// One library through its setup, a refresh and the checks of both artists.
+#[allow(clippy::too_many_lines)]
+async fn a_manual_refresh_of_two_albums_refreshes_a_shared_artist_once_and_creates_a_missing_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    let meta = tmp.path().join("metadata");
+    let store = ferrofin_core::by_name_store::ByNameStore::new(
+        fx.persistence.clone(),
+        meta.join("Genre"),
+        meta.join("MusicGenre"),
+        meta.join("Studio"),
+        meta.join("artists"),
+    );
+    let fx = Fixture {
+        scanner: fx.scanner.with_by_name_store(store),
+        ..fx
+    };
+    let sketches = fx.artist_dir.join("Sketches of Spain");
+    std::fs::create_dir_all(&sketches).expect("mkdir");
+    std::fs::write(sketches.join("01 - Concierto de Aranjuez.mp3"), b"").expect("track");
+    fx.scan().await;
+    let credit = |path: PathBuf, kind: BaseItemKind, artists: &'static str| {
+        let fx = &fx;
+        async move {
+            let id = derive_item_id(kind, &path.to_string_lossy()).expect("id");
+            let row = fx.row(id).await;
+            fx.persistence
+                .save_items(&[BaseItemEntity {
+                    artists: Some(artists.into()),
+                    ..row
+                }])
+                .await
+                .expect("credit");
+            id
+        }
+    };
+    for track in ["01 - So What.mp3", "02 - Blue in Green.mp3"] {
+        let id = credit(fx.album_dir.join(track), BaseItemKind::Audio, "Gil Evans").await;
+        fx.persistence
+            .save_item_values(id, &[(1, "Gil Evans".into())])
+            .await
+            .expect("materialize");
+    }
+    credit(fx.album_dir.clone(), BaseItemKind::MusicAlbum, "Gil Evans").await;
+    let both = "Gil Evans|Ghost Orchestra";
+    credit(
+        sketches.join("01 - Concierto de Aranjuez.mp3"),
+        BaseItemKind::Audio,
+        both,
+    )
+    .await;
+    credit(sketches.clone(), BaseItemKind::MusicAlbum, both).await;
+    let gil = by_name_artist(&fx, "Gil Evans").await;
+    let artists = |name: &'static str| {
+        let fx = &fx;
+        async move {
+            fx.items
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::MusicArtist],
+                    ..InternalItemsQuery::default()
+                })
+                .await
+                .expect("artists")
+                .into_iter()
+                .filter(|a| a.name.as_deref() == Some(name))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert!(artists("Ghost Orchestra").await.is_empty(), "no row yet");
+    fx.music.take();
+
+    let options = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::Default,
+        MetadataRefreshMode::Default,
+        false,
+        false,
+        false,
+    );
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    fx.scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![fx.artist_dir.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("refresh");
+    let asked = fx.music.take();
+    let searched = |name: &str| searches(&asked).iter().filter(|l| l.contains(name)).count();
+    assert!(fx.row(gil).await.date_last_refreshed.is_some(), "{asked:?}");
+    assert_eq!(
+        searched("Gil"),
+        1,
+        "the shared artist refreshes once: {asked:?}"
+    );
+    let ghost = artists("Ghost Orchestra").await;
+    assert_eq!(ghost.len(), 1, "the missing artist is created");
+    assert!(
+        ghost[0].parent_id.as_deref().is_none_or(str::is_empty),
+        "known only by name"
+    );
+    assert!(
+        ghost[0].date_last_refreshed.is_some(),
+        "and refreshed: {asked:?}"
+    );
+    assert_eq!(searched("Ghost"), 1, "{asked:?}");
+}
+
 /// The id of the by-name `MusicArtist` row named `name`.
 async fn by_name_artist(fx: &Fixture, name: &str) -> Uuid {
     let row = fx

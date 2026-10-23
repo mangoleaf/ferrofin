@@ -1668,6 +1668,7 @@ impl LocalProviderManager {
             force_save: options.force_save,
             regenerate_trickplay: options.regenerate_trickplay,
             enable_remote_content_probe: options.enable_remote_content_probe,
+            is_automated: options.is_automated,
         }
     }
 
@@ -2028,8 +2029,9 @@ impl LocalProviderManager {
     /// Neither names a `ResultLanguage` here, so the fold's language
     /// fallback (`:977-999`) never applies to a season: its request carries
     /// the resolved metadata language. The ids an answer brings
-    /// are not looked up by: TheTVDB reads the season's id from its series
-    /// under the scan's `IsAutomated` (see [`crate::season::tvdb_season`]).
+    /// are not looked up by: TheTVDB reads the season's id from its series,
+    /// as the plugin at `5c4592f` does under an automated refresh (see
+    /// [`crate::season::tvdb_season`]).
     ///
     /// [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
     async fn fetch_season_providers(&self, season: SeasonRefresh<'_>) -> Fetched {

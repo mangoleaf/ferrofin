@@ -321,6 +321,33 @@ pub struct TrickplayExtraction<'a> {
 /// Compile-time assertion that [`TrickplayFrameExtractor`] is object-safe.
 fn _assert_object_safe_trickplay_frame_extractor(_: &dyn TrickplayFrameExtractor) {}
 
+/// Extracts a video file's keyframe times.
+///
+/// Port of `Jellyfin.MediaEncoding.Hls.Extractors.IKeyframeExtractor`. Upstream
+/// registers two, each wrapped in a cache over the keyframe repository: one
+/// reading a Matroska file's cue index (metadata-based) and one running
+/// ffprobe. The HLS playlist generator keeps only the metadata-based ones; the
+/// "Keyframe Extractor" task tries them first and ffprobe after.
+#[async_trait]
+pub trait KeyframeExtractor: Send + Sync {
+    /// `IsMetadataBased`: whether the extractor reads container metadata
+    /// rather than the stream itself, which makes it cheap enough to run while
+    /// a client waits for a playlist.
+    fn is_metadata_based(&self) -> bool;
+
+    /// `TryExtractKeyframes`: the keyframes of `item_id`'s file at
+    /// `file_path`, or `None` when this extractor cannot produce any (the file
+    /// is not one it reads, extraction failed, or it found no keyframes).
+    async fn try_extract_keyframes(
+        &self,
+        item_id: Uuid,
+        file_path: &str,
+    ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData>;
+}
+
+/// Compile-time assertion that [`KeyframeExtractor`] is object-safe.
+fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
+
 /// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
 ///
 /// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` (which

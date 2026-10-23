@@ -8,6 +8,25 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — missing episodes you now have are removed
+
+A database adopted from Jellyfin can hold **missing episodes**: placeholder rows with no
+file, which Jellyfin's TMDb option or the TheTVDB plugin added. They show to users with
+**Display missing episodes** on. Earlier versions kept every one forever, so when the
+file for one of them arrived, the episode was listed twice.
+
+Each library scan now does what Jellyfin does at the end of every series refresh. It
+removes a series' missing episode when:
+- a file in the same season covers its number;
+- it has no episode number;
+- it carries the TheTVDB, TMDb or other id of exactly one episode you have, under another
+  number. Aired, DVD and absolute orders number the same episode differently.
+
+The first scan after the upgrade does this for every series. Only placeholder rows go;
+no file is touched. A missing episode you still lack stays. A library monitor's event for
+a single file does not refresh its series, as in Jellyfin, so the next library scan
+removes its placeholder.
+
 ## Unreleased — the server needs 2 GiB free to start, as Jellyfin does
 
 Ferrofin now checks free space at startup. It refuses to start when `{data_dir}/data`, the

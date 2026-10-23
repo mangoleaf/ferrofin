@@ -1174,7 +1174,8 @@ impl FerrofinItemRepository {
 
     /// A library's `CollectionType`, from the same `Data` blob that carries its
     /// `PhysicalFolderIds` — `movies`, `tvshows`, … or `None` for an untyped
-    /// library, which upstream treats as matching any view.
+    /// library, which upstream treats as matching any view. A mixed library
+    /// (`mixed.collection`) is untyped, as upstream parses it.
     async fn collection_type_of(db: &Database, id: Uuid) -> Result<Option<String>, ServiceError> {
         let data: Option<Option<String>> =
             sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
@@ -1189,7 +1190,8 @@ impl FerrofinItemRepository {
                 v.get("CollectionType")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_ascii_lowercase)
-            }))
+            })
+            .filter(|collection_type| collection_type != "mixed"))
     }
 
     /// Runs a translated query in the requested shape, returning full rows.
@@ -1984,19 +1986,13 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
             .push_bind(tag.to_owned())
             .push(")");
         }
-        if let Some(airing) = filter.is_airing {
-            let now = datetime_to_db(chrono::Utc::now());
-            if airing {
-                qb.push(r#" AND ci."StartDate" <= "#)
-                    .push_bind(now.clone())
-                    .push(r#" AND ci."EndDate" >= "#)
-                    .push_bind(now);
-            } else {
-                qb.push(r#" AND ci."StartDate" > "#)
-                    .push_bind(now.clone())
-                    .push(r#" AND ci."EndDate" < "#)
-                    .push_bind(now);
-            }
+        if let Some(is_airing) = filter.is_airing {
+            crate::translate_query::push_is_airing(
+                qb,
+                "ci",
+                is_airing,
+                &datetime_to_db(chrono::Utc::now()),
+            );
         }
     } else {
         if !filter.exclude_item_ids.is_empty() {
@@ -3424,6 +3420,34 @@ impl ItemRepository for FerrofinItemRepository {
             .into_iter()
             .map(|row| image_info_from_row(row, &self.virtual_paths))
             .collect())
+    }
+
+    async fn get_image_infos_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map: std::collections::HashMap<Uuid, Vec<ItemImageInfo>> =
+            std::collections::HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
+                images_of_items_sql(&placeholders),
+            ));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(item_id)
+                        .or_default()
+                        .push(image_info_from_row(row, &self.virtual_paths));
+                }
+            }
+        }
+        Ok(map)
     }
 
     async fn get_image_infos_with_auto_orient(
@@ -11982,6 +12006,49 @@ mod tests {
             0
         );
     }
+
+    /// A mixed library has no collection type upstream (`mixed.collection`
+    /// parses to none), so grouped, it joins a movies view and its items are
+    /// browsed there, as the views list puts it in that view.
+    #[tokio::test]
+    async fn a_grouped_mixed_library_is_browsed_in_a_movies_view() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, second, user_id, user) = two_libraries(&db).await;
+        set_collection_type(&db, first, "movies").await;
+        set_collection_type(&db, second, "mixed").await;
+        let view = Uuid::from_u128(0x9F91);
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            r#"{"ViewType":"movies"}"#,
+        )
+        .await;
+        set_folder_preference(
+            &db,
+            user_id,
+            PreferenceKind::GroupedFolders,
+            &[first, second],
+        )
+        .await;
+        let mut names: Vec<String> = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                user: Some(user),
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse")
+            .into_iter()
+            .filter_map(|r| r.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["In First", "In Second"]);
+    }
 }
 
 #[cfg(test)]
@@ -13180,3 +13247,7 @@ pub(crate) async fn by_name_ids_by_clean_name(
 #[cfg(test)]
 #[path = "item_repository/played_state_tests.rs"]
 mod played_state_tests;
+
+#[cfg(test)]
+#[path = "item_repository/is_airing_tests.rs"]
+mod is_airing_tests;
