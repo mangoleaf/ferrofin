@@ -33,6 +33,40 @@ fn type_entry<'a>(
     })
 }
 
+/// `BaseItemManager`'s two `// Hack alert.` arms (`BaseItemManager.cs:28-38`),
+/// which both `IsMetadataFetcherEnabled` and `IsImageFetcherEnabled` test
+/// before any library or server option. `None` when neither applies.
+///
+/// - A `Channel` item may use every fetcher.
+/// - An item from a channel (`SourceType.Channel`: a non-empty `ChannelId`)
+///   may use one iff `!EnableMediaSourceDisplay`. Live TV channels and
+///   programs carry a `ChannelId` too, but override `SourceType` to `LiveTV`
+///   (`LiveTvChannel.cs:27`, `LiveTvProgram.cs:34`), so they fall through, as
+///   `item_repository`'s `SourceType` derivation has them. `EnableMediaSourceDisplay` is
+///   `ChannelManager.EnableMediaSourceDisplay`: `channel is not
+///   IDisableMediaSourceDisplay` for the plugin channel that supplied the
+///   item. Ferrofin has no channel plugins (gl-298), so the lookup finds none,
+///   `EnableMediaSourceDisplay` is true, and such an item uses no fetcher.
+///
+/// Only an adopted Jellyfin database holds either kind of row today.
+#[must_use]
+pub fn channel_fetcher_override(kind: &str, channel_id: Option<&str>) -> Option<bool> {
+    if kind.eq_ignore_ascii_case("Channel") {
+        return Some(true);
+    }
+    // `SourceType.LiveTV`, whatever the `ChannelId` says.
+    if ["LiveTvChannel", "TvChannel", "LiveTvProgram", "TvProgram"]
+        .iter()
+        .any(|live| kind.eq_ignore_ascii_case(live))
+    {
+        return None;
+    }
+    channel_id
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .is_some_and(|id| !id.is_nil())
+        .then_some(false)
+}
+
 /// Whether metadata fetcher `name` is enabled for item type `kind`.
 ///
 /// Port of `BaseItemManager.IsMetadataFetcherEnabled` (upstream master
@@ -60,12 +94,12 @@ fn type_entry<'a>(
 /// which calls it. Anything in Ferrofin that fetches remote metadata must ask
 /// here too, or clearing the checkboxes stops meaning anything.
 ///
-/// TODO(parity, open work item — NOT an accepted divergence): the two
-/// `// Hack alert.` arms at `BaseItemManager.cs:28-38` are not ported: a
-/// `Channel` item is always enabled, and an item whose `SourceType` is
-/// `Channel` is enabled iff `!EnableMediaSourceDisplay`. Neither is reachable
-/// from this signature, which takes a kind and not the item; porting them
-/// means passing the item's kind and `SourceType` here from both callers.
+/// `BaseItemManager`'s two `// Hack alert.` arms, which decide before any of
+/// this for a channel or a channel's item, are [`channel_fetcher_override`].
+/// The provider manager's gates for a whole item consult it first; its season
+/// and episode passes need not, because they run only when that item-level
+/// gate allowed metadata. The scan's callers do not either: they only ever see
+/// library items.
 #[must_use]
 pub fn metadata_fetcher_enabled(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
@@ -267,7 +301,9 @@ pub fn global_metadata_options<'a>(
 /// 50-71`), the image half of the same gate (`ProviderManager.
 /// CanRefreshImages`): the library's `TypeOptions.ImageFetchers` when it saved
 /// an entry for the kind, else the server-wide `DisabledImageFetchers`
-/// (`global`), as [`metadata_fetcher_enabled`] does.
+/// (`global`), as [`metadata_fetcher_enabled`] does. Its channel arms are
+/// [`channel_fetcher_override`], consulted first by the callers that hold
+/// the item.
 #[must_use]
 pub fn image_fetcher_enabled(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
@@ -1129,7 +1165,7 @@ mod tests {
     use super::{all_metadata_plugins, library_options_info};
     use ferrofin_model::configuration::MetadataPluginType;
 
-    use super::{image_fetcher_enabled, metadata_fetcher_enabled};
+    use super::{channel_fetcher_override, image_fetcher_enabled, metadata_fetcher_enabled};
     use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
 
     /// `BaseItemManager.IsMetadataFetcherEnabled` /
@@ -1223,6 +1259,35 @@ mod tests {
             "MusicAlbum",
             AUDIODB
         ));
+    }
+
+    /// `BaseItemManager.cs:28-38`: a channel uses every fetcher, a channel's
+    /// item none (no channel plugin disables its media-source display); any
+    /// other item falls through to the options.
+    #[rstest::rstest]
+    #[case::a_channel("Channel", None, Some(true))]
+    #[case::a_channel_ignoring_its_own_channel_id(
+        "channel",
+        Some("6f1e4c1a2b3d4e5f6a7b8c9d0e1f2a3b"),
+        Some(true)
+    )]
+    #[case::a_channel_item("Video", Some("6f1e4c1a2b3d4e5f6a7b8c9d0e1f2a3b"), Some(false))]
+    #[case::a_hyphenated_channel_id(
+        "Audio",
+        Some("6f1e4c1a-2b3d-4e5f-6a7b-8c9d0e1f2a3b"),
+        Some(false)
+    )]
+    #[case::a_guide_program("LiveTvProgram", Some("6f1e4c1a2b3d4e5f6a7b8c9d0e1f2a3b"), None)]
+    #[case::a_tv_channel("LiveTvChannel", Some("6f1e4c1a2b3d4e5f6a7b8c9d0e1f2a3b"), None)]
+    #[case::a_library_item("Movie", None, None)]
+    #[case::a_nil_channel_id("Movie", Some("00000000-0000-0000-0000-000000000000"), None)]
+    #[case::an_unreadable_channel_id("Movie", Some(""), None)]
+    fn a_channel_and_its_items_decide_before_the_options(
+        #[case] kind: &str,
+        #[case] channel_id: Option<&str>,
+        #[case] expected: Option<bool>,
+    ) {
+        assert_eq!(channel_fetcher_override(kind, channel_id), expected);
     }
 
     #[test]

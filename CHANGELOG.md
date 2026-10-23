@@ -154,6 +154,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
   forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
   some clients produce on partial-GOP audio. As upstream, the default is off
+- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
+  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
+  the same store, trying the Matroska cues before ffprobe, and
+  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
+  the transcode at the segment's playlist time, half a second later for a copied video so
+  ffmpeg lands on the keyframe itself
 - Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
@@ -176,12 +182,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
-- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
-  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
-  the same store, trying the Matroska cues before ffprobe, and
-  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
-  the transcode at the segment's playlist time, half a second later for a copied video so
-  ffmpeg lands on the keyframe itself
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -193,6 +198,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See

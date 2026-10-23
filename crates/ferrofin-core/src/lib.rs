@@ -224,6 +224,7 @@ pub mod next_up_service;
 pub mod notify_watcher;
 pub mod path_manager;
 pub mod people_repository;
+pub mod playback_activity;
 pub mod playback_metrics;
 pub mod plugin_manager;
 mod query_restrictions;
