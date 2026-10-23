@@ -210,9 +210,6 @@ pub struct SubtitleTrackInfo {
 }
 
 /// A request to open a live stream.
-///
-/// The upstream `DeviceProfile` field is deferred to a later port unit and is
-/// intentionally omitted here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct LiveStreamRequest {
@@ -256,6 +253,10 @@ pub struct LiveStreamRequest {
     pub enable_direct_stream: bool,
     /// Whether subtitles are always burned in when transcoding.
     pub always_burn_in_subtitle_when_transcoding: bool,
+    /// The device profile the opened source is negotiated against; [`None`]
+    /// falls back to the profile the device last reported.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub device_profile: Option<crate::dlna::DeviceProfile>,
     /// The direct-play protocols.
     pub direct_play_protocols: Vec<MediaProtocol>,
 }
@@ -275,6 +276,7 @@ impl Default for LiveStreamRequest {
             enable_direct_play: true,
             enable_direct_stream: true,
             always_burn_in_subtitle_when_transcoding: false,
+            device_profile: None,
             direct_play_protocols: vec![MediaProtocol::Http],
         }
     }
