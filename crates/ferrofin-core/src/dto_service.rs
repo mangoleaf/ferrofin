@@ -79,7 +79,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, MediaSourceManager, UserDataManager,
 };
-use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow};
 use ferrofin_traits::trickplay::TrickplayManager;
 
@@ -691,30 +691,45 @@ fn empty_user_data_dto(item_id: Uuid) -> UserItemDataDto {
     }
 }
 
-/// Sets `ChildCount` on a folder DTO from the prefetched per-parent counts.
+/// Sets `ChildCount` on a folder DTO from the prefetched per-folder counts
+/// ([`FerrofinDtoService::child_count_batch`]).
 ///
-/// Port of the `AttachUserSpecificInfo` ChildCount attach + `GetChildCount`:
-/// only folders get a count, and an already-set value is kept (`??=`).
-/// `ICollectionFolder` and `UserView` rows skip the count: C# returns
-/// `Random.Shared.Next(1, 10)` there (DtoService.cs:649-656, "too slow to
-/// calculate for top level folders on a per-user basis — just return something
-/// so that apps that are expecting a value won't think the folders are empty");
-/// an id-derived 1..=9 honors the same contract (nonzero, meaningless) without a
-/// rand dependency. `ICollectionFolder` covers `BasePluginFolder`
-/// (BasePluginFolder.cs:12) too, hence the playlists folder.
+/// Port of the `AttachUserSpecificInfo` ChildCount attach + `GetChildCount`
+/// (v12.2 `DtoService.cs:653-656,797-810`): only folders get a count, and an
+/// already-set value is kept (`??=`). Libraries and views are counted too, since
+/// 12.1 (jellyfin/jellyfin#17881), where 12.0 returned a random 1..10.
 fn attach_child_count(dto: &mut BaseItemDto, item: &BaseItemEntity, counts: &HashMap<Uuid, i32>) {
     if dto.child_count.is_some() || !item.is_folder {
         return;
     }
-    let id = row_id(item);
-    dto.child_count = Some(match row_kind(item) {
-        BaseItemKind::CollectionFolder
-        | BaseItemKind::UserView
-        | BaseItemKind::BasePluginFolder
-        | BaseItemKind::ManualPlaylistsFolder
-        | BaseItemKind::PlaylistsFolder => i32::from(id.as_bytes()[15] % 9) + 1,
-        _ => counts.get(&id).copied().unwrap_or(0),
-    });
+    dto.child_count = Some(counts.get(&row_id(item)).copied().unwrap_or(0));
+}
+
+/// A view's `DisplayParentId`, else its `ParentId`, when set: the folder
+/// `UserView.GetItemsInternal` browses and `GetChildCountSourceIds` follows.
+fn view_parent_id(view: &BaseItemEntity) -> Option<Uuid> {
+    crate::item_data::parse_data(view.data.as_deref())
+        .get("DisplayParentId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())
+        .or_else(|| {
+            view.parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        })
+}
+
+/// `UserView.EnableOriginalFolder` (`UserView.cs:29-37,182-185`): the view
+/// types that show a library's own folder tree. A view of one of these, or of
+/// `movies`/`tvshows`, that stands for one library counts that library's
+/// children; any other view counts its own browse.
+fn enables_original_folder(view_type: Option<&str>) -> bool {
+    matches!(
+        view_type,
+        Some("books" | "musicvideos" | "homevideos" | "photos" | "music" | "boxsets")
+    )
 }
 
 /// The `CollectionType` of an `IHasCollectionType` row (`DtoService`
@@ -3818,6 +3833,155 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
 }
 
 impl FerrofinDtoService {
+    /// `GetChildCountBatch` with `GetChildCount`'s fallback (v12.2
+    /// `DtoService.cs:714-748,797-810`): the `ChildCount` of every folder on
+    /// the page. The sources of all of them ([`Self::child_count_source_ids`])
+    /// go into one count batch, and each folder sums its own. A view with no
+    /// source counts its own browse instead ([`Self::view_child_count`]), as
+    /// `folder.GetChildCount(user)` does.
+    async fn child_count_batch(
+        &self,
+        items: &[BaseItemEntity],
+        user: &UserEntity,
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        let mut with_sources = Vec::new();
+        let mut by_browse = Vec::new();
+        for folder in items.iter().filter(|i| runtime_is_folder(i)) {
+            let sources = self.child_count_source_ids(folder, user).await?;
+            if sources.is_empty() {
+                by_browse.push(folder);
+            } else {
+                with_sources.push((row_id(folder), sources));
+            }
+        }
+        let mut distinct: Vec<Uuid> = with_sources
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let counts = if distinct.is_empty() {
+            HashMap::new()
+        } else {
+            self.item_counts
+                .get_child_count_batch(&distinct, Uuid::parse_str(&user.id).ok())
+                .await?
+        };
+        let mut out: HashMap<Uuid, i32> = with_sources
+            .into_iter()
+            .map(|(folder, ids)| {
+                let total = ids
+                    .iter()
+                    .map(|id| counts.get(id).copied().unwrap_or(0))
+                    .fold(0, i32::saturating_add);
+                (folder, total)
+            })
+            .collect();
+        for view in by_browse {
+            if let std::collections::hash_map::Entry::Vacant(slot) = out.entry(row_id(view)) {
+                slot.insert(self.view_child_count(view, user).await?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `GetChildCountSourceIds` (v12.2 `DtoService.cs:750-795`): the folders
+    /// whose children `folder`'s `ChildCount` sums.
+    ///
+    /// - A folder that is not a view is its own source. That includes a library,
+    ///   whose `PhysicalFolderIds` upstream sums: the count batch counts a
+    ///   library's physical folders and the library itself
+    ///   (`library_top_parents_by_view`).
+    /// - A view of an original-folder type or of `movies`/`tvshows` whose display
+    ///   parent (else relational parent) is a folder and not a view stands for
+    ///   that folder. Sub-views such as "Continue Watching" hang off the same
+    ///   library but hold a query, so they never count the library.
+    /// - A `movies`/`tvshows` view with no usable library parent (none, a
+    ///   view, a missing row or a non-folder) stands for the libraries the user
+    ///   grouped into it
+    ///   ([`crate::item_repository::grouped_libraries`]).
+    /// - Every other view has none.
+    async fn child_count_source_ids(
+        &self,
+        folder: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let id = row_id(folder);
+        if row_kind(folder) != BaseItemKind::UserView {
+            return Ok(vec![id]);
+        }
+        let view_type = crate::user_view_repository::view_type_of(folder.data.as_deref());
+        let view_type = view_type.as_deref();
+        let movies_or_shows = matches!(view_type, Some("movies" | "tvshows"));
+        if !movies_or_shows && !enables_original_folder(view_type) {
+            return Ok(Vec::new());
+        }
+        if let Some(parent_id) = view_parent_id(folder).filter(|parent| *parent != id)
+            && let Some(parent) = self.library.get_item_by_id(parent_id).await?
+            && runtime_is_folder(&parent)
+            && row_kind(&parent) != BaseItemKind::UserView
+        {
+            // Upstream recurses into the parent; a parent that is not a view
+            // is its own source.
+            return Ok(vec![parent_id]);
+        }
+        if movies_or_shows {
+            return crate::item_repository::grouped_libraries(&self.db, user, view_type).await;
+        }
+        Ok(Vec::new())
+    }
+
+    /// `UserView.GetChildCount(user)`, which is `GetChildren(user, true).Count`
+    /// (`UserView.cs:90-93`): how many items the view's own browse lists, for
+    /// a view with no count source. Those are the Playlists view, the folders
+    /// view and Live TV.
+    ///
+    /// The query is what the plain `GET /Items?parentId=<view>` browse runs
+    /// for every view Ferrofin builds. A view over a playlists folder lists
+    /// every playlist the user may open (`PlaylistsFolder.GetItemsInternal`,
+    /// re-rooted at the user root as that browse is). Any other view is
+    /// browsed as itself. The handler's other view arms (a default-type view
+    /// over a library, the `moviemovies`/`tvshowseries` sub-views) apply only
+    /// to views an adopted database can hold, and are not mirrored here.
+    ///
+    /// Divergence: upstream's `UserViewBuilder` has no `livetv` case, so its
+    /// Live TV view takes the default branch and lists, and counts, the
+    /// children of the libraries the user grouped (none for most users).
+    /// Ferrofin's browse of that view lists its channels, and the count
+    /// follows the browse, so the view never reports a number its own listing
+    /// does not show.
+    async fn view_child_count(
+        &self,
+        view: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<i32, ServiceError> {
+        let mut query = InternalItemsQuery {
+            user: Some(user.clone()),
+            limit: Some(0),
+            enable_total_record_count: true,
+            ..InternalItemsQuery::default()
+        };
+        let id = row_id(view);
+        let parent = match view_parent_id(view).filter(|parent| *parent != id) {
+            Some(parent) => self.library.get_item_by_id(parent).await?,
+            None => None,
+        };
+        if parent.as_ref().map(row_kind).is_some_and(|kind| {
+            matches!(
+                kind,
+                BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder
+            )
+        }) {
+            query.recursive = true;
+            query.include_item_types = vec![BaseItemKind::Playlist];
+            query.apply_folder_display_options = true;
+        } else {
+            query.parent_id = id;
+            query.parent_type = Some(BaseItemKind::UserView);
+        }
+        Ok(self.library.query_items(&query).await?.total_record_count)
+    }
+
     /// The shared projection body behind [`DtoService::get_base_item_dto`] and
     /// [`DtoService::get_base_item_dtos`].
     ///
@@ -4454,25 +4618,7 @@ impl FerrofinDtoService {
         // same way before `AttachUserSpecificInfo`, which is user-gated).
         let child_counts = match user {
             Some(user) if options.contains_field(ItemFields::ChildCount) => {
-                let folder_ids: Vec<Uuid> = items
-                    .iter()
-                    .filter(|i| {
-                        runtime_is_folder(i)
-                            && !matches!(
-                                row_kind(i),
-                                BaseItemKind::CollectionFolder | BaseItemKind::UserView
-                            )
-                    })
-                    .map(row_id)
-                    .collect();
-                if folder_ids.is_empty() {
-                    HashMap::new()
-                } else {
-                    let user_id = Uuid::parse_str(&user.id).ok();
-                    self.item_counts
-                        .get_child_count_batch(&folder_ids, user_id)
-                        .await?
-                }
+                self.child_count_batch(items, user).await?
             }
             _ => HashMap::new(),
         };
@@ -4989,8 +5135,9 @@ mod tests {
 
     use crate::test_support::{
         fetch_item, fetch_item_opt, image_info, link_alternate_version, save_item, seed_child_item,
-        seed_folder_item, seed_images, seed_item_of_series, seed_item_with_data, seed_named_item,
-        seed_provider_id, seed_series_with_studios, seed_user, test_db,
+        seed_folder_item, seed_folder_with_data, seed_images, seed_item_of_series,
+        seed_item_with_data, seed_named_item, seed_provider_id, seed_series_with_studios,
+        seed_user, test_db,
     };
 
     // ---- Fakes for the injected siblings -------------------------------------
@@ -6554,6 +6701,8 @@ mod tests {
         linked: i32,
         played: i32,
         total: i32,
+        /// Every parent id the child-count batch was asked for, in order.
+        child_count_asks: Arc<std::sync::Mutex<Vec<Uuid>>>,
     }
 
     impl Default for FakeCounts {
@@ -6562,6 +6711,7 @@ mod tests {
                 linked: 0,
                 played: 1,
                 total: 4,
+                child_count_asks: Arc::default(),
             }
         }
     }
@@ -6673,6 +6823,10 @@ mod tests {
             _user_id: Option<Uuid>,
         ) -> Result<HashMap<Uuid, i32>, ServiceError> {
             // Every requested parent reports a fixed 4 children.
+            self.child_count_asks
+                .lock()
+                .expect("asks lock")
+                .extend_from_slice(parent_ids);
             Ok(parent_ids.iter().map(|&p| (p, 4)).collect())
         }
     }
@@ -9385,43 +9539,367 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn child_count_placeholder_for_collection_folders() {
-        // C# `GetChildCount` returns a random 1..10 for collection folders and
-        // user views instead of a real count; the port derives a stable 1..=9.
-        let db = test_db().await;
+    /// A library of `collection_type` (`None`: untyped).
+    async fn seed_library(db: &Database, collection_type: Option<&str>) -> Uuid {
         let id = Uuid::new_v4();
-        seed_folder_item(&db, id, BaseItemKind::CollectionFolder, "Shows", None).await;
-        let user = seed_user(&db, Uuid::new_v4()).await;
-        let item = fetch_item(&db, id).await;
-        let svc = service(db);
-        let options = DtoOptions {
-            fields: vec![ItemFields::ChildCount],
-            ..DtoOptions::default()
-        };
-
-        let dto = svc
-            .get_base_item_dto(&item, &options, Some(&user), None)
-            .await
-            .unwrap();
-        let count = dto.child_count.expect("placeholder set");
-        assert!((1..=9).contains(&count));
+        let data = collection_type.map_or_else(
+            || "{}".to_owned(),
+            |kind| format!(r#"{{"CollectionType":"{kind}"}}"#),
+        );
+        seed_folder_with_data(
+            db,
+            id,
+            BaseItemKind::CollectionFolder,
+            "Library",
+            &data,
+            None,
+        )
+        .await;
+        id
     }
 
-    /// `UserRootFolder` is neither `ICollectionFolder` nor `UserView`, so C#
-    /// falls through to `folder.GetChildCount(user)` — a REAL count
-    /// (DtoService.cs:648-665). Its children are the libraries plus the
-    /// playlists plugin folder `CreateRootFolder()` parents to it, and getting
-    /// this wrong is what made `GET /Items/Root` report 3 where 10.11.8
-    /// reports 4.
+    /// [`service`] over a library that reads the database and a count
+    /// service that records what it is asked.
+    fn child_count_service(db: Database, counts: FakeCounts) -> FerrofinDtoService {
+        FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(DbBackedLibrary { db }),
+            Arc::new(FakeUserData),
+            Arc::new(counts),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        )
+    }
+
+    fn child_count_options() -> DtoOptions {
+        DtoOptions {
+            fields: vec![ItemFields::ChildCount],
+            ..DtoOptions::default()
+        }
+    }
+
+    /// v12.2 `GetChildCountSourceIds`: a library counts its own children (the
+    /// real count batch counts its physical folders), where 12.0 returned a
+    /// random 1..10.
+    #[tokio::test]
+    async fn a_library_counts_its_children() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("tvshows")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let item = fetch_item(&db, library).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().expect("asks"), [library]);
+        assert_eq!(dto.child_count, Some(4));
+    }
+
+    /// Upstream `DtoServiceTests.GetBaseItemDtos_NoUser_SkipsTheChildCountBatch`:
+    /// a child count is attached only to a user's DTO, so with no user the batch
+    /// never runs.
+    #[tokio::test]
+    async fn without_a_user_the_child_count_batch_never_runs() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("movies")).await;
+        let item = fetch_item(&db, library).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.child_count, None);
+        assert!(asks.lock().expect("asks").is_empty());
+    }
+
+    /// Upstream `DtoServiceTests.GetBaseItemDtos_GroupedMoviesView_CountsEveryLibraryGroupedIntoIt`:
+    /// a grouped `movies` view has no library of its own, so it sums the
+    /// libraries the user grouped into it, an untyped one included. A grouped
+    /// tvshows library and an ungrouped movies library are not counted. Upstream
+    /// asks for each library's two physical folders (4 each, 16); the real
+    /// count batch here translates a library to its physical folders itself, so
+    /// the libraries are what it is asked for (4 each, 8).
+    #[tokio::test]
+    async fn a_grouped_movies_view_counts_every_library_grouped_into_it() {
+        let db = test_db().await;
+        let grouped = seed_library(&db, Some("movies")).await;
+        let untyped = seed_library(&db, None).await;
+        let shows = seed_library(&db, Some("tvshows")).await;
+        let _ungrouped = seed_library(&db, Some("movies")).await;
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        let values: Vec<String> = [grouped, untyped, shows]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::GroupedFolders,
+            &values,
+        )
+        .await
+        .expect("group the folders");
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            r#"{"ViewType":"movies"}"#,
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        let mut expected = vec![grouped, untyped];
+        expected.sort_unstable();
+        assert_eq!(*asks.lock().expect("asks"), expected);
+        assert_eq!(dto.child_count, Some(8));
+    }
+
+    /// Upstream `DtoServiceTests.GetBaseItemDtos_SubViewOfALibrary_DoesNotCountTheLibrary`:
+    /// a sub-view such as "Continue Watching" hangs off the library its view
+    /// was built over, but it holds a query, so it never counts the library. It
+    /// counts its own browse instead (the fake's is empty).
+    #[tokio::test]
+    async fn a_sub_view_of_a_library_does_not_count_the_library() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("movies")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let sub_view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            sub_view,
+            BaseItemKind::UserView,
+            "Continue Watching",
+            &format!(r#"{{"ViewType":"movieresume","DisplayParentId":"{library}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, sub_view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert!(asks.lock().expect("asks").is_empty());
+        assert_eq!(dto.child_count, Some(0));
+    }
+
+    /// `GetChildCountSourceIds`'s parent guards: a `movies` view whose parent
+    /// is another view, is missing, or is not a folder does not stand for it,
+    /// and falls through to the libraries the user grouped.
+    #[rstest::rstest]
+    #[case::the_parent_is_a_view(Some(BaseItemKind::UserView))]
+    #[case::the_parent_is_not_a_folder(Some(BaseItemKind::Movie))]
+    #[case::the_parent_is_missing(None)]
+    #[tokio::test]
+    async fn a_movies_view_without_a_library_parent_counts_the_grouped_libraries(
+        #[case] parent_kind: Option<BaseItemKind>,
+    ) {
+        let db = test_db().await;
+        let grouped = seed_library(&db, Some("movies")).await;
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::GroupedFolders,
+            &[grouped.to_string()],
+        )
+        .await
+        .expect("group the folder");
+        let parent = Uuid::new_v4();
+        match parent_kind {
+            Some(BaseItemKind::UserView) => {
+                seed_folder_with_data(
+                    &db,
+                    parent,
+                    BaseItemKind::UserView,
+                    "Parent",
+                    r#"{"ViewType":"movies"}"#,
+                    None,
+                )
+                .await;
+            }
+            Some(kind) => seed_named_item(&db, parent, kind, "Parent").await,
+            None => {}
+        }
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            &format!(r#"{{"ViewType":"movies","DisplayParentId":"{parent}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().expect("asks"), [grouped]);
+        assert_eq!(dto.child_count, Some(4));
+    }
+
+    /// `!parentId.Equals(view.Id)`: a view whose `DisplayParentId` is itself
+    /// has no parent. Upstream does not fall back to its `ParentId` then, so
+    /// the library that column names is not counted.
+    #[tokio::test]
+    async fn a_view_that_is_its_own_display_parent_does_not_fall_back_to_its_parent_id() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("movies")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            &format!(r#"{{"ViewType":"movies","DisplayParentId":"{view}"}}"#),
+            Some(library),
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert!(asks.lock().expect("asks").is_empty());
+        assert_eq!(dto.child_count, Some(0), "the fake browse is empty");
+    }
+
+    /// `GetChildCountBatch` asks for the distinct source ids: two views over
+    /// one library on a page ask for it once, and each counts it.
+    #[tokio::test]
+    async fn two_views_over_one_library_ask_for_it_once() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("music")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let mut views = Vec::new();
+        for name in ["Music", "Music again"] {
+            let view = Uuid::new_v4();
+            seed_folder_with_data(
+                &db,
+                view,
+                BaseItemKind::UserView,
+                name,
+                &format!(r#"{{"ViewType":"music","DisplayParentId":"{library}"}}"#),
+                None,
+            )
+            .await;
+            views.push(fetch_item(&db, view).await);
+        }
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dtos = svc
+            .get_base_item_dtos(&views, &child_count_options(), Some(&user), None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().expect("asks"), [library]);
+        assert!(
+            dtos.iter().all(|dto| dto.child_count == Some(4)),
+            "{dtos:?}"
+        );
+    }
+
+    /// `GetChildCountSourceIds`: a view over one library, whatever its
+    /// original-folder or movies/tvshows type, counts that library; a view of
+    /// another type over the same library does not.
+    #[rstest::rstest]
+    #[case("music", true)]
+    #[case("movies", true)]
+    #[case("tvshows", true)]
+    #[case("boxsets", true)]
+    #[case("homevideos", true)]
+    #[case("livetv", false)]
+    #[case("playlists", false)]
+    #[tokio::test]
+    async fn a_view_over_one_library_counts_that_library(
+        #[case] view_type: &str,
+        #[case] counts_the_library: bool,
+    ) {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("music")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "View",
+            &format!(r#"{{"ViewType":"{view_type}","DisplayParentId":"{library}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        if counts_the_library {
+            assert_eq!(*asks.lock().expect("asks"), [library]);
+            assert_eq!(dto.child_count, Some(4));
+        } else {
+            assert!(asks.lock().expect("asks").is_empty());
+            assert_eq!(dto.child_count, Some(0), "the fake browse is empty");
+        }
+    }
+
+    /// `UserRootFolder` is not a view, so `GetChildCountSourceIds` makes it its
+    /// own source (v12.2 `DtoService.cs:750-760`). Its children are the
+    /// libraries plus the playlists plugin folder `CreateRootFolder()` parents
+    /// to it, and getting this wrong is what made `GET /Items/Root` report 3
+    /// where 10.11.8 reports 4.
     #[tokio::test]
     async fn child_count_is_real_for_the_user_root_folder() {
         let db = test_db().await;
-        // A fixed id whose id-derived placeholder is NOT the count service's
-        // canned value, so the assertion below can only pass on the real branch.
-        let root = Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7700);
-        let placeholder = i32::from(root.as_bytes()[15] % 9) + 1;
-        assert_ne!(placeholder, 4, "the fixture must separate the two branches");
+        let root = Uuid::new_v4();
         seed_folder_item(
             &db,
             root,
@@ -9432,7 +9910,7 @@ mod tests {
         .await;
         // The children upstream's root has: the libraries plus the playlists
         // plugin folder. (`FakeCounts` reports a fixed 4 per parent, so what is
-        // under test is which branch `attach_child_count` takes, not the sum.)
+        // under test is that the root is counted as itself, not the sum.)
         for (kind, name) in [
             (BaseItemKind::CollectionFolder, "Movies"),
             (BaseItemKind::CollectionFolder, "Shows"),
@@ -9452,11 +9930,7 @@ mod tests {
             .get_base_item_dto(&item, &options, Some(&user), None)
             .await
             .unwrap();
-        assert_eq!(
-            dto.child_count,
-            Some(4),
-            "the root takes the real-count branch, not the id-derived placeholder"
-        );
+        assert_eq!(dto.child_count, Some(4), "the root is counted as itself");
     }
 
     /// `BasePluginFolder.CanDelete() => false` (v10.11.8
