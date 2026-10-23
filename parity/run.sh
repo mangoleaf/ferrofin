@@ -8,13 +8,14 @@
 #   --oracle     the Jellyfin image (the pinned release image in bench/testdata/jellyfin-image.txt)
 #   --ferrofin   the Ferrofin image under test
 #   --testdata   the benchmark corpus (config/, media/, ids.json, jellyfin/): default bench/testdata
-#   --requests   the request file: default parity/requests/tracer.jsonl
+#   --requests   the request file: default parity/requests/tracer.jsonl. Its writes each run on a
+#                fresh database copy: parity/reset.sh restores both servers to the snapshot taken at boot
 #   --out        the run directory: default parity/runs/<name>; never reused
 #   --gate       a release-gate run: a stale oracle pin, or an --oracle other than the pin, is refused
 #                (an ad-hoc run only warns)
 #
 # Exit: 0 no new difference; 1 a new difference or a run failure (a server did not boot, the cap
-# passed); 2 the arguments or inputs were refused before anything started.
+# passed, a reset failed); 2 the arguments or inputs were refused before anything started.
 #
 # Settings (environment): PARITY_CAP_S (the whole run's limit, default 7200 = 2 hours),
 # PARITY_REQUEST_TIMEOUT (seconds per request, 10 to 120, default 30), PARITY_ORACLE_PORT /
@@ -29,20 +30,17 @@ set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/.."
 START_EPOCH=$(date +%s)
+# shellcheck source=parity/lib.sh
+source parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
 
 PARITY_CAP_S=${PARITY_CAP_S:-7200}
 PARITY_REQUEST_TIMEOUT=${PARITY_REQUEST_TIMEOUT:-30}
-READY_TIMEOUT_S=${READY_TIMEOUT_S:-300}
-DRAIN_TIMEOUT_S=${DRAIN_TIMEOUT_S:-300}
-HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S:-10}
-CLEANUP_TIMEOUT_S=${CLEANUP_TIMEOUT_S:-30}   # the four timeouts above and the settings below are bench/run.sh's
+DRAIN_TIMEOUT_S=${DRAIN_TIMEOUT_S:-300}   # this and the settings below are bench/run.sh's
 CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}   # the server and client cores must be this idle before a run starts
 SERVER_CPUS=${SERVER_CPUS:-8-15}       # the benchmark's server cpuset: each server gets half of it
 CLIENT_CPUS=${CLIENT_CPUS:-16-19}
 MEMORY=${MEMORY:-8g}                   # per server, swap disabled
 PIN=${PARITY_PIN:-1}
-KILL_GRACE_S=2   # between asking a process to stop and killing it (bench/run.sh's value)
-POLL_S=1         # between readiness and drain polls (bench/run.sh's value)
 ORACLE_PORT=${PARITY_ORACLE_PORT:-18111}    # beside the benchmark's 18101 and 18103
 FERROFIN_PORT=${PARITY_FERROFIN_PORT:-18113}
 
@@ -72,6 +70,7 @@ done
 [[ "$PIN" =~ ^[01]$ ]] || die "PARITY_PIN is 0 or 1"
 ! $GATE || [ "$PIN" = 1 ] || die "a release-gate run is pinned: PARITY_PIN=0 is for ad-hoc runs and the harness's own tests"
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")"); REQUESTS=$(realpath -m "$(abs "$REQUESTS")")
+export READY_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S   # parity/reset.sh waits as the boot does
 DEADLINE=$((START_EPOCH + PARITY_CAP_S))
 
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
@@ -98,8 +97,6 @@ require_local() {
 }
 command -v findmnt >/dev/null || die "findmnt not installed"
 require_local "$TESTDATA"; require_local "$OUT"
-
-docker_cmd() { timeout --kill-after="$KILL_GRACE_S" "$HTTP_TIMEOUT_S" docker "$@"; }
 
 # ── preflight: nothing is booted, so a refusal leaves no run directory ─────────────────────────
 for t in docker python3 jq curl timeout; do command -v "$t" >/dev/null || die "$t not installed"; done
@@ -154,6 +151,9 @@ cleanup() {   # the EXIT trap: stops what runs, removes the containers, and make
   # to the script's group kills the subshell first, so the create is orphaned). Find it by its command
   # line and stop it before the removals below: a container must not appear after them.
   give_up=$((SECONDS + CLEANUP_TIMEOUT_S))
+  # A reset in flight leads a session of its own (diff.py stops it on a signal; this is the backstop for a
+  # diff.py killed outright): stop its whole session, the docker calls it is waiting on included.
+  for pid in $(pgrep -f -- "parity/reset.sh $OUT\$"); do pkill -KILL -s "$pid" 2>/dev/null; done
   for name in oracle ferrofin; do
     pkill -TERM -f -- "--name parity-$name " 2>/dev/null
     while pgrep -f -- "--name parity-$name " >/dev/null 2>&1 && (( SECONDS < give_up )); do sleep 0.1; done   # a short poll, bounded by give_up
@@ -197,15 +197,6 @@ echo "parity: oracle $ORACLE_IMAGE, ferrofin $FERROFIN_IMAGE; cap ${PARITY_CAP_S
 
 auth() { echo "MediaBrowser Client=\"parity\", Device=\"parity\", DeviceId=\"parity-run\", Version=\"1\", Token=\"$1\""; }
 reason() { echo "$*" > "$D/failed"; echo "parity: $NAME: $*" >&2; }   # inside a server's boot subshell
-ping_ready() {   # the server answers /System/Ping and reports a version
-  curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" "$URL/System/Ping" >/dev/null 2>&1 &&
-    curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" "$URL/System/Info/Public" 2>/dev/null | jq -e '.Version | strings | length > 0' >/dev/null 2>&1
-}
-wait_ready() {
-  local give_up=$((SECONDS + READY_TIMEOUT_S))
-  while (( SECONDS < give_up )); do ping_ready && return 0; sleep "$POLL_S"; done
-  return 1
-}
 api() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -H "Authorization: $(auth "$TOKEN")" "$URL$1"; }
 api_post() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -X POST -H "Authorization: $(auth "$TOKEN")" -H 'Content-Type: application/json' --data "${2:-}" "$URL$1" >/dev/null; }
 drain() {   # every scheduled task idle
@@ -244,6 +235,7 @@ boot_server() {   # boot_server NAME IMAGE CONFIG_SOURCE PORT CPUS: runs in a ba
   D=$OUT/$NAME; URL=http://127.0.0.1:$port; TOKEN=""
   local cfg=$D/config cache=$D/cache env=() cpuset=()
   mkdir -p "$D" "$cache"
+  echo "$URL" > "$D/url"   # for parity/reset.sh
   cp -r --reflink=auto "$source" "$cfg" || { reason "cannot copy the configuration"; return 1; }
   # The parity answers are the core servers': no WASM plugin may ride along in the copy (as bench/run.sh).
   if [ -n "$(find "$cfg" -name '*.wasm' -print -quit 2>/dev/null)" ]; then reason "a WASM plugin is present in the configuration copy"; return 1; fi
@@ -276,10 +268,14 @@ PY_ISOLATION
   fi
   TOKEN=$(python3 parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in as the browse user"; return 1; }
   isolate || { reason "could not disable plugins and automatic tasks"; return 1; }
-  # Jellyfin unloads disabled plugin assemblies only on restart.
-  if ! timeout --kill-after="$KILL_GRACE_S" "$((CLEANUP_TIMEOUT_S + HTTP_TIMEOUT_S))" docker stop --time "$CLEANUP_TIMEOUT_S" "parity-$NAME" >/dev/null || ! docker_cmd start "parity-$NAME" >/dev/null; then
-    reason "isolation restart failed"; return 1
+  # Jellyfin unloads disabled plugin assemblies only on restart. While the server is stopped, its isolated
+  # configuration is the snapshot every write starts from: parity/reset.sh restores it before each one.
+  stop_container "parity-$NAME" || { reason "isolation restart failed (stop)"; return 1; }
+  mkdir -p "$D/pristine"
+  if ! cp -r --reflink=auto "$cfg" "$D/pristine/config" || ! cp -r --reflink=auto "$cache" "$D/pristine/cache"; then
+    reason "cannot snapshot the isolated configuration"; return 1
   fi
+  docker_cmd start "parity-$NAME" >/dev/null || { reason "isolation restart failed (start)"; return 1; }
   wait_ready || { reason "did not come back after the isolation restart"; return 1; }
   TOKEN=$(python3 parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in after the restart"; return 1; }
   verify_isolation || return 1
@@ -314,7 +310,8 @@ pin_prefix=(); [ "$PIN" = 0 ] || pin_prefix=(taskset -c "$CLIENT_CPUS")
 rc=0
 timeout --kill-after="${CLEANUP_TIMEOUT_S}s" "$((remaining + CLEANUP_TIMEOUT_S))s" "${pin_prefix[@]}" python3 parity/diff.py run \
   --oracle-url "http://127.0.0.1:$ORACLE_PORT" --ferrofin-url "http://127.0.0.1:$FERROFIN_PORT" --ids "$IDS" --requests "$REQUESTS" \
-  --out "$OUT" --request-timeout "$PARITY_REQUEST_TIMEOUT" --deadline "$DEADLINE" 2> "$OUT/diff.err" &
+  --out "$OUT" --request-timeout "$PARITY_REQUEST_TIMEOUT" --deadline "$DEADLINE" \
+  --reset-command "$(printf '%q ' bash parity/reset.sh "$OUT")" 2> "$OUT/diff.err" &
 wait "$!" || rc=$?
 cat "$OUT/diff.err" >&2
 # diff.py exits 0 (nothing new), 1 (new differences) or 2 (an input it could not use); anything else

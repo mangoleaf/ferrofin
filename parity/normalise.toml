@@ -31,3 +31,19 @@ reason = "Image cache tags are derived by each server from its own view of the f
 paths = ["ImageBlurHashes.Primary", "ImageBlurHashes.Backdrop"]
 kind = "opaque-keys"
 reason = "The blurhash maps are keyed by the image tag, which differs per server; the hashes themselves are compared."
+
+# ── what a write makes differ (rules limited to the write tests of requests/writes.jsonl) ───────────
+# Each server stamps the moment it handled the write, and the two writes are sent a few milliseconds
+# apart: the times can never agree. Nullness and type are still compared. An item's Etag is a hash of
+# its save time, so it differs with it.
+[[rule]]
+paths = ["LastPlayedDate", "UserData.LastPlayedDate", "Items[].UserData.LastPlayedDate"]
+kind = "opaque"
+requests = ["played-movie", "played-movie/*", "unplayed-movie", "unplayed-movie/*", "played-episode", "played-episode/*"]
+reason = "Marking an item played stamps the time each server handled the request."
+
+[[rule]]
+paths = ["DateCreated", "DateLastMediaAdded", "Etag"]
+kind = "opaque"
+requests = ["playlist-create/detail", "collection-create/detail"]
+reason = "A playlist or collection created by the write carries the time each server created it, and an Etag derived from that time."
