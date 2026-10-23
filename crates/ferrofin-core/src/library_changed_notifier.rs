@@ -2,11 +2,12 @@
 //! `Emby.Server.Implementations/EntryPoints/LibraryChangedNotifier.cs`.
 //!
 //! Jellyfin's notifier subscribes to `ILibraryManager.ItemAdded` /
-//! `ItemUpdated` / `ItemRemoved`, accumulates the changed items, and resets a
-//! one-shot timer on every change. When the timer finally fires — nothing has
-//! changed for `LibraryUpdateDuration` seconds — it folds the accumulated sets
-//! into a [`LibraryUpdateInfo`] and pushes it so open clients refresh their
-//! views.
+//! `ItemUpdated` / `ItemRemoved` and accumulates the changed items, keyed by
+//! id. The first change of a batch starts a one-shot timer of
+//! `LibraryUpdateDuration` seconds that later changes never extend (Jellyfin
+//! 12, jellyfin/jellyfin#17762), and a batch that reaches `MaxBatchSize` is
+//! sent at once. When the timer fires it folds the accumulated sets into a
+//! [`LibraryUpdateInfo`] and pushes it so open clients refresh their views.
 //!
 //! Ferrofin published `LibraryChanged` at **scan end only**, which meant a
 //! metadata edit or a delete through the API pushed nothing at all: a client
@@ -18,19 +19,25 @@
 //! from `FerrofinLibraryManager`'s `create_items` / `update_items` /
 //! `delete_item` — the same three write paths the C# events fire from.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::entities_media::LibraryUpdateInfo;
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::events::{EventManager, LibraryChangeAudience};
 use uuid::Uuid;
 
 /// Jellyfin's `ServerConfiguration.LibraryUpdateDuration` default, in seconds
 /// (`configuration_manager.rs` seeds the same 30).
 pub const DEFAULT_LIBRARY_UPDATE_DURATION_SECS: u64 = 30;
+
+/// `LibraryChangedNotifier.MaxBatchSize`: a batch holding this many changed
+/// items (added + updated + removed) is pushed at once, without waiting out
+/// its window.
+const MAX_BATCH_SIZE: usize = 2000;
 
 /// One changed item, reduced at record time to just what the flush needs.
 ///
@@ -44,21 +51,83 @@ struct Changed {
     id: String,
     /// The owning library, for per-user visibility filtering.
     top_parent: Option<String>,
-    /// The parent folder, which the added/removed buckets report separately.
+    /// The parent folder, recorded into the batch's folder buckets.
     parent: Option<String>,
+}
+
+/// Which `ILibraryManager` event a change came from.
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Added,
+    Updated,
+    Removed,
+}
+
+/// One kind of change, keyed by item id (`Dictionary<Guid, BaseItem>`): a
+/// repeat replaces its entry in place, so a batch grows with the items it
+/// names, not with the saves.
+#[derive(Debug, Default)]
+struct Bucket {
+    items: Vec<Changed>,
+    index: HashMap<String, usize>,
+}
+
+impl Bucket {
+    /// `itemsList[item.Id] = item`.
+    fn insert(&mut self, changed: Changed) {
+        if let Some(&at) = self.index.get(&changed.id) {
+            self.items[at] = changed;
+        } else {
+            self.index.insert(changed.id.clone(), self.items.len());
+            self.items.push(changed);
+        }
+    }
 }
 
 /// What has changed since the last flush.
 #[derive(Debug, Default)]
 struct Pending {
-    added: Vec<Changed>,
-    updated: Vec<Changed>,
-    removed: Vec<Changed>,
+    added: Bucket,
+    updated: Bucket,
+    removed: Bucket,
+    /// `_foldersAddedTo` / `_foldersRemovedFrom`: every parent folder an added
+    /// or removed item was recorded under, keyed by folder id. Each entry
+    /// carries the item's top parent, for the per-user filter.
+    folders_added_to: Bucket,
+    folders_removed_from: Bucket,
+    /// The open window's id, `None` while no batch is open
+    /// (`_libraryUpdateTimer is null`). A timer task flushes only the window
+    /// it was started for.
+    window: Option<u64>,
 }
 
 impl Pending {
     fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
+        self.added.items.is_empty()
+            && self.updated.items.is_empty()
+            && self.removed.items.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.added.items.len() + self.updated.items.len() + self.removed.items.len()
+    }
+
+    /// `OnLibraryChange`'s inserts: the item into its bucket and, for an
+    /// addition or removal, its parent into that kind's folder bucket.
+    fn insert(&mut self, kind: Kind, changed: Changed) {
+        let (items, folders) = match kind {
+            Kind::Added => (&mut self.added, Some(&mut self.folders_added_to)),
+            Kind::Updated => (&mut self.updated, None),
+            Kind::Removed => (&mut self.removed, Some(&mut self.folders_removed_from)),
+        };
+        if let (Some(folders), Some(parent)) = (folders, &changed.parent) {
+            folders.insert(Changed {
+                id: parent.clone(),
+                top_parent: changed.top_parent.clone(),
+                parent: None,
+            });
+        }
+        items.insert(changed);
     }
 }
 
@@ -67,17 +136,19 @@ impl Pending {
 /// (`LibraryChanged` is, filtered per user).
 pub const ITEMS_CHANGED: &str = "ItemsChanged";
 
-/// Accumulates library changes and pushes a folded `LibraryChanged` once the
-/// changes stop arriving.
+/// Accumulates library changes and pushes a folded `LibraryChanged` at the
+/// end of each batch's window.
 pub struct LibraryChangedNotifier {
     events: Arc<dyn EventManager>,
+    /// The window length without a configuration to read, or when reading
+    /// it fails.
     debounce: Duration,
+    /// Where `LibraryUpdateDuration` is read as each window opens. `None`
+    /// (unit tests) uses `debounce`.
+    config: Option<Arc<dyn ServerConfigurationManager>>,
     pending: Mutex<Pending>,
-    /// Bumped by every `record_*`. The timer task that wakes to find the
-    /// generation moved on has been superseded by a later change and returns
-    /// without flushing — the Rust shape of `Timer.Change(duration, Infinite)`,
-    /// which likewise restarts rather than stacks.
-    generation: AtomicU64,
+    /// The id the next window gets ([`Pending::window`]).
+    next_window: AtomicU64,
     /// The per-user fan-out. Set by the composition root after the library
     /// manager it reads from exists. `None` — unit tests, and any moment
     /// before wiring completes — falls back to publishing one payload on the
@@ -86,17 +157,28 @@ pub struct LibraryChangedNotifier {
 }
 
 impl LibraryChangedNotifier {
-    /// Creates a notifier that publishes through `events` after `debounce`
-    /// of quiet.
+    /// Creates a notifier that publishes through `events`, each batch
+    /// `debounce` after its first change unless [`Self::with_config`] wires
+    /// the configured duration.
     #[must_use]
     pub fn new(events: Arc<dyn EventManager>, debounce: Duration) -> Self {
         Self {
             events,
             debounce,
+            config: None,
             pending: Mutex::new(Pending::default()),
-            generation: AtomicU64::new(0),
+            next_window: AtomicU64::new(0),
             audience: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Reads each window's length from the server configuration's
+    /// `LibraryUpdateDuration` as the window opens, so a change to it applies
+    /// to the next batch without a restart.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<dyn ServerConfigurationManager>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Wires the per-user fan-out. Called once by the composition root, after
@@ -135,76 +217,127 @@ impl LibraryChangedNotifier {
         })
     }
 
-    /// Records created items (`ItemAdded`) and restarts the debounce.
+    /// Records created items (`ItemAdded`).
     pub fn record_added(self: &Arc<Self>, items: &[BaseItemEntity]) {
-        self.record(items, |p| &mut p.added);
+        self.record(items, Kind::Added);
     }
 
-    /// Records saved items (`ItemUpdated`) and restarts the debounce.
+    /// Records saved items (`ItemUpdated`).
     pub fn record_updated(self: &Arc<Self>, items: &[BaseItemEntity]) {
-        self.record(items, |p| &mut p.updated);
+        self.record(items, Kind::Updated);
     }
 
-    /// Records deleted items (`ItemRemoved`) and restarts the debounce.
+    /// Records deleted items (`ItemRemoved`).
     ///
     /// Takes the rows rather than bare ids because the flush needs the owning
     /// library and parent folder, which are unresolvable once the rows are gone.
     pub fn record_removed(self: &Arc<Self>, items: &[BaseItemEntity]) {
-        self.record(items, |p| &mut p.removed);
+        self.record(items, Kind::Removed);
     }
 
-    fn record(
-        self: &Arc<Self>,
-        items: &[BaseItemEntity],
-        bucket: fn(&mut Pending) -> &mut Vec<Changed>,
-    ) {
+    fn record(self: &Arc<Self>, items: &[BaseItemEntity], kind: Kind) {
         let changed: Vec<Changed> = items
             .iter()
             .filter(|i| Self::filter_item(i))
             .filter_map(Self::changed_of)
             .collect();
-        if changed.is_empty() {
-            return;
-        }
+        self.add(changed, kind);
+    }
+
+    /// `OnLibraryChange`, per item: adds it to its bucket, opens a window of
+    /// `LibraryUpdateDuration` at a batch's first change (never extending
+    /// one already open: a window that moved with every change would keep a
+    /// library scan's batch open for the whole scan), and sends the batch at
+    /// once when it reaches [`MAX_BATCH_SIZE`], so one large call goes out as
+    /// several full batches.
+    fn add(self: &Arc<Self>, changed: Vec<Changed>, kind: Kind) {
+        let mut opened = Vec::new();
+        let mut full = Vec::new();
         {
             let Ok(mut pending) = self.pending.lock() else {
                 return;
             };
-            bucket(&mut pending).extend(changed);
+            for change in changed {
+                if pending.window.is_none() {
+                    let window = self.next_window.fetch_add(1, Ordering::SeqCst);
+                    pending.window = Some(window);
+                    opened.push(window);
+                }
+                pending.insert(kind, change);
+                if pending.len() >= MAX_BATCH_SIZE {
+                    // `_libraryUpdateTimer.Change(TimeSpan.Zero, …)`: the batch
+                    // is taken now, so its window's timer finds it closed.
+                    full.push(std::mem::take(&mut *pending));
+                }
+            }
         }
-        self.restart_timer();
+        for window in opened {
+            self.close_window_after(window);
+        }
+        if !full.is_empty() {
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                for batch in full {
+                    this.publish(batch).await;
+                }
+            });
+        }
     }
 
-    /// Restarts the one-shot debounce (`_libraryUpdateTimer.Change`).
-    fn restart_timer(self: &Arc<Self>) {
-        let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    /// Fires `window`'s timer: the batch is sent unless that window has
+    /// already closed.
+    fn close_window_after(self: &Arc<Self>, window: u64) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(this.debounce).await;
-            // A change landed while this task slept, so a later task owns the
-            // flush. Returning here is what makes the timer restart rather
-            // than fire once per recorded change.
-            if this.generation.load(Ordering::SeqCst) != mine {
-                return;
+            tokio::time::sleep(this.window_length().await).await;
+            if let Some(pending) = this.take(Some(window)) {
+                this.publish(pending).await;
             }
-            this.flush().await;
         });
     }
 
-    /// Folds the accumulated changes and publishes them (`LibraryUpdateTimerCallback`).
+    /// The length of a window opening now: `TimeSpan.FromSeconds(
+    /// LibraryUpdateDuration)`, read when the window opens, with zero sending
+    /// the batch at once. A negative value counts as zero (upstream's `Timer`
+    /// rejects it).
+    async fn window_length(&self) -> Duration {
+        let Some(config) = &self.config else {
+            return self.debounce;
+        };
+        match config.configuration().await {
+            Ok(c) => Duration::from_secs(u64::try_from(c.library_update_duration).unwrap_or(0)),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read LibraryUpdateDuration; using the default");
+                self.debounce
+            }
+        }
+    }
+
+    /// Takes the batch and closes its window, when `window` is the one open
+    /// (any window for `None`); `None` when there is nothing to take.
+    fn take(&self, window: Option<u64>) -> Option<Pending> {
+        let mut guard = self.pending.lock().ok()?;
+        if window.is_some_and(|window| guard.window != Some(window)) {
+            return None;
+        }
+        let pending = std::mem::take(&mut *guard);
+        (!pending.is_empty()).then_some(pending)
+    }
+
+    /// Folds the accumulated changes and publishes them now
+    /// (`LibraryUpdateTimerCallback`), closing the open window.
     ///
     /// Public so a caller that needs the push *now* — a test, or a shutdown
     /// path that must not lose a pending announcement — can force it.
     pub async fn flush(&self) {
-        let pending = {
-            let Ok(mut guard) = self.pending.lock() else {
-                return;
-            };
-            if guard.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *guard)
-        };
+        if let Some(pending) = self.take(None) {
+            self.publish(pending).await;
+        }
+    }
+
+    /// Folds one taken batch and publishes it, per user when an audience is
+    /// wired.
+    async fn publish(&self, pending: Pending) {
         let folded = fold(&pending);
         if folded.info.is_empty {
             return;
@@ -257,16 +390,24 @@ impl LibraryChangedNotifier {
     }
 }
 
+/// One batch's deduped lists.
+#[derive(Default)]
+struct Lists {
+    added: Vec<Changed>,
+    updated: Vec<Changed>,
+    removed: Vec<Changed>,
+    folders_added_to: Vec<Changed>,
+    folders_removed_from: Vec<Changed>,
+}
+
 /// The deduped change set, kept alongside the payload it folds into.
 ///
 /// The per-user filter needs each item's owning library, which the wire
 /// [`LibraryUpdateInfo`] does not carry — it is a flat list of ids. So the
-/// folded buckets are retained and [`Folded::for_libraries`] re-derives one
+/// folded lists are retained and [`Folded::for_libraries`] re-derives one
 /// user's payload from them.
 struct Folded {
-    added: Vec<Changed>,
-    updated: Vec<Changed>,
-    removed: Vec<Changed>,
+    lists: Lists,
     /// The unfiltered payload, used when no per-user audience is wired.
     info: LibraryUpdateInfo,
 }
@@ -292,41 +433,25 @@ impl Folded {
                 .cloned()
                 .collect()
         };
-        build(
-            &keep(&self.added),
-            &keep(&self.updated),
-            &self.removed,
-            Some(visible),
-        )
+        let lists = Lists {
+            added: keep(&self.lists.added),
+            updated: keep(&self.lists.updated),
+            removed: self.lists.removed.clone(),
+            folders_added_to: keep(&self.lists.folders_added_to),
+            folders_removed_from: self.lists.folders_removed_from.clone(),
+        };
+        build(&lists, Some(visible))
     }
 }
 
-/// Builds the wire payload from three already-deduped buckets.
+/// Builds the wire payload from one batch's deduped lists.
 ///
 /// `user_libraries` is the set of libraries the recipient can see, when there is
 /// a recipient. It is what `CollectionFolders` is derived from — see below.
-fn build(
-    added: &[Changed],
-    updated: &[Changed],
-    removed: &[Changed],
-    user_libraries: Option<&HashSet<String>>,
-) -> LibraryUpdateInfo {
-    let ids = |v: &[Changed]| -> Vec<String> {
-        let mut seen = HashSet::new();
-        v.iter()
-            .filter(|c| seen.insert(c.id.clone()))
-            .map(|c| c.id.clone())
-            .collect()
-    };
-    let parents = |v: &[Changed]| -> Vec<String> {
-        let mut seen = HashSet::new();
-        v.iter()
-            .filter_map(|c| c.parent.clone())
-            .filter(|p| seen.insert(p.clone()))
-            .collect()
-    };
-    let folders_added_to = parents(added);
-    let folders_removed_from = parents(removed);
+fn build(lists: &Lists, user_libraries: Option<&HashSet<String>>) -> LibraryUpdateInfo {
+    let ids = |v: &[Changed]| -> Vec<String> { v.iter().map(|c| c.id.clone()).collect() };
+    let folders_added_to = ids(&lists.folders_added_to);
+    let folders_removed_from = ids(&lists.folders_removed_from);
 
     // `GetTopParentIds(newAndRemoved, allUserRootChildren)`, and it is NOT the
     // changed items' own libraries. C# passes it `foldersAddedTo +
@@ -353,10 +478,11 @@ fn build(
         // honestly say without the library list.
         None => {
             let mut seen = HashSet::new();
-            added
+            lists
+                .added
                 .iter()
-                .chain(removed)
-                .chain(updated)
+                .chain(&lists.removed)
+                .chain(&lists.updated)
                 .filter_map(|c| c.top_parent.clone())
                 .filter(|t| seen.insert(t.clone()))
                 .collect()
@@ -366,9 +492,9 @@ fn build(
     let mut info = LibraryUpdateInfo {
         folders_added_to,
         folders_removed_from,
-        items_added: ids(added),
-        items_removed: ids(removed),
-        items_updated: ids(updated),
+        items_added: ids(&lists.added),
+        items_removed: ids(&lists.removed),
+        items_updated: ids(&lists.updated),
         collection_folders,
         ..LibraryUpdateInfo::default()
     };
@@ -382,20 +508,22 @@ fn build(
 /// => !_itemsAdded.Contains(i))`): an item created and then saved in the same
 /// window is an addition, and reporting it twice makes a client fetch it twice.
 fn fold(pending: &Pending) -> Folded {
-    let added_ids: HashSet<&String> = pending.added.iter().map(|c| &c.id).collect();
     let updated: Vec<Changed> = pending
         .updated
+        .items
         .iter()
-        .filter(|c| !added_ids.contains(&c.id))
+        .filter(|c| !pending.added.index.contains_key(&c.id))
         .cloned()
         .collect();
-    let info = build(&pending.added, &updated, &pending.removed, None);
-    Folded {
-        added: pending.added.clone(),
+    let lists = Lists {
+        added: pending.added.items.clone(),
         updated,
-        removed: pending.removed.clone(),
-        info,
-    }
+        removed: pending.removed.items.clone(),
+        folders_added_to: pending.folders_added_to.items.clone(),
+        folders_removed_from: pending.folders_removed_from.items.clone(),
+    };
+    let info = build(&lists, None);
+    Folded { lists, info }
 }
 
 impl LibraryChangedNotifier {
@@ -425,16 +553,7 @@ impl LibraryChangedNotifier {
             top_parent: top.clone(),
             parent: root_n.clone(),
         }));
-        if all.is_empty() {
-            return;
-        }
-        {
-            let Ok(mut pending) = self.pending.lock() else {
-                return;
-            };
-            pending.removed.extend(all);
-        }
-        self.restart_timer();
+        self.add(all, Kind::Removed);
     }
 }
 
@@ -482,6 +601,45 @@ mod tests {
         (n, events)
     }
 
+    /// A configuration whose `LibraryUpdateDuration` a test can change.
+    struct LiveConfig(Mutex<ferrofin_model::configuration::ServerConfiguration>);
+
+    impl LiveConfig {
+        fn set(&self, seconds: i32) {
+            self.0.lock().expect("lock").library_update_duration = seconds;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServerConfigurationManager for LiveConfig {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not used by the notifier")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.0.lock().expect("lock").clone()))
+        }
+        async fn update_configuration(
+            &self,
+            configuration: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            *self.0.lock().expect("lock") = configuration.clone();
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
     fn movie(id: Uuid, parent: Uuid, library: Uuid) -> BaseItemEntity {
         BaseItemEntity {
             id: id.to_string(),
@@ -516,36 +674,182 @@ mod tests {
         );
     }
 
+    /// Jellyfin 12's window (jellyfin/jellyfin#17762): it runs from the first
+    /// change of a batch and is never extended, so a steady stream of changes
+    /// still pushes every `LibraryUpdateDuration`, and the next change after a
+    /// push opens a new window.
     #[tokio::test(start_paused = true)]
-    async fn changes_are_coalesced_into_one_push_after_the_quiet_period() {
+    async fn the_window_runs_from_the_first_change_and_is_never_extended() {
         let (n, events) = notifier(Duration::from_secs(30));
         let library = Uuid::new_v4();
         let parent = Uuid::new_v4();
 
-        // Three writes 10s apart: each restarts the timer, so none of them
-        // fires on its own. A per-change timer would have pushed three times.
+        // Three writes 10 s apart, all inside the first change's window.
         for _ in 0..3 {
             n.record_added(&[movie(Uuid::new_v4(), parent, library)]);
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
-        assert!(
-            events.library_updates().is_empty(),
-            "the debounce must restart on each change, not fire 30s after the first"
-        );
-
-        tokio::time::sleep(Duration::from_secs(31)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let pushed = events.library_updates();
-        assert_eq!(
-            pushed.len(),
-            1,
-            "one push for the whole quiet-bounded batch"
-        );
+        assert_eq!(pushed.len(), 1, "one push, 30 s after the first change");
         assert_eq!(pushed[0].items_added.len(), 3);
         assert_eq!(
             pushed[0].collection_folders,
             vec![library.simple().to_string()]
         );
         assert!(!pushed[0].is_empty);
+
+        // A later change opens a new window of its own.
+        n.record_added(&[movie(Uuid::new_v4(), parent, library)]);
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert_eq!(events.library_updates().len(), 1);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(events.library_updates().len(), 2);
+    }
+
+    /// The buckets are keyed by item id, so a repeat replaces its entry
+    /// instead of growing the batch, and a batch that reaches
+    /// `MaxBatchSize` (2000) is pushed at once, without waiting out its
+    /// window.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_is_keyed_by_item_and_flushed_once_it_reaches_the_cap() {
+        let (n, events) = notifier(Duration::from_secs(30));
+        let library = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let same = movie(Uuid::new_v4(), parent, library);
+        for _ in 0..MAX_BATCH_SIZE {
+            n.record_updated(std::slice::from_ref(&same));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            events.library_updates().is_empty(),
+            "one item saved 2000 times is one entry, not a full batch"
+        );
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].items_updated.len(), 1);
+
+        let items: Vec<BaseItemEntity> = (0..MAX_BATCH_SIZE)
+            .map(|_| movie(Uuid::new_v4(), parent, library))
+            .collect();
+        n.record_added(&items[..MAX_BATCH_SIZE - 1]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(events.library_updates().len(), 1, "one short of the cap");
+        n.record_added(&items[MAX_BATCH_SIZE - 1..]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 2, "the cap pushes without waiting");
+        assert_eq!(pushed[1].items_added.len(), MAX_BATCH_SIZE);
+
+        // The capped batch's window ends with nothing left to push.
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(events.library_updates().len(), 2);
+
+        // One call over twice the cap goes out as two full batches at once,
+        // and the remainder waits out a window of its own.
+        let items: Vec<BaseItemEntity> = (0..=2 * MAX_BATCH_SIZE)
+            .map(|_| movie(Uuid::new_v4(), parent, library))
+            .collect();
+        n.record_added(&items);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 4, "two full batches, without waiting");
+        assert_eq!(pushed[2].items_added.len(), MAX_BATCH_SIZE);
+        assert_eq!(pushed[3].items_added.len(), MAX_BATCH_SIZE);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 5);
+        assert_eq!(pushed[4].items_added.len(), 1);
+    }
+
+    /// `LibraryUpdateDuration` is read as each window opens
+    /// (`OnLibraryChange`), so a configuration change applies to the next
+    /// batch without a restart; zero, or a negative value, sends it at once.
+    #[tokio::test(start_paused = true)]
+    async fn each_window_reads_the_configured_duration() {
+        let config = Arc::new(LiveConfig(Mutex::new(
+            ferrofin_model::configuration::ServerConfiguration {
+                library_update_duration: 10,
+                ..Default::default()
+            },
+        )));
+        let events = Arc::new(RecordingEvents::default());
+        let n = Arc::new(
+            LibraryChangedNotifier::new(
+                Arc::clone(&events) as Arc<dyn EventManager>,
+                Duration::from_secs(30),
+            )
+            .with_config(Arc::clone(&config) as Arc<dyn ServerConfigurationManager>),
+        );
+        let (library, parent) = (Uuid::new_v4(), Uuid::new_v4());
+        let add = || n.record_added(&[movie(Uuid::new_v4(), parent, library)]);
+
+        add();
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(events.library_updates().is_empty());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(events.library_updates().len(), 1, "a 10 s window");
+
+        config.set(60);
+        add();
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(events.library_updates().len(), 1, "the new 60 s applies");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(events.library_updates().len(), 2);
+
+        for seconds in [0, -5] {
+            config.set(seconds);
+            add();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            events.library_updates().len(),
+            4,
+            "zero and below send at once"
+        );
+    }
+
+    /// A forced flush closes the window, so that window's timer, still
+    /// asleep, must leave the next batch alone rather than cut it short.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_windows_timer_leaves_the_next_batch_alone() {
+        let (n, events) = notifier(Duration::from_secs(30));
+        let (library, parent) = (Uuid::new_v4(), Uuid::new_v4());
+        n.record_added(&[movie(Uuid::new_v4(), parent, library)]);
+        n.flush().await;
+        assert_eq!(events.library_updates().len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        n.record_added(&[movie(Uuid::new_v4(), parent, library)]);
+        // The first window's timer wakes at 30 s, inside the second window.
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert_eq!(
+            events.library_updates().len(),
+            1,
+            "the closed window's timer sent the open batch"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(events.library_updates().len(), 2);
+    }
+
+    /// `_foldersRemovedFrom` is a dictionary of its own: every folder an item
+    /// was removed from is reported, even when the item repeats under another.
+    #[tokio::test(start_paused = true)]
+    async fn every_folder_a_repeated_removal_named_is_reported() {
+        let (n, events) = notifier(Duration::from_secs(30));
+        let (library, season, series) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let episode = Uuid::new_v4();
+        n.record_removed(&[movie(episode, season, library)]);
+        n.record_removed(&[movie(episode, series, library)]);
+        n.flush().await;
+
+        let pushed = events.library_updates();
+        assert_eq!(pushed[0].items_removed, vec![episode.simple().to_string()]);
+        assert_eq!(
+            pushed[0].folders_removed_from,
+            vec![season.simple().to_string(), series.simple().to_string()]
+        );
     }
 
     #[tokio::test(start_paused = true)]

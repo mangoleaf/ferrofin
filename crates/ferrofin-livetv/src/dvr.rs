@@ -123,6 +123,10 @@ pub struct TimerRecordingInfo {
     pub external_program_id: Option<String>,
     /// The series timer that scheduled this one, if any.
     pub series_timer_id: Option<String>,
+    /// The programme's genres (`TimerInfo.Genres`).
+    pub genres: Vec<String>,
+    /// The programme's parental rating (`TimerInfo.OfficialRating`).
+    pub official_rating: Option<String>,
 }
 
 impl TimerRecordingInfo {
