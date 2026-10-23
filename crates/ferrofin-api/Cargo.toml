@@ -58,6 +58,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
+url.workspace = true
 tracing.workspace = true
 # Read the OTel trace_id off the request span for log↔trace correlation. No
 # exporter here — that lives in ferrofin-server; these are API-only helpers.

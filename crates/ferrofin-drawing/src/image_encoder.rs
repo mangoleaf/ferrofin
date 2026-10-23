@@ -27,8 +27,9 @@
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
 //!   foreground layer, unplayed/percent-played indicators) is **not** ported —
-//!   this encoder does resize + format-convert only, so `has_default_options`
-//!   already decides whether re-encoding is needed.
+//!   this encoder does auto-orientation, resize and format-convert only, so
+//!   `has_default_options` and `auto_orient` already decide whether re-encoding
+//!   is needed.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -127,6 +128,32 @@ impl ImageCrateEncoder {
             .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))
     }
 
+    /// `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: decodes `path` and
+    /// applies its own EXIF origin (`codec.EncodedOrigin` → `OrientImage`), so
+    /// the pixels stand as the photo was taken. A file whose orientation
+    /// cannot be read is taken as stored.
+    fn decode_oriented(path: &str) -> Result<DynamicImage, ServiceError> {
+        use image::ImageDecoder as _;
+        if !Path::new(path).exists() {
+            return Err(ServiceError::not_found(format!(
+                "image file not found: {path}"
+            )));
+        }
+        let mut decoder = ImageReader::open(path)
+            .map_err(|e| DrawingError::io(format!("open {path}"), e))?
+            .with_guessed_format()
+            .map_err(|e| DrawingError::io(format!("probe {path}"), e))?
+            .into_decoder()
+            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))?;
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut image = DynamicImage::from_decoder(decoder)
+            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))?;
+        image.apply_orientation(orientation);
+        Ok(image)
+    }
+
     /// Maps an output [`ImageFormat`] onto the `image` crate's writer format.
     /// Port of `SkiaEncoder.GetImageFormat`, restricted to the three formats
     /// this encoder advertises (anything else falls back to PNG, as Skia does).
@@ -151,10 +178,9 @@ impl ImageCrateEncoder {
     }
 
     /// Writes `image` to `output_path` in `format` at `quality` (0–100),
-    /// creating the parent directory first. JPEG honours `quality`; PNG/WebP are
-    /// lossless here, so `quality` is ignored (the `image` crate's default WebP
-    /// writer is lossless). Port of the `SKFileWStream`/`Encode(..., quality)`
-    /// tail of `EncodeImage`.
+    /// creating the parent directory first. JPEG and WebP (lossy, via libwebp)
+    /// honour `quality`; PNG is lossless, so it ignores `quality`. Port of the
+    /// `SKFileWStream`/`Encode(..., quality)` tail of `EncodeImage`.
     fn write(
         image: &DynamicImage,
         output_path: &str,
@@ -176,12 +202,27 @@ impl ImageCrateEncoder {
             // WebP encoder is lossless-only and ignores `quality`, which made
             // every poster several times larger than Jellyfin's — so this branch
             // routes around it.
+            //
+            // libwebp cannot write a side over 16383 px. Refused before the RGBA
+            // copy, and as invalid input like the JPEG limit: it is decided by the
+            // input alone and recurs on every request (nothing is cached).
+            if image.width() > WEBP_MAX_DIMENSION || image.height() > WEBP_MAX_DIMENSION {
+                return Err(ServiceError::InvalidInput(format!(
+                    "cannot write {output_path}: {}x{} exceeds WebP's \
+                     {WEBP_MAX_DIMENSION}x{WEBP_MAX_DIMENSION} limit",
+                    image.width(),
+                    image.height()
+                )));
+            }
             let rgba = image.to_rgba8();
             // Precision loss is irrelevant: quality is clamped to 0..=100.
             #[allow(clippy::cast_precision_loss)]
             let quality = quality.clamp(0, 100) as f32;
+            // `encode_simple`, not `encode`: the latter unwraps libwebp's error
+            // and panics on any other encode failure.
             let bytes = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                .encode(quality);
+                .encode_simple(false, quality)
+                .map_err(|code| DrawingError::webp_encode(format!("encode {output_path}"), code))?;
             std::fs::write(output_path, &*bytes)
                 .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
         } else {
@@ -344,7 +385,11 @@ impl ImageCrateEncoder {
             return Ok(input_path.to_owned());
         }
 
-        let image = Self::decode(input_path)?;
+        let image = if auto_orient {
+            Self::decode_oriented(input_path)?
+        } else {
+            Self::decode(input_path)?
+        };
         let original = ImageDimensions::new(
             i32::try_from(image.width()).unwrap_or(i32::MAX),
             i32::try_from(image.height()).unwrap_or(i32::MAX),
@@ -522,6 +567,11 @@ fn get_new_image_size(
 /// its own decoder dependency before it can join this list.
 const SUPPORTED_INPUT_FORMATS: [&str; 7] = ["jpeg", "jpg", "png", "webp", "gif", "bmp", "ico"];
 
+/// The widest or tallest image libwebp can write, its `WEBP_MAX_DIMENSION`
+/// (the bitstream's 14-bit size fields), which the `webp` crate does not
+/// re-export.
+const WEBP_MAX_DIMENSION: u32 = 16_383;
+
 #[async_trait]
 impl ImageEncoder for ImageCrateEncoder {
     /// Port of `SupportedInputFormats` — the decodable subset
@@ -611,8 +661,11 @@ impl ImageEncoder for ImageCrateEncoder {
     /// auto-orientation is requested, otherwise resizes to
     /// `ImageHelper.GetNewImageSize` and writes `output_format` at `quality`.
     ///
-    /// The `auto_orient`/`orientation` overlay work Skia performs is not ported;
-    /// this encoder does resize + format-convert only.
+    /// With `auto_orient` the file's own EXIF origin is applied first
+    /// (`SkiaEncoder.GetBitmap` → `OrientImage`), so the resize sees the
+    /// upright size. `orientation` is unused: Skia falls back to it only when
+    /// the codec cannot open the file, and then has no bitmap to draw either.
+    /// The played/unplayed/blur overlays are not drawn.
     async fn encode_image(
         &self,
         input_path: &str,
@@ -1026,6 +1079,73 @@ mod tests {
         );
     }
 
+    /// An EXIF block holding only `Orientation = 6` (rotate 90° clockwise),
+    /// as a phone writes a portrait shot stored landscape: a little-endian
+    /// TIFF header and one IFD entry.
+    const ORIENTATION_6_EXIF: [u8; 26] = [
+        0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // "II*", IFD at 8
+        0x01, 0x00, // one entry
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00,
+        0x00, // Orientation = 6
+        0x00, 0x00, 0x00, 0x00, // no next IFD
+    ];
+
+    /// `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: the file's EXIF
+    /// origin is applied before the resize, so a 40×20 JPEG tagged with
+    /// orientation 6 comes out 20×40; without auto-orientation it is left as
+    /// stored.
+    #[tokio::test]
+    async fn auto_orient_applies_the_exif_orientation() {
+        use image::ImageEncoder as _;
+        let dir = TempDir::new().expect("tempdir");
+        let input = out_path(&dir, "phone.jpg");
+        {
+            let pixels = image::RgbImage::from_pixel(40, 20, image::Rgb([200, 30, 30]));
+            let file = std::fs::File::create(&input).expect("fixture");
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 90);
+            encoder
+                .set_exif_metadata(ORIENTATION_6_EXIF.to_vec())
+                .expect("exif");
+            encoder
+                .write_image(&pixels, 40, 20, image::ExtendedColorType::Rgb8)
+                .expect("write fixture");
+        }
+        let enc = ImageCrateEncoder::new();
+        // The resize measures the upright image: a 10-pixel height bound
+        // halves the rotated 20×40 to 5×10.
+        for (auto_orient, max_height, expected) in [
+            (true, 100, (20, 40)),
+            (false, 100, (40, 20)),
+            (true, 10, (5, 10)),
+        ] {
+            let output = out_path(&dir, &format!("out-{auto_orient}-{max_height}.jpg"));
+            let options = ImageProcessingOptions {
+                max_height: Some(max_height),
+                supported_output_formats: vec![ImageFormat::Jpg],
+                ..Default::default()
+            };
+            let written = enc
+                .encode_image(
+                    &input,
+                    Utc::now(),
+                    &output,
+                    auto_orient,
+                    None,
+                    90,
+                    &options,
+                    ImageFormat::Jpg,
+                )
+                .await
+                .expect("encode");
+            let dims = enc.get_image_size(&written).await.expect("probe out");
+            assert_eq!(
+                (dims.width, dims.height),
+                expected,
+                "auto_orient {auto_orient}"
+            );
+        }
+    }
+
     /// Transliterated from upstream `ImageHelperTests` (jellyfin#17056): an
     /// explicit size larger than a 600x336 source is clamped to it.
     #[rstest]
@@ -1167,6 +1287,61 @@ mod tests {
         for h in handles {
             h.await.expect("task");
         }
+    }
+
+    /// libwebp cannot write a side over 16383 px, and its `encode` panicked on
+    /// one (`VP8_ENC_ERROR_BAD_DIMENSION`). Such an output is now refused as
+    /// invalid input before encoding, like the JPEG limit, so `process_image`
+    /// logs it at debug and serves the original; a side of exactly 16383 px
+    /// still encodes.
+    #[rstest]
+    #[case(16_384, 1)]
+    #[case(1, 16_384)]
+    fn a_webp_output_over_libwebps_limit_is_invalid_input_not_a_panic(
+        #[case] width: u32,
+        #[case] height: u32,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let out = out_path(&dir, "huge.webp");
+
+        let err = ImageCrateEncoder::write(
+            &DynamicImage::new_rgba8(width, height),
+            &out,
+            CrateFormat::WebP,
+            90,
+        )
+        .expect_err("libwebp's dimension limit");
+
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("16383x16383 limit"), "{err}");
+        assert!(!Path::new(&out).exists(), "nothing is written");
+
+        let edge = out_path(&dir, "edge.webp");
+        ImageCrateEncoder::write(
+            &DynamicImage::new_rgba8(width.min(16_383), height.min(16_383)),
+            &edge,
+            CrateFormat::WebP,
+            90,
+        )
+        .expect("16383 px is within the limit");
+        assert!(Path::new(&edge).exists());
+    }
+
+    /// Any other libwebp failure is an ordinary encode error too, not the
+    /// `unwrap` panic of `Encoder::encode`: a zero-width image, which libwebp
+    /// rejects itself.
+    #[test]
+    fn a_libwebp_failure_is_an_encode_error_not_a_panic() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = out_path(&dir, "empty.webp");
+
+        let err =
+            ImageCrateEncoder::write(&DynamicImage::new_rgba8(0, 1), &out, CrateFormat::WebP, 90)
+                .expect_err("libwebp refuses an empty picture");
+
+        assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
+        assert!(err.to_string().contains("libwebp VP8_ENC_ERROR"), "{err}");
+        assert!(!Path::new(&out).exists(), "nothing is written");
     }
 
     #[tokio::test]
