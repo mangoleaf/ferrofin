@@ -1,0 +1,13 @@
+WEBVTT
+
+00:00:02.000 --> 00:00:03.000
+<c.black>accented colour</c>
+
+00:00:03.000 --> 00:00:04.000
+<font size="NaN">not a number size</c>
+
+00:00:04.000 --> 00:00:05.000
+<font size="Infinity">infinite size</c>
+
+00:00:06.000 --> 00:00:07.000
+<c.red><i>red italic</c></i>
