@@ -340,8 +340,8 @@ impl FerrofinServerApplicationHost {
     /// The port is `None` when absent or unparseable. IPv6 literals in
     /// brackets (`[::1]:8096`) are handled.
     fn parse_request_host(request: &RequestContext) -> Option<(String, Option<u16>)> {
-        // TODO(gl-813): behind a known proxy, upstream's `request.Host` is the
-        // proxy's `X-Forwarded-Host` (ForwardedHeadersMiddleware).
+        // TODO(gl-813): behind a known proxy, upstream's `request.Host` (host
+        // and port) is the proxy's `X-Forwarded-Host` (ForwardedHeadersMiddleware).
         let host = request.header("host")?;
         if let Some(rest) = host.strip_prefix('[') {
             // IPv6 literal: [addr]:port

@@ -57,6 +57,9 @@ pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 /// may be bracketed; both spellings are read. An entry that is neither is
 /// dropped rather than ending the walk, since a proxy that writes an obfuscated
 /// identifier should not silently pin the client to the hop before it.
+///
+/// TODO(gl-184): ASP.NET's `ApplyForwarders` ends the walk at such an entry,
+/// and so does [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers).
 #[must_use]
 pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     headers

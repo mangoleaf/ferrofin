@@ -61,6 +61,9 @@ pub struct ForwardedRequest {
 /// Unlike [`forwarded_for`](crate::state::forwarded_for), which keeps only the
 /// entries that parse, this walk keeps the headers' entries aligned, as the
 /// scheme and host depend on which hop supplied them.
+///
+/// TODO(gl-184): the client-address walk should stop at an unparsable entry
+/// too, as `ApplyForwarders` does, so the two walks agree.
 #[must_use]
 pub fn walk_forwarded_headers(
     peer: std::net::IpAddr,

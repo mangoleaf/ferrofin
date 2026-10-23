@@ -49,20 +49,26 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
   listens with HTTPS on `FERROFIN_HTTPS_PORT` on every address it listens with HTTP on.
   If the certificate does not load, the server logs why and serves HTTP only.
   A certificate without a password must use the usual empty-password form, as OpenSSL writes
-  it (`openssl pkcs12 -export … -passout pass:`). The rarer NULL-password form, which some
-  Windows and Java tools write and Jellyfin accepts, does not load yet (gl-815).
-- HTTPS connections use HTTP/1.1; Jellyfin's also offer HTTP/2 (gl-814).
+  it. The rarer NULL-password form, which .NET loads, does not load yet (gl-815). To rewrite
+  a password-less file in the usual form:
+  `openssl pkcs12 -in old.pfx -passin pass: -nodes -out all.pem`, then
+  `openssl pkcs12 -export -in all.pem -passout pass: -out new.pfx` (delete `all.pem` after:
+  it holds the private key unencrypted).
+- HTTPS connections use HTTP/1.1; Jellyfin's HTTPS endpoints also offer HTTP/2 (gl-814).
 - **Require HTTPS** answers every plain HTTP request with a `307` redirect to the same path on
   HTTPS, except `/health/live` and `/health/ready`. A request a known proxy forwarded with
   `X-Forwarded-Proto: https` counts as HTTPS.
 - A new certificate path takes effect after a restart; the dashboard shows the restart as
   pending. A path to a missing file saves but is answered `404`.
 - The ports are `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`; the port fields on the Networking
-  page are not read. When both name the same port, HTTPS is not served and the log says so.
+  page are not read yet (gl-554). When both name the same port, HTTPS is not served and the
+  log says so.
 - Adoption keeps Jellyfin's **Enable HTTPS** and **Require HTTPS**, but not its certificate
   path and password, which point into Jellyfin's filesystem.
 
 A reverse proxy that terminates TLS needs none of this. List it under **Known proxies** instead.
+Addresses published from each request take the proxy's `X-Forwarded-Proto`, but not yet its
+`X-Forwarded-Host` (gl-813).
 
 ## Admin seeding (fresh database only)
 
