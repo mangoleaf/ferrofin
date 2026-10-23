@@ -456,6 +456,56 @@ class RuleFile(Scratch):
             diff.check_rule_scopes(rules + self.rules('[[rule]]\npaths = ["A"]\nkind = "opaque"\nrequests = ["xy"]\nreason = "r"\n'), ["xy"])
 
 
+class Normalised(Scratch):
+    def test_a_body_is_shown_as_the_comparison_saw_it_with_the_rules_it_applied(self):
+        rules = self.rules('[[rule]]\npaths = ["ServerId"]\nkind = "opaque"\nreason = "r"\n'
+                           '[[rule]]\npaths = ["Tags"]\nkind = "unordered"\nby = "Id"\nreason = "r"\n'
+                           '[[rule]]\npaths = ["Hashes"]\nkind = "opaque-keys"\nreason = "r"\n'
+                           '[[rule]]\npaths = ["Gone"]\nkind = "opaque"\nreason = "r"\n')
+        body = {"ServerId": "abc", "Tags": [{"Id": "b"}, {"Id": "a"}], "Hashes": {"t2": "h2", "t1": "h1"}, "Name": "x"}
+        shown, applied = diff.normalised(body, rules)
+        self.assertEqual(shown, {"ServerId": "<opaque>", "Tags": [{"Id": "a"}, {"Id": "b"}], "Hashes": {"<key 1>": "h1", "<key 2>": "h2"}, "Name": "x"})
+        self.assertEqual(applied, ["Hashes", "ServerId", "Tags"])
+        self.assertEqual(diff.normalised(None, rules), (None, []))
+
+
+class Filed(Scratch):
+    def filed(self, toml):
+        return diff.load_filed(write(self.dir, "filed.toml", toml))
+
+    def test_a_filed_difference_names_its_issue_and_stays_new(self):
+        (entry,) = self.filed('[[filed]]\nrequest = "GetItems.*"\npath = "TotalRecordCount"\nkind = "value"\nissue = 830\n')
+        hit = diff.Difference("TotalRecordCount", "TotalRecordCount", "value", "1", "2")
+        self.assertEqual(diff.filed_issue([entry], "GetItems.sortBy.name", hit), 830)
+        self.assertIsNone(diff.filed_issue([entry], "Other", hit))
+        self.assertIsNone(diff.filed_issue([entry], "GetItems.x", diff.Difference("TotalRecordCount", "TotalRecordCount", "null", "1", None)))
+
+    def test_a_filed_image_tag_group_matches_every_tag_of_it(self):
+        (entry,) = self.filed('[[filed]]\nrequest = "*"\npath = "Items[].ImageBlurHashes.Primary.<tag>"\nkind = "missing"\nissue = 7\n')
+        hit = diff.Difference("Items[].ImageBlurHashes.Primary." + "c" * 32, "x", "missing", "1", None)
+        self.assertEqual(diff.filed_issue([entry], "any", hit), 7)
+
+    def test_check_refuses_a_bad_links_file_before_anything_boots(self):
+        files = Live.files(self)
+        bad = write(self.dir, "bad-filed.toml", 'version = 1\n[[filed]]\nrequest = "a"\npath = "X"\nkind = "value"\n')
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = diff.main(["check", "--requests", files["requests"], "--normalise", files["normalise"], "--ledger", files["ledger"], "--filed", bad])
+        self.assertEqual(code, 2)
+        self.assertIn("`issue` is a GitLab issue number", stderr.getvalue())
+
+    def test_invalid_filed_entries_are_refused(self):
+        for toml, message in (('[[filed]]\nrequest = "a"\npath = "X"\nkind = "value"\n', "`issue` is a GitLab issue number"),
+                              ('[[filed]]\npath = "X"\nkind = "value"\nissue = 1\n', "`request` is required"),
+                              ('[[filed]]\nrequest = "a"\npath = "X"\nkind = "bogus"\nissue = 1\n', "`kind` is required"),
+                              ('[[filed]]\nrequest = "a"\npath = "X"\nkind = "value"\nissue = 1\nextra = 2\n', "unknown key")):
+            with self.subTest(message), self.assertRaisesRegex(diff.ParityError, message):
+                self.filed(toml)
+
+    def test_the_shipped_links_file_is_valid(self):
+        diff.load_filed(diff.HERE / "filed.toml")
+
+
 class Ledger(Scratch):
     def test_the_ledger_shipped_with_the_harness_is_valid(self):
         diff.load_ledger(diff.HERE / "ledger.toml")
@@ -1105,6 +1155,7 @@ class Live(Scratch):
         self.assertIn("RUN FAILED", page)
         self.assertIn("ferrofin did not start", page)
         self.assertIn("failed-run", page)
+        self.assertEqual(json.loads((out / "new-differences.json").read_text())["requests"], [])
 
     def test_a_failure_report_is_written_even_when_run_json_is_empty_or_garbled(self):
         for content in ("", "{not json", "[1, 2]"):
@@ -1179,6 +1230,62 @@ class Live(Scratch):
         summary = json.loads((out / "results.json").read_text())
         self.assertEqual((code, summary["requests"][0]["target"], summary["found"]), (0, "/Genres/Drama", {"genre": "Drama"}))
         self.assertEqual(summary["timing"]["reads"]["concurrency"], 2)
+
+    def test_a_run_writes_its_new_differences_for_filing_with_normalised_bodies_and_the_issue_once_filed(self):
+        files = self.files('{"id": "a", "method": "GET", "path": "/Items/{movie}"}\n{"id": "b", "method": "GET", "path": "/Items/{movie}/x"}\n')
+        files["normalise"] = write(self.dir, "n.toml", 'version = 1\n[[rule]]\npaths = ["ServerId"]\nkind = "opaque"\nreason = "per server"\n')
+        files["ledger"] = write(self.dir, "l.toml", 'version = 1\n[[entry]]\nrequest = "b"\npath = "Name"\nkind = "value"\nissue = 4\nreason = "known"\n')
+        filed = write(self.dir, "f.toml", 'version = 1\n[[filed]]\nrequest = "a"\npath = "Count"\nkind = "value"\nissue = 830\n')
+        oracle = {"/Items/m1": (200, {"ServerId": "s1", "Name": "x", "Count": 1, "Overview": "text"}), "/Items/m1/x": (200, {"Name": "x"})}
+        ferrofin = {"/Items/m1": (200, {"ServerId": "s2", "Name": "x", "Count": 2, "Overview": None}), "/Items/m1/x": (200, {"Name": "y"})}
+        with serve(oracle) as a, serve(ferrofin) as b:
+            code, out = self.run_cli(a, b, files, "--filed", filed)
+        self.assertEqual(code, 1)
+        new = json.loads((out / "new-differences.json").read_text())
+        (entry,) = new["requests"]   # b's only difference is ledgered: nothing new to file there
+        self.assertEqual((entry["request"], entry["method"], entry["target"]), ("a", "GET", "/Items/m1"))
+        self.assertEqual(sorted((d["path"], d["kind"], d["filed"]) for d in entry["differences"]),
+                         [("Count", "value", 830), ("Overview", "null", None)])
+        self.assertEqual(entry["bodies"]["oracle"]["ServerId"], "<opaque>")
+        self.assertEqual(entry["bodies"]["ferrofin"]["Overview"], None)
+        self.assertEqual(entry["rules_applied"], ["ServerId"])
+        page = (out / "report.html").read_text()
+        self.assertIn("gl-830", page)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(diff.main(["findings", "--out", str(out)]), 0)
+        text = stdout.getvalue()
+        self.assertIn("`Overview` (null)", text)
+        self.assertNotIn("`Count` (value)", text)   # filed already: not offered again
+        self.assertIn("GET /Items/m1", text)
+        summary = json.loads((out / "results.json").read_text())
+        self.assertEqual(summary["unused_filed"], [])
+
+    def test_a_filed_entry_that_matched_nothing_is_listed(self):
+        files = self.files()
+        filed = write(self.dir, "f.toml", 'version = 1\n[[filed]]\nrequest = "gone"\npath = "X"\nkind = "value"\nissue = 9\n')
+        with serve({"/Items/m1": (200, {"A": 1})}) as a, serve({"/Items/m1": (200, {"A": 1})}) as b:
+            _, out = self.run_cli(a, b, files, "--filed", filed)
+        self.assertEqual(json.loads((out / "results.json").read_text())["unused_filed"], [{"request": "gone", "path": "X", "issue": 9}])
+        self.assertIn("gl-9", (out / "report.html").read_text())
+
+    def test_findings_say_when_a_body_is_cut_and_a_body_cannot_break_the_fence(self):
+        body = {"Text": "```" + "x" * 5000}
+        new = {"requests": [{"request": "a", "method": "GET", "target": "/x", "source": "", "rules_applied": [], "bodies": {"oracle": body, "ferrofin": {}},
+                             "differences": [{"path": "Text", "at": "Text", "kind": "value", "oracle": "1", "ferrofin": "2", "filed": None}]}]}
+        text = diff.findings(new)
+        self.assertIn("cut at 4000 characters; the whole body is in new-differences.json", text)
+        self.assertIn("````json", text)
+
+    def test_findings_group_image_tag_keys_and_put_the_widest_group_first(self):
+        entry = lambda id, diffs: {"request": id, "method": "GET", "target": "/x", "source": "", "rules_applied": [],
+                                   "bodies": {"oracle": {}, "ferrofin": {}},
+                                   "differences": [{"path": p, "at": p, "kind": k, "oracle": "1", "ferrofin": "2", "filed": None} for p, k in diffs]}
+        new = {"requests": [entry("a", [("Hashes.Primary." + "a" * 32, "missing"), ("N", "value")]),
+                            entry("b", [("Hashes.Primary." + "b" * 32, "missing")])]}
+        text = diff.findings(new)
+        self.assertIn("`Hashes.Primary.<tag>` (missing) in 2 request(s)", text)
+        self.assertLess(text.index("Hashes.Primary.<tag>"), text.index("`N` (value)"))
 
     def test_check_validates_the_shipped_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:

@@ -64,7 +64,7 @@ instead of warned about. The oracle is the same pinned image and the same stale-
    then the write to both, compares the answers, then sends the write's read-backs and compares them like any
    read. A server that does not come back fails the run, naming it (`<server>/reset.log` keeps what docker said). The report
    shows each write's reset time, and the resets count against the cap like everything else.
-4. **Report and tear down.** `report.html` and `results.json` are written, both containers are removed and
+4. **Report and tear down.** `report.html`, `results.json` and `new-differences.json` are written, both containers are removed and
    their logs saved. **A run that ends any way at all leaves a report**: a server that did not boot, the cap,
    a signal.
 
@@ -100,6 +100,7 @@ isolation snapshots): remove the directory when you are done with the run.
 | `discover.toml` | names the corpus does not record, read from the oracle at run start (`{found.<name>}`) |
 | `normalise.toml` | what the comparison treats as equal although two servers cannot agree |
 | `ledger.toml` | the accepted divergences |
+| `filed.toml` | the new differences already filed as issues, so the report names them (see "Filing new differences") |
 | `tests/` | `test_diff.py` (the comparison, over fixture pairs and local servers), `test_generate.py` (the sweep covers every operation and is current), `test_edge.py` (every edge category has requests) and `parity.bats` (the runner, over a fake docker) |
 
 ### Requests
@@ -173,6 +174,28 @@ and exactly one link:
 issue that tracks it). An entry with no link, two, or a `verified` that is not a row of the record fails the run
 before anything boots. The report groups ledgered differences by their link and lists the entries (not links) that
 matched nothing.
+
+### Filing new differences (`new-differences.json`, `filed.toml`)
+
+Every run writes `new-differences.json` beside its report. It holds each request with a difference no ledger
+entry accepts: the request (method, target, source, request file), each new difference's field path, place,
+kind and both values, both bodies **as the comparison saw them** (`<opaque>` where a rule made a value opaque,
+`<key N>` for opaque keys, unordered arrays sorted), the rules that changed them, and the issue a difference
+was filed as. The harness never talks to GitLab: filing is a step a person or an agent takes after the run.
+
+1. `python3 parity/diff.py findings --out parity/runs/<run>` prints the differences not filed yet as Markdown,
+   one section per field path and kind (with the requests that show it and the first one's bodies), largest
+   group first.
+2. File them through the project's issue-filing workflow (agents: the issue-filing skill), which dedupes
+   against the existing issues on the request pattern and the field path, and verifies each against the
+   upstream code before it is filed.
+3. Add each filed difference to `filed.toml` (`request` pattern, `path` as `findings` prints it, `kind`, `issue`)
+   in a reviewed PR; a path with `<tag>` covers every image tag of that map. The next run's report then shows
+   `gl-<iid>` beside it, `findings` no longer offers it, and an entry that matched nothing is listed in the
+   report (fixed, or no longer sent). `filed.toml` is validated before anything boots, like the ledger.
+
+A filed difference is still new: it fails the run until Ferrofin is fixed (or the difference is accepted into
+`ledger.toml`, which needs a `VERIFIED` row or the issue as its link).
 
 ## Settings
 
