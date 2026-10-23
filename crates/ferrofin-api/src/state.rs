@@ -815,15 +815,11 @@ impl AppState {
         peer: std::net::IpAddr,
         forwarded_for: &[std::net::IpAddr],
     ) -> std::net::IpAddr {
-        match self.inner.network.as_ref() {
-            Some(network) => network.read().map_or_else(
-                |e| e.into_inner().client_address(peer, forwarded_for),
-                |n| n.client_address(peer, forwarded_for),
-            ),
-            // No policy wired means no known proxies, and upstream ignores the
-            // header entirely in that case.
-            None => peer,
-        }
+        crate::forwarded_headers::client_address_through(
+            self.inner.network.as_deref(),
+            peer,
+            forwarded_for,
+        )
     }
 
     /// Whether `ip` is on the local network.

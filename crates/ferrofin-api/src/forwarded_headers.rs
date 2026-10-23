@@ -137,6 +137,25 @@ pub fn forwarded_through(
     walk_forwarded_headers(peer, headers, |address| network.is_known_proxy(address))
 }
 
+/// The client a request came from (upstream's `GetNormalizedRemoteIP()` after
+/// `ForwardedHeadersMiddleware`): `NetworkManager::client_address` over
+/// `network`'s known proxies. No policy (`None`) means no known proxies, and
+/// upstream then ignores `X-Forwarded-For` entirely, so it is the peer.
+#[must_use]
+pub fn client_address_through(
+    network: Option<&std::sync::RwLock<ferrofin_networking::NetworkManager>>,
+    peer: std::net::IpAddr,
+    forwarded_for: &[std::net::IpAddr],
+) -> std::net::IpAddr {
+    match network {
+        Some(network) => network
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .client_address(peer, forwarded_for),
+        None => peer,
+    }
+}
+
 /// Whether `scheme` holds only RFC 3986 scheme characters
 /// (`ForwardedHeadersMiddleware.SchemeChars`).
 fn is_valid_scheme(scheme: &str) -> bool {
@@ -371,6 +390,34 @@ mod tests {
         for host in invalid {
             assert!(!is_valid_host(&host), "{host}");
         }
+    }
+
+    /// Only a known proxy's `X-Forwarded-For` names the client; without a
+    /// policy the peer is the client.
+    #[rstest]
+    #[case::known_proxy(Some("10.0.0.1"), "10.0.0.1", "203.0.113.9")]
+    #[case::unknown_peer(Some("10.0.0.1"), "192.168.1.20", "192.168.1.20")]
+    #[case::no_policy(None, "10.0.0.1", "10.0.0.1")]
+    fn the_client_is_forwarded_only_by_a_known_proxy(
+        #[case] known_proxy: Option<&str>,
+        #[case] peer: &str,
+        #[case] expected: &str,
+    ) {
+        let network = known_proxy.map(|proxy| {
+            std::sync::RwLock::new(ferrofin_networking::NetworkManager::with_interfaces(
+                ferrofin_networking::NetworkConfiguration {
+                    known_proxies: vec![proxy.to_owned()],
+                    ..ferrofin_networking::NetworkConfiguration::default()
+                },
+                Vec::new(),
+            ))
+        });
+        let client = client_address_through(
+            network.as_ref(),
+            peer.parse().expect("peer"),
+            &["203.0.113.9".parse().expect("client")],
+        );
+        assert_eq!(client, expected.parse::<IpAddr>().expect("expected"));
     }
 
     /// The scheme a request has, as the API resolves it for the addresses it

@@ -295,11 +295,12 @@ pub struct HttpsRedirect {
     pub port: u16,
     /// The normalized base URL (`PathBase`), which the redirect keeps.
     pub base: String,
-    /// The network manager whose known proxies may forward the scheme and
-    /// host; `None` trusts no forwarded header.
+    /// The network manager whose known proxies may forward the scheme, the
+    /// host and the client the slow-response line names; `None` trusts no
+    /// forwarded header.
     pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
-    /// The live server configuration, whose `CorsHosts` the redirect answers
-    /// under, as the router does.
+    /// The live server configuration, whose `CorsHosts` and slow-response
+    /// settings the redirect answers under, as the router does.
     pub config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
 }
 
@@ -310,9 +311,13 @@ pub struct HttpsRedirect {
 ///
 /// It runs where Jellyfin runs it, inside the base URL mount (so a request
 /// outside it gets the base URL redirect first, and the base is put back into
-/// the location), and after `ForwardedHeadersMiddleware` and CORS:
+/// the location), and after `ForwardedHeadersMiddleware`,
+/// `ResponseTimeMiddleware` and CORS:
 /// - a request is HTTPS when it came over TLS, or when known proxies forwarded
 ///   it as `https`, and a forwarded host is the host redirected to;
+/// - a redirect or preflight answer carries `X-Response-Time-ms`, and a slow
+///   one is logged, as the router's are
+///   ([`ferrofin_api::response_time::with_response_time`]);
 /// - a CORS preflight is answered, and the redirect carries the CORS headers,
 ///   so a browser client on another origin can follow it. Both follow the
 ///   configured `CorsHosts`, as the router's CORS does
@@ -323,7 +328,8 @@ pub struct HttpsRedirect {
 /// redirected. With no redirect (`None`) every request passes through.
 ///
 /// A `Host` that is not a valid host is answered `400`, as Kestrel answers it
-/// before any middleware runs, rather than copied into the location.
+/// before any middleware runs (so with no response time or CORS headers),
+/// rather than copied into the location.
 pub async fn redirect_to_https(
     State(redirect): State<Option<Arc<HttpsRedirect>>>,
     request: Request,
@@ -393,18 +399,36 @@ pub async fn redirect_to_https(
         ))
         .ok()
     });
+    let Some(location) = location else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     let answer = tower::service_fn(move |_: Request| {
-        let response = match location.clone() {
-            Some(location) => (
-                StatusCode::TEMPORARY_REDIRECT,
-                [(header::LOCATION, location)],
-            )
-                .into_response(),
-            None => StatusCode::BAD_REQUEST.into_response(),
-        };
+        let response = (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(header::LOCATION, location.clone())],
+        )
+            .into_response();
         async move { Ok::<_, std::convert::Infallible>(response) }
     });
-    ferrofin_api::cors::with_configured_cors(redirect.config.as_ref(), request, answer).await
+    let config = redirect.config.as_ref();
+    let cors = tower::service_fn(move |request: Request| {
+        let answer = answer.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                ferrofin_api::cors::with_configured_cors(config, request, answer).await,
+            )
+        }
+    });
+    let network = redirect.network.as_deref();
+    ferrofin_api::response_time::with_response_time(
+        config,
+        |peer, forwarded_for| {
+            ferrofin_api::forwarded_headers::client_address_through(network, peer, forwarded_for)
+        },
+        request,
+        cors,
+    )
+    .await
 }
 
 /// The host part of a `Host` value (`HostString.Host`): an IPv6 address keeps
@@ -802,11 +826,26 @@ mod tests {
         ))
     }
 
-    /// A configuration whose only setting the redirect reads, `CorsHosts`.
-    struct CorsHosts(Vec<String>);
+    /// A fixed configuration, of which the redirect reads `CorsHosts` and the
+    /// slow-response settings.
+    struct Configured(ferrofin_model::configuration::ServerConfiguration);
+
+    /// Everything logged while a test runs.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[async_trait::async_trait]
-    impl ferrofin_traits::configuration::ServerConfigurationManager for CorsHosts {
+    impl ferrofin_traits::configuration::ServerConfigurationManager for Configured {
         fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
             unreachable!("the HTTPS redirect reads only the server configuration")
         }
@@ -816,12 +855,7 @@ mod tests {
             Arc<ferrofin_model::configuration::ServerConfiguration>,
             ferrofin_traits::error::ServiceError,
         > {
-            Ok(Arc::new(
-                ferrofin_model::configuration::ServerConfiguration {
-                    cors_hosts: self.0.clone(),
-                    ..ferrofin_model::configuration::ServerConfiguration::default()
-                },
-            ))
+            Ok(Arc::new(self.0.clone()))
         }
         async fn update_configuration(
             &self,
@@ -848,13 +882,26 @@ mod tests {
     }
 
     fn redirect_with_cors_hosts(port: u16, base: &str, cors_hosts: &[&str]) -> Arc<HttpsRedirect> {
+        redirect_with_configuration(
+            port,
+            base,
+            ferrofin_model::configuration::ServerConfiguration {
+                cors_hosts: cors_hosts.iter().map(|host| (*host).to_owned()).collect(),
+                ..ferrofin_model::configuration::ServerConfiguration::default()
+            },
+        )
+    }
+
+    fn redirect_with_configuration(
+        port: u16,
+        base: &str,
+        configuration: ferrofin_model::configuration::ServerConfiguration,
+    ) -> Arc<HttpsRedirect> {
         Arc::new(HttpsRedirect {
             port,
             base: base.to_owned(),
             network: Some(known_proxy_network("10.0.0.1")),
-            config: Arc::new(CorsHosts(
-                cors_hosts.iter().map(|host| (*host).to_owned()).collect(),
-            )),
+            config: Arc::new(Configured(configuration)),
         })
     }
 
@@ -1120,6 +1167,121 @@ mod tests {
             no_origin.headers().get(header::VARY).is_none(),
             "no CORS request"
         );
+    }
+
+    /// The redirect's answers carry `X-Response-Time-ms`, as Jellyfin runs
+    /// `ResponseTimeMiddleware` before `UseHttpsRedirection`. A refused `Host`
+    /// is Kestrel's answer, given before any middleware, so it carries neither
+    /// the header nor CORS headers. A request the redirect passes on gets the
+    /// header from the router instead, not twice.
+    #[tokio::test]
+    async fn the_redirects_answers_carry_the_response_time() {
+        use ferrofin_api::response_time::RESPONSE_TIME_HEADER;
+
+        let redirect = redirect_with_cors_hosts(8920, "", &["https://app.example"]);
+        let answers = [
+            (
+                Request::get("/web/").header(header::HOST, "example.com:8096"),
+                StatusCode::TEMPORARY_REDIRECT,
+            ),
+            (
+                Request::options("/Users/AuthenticateByName")
+                    .header(header::HOST, "example.com:8096")
+                    .header(header::ORIGIN, "https://app.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST"),
+                StatusCode::OK,
+            ),
+        ];
+        for (request, status) in answers {
+            let response = send(
+                Some(Arc::clone(&redirect)),
+                request,
+                "192.168.1.20",
+                Transport::Plain,
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            let elapsed: f64 = response
+                .headers()
+                .get(RESPONSE_TIME_HEADER)
+                .unwrap_or_else(|| panic!("a {status} answer carries no {RESPONSE_TIME_HEADER}"))
+                .to_str()
+                .expect("ASCII")
+                .parse()
+                .expect("milliseconds");
+            assert!(elapsed >= 0.0);
+        }
+
+        let refused = send(
+            Some(Arc::clone(&redirect)),
+            Request::get("/web/")
+                .header(header::HOST, "evil.example/path")
+                .header(header::ORIGIN, "https://app.example"),
+            "192.168.1.20",
+            Transport::Plain,
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(refused.headers().get(RESPONSE_TIME_HEADER).is_none());
+        assert!(
+            refused
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+
+        let passed_on = send(
+            Some(redirect),
+            Request::get("/web/").header(header::HOST, "example.com:8096"),
+            "192.168.1.20",
+            Transport::Tls,
+        )
+        .await;
+        assert_eq!(passed_on.status(), StatusCode::OK);
+        assert!(passed_on.headers().get(RESPONSE_TIME_HEADER).is_none());
+    }
+
+    /// A slow redirect is logged as the router logs a slow response: the
+    /// client a known proxy forwarded for, the status and the path, never the
+    /// query.
+    #[tokio::test]
+    async fn a_slow_redirect_is_logged_with_the_forwarded_client() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let redirect = redirect_with_configuration(
+            8920,
+            "",
+            ferrofin_model::configuration::ServerConfiguration {
+                enable_slow_response_warning: true,
+                slow_response_threshold_ms: -1,
+                ..ferrofin_model::configuration::ServerConfiguration::default()
+            },
+        );
+        let response = send(
+            Some(redirect),
+            Request::get("/web/?api_key=secret")
+                .header(header::HOST, "example.com:8096")
+                .header("x-forwarded-for", "203.0.113.9"),
+            "10.0.0.1",
+            Transport::Plain,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
+        assert!(
+            log.contains("slow HTTP response")
+                && log.contains("remote_ip=203.0.113.9")
+                && log.contains("status=307")
+                && log.contains(" path=/web/"),
+            "{log}"
+        );
+        assert!(!log.contains("secret"), "{log}");
     }
 
     #[rstest]
