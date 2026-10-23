@@ -1,0 +1,16 @@
+1
+00:00:02,000 --> 00:00:03,000
+<font color="#000000">accented colour</font>
+
+2
+00:00:03,000 --> 00:00:04,000
+<font size="NaN">not a number size</font>
+
+3
+00:00:04,000 --> 00:00:05,000
+<font size="Infinity">infinite size</font>
+
+4
+00:00:06,000 --> 00:00:07,000
+<font color="#ff0000"><i>red italic</font></i>
+
