@@ -1200,6 +1200,27 @@ impl Default for EncodingOptions {
     }
 }
 
+/// `ServerConfiguration.SortReplaceCharacters`' initializer: each becomes a
+/// space in a sort name.
+#[must_use]
+pub fn default_sort_replace_characters() -> Vec<String> {
+    [".", "+", "%"].map(str::to_owned).to_vec()
+}
+
+/// `ServerConfiguration.SortRemoveCharacters`' initializer: each is deleted
+/// from a sort name.
+#[must_use]
+pub fn default_sort_remove_characters() -> Vec<String> {
+    [",", "&", "-", "{", "}", "'"].map(str::to_owned).to_vec()
+}
+
+/// `ServerConfiguration.SortRemoveWords`' initializer: the articles a sort
+/// name drops where they stand alone.
+#[must_use]
+pub fn default_sort_remove_words() -> Vec<String> {
+    ["the", "a", "an"].map(str::to_owned).to_vec()
+}
+
 /// The server configuration. Flattens the C# base
 /// `BaseApplicationConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -1258,13 +1279,19 @@ pub struct ServerConfiguration {
     /// Gets or sets the metadata country code.
     pub metadata_country_code: String,
 
-    /// Gets or sets the sort replace characters.
+    /// Gets or sets the sort replace characters. Absent from a document, it
+    /// takes Jellyfin's initializer list, as C# deserialization keeps it.
+    #[serde(default = "default_sort_replace_characters")]
     pub sort_replace_characters: Vec<String>,
 
-    /// Gets or sets the sort remove characters.
+    /// Gets or sets the sort remove characters. Absent from a document, it
+    /// takes Jellyfin's initializer list.
+    #[serde(default = "default_sort_remove_characters")]
     pub sort_remove_characters: Vec<String>,
 
-    /// Gets or sets the sort remove words.
+    /// Gets or sets the sort remove words. Absent from a document, it takes
+    /// Jellyfin's initializer list.
+    #[serde(default = "default_sort_remove_words")]
     pub sort_remove_words: Vec<String>,
 
     /// Gets or sets the minimum resume percentage.
