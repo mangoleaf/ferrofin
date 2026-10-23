@@ -1065,7 +1065,7 @@ mod tests {
         );
 
         let other = send(
-            Some(redirect),
+            Some(Arc::clone(&redirect)),
             Request::get("/System/Info/Public")
                 .header(header::HOST, "example.com:8096")
                 .header(header::ORIGIN, "https://other.example"),
@@ -1079,6 +1079,46 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .is_none()
+        );
+
+        let unlisted_preflight = send(
+            Some(Arc::clone(&redirect)),
+            Request::options("/Users/AuthenticateByName")
+                .header(header::HOST, "example.com:8096")
+                .header(header::ORIGIN, "https://other.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST"),
+            "192.168.1.20",
+            Transport::Plain,
+        )
+        .await;
+        assert!(
+            location(&unlisted_preflight).is_none(),
+            "a preflight is answered, not redirected"
+        );
+        assert!(
+            unlisted_preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+
+        let no_origin = send(
+            Some(redirect),
+            Request::get("/System/Info/Public").header(header::HOST, "example.com:8096"),
+            "192.168.1.20",
+            Transport::Plain,
+        )
+        .await;
+        assert_eq!(no_origin.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            no_origin
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+        assert!(
+            no_origin.headers().get(header::VARY).is_none(),
+            "no CORS request"
         );
     }
 

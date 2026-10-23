@@ -84,7 +84,7 @@ pub(crate) async fn cors_layer(
 }
 
 /// Answers `request` with `inner` under the layer the live configuration's
-/// `CorsHosts` selects ([`layer_for`]). A request with no `Origin` is no CORS
+/// `CorsHosts` selects (`layer_for`). A request with no `Origin` is no CORS
 /// request and goes straight to `inner` with the policy unread, as ASP.NET's
 /// `CorsMiddleware.Invoke` does. A configuration that cannot be read leaves the
 /// default, any origin.
