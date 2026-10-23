@@ -1495,8 +1495,23 @@ impl FerrofinStreamStatePlanner {
             // video by (target − keyframe), an audible desync on every seeked
             // copy-video stream (measured 0.7–1.6 s on real media). Start the
             // audio at the same keyframe instead; the segment already begins
-            // there for video anyway.
-            if copying_video && !progressive {
+            // there for video anyway. Never on a wtv input: every upstream
+            // version that passed the flag kept it off wtv, "because it breaks
+            // seeking" (as `copied_audio_trim_bsf` does for its trim).
+            //
+            // TS segments keep it, even though 10.11.8 left it off them ("the
+            // timestamps issue on some clients") and v12 dropped it
+            // altogether: the copied video starts at the earlier keyframe with
+            // or without it, and only with it does the audio start there as
+            // well. Measured on a seek to 18 s between keyframes at 15 and
+            // 20 s, TS segments (PTS carry the TS muxer's 1.4 s start offset):
+            // first video / audio PTS 16.40 / 16.39 s with the flag, 16.40 /
+            // 19.38 s without (the audio a whole 3 s after the video).
+            let wtv = state
+                .input_container
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("wtv"));
+            if copying_video && !progressive && !wtv {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
@@ -4828,6 +4843,46 @@ mod tests {
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "no seek, no flag: {:?}",
+            plan.arguments
+        );
+
+        // TS segments take it as fMP4 ones do: the copied video starts at the
+        // keyframe either way, and the flag starts the audio there too.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("ts".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "TS segments keep the flag: {:?}",
+            plan.arguments
+        );
+
+        // A wtv input never takes it: every upstream version that passed the
+        // flag kept it off wtv, "because it breaks seeking".
+        let mut src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        src.container = Some("wtv".to_owned());
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "wtv input keeps accurate seek: {:?}",
             plan.arguments
         );
     }
