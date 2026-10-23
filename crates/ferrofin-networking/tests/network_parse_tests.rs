@@ -360,6 +360,69 @@ fn test_bind_interface_overrides(
     assert_eq!(result, intf);
 }
 
+/// `GetBindAddress_PublishedServerOverride_ParsesHostAndPort` (v12.2): a
+/// published-server override's host and explicit port, an IPv6 literal kept
+/// whole, a full URL left as it is.
+#[rstest]
+// Internal override with an explicit port.
+#[case(
+    "192.168.1.1",
+    "192.168.1.0/24=internal.jellyfin:8097",
+    "internal.jellyfin",
+    Some(8097)
+)]
+// External/all override with an explicit port.
+#[case(
+    "8.8.8.8",
+    "all=external.jellyfin:8097",
+    "external.jellyfin",
+    Some(8097)
+)]
+// Bracketed IPv6 override with an explicit port.
+#[case("8.8.8.8", "all=[fd00:1234::1]:8097", "fd00:1234::1", Some(8097))]
+// Bare IPv6 override without a port - must remain whole, not mangled by the extra colons.
+#[case("8.8.8.8", "all=fd00:1234::1", "fd00:1234::1", None)]
+// Full HTTPS URL override with an explicit port - the URL stays whole, port stays embedded.
+#[case(
+    "8.8.8.8",
+    "all=https://secure.jellyfin.org:8920",
+    "https://secure.jellyfin.org:8920",
+    None
+)]
+// Hostname beginning with "http" is a hostname, not a URL scheme.
+#[case("8.8.8.8", "all=http-proxy.lan:8097", "http-proxy.lan", Some(8097))]
+// Literal "internal" keyword override (applies to every LAN subnet) with an explicit port.
+#[case(
+    "192.168.1.1",
+    "internal=myhost.internal:8097",
+    "myhost.internal",
+    Some(8097)
+)]
+// Literal "external" keyword override with an explicit port.
+#[case(
+    "8.8.8.8",
+    "external=myhost.external:9090",
+    "myhost.external",
+    Some(9090)
+)]
+fn get_bind_address_published_server_override_parses_host_and_port(
+    #[case] source: &str,
+    #[case] published_servers: &str,
+    #[case] expected_host: &str,
+    #[case] expected_port: Option<u16>,
+) {
+    let conf = NetworkConfiguration {
+        local_network_subnets: vec!["192.168.1.0/24".to_owned()],
+        local_network_addresses: vec!["eth16".to_owned(), "eth11".to_owned()],
+        enable_ipv4: true,
+        published_server_uri_by_subnet: vec![published_servers.to_owned()],
+        ..Default::default()
+    };
+    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES).with_resolver(fake_dns);
+    let (host, port) = nm.get_bind_address(source);
+    assert_eq!((host.as_str(), port), (expected_host, expected_port));
+}
+
 /// `HasRemoteAccess_GivenWhitelist_AllowsOnlyIPsInWhitelist`.
 #[rstest]
 #[case(
