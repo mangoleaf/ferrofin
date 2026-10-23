@@ -182,6 +182,7 @@ pub mod device_manager;
 mod device_repository;
 mod directory_cache;
 pub mod display_preferences_manager;
+mod dot_ignore;
 pub mod dto_service;
 pub mod dynamic_images;
 mod embedded_lyrics;
