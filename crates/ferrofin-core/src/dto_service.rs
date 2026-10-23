@@ -1781,31 +1781,14 @@ impl FerrofinDtoService {
         Ok(map)
     }
 
-    /// `DtoService.GetPrimaryImageAspectRatio` (v12 :1745-1775) over a set of
-    /// already-loaded image rows: `None` when there is no primary image; the
-    /// kind's `GetDefaultPrimaryImageAspectRatio()` for a remote image or one
-    /// whose dimensions cannot be read (`Series` 2/3, `BaseItem` 0 — emitted
-    /// as `0`, as upstream does); else width / height.
+    /// [`primary_image_aspect_ratio`] through this service's image processor.
     async fn primary_aspect_ratio(
         &self,
         item_id: Uuid,
         kind: BaseItemKind,
         images: &[ItemImageInfo],
     ) -> Option<f64> {
-        let primary = images.iter().find(|i| i.image_type == ImageType::Primary)?;
-        if !primary.is_local_file() {
-            return Some(kinds::default_primary_image_aspect_ratio(kind));
-        }
-        match self
-            .image_processor
-            .get_item_image_dimensions(item_id, primary)
-            .await
-        {
-            Ok(dim) if dim.width > 0 && dim.height > 0 => {
-                Some(f64::from(dim.width) / f64::from(dim.height))
-            }
-            _ => Some(kinds::default_primary_image_aspect_ratio(kind)),
-        }
+        primary_image_aspect_ratio(self.image_processor.as_ref(), item_id, kind, images).await
     }
 
     /// Computes the cache tag for one image, tolerating processor failures
@@ -3749,6 +3732,30 @@ fn to_trickplay_dto(
     }
 }
 
+/// `DtoService.GetPrimaryImageAspectRatio` (v12 :1745-1775) over a set of
+/// already-loaded image rows: `None` when there is no primary image; the kind's
+/// `GetDefaultPrimaryImageAspectRatio()` for a remote image or one whose
+/// dimensions cannot be read (`Series` 2/3, `BaseItem` 0 — emitted as `0`, as
+/// upstream does); else width / height. Shared with the search hints, which
+/// upstream fill through the same `IDtoService` call.
+pub(crate) async fn primary_image_aspect_ratio(
+    processor: &dyn ImageProcessor,
+    item_id: Uuid,
+    kind: BaseItemKind,
+    images: &[ItemImageInfo],
+) -> Option<f64> {
+    let primary = images.iter().find(|i| i.image_type == ImageType::Primary)?;
+    if !primary.is_local_file() {
+        return Some(kinds::default_primary_image_aspect_ratio(kind));
+    }
+    match processor.get_item_image_dimensions(item_id, primary).await {
+        Ok(dim) if dim.width > 0 && dim.height > 0 => {
+            Some(f64::from(dim.width) / f64::from(dim.height))
+        }
+        _ => Some(kinds::default_primary_image_aspect_ratio(kind)),
+    }
+}
+
 #[async_trait]
 impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
     async fn get_primary_image_aspect_ratio(
@@ -5215,13 +5222,12 @@ mod tests {
 
     use super::*;
 
-    use chrono::{DateTime, TimeZone as _, Utc};
+    use crate::test_support::FakeImages;
+    use chrono::{TimeZone as _, Utc};
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
-    use ferrofin_model::drawing::{ImageDimensions, ImageFormat};
     use ferrofin_model::dto::{MediaSourceInfo, UserItemDataDto};
     use ferrofin_model::entities_media::{ChapterInfo, MediaAttachment, MediaStream};
-    use ferrofin_traits::drawing::ProcessedImage;
     use ferrofin_traits::dto::DtoService as _;
 
     use crate::test_support::{
@@ -7049,77 +7055,6 @@ mod tests {
                 .expect("asks lock")
                 .extend_from_slice(parent_ids);
             Ok(parent_ids.iter().map(|&p| (p, 4)).collect())
-        }
-    }
-
-    /// An [`ImageProcessor`] fake: a deterministic cache tag per path, a fixed
-    /// 2:1 dimension.
-    #[derive(Default)]
-    struct FakeImages;
-
-    #[async_trait]
-    impl ImageProcessor for FakeImages {
-        fn supported_input_formats(&self) -> Vec<String> {
-            vec![]
-        }
-        fn supports_image_collage_creation(&self) -> bool {
-            false
-        }
-        fn supported_image_output_formats(&self) -> Vec<ImageFormat> {
-            vec![]
-        }
-        async fn get_image_dimensions(&self, _path: &str) -> Result<ImageDimensions, ServiceError> {
-            Ok(ImageDimensions {
-                width: 400,
-                height: 200,
-            })
-        }
-        async fn get_item_image_dimensions(
-            &self,
-            _item_id: Uuid,
-            _info: &ItemImageInfo,
-        ) -> Result<ImageDimensions, ServiceError> {
-            Ok(ImageDimensions {
-                width: 400,
-                height: 200,
-            })
-        }
-        async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
-            Ok("blur".into())
-        }
-        async fn get_image_blur_hash_sized(
-            &self,
-            _path: &str,
-            _image_dimensions: ImageDimensions,
-        ) -> Result<String, ServiceError> {
-            Ok("blur".into())
-        }
-        async fn get_image_cache_tag(
-            &self,
-            _item_id: Uuid,
-            image: &ItemImageInfo,
-        ) -> Result<Option<String>, ServiceError> {
-            Ok(Some(format!("tag:{}", image.path)))
-        }
-        async fn get_image_cache_tag_for_path(
-            &self,
-            _base_item_path: &str,
-            _image_date_modified: DateTime<Utc>,
-        ) -> Result<Option<String>, ServiceError> {
-            Ok(None)
-        }
-        async fn process_image(
-            &self,
-            _options: &ferrofin_traits::options::ImageProcessingOptions,
-        ) -> Result<ProcessedImage, ServiceError> {
-            Err(ServiceError::NotFound("process_image".into()))
-        }
-        async fn create_image_collage(
-            &self,
-            _options: &ferrofin_traits::options::ImageCollageOptions,
-            _library_name: Option<&str>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
     }
 

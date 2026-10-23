@@ -889,7 +889,8 @@ pub async fn build_app_state(
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
-        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users)),
+        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users))
+            .with_image_processor(Arc::clone(&image_processor)),
     );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
