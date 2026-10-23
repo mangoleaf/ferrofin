@@ -290,6 +290,20 @@ pub async fn build_app_state(
             .context("failed to persist resolved ffmpeg path")?;
     }
     let server_config = config_mgr.snapshot();
+    // `GetSortName` reads `SortRemoveWords` / `SortRemoveCharacters` /
+    // `SortReplaceCharacters` from the configuration on every call: install
+    // them now and again on each save, before the boot repairs, the scans
+    // and the request paths derive one. Two things ran earlier, in
+    // `open_database`, on Jellyfin's defaults: the migrations (whose SQLite
+    // sort functions are fixed on the defaults anyway), and the backfill of
+    // the NULL `SortName`s rows from before the persistence service derived
+    // them carry, which an item's next refresh re-derives on these rules.
+    ferrofin_util::sort_name::install_sort_rules(sort_rules(&server_config));
+    config_mgr.add_configuration_listener(Arc::new(|update| {
+        if let ferrofin_traits::configuration::ConfigurationUpdate::Server(config) = update {
+            ferrofin_util::sort_name::install_sort_rules(sort_rules(config));
+        }
+    }));
     let metadata_root = {
         let paths = Arc::clone(&paths);
         ferrofin_util::directory_path::DirectoryPath::live(move || {
@@ -824,6 +838,21 @@ pub async fn build_app_state(
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
         // back to when a tuner is not a transport stream).
         .with_encoder(Arc::clone(&media_encoder))
+        // A recording NFO's dates, in the `xbmcmetadata` options'
+        // `ReleaseDateFormat`, as the NFO savers write theirs.
+        .with_release_date_format({
+            let nfo = Arc::new(ferrofin_providers::xbmc::config::NfoConfigurationFile::new(
+                std::path::PathBuf::from(paths.user_configuration_directory_path())
+                    .join("named/xbmcmetadata.json"),
+            ));
+            Arc::new(move |date| {
+                ferrofin_providers::xbmc::dotnet_date::format_date_time(
+                    date,
+                    &nfo.current().release_date_format,
+                )
+                .unwrap_or_else(|| date.format("%Y-%m-%d").to_string())
+            })
+        })
         // Where a shared tuner stream buffers, where the DVR records, and where
         // the dashboard's Live TV options live (C# `GetTranscodePath()`,
         // `CommonApplicationPaths.DataPath`, the `livetv` named config).
@@ -860,7 +889,8 @@ pub async fn build_app_state(
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
-        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users)),
+        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users))
+            .with_image_processor(Arc::clone(&image_processor)),
     );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
@@ -939,7 +969,8 @@ pub async fn build_app_state(
             .with_playlists_path(playlists_path.clone())
             .with_user_root(user_root_store.clone())
             .with_scan_progress(scan_progress.clone())
-            .with_virtual_paths(virtual_paths.clone()),
+            .with_virtual_paths(virtual_paths.clone())
+            .with_server_configuration(Arc::clone(&config_trait)),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -1306,6 +1337,12 @@ pub async fn build_app_state(
     .with_display_specials_within_seasons({
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().display_specials_within_seasons
+    })
+    // The metadata editor's folder content-type overrides, read once per plan
+    // pass: a folder set to Movies or Shows resolves so from its next scan.
+    .with_content_types({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().content_types.clone()
     })
     // The saved `xbmcmetadata` options (ReleaseDateFormat, UserId) every NFO
     // sidecar is parsed with, re-read when the dashboard changes the file.
@@ -2448,6 +2485,8 @@ pub async fn build_app_state(
             virtual_folders: Some(Arc::clone(&virtual_folders)),
             trickplay: Some(me_trickplay),
             sessions: Some(me_sessions),
+            // Remux playlists are cut on the stored or extracted keyframes.
+            keyframes: Some(Arc::clone(&keyframe_repository)),
         },
     );
     let state = state
@@ -2803,6 +2842,18 @@ fn subscribe_intro_skipper(
             ferrofin_core::event_manager::consumer_done()
         }),
     );
+}
+
+/// The sort-name lists of `config` (`SortRemoveWords`, `SortRemoveCharacters`,
+/// `SortReplaceCharacters`), as every sort-name derivation reads them.
+fn sort_rules(
+    config: &ferrofin_model::configuration::ServerConfiguration,
+) -> ferrofin_util::sort_name::SortRules {
+    ferrofin_util::sort_name::SortRules {
+        remove_words: config.sort_remove_words.clone(),
+        remove_characters: config.sort_remove_characters.clone(),
+        replace_characters: config.sort_replace_characters.clone(),
+    }
 }
 
 /// The server's stable id (`ApplicationHost.SystemId`), persisted across

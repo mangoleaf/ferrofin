@@ -1595,15 +1595,17 @@ async fn check_parent_visibility(
     let (view_type, parent_id) = user_view_browse_context(&parent);
     let direct = user_view_uses_direct_items(view_type);
     if direct {
-        // These simple direct builders set their kind and recursive mode
-        // regardless of the request, then forward explicit collapse to SQL.
-        // Their automatic global grouping policy is intentionally absent.
-        if let Some(kind) = match view_type {
-            Some(CollectionType::Moviemovies) => Some(BaseItemKind::Movie),
-            Some(CollectionType::Tvshowseries) => Some(BaseItemKind::Series),
+        // These simple direct builders (`GetMovieMovies`, `GetTvSeries`,
+        // `GetBooks`) set their kinds and recursive mode regardless of the
+        // request, then forward explicit collapse to SQL. Their automatic
+        // global grouping policy is intentionally absent.
+        if let Some(kinds) = match view_type {
+            Some(CollectionType::Moviemovies) => Some(vec![BaseItemKind::Movie]),
+            Some(CollectionType::Tvshowseries) => Some(vec![BaseItemKind::Series]),
+            Some(CollectionType::books) => Some(vec![BaseItemKind::Book, BaseItemKind::AudioBook]),
             _ => None,
         } {
-            query.include_item_types = vec![kind];
+            query.include_item_types = kinds;
             query.recursive = true;
             query.user_root_children = false;
         }
