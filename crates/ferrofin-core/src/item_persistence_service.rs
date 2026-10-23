@@ -1268,6 +1268,85 @@ impl FerrofinItemPersistenceService {
         Ok(repaired)
     }
 
+    /// One-shot startup pass: dates the container rows older builds created
+    /// with dates missing, which [`Self::repair_named_item_rows`] does not
+    /// select: the `PlaylistsFolder` (provisioned with `DateCreated` only)
+    /// and the Collections `CollectionFolder` at `collections_path`. A library
+    /// is never selected: every library is a `CollectionFolder`, so the type
+    /// alone would take them all.
+    ///
+    /// Only NULL dates are filled, so a row Jellyfin wrote keeps its own.
+    /// `DateCreated` and `DateModified` come from the row's directory, as
+    /// `CreateRootFolder` dates a folder it creates, or are now when it cannot
+    /// be read; `DateLastSaved` is now.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under `container_dates_v1`.
+    /// Returns the number of rows repaired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the read or the transaction fails. The
+    /// marker is written inside the transaction, so a failure retries on the
+    /// next boot.
+    pub async fn repair_container_dates(
+        &self,
+        collections_path: &str,
+    ) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "container_dates_v1";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let type_name = |kind: BaseItemKind| {
+            stored_type_name(kind)
+                .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))
+        };
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "Id", "Path" FROM "BaseItems"
+               WHERE ("Type" = ?1 OR ("Type" = ?2 AND "Path" = ?3))
+                 AND ("DateCreated" IS NULL OR "DateModified" IS NULL
+                      OR "DateLastSaved" IS NULL)"#,
+        )
+        .bind(type_name(BaseItemKind::PlaylistsFolder)?)
+        .bind(type_name(BaseItemKind::CollectionFolder)?)
+        .bind(collections_path)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let now = chrono::Utc::now();
+        let mut dated = Vec::with_capacity(rows.len());
+        for (id, path) in rows {
+            let dir = match path {
+                Some(path) => tokio::fs::metadata(path).await.ok(),
+                None => None,
+            };
+            let (created, modified) = dir
+                .as_ref()
+                .map_or((now, now), crate::library_scan::created_and_modified);
+            dated.push((id, created, modified));
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut repaired: u64 = 0;
+        for (id, created, modified) in &dated {
+            let written = sqlx::query(
+                r#"UPDATE "BaseItems" SET "DateCreated" = COALESCE("DateCreated", ?2),
+                       "DateModified" = COALESCE("DateModified", ?3),
+                       "DateLastSaved" = COALESCE("DateLastSaved", ?4)
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .bind(datetime_to_db(*created))
+            .bind(datetime_to_db(*modified))
+            .bind(datetime_to_db(now))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            repaired += written.rows_affected();
+        }
+        Self::mark_repair_done_in(&mut tx, META_KEY).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(repaired)
+    }
+
     /// One-shot startup pass: recomputes `InheritedParentalRatingValue` /
     /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
     /// — Jellyfin's `MigrateRatingLevels` routine, as 12.2 re-dated it
@@ -2242,6 +2321,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         parts: bool,
     ) -> Result<usize, ServiceError> {
         copy_owned_video_metadata(self, owner_ids, (versions, parts)).await
+    }
+
+    async fn copy_owner_metadata_to_extras(
+        &self,
+        refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+    ) -> Result<usize, ServiceError> {
+        copy_extras_metadata(self, refreshes).await
     }
 
     async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
@@ -6391,7 +6477,8 @@ struct OwnedCopy {
     /// The row with the owner's metadata applied.
     row: BaseItemEntity,
     /// A local alternate version (the `Video.UpdateToRepositoryAsync` set);
-    /// else a stacked part (the `copyTitleMetadata` set).
+    /// else a stacked part or an extra (the `copyTitleMetadata` set, or the
+    /// dates alone).
     local: bool,
     /// Whether a `BaseItems` column changed.
     columns: bool,
@@ -6617,6 +6704,17 @@ async fn copy_owned_video_metadata(
     let copies = plan_owned_copies(&mut tx, owner_ids, which, localization).await?;
     write_owned_copies(&mut tx, &copies).await?;
     tx.commit().await.map_err(db_err)?;
+    relink_owned_copies(service, &copies).await?;
+    Ok(copies.len())
+}
+
+/// After [`write_owned_copies`] commits: re-links the genres and studios of
+/// the copies whose lists changed (`SaveItems` rewrites `ItemValues` with
+/// the row), and reports the rows as updated.
+async fn relink_owned_copies(
+    service: &FerrofinItemPersistenceService,
+    copies: &[OwnedCopy],
+) -> Result<(), ServiceError> {
     for copy in copies.iter().filter(|c| c.values) {
         if let Ok(id) = Uuid::parse_str(&copy.row.id) {
             service
@@ -6631,7 +6729,208 @@ async fn copy_owned_video_metadata(
         let rows: Vec<BaseItemEntity> = copies.iter().map(|c| c.row.clone()).collect();
         changed.record_updated(&rows);
     }
+    Ok(())
+}
+
+/// [`ItemPersistenceService::copy_owner_metadata_to_extras`]: decided on a
+/// reader first, so refreshes whose extras already match — every one on a
+/// quiet rescan — take no writer lock; decided again under the writer and
+/// written there.
+async fn copy_extras_metadata(
+    service: &FerrofinItemPersistenceService,
+    refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+) -> Result<usize, ServiceError> {
+    if refreshes.is_empty() {
+        return Ok(0);
+    }
+    let localization = service.localization.get().cloned();
+    let localization = localization.as_deref();
+    {
+        let mut conn = service.db.pool().acquire().await.map_err(db_err)?;
+        if plan_extra_copies(&mut conn, refreshes, localization)
+            .await?
+            .is_empty()
+        {
+            return Ok(0);
+        }
+    }
+    let mut tx = service
+        .db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    let copies = plan_extra_copies(&mut tx, refreshes, localization).await?;
+    write_owned_copies(&mut tx, &copies).await?;
+    tx.commit().await.map_err(db_err)?;
+    relink_owned_copies(service, &copies).await?;
     Ok(copies.len())
+}
+
+/// The primaries the refreshes stand for, each with how they reached its
+/// extras ([`plan_extra_copies`]): an owner that is a local version stands
+/// for its primary (`GetOwnedVersionIds`), and one that is a linked version
+/// for none (`Video.RefreshedOwnedItems` returns for any version).
+fn extras_groups(
+    refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+    rows: &HashMap<Uuid, BaseItemEntity>,
+) -> HashMap<Uuid, ExtrasGroup> {
+    use crate::video_versions::is_local_version_of;
+    let mut groups: HashMap<Uuid, ExtrasGroup> = HashMap::new();
+    for refresh in refreshes {
+        let Some(row) = rows.get(&refresh.owner) else {
+            continue;
+        };
+        let primary = match row
+            .primary_version_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        {
+            None => refresh.owner,
+            Some(primary) if is_local_version_of(row, primary) => primary,
+            Some(_) => continue,
+        };
+        let group = groups.entry(primary).or_insert_with(|| ExtrasGroup {
+            title: false,
+            found: Some(std::collections::HashSet::new()),
+        });
+        group.title |= refresh.changed;
+        match (&mut group.found, &refresh.found) {
+            (Some(all), Some(found)) => all.extend(found),
+            (found, _) => *found = None,
+        }
+    }
+    groups
+}
+
+/// The extras each of `primaries` maintains, keyed by it: those it owns and
+/// those its local versions own (one query on `OwnerId` for the primaries,
+/// and one for their versions only when there are any).
+async fn maintained_extras(
+    conn: &mut sqlx::SqliteConnection,
+    primaries: &[Uuid],
+) -> Result<Vec<(Uuid, BaseItemEntity)>, ServiceError> {
+    use crate::item_repository::select_item_rows_on;
+    use crate::video_versions::is_local_version_of;
+    let parse = |id: Option<&str>| id.and_then(|id| Uuid::parse_str(id).ok());
+    let mut extras: Vec<(Uuid, BaseItemEntity)> = Vec::new();
+    let mut versions: HashMap<Uuid, Uuid> = HashMap::new();
+    for row in select_item_rows_on(&mut *conn, r#""OwnerId""#, primaries).await? {
+        let Some(owner) = parse(row.owner_id.as_deref()) else {
+            continue;
+        };
+        if row.extra_type.is_some() {
+            extras.push((owner, row));
+        } else if is_local_version_of(&row, owner)
+            && let Ok(id) = Uuid::parse_str(&row.id)
+        {
+            versions.insert(id, owner);
+        }
+    }
+    if !versions.is_empty() {
+        let ids: Vec<Uuid> = versions.keys().copied().collect();
+        for row in select_item_rows_on(&mut *conn, r#""OwnerId""#, &ids).await? {
+            if row.extra_type.is_some()
+                && let Some(&primary) =
+                    parse(row.owner_id.as_deref()).and_then(|o| versions.get(&o))
+            {
+                extras.push((primary, row));
+            }
+        }
+    }
+    Ok(extras)
+}
+
+/// How a refresh reached one primary's extras ([`plan_extra_copies`]).
+struct ExtrasGroup {
+    /// Whether they take the title metadata, not only the dates.
+    title: bool,
+    /// The extras the refreshes found, when every one of them looked.
+    found: Option<std::collections::HashSet<Uuid>>,
+}
+
+/// The extras of the refreshed owners that differ from what their primary
+/// gives them ([`copy_extras_metadata`]'s reads): the owners, the primaries
+/// they stand for (an owner that is a local version stands for its primary,
+/// `GetOwnedVersionIds`), the rows those primaries own (their extras and
+/// local versions, one query on `OwnerId`), and — only when there are local
+/// versions — the extras those own. Each extra is planned as a part is: the
+/// `copyTitleMetadata` columns, or only the dates.
+async fn plan_extra_copies(
+    conn: &mut sqlx::SqliteConnection,
+    refreshes: &[ferrofin_traits::persistence::OwnerExtrasRefresh],
+    localization: Option<&dyn ferrofin_traits::localization::LocalizationManager>,
+) -> Result<Vec<OwnedCopy>, ServiceError> {
+    use crate::item_repository::select_item_rows_on;
+    use crate::video_versions::{copy_title_metadata, inherit_dates_from_owner};
+    let mut owner_ids: Vec<Uuid> = refreshes.iter().map(|r| r.owner).collect();
+    owner_ids.sort_unstable();
+    owner_ids.dedup();
+    let mut rows: HashMap<Uuid, BaseItemEntity> =
+        select_item_rows_on(&mut *conn, r#""Id""#, &owner_ids)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect();
+    let mut groups = extras_groups(refreshes, &rows);
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut primaries: Vec<Uuid> = groups.keys().copied().collect();
+    primaries.sort_unstable();
+    let missing: Vec<Uuid> = primaries
+        .iter()
+        .filter(|id| !rows.contains_key(id))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        rows.extend(
+            select_item_rows_on(&mut *conn, r#""Id""#, &missing)
+                .await?
+                .into_iter()
+                .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row))),
+        );
+    }
+    let extras = maintained_extras(conn, &primaries).await?;
+    // `extrasChanged`: the stored extras are not the ones found — one is
+    // gone (a new one is already stored, and marked `changed`).
+    for (primary, group) in &mut groups {
+        if let Some(found) = &group.found {
+            let stored: std::collections::HashSet<Uuid> = extras
+                .iter()
+                .filter(|(owner, _)| owner == primary)
+                .filter_map(|(_, row)| Uuid::parse_str(&row.id).ok())
+                .collect();
+            group.title |= stored != *found;
+        }
+    }
+    let mut copies = Vec::new();
+    for (primary, row) in extras {
+        let (Some(group), Some(owner)) = (groups.get(&primary), rows.get(&primary)) else {
+            continue;
+        };
+        let mut copy = OwnedCopy {
+            row: row.clone(),
+            local: false,
+            columns: false,
+            values: false,
+            provider_ids: None,
+            images: None,
+        };
+        copy.columns = if group.title {
+            copy_title_metadata(owner, &mut copy.row)
+        } else {
+            inherit_dates_from_owner(owner, &mut copy.row)
+        };
+        copy.values = copy.row.genres != row.genres || copy.row.studios != row.studios;
+        if let Some(localization) = localization {
+            copy.columns |= settle_rating_score(&mut copy.row, localization);
+        }
+        if copy.columns {
+            copies.push(copy);
+        }
+    }
+    Ok(copies)
 }
 
 /// The owned rows of `owner_ids` that differ from what their owner gives
@@ -6740,9 +7039,9 @@ async fn plan_owned_copies(
 
 /// Writes the planned copies on `tx`: for a local version only the columns
 /// `Video.UpdateToRepositoryAsync` copies (`Video.cs:704-726`), its provider
-/// ids and its images; for a part only the `copyTitleMetadata` columns and
-/// the dates (`BaseItem.cs:2805-2858`) — each with the parental score its
-/// ratings now give.
+/// ids and its images; for a part or an extra only the `copyTitleMetadata`
+/// columns and the dates (`BaseItem.cs:2805-2858`) — each with the parental
+/// score its ratings now give.
 async fn write_owned_copies(
     tx: &mut sqlx::SqliteConnection,
     copies: &[OwnedCopy],
@@ -10919,6 +11218,142 @@ mod tests {
                 .await
                 .date_created
                 .is_none()
+        );
+    }
+
+    /// The Playlists folder and the Collections library an older build
+    /// created get their missing dates from their directories, a stored date
+    /// is kept, a user library is left alone, and the pass runs once.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn the_container_date_repair_fills_only_missing_container_dates_once() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("date")
+                .with_timezone(&chrono::Utc)
+        };
+        // A directory written at `written` (and changed now), so its .NET
+        // creation time is the older of the two: `written`.
+        let dir = |name: &str, written: chrono::DateTime<chrono::Utc>| {
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(&path).expect("dir");
+            std::fs::File::open(&path)
+                .expect("open dir")
+                .set_modified(written.into())
+                .expect("set mtime");
+            path.to_string_lossy().into_owned()
+        };
+        let (playlists, collections, library) = (
+            Uuid::from_u128(0xD0A1),
+            Uuid::from_u128(0xD0A2),
+            Uuid::from_u128(0xD0A3),
+        );
+        let playlists_written = at("2020-01-02T03:04:05Z");
+        let collections_written = at("2021-06-07T08:09:10Z");
+        let collections_path = dir("collections", collections_written);
+        let movies_path = dir("movies", collections_written);
+        let playlists_path = dir("playlists", playlists_written);
+        // Playlists: the boot provisioning stored `DateCreated` only.
+        // Collections: `ensure_container` stored no date at all. Movies: a
+        // user library, undated, the same type and not the repair's to touch.
+        for (id, kind, name, path, created) in [
+            (
+                playlists,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                &playlists_path,
+                Some("2026-05-05 00:00:00.0000000"),
+            ),
+            (
+                collections,
+                BaseItemKind::CollectionFolder,
+                "Collections",
+                &collections_path,
+                None,
+            ),
+            (
+                library,
+                BaseItemKind::CollectionFolder,
+                "Movies",
+                &movies_path,
+                None,
+            ),
+        ] {
+            super::insert_named_item(&db, id, kind, name, true, None)
+                .await
+                .expect("row");
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "Path" = ?2, "DateCreated" = ?3,
+                       "DateModified" = NULL, "DateLastSaved" = NULL
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(path)
+            .bind(created)
+            .execute(db.writer())
+            .await
+            .expect("undated");
+        }
+
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let before = chrono::Utc::now();
+        assert_eq!(
+            service
+                .repair_container_dates(&collections_path)
+                .await
+                .expect("repair"),
+            2
+        );
+        let after = chrono::Utc::now();
+
+        let row = crate::test_support::fetch_item(&db, playlists).await;
+        assert_eq!(
+            row.date_created.map(|d| d.to_rfc3339()).as_deref(),
+            Some("2026-05-05T00:00:00+00:00"),
+            "a stored date is kept"
+        );
+        assert_eq!(row.date_modified, Some(playlists_written));
+        let saved = row.date_last_saved.expect("saved");
+        assert!((before..=after).contains(&saved), "{saved}");
+        let row = crate::test_support::fetch_item(&db, collections).await;
+        assert_eq!(row.date_created, Some(collections_written));
+        assert_eq!(row.date_modified, Some(collections_written));
+        let saved = row.date_last_saved.expect("saved");
+        assert!((before..=after).contains(&saved), "{saved}");
+        let row = crate::test_support::fetch_item(&db, library).await;
+        assert_eq!(
+            (row.date_created, row.date_modified, row.date_last_saved),
+            (None, None, None)
+        );
+
+        // Second boot: the marker skips the pass.
+        sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(collections))
+            .execute(db.writer())
+            .await
+            .expect("undated again");
+        assert_eq!(
+            service
+                .repair_container_dates(&collections_path)
+                .await
+                .expect("repair"),
+            0
+        );
+        assert_eq!(
+            db.meta_get("container_dates_v1")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
+        assert!(
+            crate::test_support::fetch_item(&db, collections)
+                .await
+                .date_last_saved
+                .is_none(),
+            "the marker kept the pass from writing"
         );
     }
 

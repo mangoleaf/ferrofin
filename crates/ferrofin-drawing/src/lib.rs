@@ -8,6 +8,7 @@ pub mod image_encoder;
 pub mod null_encoder;
 pub mod photo_provider;
 pub mod processor;
+mod splashscreen;
 
 pub use error::DrawingError;
 pub use image_encoder::ImageCrateEncoder;

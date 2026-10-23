@@ -1327,6 +1327,54 @@ pub fn get_subtitle_stream_index_for_ffmpeg(
     index.saturating_add(i32::try_from(hidden_before).unwrap_or(i32::MAX))
 }
 
+/// The VBR arguments for `encoder` at `bitrate` over `channels`, or `None`
+/// when the encoder has no VBR mode here and is encoded at `-b:a`. Port of
+/// `EncodingHelper.GetAudioVbrModeParam`, thresholds verbatim, chosen by the
+/// bitrate per channel.
+#[must_use]
+pub fn audio_vbr_mode_param(encoder: &str, bitrate: i32, channels: i32) -> Option<String> {
+    let per_channel = bitrate / channels.max(1);
+    if encoder.eq_ignore_ascii_case("libfdk_aac") {
+        let mode = match per_channel {
+            ..32_000 => 1,
+            32_000..48_000 => 2,
+            48_000..64_000 => 3,
+            64_000..96_000 => 4,
+            _ => 5,
+        };
+        return Some(format!("-vbr:a {mode}"));
+    }
+    if encoder.eq_ignore_ascii_case("libmp3lame") {
+        // lame's VBR is only good for a certain bitrate range; below and
+        // above it, ABR.
+        if per_channel > 48_000 && per_channel < 122_500 {
+            let quality = match per_channel {
+                ..64_000 => 6,
+                64_000..88_000 => 4,
+                88_000..112_000 => 2,
+                _ => 0,
+            };
+            return Some(format!("-qscale:a {quality}"));
+        }
+        return Some(format!("-abr:a 1 -b:a {bitrate}"));
+    }
+    if encoder.eq_ignore_ascii_case("aac_at") {
+        // aac_at's CVBR mode.
+        return Some(format!("-aac_at_mode:a 2 -b:a {bitrate}"));
+    }
+    if encoder.eq_ignore_ascii_case("libvorbis") {
+        let quality = match per_channel {
+            ..40_000 => 0,
+            40_000..56_000 => 2,
+            56_000..80_000 => 4,
+            80_000..112_000 => 6,
+            _ => 8,
+        };
+        return Some(format!("-qscale:a {quality}"));
+    }
+    None
+}
+
 /// Whether the encoded output would embed a burnt-in subtitle. Port of
 /// `ShouldEncodeSubtitle`.
 #[must_use]
@@ -2030,6 +2078,44 @@ mod tests {
     }
 
     // ----- is_copy_codec -----------------------------------------------------
+
+    /// `GetAudioVbrModeParam`'s modes, at each threshold's edges, by the
+    /// bitrate per channel. An encoder without one (libopus, the native aac
+    /// encoder) has none, and is encoded at `-b:a`.
+    #[rstest]
+    #[case::fdk_lowest("libfdk_aac", 62_000, 2, Some("-vbr:a 1"))]
+    #[case::fdk_32k("libfdk_aac", 64_000, 2, Some("-vbr:a 2"))]
+    #[case::fdk_48k("libfdk_aac", 96_000, 2, Some("-vbr:a 3"))]
+    #[case::fdk_64k("libfdk_aac", 128_000, 2, Some("-vbr:a 4"))]
+    #[case::fdk_96k("libfdk_aac", 192_000, 2, Some("-vbr:a 5"))]
+    #[case::lame_abr_low("libmp3lame", 96_000, 2, Some("-abr:a 1 -b:a 96000"))]
+    #[case::lame_q6("libmp3lame", 98_000, 2, Some("-qscale:a 6"))]
+    #[case::lame_q4("libmp3lame", 128_000, 2, Some("-qscale:a 4"))]
+    #[case::lame_q2("libmp3lame", 176_000, 2, Some("-qscale:a 2"))]
+    #[case::lame_q0("libmp3lame", 224_000, 2, Some("-qscale:a 0"))]
+    #[case::lame_abr_high("libmp3lame", 245_000, 2, Some("-abr:a 1 -b:a 245000"))]
+    #[case::lame_mono("libmp3lame", 64_000, 1, Some("-qscale:a 4"))]
+    #[case::aac_at("aac_at", 128_000, 2, Some("-aac_at_mode:a 2 -b:a 128000"))]
+    #[case::vorbis_q0("libvorbis", 78_000, 2, Some("-qscale:a 0"))]
+    #[case::vorbis_q2("libvorbis", 80_000, 2, Some("-qscale:a 2"))]
+    #[case::vorbis_q4("libvorbis", 112_000, 2, Some("-qscale:a 4"))]
+    #[case::vorbis_q6("libvorbis", 160_000, 2, Some("-qscale:a 6"))]
+    #[case::vorbis_q8("libvorbis", 224_000, 2, Some("-qscale:a 8"))]
+    #[case::case_insensitive("LIBMP3LAME", 128_000, 2, Some("-qscale:a 4"))]
+    #[case::zero_channels("libfdk_aac", 128_000, 0, Some("-vbr:a 5"))]
+    #[case::opus("libopus", 128_000, 2, None)]
+    #[case::native_aac("aac", 128_000, 2, None)]
+    fn audio_vbr_mode_param_picks_the_encoders_mode(
+        #[case] encoder: &str,
+        #[case] bitrate: i32,
+        #[case] channels: i32,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            audio_vbr_mode_param(encoder, bitrate, channels).as_deref(),
+            expected
+        );
+    }
 
     #[test]
     fn is_copy_codec_matches_copy_case_insensitively() {

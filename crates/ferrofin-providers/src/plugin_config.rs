@@ -116,6 +116,23 @@ pub struct TmdbConfig {
     pub hide_missing_cast_members: bool,
     /// Skip crew members with no profile image.
     pub hide_missing_crew_members: bool,
+    /// Create virtual episodes for episodes TMDb lists that have not aired
+    /// yet (`ImportUnairedEpisodes`, `TmdbMissingEpisodeProvider`).
+    pub import_unaired_episodes: bool,
+    /// Create virtual episodes for aired episodes the library lacks
+    /// (`ImportMissingEpisodes`).
+    pub import_missing_episodes: bool,
+    /// Include specials (season 0) in both (`ImportSpecials`).
+    pub import_specials: bool,
+    /// The libraries the two options run for, by item id in `N` form
+    /// (`EnabledMissingEpisodeLibraries`); none opted in by default.
+    pub enabled_missing_episode_libraries: Vec<String>,
+    /// How often `TmdbUpcomingEpisodesTask` re-checks TMDb, in days
+    /// (`MissingEpisodeRefreshIntervalDays`, C# default 7).
+    pub missing_episode_refresh_interval_days: i32,
+    /// With missing episodes off, how many days a recently aired episode's
+    /// placeholder stays (`UpcomingEpisodeGracePeriodDays`, C# default 7).
+    pub upcoming_episode_grace_period_days: i32,
     /// The image CDN size segment for posters; empty/absent means `original`
     /// (`TmdbClientManager.GetUrl`).
     pub poster_size: Option<String>,
@@ -148,6 +165,13 @@ impl Default for TmdbConfig {
             max_crew_members: 15,
             hide_missing_cast_members: false,
             hide_missing_crew_members: false,
+            import_unaired_episodes: false,
+            import_missing_episodes: false,
+            import_specials: false,
+            enabled_missing_episode_libraries: Vec::new(),
+            // `PluginConfiguration.cs:73,81`.
+            missing_episode_refresh_interval_days: 7,
+            upcoming_episode_grace_period_days: 7,
             poster_size: None,
             backdrop_size: None,
             logo_size: None,

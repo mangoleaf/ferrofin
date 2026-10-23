@@ -6,7 +6,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::{ImageSavingConvention, XbmcMetadataOptions};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::ItemRepository;
 use ferrofin_util::directory_path::DirectoryPath;
@@ -60,6 +60,9 @@ pub struct ImageFileSaver {
     folders: Arc<dyn VirtualFolderManager>,
     configuration: Arc<dyn ServerConfigurationManager>,
     metadata: DirectoryPath,
+    /// Brackets the files written beside the media (`ILibraryMonitor`).
+    /// `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl ImageFileSaver {
@@ -76,7 +79,18 @@ impl ImageFileSaver {
             folders,
             configuration,
             metadata,
+            self_writes: None,
         }
+    }
+
+    /// Brackets each file this saver writes on `guard`, as upstream does
+    /// (`ReportFileSystemChangeBeginning`/`Complete` in `ImageSaver.SaveImageToLocation` and its delete of the previous image), so the
+    /// library monitor takes it for the server's own write. Called once by
+    /// the composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Applies the saved destination to a newly acquired or manually uploaded image.
@@ -179,18 +193,25 @@ impl ImageFileSaver {
         })
     }
 
-    /// Whether the item's own path lies in the server's data or internal
-    /// metadata directory (a genre's `{metadata}/Genre/<name>`, a playlist in
-    /// `{data}/playlists`) rather than in a media library. The check is
-    /// lexical, so a path it cannot match falls back to the library's setting.
+    /// Whether the item's own path lies in one of the server's own
+    /// directories rather than in a media library: the data directory (a
+    /// playlist in `{data}/playlists`, a box set in `{data}/collections`), the
+    /// internal metadata directory (a genre's `{metadata}/Genre/<name>`, a
+    /// person's `{metadata}/People/…`) or the libraries' root folder (a
+    /// library's own `root/default/<name>`). The check is lexical, so a path
+    /// it cannot match falls back to the library's setting.
     fn in_server_directories(&self, item: &BaseItemEntity) -> bool {
         let Some(path) = item.path.as_deref().map(Path::new) else {
             return false;
         };
         let paths = self.configuration.application_paths();
-        [paths.data_path(), paths.internal_metadata_path()]
-            .iter()
-            .any(|root| !root.is_empty() && path.starts_with(root))
+        [
+            paths.data_path(),
+            paths.internal_metadata_path(),
+            paths.root_folder_path(),
+        ]
+        .iter()
+        .any(|root| !root.is_empty() && path.starts_with(root))
     }
 
     async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {
@@ -208,20 +229,29 @@ impl ImageFileSaver {
         } else {
             None
         };
-        // `IsSaveLocalMetadataEnabled`: a genre, music genre or playlist
-        // overrides it to true (`Genre.cs:55`, `MusicGenre.cs:63`,
-        // `Playlist.cs:126`), so its artwork lives beside its own path, out of
-        // reach of the dynamic image providers. Accepted divergence: the
-        // override holds only while that path is in the server's own data or
-        // metadata directory. A playlist file or folder inside a media
-        // library follows the library's "Save artwork into media folders",
-        // so nothing is written into a media folder the library did not open
-        // to it. Upstream's other overrides (Person, Studio, Year, BoxSet, a
-        // by-name MusicArtist, CollectionFolder, UserView) are not ported yet,
-        // so their downloaded art stays in the internal metadata folder.
+        // `IsSaveLocalMetadataEnabled`: these kinds override it to true
+        // (`Genre.cs:55`, `MusicGenre.cs:63`, `Playlist.cs:126`, `Person.cs:89`,
+        // `Studio.cs:62`, `Year.cs:54`, `BoxSet.cs:112`, `MusicArtist.cs:106`
+        // when accessed by name, `CollectionFolder.cs:196`), so their artwork
+        // lives beside their own path, out of reach of the dynamic image
+        // providers. Accepted divergence (owner decision 2026-10-17): the
+        // override holds only while that path is in the server's own
+        // directories. A playlist file, a box-set folder or an artist folder
+        // inside a media library follows the library's "Save artwork into
+        // media folders", so nothing is written into a media folder the
+        // library did not open to it. `UserView` and `BasePluginFolder` are
+        // not given the override here (see gl-598).
         if !(matches!(
             policy::short_kind(item),
-            "Genre" | "MusicGenre" | "Playlist"
+            "Genre"
+                | "MusicGenre"
+                | "Playlist"
+                | "Person"
+                | "Studio"
+                | "Year"
+                | "BoxSet"
+                | "MusicArtist"
+                | "CollectionFolder"
         ) && self.in_server_directories(item))
         {
             let folders = self.folders.get_virtual_folders().await?;
@@ -310,14 +340,22 @@ impl ImageFileSaver {
         let destination = paths[0].clone();
         let duplicate = paths.len() > 1;
         let old_path = old.clone();
+        let self_writes = self.self_writes.clone();
         let (copied, cleanup) = tokio::task::spawn_blocking(move || {
-            match copy_images(&source, &paths, old.as_deref()) {
+            let self_writes = self_writes.as_ref();
+            match copy_images(&source, &paths, old.as_deref(), self_writes) {
                 Ok(cleanup) => (Ok(()), cleanup),
                 Err(error) => {
                     // The retained internal image is the new image, so the
                     // replaced file still goes.
                     let cleanup = (!duplicate && source.is_file())
-                        .then(|| remove_previous(old.as_deref(), std::slice::from_ref(&source)))
+                        .then(|| {
+                            remove_previous(
+                                old.as_deref(),
+                                std::slice::from_ref(&source),
+                                self_writes,
+                            )
+                        })
                         .and_then(Result::err);
                     (Err(error), cleanup)
                 }
@@ -363,18 +401,25 @@ fn shared(path: &Path) -> bool {
 /// Writes every destination, then removes the replaced file and the staged
 /// source. `Err` means a destination could not be written; `Ok(Some(_))` means
 /// the images were published but the previous file could not be removed.
+/// Each destination written is bracketed on `self_writes` with its folder, as
+/// `ImageSaver.SaveImageToLocation` brackets both.
 fn copy_images(
     source: &Path,
     paths: &[PathBuf],
     old: Option<&Path>,
+    self_writes: Option<&Arc<dyn SelfWriteGuard>>,
 ) -> std::io::Result<Option<std::io::Error>> {
     let bytes = std::fs::read(source)?;
     for path in paths {
         if path != source && std::fs::read(path).ok().as_deref() != Some(bytes.as_slice()) {
+            let _file = SelfWrite::begin(self_writes, path.to_string_lossy());
+            let _folder = path
+                .parent()
+                .map(|folder| SelfWrite::begin(self_writes, folder.to_string_lossy()));
             ferrofin_util::file_helper::atomic_write_media(path, &bytes)?;
         }
     }
-    let cleanup = remove_previous(old, paths).err();
+    let cleanup = remove_previous(old, paths, self_writes).err();
     if !paths.iter().any(|path| path == source) && !shared(source) {
         let _ = std::fs::remove_file(source);
     }
@@ -383,8 +428,13 @@ fn copy_images(
 
 /// `ImageSaver`'s "Delete the current path": skipped when any saved path equals
 /// it ignoring case (`OrdinalIgnoreCase`), and only "file not found" is
-/// forgiven — every other failure is returned.
-fn remove_previous(old: Option<&Path>, paths: &[PathBuf]) -> std::io::Result<()> {
+/// forgiven — every other failure is returned. The delete is bracketed on
+/// `self_writes`, as upstream brackets it.
+fn remove_previous(
+    old: Option<&Path>,
+    paths: &[PathBuf],
+    self_writes: Option<&Arc<dyn SelfWriteGuard>>,
+) -> std::io::Result<()> {
     let Some(old) = old else {
         return Ok(());
     };
@@ -397,6 +447,7 @@ fn remove_previous(old: Option<&Path>, paths: &[PathBuf]) -> std::io::Result<()>
     if paths.iter().any(same) {
         return Ok(());
     }
+    let _write = SelfWrite::begin(self_writes, old.to_string_lossy());
     match std::fs::remove_file(old) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
@@ -406,6 +457,63 @@ fn remove_previous(old: Option<&Path>, paths: &[PathBuf]) -> std::io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A [`SelfWriteGuard`] recording each call, in order.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl SelfWriteGuard for Recording {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// `ImageSaver` brackets each image it writes with its folder
+    /// (`SaveImageToLocation`), and the previous image it deletes.
+    #[test]
+    fn publishing_brackets_each_destination_its_folder_and_the_replaced_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("internal.png");
+        let folder = tmp.path().join("Movie");
+        std::fs::create_dir(&folder).unwrap();
+        let old = folder.join("folder.jpg");
+        let dest = folder.join("folder.png");
+        std::fs::write(&source, b"art").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        let recording = Arc::new(Recording::default());
+        let guard: Arc<dyn SelfWriteGuard> = recording.clone();
+        copy_images(
+            &source,
+            std::slice::from_ref(&dest),
+            Some(&old),
+            Some(&guard),
+        )
+        .unwrap();
+        let (dest, folder, old) = (dest.display(), folder.display(), old.display());
+        assert_eq!(
+            recording.calls(),
+            [
+                format!("begin {dest}"),
+                format!("begin {folder}"),
+                format!("complete {folder} false"),
+                format!("complete {dest} false"),
+                format!("begin {old}"),
+                format!("complete {old} false"),
+            ]
+        );
+    }
+
     #[test]
     fn publishing_replaces_old_extension_and_preserves_identical_destination_mtime() {
         let tmp = tempfile::tempdir().unwrap();
@@ -415,7 +523,7 @@ mod tests {
         std::fs::write(&source, b"art").unwrap();
         std::fs::write(&old, b"old").unwrap();
         assert!(
-            copy_images(&source, std::slice::from_ref(&dest), Some(&old))
+            copy_images(&source, std::slice::from_ref(&dest), Some(&old), None)
                 .unwrap()
                 .is_none()
         );
@@ -424,7 +532,7 @@ mod tests {
         assert!(!old.exists());
         let modified = std::fs::metadata(&dest).unwrap().modified().unwrap();
         std::fs::write(&source, b"art").unwrap();
-        copy_images(&source, std::slice::from_ref(&dest), None).unwrap();
+        copy_images(&source, std::slice::from_ref(&dest), None, None).unwrap();
         assert_eq!(
             std::fs::metadata(&dest).unwrap().modified().unwrap(),
             modified
@@ -444,7 +552,8 @@ mod tests {
         let stuck = tmp.path().join("old.jpg");
         std::fs::create_dir(&stuck).unwrap();
         std::fs::write(stuck.join("keep"), b"x").unwrap();
-        let cleanup = copy_images(&source, std::slice::from_ref(&dest), Some(&stuck)).unwrap();
+        let cleanup =
+            copy_images(&source, std::slice::from_ref(&dest), Some(&stuck), None).unwrap();
         assert!(cleanup.is_some());
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert!(!source.exists());
@@ -452,7 +561,7 @@ mod tests {
         std::fs::write(&source, b"new").unwrap();
         let missing = tmp.path().join("gone.jpg");
         assert!(
-            copy_images(&source, std::slice::from_ref(&dest), Some(&missing))
+            copy_images(&source, std::slice::from_ref(&dest), Some(&missing), None)
                 .unwrap()
                 .is_none()
         );
@@ -461,7 +570,7 @@ mod tests {
         let alias = tmp.path().join("FOLDER.PNG");
         std::fs::write(&alias, b"old").unwrap();
         assert!(
-            copy_images(&source, std::slice::from_ref(&dest), Some(&alias))
+            copy_images(&source, std::slice::from_ref(&dest), Some(&alias), None)
                 .unwrap()
                 .is_none()
         );
@@ -477,7 +586,7 @@ mod tests {
         std::fs::write(&source, b"new").unwrap();
         std::fs::write(&old, b"old").unwrap();
         std::fs::create_dir(&blocked).unwrap();
-        assert!(copy_images(&source, std::slice::from_ref(&blocked), Some(&old)).is_err());
+        assert!(copy_images(&source, std::slice::from_ref(&blocked), Some(&old), None).is_err());
         assert!(source.exists());
         assert!(old.exists());
         let shared = tmp.path().join("album-covers/album/content.png");
@@ -487,7 +596,7 @@ mod tests {
             tmp.path().join("extrafanart/fanart1.png"),
             tmp.path().join("extrathumbs/thumb1.png"),
         ];
-        copy_images(&shared, &outputs, None).unwrap();
+        copy_images(&shared, &outputs, None, None).unwrap();
         assert!(shared.exists());
         for output in outputs {
             assert_eq!(std::fs::read(output).unwrap(), b"shared");

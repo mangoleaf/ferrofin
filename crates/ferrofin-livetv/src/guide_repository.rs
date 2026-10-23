@@ -404,6 +404,48 @@ pub async fn existing_config_id(
         .map_err(db_err)
 }
 
+/// Stores a listings provider's row (`Type`, `Path` and the JSON `Data`),
+/// first renaming the stored row to `id` when `renamed_from` is the same id
+/// spelled differently.
+///
+/// The configuration half of `ListingsManager.SaveListingProvider`, whose
+/// `config.ListingProviders[index] = info` keeps the posted spelling of a
+/// matched id. One transaction, so a failed write leaves the old row as it was.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub async fn store_listing_provider(
+    db: &Database,
+    renamed_from: Option<&str>,
+    id: &str,
+    provider_type: &str,
+    path: &str,
+    data: &str,
+) -> Result<(), ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    if let Some(stored) = renamed_from.filter(|stored| *stored != id) {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvListingProviders" SET "Id" = ?1 WHERE "Id" = ?2"#)
+            .bind(id)
+            .bind(stored)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
+           ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
+    )
+    .bind(id)
+    .bind(provider_type)
+    .bind(path)
+    .bind(data)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)
+}
+
 /// The tuner-facing external id of one channel, or `None` when the lineup does
 /// not hold it (or holds it empty, as a row written before migration 0023).
 ///

@@ -204,7 +204,8 @@ impl ServerConfigurationManager for FontConfig {
         &self,
     ) -> Result<std::sync::Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError>
     {
-        unimplemented!("unused")
+        // Read by the response-time layer on every request.
+        Ok(std::sync::Arc::default())
     }
     async fn update_configuration(
         &self,

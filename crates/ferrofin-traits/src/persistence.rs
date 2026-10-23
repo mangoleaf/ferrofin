@@ -649,6 +649,21 @@ pub trait ItemRepository: Send + Sync {
         Ok(self.get_query_filters_legacy(filter).await?.years)
     }
 
+    /// Gets the tag names of the matching items, one per clean value, in value
+    /// order — the one facet `/Items/Filters2` needs from the legacy set. See
+    /// [`LibraryManager::get_tag_names`].
+    ///
+    /// The default reads the whole legacy filter aggregate; an implementation
+    /// that can answer the tags alone should override this.
+    ///
+    /// [`LibraryManager::get_tag_names`]: crate::library::LibraryManager::get_tag_names
+    async fn get_tag_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(filter).await?.tags)
+    }
+
     /// Reports whether all children of `id` are played for the given user.
     async fn get_is_played(
         &self,
@@ -885,6 +900,40 @@ pub trait ItemPersistenceService: Send + Sync {
         parts: bool,
     ) -> Result<usize, ServiceError> {
         let _ = (owner_ids, versions, parts);
+        Ok(0)
+    }
+
+    /// Gives the extras of each refreshed owner what its refresh gives them
+    /// upstream (`BaseItem.RefreshExtras`), and returns how many extras were
+    /// written. An owner's extras are those it owns (`OwnerId`, with an
+    /// `ExtraType`) and those its local alternate versions own, all of which
+    /// its primary maintains (`Video.GetOwnedVersionIds`) and whose metadata
+    /// they take; an alternate version linked rather than local refreshes no
+    /// extras (`Video.RefreshedOwnedItems`).
+    ///
+    /// - When a refresh of the group [`changed`](OwnerExtrasRefresh::changed)
+    ///   its extras or ran in full, or found fewer than are stored (one is
+    ///   gone), every extra takes the title metadata: genres, studios,
+    ///   production locations, community and critic rating, overview,
+    ///   official and custom rating, and the year and premiere date the owner
+    ///   has (`RefreshMetadataForOwnedItem`'s `copyTitleMetadata`).
+    /// - Otherwise each takes only the owner's year and premiere date
+    ///   (`InheritDatesFromOwner`), which an owner often learns after its
+    ///   extras were created.
+    ///
+    /// Each written row's parental score follows the ratings it was given,
+    /// and its genre and studio links follow its genres and studios. Only a
+    /// row that differs is written, so a quiet rescan writes nothing. The
+    /// default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn copy_owner_metadata_to_extras(
+        &self,
+        refreshes: &[OwnerExtrasRefresh],
+    ) -> Result<usize, ServiceError> {
+        let _ = refreshes;
         Ok(0)
     }
 
@@ -2192,6 +2241,21 @@ pub struct ItemPathRow {
     /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
     /// for nothing else — an owned part or alternate version has none.
     pub extra_type: Option<i32>,
+}
+
+/// An owner whose extras a refresh reached
+/// ([`ItemPersistenceService::copy_owner_metadata_to_extras`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerExtrasRefresh {
+    /// The owner: a primary item, or one of its local alternate versions (an
+    /// extra is owned by the version it is named after).
+    pub owner: Uuid,
+    /// The extras of `owner` the refresh found, when it looked for all of
+    /// them (`FindExtras`, run by a library scan); `None` when it did not.
+    pub found: Option<Vec<Uuid>>,
+    /// Whether the refresh created, re-owned or renamed one of them, or
+    /// ran in full (`FullRefresh` or "Replace all metadata").
+    pub changed: bool,
 }
 
 /// One stored season with no folder of its own

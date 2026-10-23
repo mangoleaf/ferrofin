@@ -29,7 +29,9 @@ use ferrofin_model::providers::{
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ItemTypeLookup};
+use ferrofin_traits::persistence::{
+    ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh,
+};
 use ferrofin_traits::providers::{
     GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
     ProviderManager, RefreshPriority, RemoteSearchRequest,
@@ -2853,6 +2855,35 @@ impl LocalProviderManager {
                 tracing::warn!(%item_id, %err, "failed to persist cast/crew");
             }
         }
+        // `BaseItem.RefreshExtras`, which every refresh of an owner runs: a
+        // refresh in full gives its extras its title metadata, any other its
+        // dates. This refresh does not look for them (`found: None`). Best
+        // effort, as the scan's copy is: the row is already saved.
+        let parent = match row
+            .parent_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        {
+            Some(parent) if searches_folder_for_extras(&row) => {
+                items.retrieve_item(parent).await.ok().flatten()
+            }
+            _ => None,
+        };
+        if let Some(store) = &self.image_store
+            && searches_folder_for_extras(&row)
+            && !parent.is_some_and(|parent| leaves_extras_to(&row, &parent))
+            && let Err(err) = store
+                .copy_owner_metadata_to_extras(&[OwnerExtrasRefresh {
+                    owner: item_id,
+                    found: None,
+                    changed: request.options.replace_all_metadata
+                        || request.options.metadata_refresh_mode
+                            == MetadataRefreshMode::FullRefresh,
+                }])
+                .await
+        {
+            tracing::warn!(%item_id, %err, "could not copy the item's metadata to its extras");
+        }
         // What changed: the row's metadata beats an image save, which beats
         // nothing — the closest single value to the C# `ItemUpdateType` flags.
         let update = if metadata_changed
@@ -4423,6 +4454,55 @@ pub(crate) fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     ))
 }
 
+/// Whether a refresh of `row` searches its folder for extras
+/// (`BaseItem.SearchesContainingFolderForExtras`): a file item with a parent
+/// (`SupportsOwnedItems`), not in a mixed folder, and neither a library root
+/// (`ICollectionFolder`: a library, the playlists folder) nor a plain
+/// folder; an episode only when it owns videos (`Episode.SupportsOwnedItems`),
+/// never a song or an audiobook (`Audio.SupportsOwnedItems`), and never a
+/// version of another video (`Video.RefreshedOwnedItems` returns for one).
+fn searches_folder_for_extras(row: &BaseItemEntity) -> bool {
+    let kind = short_kind(row);
+    row.path
+        .as_deref()
+        .is_some_and(|path| !path.contains("://"))
+        && row.parent_id.is_some()
+        && row.primary_version_id.is_none()
+        && !row.is_in_mixed_folder
+        && !matches!(
+            kind,
+            "CollectionFolder"
+                | "UserRootFolder"
+                | "AggregateFolder"
+                | "PlaylistsFolder"
+                | "Folder"
+                | "Audio"
+                | "AudioBook"
+        )
+        && (kind != "Episode" || owns_videos(row.data.as_deref()))
+}
+
+/// The container half of `BaseItem.RefreshedOwnedItems`: an item that sits
+/// in the very folder of a parent folder searching it for extras leaves them
+/// to that parent (an episode in its season's folder).
+fn leaves_extras_to(row: &BaseItemEntity, parent: &BaseItemEntity) -> bool {
+    let containing = if row.is_folder {
+        row.path.as_deref()
+    } else {
+        row.path
+            .as_deref()
+            .and_then(|path| std::path::Path::new(path).parent())
+            .and_then(std::path::Path::to_str)
+    };
+    parent.is_folder
+        && searches_folder_for_extras(parent)
+        && parent
+            .path
+            .as_deref()
+            .zip(containing)
+            .is_some_and(|(parent, containing)| parent.eq_ignore_ascii_case(containing))
+}
+
 /// Whether a video's `Data` lists other parts (`AdditionalParts`) or local
 /// alternate versions (`LocalAlternateVersions`) — the owned videos a save
 /// of it copies metadata to. Anything else owns none, and costs no query.
@@ -5104,6 +5184,7 @@ mod tests {
         order_by_language_descending, parse_ymd, wants_fetch,
     };
     use ferrofin_model::entities::MetadataField;
+    use ferrofin_traits::persistence::OwnerExtrasRefresh;
     use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
 
     use async_trait::async_trait;
@@ -7178,6 +7259,8 @@ mod tests {
         touched: std::sync::Mutex<Vec<Uuid>>,
         /// Each `copy_metadata_to_owned_videos` call: owners, versions, parts.
         copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
+        /// Each refresh `copy_owner_metadata_to_extras` was asked for.
+        extras_copied: std::sync::Mutex<Vec<OwnerExtrasRefresh>>,
     }
 
     #[async_trait]
@@ -7369,6 +7452,16 @@ mod tests {
                 .push((owner_ids.to_vec(), versions, parts));
             Ok(0)
         }
+        async fn copy_owner_metadata_to_extras(
+            &self,
+            refreshes: &[OwnerExtrasRefresh],
+        ) -> Result<usize, ServiceError> {
+            self.extras_copied
+                .lock()
+                .expect("lock")
+                .extend_from_slice(refreshes);
+            Ok(0)
+        }
         async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
             assert!(
                 self.saved
@@ -7458,6 +7551,106 @@ mod tests {
                 assert!(copied.is_empty(), "{copied:?}");
             }
         }
+    }
+
+    /// Every refresh of an owner reaches its extras (`BaseItem.RefreshExtras`):
+    /// a full one gives them its title metadata, any other only its dates.
+    /// This refresh does not look for them, so it reports none found. An
+    /// item that searches no folder for extras (here one with no path) asks
+    /// nothing.
+    #[tokio::test]
+    async fn a_refresh_of_an_owner_reaches_its_extras() {
+        let default = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::Default,
+            ..MetadataRefreshOptions::default()
+        };
+        for (options, changed) in [(full_metadata_refresh(), true), (default, false)] {
+            let (_server, tmdb) = tmdb_with_decoy_search().await;
+            let store = Arc::new(RecordingStore::default());
+            let mut stored = row("Movies.BoxSet", "Matrix");
+            stored.path = Some("/data/collections/Matrix [boxset]".to_owned());
+            stored.parent_id = Some(Uuid::new_v4().simple().to_string());
+            let (item_id, mgr) = box_set_manager(stored, tmdb, Arc::clone(&store));
+            mgr.refresh_full_item(item_id, &options)
+                .await
+                .expect("refresh");
+            assert_eq!(
+                *store.extras_copied.lock().expect("lock"),
+                [OwnerExtrasRefresh {
+                    owner: item_id,
+                    found: None,
+                    changed,
+                }]
+            );
+        }
+        let (_server, tmdb) = tmdb_with_decoy_search().await;
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) =
+            box_set_manager(row("Movies.BoxSet", "Matrix"), tmdb, Arc::clone(&store));
+        mgr.refresh_full_item(item_id, &full_metadata_refresh())
+            .await
+            .expect("refresh");
+        assert!(store.extras_copied.lock().expect("lock").is_empty());
+    }
+
+    /// `SearchesContainingFolderForExtras` and the container rule of
+    /// `RefreshedOwnedItems`, arm by arm.
+    #[test]
+    fn which_refreshes_search_their_folder_for_extras() {
+        let item = |kind: &str, path: Option<&str>| {
+            let mut row = row(&format!("MediaBrowser.Controller.Entities.{kind}"), "x");
+            row.path = path.map(ToOwned::to_owned);
+            row.parent_id = Some(Uuid::new_v4().simple().to_string());
+            row
+        };
+        let parts = Some(r#"{"AdditionalParts":["/tv/S/S01E01-part2.mkv"]}"#.to_owned());
+        assert!(super::searches_folder_for_extras(&item(
+            "TV.Season",
+            Some("/tv/S/Season 1")
+        )));
+        assert!(!super::searches_folder_for_extras(&item(
+            "TV.Episode",
+            Some("/tv/S/e.mkv")
+        )));
+        let mut stacked = item("TV.Episode", Some("/tv/S/Season 1/S01E01-part1.mkv"));
+        stacked.data.clone_from(&parts);
+        assert!(super::searches_folder_for_extras(&stacked));
+        for kind in [
+            "Audio.Audio",
+            "AudioBook",
+            "Folder",
+            "CollectionFolder",
+            "UserRootFolder",
+            "AggregateFolder",
+            "PlaylistsFolder",
+        ] {
+            assert!(
+                !super::searches_folder_for_extras(&item(kind, Some("/m/x"))),
+                "{kind}"
+            );
+        }
+        assert!(!super::searches_folder_for_extras(&item("TV.Season", None)));
+        assert!(!super::searches_folder_for_extras(&item(
+            "TV.Season",
+            Some("http://x/s")
+        )));
+        let mut mixed = item("TV.Season", Some("/tv/S/Season 1"));
+        mixed.is_in_mixed_folder = true;
+        assert!(!super::searches_folder_for_extras(&mixed));
+        let mut orphan = item("TV.Season", Some("/tv/S/Season 1"));
+        orphan.parent_id = None;
+        assert!(!super::searches_folder_for_extras(&orphan));
+        let mut version = item("Movie", Some("/m/F/F - 4K.mkv"));
+        version.primary_version_id = Some(Uuid::new_v4().simple().to_string());
+        assert!(!super::searches_folder_for_extras(&version));
+
+        // An episode in its season's own folder leaves the extras there to it.
+        let mut season = item("TV.Season", Some("/tv/S/Season 1"));
+        season.is_folder = true;
+        assert!(super::leaves_extras_to(&stacked, &season));
+        let mut series = item("TV.Series", Some("/tv/S"));
+        series.is_folder = true;
+        assert!(!super::leaves_extras_to(&stacked, &series));
     }
 
     /// A mock TMDB where the collection search points at box set 999 ("Wrong

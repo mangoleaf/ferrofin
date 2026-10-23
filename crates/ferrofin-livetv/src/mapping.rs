@@ -36,7 +36,8 @@ pub struct EpgChannel {
     pub name: String,
     /// The guide's channel number, or [`id`](Self::id) when it carries none.
     pub number: String,
-    /// The guide's channel logo (`<icon src>`), which
+    /// The guide's channel logo (an XMLTV `<icon src>`, a Schedules Direct
+    /// station's logo), which
     /// `ListingsManager.AddMetadata` gives a tuner channel matched to it.
     pub image_url: Option<String>,
 }
@@ -341,15 +342,22 @@ fn strip_schedules_direct(tuner_channel_id: &str) -> String {
     if find_ordinal_ignore_case(tuner_channel_id, SCHEDULES_DIRECT_SUFFIX).is_none() {
         return tuner_channel_id.to_owned();
     }
-    // `Replace(..., OrdinalIgnoreCase)` — every occurrence, whatever its case.
-    let mut out = String::with_capacity(tuner_channel_id.len());
-    let mut rest = tuner_channel_id;
+    without_schedules_direct_suffix(tuner_channel_id)
+        .trim_start_matches('I')
+        .to_owned()
+}
+
+/// `Replace(".json.schedulesdirect.org", "", OrdinalIgnoreCase)`: every
+/// occurrence of the Schedules Direct station-id suffix, whatever its case.
+pub(crate) fn without_schedules_direct_suffix(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    let mut rest = id;
     while let Some((at, end)) = find_ordinal_ignore_case(rest, SCHEDULES_DIRECT_SUFFIX) {
         out.push_str(&rest[..at]);
         rest = &rest[end..];
     }
     out.push_str(rest);
-    out.trim_start_matches('I').to_owned()
+    out
 }
 
 #[cfg(test)]
