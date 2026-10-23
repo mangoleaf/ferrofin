@@ -291,12 +291,10 @@ async fn get_endpoint_info(
 /// [`ferrofin_networking::NetworkManager::is_in_local_network`].
 ///
 /// This is `NetworkManager`'s *fallback* subnet set, without the configured
-/// `LocalNetworkSubnets` / excluded-subnet list. See
-/// [`crate::auth::RequireLocalAccessOrAdmin`] for what that costs.
-///
-/// Shared with the HLS master playlist, which (like upstream's
-/// `DynamicHlsHelper.EnableAdaptiveBitrateStreaming`) skips the adaptive
-/// variants for local peers.
+/// `LocalNetworkSubnets` / excluded-subnet list: the answer of
+/// [`AppState::is_in_local_network`](crate::state::AppState::is_in_local_network)
+/// only when no network policy is wired (unit tests). Request paths ask
+/// `AppState`, never this.
 pub(crate) fn is_in_local_network(ip: std::net::IpAddr) -> bool {
     let ip = match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),

@@ -10,14 +10,14 @@
 //! - a `[playlist]` folder is a playlist, and nothing in it is an item;
 //! - an unchanged rescan leaves the members alone, an edited file replaces
 //!   them, a full refresh that keeps metadata puts the file's first and
-//!   keeps the rest, and a deleted file takes its playlist with it.
+//!   keeps the rest, and a deleted file takes its playlist with it;
+//! - a folder that is neither artist nor album is a plain `Folder` the
+//!   playlist hangs off, and a database an older scan wrote without that
+//!   row is re-parented by a quiet rescan.
 //!
 //! The rows and members match what a real Jellyfin 12.2 stores for the same
 //! tree when it writes no XML sidecar beside the playlist files (see
-//! `library_scan/playlists.rs` for the case where it does) — but for
-//! `Lists/top.m3u8`'s parent: Jellyfin makes `Lists`, neither artist nor
-//! album, a plain `Folder`, and a music scan here plans no such row, so the
-//! playlist hangs off the library.
+//! `library_scan/playlists.rs` for the case where it does).
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -242,11 +242,13 @@ async fn a_playlist_file_is_a_playlist_of_its_entries() {
     // An absolute entry and a relative one.
     assert_eq!(f.members(MIX_PLS).await, [TWO, UNO]);
     // A `../` entry, from a folder that is neither artist nor album: the
-    // playlist hangs off the library (Jellyfin's parent is a plain `Folder`
-    // for `Lists`, a row a music scan here does not plan).
+    // playlist hangs off that folder, a plain `Folder` (`FolderResolver`).
     assert_eq!(f.members(TOP).await, [TWO]);
     let top = f.row(f.id(BaseItemKind::Playlist, TOP)).await.expect("top");
-    assert_eq!(top.parent_id.as_deref(), Some(library.as_str()));
+    let lists = f.id(BaseItemKind::Folder, "Lists");
+    assert_eq!(top.parent_id.as_deref(), Some(guid_to_db(lists).as_str()));
+    let lists = f.row(lists).await.expect("the Lists folder");
+    assert_eq!(lists.parent_id.as_deref(), Some(library.as_str()));
 
     // Owned by nobody, open to everyone.
     let meta: (String, bool) = sqlx::query_as(
@@ -345,6 +347,77 @@ async fn a_rescan_follows_the_file() {
             .is_none()
     );
     assert!(f.members(ALBUM_M3U).await.is_empty());
+}
+
+/// An older scan walked through a folder that is neither artist nor album
+/// and planned no row for it: `Lists`' playlist and `Rock`'s artist hung
+/// off the library. A quiet rescan plans the `Folder`s and moves the rows
+/// under them, chains included, and the playlist keeps its members.
+#[tokio::test]
+async fn a_quiet_rescan_moves_rows_under_their_new_folders() {
+    let f = Fixture::new().await;
+    let track = "Rock/Band/Album/01 - A.mp3";
+    std::fs::create_dir_all(f.media.join("Rock/Band/Album")).expect("mkdir");
+    std::fs::write(f.media.join(track), b"").expect("track");
+    f.scan().await;
+    let library = f.library().await;
+    let folder = |rel: &str| guid_to_db(f.id(BaseItemKind::Folder, rel));
+    let band = guid_to_db(f.id(BaseItemKind::MusicArtist, "Rock/Band"));
+    let top = guid_to_db(f.id(BaseItemKind::Playlist, TOP));
+    let album = f.id(BaseItemKind::MusicAlbum, "Rock/Band/Album");
+    let audio = f.id(BaseItemKind::Audio, track);
+
+    // What the walk-through left behind: the folder out of every chain,
+    // its row gone (its own chain rows go with it, by the foreign key),
+    // its child under the library.
+    for (child, old) in [(&top, folder("Lists")), (&band, folder("Rock"))] {
+        let moved = sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?1 WHERE "Id" = ?2"#)
+            .bind(&library)
+            .bind(child)
+            .execute(f.db.writer())
+            .await
+            .expect("re-parent");
+        assert_eq!(moved.rows_affected(), 1, "{child}");
+        let links = sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ParentItemId" = ?1"#)
+            .bind(&old)
+            .execute(f.db.writer())
+            .await
+            .expect("chain");
+        assert!(links.rows_affected() > 0, "{old}");
+        let gone = sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&old)
+            .execute(f.db.writer())
+            .await
+            .expect("folder");
+        assert_eq!(gone.rows_affected(), 1, "{old}");
+    }
+    assert!(!chain(&f.db, audio).await.contains(&folder("Rock")));
+    f.scan().await;
+
+    let playlist = f.row(f.id(BaseItemKind::Playlist, TOP)).await.expect("top");
+    assert_eq!(playlist.parent_id, Some(folder("Lists")));
+    assert!(
+        chain(&f.db, f.id(BaseItemKind::Playlist, TOP))
+            .await
+            .contains(&folder("Lists"))
+    );
+    assert_eq!(f.members(TOP).await, [TWO]);
+    let artist = f
+        .row(f.id(BaseItemKind::MusicArtist, "Rock/Band"))
+        .await
+        .expect("band");
+    assert_eq!(artist.parent_id, Some(folder("Rock")));
+    assert!(chain(&f.db, album).await.contains(&folder("Rock")));
+    assert!(chain(&f.db, audio).await.contains(&folder("Rock")));
+}
+
+/// The ids in `id`'s `AncestorIds` chain.
+async fn chain(db: &Database, id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_all(db.pool())
+        .await
+        .expect("ancestors")
 }
 
 /// A library of `collection_type` over `media`, scanned once.

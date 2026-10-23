@@ -201,7 +201,8 @@ pub trait LibraryScanTrigger: Send + Sync {
 
 fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 
-/// Supplies the filesystem roots the monitor should watch.
+/// Supplies the filesystem roots the monitor should watch, and every library
+/// location, which its watcher's metadata-only filter treats as a root.
 ///
 /// Resolved fresh on every [`LibraryMonitor::start`], so a monitor restart
 /// after a library-structure change (folder added/removed, realtime option
@@ -213,6 +214,14 @@ fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 pub trait WatchRootsSource: Send + Sync {
     /// The root paths to watch right now.
     async fn watch_roots(&self) -> Vec<String>;
+
+    /// Every library location right now, real-time monitored or not: what a
+    /// change is attributed to, since a scan matches a changed path against
+    /// every library. A library without real-time monitoring can sit inside
+    /// a watched one. The default is [`Self::watch_roots`].
+    async fn library_locations(&self) -> Vec<String> {
+        self.watch_roots().await
+    }
 }
 
 #[async_trait]
@@ -226,6 +235,10 @@ impl WatchRootsSource for Vec<String> {
 impl<T: WatchRootsSource + ?Sized> WatchRootsSource for Arc<T> {
     async fn watch_roots(&self) -> Vec<String> {
         (**self).watch_roots().await
+    }
+
+    async fn library_locations(&self) -> Vec<String> {
+        (**self).library_locations().await
     }
 }
 
@@ -424,6 +437,12 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
         let mut roots = self.roots.watch_roots().await;
         roots.sort();
+        // Every library location is a library root to the metadata-only
+        // filter: the nested ones skipped below, and those of libraries
+        // without real-time monitoring inside a watched one. Read after the
+        // watch roots, whose listing refreshes the libraries it comes from.
+        self.watcher
+            .set_library_roots(&self.roots.library_locations().await);
         let mut watched_roots: Vec<String> = Vec::new();
         for root in roots {
             // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
@@ -507,6 +526,23 @@ impl FerrofinLibraryMonitor {
         // `/Library/Media/Updated` report reaches only this check.
         if crate::resolvers::should_ignore_path(path) {
             tracing::trace!(path, "change ignored (ignore patterns)");
+            return Ok(());
+        }
+        // `DotIgnoreIgnoreRule.ShouldIgnore` (`LibraryMonitor.cs:389`): nor
+        // does a path a `.ignore` file hides. The lookup stats the path's
+        // folders, so it stays off the async workers.
+        let owned = path.to_owned();
+        let hidden = tokio::task::spawn_blocking(move || {
+            let is_dir = Path::new(&owned).is_dir();
+            crate::dot_ignore::DotIgnoreRule::default().should_ignore(&owned, is_dir)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(path, %error, ".ignore lookup failed; the change is not filtered by it");
+            false
+        });
+        if hidden {
+            tracing::trace!(path, "change ignored (.ignore file)");
             return Ok(());
         }
         if self.is_path_suppressed(path) {
@@ -1168,6 +1204,32 @@ mod tests {
             .expect("report");
         monitor.report_webhook_change(path).await.expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `ReportFileSystemChanged` also returns when a `.ignore` file hides
+    /// the path (`LibraryMonitor.cs:389`); a path its rules keep still scans.
+    #[tokio::test]
+    async fn a_dot_ignored_path_does_not_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(movies.join("Private")).expect("mkdir");
+        std::fs::write(movies.join("Private/.ignore"), "").expect(".ignore");
+        std::fs::write(movies.join(".ignore"), "*.part\n").expect(".ignore");
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        for hidden in ["Private/Home Video.mkv", "Private", "Heat.mkv.part"] {
+            monitor
+                .report_file_system_changed(&movies.join(hidden).to_string_lossy())
+                .await
+                .expect("report");
+        }
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        monitor
+            .report_file_system_changed(&movies.join("Heat.mkv").to_string_lossy())
+            .await
+            .expect("report");
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
