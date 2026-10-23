@@ -4,10 +4,11 @@
 //! - [`keyframe_data`] — `KeyframeData` (root namespace).
 //! - [`ff_probe`] — `FfProbe.FfProbeKeyframeExtractor`.
 //! - [`ff_tool`] — `FfTool.FfToolKeyframeExtractor` (unimplemented upstream stub).
-//!
-//! The Matroska extractor is deferred.
+//! - [`matroska`] — `Matroska.MatroskaKeyframeExtractor`, which reads a Matroska
+//!   file's cue index.
 
 pub mod error;
 pub mod ff_probe;
 pub mod ff_tool;
 pub mod keyframe_data;
+pub mod matroska;
