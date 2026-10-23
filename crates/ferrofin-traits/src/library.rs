@@ -1772,11 +1772,11 @@ pub trait UserDataManager: Send + Sync {
     /// `UserDataManager.GetUserData(User, BaseItem)` synthesizes one keyed by
     /// `item.GetUserDataKeys()[0]` — `"Year-2020"` for a year, `"Studio-Acme"`
     /// for a studio, `"<series guid>001001"` for an episode. Deriving that needs
-    /// the item's *metadata*, not just its id, so the id-only batch above can
-    /// only ever answer with the guid.
+    /// the item's *metadata*, not just its id, so the id-only batch above has to
+    /// read every unwritten item's identity again to answer with it.
     ///
     /// The DTO service already holds the rows it is projecting, so passing them
-    /// through costs nothing and keeps the derivation off the N+1 path. The
+    /// through saves that read and keeps the derivation off the N+1 path. The
     /// default delegates to the id-only form, leaving fakes and any impl that
     /// has not overridden it exactly as they were.
     ///

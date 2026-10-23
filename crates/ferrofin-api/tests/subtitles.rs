@@ -638,6 +638,19 @@ async fn get_subtitle_converts_and_serves_vtt() {
 }
 
 #[tokio::test]
+async fn get_subtitle_serves_ttml_as_application_ttml_xml() {
+    // `MimeTypes.GetMimeType("file.ttml")`: the `MimeTypes` package's `.ttml` entry.
+    let app = subtitle_state(StubEncoder(Ok(b"<?xml version=\"1.0\"?><tt />".to_vec())));
+    let (status, _, ct) = call(
+        app,
+        &format!("/Videos/{ITEM_ID}/msrc/Subtitles/0/Stream.ttml"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some("application/ttml+xml"));
+}
+
+#[tokio::test]
 async fn get_subtitle_adds_vtt_time_map_when_requested() {
     let app = subtitle_state(StubEncoder(Ok(b"WEBVTT\n\nHi".to_vec())));
     let (status, body, _) = call(

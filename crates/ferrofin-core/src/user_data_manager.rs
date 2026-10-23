@@ -373,6 +373,16 @@ impl FerrofinUserDataManager {
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserDataEntity>, ServiceError> {
+        let (rows, keys) = self.rows_and_keys(item_id, user_id).await?;
+        Ok(Self::preferred_row(&rows, &keys))
+    }
+
+    /// The user's stored rows on the item, and the item's current keys.
+    async fn rows_and_keys(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Vec<UserDataEntity>, Vec<String>), ServiceError> {
         let keys = self.keys_for(item_id).await?;
         let rows = sqlx::query_as::<_, UserDataEntity>(
             r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
@@ -382,7 +392,26 @@ impl FerrofinUserDataManager {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(Self::preferred_row(&rows, &keys))
+        Ok((rows, keys))
+    }
+
+    /// [`Self::read_row`], or the row `GetUserData` answers for an item the
+    /// user never wrote (`UserDataManager.cs:373-376`): empty, keyed by the
+    /// item's first user-data key, which is its id when it has no item row.
+    /// One key derivation serves both the row lookup and the empty row's key.
+    async fn read_or_unwritten_row(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<UserDataEntity, ServiceError> {
+        let (rows, keys) = self.rows_and_keys(item_id, user_id).await?;
+        Ok(Self::preferred_row(&rows, &keys).unwrap_or_else(|| {
+            let mut row = Self::empty_row(item_id, user_id);
+            if let Some(first) = keys.into_iter().next() {
+                row.custom_data_key = first;
+            }
+            row
+        }))
     }
 
     /// Pinned ResolveUserDataRow: exact current-key priority, then the first
@@ -647,10 +676,7 @@ impl FerrofinUserDataManager {
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
 
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
         let tracks_changed = streams.is_some_and(|streams| {
             streams.apply_to(&mut row.audio_stream_index, &mut row.subtitle_stream_index)
         });
@@ -805,16 +831,14 @@ impl FerrofinUserDataManager {
             if version == item_id {
                 continue;
             }
-            let stored = self.read_row(version, user_id).await?;
+            let mut row = self.read_or_unwritten_row(version, user_id).await?;
             let row = if played {
-                let mut row = stored.unwrap_or_else(|| Self::empty_row(version, user_id));
                 row.played = true;
                 if reset_position {
                     row.playback_position_ticks = 0;
                 }
                 row
             } else {
-                let mut row = stored.unwrap_or_else(|| Self::empty_row(version, user_id));
                 row.played = false;
                 row.play_count = 0;
                 row.playback_position_ticks = 0;
@@ -1112,10 +1136,7 @@ impl FerrofinUserDataManager {
         item_id: Uuid,
         date_played: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<UserItemDataDto, ServiceError> {
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
 
         // A supplied date is a fresh play → increment the count.
         if date_played.is_some() {
@@ -1148,10 +1169,7 @@ impl FerrofinUserDataManager {
         user_id: Uuid,
         item_id: Uuid,
     ) -> Result<UserItemDataDto, ServiceError> {
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
 
         row.play_count = 0;
         row.playback_position_ticks = 0;
@@ -1402,10 +1420,7 @@ impl UserDataManager for FerrofinUserDataManager {
             ));
         }
         // C# loads the existing row, applies only the set fields, then saves.
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
 
         if let Some(v) = user_data.playback_position_ticks {
             row.playback_position_ticks = v;
@@ -1465,10 +1480,7 @@ impl UserDataManager for FerrofinUserDataManager {
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserItemDataDto>, ServiceError> {
-        let row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let row = self.read_or_unwritten_row(item_id, user_id).await?;
         let mut dto = to_dto(&row, item_id);
         self.fill_user_data_dto_values(&mut dto, item_id, user_id)
             .await?;
@@ -1481,13 +1493,35 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
         let mut map = self.stored_user_data_dtos(item_ids, user_id).await?;
-        // Items without a stored row get the empty-row DTO, matching the
-        // per-item path's `unwrap_or_else(empty_row)` fallback. With only an id
-        // in hand the synthetic key can only be the guid; the row-aware form
-        // (`get_user_data_dtos_for_rows`) derives the real one.
+        // Items without a stored row get the empty-row DTO keyed by their first
+        // user-data key (`GetUserDataBatch`'s `keys[0]`, `UserDataManager.cs:251`),
+        // derived for all of them in one batch. An id with no item row keeps
+        // the id as its key.
+        let mut unwritten: Vec<String> = item_ids
+            .iter()
+            .filter(|id| !map.contains_key(id))
+            .map(|&id| guid_to_db(id))
+            .collect();
+        unwritten.sort_unstable();
+        unwritten.dedup();
+        if unwritten.is_empty() {
+            return Ok(map);
+        }
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        let first_keys: HashMap<String, String> =
+            crate::user_data_key_repository::load_keys_for_items(&mut conn, &unwritten)
+                .await?
+                .into_iter()
+                .filter_map(|(id, keys)| Some((id, keys.into_iter().next()?)))
+                .collect();
         for &item_id in item_ids {
-            map.entry(item_id)
-                .or_insert_with(|| to_dto(&Self::empty_row(item_id, user_id), item_id));
+            map.entry(item_id).or_insert_with(|| {
+                let mut row = Self::empty_row(item_id, user_id);
+                if let Some(first) = first_keys.get(&guid_to_db(item_id)) {
+                    row.custom_data_key.clone_from(first);
+                }
+                to_dto(&row, item_id)
+            });
         }
         Ok(map)
     }
@@ -1575,10 +1609,7 @@ impl UserDataManager for FerrofinUserDataManager {
         // Assign the like directly (including `None`) so a clear persists — the
         // merge path in `save_user_data` can only ever *set* a like. Port of C#
         // `UpdateUserItemRatingInternal` (`userData.Likes = likes; Save(...)`).
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
         row.likes = likes;
         row.rating = likes.map(|likes| if likes { 10.0 } else { 1.0 });
         self.upsert_row(&row).await?;
@@ -1692,10 +1723,7 @@ impl UserDataManager for FerrofinUserDataManager {
         // non-resumable; a rewatch of a played, resumable item (episode/movie)
         // defers the stamp to the progress/stop path so that barely-started
         // rewatches don't advance Next Up.
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
         row.play_count += 1;
         let item = self.item_runtime_and_kind(item_id).await?;
         let resumable = item.as_ref().is_some_and(|item| item.resume);
@@ -2600,6 +2628,115 @@ mod tests {
             .await
             .expect("finish");
         assert_eq!(resume().await, 0, "finished");
+    }
+
+    /// An item the user never wrote reports its first user-data key, as
+    /// `GetUserData`'s `new UserItemData { Key = item.GetUserDataKeys()[0] }`
+    /// and `GetUserDataBatch`'s `keys[0]` do: the TMDb id for a movie that has
+    /// one, its id for one that has none. An id with no item row keeps the id.
+    #[rstest::rstest]
+    #[case::provider_key(Some("700391"), true, "700391")]
+    #[case::no_provider(None, true, "00000000-0000-0000-0000-000000000002")]
+    #[case::no_item(None, false, "00000000-0000-0000-0000-000000000002")]
+    #[tokio::test]
+    async fn a_never_written_item_reports_its_first_user_data_key(
+        #[case] tmdb: Option<&str>,
+        #[case] stored: bool,
+        #[case] key: &str,
+    ) {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        if stored {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+        }
+        if let Some(tmdb) = tmdb {
+            seed_provider_id(&db, item, "Tmdb", tmdb).await;
+        }
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        let one = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        assert_eq!(one.key, key);
+        assert!(!one.is_favorite && !one.played);
+        let batch = mgr.get_user_data_dtos(&[item], user).await.expect("batch");
+        assert_eq!(batch[&item].key, key, "the batch read agrees");
+    }
+
+    /// An episode never written reports its series-derived first key, from
+    /// the per-item and the batch read alike.
+    #[tokio::test]
+    async fn a_never_written_episode_reports_its_series_derived_key() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let series = Uuid::from_u128(2);
+        let episode = Uuid::from_u128(3);
+        seed_user(&db, user).await;
+        seed_item(&db, series, BaseItemKind::Series).await;
+        seed_provider_id(&db, series, "Tvdb", "343498").await;
+        crate::test_support::seed_episode(&db, episode, "series-key", 1, 2, false, None).await;
+        let mut row = fetch_item(&db, episode).await;
+        row.series_id = Some(guid_to_db(series));
+        crate::test_support::save_item(&db, &row).await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        let one = mgr
+            .get_user_data_dto(episode, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        // The series' keys are `[343498, <series id>]`; an episode drops the
+        // series' own id and suffixes `SSSEEE`.
+        assert_eq!(one.key, "343498001002");
+        let batch = mgr
+            .get_user_data_dtos(&[episode, episode], user)
+            .await
+            .expect("batch");
+        assert_eq!(batch[&episode].key, "343498001002");
+    }
+
+    /// The writes that answer with the saved row's DTO.
+    #[derive(Debug, Clone, Copy)]
+    enum FirstWrite {
+        MarkPlayed,
+        MarkUnplayed,
+        SetLikes,
+    }
+
+    /// A write on a never-written item answers with the key its rows were
+    /// saved under, as upstream's re-read through `GetUserData` does, not
+    /// the item id.
+    #[rstest::rstest]
+    #[case::mark_played(FirstWrite::MarkPlayed)]
+    #[case::mark_unplayed(FirstWrite::MarkUnplayed)]
+    #[case::set_likes(FirstWrite::SetLikes)]
+    #[tokio::test]
+    async fn a_first_write_answers_with_the_first_user_data_key(#[case] write: FirstWrite) {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        let answered = match write {
+            FirstWrite::MarkPlayed => mgr.mark_played(user, item, None).await,
+            FirstWrite::MarkUnplayed => mgr.mark_unplayed(user, item).await,
+            FirstWrite::SetLikes => mgr.set_likes(user, item, Some(true)).await,
+        }
+        .expect("write");
+        assert_eq!(answered.key, "700391");
+        let read = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        assert_eq!(read.key, answered.key, "the write and the read agree");
     }
 
     /// A row written by Jellyfin under a provider key alone must be readable.
@@ -4782,6 +4919,10 @@ mod tests {
         let user = Uuid::from_u128(1);
         seed_user(&db, user).await;
         let (primary, alt1, alt2) = version_group(&db).await;
+        // Never-written versions with keys of their own: each announcement
+        // carries the version's first user-data key, not its id.
+        seed_provider_id(&db, alt1, "Tmdb", "1111").await;
+        seed_provider_id(&db, alt2, "Tmdb", "2222").await;
         let mgr = FerrofinUserDataManager::new(db, config());
         let sink = Arc::new(RecordingSink::default());
         mgr.set_user_data_changed_sink(sink.clone());
@@ -4792,7 +4933,7 @@ mod tests {
         assert_eq!(sent.len(), 1, "one message for the group");
         let (to, info) = &sent[0];
         assert_eq!(*to, user);
-        let mut items: Vec<(String, bool)> = info["UserDataList"]
+        let mut items: Vec<(String, bool, String)> = info["UserDataList"]
             .as_array()
             .unwrap()
             .iter()
@@ -4800,14 +4941,17 @@ mod tests {
                 (
                     d["ItemId"].as_str().unwrap().to_owned(),
                     d["Played"].as_bool().unwrap(),
+                    d["Key"].as_str().unwrap().to_owned(),
                 )
             })
             .collect();
         items.sort();
         let mut want = vec![
-            (primary.simple().to_string(), true),
-            (alt1.simple().to_string(), true),
-            (alt2.simple().to_string(), true),
+            // The primary has no provider id of its own, so its first key is
+            // its id.
+            (primary.simple().to_string(), true, primary.to_string()),
+            (alt1.simple().to_string(), true, "1111".to_owned()),
+            (alt2.simple().to_string(), true, "2222".to_owned()),
         ];
         want.sort();
         assert_eq!(items, want);

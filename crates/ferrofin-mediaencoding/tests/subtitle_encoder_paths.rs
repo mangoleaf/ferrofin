@@ -7,6 +7,8 @@
 //! All process/network I/O is captured by an in-memory `SubtitleIo` fake, so the
 //! real ffmpeg subprocess is never spawned — only the arg-building/decision code
 //! is exercised.
+// libse keeps times as `double`s, and `filter_events` must reproduce them exactly.
+#![allow(clippy::float_cmp)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -276,6 +278,18 @@ async fn readable_file_external_vtt_is_parsed_not_converted() {
         .await
         .unwrap();
     assert!(String::from_utf8(srt).unwrap().contains("{\\an8}Top"));
+
+    // Only a request for the source's own format is served verbatim: `webvtt` is
+    // converted (`TryGetWriter` takes it as a WebVTT alias), so the cue gets libse's
+    // settings for `{\an8}`.
+    let webvtt = encoder
+        .get_subtitles(&source, &stream, "webvtt", 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(webvtt).unwrap(),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000 line:20%\nTop"
+    );
 }
 
 // -- extract_all_extractable_subtitles: arg building -----------------------
@@ -527,7 +541,7 @@ async fn convert_subtitles_windows_and_rebases_timestamps() {
 
 // -- filter_events directly ------------------------------------------------
 
-fn cue(text: &str, start_ms: i64, end_ms: i64) -> Paragraph {
+fn cue(text: &str, start_ms: f64, end_ms: f64) -> Paragraph {
     Paragraph::new(
         text.to_owned(),
         TimeCode::from_milliseconds(start_ms),
@@ -539,12 +553,12 @@ fn cue(text: &str, start_ms: i64, end_ms: i64) -> Paragraph {
 fn filter_events_drops_fully_elapsed_and_after_end() {
     let mut s = Subtitle {
         paragraphs: vec![
-            cue("before", 0, 500),   // fully before start=1000 -> dropped
-            cue("spans", 800, 1500), // ends after start -> kept
-            cue("mid", 2000, 3000),  // kept
-            cue("late", 9000, 9500), // starts after end=5000 -> dropped
+            cue("before", 0.0, 500.0),   // fully before start=1000 -> dropped
+            cue("spans", 800.0, 1500.0), // ends after start -> kept
+            cue("mid", 2000.0, 3000.0),  // kept
+            cue("late", 9000.0, 9500.0), // starts after end=5000 -> dropped
         ],
-        header: None,
+        ..Subtitle::default()
     };
     let start_ticks = 1_000 * 10_000;
     let end_ticks = 5_000 * 10_000;
@@ -552,20 +566,45 @@ fn filter_events_drops_fully_elapsed_and_after_end() {
     let texts: Vec<_> = s.paragraphs.iter().map(|p| p.text.as_str()).collect();
     assert_eq!(texts, vec!["spans", "mid"]);
     // preserve_timestamps=true -> timestamps unchanged.
-    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 800);
+    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 800.0);
 }
 
 #[test]
 fn filter_events_rebase_clamps_to_zero() {
     let mut s = Subtitle {
-        paragraphs: vec![cue("spans", 800, 1500)],
-        header: None,
+        paragraphs: vec![cue("spans", 800.0, 1500.0)],
+        ..Subtitle::default()
     };
     let start_ticks = 1_000 * 10_000;
     filter_events(&mut s, start_ticks, 0, false);
     // start 800ms - 1000ms clamps to 0; end 1500-1000 = 500ms.
-    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 0);
-    assert_eq!(s.paragraphs[0].end_time.total_milliseconds(), 500);
+    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 0.0);
+    assert_eq!(s.paragraphs[0].end_time.total_milliseconds(), 500.0);
+}
+
+#[test]
+fn filter_events_wraps_an_extreme_offset_as_unchecked_csharp_arithmetic_does() {
+    // The offset comes from the request (`routeStartPositionTicks`). C#'s `long`
+    // arithmetic wraps: `ticks - long.MinValue` goes negative, so every cue elapsed.
+    let mut s = Subtitle {
+        paragraphs: vec![cue("cue", 1000.0, 2000.0)],
+        ..Subtitle::default()
+    };
+    filter_events(&mut s, i64::MIN, 0, false);
+    assert!(s.paragraphs.is_empty());
+}
+
+#[test]
+fn filter_events_rebase_keeps_the_sub_millisecond_part_of_the_offset() {
+    // `new TimeCode(TimeSpan.FromTicks(...))`: a 1.2345 ms offset leaves 998.7655 ms,
+    // which the JSON writer reads back as 9 987 655 ticks.
+    let mut s = Subtitle {
+        paragraphs: vec![cue("cue", 1000.0, 2000.0)],
+        ..Subtitle::default()
+    };
+    filter_events(&mut s, 12_345, 0, false);
+    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 998.7655);
+    assert_eq!(s.paragraphs[0].start_time.ticks(), 9_987_655);
 }
 
 // -- extract_all_extractable_subtitles: failure handling --------------------

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" ttp:timeBase="media" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="en" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <head>
+    <metadata>
+      <ttm:title></ttm:title>
+    </metadata>
+    <styling>
+      <style xml:id="s0" tts:backgroundColor="black" tts:fontStyle="normal" tts:fontSize="16px" tts:fontFamily="sansSerif" tts:color="white" />
+    </styling>
+    <layout>
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="start" xml:id="topLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="start" xml:id="centerLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="start" xml:id="bottomLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="center" xml:id="topCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="center" xml:id="centerCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="center" xml:id="bottomCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="end" xml:id="topRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="end" xml:id="centerRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="end" xml:id="bottomRight" />
+    </layout>
+  </head>
+  <body style="s0">
+    <div>
+      <p begin="2.0s" xml:id="p0" end="3.5s">
+        <span tts:fontStyle="italic">first</span>
+        <br />
+        <span tts:fontStyle="italic">second</span>
+      </p>
+      <p begin="4.0s" xml:id="p1" end="5.5s">
+        <span tts:fontStyle="italic">one</span>two</p>
+      <p begin="6.0s" xml:id="p2" end="7.5s">
+        <span tts:fontStyle="italic">- dash start</span>
+      </p>
+      <p begin="8.0s" xml:id="p3" end="9.5s">lead closing <span tts:fontStyle="italic">mid</span></p>
+      <p begin="10.0s" xml:id="p4" end="11.5s">mid closing <span tts:fontStyle="italic">again</span></p>
+      <p begin="12.0s" xml:id="p5" end="13.5s">
+        <span tts:fontStyle="italic">Line one<br />Line two</span>
+      </p>
+      <p begin="14.0s" xml:id="p6" end="15.5s">
+        <span tts:fontStyle="italic">a b</span> c</p>
+      <p begin="16.0s" xml:id="p7" end="17.5s">
+        <span tts:fontStyle="italic">- You think they're gone?<br />- That can't be.</span>
+      </p>
+      <p begin="18.0s" xml:id="p8" end="19.5s">i- foo.br/- bar.i</p>
+      <p begin="20.0s" xml:id="p9" end="21.5s">x<span tts:fontStyle="italic"> y</span></p>
+      <p begin="22.0s" xml:id="p10" end="23.5s">
+        <span tts:fontStyle="italic">one</span>
+        <br />
+        <span tts:fontStyle="italic">two</span>
+      </p>
+      <p begin="24.0s" xml:id="p11" end="25.5s">
+        <span tts:fontStyle="italic">one</span>
+        <br />
+        <span tts:fontStyle="italic">two</span>
+      </p>
+      <p begin="26.0s" xml:id="p12" end="27.5s">
+        <span tts:fontStyle="italic">a</span>
+        <br />
+        <span tts:fontStyle="italic">b<br />c</span>
+      </p>
+      <p begin="28.0s" xml:id="p13" end="29.5s">iabr/b/i/i</p>
+      <p begin="30.0s" xml:id="p14" end="31.5s">
+        <span tts:fontStyle="italic">- Foo</span>
+        <br />Bar.</p>
+      <p begin="32.0s" xml:id="p15" end="33.5s">
+        <span tts:fontStyle="italic">Foo.</span>
+      </p>
+      <p begin="34.0s" xml:id="p16" end="35.5s">empty pair</p>
+      <p begin="36.0s" xml:id="p17" end="37.5s">word joined</p>
+      <p begin="38.0s" xml:id="p18" end="39.5s">
+        <span tts:fontStyle="italic"> spaced  pair </span>
+      </p>
+      <p begin="40.0s" xml:id="p19" end="41.5s">[sound] <span tts:fontStyle="italic">text</span></p>
+      <p begin="42.0s" xml:id="p20" end="43.5s">
+        <span tts:fontWeight="bold">
+          <span tts:fontStyle="italic">foobar</span>
+        </span>
+      </p>
+      <p begin="44.0s" xml:id="p21" end="45.5s">
+        <span tts:fontStyle="italic">trailing</span>
+        <br />next line</p>
+      <p begin="46.0s" xml:id="p22" end="47.5s">@ at  sign</p>
+      <p begin="48.0s" xml:id="p23" end="49.5s">ALICE: <span tts:fontStyle="italic">Hi there<br />BOB: 10:30</span></p>
+      <p begin="50.0s" xml:id="p24" end="51.5s">
+        <span tts:fontStyle="italic">upper spaced</span>
+      </p>
+      <p begin="52.0s" xml:id="p25" end="53.5s">
+        <span tts:fontStyle="italic">xy</span>
+      </p>
+    </div>
+  </body>
+</tt>

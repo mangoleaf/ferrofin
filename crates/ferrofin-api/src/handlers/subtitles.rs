@@ -299,13 +299,15 @@ async fn get_remote_subtitles(
 }
 
 /// The MIME type for a subtitle of the given format (a small, common-format map;
-/// unknown formats fall back to `text/plain`).
+/// unknown formats fall back to `text/plain`). `ttml` is the `MimeTypes` package
+/// entry `MimeTypes.GetMimeType("file.ttml")` falls back to.
 fn subtitle_mime(format: &str) -> &'static str {
     match format.to_ascii_lowercase().as_str() {
         "vtt" => "text/vtt",
         "srt" | "subrip" => "application/x-subrip",
         "ass" | "ssa" => "text/x-ssa",
         "json" => "application/json",
+        "ttml" => "application/ttml+xml",
         _ => "text/plain",
     }
 }
@@ -378,8 +380,8 @@ async fn encode_subtitle_response(
     // (port of the `WEBVTT` → `WEBVTT\nX-TIMESTAMP-MAP=…` string replace).
     if format.eq_ignore_ascii_case("vtt") && query.add_vtt_time_map {
         // Jellyfin reads the encoded stream through a BOM-detecting StreamReader and
-        // re-encodes the text without a preamble, so the writer's BOM does not survive
-        // this path.
+        // re-encodes the text without a preamble. Its WebVTT writer emits no BOM, but a
+        // `.vtt` file served verbatim can carry one, and it does not survive this path.
         let text = String::from_utf8_lossy(&bytes);
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace(
             "WEBVTT",
