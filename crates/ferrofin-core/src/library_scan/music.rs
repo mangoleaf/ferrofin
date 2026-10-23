@@ -46,8 +46,9 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
-    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, images_changed,
-    item_values_of, preferred_language, provider_order, search_result_ids, split_pipe,
+    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, first_album_tag,
+    images_changed, item_values_of, preferred_language, provider_order, search_result_ids,
+    split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -599,9 +600,122 @@ impl LibraryScanner {
             }
             if kind == MusicKind::Album {
                 self.set_album_people(work, run.cancel).await;
+                Box::pin(self.refresh_album_artists(work, run)).await;
             }
         }
         skipped.report("music");
+    }
+
+    /// The close of `MusicAlbum.RefreshAllMetadata` (`MusicAlbum.cs:212-236`):
+    /// a refresh that is not automated (`IsAutomated`, false only for
+    /// `POST /Items/{itemId}/Refresh`) refreshes every album it covered and
+    /// then that album's artists, album artists first (`GetAllArtists`),
+    /// with its own options. `LibraryManager.GetArtist` takes a
+    /// folder-backed artist of the name before one known only by name, and
+    /// `RefreshArtists` passes over a folder-backed one; a name with no
+    /// artist row yet gets one (`CreateItemByName`). Each name is looked up
+    /// once per pass, and an artist several of the albums share refreshes
+    /// once (by its id, so spellings that resolve to one artist count once,
+    /// as `DistinctNames` makes them). An album above the refreshed item,
+    /// read only for context, carries the automated ancestor options, so its
+    /// artists stay as they are.
+    async fn refresh_album_artists(&self, work: &[MusicRefresh<'_>], run: ScanRun<'_>) {
+        let Some(items) = &self.item_repository else {
+            return;
+        };
+        if run.cancel.is_cancelled() {
+            return;
+        }
+        let albums: Vec<Uuid> = work
+            .iter()
+            .filter(|w| w.kind == MusicKind::Album && !w.request.options.is_automated)
+            .map(|w| w.id)
+            .collect();
+        let mut skipped = super::SkippedItems::default();
+        let mut resolved: HashMap<String, Option<Uuid>> = HashMap::new();
+        let mut refreshed = HashSet::new();
+        for window in albums.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            if run.cancel.is_cancelled() {
+                break;
+            }
+            let rows = match items.retrieve_items(window).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    for id in window {
+                        skipped.note(*id, &err);
+                    }
+                    continue;
+                }
+            };
+            for album in &rows {
+                let names = split_pipe(album.album_artists.as_deref())
+                    .into_iter()
+                    .chain(split_pipe(album.artists.as_deref()));
+                for name in names {
+                    if run.cancel.is_cancelled() {
+                        skipped.report("album artists");
+                        return;
+                    }
+                    let key = crate::text_util::get_clean_value(&name);
+                    let artist = if let Some(artist) = resolved.get(&key) {
+                        *artist
+                    } else {
+                        match self.album_artist_by_name(&name).await {
+                            Ok(artist) => *resolved.entry(key).or_insert(artist),
+                            Err(err) => {
+                                if let Ok(id) = Uuid::parse_str(&album.id) {
+                                    skipped.note(id, &err);
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    let Some(artist) = artist else {
+                        continue;
+                    };
+                    if !refreshed.insert(artist) {
+                        continue;
+                    }
+                    if let Err(err) = Box::pin(self.refresh_by_name_artist(artist, run)).await {
+                        skipped.note(artist, &err);
+                    }
+                }
+            }
+        }
+        skipped.report("album artists");
+    }
+
+    /// `LibraryManager.GetArtist(name)` for [`Self::refresh_album_artists`]:
+    /// the artist known only by name to refresh, or [`None`] when a
+    /// folder-backed artist of that name comes first (`IsAccessedByName`
+    /// sorts it ahead) or the name is blank. A name no artist row carries yet
+    /// gets a by-name one (`CreateItemByName`).
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading the artists or writing the new row.
+    async fn album_artist_by_name(&self, name: &str) -> Result<Option<Uuid>, ServiceError> {
+        let Some(items) = &self.item_repository else {
+            return Ok(None);
+        };
+        let named = items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicArtist],
+                name: Some(name.to_owned()),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        // `IsAccessedByName` is `ParentId.IsEmpty()`.
+        let by_name = |a: &BaseItemEntity| a.parent_id.as_deref().is_none_or(str::is_empty);
+        if let Some(first) = named.iter().find(|a| !by_name(a)).or_else(|| named.first()) {
+            return Ok(by_name(first)
+                .then(|| Uuid::parse_str(&first.id).ok())
+                .flatten());
+        }
+        match &self.by_name {
+            Some(store) => store.ensure(BaseItemKind::MusicArtist, name).await,
+            None => Ok(None),
+        }
     }
 
     /// `AlbumMetadataService.AfterMetadataRefresh` → `SetPeople`
@@ -1352,13 +1466,7 @@ impl LibraryScanner {
         let name = work
             .identified
             .and_then(|r| r.name.clone())
-            .or_else(|| {
-                children
-                    .iter()
-                    .filter_map(|c| c.album.as_deref())
-                    .find(|a| !a.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+            .or_else(|| first_album_tag(children))
             .or_else(|| current.item.name.clone())
             .unwrap_or_default();
         // `GetAlbumArtist`: the tracks' first album artist, else the album's.
@@ -1779,9 +1887,8 @@ impl LibraryScanner {
             );
         }
         sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
-        let key = work.id.to_string();
         let meta_root = meta_root.resolve();
-        let dir = meta_root.join(&key);
+        let dir = crate::dynamic_images::own_art_dir(&meta_root, work.id);
         let mut images: Vec<_> = stored
             .iter()
             .filter(|image| {
@@ -1824,7 +1931,8 @@ impl LibraryScanner {
             }
         }
         if fetch.images == ImageFetch::All {
-            super::artwork::prune_old_backdrops(&dir, &images);
+            let legacy = crate::dynamic_images::legacy_art_dir(&meta_root, work.id);
+            super::artwork::prune_old_backdrops_in(&[dir.clone(), legacy], &images);
             let acquired: HashSet<_> = images.iter().map(|image| image.image_type).collect();
             images.extend(
                 stored

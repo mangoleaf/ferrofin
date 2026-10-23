@@ -370,15 +370,42 @@ struct ProcessMetrics {
     gauges: metrics_wiring::SamplerGauges,
 }
 
+/// `StorageHelper.TestCommonPathsForStorageCapacity`: Jellyfin will not start,
+/// nor apply a restore, without 2 GiB free on the data, cache and
+/// program-data paths. A failure stops the boot before the database is opened
+/// or a restore is applied; only the three directories may have been created.
+fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
+    ferrofin_core::system_manager::test_common_paths_for_storage_capacity(
+        &ferrofin_core::system_manager::FsStorageProbe,
+        &config.data_dir.join("data"),
+        &config.cache_dir,
+        &config.data_dir,
+    )
+    .context("the storage capacity check failed")
+}
+
 /// Applies a restore scheduled by `POST /Backup/Restore`, before the database
 /// is opened. Returns the failure of a restore rejected before it wrote
 /// anything (to be recorded once the activity log exists); a restore that
 /// failed part-way aborts the boot.
+///
+/// First it runs [`check_storage_capacity`], whose failure aborts the boot, as
+/// Jellyfin does: once per process (`Program.cs:138`), and again when a restore
+/// is pending (`BackupService.RestoreBackupAsync`). An API restart with nothing
+/// to restore is not re-checked, as Jellyfin's restart loop is not.
 fn apply_scheduled_restore(
     config: &Config,
 ) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+    static STORAGE_CHECKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let roots = boot_tree_roots(config);
+    if !STORAGE_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        || ferrofin_api::handlers::backup::restore_pending(&roots)
+    {
+        check_storage_capacity(config)?;
+    }
     Ok(
-        match ferrofin_api::handlers::backup::apply_pending_restore(&boot_tree_roots(config)) {
+        match ferrofin_api::handlers::backup::apply_pending_restore(&roots) {
             Ok(Some(archive)) => {
                 tracing::warn!(archive = %archive.display(), "restored backup");
                 None

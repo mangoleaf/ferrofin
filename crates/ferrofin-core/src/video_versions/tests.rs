@@ -837,3 +837,163 @@ fn containing_folder_path_follows_the_video_type(
     item.data = Some(data.to_owned());
     assert_eq!(containing_folder_path(&item), expected);
 }
+
+// ----- VersionResumeData (upstream `VersionResumeDataTests`) -----------------
+
+fn played_on(day: u32) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone as _;
+    chrono::Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap()
+}
+
+fn user_data(item_id: Uuid) -> ferrofin_model::dto::UserItemDataDto {
+    ferrofin_model::dto::UserItemDataDto {
+        rating: None,
+        played_percentage: None,
+        unplayed_item_count: None,
+        playback_position_ticks: 0,
+        play_count: 0,
+        is_favorite: false,
+        likes: None,
+        last_played_date: None,
+        played: false,
+        key: item_id.simple().to_string(),
+        item_id,
+    }
+}
+
+#[test]
+fn apply_to_completed_other_version_propagates_completion_and_clears_stale_resume() {
+    let resume = VersionResumeData {
+        version_id: Uuid::new_v4(),
+        user_data: ferrofin_model::dto::UserItemDataDto {
+            played: true,
+            last_played_date: Some(played_on(2)),
+            ..user_data(Uuid::new_v4())
+        },
+    };
+    let mut dto = ferrofin_model::dto::UserItemDataDto {
+        playback_position_ticks: 1,
+        played_percentage: Some(50.0),
+        ..user_data(Uuid::new_v4())
+    };
+    resume.apply_to(&mut dto);
+    assert!(dto.played);
+    assert_eq!(dto.last_played_date, Some(played_on(2)));
+    assert_eq!(dto.playback_position_ticks, 0);
+    assert_eq!(dto.played_percentage, None);
+}
+
+#[test]
+fn apply_to_primary_own_progress_keeps_resume_position() {
+    let primary = Uuid::new_v4();
+    let resume = VersionResumeData {
+        version_id: primary,
+        user_data: ferrofin_model::dto::UserItemDataDto {
+            playback_position_ticks: 5,
+            played: true,
+            last_played_date: Some(played_on(2)),
+            ..user_data(primary)
+        },
+    };
+    let mut dto = ferrofin_model::dto::UserItemDataDto {
+        playback_position_ticks: 5,
+        played: true,
+        played_percentage: Some(20.0),
+        ..user_data(primary)
+    };
+    resume.apply_to(&mut dto);
+    assert!(dto.played);
+    assert_eq!(dto.playback_position_ticks, 5);
+    assert_eq!(dto.played_percentage, Some(20.0));
+}
+
+#[test]
+fn apply_to_in_progress_other_version_keeps_primary_resume_position() {
+    let resume = VersionResumeData {
+        version_id: Uuid::new_v4(),
+        user_data: ferrofin_model::dto::UserItemDataDto {
+            playback_position_ticks: 25,
+            last_played_date: Some(played_on(2)),
+            ..user_data(Uuid::new_v4())
+        },
+    };
+    let mut dto = ferrofin_model::dto::UserItemDataDto {
+        playback_position_ticks: 1,
+        played_percentage: Some(50.0),
+        ..user_data(Uuid::new_v4())
+    };
+    resume.apply_to(&mut dto);
+    assert!(!dto.played);
+    assert_eq!(dto.playback_position_ticks, 1);
+    assert_eq!(dto.played_percentage, Some(50.0));
+}
+
+#[test]
+fn apply_to_does_not_unset_existing_played_or_regress_last_played() {
+    let resume = VersionResumeData {
+        version_id: Uuid::new_v4(),
+        user_data: ferrofin_model::dto::UserItemDataDto {
+            last_played_date: Some(played_on(2)),
+            ..user_data(Uuid::new_v4())
+        },
+    };
+    let mut dto = ferrofin_model::dto::UserItemDataDto {
+        played: true,
+        last_played_date: Some(played_on(5)),
+        ..user_data(Uuid::new_v4())
+    };
+    resume.apply_to(&mut dto);
+    assert!(dto.played);
+    assert_eq!(dto.last_played_date, Some(played_on(5)));
+}
+
+/// `GetResumeUserDataBatch`'s pick: among the versions part-way through or
+/// finished, the one played last; none for a video without versions or for
+/// a version queried directly.
+#[tokio::test]
+async fn resume_user_data_picks_the_version_played_last() {
+    let (primary, alt1, alt2) = version_group();
+    let rows = load(&[&primary, &alt1, &alt2], &primary).await;
+    let data: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto> = [
+        // Played longest ago, and finished.
+        (
+            row_id(&alt1),
+            ferrofin_model::dto::UserItemDataDto {
+                played: true,
+                last_played_date: Some(played_on(1)),
+                ..user_data(row_id(&alt1))
+            },
+        ),
+        // Played last, part-way through.
+        (
+            row_id(&alt2),
+            ferrofin_model::dto::UserItemDataDto {
+                playback_position_ticks: 40,
+                last_played_date: Some(played_on(3)),
+                ..user_data(row_id(&alt2))
+            },
+        ),
+        // Opened most recently but neither started nor finished: not eligible.
+        (
+            row_id(&primary),
+            ferrofin_model::dto::UserItemDataDto {
+                last_played_date: Some(played_on(9)),
+                ..user_data(row_id(&primary))
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let resume = resume_user_data(&rows, &primary, |id| data.get(&id)).expect("a winner");
+    assert_eq!(resume.version_id, row_id(&alt2));
+    assert_eq!(resume.user_data.playback_position_ticks, 40);
+
+    let alt_rows = load(&[&primary, &alt1, &alt2], &alt1).await;
+    assert_eq!(resume_user_data(&alt_rows, &alt1, |id| data.get(&id)), None);
+    let alone = video("/Movies/Alone/Alone.mkv");
+    let alone_rows = load(&[&alone], &alone).await;
+    assert_eq!(
+        resume_user_data(&alone_rows, &alone, |id| data.get(&id)),
+        None
+    );
+}
