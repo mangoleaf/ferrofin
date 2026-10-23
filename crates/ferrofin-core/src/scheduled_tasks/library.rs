@@ -3120,6 +3120,8 @@ mod tests {
         let (done, fresh) = (Uuid::from_u128(0xB1), Uuid::from_u128(0xB2));
         for (id, name) in [(done, "done.mkv"), (fresh, "fresh.mkv")] {
             seed_item(&db, id, BaseItemKind::Movie).await;
+            // The task asks for video items only.
+            set_media_type(&db, id, "Video").await;
             let path = media.path().join(name);
             std::fs::write(&path, b"x").expect("write");
             set_path(&db, id, &path.to_string_lossy()).await;
@@ -3134,23 +3136,38 @@ mod tests {
             .await
             .expect("seed keyframes");
 
-        // The fake probe path is /bin/false: extraction "runs" and yields
-        // empty data, which must not fail the task.
-        let task = KeyframeExtractionTask::new(
-            library,
+        // A probe that finds nothing, behind the repository cache: the
+        // extracted item is served from its row, the new one reaches the
+        // probe, and an empty answer must not fail the task.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = crate::keyframe_extractors::CachedKeyframeExtractor::new(
             Arc::clone(&keyframes),
-            Arc::new(FakeEncoder {
-                fail_extract: false,
+            Arc::new(LoggingExtractor {
+                name: "probe",
+                metadata_based: false,
+                answers_for: ".none",
+                log: Arc::clone(&log),
             }),
+            "probe",
         );
+        let task = KeyframeExtractionTask::with_extractors(library, vec![Arc::new(probe)]);
         assert_eq!(task.key(), "KeyframeExtraction");
         assert!(task.default_triggers().is_empty());
         task.execute(&TaskProgress::default()).await.expect("run");
 
+        assert_eq!(*log.lock().expect("log"), ["probe:fresh.mkv"]);
         // The pre-extracted item is untouched.
         let kept = keyframes.get_keyframe_data(done).await.expect("kept");
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
+        // The failed probe stored nothing for the new item.
+        assert!(
+            keyframes
+                .get_keyframe_data(fresh)
+                .await
+                .expect("read")
+                .is_empty()
+        );
     }
 
     /// A keyframe extractor that logs `name:file` for each call and answers
@@ -3198,11 +3215,14 @@ mod tests {
         );
         for (id, name) in [(mkv, "a.mkv"), (mp4, "b.mp4")] {
             seed_item(&db, id, BaseItemKind::Movie).await;
+            set_media_type(&db, id, "Video").await;
             let path = media.path().join(name);
             std::fs::write(&path, b"x").expect("write");
             set_path(&db, id, &path.to_string_lossy()).await;
         }
+        // A video whose file is gone: the task finds it and skips it.
         seed_item(&db, gone, BaseItemKind::Episode).await;
+        set_media_type(&db, gone, "Video").await;
         set_path(&db, gone, &media.path().join("gone.mkv").to_string_lossy()).await;
 
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -3240,8 +3260,6 @@ mod tests {
         use ferrofin_traits::persistence::ItemPersistenceService as _;
         let db = test_db().await;
         let media = tempfile::tempdir().expect("tempdir");
-        let keyframes: Arc<dyn KeyframeRepository> =
-            Arc::new(crate::FerrofinKeyframeRepository::new(db.clone()));
         let (primary, alternate) = (Uuid::from_u128(0xC1), Uuid::from_u128(0xC2));
         // A movie row over a real file of that name, written here.
         let movie = |id: Uuid, name: &str, version_of: Option<Uuid>| {
@@ -3269,25 +3287,23 @@ mod tests {
             .await
             .expect("seed the versions");
 
-        let task = KeyframeExtractionTask::new(
+        // An extractor that answers for every file, so the log shows which
+        // items the task's query reached.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task = KeyframeExtractionTask::with_extractors(
             library_manager_over(db.clone()),
-            Arc::clone(&keyframes),
-            Arc::new(FakeEncoder {
-                fail_extract: false,
-            }),
+            vec![Arc::new(LoggingExtractor {
+                name: "ffprobe",
+                metadata_based: false,
+                answers_for: "",
+                log: Arc::clone(&log),
+            })],
         );
         task.execute(&TaskProgress::default()).await.expect("run");
 
-        for id in [primary, alternate] {
-            assert!(
-                !keyframes
-                    .get_keyframe_data(id)
-                    .await
-                    .expect("read")
-                    .is_empty(),
-                "{id} was extracted"
-            );
-        }
+        let mut calls = log.lock().expect("log").clone();
+        calls.sort();
+        assert_eq!(calls, ["ffprobe:Heat - 2160p.mkv", "ffprobe:Heat.mkv"]);
     }
 
     // -- Extract Chapter Images ----------------------------------------------
