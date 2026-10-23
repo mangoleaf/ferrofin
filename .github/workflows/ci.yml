@@ -189,8 +189,9 @@ jobs:
     # throwaway SQLite files; the real fixtures never run here), verify/ (the live
     # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
     # against a python3 static file server, and whole runs against verify/tests/fake_server.py,
-    # which plays back a scripted server's scans) and scripts/ci-timings.py (CI time medians —
-    # its log parsing is driven with canned job logs).
+    # which plays back a scripted server's scans), parity/ (the live parity replay — its runner is
+    # driven against a fake docker and fake servers, its comparison with fixture response pairs) and
+    # scripts/ci-timings.py (CI time medians — its log parsing is driven with canned job logs).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -200,9 +201,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats verify/tests/verify.bats
-      - run: bats scripts/tests adoption/tests verify/tests
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh parity/run.sh verify/lib.sh verify/scan-behaviour.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats parity/tests/parity.bats verify/tests/verify.bats
+      - run: bats scripts/tests adoption/tests parity/tests verify/tests
+      - run: python3 -m unittest discover -s parity/tests
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: scripts/ci-config-check.sh check
 

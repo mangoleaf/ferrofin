@@ -1092,15 +1092,7 @@ impl NetworkManager {
             return None;
         }
 
-        // Handle override specifying a port.
-        let parts: Vec<&str> = bind_preference.split(':').collect();
-        if parts.len() > 1
-            && let Ok(p) = parts[1].parse::<u16>()
-        {
-            return Some((parts[0].to_owned(), Some(p)));
-        }
-
-        Some((bind_preference, None))
+        Some(parse_host_and_port(bind_preference))
     }
 
     /// Matches `source` against the user-defined bind interfaces
@@ -1219,4 +1211,77 @@ fn distinct_by_address(interfaces: Vec<IpData>) -> Vec<IpData> {
         }
     }
     result
+}
+
+/// `NetworkManager.ParseHostAndPort` (v12.2): a published-server override's
+/// host and explicit port. A full URL (`://`) is returned whole, its port
+/// left in it. Otherwise the value is read as the authority of
+/// `any://{value}`, the subset of `Uri.TryCreate` an override uses: a
+/// bracketed IPv6 literal or a host with one colon, followed by a port,
+/// gives the host (`DnsSafeHost`: unbracketed, lowercased) and the port;
+/// anything else — an unbracketed IPv6 literal, no port, a port that is not a
+/// number in range — is returned whole, with no port. Not read as `Uri`
+/// would: an IPv6 zone id (`[fe80::1%eth0]:80`, returned whole), userinfo
+/// (`user@host:80`), a path after the host, and a host with characters `Uri`
+/// refuses.
+fn parse_host_and_port(value: String) -> (String, Option<u16>) {
+    fn port(text: &str) -> Option<u16> {
+        text.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| text.parse().ok())
+            .flatten()
+    }
+    if value.contains("://") {
+        return (value, None);
+    }
+    let parsed = if let Some(rest) = value.strip_prefix('[') {
+        rest.split_once(']').and_then(|(host, tail)| {
+            let port = port(tail.strip_prefix(':')?)?;
+            let host: std::net::Ipv6Addr = host.parse().ok()?;
+            Some((host.to_string(), port))
+        })
+    } else {
+        value
+            .split_once(':')
+            .filter(|(host, _)| !host.is_empty())
+            .and_then(|(host, tail)| Some((host.to_ascii_lowercase(), port(tail)?)))
+    };
+    match parsed {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::parse_host_and_port;
+
+    /// What `Uri.TryCreate("any://" + value)` refuses, or gives no port for,
+    /// is returned whole; a parsed host is `DnsSafeHost`'s.
+    #[rstest]
+    #[case("Internal.Jellyfin:8097", "internal.jellyfin", Some(8097))]
+    #[case("[FD00:1234::1]:8097", "fd00:1234::1", Some(8097))]
+    #[case("[fd00:1234::1]", "[fd00:1234::1]", None)]
+    #[case("[not-ipv6]:8097", "[not-ipv6]:8097", None)]
+    #[case("host:", "host:", None)]
+    #[case("host:+80", "host:+80", None)]
+    #[case("host:70000", "host:70000", None)]
+    #[case(":8097", ":8097", None)]
+    #[case("host", "host", None)]
+    #[case("http://host:8097", "http://host:8097", None)]
+    #[case("host:0080", "host", Some(80))]
+    #[case("Host.LAN", "Host.LAN", None)]
+    #[case("[fe80::1%eth0]:80", "[fe80::1%eth0]:80", None)]
+    fn parse_host_and_port_reads_the_override_as_a_uri_authority(
+        #[case] value: &str,
+        #[case] host: &str,
+        #[case] port: Option<u16>,
+    ) {
+        assert_eq!(
+            parse_host_and_port(value.to_owned()),
+            (host.to_owned(), port)
+        );
+    }
 }

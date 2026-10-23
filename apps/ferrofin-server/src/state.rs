@@ -915,7 +915,8 @@ pub async fn build_app_state(
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
     // the filesystem scanner the library manager runs on `queue_library_scan`.
     // Kept concrete so the library monitor can take it as its `WatchRootsSource`
-    // (the roots of every library with realtime monitoring enabled).
+    // (the roots of every library with realtime monitoring enabled, and every
+    // library's locations).
     // The playlists media folder lives at `{data}/playlists` (stored as
     // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
     // `GetClientTypeName()`). Both seams need the path: the user-root store
@@ -2239,6 +2240,10 @@ pub async fn build_app_state(
             "AuthenticationSucceeded",
             |user, _device| format!("{user} successfully authenticated"),
         );
+        // Port of `PlaybackStartLogger` / `PlaybackStopLogger`, on the same
+        // awaited bus, so every route that reports playback (the obsolete
+        // `/PlayingItems/{itemId}` forms included) writes its entry.
+        ferrofin_core::playback_activity::subscribe(&event_bus, &activity, &library);
     }
 
     // These two maintenance tasks gate on active playback, so they register
