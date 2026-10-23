@@ -189,7 +189,7 @@ async fn artwork_saved_into_a_media_folder_lands_in_the_runs_listing() {
         ..Default::default()
     };
     // A downloaded poster, in the item's metadata folder.
-    let downloaded = meta.join(id.to_string()).join("poster.jpg");
+    let downloaded = crate::dynamic_images::own_art_dir(&meta, id).join("poster.jpg");
     std::fs::create_dir_all(downloaded.parent().unwrap()).unwrap();
     std::fs::write(&downloaded, b"poster").unwrap();
     let mut images = vec![ItemImageInfo {
