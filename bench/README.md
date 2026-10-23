@@ -441,7 +441,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab` or `ramp` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp` or `soak` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -456,9 +456,11 @@ runs of different harnesses are never compared. If a benchmark run directory hol
 `improved`, and `reason` saying why a cell was not comparable), its
 `report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
 the blocking ones first; a malformed file is an error, not an omitted section. When several runs are rendered together the
-file of the first run that has one is used. `gate.py ab` (and `gate.py render`) writes the
-session's gated cells into every candidate run and rewrites that run's `report.html`, since a
-`report.html` written before the file existed does not show it.
+file of the first run that has one is used. `gate.py ab`, `ramp` and `soak` (and `gate.py
+render` of such a session) write the session's gated cells into every candidate run and
+rewrite that run's `report.html`, since a `report.html` written before the file existed does
+not show it. A soak cell's rule is a slope limit rather than a percentage, so its Change
+column shows `—`.
 
 On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the

@@ -96,6 +96,38 @@ fn is_in_local_network_str_resolves_names_with_the_injected_resolver() {
     assert!(!nm.is_in_local_network_str("unknown.test"));
 }
 
+/// The lookup a caller takes to resolve outside the manager's lock reads an
+/// address the way `is_in_local_network_str` does: a literal or subnet as
+/// itself, a name through the resolver, nothing for an unknown name. Testing
+/// its addresses gives the same answer as the one-step check.
+#[test]
+fn the_host_lookup_reads_addresses_as_the_one_step_check_does() {
+    let nm = NetworkManager::with_defaults(conf(), MOCK_INTERFACES).with_resolver(stub_dns);
+    let lookup = nm.host_lookup();
+    assert_eq!(
+        lookup.addresses("192.168.1.5"),
+        Some(vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))])
+    );
+    assert_eq!(
+        lookup.addresses("lan.test"),
+        Some(vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))])
+    );
+    assert_eq!(lookup.addresses("unknown.test"), None);
+    for host in [
+        "192.168.1.5",
+        "8.8.8.8",
+        "10.0.0.0/8",
+        "lan.test",
+        "wan.test",
+        "unknown.test",
+    ] {
+        let two_step = lookup
+            .addresses(host)
+            .is_some_and(|addresses| addresses.iter().any(|a| nm.is_in_local_network(*a)));
+        assert_eq!(two_step, nm.is_in_local_network_str(host), "{host}");
+    }
+}
+
 #[test]
 fn update_settings_reapplies_configuration() {
     let mut nm = NetworkManager::with_defaults(conf(), MOCK_INTERFACES);

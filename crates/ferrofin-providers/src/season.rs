@@ -155,17 +155,16 @@ pub fn tvdb_answer(
 /// [`tvdb_answer`]. `None` is no answer — TheTVDB lists no such season, or
 /// a request failed (the failure is counted by the request).
 ///
-/// The scan's `IsAutomated` is `true` (`ImageRefreshOptions`' default, which
-/// a library scan and Identify keep), so the plugin always re-reads the
-/// season's id from the series ("the order has changed and we need to find
-/// the new season id", `:67-91`) and never resolves by an id already on the
-/// season. TODO(parity, open work item — NOT an accepted divergence):
-/// `ItemRefreshController` refreshes with `IsAutomated = false`
-/// (`ItemRefreshController.cs:86`), where the plugin first takes the
-/// season's own `Tvdb` id. To port: carry `IsAutomated` on
-/// `MetadataRefreshOptions` (false from the item-refresh route) and pass the
-/// season's id in here when it is false; the episode provider's
-/// `IsAutomated` branch (`TvdbEpisodeProvider.cs:171`) is the same item.
+/// At `5c4592f` the plugin re-reads the season's id from the series
+/// whenever the refresh is automated ("the order has changed and we need to
+/// find the new season id", `:67-91`), and a scan always is, so this never
+/// resolves by an id already on the season. TODO(parity, open work item
+/// gl-791 — NOT an accepted divergence): the plugin's latest release, `v24`,
+/// dropped that `IsAutomated` branch here and in `TvdbEpisodeProvider`
+/// (`228f7b3`): it takes the season's own `Tvdb` id whenever there is one
+/// and reads the series only when there is none. Porting that, with the
+/// rest of `5c4592f..v24`, is gl-791. (`MetadataRefreshOptions` carries
+/// `is_automated`, but the plugin no longer reads it.)
 ///
 /// The caller supplies `series_tvdb_id` only when the series has a `Tvdb`
 /// id. ACCEPTED DIVERGENCE (owner, 2026-10-04; don't-port-bugs): upstream

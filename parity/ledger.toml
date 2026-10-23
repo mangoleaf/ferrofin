@@ -1,0 +1,26 @@
+# The accepted divergences: differences between Ferrofin and Jellyfin that are known and linked.
+#
+# One entry per request pattern and field path. Every entry carries exactly one link:
+#   verified = "<METHOD> <path>"   a row of the parity record (handlers::VERIFIED) that states it
+#   issue    = <iid>               the GitLab issue that tracks it
+# and a `reason`. An entry with neither link, or with a `verified` that is not a row of the
+# record, fails the run before any server boots. Entries change only through a reviewed PR.
+#
+#   request   the request id, or a glob over request ids (`detail-*`)
+#   path      the field path as the report prints it (`MediaSources[].Size`); `$status` for the
+#             status code, `$` for a body that is not JSON
+#   kind      required: one kind or a list of status, value, type, null, missing, extra, length. An
+#             entry accepts only the kinds it names, so a harmless value difference cannot also hide
+#             a null, a type change or a Ferrofin timeout at the same path
+#
+# [[entry]]
+# request = "detail-item"
+# path = "Overview"
+# kind = "value"
+# verified = "GET /Users/{userId}/Items/{itemId}"
+# reason = "one sentence naming the divergence"
+#
+# The ledger is seeded from the first full run (a later phase); it starts empty so that every
+# difference the harness finds is new.
+
+version = 1
