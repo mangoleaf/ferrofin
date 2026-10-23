@@ -254,6 +254,19 @@ impl DownloadState {
             .filter(|session| session.belongs_to(cfg))
             .and_then(|session| session.quota.as_mut())
     }
+
+    /// Drops the session when it still holds `rejected`, the token the API
+    /// refused. A concurrent download may already have logged in again, and
+    /// its fresh session is kept.
+    fn forget_rejected(&mut self, rejected: &SecretString) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.holds(rejected))
+        {
+            self.session = None;
+        }
+    }
 }
 
 /// The expiry a JWT carries in its payload's `exp` (`LoginInfo.ExpirationDate`).
@@ -843,15 +856,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 return Err(download_limit_reached());
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                // Only the rejected token is dropped: a concurrent download
-                // may already have logged in again.
-                if state
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.holds(&token))
-                {
-                    state.session = None;
-                }
+                state.forget_rejected(&token);
                 if !retried {
                     tracing::debug!(file_id, "OpenSubtitles refused the token; logging in again");
                     retried = true;
@@ -1538,6 +1543,96 @@ mod tests {
         assert_eq!(
             state.limit_reset,
             Some(known - chrono::Duration::milliseconds(2_500))
+        );
+    }
+
+    /// Downloads running at once share one login: the second waits for the
+    /// first's login instead of making its own.
+    #[tokio::test]
+    async fn concurrent_downloads_share_one_login() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                ("/download", vec![download_reply(base, 19)]),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let (first, second) = tokio::join!(
+            provider.get_subtitles("srt-en-1"),
+            provider.get_subtitles("srt-en-2")
+        );
+        first.expect("first download");
+        second.expect("second download");
+
+        assert_eq!(mock.count("POST /login"), 1);
+        assert_eq!(mock.count("GET /infos/user"), 1);
+        assert_eq!(mock.count("POST /download"), 2);
+    }
+
+    /// A download that used up the quota is the last one: the next is
+    /// refused until the reset time without asking the API.
+    #[tokio::test]
+    async fn a_download_that_spends_the_quota_is_the_last() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(1, "2100-01-01T00:00:00Z")]),
+                ("/download", vec![download_reply(base, 0)]),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect("the last download");
+        let error = provider.get_subtitles("srt-en-1").await.expect_err("spent");
+
+        assert!(
+            error.to_string().contains("download limit reached"),
+            "{error}"
+        );
+        assert_eq!(mock.count("POST /download"), 1);
+    }
+
+    /// A refused token is forgotten only while the session still holds it: a
+    /// session another download has already renewed is kept.
+    #[test]
+    fn only_the_rejected_token_is_forgotten() {
+        let session = |token: &str| Session {
+            username: "user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            api_key: SecretString::from(DEFAULT_API_KEY.to_owned()),
+            token: SecretString::from(token.to_owned()),
+            expires_at: chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap(),
+            quota: None,
+        };
+        let rejected = SecretString::from("first".to_owned());
+        let mut state = DownloadState {
+            session: Some(session("second")),
+            ..DownloadState::default()
+        };
+
+        state.forget_rejected(&rejected);
+        assert!(
+            state
+                .session
+                .as_ref()
+                .is_some_and(|s| s.holds(&SecretString::from("second".to_owned()))),
+            "a session renewed by another download is kept"
+        );
+
+        state.session = Some(session("first"));
+        state.forget_rejected(&rejected);
+        assert!(
+            state.session.is_none(),
+            "the session holding the rejected token is dropped"
         );
     }
 
