@@ -2478,7 +2478,7 @@ impl FerrofinDtoService {
         // A Live TV channel IS `IHasMediaSources`, but its `GetMediaSources`
         // override returns the one Placeholder source, not a probed file.
         if options.contains_field(ItemFields::MediaSources) && is_live_tv_channel(kind) {
-            dto.media_sources = Some(vec![ferrofin_model::dto::MediaSourceInfo {
+            let mut source = ferrofin_model::dto::MediaSourceInfo {
                 id: Some(item_id.simple().to_string()),
                 name: item.name.clone(),
                 path: item.path.clone(),
@@ -2486,7 +2486,29 @@ impl FerrofinDtoService {
                 type_: ferrofin_model::dto::MediaSourceType::Placeholder,
                 is_infinite_stream: item.run_time_ticks.is_none(),
                 ..ferrofin_model::dto::MediaSourceInfo::default()
-            }]);
+            };
+            // `GetStaticMediaSources`' per-user tail runs for a channel too
+            // (`MediaSourceManager.cs:405-418`), never with a remembered
+            // selection (`LiveTvChannel.EnableRememberingTrackSelections` is
+            // false), and with the row's media type: Audio for a radio
+            // channel, as `PlaybackInfo` reads it.
+            if let Some(user) = user {
+                let media_type = item.media_type.as_deref();
+                crate::media_source_manager::StreamDefaults {
+                    localization: self.localization.as_deref(),
+                }
+                .apply(
+                    media_type,
+                    &mut source,
+                    user,
+                    (None, None),
+                    item.original_language.as_deref(),
+                );
+                if let Some(permissions) = prefetched.playback_permissions {
+                    permissions.apply(media_type, &mut source);
+                }
+            }
+            dto.media_sources = Some(vec![source]);
         } else if options.contains_field(ItemFields::MediaSources)
             && (kinds::is_video(kind) || kinds::is_audio(kind))
         {
@@ -4326,13 +4348,17 @@ impl FerrofinDtoService {
         // reads, per item, the user's remembered streams and the item's
         // inherited original language, and the user's permissions: here one
         // read each for the whole page, and none without a user or the field.
-        let sourced = items
-            .iter()
-            .filter(|i| kinds::is_video(row_kind(i)) || kinds::is_audio(row_kind(i)));
+        // A Live TV channel takes the permissions but never a remembered
+        // stream (`EnableRememberingTrackSelections` is false for it).
+        let sourced = items.iter().filter(|i| {
+            let kind = row_kind(i);
+            kinds::is_video(kind) || kinds::is_audio(kind) || is_live_tv_channel(kind)
+        });
         let (remembered_streams, series_original_languages, playback_permissions) = match user {
             Some(user) if want_sources && sourced.clone().next().is_some() => {
                 let user_id = parse_user_id(&user.id)?;
                 let videos: Vec<&BaseItemEntity> = sourced
+                    .filter(|i| !is_live_tv_channel(row_kind(i)))
                     .filter(|i| i.media_type.as_deref().unwrap_or("Video") == "Video")
                     .collect();
                 let mut video_ids: Vec<Uuid> = videos.iter().map(|i| row_id(i)).collect();
@@ -9258,6 +9284,62 @@ mod tests {
         let source = &anonymous.media_sources.as_ref().expect("sources")[0];
         assert_eq!(source.default_subtitle_stream_index, None);
         assert!(source.supports_transcoding, "as built");
+    }
+
+    /// A Live TV channel is `IHasMediaSources` too, so its placeholder source
+    /// gets the same per-user policy flags (`MediaSourceManager.cs:409-417`):
+    /// a television channel by video transcoding and remuxing, a radio
+    /// channel (`MediaType` Audio) by audio transcoding. Without a user it
+    /// stays as built.
+    #[tokio::test]
+    async fn a_channels_source_carries_the_users_permissions() {
+        use ferrofin_db::enums::PermissionKind;
+
+        let db = test_db().await;
+        let (tv, radio) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, name, media_type) in [(tv, "News", "Video"), (radio, "Jazz", "Audio")] {
+            seed_named_item(&db, id, BaseItemKind::LiveTvChannel, name).await;
+            let mut row = fetch_item(&db, id).await;
+            row.media_type = Some(media_type.to_owned());
+            save_item(&db, &row).await;
+        }
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        crate::user_data_manager::seed_content_permissions(
+            &db,
+            user_id,
+            &[PermissionKind::EnableAudioPlaybackTranscoding],
+            &[],
+        )
+        .await;
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let channels = [fetch_item(&db, tv).await, fetch_item(&db, radio).await];
+        let flags = |dto: &BaseItemDto| {
+            let source = &dto.media_sources.as_ref().expect("sources")[0];
+            (source.supports_transcoding, source.supports_direct_stream)
+        };
+
+        let page = svc
+            .get_base_item_dtos(&channels, &options, Some(&user), None, false)
+            .await
+            .expect("page");
+        let single = svc
+            .get_base_item_dto(&channels[0], &options, Some(&user), None)
+            .await
+            .expect("dto");
+        assert_eq!(flags(&page[0]), (false, false), "television channel");
+        assert_eq!(flags(&single), (false, false), "television channel, alone");
+        assert_eq!(flags(&page[1]), (true, true), "radio channel");
+
+        let anonymous = svc
+            .get_base_item_dto(&channels[0], &options, None, None)
+            .await
+            .expect("dto");
+        assert_eq!(flags(&anonymous), (true, true), "as built");
     }
 
     #[tokio::test]
