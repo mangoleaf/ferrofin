@@ -176,6 +176,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
+  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
+  the same store, trying the Matroska cues before ffprobe, and
+  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
+  the transcode at the segment's playlist time, half a second later for a copied video so
+  ffmpeg lands on the keyframe itself
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
