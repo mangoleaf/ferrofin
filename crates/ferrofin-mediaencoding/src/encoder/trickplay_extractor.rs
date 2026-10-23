@@ -13,7 +13,7 @@
 //! hardware matrix in [`crate::encoding_helper::hw`]. It is chosen per job when
 //! the request allows hardware, the configured accelerator has a ported filter
 //! chain, and a video stream is available to size it from — otherwise the
-//! software path, which is also where a failed keyframe-only run retries.
+//! software path. A failed keyframe-only run retries on the path it took.
 //!
 //! The three switches come from `TrickplayOptions`, **not** from the playback
 //! encoding options: an operator can run playback on a GPU and trickplay on the
@@ -740,7 +740,13 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
             None => None,
         };
         let plan = self
-            .plan(request, &output_pattern, pts_frame_rate, map_index)
+            .plan(
+                request,
+                request.keyframe_only,
+                &output_pattern,
+                pts_frame_rate,
+                map_index,
+            )
             .await;
         let first = self.run(&plan, request.priority, dir).await?;
         if let Some(frames) = Self::frames_of(dir, &first)? {
@@ -768,6 +774,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
                         keyframe_only: false,
                         ..*request
                     },
+                    request.keyframe_only,
                     &output_pattern,
                     pts_frame_rate,
                     map_index,
@@ -802,21 +809,32 @@ struct ExtractionPlan {
 impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     /// Chooses the hardware plan when everything it needs is present, and the
     /// software one otherwise.
+    ///
+    /// `configured_keyframe_only` is the job's configured flag, which the
+    /// standard-way retry of a keyframe-only run passes on although its
+    /// `request` no longer asks for keyframes only.
     async fn plan(
         &self,
         request: &TrickplayExtraction<'_>,
+        configured_keyframe_only: bool,
         output_pattern: &str,
         pts_frame_rate: Option<f32>,
         map_index: Option<i32>,
     ) -> ExtractionPlan {
         // Upstream reads the configured options only while trickplay may use
         // the hardware path (`allowHwAccel ? GetEncodingOptions() : new
-        // EncodingOptions()`, `MediaEncoder.cs:850`).
+        // EncodingOptions()`, `MediaEncoder.cs:850`). Keyframe-only extraction
+        // asked of an accelerator that cannot do it turns hardware off and
+        // starts over from `new EncodingOptions()` (`:853-866`), once, before
+        // the arguments its standard-way retry reuses are built (`:980`).
         let configured = if request.allow_hw_accel {
             self.encoding_options().await
         } else {
             None
-        };
+        }
+        .filter(|options| {
+            !configured_keyframe_only || supports_keyframe_only_decode(&self.caps, options)
+        });
         if let Some(stream) = request.video_stream
             && let Some(options) = configured.as_ref()
             && let Some((args, env)) = build_accelerated_trickplay_args(
@@ -844,15 +862,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 hardware: true,
             };
         }
-        // The software filter's options: the configured ones, unless
-        // keyframe-only extraction was asked of an accelerator that cannot do
-        // it, where upstream starts over from `new EncodingOptions()`
-        // (`:853-866`).
-        let options = configured
-            .filter(|options| {
-                !request.keyframe_only || supports_keyframe_only_decode(&self.caps, options)
-            })
-            .unwrap_or_default();
+        let options = configured.unwrap_or_default();
         let deinterlace = request
             .video_stream
             .filter(|stream| stream.is_interlaced)
@@ -2183,6 +2193,53 @@ mod tests {
             args.contains("-skip_frame nokey"),
             "keyframe-only kept: {args}"
         );
+    }
+
+    /// Upstream turns hardware off once, before it builds the arguments its
+    /// standard-way retry reuses (`MediaEncoder.cs:853-866, :980`). So when an
+    /// accelerator cannot skip to keyframes, the retry is software too, with
+    /// the same `new EncodingOptions()` deinterlacer as the first run.
+    #[tokio::test]
+    async fn the_retry_of_a_keyframe_only_run_the_accelerator_cannot_do_stays_in_software() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(0, "no frames decoded").failing());
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .platform(crate::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_nvenc", "mjpeg"])
+            .hwaccels(["cuda"])
+            .filters(crate::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            // The gate: nvenc needs the enhanced decoder to skip to keyframes.
+            enable_enhanced_nvdec_decoder: false,
+            enable_hardware_encoding: true,
+            hardware_decoding_codecs: vec!["h264".to_owned()],
+            deinterlace_method: ferrofin_model::entities::DeinterlaceMethod::bwdif,
+            ..EncodingOptions::default()
+        };
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)));
+        let stream = MediaStream {
+            is_interlaced: true,
+            ..h264_stream()
+        };
+
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect_err("both runs fail");
+
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 2, "the retry ran: {recorded:?}");
+        for args in &recorded {
+            assert!(!args.contains("-init_hw_device"), "software: {args}");
+            assert!(args.contains("-vf \"yadif=0:-1:0,"), "{args}");
+        }
+        assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
     }
 
     #[tokio::test]
