@@ -434,7 +434,7 @@ pub(crate) fn resolve_host(host: &str) -> Option<Vec<IpAddr>> {
 
 /// Unwraps an IPv4-mapped IPv6 address to plain IPv4 (`IsIPv4MappedToIPv6` +
 /// `MapToIPv4`); other addresses pass through unchanged.
-fn unmap_v4_mapped(address: IpAddr) -> IpAddr {
+pub(crate) fn unmap_v4_mapped(address: IpAddr) -> IpAddr {
     if let IpAddr::V6(v6) = address
         && let Some(v4) = v6.to_ipv4_mapped()
     {

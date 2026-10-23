@@ -1933,6 +1933,15 @@ fn settle_sort_name_follows_create_sort_name_per_kind() {
     );
     assert_eq!(
         settled(BaseItemEntity {
+            name: Some("The Lost Season 2".into()),
+            ..item(BaseItemKind::Season)
+        })
+        .as_deref(),
+        Some("The Lost Season 2"),
+        "an unnumbered season sorts by its name as it is"
+    );
+    assert_eq!(
+        settled(BaseItemEntity {
             name: Some("Song".into()),
             index_number: Some(4),
             ..item(BaseItemKind::Audio)
