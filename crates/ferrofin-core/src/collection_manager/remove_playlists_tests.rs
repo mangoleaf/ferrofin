@@ -211,11 +211,12 @@ async fn the_heir_is_the_first_editor_in_the_order_data_lists_the_shares() {
             Some(PlaylistAccessLevel::Owner),
             "imported: {imported}"
         );
+        // `Shares = rankedShares.Skip(1)`: the rest, editors first.
         assert_eq!(
             mgr.get_playlist_shares(editors).await.expect("shares"),
             vec![
-                PlaylistUserPermissions::new(bob, false),
                 PlaylistUserPermissions::new(carol, true),
+                PlaylistUserPermissions::new(bob, false),
             ],
             "imported: {imported}"
         );

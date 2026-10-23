@@ -579,6 +579,25 @@ pub mod test_support {
         Ok(())
     }
 
+    /// The item holding `user_id`'s favourite row keyed `key`, if any: the
+    /// channel itself, or the deletion placeholder a removed channel's rows
+    /// are parked on.
+    pub async fn favorite_holder(
+        db: &Database,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        sqlx::query_scalar(
+            r#"SELECT "ItemId" FROM "UserData"
+               WHERE "UserId" = ?1 AND "CustomDataKey" = ?2 AND "IsFavorite" = 1"#,
+        )
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// Pins every channel's `DateCreated` to a sentinel value.
     pub async fn pin_channel_dates(db: &Database, value: &str) -> Result<(), ServiceError> {
         sqlx::query(r#"UPDATE "FerrofinLiveTvChannels" SET "DateCreated" = ?1"#)

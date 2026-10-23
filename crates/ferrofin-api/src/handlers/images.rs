@@ -122,7 +122,7 @@ pub(crate) struct ImageQuery {
     fill_width: Option<i32>,
     #[serde(default)]
     fill_height: Option<i32>,
-    /// JPEG/WebP quality (1–100); the encoder default is used when omitted.
+    /// JPEG/WebP quality (1–100); 100 when omitted, as `GetImageInternal`.
     #[serde(default)]
     quality: Option<i32>,
     /// Gaussian blur radius.
@@ -137,11 +137,12 @@ pub(crate) struct ImageQuery {
 
 impl ImageQuery {
     /// A query naming only a cache `tag` and an output `format`, as the
-    /// splashscreen route accepts.
+    /// splashscreen route accepts. Its quality is `GetSplashscreen`'s fixed 90.
     pub(crate) fn tagged(tag: Option<String>, format: Option<String>) -> Self {
         Self {
             format,
             tag,
+            quality: Some(90),
             ..Self::default()
         }
     }
@@ -411,12 +412,17 @@ fn select_image(
 /// (which says why the row itself stays remote). One that cannot be
 /// downloaded is a `404` (upstream's exception is a `500`).
 ///
+/// `auto_orient` is `ImageProcessor.ProcessImage`'s photo flag: the image is
+/// turned upright from its EXIF orientation, so it goes through the processor
+/// even when nothing else is asked for, as upstream re-encodes it.
+///
 /// [`ProviderManager::cached_remote_image`]: ferrofin_traits::providers::ProviderManager::cached_remote_image
 pub(crate) async fn serve_image_file(
     state: &AppState,
     item_id: Uuid,
     image: &ItemImageInfo,
     index: i32,
+    auto_orient: bool,
     query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -452,7 +458,10 @@ pub(crate) async fn serve_image_file(
     // already matches), so a plain request still serves the untouched original.
     let mut serve_path = image.path.clone();
     let mut content_type: Option<String> = None;
-    if let (true, Some(processor)) = (query.wants_transform(), state.image_processor.as_ref()) {
+    if let (true, Some(processor)) = (
+        query.wants_transform() || auto_orient,
+        state.image_processor.as_ref(),
+    ) {
         let options = ImageProcessingOptions {
             item_id,
             image: image.clone(),
@@ -464,7 +473,7 @@ pub(crate) async fn serve_image_file(
             fill_width: query.fill_width,
             fill_height: query.fill_height,
             blur: query.blur,
-            quality: query.quality.unwrap_or(90),
+            quality: query.quality.unwrap_or(100),
             // C# `GetOutputFormats(format)`: an explicit `format` wins outright,
             // otherwise the list is derived from what the *client* advertised.
             supported_output_formats: bind_query_image_format(query.format.as_deref())?
@@ -477,6 +486,7 @@ pub(crate) async fn serve_image_file(
                     },
                     |f| vec![f],
                 ),
+            auto_orient,
             ..Default::default()
         };
         let processed = processor.process_image(&options).await?;
@@ -654,10 +664,13 @@ async fn serve_item_image(
     } else {
         None
     };
-    let images = if chapter_image.is_some() {
-        Vec::new()
+    let (images, auto_orient) = if chapter_image.is_some() {
+        (Vec::new(), false)
     } else {
-        state.library.get_item_images(item_id).await?
+        state
+            .library
+            .get_item_images_with_auto_orient(item_id)
+            .await?
     };
     let image = chapter_image
         .as_ref()
@@ -670,7 +683,7 @@ async fn serve_item_image(
             "item {item_id} has no {image_type:?} image at {index}"
         )));
     };
-    serve_image_file(state, item_id, image, index, query, request).await
+    serve_image_file(state, item_id, image, index, auto_orient, query, request).await
 }
 
 /// Resolve authenticated item access even on image-cache hits. Anonymous
@@ -1108,7 +1121,7 @@ async fn get_user_image(
         .get_profile_image(user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {user_id} has no profile image")))?;
-    serve_image_file(&state, user_id, &image, 0, &query, request).await
+    serve_image_file(&state, user_id, &image, 0, false, &query, request).await
 }
 
 /// `POST /UserImage` — upload a user's profile image.

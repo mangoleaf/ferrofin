@@ -1661,20 +1661,10 @@ fn written_columns(item: &BaseItemEntity) -> Vec<(&'static str, Column)> {
     // => false` and keeps its name — or its forced sort name — verbatim.
     // Deriving the generic key for a `Person` here lower-cased rows the
     // people repository had written correctly.
-    let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
-    let sort_name = item.sort_name.clone().or_else(|| {
-        let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
-        match forced {
-            Some(f) => Some(match sort_kind {
-                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                None => ferrofin_util::sort_name::forced_sort_key(f),
-            }),
-            None => item.name.as_deref().map(|n| match sort_kind {
-                Some(kind) => crate::kinds::sort_name_for(kind, n),
-                None => ferrofin_util::sort_name::create_sort_name(n),
-            }),
-        }
-    });
+    let sort_name = item
+        .sort_name
+        .clone()
+        .or_else(|| crate::kinds::fallback_sort_name(item));
     columns_of(item, clean_name, presentation_unique_key, sort_name)
 }
 
@@ -2114,6 +2104,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
             query.execute(&mut *tx).await.map_err(db_err)?;
         }
+        // The deleted rows' `ItemValuesMap` rows went with them (`ON DELETE
+        // CASCADE`); the values nothing maps to any more go too.
+        sqlx::query(PRUNE_ORPHAN_ITEM_VALUES_SQL)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(closure
             .iter()
@@ -3624,6 +3620,21 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(Vec::new());
         };
         let ids: Vec<String> = sqlx::query_scalar(SUPERSEDED_BY_NAME_ARTISTS_SQL)
+            .bind(type_name)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    async fn dead_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        let Some(type_name) = stored_type_name(BaseItemKind::MusicArtist) else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<String> = sqlx::query_scalar(DEAD_BY_NAME_ARTISTS_SQL)
             .bind(type_name)
             .fetch_all(self.db.pool())
             .await
@@ -5487,8 +5498,17 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
 /// # Errors
 /// Returns [`ServiceError`] if the read or the write fails.
 pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, ServiceError> {
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        r#"SELECT "Id", "Name", "ForcedSortName", "Type" FROM "BaseItems"
+    type Unsorted = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<i64>,
+    );
+    let rows: Vec<Unsorted> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "ForcedSortName", "Type", "IndexNumber", "ParentIndexNumber"
+           FROM "BaseItems"
            WHERE "SortName" IS NULL AND "Name" IS NOT NULL AND "Name" <> ''
              AND "Type" <> 'PLACEHOLDER'"#,
     )
@@ -5500,22 +5520,22 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for (id, name, forced, type_name) in &rows {
-        // `Type` is selected so the per-kind `GetSortName` branch applies to
-        // both the derived and the forced key: a `Person` keeps its name
-        // verbatim (`EnableAlphaNumericSorting => false`). Backfilling the
-        // generic key here wrote the WRONG value into exactly the rows this
-        // function exists to repair.
-        let kind = crate::item_type_lookup::kind_from_type_name(type_name);
-        let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
-            Some(f) => match kind {
-                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                None => ferrofin_util::sort_name::forced_sort_key(f),
-            },
-            None => match kind {
-                Some(kind) => crate::kinds::sort_name_for(kind, name),
-                None => ferrofin_util::sort_name::create_sort_name(name),
-            },
+    for (id, name, forced, type_name, index_number, parent_index_number) in &rows {
+        // `Type` and the numbers are selected so the per-kind rules apply
+        // to both the derived and the forced key: a `Person` keeps its name
+        // verbatim (`EnableAlphaNumericSorting => false`), and an episode,
+        // season or track sorts by its numbers (`CreateSortName`).
+        // Backfilling the generic key here wrote the WRONG value into
+        // exactly the rows this function exists to repair.
+        let Some(sort_name) = crate::kinds::fallback_sort_name(&BaseItemEntity {
+            name: Some(name.clone()),
+            forced_sort_name: forced.clone(),
+            type_: type_name.clone(),
+            index_number: *index_number,
+            parent_index_number: *parent_index_number,
+            ..BaseItemEntity::default()
+        }) else {
+            continue;
         };
         sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
             .bind(sort_name)
@@ -6197,6 +6217,35 @@ pub(crate) const SUPERSEDED_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "B
                   WHERE f."Type" = ?1 AND f."CleanName" = b."CleanName"
                     AND +f."TopParentId" IS NOT NULL AND +f."TopParentId" <> '')
    ORDER BY b."Id""#;
+
+/// [`ItemPersistenceService::dead_by_name_artists`] over the `MusicArtist`
+/// type bound as `?1`: the unlocked rows accessed by name (no `ParentId`,
+/// `MusicArtist.IsAccessedByName`) outside v12.2 `ArtistsValidator`'s live
+/// set, which is every artist and album-artist value an item maps to
+/// (`GetAllArtistNames`), resolved to its artist by `CleanName`
+/// (`FindArtists`). Sought by `Type`, the values by
+/// `IX_ItemValues_Type_CleanValue` and their maps by `PK_ItemValuesMap`;
+/// `EXPLAIN QUERY PLAN` pinned by `the_closing_pass_selections_seek_by_type`.
+pub(crate) const DEAD_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "BaseItems" AS b
+   WHERE b."Type" = ?1
+     AND b."ParentId" IS NULL
+     AND NOT b."IsLocked"
+     AND NOT EXISTS (SELECT 1 FROM "ItemValues" AS v
+                      -- ItemValueType::Artist (0), ItemValueType::AlbumArtist (1)
+                      WHERE v."Type" IN (0, 1) AND v."CleanValue" = b."CleanName"
+                        AND EXISTS (SELECT 1 FROM "ItemValuesMap" AS m
+                                     WHERE m."ItemValueId" = v."ItemValueId"))
+   ORDER BY b."Id""#;
+
+/// The `ItemValues` rows no item maps to any more, deleted with every
+/// deletion (`ItemPersistenceService.cs:149`), so a genre, studio or artist
+/// name only the deleted items carried is gone and its by-name row reads
+/// dead. One pass over `ItemValues` (a few rows per distinct name), each
+/// row's maps sought by `PK_ItemValuesMap`; `EXPLAIN QUERY PLAN` pinned by
+/// `the_item_values_prune_seeks_each_values_maps`.
+pub(crate) const PRUNE_ORPHAN_ITEM_VALUES_SQL: &str = r#"DELETE FROM "ItemValues"
+   WHERE NOT EXISTS (SELECT 1 FROM "ItemValuesMap" AS m
+                      WHERE m."ItemValueId" = "ItemValues"."ItemValueId")"#;
 
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
 /// unset), in id order — `PeopleValidator`'s new person items.
@@ -7977,6 +8026,50 @@ mod tests {
         );
     }
 
+    /// A row saved without a sort name, and one the boot backfill repairs,
+    /// gets its kind's `CreateSortName` as the writers settle it: an episode,
+    /// season or track sorts by its numbers, never by its title.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Episode, Some(1), Some(4), "Pilot", "001 - 0004 - Pilot")]
+    #[case(BaseItemKind::Season, None, Some(3), "Season 3", "0003")]
+    #[case(BaseItemKind::Audio, Some(2), Some(5), "Song", "0002 - 0005 - Song")]
+    #[tokio::test]
+    async fn a_missing_sort_name_takes_the_kinds_create_sort_name(
+        #[case] kind: BaseItemKind,
+        #[case] parent_index_number: Option<i64>,
+        #[case] index_number: Option<i64>,
+        #[case] name: &str,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: stored_type_name(kind).expect("type").to_owned(),
+            parent_index_number,
+            index_number,
+            ..named(name)
+        };
+        assert_eq!(
+            persisted_sort_name(&db, entity.clone()).await.as_deref(),
+            Some(expected),
+            "save_items"
+        );
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" = ?1"#)
+            .bind(&entity.id)
+            .execute(db.writer())
+            .await
+            .expect("null it out");
+        super::backfill_missing_sort_names(&db)
+            .await
+            .expect("backfill");
+        let repaired: Option<String> =
+            sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&entity.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("query");
+        assert_eq!(repaired.as_deref(), Some(expected), "backfill");
+    }
+
     // A caller-supplied sort name wins: that is what carries the per-kind
     // `CreateSortName` overrides (episode/season) the scanner computes, and
     // those drive the client's play queue.
@@ -9457,7 +9550,7 @@ mod tests {
             .expect("rewrite");
 
         let read = repo
-            .get_image_infos_for_items(&[one, two, bare])
+            .get_image_infos_batch(&[one, two, bare])
             .await
             .expect("read");
         assert_eq!(read.len(), 2, "an item with no images is absent");
@@ -11811,6 +11904,45 @@ mod tests {
                 && s.contains("CleanName=?")),
             "the folder twin by Type and CleanName, got: {plan:?}"
         );
+
+        // The dead by-name artists: the artists by Type, each one's values
+        // by Type and CleanValue, and each value's maps by its id.
+        let plan = query_plan(&db, super::DEAD_BY_NAME_ARTISTS_SQL, 1).await;
+        assert!(
+            !plan.iter().any(|s| s.starts_with("SCAN")),
+            "no scan of any table, got: {plan:?}"
+        );
+        for (table, index) in [
+            ("b ", "(Type=?"),
+            (
+                "v ",
+                "IX_ItemValues_Type_CleanValue (Type=? AND CleanValue=?)",
+            ),
+            ("m ", "(ItemValueId=?)"),
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH") && s.contains(table) && s.contains(index)),
+                "{table}sought by {index}, got: {plan:?}"
+            );
+        }
+    }
+
+    /// The `ItemValues` prune every deletion runs reads each value's maps
+    /// through the map's primary key, never a scan of `ItemValuesMap`.
+    #[tokio::test]
+    async fn the_item_values_prune_seeks_each_values_maps() {
+        let db = test_db().await;
+        let plan = query_plan(&db, super::PRUNE_ORPHAN_ITEM_VALUES_SQL, 0).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH m") && s.contains("(ItemValueId=?)")),
+            "the maps sought by ItemValueId, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.starts_with("SCAN m")),
+            "never a scan of the maps, got: {plan:?}"
+        );
     }
 
     /// The two persisted selections over real rows: a never-refreshed row of
@@ -11872,6 +12004,82 @@ mod tests {
             svc.superseded_by_name_artists().await.unwrap(),
             vec![Uuid::from_u128(0x22)],
             "only the by-name twin of a library artist"
+        );
+    }
+
+    /// A deletion drops the `ItemValues` rows only the deleted items mapped
+    /// to (`ItemPersistenceService.cs:149`), and the dead-artist selection
+    /// then names the by-name artist no item credits any more: never one a
+    /// remaining item credits, a locked one, or a library artist.
+    #[tokio::test]
+    async fn a_deletion_prunes_unmapped_values_and_the_dead_artists_follow() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let row = |id: u128, kind: BaseItemKind, name: &str, parent: Option<u128>| {
+            ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid_to_db(Uuid::from_u128(id)),
+                type_: stored_type_name(kind).unwrap_or_default().to_owned(),
+                name: Some(name.to_owned()),
+                clean_name: Some(crate::text_util::get_clean_value(name)),
+                is_folder: kind != BaseItemKind::Audio,
+                parent_id: parent.map(|p| guid_to_db(Uuid::from_u128(p))),
+                ..Default::default()
+            }
+        };
+        let (kept, gone) = (Uuid::from_u128(0x41), Uuid::from_u128(0x42));
+        svc.save_items(&[
+            row(0x10, BaseItemKind::Folder, "Jazz", None),
+            row(0x41, BaseItemKind::Audio, "So What", Some(0x10)),
+            row(0x42, BaseItemKind::Audio, "Alone Together", Some(0x10)),
+            row(0x43, BaseItemKind::MusicArtist, "Art Pepper", Some(0x10)),
+        ])
+        .await
+        .expect("seed");
+        svc.save_item_values(kept, &[(1, "Miles Davis".to_owned())])
+            .await
+            .expect("values");
+        svc.save_item_values(gone, &[(0, "Chet Baker".to_owned())])
+            .await
+            .expect("values");
+        let by_name = |name: &'static str| {
+            let svc = &svc;
+            async move {
+                svc.ensure_by_name_item(BaseItemKind::MusicArtist, name, "/metadata/artists")
+                    .await
+                    .expect("by-name artist")
+                    .expect("an id")
+            }
+        };
+        let chet = by_name("Chet Baker").await;
+        by_name("Miles Davis").await;
+        let bill = by_name("Bill Evans").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(bill))
+            .execute(db.pool())
+            .await
+            .expect("lock");
+        assert_eq!(
+            svc.dead_by_name_artists().await.unwrap(),
+            Vec::<Uuid>::new(),
+            "every unlocked by-name artist is still credited"
+        );
+
+        svc.delete_items(&[gone]).await.expect("delete");
+
+        let values: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Value" FROM "ItemValues" ORDER BY 1"#)
+                .fetch_all(db.pool())
+                .await
+                .expect("values");
+        assert_eq!(
+            values,
+            ["Miles Davis"],
+            "only the value an item still maps to stays"
+        );
+        assert_eq!(
+            svc.dead_by_name_artists().await.unwrap(),
+            vec![chet],
+            "the artist only the deleted track credited"
         );
     }
 

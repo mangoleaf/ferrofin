@@ -45,16 +45,23 @@ fn render(map: &BTreeMap<i64, (String, String)>) -> String {
     out
 }
 
-fn parse(text: &str) -> BTreeMap<i64, String> {
-    text.lines()
+/// The pinned checksums, and each version pinned more than once (both sides of a merge kept).
+fn parse(text: &str) -> (BTreeMap<i64, String>, Vec<i64>) {
+    let mut pinned = BTreeMap::new();
+    let mut repeated = Vec::new();
+    for l in text
+        .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let v = it.next()?.parse().ok()?;
-            let sum = it.next()?.to_string();
-            Some((v, sum))
-        })
-        .collect()
+    {
+        let mut it = l.split_whitespace();
+        let (Some(v), Some(sum)) = (it.next().and_then(|v| v.parse().ok()), it.next()) else {
+            continue;
+        };
+        if pinned.insert(v, sum.to_string()).is_some() {
+            repeated.push(v);
+        }
+    }
+    (pinned, repeated)
 }
 
 #[test]
@@ -65,9 +72,17 @@ fn released_migrations_have_not_changed() {
         std::fs::write(&path, render(&now)).expect("write the pinned checksums");
         return;
     }
-    let pinned =
+    let (pinned, repeated) =
         parse(&std::fs::read_to_string(&path).expect("tests/data/migration_checksums.txt exists"));
-    let mut problems = Vec::new();
+    let mut problems: Vec<String> = repeated
+        .iter()
+        .map(|v| {
+            format!(
+                "migration {v:04} is pinned more than once — two migrations took the same number \
+                 (see migration_versions.rs); keep one line per version"
+            )
+        })
+        .collect();
     for (v, (desc, sum)) in &now {
         match pinned.get(v) {
             None => problems.push(format!(

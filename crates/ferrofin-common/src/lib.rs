@@ -4,6 +4,8 @@
 //!
 //! - [`crc32`] — zlib/IEEE CRC-32 (`MediaBrowser.Common`).
 //! - [`providers`] — provider-id parsers (`MediaBrowser.Common.Providers`).
+//! - [`path_attributes`] — the `[name=value]` attributes in file and folder
+//!   names (`PathExtensions.GetAttributeValue`).
 //! - [`extensions`] — string helpers (`MediaBrowser.Common.Extensions`).
 //! - [`configuration`] — config-store value types + factory/validation traits
 //!   (`MediaBrowser.Common.Configuration`).
@@ -25,6 +27,7 @@ pub mod cryptography;
 pub mod error;
 pub mod exceptions;
 pub mod extensions;
+pub mod path_attributes;
 pub mod providers;
 
 pub use error::{CryptoError, Result};

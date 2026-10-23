@@ -341,66 +341,60 @@ fn push_group_tail(qb: &mut QueryBuilder<Sqlite>) {
     qb.push(r#" GROUP BY bi."PresentationUniqueKey"))"#);
 }
 
-/// Builds the "latest media" statement for a **tvshows** library — **v10.11.8**
-/// `BaseItemRepository.GetLatestItemList` (`BaseItemRepository.cs:328-369`).
+/// Step 1 of v12's tvshows "latest" (`GetLatestTvShowItems`,
+/// `Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs:287-303`):
+/// the newest `filter.limit` series, by the newest `DateCreated` among the rows
+/// the caller's filter matches, grouped by `SeriesName`, newest first. Each row
+/// is `(SeriesName, MaxDate)`.
 ///
-/// Upstream composes two translations of the **same** filter: a grouped
-/// subquery that takes the newest `MAX(DateCreated)` per series (`SeriesName`),
-/// keeps the top `filter.limit` groups, and uses the *smallest* of those maxima
-/// as a threshold; the main query then returns every row at or above that
-/// threshold, ordered by the caller's `order_by` and **unpaged** (upstream nulls
-/// `Limit` before `ApplyQueryPaging`, so only a `StartIndex` survives). That is
-/// what makes one query return whole groups — the caller groups the rows by
-/// container afterwards.
-///
-/// Both translations share the predicate set, so the filter is appended twice;
-/// the inner `bi` alias shadows the outer inside the subquery, exactly as EF's
-/// nested query does.
-///
-/// The **music** arm no longer uses this shape:
-/// [`build_latest_music_albums_query`] carries v12's rewritten one. This one
-/// stays on 10.11.8 deliberately — v12 replaced the tvshows arm too, with
-/// `GetLatestTvShowItems` (`Querying.cs:282+`, which picks a Season or Series
-/// container per group), and porting that is its own work item, not part of the
-/// music branch.
+/// No grouping by presentation key: v12's `GetLatestItemList` builds its base
+/// query with `TranslateQuery` alone, without `ApplyGroupingFilter`. The
+/// caller's `order_by` and `start_index` play no part, as upstream.
 #[must_use]
-pub(crate) fn build_latest_item_list_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
-    let mut qb: QueryBuilder<Sqlite> =
-        QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE "#);
-    // `GetLatestItemList` runs `ApplyGroupingFilter` over the main query too
-    // (`BaseItemRepository.cs:363`), so "latest" collapses merged versions the
-    // same way a browse does — otherwise the two paths disagree about what a
-    // duplicate is, and a four-cut film fills the row.
-    let groups = group_by_presentation_unique_key(filter);
-    if groups {
-        push_group_head(&mut qb);
-    } else {
-        qb.push(r#"bi."Id" <> "#).push_bind(PLACEHOLDER_ID);
-    }
-    append_predicates(&mut qb, filter);
-
-    // `mainquery.Where(g => g.DateCreated >= subqueryGrouped.Min(s => s.MaxDateCreated))`
-    qb.push(r#" AND bi."DateCreated" >= (SELECT MIN(g."m") FROM ("#);
-    qb.push(r#"SELECT MAX(bi."DateCreated") AS "m" FROM "BaseItems" AS bi WHERE bi."Id" <> "#);
+pub(crate) fn build_latest_tv_series_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT bi."SeriesName" AS "SeriesName", MAX(bi."DateCreated") AS "MaxDate"
+           FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
     qb.push_bind(PLACEHOLDER_ID);
     append_predicates(&mut qb, filter);
-    // `dbQuery.GroupBy(e => e.SeriesName)` — the one grouping key this shape
-    // ever had once the music arm moved to [`build_latest_music_albums_query`]
-    // (it used to take `bi."Album"` as a parameter).
-    qb.push(r#" GROUP BY bi."SeriesName" ORDER BY "m" DESC"#);
+    qb.push(r#" AND bi."SeriesName" IS NOT NULL GROUP BY bi."SeriesName" ORDER BY "MaxDate" DESC"#);
     if let Some(limit) = filter.limit {
-        qb.push(" LIMIT ").push_bind(i64::from(limit));
+        qb.push(" LIMIT ").push_bind(i64::from(limit).max(0));
     }
-    qb.push(") AS g)");
-    if groups {
-        push_group_tail(&mut qb);
-    }
+    qb
+}
 
-    append_order_by(&mut qb, filter);
-    // `filter.Limit = null` upstream — only a start index can page this query.
-    if let Some(offset) = filter.start_index.filter(|o| *o > 0) {
-        qb.push(" LIMIT -1 OFFSET ").push_bind(i64::from(offset));
+/// Step 2 of `GetLatestTvShowItems` (`Querying.cs:313-325`): the rows of
+/// `series_names` the caller's filter matches, created at or after `cutoff`
+/// when there is one, as the lightweight `(Id, SeriesName, DateCreated,
+/// SeasonId, SeriesId)` projection, newest first (`DateCreated DESC, Id
+/// DESC`). `series_names` must not be empty.
+#[must_use]
+pub(crate) fn build_latest_tv_episodes_query(
+    filter: &InternalItemsQuery,
+    series_names: &[String],
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT bi."Id" AS "Id", bi."SeriesName" AS "SeriesName",
+                  bi."DateCreated" AS "DateCreated", bi."SeasonId" AS "SeasonId",
+                  bi."SeriesId" AS "SeriesId"
+           FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(r#" AND bi."SeriesName" IN ("#);
+    let mut names = qb.separated(", ");
+    for name in series_names {
+        names.push_bind(name.clone());
     }
+    qb.push(")");
+    if let Some(cutoff) = cutoff {
+        qb.push(r#" AND bi."DateCreated" >= "#)
+            .push_bind(ferrofin_db::store::datetime_to_db(cutoff));
+    }
+    qb.push(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#);
     qb
 }
 
@@ -472,8 +466,8 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
     // reads a negative `LIMIT` as *unbounded*. Answering a nonsense request with
     // every album in the library is not worth reproducing. Unreachable today —
     // both `/Items/Latest` forms clamp with `.max(0)` in the handler — and NOT
-    // mirrored into [`build_latest_item_list_query`], which would only move that
-    // statement further from both upstream and the generic path.
+    // mirrored into the tvshows builders, which would only move those
+    // statements further from both upstream and the generic path.
     if let Some(limit) = filter.limit {
         qb.push(" LIMIT ").push_bind(i64::from(limit).max(0));
     }
@@ -1285,6 +1279,31 @@ fn append_type_filters(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuer
     }
 }
 
+/// The `IsAiring` predicate on the item table aliased `alias` (v12.2
+/// `TranslateQuery.cs:433-443`): `true` keeps what is on at `now`
+/// (`StartDate <= now && EndDate >= now`), `false` what is not
+/// (`StartDate > now || EndDate < now`, the negation jellyfin/jellyfin#17588
+/// fixed in v12.0-rc5). `now` is already in the stored date format.
+pub(crate) fn push_is_airing(
+    qb: &mut QueryBuilder<Sqlite>,
+    alias: &str,
+    is_airing: bool,
+    now: &str,
+) {
+    if is_airing {
+        qb.push(format_args!(r#" AND {alias}."StartDate" <= "#))
+            .push_bind(now.to_owned())
+            .push(format_args!(r#" AND {alias}."EndDate" >= "#))
+            .push_bind(now.to_owned());
+    } else {
+        qb.push(format_args!(r#" AND ({alias}."StartDate" > "#))
+            .push_bind(now.to_owned())
+            .push(format_args!(r#" OR {alias}."EndDate" < "#))
+            .push_bind(now.to_owned())
+            .push(")");
+    }
+}
+
 /// Appends the date-range predicates, including the `HasAired` sugar that maps to
 /// an end-date bound relative to now.
 fn append_date_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
@@ -1332,16 +1351,8 @@ fn append_date_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQ
             .push_bind(datetime_to_db(d))
             .push(")");
     }
-    if filter.is_airing == Some(true) {
-        qb.push(r#" AND bi."StartDate" <= "#)
-            .push_bind(datetime_to_db(now))
-            .push(r#" AND bi."EndDate" >= "#)
-            .push_bind(datetime_to_db(now));
-    } else if filter.is_airing == Some(false) {
-        qb.push(r#" AND bi."StartDate" > "#)
-            .push_bind(datetime_to_db(now))
-            .push(r#" AND bi."EndDate" < "#)
-            .push_bind(datetime_to_db(now));
+    if let Some(is_airing) = filter.is_airing {
+        push_is_airing(qb, "bi", is_airing, &datetime_to_db(now));
     }
     if filter.is_unaired == Some(true) {
         qb.push(r#" AND bi."PremiereDate" >= "#)
@@ -2606,10 +2617,14 @@ fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery)
 /// `bi."SortName"` column (rather than a correlated sub-select or another
 /// column).
 fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bool {
-    // The `ItemValues`-correlated keys are sub-selects of their own.
+    // The `ItemValues`-correlated keys are sub-selects of their own, and so
+    // is `SeriesDatePlayed`, with or without a user.
     if matches!(
         by,
-        ItemSortBy::Artist | ItemSortBy::AlbumArtist | ItemSortBy::Studio
+        ItemSortBy::Artist
+            | ItemSortBy::AlbumArtist
+            | ItemSortBy::Studio
+            | ItemSortBy::SeriesDatePlayed
     ) {
         return false;
     }
@@ -2619,7 +2634,6 @@ fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bo
         && matches!(
             by,
             ItemSortBy::DatePlayed
-                | ItemSortBy::SeriesDatePlayed
                 | ItemSortBy::PlayCount
                 | ItemSortBy::IsPlayed
                 | ItemSortBy::IsUnplayed
@@ -2710,6 +2724,23 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         return;
     }
 
+    // C# `ApplyOrder`: with no search, any `SeriesDatePlayed` key hands the
+    // whole ordering to `ApplySeriesDatePlayedOrder`, which orders by the
+    // series' played date in that key's direction, then `SortName` ascending,
+    // and drops every other key (`QueryBuilding.cs:314-316, 415-419`).
+    if let Some((_, order)) = ordered
+        .iter()
+        .find(|(by, _)| *by == ItemSortBy::SeriesDatePlayed)
+    {
+        push_series_date_played(qb, filter);
+        qb.push(match order {
+            SortOrder::Ascending => " ASC",
+            SortOrder::Descending | SortOrder::Unrecognized(_) => " DESC",
+        });
+        qb.push(r#", bi."SortName" ASC"#);
+        return;
+    }
+
     // Only the leading term can be satisfied by an index, so it is the only one
     // that ever carries the plan pin.
     let pin_leading_term = pins_sort_plan(ordered[0].0, ordered[0].1, filter);
@@ -2772,6 +2803,41 @@ fn push_caller_keys(
     }
 }
 
+/// Pushes the `SeriesDatePlayed` key: the newest `LastPlayedDate` among the
+/// played rows of the items whose `SeriesPresentationUniqueKey` is the row's
+/// `PresentationUniqueKey` — the requesting user's rows, or everyone's when
+/// there is no user. `NULL` for a series none of whose items was finished.
+///
+/// The shape is upstream's `ApplySeriesDatePlayedOrder` (v12.2
+/// `QueryBuilding.cs:392-413`): the played rows are grouped by series key in
+/// ONE pass and the result joined on the key, not a `MAX()` walked per series
+/// row. Here the grouped set is a non-correlated `MATERIALIZED` CTE
+/// (`series_plays`) that SQLite builds once per statement and searches per
+/// row through an automatic index on the key (a plain sub-select ran as a
+/// co-routine inside the correlated look-up); the `EXPLAIN QUERY PLAN` test in
+/// `tests/item_repository.rs` holds that plan. The series key columns lead
+/// with `Type` in every index, so a per-series lookup could not seek them.
+fn push_series_date_played(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    qb.push(
+        r#"(WITH series_plays AS MATERIALIZED (
+            SELECT ep."SeriesPresentationUniqueKey" AS "SeriesKey",
+                   MAX(ud."LastPlayedDate") AS "LastPlayed"
+            FROM "UserData" ud
+                CROSS JOIN "BaseItems" ep ON ep."Id" = ud."ItemId"
+            WHERE ud."Played" = 1"#,
+    );
+    if let Some(user_id) = filter.user_id() {
+        qb.push(r#" AND ud."UserId" = "#)
+            .push_bind(guid_to_db(user_id));
+    }
+    qb.push(
+        r#" AND ep."SeriesPresentationUniqueKey" IS NOT NULL
+            GROUP BY ep."SeriesPresentationUniqueKey")
+        SELECT series_plays."LastPlayed" FROM series_plays
+        WHERE series_plays."SeriesKey" = bi."PresentationUniqueKey")"#,
+    );
+}
+
 /// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
 /// keys (`DatePlayed`, `PlayCount`, favorite state) are correlated
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
@@ -2782,6 +2848,12 @@ fn push_order_expression(
     by: ItemSortBy,
     filter: &InternalItemsQuery,
 ) {
+    // `SeriesDatePlayed` keys on every user's plays when there is no user
+    // (`OrderMapper.cs:84-87`), so it is not one of the keys below.
+    if by == ItemSortBy::SeriesDatePlayed {
+        push_series_date_played(qb, filter);
+        return;
+    }
     // The user-data-correlated keys need the requesting user; without one they
     // fall through to SortName (matching the C# `(key, null)` arms).
     if let Some(user_id) = filter.user_id() {
@@ -2802,13 +2874,7 @@ fn push_order_expression(
             // by the alternate's id. `CROSS JOIN` pins that order: left to
             // itself the planner re-drives the arm from `IX_UserData_UserId`
             // and walks the user's rows per candidate again (300 ms).
-            //
-            // `SeriesDatePlayed` shares the arm: v12 orders it through a
-            // pre-aggregated join (`ApplySeriesDatePlayedOrder`) that is not
-            // ported here, and its correlated fallback (`OrderMapper.cs:75-84`)
-            // keys on `SeriesPresentationUniqueKey`, which is an open work
-            // item for the series-sorted browses.
-            ItemSortBy::DatePlayed | ItemSortBy::SeriesDatePlayed => {
+            ItemSortBy::DatePlayed => {
                 qb.push(
                     r#"(SELECT MAX(d."LastPlayedDate") FROM (
                         SELECT oud."LastPlayedDate" FROM "UserData" oud
@@ -3000,12 +3066,44 @@ pub(crate) fn non_blank(value: Option<&String>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryShape, build_latest_item_list_query, build_latest_music_albums_query, build_query,
+        QueryShape, build_latest_music_albums_query, build_latest_tv_episodes_query,
+        build_latest_tv_series_query, build_query,
     };
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// The closing sweep's dead genre and studio selections
+    /// ([`crate::library_scan::dead_by_name_queries`]) seek the by-name rows
+    /// by `Type` and each row's values by `IX_ItemValues_Type_Value`: never a
+    /// scan, which on a large library's every validation would be the pass's
+    /// whole cost.
+    #[tokio::test]
+    async fn the_dead_by_name_selections_seek_the_values_by_type_and_value() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        for filter in crate::library_scan::dead_by_name_queries() {
+            let mut builder = build_query(&filter, QueryShape::IdsOnly);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|d| d.starts_with("SEARCH iv")
+                    && d.contains("IX_ItemValues_Type_Value")
+                    && d.contains("(Type=? AND Value=?)")),
+                "{plan:?}"
+            );
+            assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
+        }
+    }
 
     /// The candidate read behind the Playlists/Collections views
     /// (`UserViewManager.HasVisibleItem`, see
@@ -3291,61 +3389,64 @@ mod tests {
         );
     }
 
-    /// The statement `GetLatestItemList` sends: grouped-threshold subquery
-    /// capped at `limit`, the caller's triple ORDER BY verbatim, and no paging
-    /// on the outer query (upstream nulls `Limit` before `ApplyQueryPaging`).
+    /// `GetLatestTvShowItems` step 1: the caller's predicates, grouped by
+    /// `SeriesName`, newest maximum first, capped at `limit` — and not the
+    /// caller's ORDER BY or start index.
     #[test]
-    fn latest_item_list_query_groups_thresholds_and_does_not_page() {
+    fn latest_tv_series_query_takes_the_newest_series() {
         let filter = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Episode],
             limit: Some(3),
-            order_by: vec![
-                (ItemSortBy::DateCreated, SortOrder::Descending),
-                (ItemSortBy::SortName, SortOrder::Descending),
-                (ItemSortBy::ProductionYear, SortOrder::Descending),
-            ],
+            start_index: Some(5),
+            order_by: vec![(ItemSortBy::DateCreated, SortOrder::Descending)],
             ..InternalItemsQuery::default()
         };
-        let qb = build_latest_item_list_query(&filter);
-        let sql = qb.sql().as_str().to_owned();
-
+        let sql = build_latest_tv_series_query(&filter)
+            .into_sql()
+            .as_str()
+            .to_owned();
+        assert!(sql.contains(r#"bi."Type" IN"#), "{sql}");
         assert!(
-            sql.contains(r#"GROUP BY bi."SeriesName" ORDER BY "m" DESC LIMIT "#),
-            "grouped subquery must order the per-group maxima newest-first and take `limit`: {sql}"
+            sql.ends_with(
+                r#" AND bi."SeriesName" IS NOT NULL GROUP BY bi."SeriesName" ORDER BY "MaxDate" DESC LIMIT ?"#
+            ),
+            "{sql}"
         );
+        let uncapped = build_latest_tv_series_query(&InternalItemsQuery::default())
+            .into_sql()
+            .as_str()
+            .to_owned();
         assert!(
-            sql.contains(r#"bi."DateCreated" >= (SELECT MIN(g."m") FROM ("#),
-            "the threshold is the smallest of the top-N group maxima: {sql}"
-        );
-        // The type predicate is applied to BOTH translations of the filter.
-        assert_eq!(
-            sql.matches(r#"bi."Type" IN"#).count(),
-            2,
-            "the subquery and the main query share the predicate set: {sql}"
-        );
-        let order = sql.rsplit(" ORDER BY ").next().expect("an outer ORDER BY");
-        assert_eq!(
-            order, r#"bi."DateCreated" DESC, bi."SortName" DESC, bi."ProductionYear" DESC"#,
-            "the caller's ordering rides through untouched, with no trailing LIMIT"
+            uncapped.ends_with(r#"ORDER BY "MaxDate" DESC"#),
+            "{uncapped}"
         );
     }
 
-    /// Without a `limit` the grouped subquery is uncapped (C# `Take` is only
-    /// applied when `filter.Limit.HasValue`); a start index still pages the
-    /// outer query as `LIMIT -1 OFFSET ?`.
+    /// Step 2: the named series' rows, bounded by the cutoff when there is
+    /// one, newest first by `DateCreated`, then `Id`.
     #[test]
-    fn latest_item_list_query_without_limit_is_uncapped_and_offsets() {
-        let filter = InternalItemsQuery {
-            start_index: Some(5),
-            ..InternalItemsQuery::default()
-        };
-        let qb = build_latest_item_list_query(&filter);
-        let sql = qb.sql().as_str().to_owned();
+    fn latest_tv_episodes_query_reads_the_named_series_since_the_cutoff() {
+        let names = ["A".to_owned(), "B".to_owned()];
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sql =
+            build_latest_tv_episodes_query(&InternalItemsQuery::default(), &names, Some(cutoff))
+                .into_sql()
+                .as_str()
+                .to_owned();
         assert!(
-            sql.contains(r#"GROUP BY bi."SeriesName" ORDER BY "m" DESC) AS g)"#),
+            sql.ends_with(
+                r#" AND bi."SeriesName" IN (?, ?) AND bi."DateCreated" >= ? ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#
+            ),
             "{sql}"
         );
-        assert!(sql.ends_with(" LIMIT -1 OFFSET ?"), "{sql}");
+        let unbounded =
+            build_latest_tv_episodes_query(&InternalItemsQuery::default(), &names, None)
+                .into_sql()
+                .as_str()
+                .to_owned();
+        assert!(!unbounded.contains(r#""DateCreated" >= ?"#), "{unbounded}");
     }
 
     /// v12's music arm, library-scoped: album rows by their own `TopParentId`,

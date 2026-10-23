@@ -14,7 +14,7 @@
 pub const SHARED_ALBUM_ARTWORK_DIR: &str = "album-covers";
 
 use ferrofin_util::directory_path::DirectoryPath;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,7 +37,9 @@ use ferrofin_traits::providers::{
 use uuid::Uuid;
 
 use crate::error::ProvidersError;
-use crate::library_options::{fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled};
+use crate::library_options::{
+    channel_fetcher_override, fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled,
+};
 use crate::refresh_plan::{
     FileFacts, ImageFetch, PassOutcome, ProbeKind, RefreshRequest, StoredState, decide_save,
     plan_item_refresh,
@@ -1652,25 +1654,28 @@ impl LocalProviderManager {
         let library = self.library_options_for(entity).await;
         let kind = short_kind(entity);
         let global = self.global_metadata_options_for(kind);
+        let channel = channel_gate(entity);
         let metadata_allowed = !entity.is_locked
             && self.metadata_fetchers(kind).iter().any(|name| {
-                metadata_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+                channel.unwrap_or_else(|| {
+                    metadata_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+                })
             });
-        let images_allowed = (!entity.is_locked
-            || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
-            && ((entity.extra_type.is_none()
-                && self.image_sources_for(entity).iter().any(|source| {
-                    image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, source.name())
-                }))
-                || self.dynamic_image_providers.iter().any(|provider| {
-                    provider.library_gated()
-                        && image_fetcher_enabled(
-                            library.as_ref(),
-                            global.as_ref(),
-                            kind,
-                            provider.name(),
-                        )
-                }));
+        let image_enabled = |name: &str| {
+            channel.unwrap_or_else(|| {
+                image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+            })
+        };
+        let images_allowed =
+            (!entity.is_locked || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
+                && ((entity.extra_type.is_none()
+                    && self
+                        .image_sources_for(entity)
+                        .iter()
+                        .any(|source| image_enabled(source.name())))
+                    || self.dynamic_image_providers.iter().any(|provider| {
+                        provider.library_gated() && image_enabled(provider.name())
+                    }));
         MetadataRefreshOptions {
             metadata_refresh_mode: if metadata_allowed {
                 options.metadata_refresh_mode
@@ -1689,6 +1694,7 @@ impl LocalProviderManager {
             force_save: options.force_save,
             regenerate_trickplay: options.regenerate_trickplay,
             enable_remote_content_probe: options.enable_remote_content_probe,
+            is_automated: options.is_automated,
         }
     }
 
@@ -1804,30 +1810,123 @@ impl LocalProviderManager {
         }
     }
 
-    /// A box set's or playlist's members' official ratings, in link order
-    /// (`Folder.GetLinkedChildren`); none without a linked-children store.
-    async fn member_ratings(
+    /// A box set's or playlist's members, one per link in link order
+    /// (`Folder.GetLinkedChildren`). `None` without a linked-children store:
+    /// the members are unknown, which is not the same as having none.
+    async fn members(
         &self,
         items: &dyn ItemRepository,
         item_id: Uuid,
-    ) -> Result<Vec<Option<String>>, ServiceError> {
+    ) -> Result<Option<Vec<crate::metadata_merge::Member>>, ServiceError> {
         let Some(linked) = &self.linked_children else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let ids = linked.get_linked_children_ids(item_id, None).await?;
-        // Only the ratings are kept, so a long playlist is never held as rows.
-        let mut ratings = HashMap::new();
+        // Only what the derivation reads is kept, so a long playlist is never
+        // held as rows.
+        let mut members = HashMap::new();
         for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             for row in items.retrieve_items(chunk).await? {
                 if let Ok(id) = Uuid::parse_str(&row.id) {
-                    ratings.insert(id, row.official_rating);
+                    members.insert(id, crate::metadata_merge::Member::from(row));
                 }
             }
         }
-        Ok(ids
-            .iter()
-            .filter_map(|id| ratings.get(id).cloned())
-            .collect())
+        Ok(Some(
+            ids.iter()
+                .filter_map(|id| members.get(id).cloned())
+                .collect(),
+        ))
+    }
+
+    /// `BoxSet.GetLibraryFolderIds()` (`BoxSet.cs:250-288`, v12.2): the
+    /// libraries a box set's members live in (`GetCollectionFolders`, so a
+    /// location two libraries share counts for both), a member box set
+    /// expanded to its own members once — the box set itself counts as
+    /// expanded, so a cycle ends — in member order, distinct. `None` without
+    /// a linked-children store or the library list.
+    async fn library_folder_ids(
+        &self,
+        items: &dyn ItemRepository,
+        item_id: Uuid,
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        /// What the walk keeps of a member, so no member row is held.
+        enum Found {
+            /// A box set, flattened into its own members.
+            BoxSet,
+            /// The libraries the member lives in.
+            In(Vec<Uuid>),
+        }
+        let (Some(linked), Some(folders)) = (&self.linked_children, &self.virtual_folders) else {
+            return Ok(None);
+        };
+        let folders = folders.get_virtual_folders().await?;
+        let locate = |row: &BaseItemEntity| {
+            if BaseItemKind::from_stored_type_name(&row.type_) == Some(BaseItemKind::BoxSet) {
+                return Found::BoxSet;
+            }
+            let libraries = match row.path.as_deref().filter(|p| !p.is_empty()) {
+                Some(path) => ferrofin_model::entities_media::libraries_holding(&folders, path),
+                None => ferrofin_model::entities_media::owning_library(
+                    &folders,
+                    row.top_parent_id.as_deref(),
+                    None,
+                )
+                .into_iter()
+                .collect(),
+            };
+            Found::In(
+                libraries
+                    .into_iter()
+                    .filter_map(|f| f.item_id.as_deref())
+                    .filter_map(|raw| Uuid::parse_str(raw).ok())
+                    .collect(),
+            )
+        };
+        let mut rows = HashMap::new();
+        let mut expanded = HashSet::from([item_id]);
+        let mut stack = Vec::new();
+        let mut ids = Vec::new();
+        let mut next = Some(item_id);
+        loop {
+            // A box set's members go on top of the stack, first member last,
+            // so they are flattened in place of the box set (`FlattenItems`).
+            if let Some(container) = next.take() {
+                let members = linked.get_linked_children_ids(container, None).await?;
+                let missing: Vec<Uuid> = members
+                    .iter()
+                    .filter(|id| !rows.contains_key(*id))
+                    .copied()
+                    .collect();
+                for chunk in missing.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+                    for row in items.retrieve_items(chunk).await? {
+                        if let Ok(id) = Uuid::parse_str(&row.id) {
+                            rows.insert(id, locate(&row));
+                        }
+                    }
+                }
+                stack.extend(members.into_iter().rev());
+            }
+            let Some(id) = stack.pop() else {
+                break;
+            };
+            match rows.get(&id) {
+                Some(Found::BoxSet) => {
+                    if expanded.insert(id) {
+                        next = Some(id);
+                    }
+                }
+                Some(Found::In(libraries)) => {
+                    for library in libraries {
+                        if !ids.contains(library) {
+                            ids.push(*library);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(Some(ids))
     }
 
     /// The item's locked metadata fields. Without a store nothing is
@@ -1956,8 +2055,9 @@ impl LocalProviderManager {
     /// Neither names a `ResultLanguage` here, so the fold's language
     /// fallback (`:977-999`) never applies to a season: its request carries
     /// the resolved metadata language. The ids an answer brings
-    /// are not looked up by: TheTVDB reads the season's id from its series
-    /// under the scan's `IsAutomated` (see [`crate::season::tvdb_season`]).
+    /// are not looked up by: TheTVDB reads the season's id from its series,
+    /// as the plugin at `5c4592f` does under an automated refresh (see
+    /// [`crate::season::tvdb_season`]).
     ///
     /// [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
     async fn fetch_season_providers(&self, season: SeasonRefresh<'_>) -> Fetched {
@@ -2563,22 +2663,39 @@ impl LocalProviderManager {
             _ => None,
         };
         let mut base = stored.clone();
-        // `BeforeSave` → `UpdateMetadataFromChildren` → `UpdateOfficialRating`
-        // (`MetadataService.cs:404-483,623-635`): past the `isFullRefresh`
-        // gate, an unlocked container without a locked `OfficialRating` takes
-        // its members' rating before the providers merge.
-        if let Some((localization, country)) = &rating_scorer
+        // `BeforeSave` → `UpdateMetadataFromChildren` (`MetadataService.cs:
+        // 404-483`): past the `isFullRefresh` gate a box set or playlist takes
+        // its runtime, genres, studios, date and rating from its members
+        // before the providers merge, honouring `IsLocked` and the field locks.
+        let container = BaseItemKind::from_stored_type_name(&stored.type_)
+            .filter(|kind| matches!(kind, BaseItemKind::BoxSet | BaseItemKind::Playlist));
+        if let Some(kind) = container
             && crate::refresh_plan::full_refresh(&plan, &request)
-            && !stored.is_locked
-            && !locked_fields.contains(&MetadataField::OfficialRating)
+            && let Some(members) = self.members(items.as_ref(), item_id).await?
         {
-            let members = self.member_ratings(items.as_ref(), item_id).await?;
-            base.official_rating = crate::metadata_merge::rating_to_items(
-                base.official_rating.as_deref(),
-                members.iter().map(Option::as_deref),
-                |rating| localization.get_rating_score(rating, Some(country)),
-            )
-            .map(str::to_owned);
+            crate::metadata_merge::update_from_members(&mut base, kind, &members, &locked_fields);
+            // `UpdateOfficialRating` (`:623-635`).
+            if let Some((localization, country)) = &rating_scorer
+                && !stored.is_locked
+                && !locked_fields.contains(&MetadataField::OfficialRating)
+            {
+                base.official_rating = crate::metadata_merge::rating_to_items(
+                    base.official_rating.as_deref(),
+                    members.iter().map(|m| m.official_rating.as_deref()),
+                    |rating| localization.get_rating_score(rating, Some(country)),
+                )
+                .map(str::to_owned);
+            }
+        }
+        // `BoxSetMetadataService.BeforeSaveInternal`: on every refresh, past
+        // any gate or lock, a box set's `LibraryFolderIds` — the libraries
+        // `BoxSet.IsVisible` checks the user against — follow its members.
+        if container == Some(BaseItemKind::BoxSet)
+            && let Some(ids) = self.library_folder_ids(items.as_ref(), item_id).await?
+            && let Some(data) =
+                crate::metadata_merge::data_with_library_folder_ids(base.data.as_deref(), &ids)
+        {
+            base.data = Some(data);
         }
         // `RefreshWithProviders`: a locked item merges nothing; otherwise the
         // provider result — starting from what upstream's `temp` starts with,
@@ -2786,8 +2903,11 @@ impl LocalProviderManager {
             .map(|p| (p.name(), Some(p.as_ref())))
             .collect();
         sources.extend(remote_sources.iter().map(|source| (source.name(), None)));
+        let channel = channel_gate(row);
         sources.retain(|(name, _)| {
-            image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+            channel.unwrap_or_else(|| {
+                image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+            })
         });
         sources.sort_by_key(|(name, _)| {
             (
@@ -3611,16 +3731,19 @@ impl LocalProviderManager {
         let kind = short_kind(entity);
         let global = self.global_metadata_options_for(kind);
         let preferred = self.preferred_metadata_language(entity).await;
+        let channel = channel_gate(entity);
         let mut results = Vec::new();
         for source in sources {
             if !query.include_disabled_providers
                 && (entity.extra_type.is_some()
-                    || !image_fetcher_enabled(
-                        library.as_ref(),
-                        global.as_ref(),
-                        kind,
-                        source.name(),
-                    ))
+                    || !channel.unwrap_or_else(|| {
+                        image_fetcher_enabled(
+                            library.as_ref(),
+                            global.as_ref(),
+                            kind,
+                            source.name(),
+                        )
+                    }))
             {
                 continue;
             }
@@ -4210,6 +4333,12 @@ async fn resolve_tmdb_id(
 /// `MediaBrowser.Controller.Entities.TV.Episode` → `Episode`.
 fn short_kind(entity: &BaseItemEntity) -> &str {
     entity.type_.rsplit('.').next().unwrap_or(&entity.type_)
+}
+
+/// The fetcher answer `BaseItemManager`'s channel arms give for `entity`
+/// before any option is read ([`channel_fetcher_override`]).
+fn channel_gate(entity: &BaseItemEntity) -> Option<bool> {
+    channel_fetcher_override(short_kind(entity), entity.channel_id.as_deref())
 }
 
 /// The pure `(kind, name, year)` extraction for a movie/series row, shared by
@@ -4804,10 +4933,13 @@ impl ProviderManager for LocalProviderManager {
         // reference item drops every non-local provider outright.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
         let global = self.global_metadata_options_for(&kind);
+        let channel = reference.as_ref().and_then(channel_gate);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
                 || (!locked
-                    && metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name))
+                    && channel.unwrap_or_else(|| {
+                        metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name)
+                    }))
         };
 
         // Select the providers that serve this item kind, drop the ones the
@@ -6260,6 +6392,19 @@ mod tests {
         // Ticked: the provider survives the scoped search.
         let ticked = manager(vec!["MusicBrainz".to_owned()], rows.clone());
         assert_eq!(ticked.remote_search(&scoped).await.unwrap().len(), 1);
+
+        // …unless the reference item came from a channel: `BaseItemManager`'s
+        // `SourceType.Channel` arm answers `!EnableMediaSourceDisplay` (false
+        // with no channel plugin) before the library's list is read.
+        let mut from_channel = entity.clone();
+        from_channel.channel_id = Some("6f1e4c1a-2b3d-4e5f-6a7b-8c9d0e1f2a3b".to_owned());
+        let mut channel_rows = HashMap::new();
+        channel_rows.insert(artist_id, from_channel);
+        let channel = manager(vec!["MusicBrainz".to_owned()], channel_rows);
+        assert!(
+            channel.remote_search(&scoped).await.unwrap().is_empty(),
+            "a channel's item uses no metadata fetcher"
+        );
 
         // A LOCKED reference item drops every remote provider outright
         // ("If locked only allow local providers", `ProviderManager.cs:478`).
@@ -8812,6 +8957,17 @@ mod tests {
         let gated = mgr.gated_options(&open, &Opts::default()).await;
         assert_eq!(gated.metadata_refresh_mode, Mode::Default);
         assert_eq!(gated.image_refresh_mode, Mode::Default);
+
+        // …unless it came from a channel: `BaseItemManager`'s
+        // `SourceType.Channel` arm answers `!EnableMediaSourceDisplay` (false
+        // with no channel plugin) for every metadata and image fetcher.
+        let from_channel = BaseItemEntity {
+            channel_id: Some("6f1e4c1a-2b3d-4e5f-6a7b-8c9d0e1f2a3b".to_owned()),
+            ..open
+        };
+        let gated = mgr.gated_options(&from_channel, &Opts::default()).await;
+        assert_eq!(gated.metadata_refresh_mode, Mode::None);
+        assert_eq!(gated.image_refresh_mode, Mode::None);
     }
     // ── remote search: the library-options / IsLocked gate ──────────────────
     //
@@ -9853,6 +10009,349 @@ mod tests {
             .expect("saved: the stored parental score starts unset");
         assert_eq!(row.official_rating.as_deref(), rating);
         assert_eq!(row.inherited_parental_rating_value, score);
+    }
+
+    /// A refresh of a container `kind` stored as `stored`, whose members are
+    /// `members` in link order, with `locked` fields; the row it saves.
+    async fn refresh_container(
+        mut stored: BaseItemEntity,
+        members: Vec<BaseItemEntity>,
+        locked: &[MetadataField],
+        options: MetadataRefreshOptions,
+    ) -> BaseItemEntity {
+        let item_id = Uuid::new_v4();
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        let mut rows = HashMap::from([(item_id, stored)]);
+        let mut ids = Vec::new();
+        for member in members {
+            let id = Uuid::parse_str(&member.id).expect("uuid");
+            ids.push(id);
+            rows.insert(id, member);
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore {
+            locked: HashMap::from([(item_id, locked.to_vec())]),
+            ..RecordingStore::default()
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems { rows, seen: tx }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_localization(Arc::new(EnglishAndFrench))
+            .with_linked_children(Arc::new(Members(ids)));
+        mgr.refresh_full_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("saved")
+    }
+
+    /// A member row of `type_` with the given genres, studios and runtime.
+    fn member(
+        type_: &str,
+        genres: Option<&str>,
+        studios: Option<&str>,
+        run_time_ticks: Option<i64>,
+    ) -> BaseItemEntity {
+        let mut member = row(type_, "Member");
+        member.genres = genres.map(str::to_owned);
+        member.studios = studios.map(str::to_owned);
+        member.run_time_ticks = run_time_ticks;
+        member.is_folder = type_ == "Folder";
+        member
+    }
+
+    /// `UpdateMetadataFromChildren` for a playlist, past `isFullRefresh`:
+    /// its runtime is the sum of its non-folder members' (before the lock
+    /// check), and an unlocked playlist takes the union of their genres and
+    /// studios (distinct ignoring case, in member order) unless that field is
+    /// locked. A Default refresh of a refreshed playlist derives nothing.
+    #[rstest::rstest]
+    #[case::force_save(true, false, &[], Some("Rock|Jazz|Pop"), Some("A24|Neon"), Some(300))]
+    #[case::locked_genres(true, false, &[MetadataField::Genres], Some("Mine"), Some("A24|Neon"), Some(300))]
+    #[case::locked_studios(true, false, &[MetadataField::Studios], Some("Rock|Jazz|Pop"), Some("Own"), Some(300))]
+    #[case::locked_item(true, true, &[], Some("Mine"), Some("Own"), Some(300))]
+    #[case::not_a_full_refresh(false, false, &[], Some("Mine"), Some("Own"), None)]
+    #[tokio::test]
+    async fn a_playlist_refresh_takes_its_members_genres_studios_and_runtime(
+        #[case] force_save: bool,
+        #[case] is_locked: bool,
+        #[case] locked: &[MetadataField],
+        #[case] genres: Option<&str>,
+        #[case] studios: Option<&str>,
+        #[case] run_time_ticks: Option<i64>,
+    ) {
+        let mut stored = row("Movies.BoxSet", "Mix");
+        stored.type_ = "MediaBrowser.Controller.Playlists.Playlist".to_owned();
+        stored.genres = Some("Mine".to_owned());
+        stored.studios = Some("Own".to_owned());
+        stored.is_locked = is_locked;
+        let members = vec![
+            member("Audio", Some("Rock|Jazz"), Some("A24"), Some(100)),
+            member("Audio", Some("rock|Pop"), Some("Neon|a24"), Some(200)),
+            member("Audio", None, None, None),
+            member("Folder", Some(""), None, Some(1000)),
+        ];
+        let options = MetadataRefreshOptions {
+            force_save,
+            ..MetadataRefreshOptions::default()
+        };
+        let row = refresh_container(stored, members, locked, options).await;
+        assert_eq!(row.genres.as_deref(), genres);
+        assert_eq!(row.studios.as_deref(), studios);
+        assert_eq!(row.run_time_ticks, run_time_ticks);
+        assert_eq!(row.premiere_date, None, "a playlist takes no date");
+    }
+
+    /// `UpdatePremiereDate` for a box set: the earliest member premiere date
+    /// and its year; with none, the smallest member year, where a member
+    /// without one counts as 0 and so keeps the stored year. A box set has no
+    /// cumulative runtime.
+    #[rstest::rstest]
+    #[case::earliest_date(&[Some("2001-05-01"), Some("1999-03-04"), None], &[None, None, None], Some("1999-03-04"), Some(1999))]
+    #[case::smallest_year(&[None, None], &[Some(2005), Some(2003)], None, Some(2003))]
+    #[case::a_member_without_a_year(&[None, None], &[Some(2005), None], None, Some(1980))]
+    #[case::an_unset_date(&[Some("0001-01-01"), None], &[Some(2005), Some(2003)], None, Some(2003))]
+    #[tokio::test]
+    async fn a_box_set_refresh_takes_its_earliest_members_date(
+        #[case] dates: &[Option<&str>],
+        #[case] years: &[Option<i64>],
+        #[case] premiere: Option<&str>,
+        #[case] year: Option<i64>,
+    ) {
+        let mut stored = row("Movies.BoxSet", "Box");
+        stored.production_year = Some(1980);
+        let members = dates
+            .iter()
+            .zip(years)
+            .map(|(date, year)| {
+                let mut member = member("Movie", None, None, Some(100));
+                member.premiere_date = date.map(|d| {
+                    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                        .expect("date")
+                        .and_hms_opt(0, 0, 0)
+                        .expect("time")
+                        .and_utc()
+                });
+                member.production_year = *year;
+                member
+            })
+            .collect();
+        let options = MetadataRefreshOptions {
+            force_save: true,
+            ..MetadataRefreshOptions::default()
+        };
+        let row = refresh_container(stored, members, &[], options).await;
+        assert_eq!(
+            row.premiere_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref(),
+            premiere
+        );
+        assert_eq!(row.production_year, year);
+        assert_eq!(row.run_time_ticks, None, "a box set sums no runtime");
+    }
+
+    /// Each container's members (`GetLinkedChildren`), keyed by container.
+    struct LinkTable(HashMap<Uuid, Vec<Uuid>>);
+
+    #[async_trait]
+    impl ferrofin_traits::persistence::LinkedChildrenService for LinkTable {
+        async fn get_linked_children_ids(
+            &self,
+            parent_id: Uuid,
+            _child_type: Option<i32>,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(self.0.get(&parent_id).cloned().unwrap_or_default())
+        }
+        async fn find_artists(
+            &self,
+            _artist_names: &[String],
+        ) -> Result<HashMap<String, Vec<BaseItemEntity>>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_manual_linked_parent_ids(
+            &self,
+            _child_id: Uuid,
+            _parent_type: Option<BaseItemKind>,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn reroute_linked_children(
+            &self,
+            _from_child_id: Uuid,
+            _to_child_id: Uuid,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn upsert_linked_child(
+            &self,
+            _parent_id: Uuid,
+            _child_id: Uuid,
+            _child_type: i32,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// Libraries `(id, locations)`; only `get_virtual_folders` is called.
+    struct Folders(Vec<(Uuid, &'static str)>);
+
+    #[async_trait]
+    impl ferrofin_traits::library::VirtualFolderManager for Folders {
+        async fn get_virtual_folders(
+            &self,
+        ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
+            Ok(self
+                .0
+                .iter()
+                .map(
+                    |(id, location)| ferrofin_model::entities_media::VirtualFolderInfo {
+                        item_id: Some(id.simple().to_string()),
+                        locations: vec![(*location).to_owned()],
+                        ..Default::default()
+                    },
+                )
+                .collect())
+        }
+        async fn add_virtual_folder(
+            &self,
+            _name: &str,
+            _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn rename_virtual_folder(
+            &self,
+            _name: &str,
+            _new_name: &str,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn add_media_path(
+            &self,
+            _virtual_folder_name: &str,
+            _path_info: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn update_media_path(
+            &self,
+            _virtual_folder_name: &str,
+            _path_info: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn remove_media_path(
+            &self,
+            _virtual_folder_name: &str,
+            _path: &str,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn update_library_options(
+            &self,
+            _virtual_folder_name: &str,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// `BoxSetMetadataService.BeforeSaveInternal`: every refresh of a box
+    /// set, a plain one of a locked box set too, stores the libraries its
+    /// members live in as its `LibraryFolderIds`. A location two libraries
+    /// share counts for both; a nested box set is flattened in place, and a
+    /// cycle back to the box set ends there; the order is the members'.
+    /// The rest of `Data` is kept, and a list that is already right is not
+    /// rewritten.
+    #[rstest::rstest]
+    #[case::stale(r#"{"DisplayOrder":"PremiereDate","LibraryFolderIds":["00000000000000000000000000000001"]}"#, true)]
+    #[case::current(r#"{"LibraryFolderIds":["0000000000000000000000000000000a","0000000000000000000000000000000c","0000000000000000000000000000000b"],"DisplayOrder":"PremiereDate"}"#, false)]
+    #[tokio::test]
+    async fn a_box_set_refresh_keeps_its_library_folder_ids_current(
+        #[case] data: &str,
+        #[case] rewritten: bool,
+    ) {
+        let (movies, shows, shared) = (
+            Uuid::from_u128(0xA),
+            Uuid::from_u128(0xB),
+            Uuid::from_u128(0xC),
+        );
+        let box_set = Uuid::new_v4();
+        let mut stored = row("Movies.BoxSet", "Box");
+        stored.id = box_set.to_string();
+        stored.is_locked = true;
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        stored.data = Some(data.to_owned());
+        let mut movie = row("Movie", "Heat");
+        movie.path = Some("/m/movies/Heat/Heat.mkv".to_owned());
+        let mut series = row("TV.Series", "Lost");
+        series.path = Some("/m/shows/Lost".to_owned());
+        let mut elsewhere = row("Movie", "Loose");
+        elsewhere.path = Some("/nowhere/Loose.mkv".to_owned());
+        let nested = row("Movies.BoxSet", "Inner");
+        let id = |row: &BaseItemEntity| Uuid::parse_str(&row.id).expect("uuid");
+        let links = LinkTable(HashMap::from([
+            (box_set, vec![id(&movie), id(&nested), id(&series)]),
+            (id(&nested), vec![id(&elsewhere), box_set, id(&series)]),
+        ]));
+        let rows = [stored.clone(), movie, series, elsewhere, nested]
+            .into_iter()
+            .map(|row| (id(&row), row))
+            .collect();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems { rows, seen: tx }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_linked_children(Arc::new(links))
+            .with_virtual_folders(Arc::new(Folders(vec![
+                (movies, "/m/movies"),
+                (shared, "/m/movies"),
+                (shows, "/m/shows"),
+            ])));
+        mgr.refresh_full_item(box_set, &MetadataRefreshOptions::default())
+            .await
+            .expect("refresh succeeds");
+        let saved = store.saved.lock().expect("lock").last().cloned();
+        if !rewritten {
+            assert!(
+                saved.is_none_or(|row| row.data.as_deref() == Some(data)),
+                "a current list is left as stored"
+            );
+            return;
+        }
+        let data: serde_json::Value =
+            serde_json::from_str(saved.expect("saved").data.as_deref().expect("data"))
+                .expect("json");
+        assert_eq!(
+            data["LibraryFolderIds"],
+            serde_json::json!([
+                movies.simple().to_string(),
+                shared.simple().to_string(),
+                shows.simple().to_string()
+            ])
+        );
+        assert_eq!(
+            data["DisplayOrder"], "PremiereDate",
+            "the rest of Data is kept"
+        );
     }
 
     /// The generated-image providers, recording each call's `force`.

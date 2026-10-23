@@ -187,8 +187,9 @@ async fn get_plugins(
 
 /// `GET /Plugins/{pluginId}/Configuration` — a plugin's stored configuration.
 ///
-/// Returns the opaque config JSON (`{}` until set); `404` when the plugin is not
-/// installed.
+/// Returns the plugin's config JSON (its defaults until set), without the null
+/// properties upstream's serializer leaves out ([`without_nulls`]); `404` when
+/// the plugin is not installed.
 #[utoipa::path(
     get,
     path = "/Plugins/{pluginId}/Configuration",
@@ -209,7 +210,49 @@ async fn get_plugin_configuration(
     // read at class level (PluginsController.cs:25).
     require_admin(&state, &auth).await?;
     let bytes = state.plugins.get_plugin_configuration(plugin_id).await?;
-    Ok(([(header::CONTENT_TYPE, "application/json")], bytes).into_response())
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        without_nulls(bytes),
+    )
+        .into_response())
+}
+
+/// The configuration as upstream's serializer writes it: `JsonDefaults` uses
+/// `JsonIgnoreCondition.WhenWritingNull`, so an unset property (TMDb's
+/// `string? PosterSize`, say) is left out rather than written as `null`. Array
+/// elements are kept. A document with no null property, or that is not JSON, is
+/// returned byte for byte, its key order included.
+fn without_nulls(bytes: Vec<u8>) -> Vec<u8> {
+    /// Removes the null properties under `value`; whether it removed any.
+    fn strip(value: &mut serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(members) => {
+                let before = members.len();
+                members.retain(|_, member| !member.is_null());
+                // `|=`, not `any`: every member is stripped, not just the first.
+                let mut removed = members.len() != before;
+                for member in members.values_mut() {
+                    removed |= strip(member);
+                }
+                removed
+            }
+            serde_json::Value::Array(elements) => {
+                let mut removed = false;
+                for element in elements {
+                    removed |= strip(element);
+                }
+                removed
+            }
+            _ => false,
+        }
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    if !strip(&mut value) {
+        return bytes;
+    }
+    serde_json::to_vec(&value).unwrap_or(bytes)
 }
 
 /// `POST /Plugins/{pluginId}/Configuration` — replace a plugin's configuration.
@@ -815,7 +858,21 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_assembly_guid;
+    use super::{parse_assembly_guid, without_nulls};
+
+    /// A document with no null property, and one that is not JSON, are served
+    /// byte for byte, key order included; only a null property is dropped.
+    #[test]
+    fn only_a_document_with_null_properties_is_rewritten() {
+        let ordered = br#"{"Zed":1,"Alpha":[null,{"b":2}]}"#.to_vec();
+        assert_eq!(without_nulls(ordered.clone()), ordered);
+        let not_json = b"not json".to_vec();
+        assert_eq!(without_nulls(not_json.clone()), not_json);
+        let stripped: serde_json::Value =
+            serde_json::from_slice(&without_nulls(br#"{"Zed":null,"Alpha":1}"#.to_vec()))
+                .expect("json");
+        assert_eq!(stripped, serde_json::json!({"Alpha": 1}));
+    }
 
     /// ASP.NET's `SimpleTypeModelBinder` runs a query value through
     /// `TypeConverter.ConvertFrom`, which trims — so absent, empty and
