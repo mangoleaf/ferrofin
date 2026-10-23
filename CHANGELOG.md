@@ -140,6 +140,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
 - TheAudioDB descriptions return for music artists and albums, in the item's metadata
   language when TheAudioDB has it, else in English
+- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
+  expires or the account changes (it was renewed for every subtitle). A rejected token is
+  renewed and the download retried once. The account's daily quota is tracked: once it is
+  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
+  OpenSubtitles until its reset time, and the remaining count is logged with each
+  download. A download without an account is refused before any request, and the error for
+  a download OpenSubtitles rejects carries its reply (a web page as `[html]`), as the
+  plugin's does
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'

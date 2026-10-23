@@ -329,7 +329,7 @@ pub(crate) mod tests_support {
 
     struct OnePlugin {
         id: Uuid,
-        config: Vec<u8>,
+        config: std::sync::Mutex<Vec<u8>>,
     }
 
     #[async_trait]
@@ -351,16 +351,19 @@ pub(crate) mod tests_support {
         }
         async fn get_plugin_configuration(&self, id: Uuid) -> Result<Vec<u8>, ServiceError> {
             if id == self.id {
-                Ok(self.config.clone())
+                Ok(self.config.lock().expect("config lock").clone())
             } else {
                 Err(ServiceError::not_found(format!("plugin {id}")))
             }
         }
         async fn set_plugin_configuration(
             &self,
-            _id: Uuid,
-            _config: Vec<u8>,
+            id: Uuid,
+            config: Vec<u8>,
         ) -> Result<(), ServiceError> {
+            if id == self.id {
+                *self.config.lock().expect("config lock") = config;
+            }
             Ok(())
         }
         async fn plugin_image(&self, _id: Uuid) -> Result<Option<PluginImage>, ServiceError> {
@@ -386,7 +389,7 @@ pub(crate) mod tests_support {
     pub(crate) fn manager_with(plugin_id: Uuid, config: Vec<u8>) -> Arc<dyn PluginManager> {
         Arc::new(OnePlugin {
             id: plugin_id,
-            config,
+            config: std::sync::Mutex::new(config),
         })
     }
 }
