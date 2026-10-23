@@ -532,10 +532,11 @@ impl LibraryManager for StubLibrary {
 type SavedProfileImage = (String, String, String);
 
 /// A [`UserManager`] resolving the fixed user, its profile image, and recording
-/// `save_profile_image`.
+/// `save_profile_image` and `clear_profile_image`.
 struct StubUsers {
     profile_path: String,
     saved: Arc<Mutex<Vec<SavedProfileImage>>>,
+    cleared: Mutex<usize>,
 }
 
 #[async_trait]
@@ -556,6 +557,7 @@ impl UserManager for StubUsers {
     }
 
     async fn clear_profile_image(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        *self.cleared.lock().expect("lock") += 1;
         Ok(())
     }
 
@@ -886,6 +888,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
         users: Arc::new(StubUsers {
             profile_path,
             saved: Arc::new(Mutex::new(Vec::new())),
+            cleared: Mutex::new(0),
         }),
         providers: Arc::new(StubProviders {
             saved: Arc::new(Mutex::new(Vec::new())),
@@ -2053,6 +2056,78 @@ async fn indexed_legacy_user_image_writes_bind_the_index_as_an_int(
     let saved = s.users.saved.lock().expect("lock").len();
     let uploaded = method == "POST" && expected == StatusCode::NO_CONTENT;
     assert_eq!(saved, usize::from(uploaded));
+}
+
+/// Upstream binds the legacy routes' `{imageType}` as `[FromRoute, Required]
+/// ImageType` (gl-691), through `EnumTypeModelBinder` like the route
+/// `{format}`: a member name in any case, a defined number, or a comma list
+/// (ORed) binds and is then ignored; anything else is a `400` before the
+/// action runs, so nothing is served, saved or cleared.
+#[rstest::rstest]
+#[case::name("Primary", true)]
+#[case::lowercase("primary", true)]
+#[case::other_member("Backdrop", true)]
+#[case::number("0", true)]
+#[case::last_member("12", true)]
+#[case::comma_list("Primary,Art", true)]
+#[case::undefined_number("13", false)]
+#[case::negative("-1", false)]
+#[case::not_a_type("NotAType", false)]
+#[tokio::test]
+async fn legacy_user_image_routes_bind_the_image_type(
+    #[case] image_type: &str,
+    #[case] binds: bool,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let s = stubs(String::new(), img.path());
+    let read = if binds {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let write = if binds {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    for form in [
+        format!("/Users/{USER_ID}/Images/{image_type}"),
+        format!("/Users/{USER_ID}/Images/{image_type}/0"),
+    ] {
+        assert_eq!(send(&s, "GET", &form, None).await.0, read, "GET {form}");
+        assert_eq!(send(&s, "HEAD", &form, None).await.0, read, "HEAD {form}");
+        assert_eq!(
+            send(&s, "POST", &form, Some(("image/png", "aGk="))).await.0,
+            write,
+            "POST {form}"
+        );
+        assert_eq!(
+            send(&s, "DELETE", &form, None).await.0,
+            write,
+            "DELETE {form}"
+        );
+    }
+    let writes = if binds { 2 } else { 0 };
+    assert_eq!(s.users.saved.lock().expect("lock").len(), writes);
+    assert_eq!(*s.users.cleared.lock().expect("lock"), writes);
+}
+
+/// The item image routes bind `{imageType}` the same way: a defined number
+/// serves, an undefined one is a `400`. `Primary,Art` ORs to `Art` (0 | 1),
+/// which this item has none of: a `404`, past binding.
+#[rstest::rstest]
+#[case::number("0", StatusCode::OK)]
+#[case::comma_list("Primary,Art", StatusCode::NOT_FOUND)]
+#[case::undefined_number("13", StatusCode::BAD_REQUEST)]
+#[tokio::test]
+async fn item_image_routes_bind_a_numeric_image_type(
+    #[case] image_type: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"POSTER");
+    let s = stubs(img.path(), String::new());
+    let uri = format!("/Items/{ITEM_ID}/Images/{image_type}");
+    assert_eq!(send(&s, "GET", &uri, None).await.0, expected, "{uri}");
 }
 
 #[tokio::test]
