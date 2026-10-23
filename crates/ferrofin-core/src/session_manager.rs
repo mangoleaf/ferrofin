@@ -91,6 +91,11 @@ use ferrofin_traits::session_bus::SessionMessageBus;
 use crate::db_error::db_err;
 use crate::user_entity_ext::has_permission;
 
+/// How long a user's `LastActivityDate` stands before session activity
+/// stamps it again (`SessionManager.cs:265`, `TotalSeconds > 60`). Upstream
+/// hardcodes it, with no setting.
+const USER_ACTIVITY_STAMP_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
 /// The default device name applied when a client reports an empty one (C#
 /// `CreateSessionInfo` → `"Network Device"`).
 const DEFAULT_DEVICE_NAME: &str = "Network Device";
@@ -284,6 +289,10 @@ pub struct FerrofinSessionManager {
     /// default (`0` = unlimited, what every user has unless an admin says
     /// otherwise) still logs in with no added serialization.
     session_limit_gate: Arc<Mutex<()>>,
+    /// When session activity last stamped each user's `LastActivityDate`
+    /// ([`Self::stamp_user_activity`]). The user a request carries can be the
+    /// auth cache's copy, read before that stamp.
+    user_activity: Arc<std::sync::Mutex<HashMap<Uuid, DateTime<Utc>>>>,
     /// The session message bus the HTTP WebSocket handler registers client
     /// sinks on. A bus-registered socket counts as a live controller (it drives
     /// `SupportsRemoteControl`) and is the delivery path for remote-control
@@ -338,6 +347,7 @@ impl FerrofinSessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             active_live_stream_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_limit_gate: Arc::new(Mutex::new(())),
+            user_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_sources: None,
             music_manager: None,
             bus: None,
@@ -677,8 +687,47 @@ impl FerrofinSessionManager {
             // registered on the injected event manager.
             let _ = self.event_manager.publish("SessionStarted", &payload).await;
         }
+        // Upstream saves the user after `GetSessionInfo` has registered (and
+        // announced) the session, and a failed save fails the request; only a
+        // concurrency conflict, which this write cannot raise, is swallowed.
+        if let Some(user) = user {
+            self.stamp_user_activity(user, user_id, now).await?;
+        }
 
         Ok(dto)
+    }
+
+    /// `LogSessionActivity`'s user stamp (`SessionManager.cs:262-275`): when
+    /// the user was last active more than [`USER_ACTIVITY_STAMP_INTERVAL`]
+    /// before `now` (never counts), their `LastActivityDate` becomes `now`.
+    /// Upstream reads that date from its in-memory user, which its own save
+    /// keeps current; `user` here can be the auth cache's copy, read before
+    /// the last stamp, so the later of its date and the last stamp this
+    /// manager made decides.
+    async fn stamp_user_activity(
+        &self,
+        user: &UserEntity,
+        user_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        let stamped = self
+            .user_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&user_id)
+            .copied();
+        if stamped
+            .max(user.last_activity_date)
+            .is_some_and(|last| now - last <= USER_ACTIVITY_STAMP_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.user_manager.record_user_activity(user, now).await?;
+        self.user_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(user_id, now);
+        Ok(())
     }
 
     /// Looks up a live session by its **session id** (not key), cloning a
@@ -1369,16 +1418,24 @@ impl SessionManager for FerrofinSessionManager {
         }
 
         // Persist play-state for every user on the session (C#
-        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`). A
-        // progress save is not announced (`UserDataChangeNotifier`).
+        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState` and
+        // `UpdatePlaybackSettings`, which keeps the reported tracks as the
+        // user's "Remember audio/subtitle selections" say). A progress save is
+        // not announced (`UserDataChangeNotifier`).
         if !info.item_id.is_nil() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
+                let streams = ferrofin_traits::library::ReportedStreams {
+                    audio_stream_index: info.audio_stream_index,
+                    subtitle_stream_index: info.subtitle_stream_index,
+                    remember_audio: user.remember_audio_selections,
+                    remember_subtitles: user.remember_subtitle_selections,
+                };
                 self.user_data_manager
-                    .update_play_state(user_id, progress_item, info.position_ticks)
+                    .update_play_progress(user_id, progress_item, info.position_ticks, streams)
                     .await?;
             }
         }

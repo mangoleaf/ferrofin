@@ -12,6 +12,7 @@ pub mod branding;
 pub mod channels;
 pub mod collections;
 pub mod configuration;
+pub mod content_type_overrides;
 pub mod cryptography;
 pub mod data;
 pub mod devices;

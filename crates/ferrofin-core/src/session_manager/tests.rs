@@ -1028,6 +1028,19 @@ impl ferrofin_traits::library::UserDataManager for CountingUserData {
             .update_play_state(user_id, item_id, reported_position_ticks)
             .await
     }
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ferrofin_traits::library::ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        self.play_state_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .update_play_progress(user_id, item_id, reported_position_ticks, streams)
+            .await
+    }
     async fn mark_played(
         &self,
         user_id: Uuid,
@@ -1126,6 +1139,108 @@ async fn progress_reports_pay_no_read_for_a_push() {
     assert_eq!(counting.play_state_writes(), 2);
     assert_eq!(counting.dto_reads(), 0);
     assert_eq!(conn.sent_count(), 0);
+}
+
+/// "Remember audio/subtitle selections": a progress report saves the tracks
+/// the user picked, so the next play of the item starts on them
+/// (`OnPlaybackProgress` → `UpdatePlaybackSettings`, v12.2
+/// SessionManager.cs:971-1055, with jellyfin#16501, #16769 and #17044):
+/// - a reported index is saved while its setting is on;
+/// - a report carrying no index keeps the saved one;
+/// - a report with no position but a new index still saves it;
+/// - with a setting off, a stored index is cleared, and a reported index of
+///   that kind resets both of the user's remembered tracks for the item.
+#[tokio::test]
+async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "linguist").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-tracks", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let report =
+        |position: Option<i64>, audio: Option<i32>, subtitle: Option<i32>| PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id,
+            position_ticks: position,
+            audio_stream_index: audio,
+            subtitle_stream_index: subtitle,
+            ..PlaybackProgressInfo::default()
+        };
+    // The remembered tracks as playback reads them back
+    // (`GetUserData(user, item)`'s `AudioStreamIndex`/`SubtitleStreamIndex`).
+    let remembered = || {
+        let db = db.clone();
+        async move {
+            use ferrofin_traits::library::UserDataManager as _;
+            let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+                config: default_server_configuration(),
+            });
+            FerrofinUserDataManager::new(db, config)
+                .get_stream_default_data(item_id, user_id)
+                .await
+                .expect("remembered tracks")
+        }
+    };
+    let set_remember = |audio: bool, subtitles: bool| {
+        let db = db.clone();
+        async move {
+            let users = FerrofinUserManager::new(db);
+            let mut row = users.get_user_by_id(user_id).await.unwrap().unwrap();
+            row.remember_audio_selections = audio;
+            row.remember_subtitle_selections = subtitles;
+            users.update_user(&row).await.unwrap();
+        }
+    };
+
+    mgr.on_playback_progress(&report(Some(1000), Some(2), Some(3)), false)
+        .await
+        .unwrap();
+    assert_eq!(remembered().await, (Some(2), Some(3)), "both saved");
+
+    mgr.on_playback_progress(&report(Some(2000), None, None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (Some(2), Some(3)),
+        "no index keeps them"
+    );
+
+    mgr.on_playback_progress(&report(None, Some(4), None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (Some(4), Some(3)),
+        "saved without a position"
+    );
+
+    set_remember(false, true).await;
+    mgr.on_playback_progress(&report(Some(3000), None, None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (None, Some(3)),
+        "audio off clears audio"
+    );
+
+    mgr.on_playback_progress(&report(Some(4000), Some(1), Some(5)), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (None, None),
+        "an audio index with audio off resets both, as upstream"
+    );
 }
 
 /// A media-source manager that records every `close_live_stream` id. Only the
@@ -3065,4 +3180,68 @@ fn the_idle_check_runs_every_fifth_minute() {
         .filter(|&minute| super::idle_check_due(minute))
         .collect();
     assert_eq!(due, [5, 10]);
+}
+
+/// `LogSessionActivity` (`SessionManager.cs:244-292`) stamps the signed-in
+/// user's `LastActivityDate` when the user's own date is more than a minute
+/// old (never set counts as old), and not again within the minute, even
+/// though the caller still holds the entity it read before the stamp, as a
+/// request served from the auth cache does. A user active within the minute
+/// is left as is.
+#[tokio::test]
+async fn session_activity_stamps_the_users_last_activity_at_most_once_a_minute() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+    let stored = |id: Uuid| {
+        let users = &users;
+        async move {
+            users
+                .get_user_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_activity_date
+        }
+    };
+
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    assert_eq!(alice.last_activity_date, None);
+    let before = chrono::Utc::now();
+    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
+        .await
+        .unwrap();
+    let stamped = stored(alice_id).await.expect("stamped");
+    assert!(
+        stamped >= before - chrono::Duration::seconds(1),
+        "{stamped}"
+    );
+
+    let row_version = || async {
+        users
+            .get_user_by_id(alice_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .row_version
+    };
+    let written = row_version().await;
+    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored(alice_id).await,
+        Some(stamped),
+        "not again within the minute"
+    );
+    assert_eq!(row_version().await, written, "no write at all");
+
+    let bob_id = Uuid::new_v4();
+    let mut bob = seed_named_user(&db, bob_id, "bob").await;
+    bob.last_activity_date = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+    mgr.log_session_activity("Web", "1.0", "dev-2", "Chrome", "1.2.3.4", Some(&bob))
+        .await
+        .unwrap();
+    assert_eq!(stored(bob_id).await, None, "active within the minute");
 }
