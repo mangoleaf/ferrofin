@@ -177,6 +177,93 @@ impl StorageProbe for FsStorageProbe {
     }
 }
 
+/// The free space each common path must have: `StorageHelper.TwoGigabyte`,
+/// copied verbatim (it is `int.MaxValue`, one byte short of 2 GiB).
+pub const TWO_GIGABYTE: i64 = 2_147_483_647;
+
+/// Checks that the data, cache and program-data paths each have
+/// [`TWO_GIGABYTE`] free, creating each first. Port of
+/// `StorageHelper.TestCommonPathsForStorageCapacity`, which Jellyfin runs at
+/// startup and again before it applies a restore.
+///
+/// Free space the probe cannot read (`-1`: always on the non-unix probe, or a
+/// failed `statvfs`) is logged and passed. Upstream's `DriveInfo` would throw
+/// there, but on a build that can never read it that would refuse every boot.
+///
+/// # Errors
+///
+/// A [`ServiceError`] with upstream's message when a path has less than the
+/// minimum free, or when a path cannot be created.
+pub fn test_common_paths_for_storage_capacity(
+    probe: &dyn StorageProbe,
+    data_path: &std::path::Path,
+    cache_path: &std::path::Path,
+    program_data_path: &std::path::Path,
+) -> Result<(), ServiceError> {
+    for path in [data_path, cache_path, program_data_path] {
+        test_data_directory_size(probe, path, TWO_GIGABYTE)?;
+    }
+    Ok(())
+}
+
+/// `StorageHelper.TestDataDirectorySize`.
+fn test_data_directory_size(
+    probe: &dyn StorageProbe,
+    path: &std::path::Path,
+    threshold: i64,
+) -> Result<(), ServiceError> {
+    tracing::debug!(path = %path.display(), "checking a path for storage capacity");
+    std::fs::create_dir_all(path)
+        .map_err(|e| ServiceError::backend(format!("cannot create `{}`: {e}", path.display())))?;
+    let info = probe.probe(&path.to_string_lossy());
+    if info.free_space < 0 {
+        tracing::warn!(
+            path = %path.display(),
+            "the free space of a storage path cannot be read, so its capacity is not checked"
+        );
+        return Ok(());
+    }
+    if info.free_space < threshold {
+        return Err(ServiceError::backend(format!(
+            "The path `{}` has insufficient free space. Available: {}, Required: {}.",
+            path.display(),
+            humanize_storage_size(info.free_space),
+            humanize_storage_size(threshold)
+        )));
+    }
+    tracing::info!(
+        path = %path.display(),
+        storage_type = info.storage_type.as_deref().unwrap_or("Unknown"),
+        free = %humanize_storage_size(info.free_space),
+        minimum = %humanize_storage_size(threshold),
+        "storage path checked: its free space is over the minimum"
+    );
+    Ok(())
+}
+
+/// A byte count in its largest binary unit, to one decimal: `1.5KiB`, `2GiB`.
+/// Port of `StorageHelper.HumanizeStorageSize`: `Math.Round` to one decimal
+/// rounds half to even, and an invariant `double.ToString()` drops a `.0`,
+/// which Rust's `f64` `Display` matches.
+#[must_use]
+pub fn humanize_storage_size(byte_count: i64) -> String {
+    const SUFFIXES: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    if byte_count == 0 {
+        return format!("0{}", SUFFIXES[0]);
+    }
+    // Precision loss is irrelevant: the value is rounded to one decimal.
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = byte_count.unsigned_abs() as f64;
+    // `floor(log1024(bytes))` is 0..=6 for any `i64`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let place = bytes.log(1024.0).floor() as usize;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let num = (bytes / 1024f64.powi(place as i32) * 10.0).round_ties_even() / 10.0;
+    #[allow(clippy::cast_precision_loss)]
+    let signed = byte_count.signum() as f64 * num;
+    format!("{signed}{}", SUFFIXES[place])
+}
+
 /// Returns `(free_space, used_space)` in bytes for the filesystem at `path`, or
 /// `None` when `statvfs` fails — the condition under which the C# `DriveInfo`
 /// property access throws and `StorageHelper` reports `-1`.
@@ -813,5 +900,102 @@ mod tests {
             out[0].free_space + out[0].used_space,
             out[2].free_space + out[2].used_space
         );
+    }
+
+    /// `StorageHelper.HumanizeStorageSize`: one decimal, rounded half to even
+    /// (`Math.Round`), and no trailing `.0` (invariant `double.ToString()`).
+    #[rstest::rstest]
+    #[case(0, "0B")]
+    #[case(1, "1B")]
+    #[case(-1, "-1B")]
+    #[case(1023, "1023B")]
+    #[case(1024, "1KiB")]
+    #[case(1536, "1.5KiB")]
+    #[case(1280, "1.2KiB")]
+    #[case(1792, "1.8KiB")]
+    #[case(1_288_490_189, "1.2GiB")]
+    #[case(TWO_GIGABYTE, "2GiB")]
+    #[case(5_368_709_115, "5GiB")]
+    fn storage_sizes_humanize_as_upstream_does(#[case] bytes: i64, #[case] expected: &str) {
+        assert_eq!(humanize_storage_size(bytes), expected);
+    }
+
+    /// A probe that reports `free` bytes for every path except `low`, which
+    /// gets `low_free`.
+    struct FreeSpaceProbe {
+        free: i64,
+        low: Option<(String, i64)>,
+    }
+    impl StorageProbe for FreeSpaceProbe {
+        fn probe(&self, path: &str) -> FolderStorageInfo {
+            let free_space = match &self.low {
+                Some((low, low_free)) if low == path => *low_free,
+                _ => self.free,
+            };
+            FolderStorageInfo {
+                path: path.to_owned(),
+                resolved_path: path.to_owned(),
+                free_space,
+                storage_type: Some("Fixed".to_owned()),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[test]
+    fn the_common_paths_pass_with_the_minimum_free_and_are_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (data, cache, program) = (
+            tmp.path().join("p/data"),
+            tmp.path().join("cache"),
+            tmp.path().join("p"),
+        );
+        let probe = FreeSpaceProbe {
+            free: TWO_GIGABYTE,
+            low: None,
+        };
+        test_common_paths_for_storage_capacity(&probe, &data, &cache, &program).expect("enough");
+        assert!(data.is_dir() && cache.is_dir() && program.is_dir());
+    }
+
+    #[test]
+    fn a_common_path_short_of_the_minimum_is_refused_with_upstreams_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (data, cache, program) = (
+            tmp.path().join("p/data"),
+            tmp.path().join("cache"),
+            tmp.path().join("p"),
+        );
+        let probe = FreeSpaceProbe {
+            free: i64::MAX,
+            low: Some((cache.to_string_lossy().into_owned(), TWO_GIGABYTE - 1)),
+        };
+        let err = test_common_paths_for_storage_capacity(&probe, &data, &cache, &program)
+            .expect_err("the cache path is short");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "backend error: The path `{}` has insufficient free space. Available: 2GiB, \
+                 Required: 2GiB.",
+                cache.display()
+            )
+        );
+    }
+
+    /// Free space a build cannot read (the non-unix probe) is not a refusal.
+    #[test]
+    fn unreadable_free_space_does_not_refuse_the_boot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let probe = FreeSpaceProbe {
+            free: -1,
+            low: None,
+        };
+        test_common_paths_for_storage_capacity(
+            &probe,
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+            tmp.path(),
+        )
+        .expect("unknown free space is not checked");
     }
 }
