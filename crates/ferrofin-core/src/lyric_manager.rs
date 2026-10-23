@@ -190,12 +190,13 @@ impl FerrofinLyricManager {
     /// `LibraryOptions.SaveLyricsWithMedia` for the library that owns the
     /// item. Older collection-folder ids take precedence; adopted physical
     /// parent ids use the innermost matching location, as the shared library
-    /// resolver does for metadata. Options are read afresh for every save.
+    /// resolver does for metadata. Options come from the library snapshot,
+    /// which every library write refreshes.
     async fn save_with_media(&self, item: &BaseItemEntity) -> bool {
         let Some(folders) = &self.virtual_folders else {
             return false;
         };
-        let Ok(folders) = folders.get_virtual_folders().await else {
+        let Ok(folders) = folders.library_folders().await else {
             return false;
         };
         ferrofin_model::entities_media::owning_library(
@@ -541,7 +542,7 @@ impl LyricManager for FerrofinLyricManager {
         let mut request = search_request_for(&item);
         request.is_automated = true;
         if let Some(folders) = &self.virtual_folders {
-            let folders = folders.get_virtual_folders().await?;
+            let folders = folders.library_folders().await?;
             if let Some(options) = ferrofin_model::entities_media::owning_library(
                 &folders,
                 item.top_parent_id.as_deref(),

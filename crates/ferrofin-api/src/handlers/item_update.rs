@@ -21,12 +21,9 @@
 //! honoured, and a changed rating only onto the children that followed the
 //! old one), and a change of `LockData` onto every descendant of a folder.
 //!
-//! TODO(parity, open work item): two parts of `UpdateItem` are not ported yet —
-//! the `request.People` write (`_libraryManager.UpdatePeople`), and v12.2's
-//! `ep.SeasonName = season.Name` in the season walk
-//! (`ItemUpdateController.cs:365`): a renamed season's episodes keep their
-//! stored `SeasonName` until it is set in [`cascade_to_children`]'s season
-//! branch.
+//! The item's people (`request.People`) are written first, through
+//! [`LibraryManager::update_people`](ferrofin_traits::library::LibraryManager::update_people),
+//! so the metadata savers that follow read them.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -34,10 +31,10 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::dto::{MetadataEditorInfo, NameGuidPair, NameValuePair};
-use ferrofin_model::entities::MetadataField;
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_model::data::{BaseItemKind, PersonKind};
+use ferrofin_model::dto::{DayOfWeek, MetadataEditorInfo, NameGuidPair, NameValuePair};
+use ferrofin_model::entities::{MetadataField, SeriesStatus, Video3DFormat};
 use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
@@ -83,8 +80,8 @@ pub(crate) async fn update_item(
     let current_tags = split_list(item.tags.as_deref());
     // `displayOrderChanged`: only a series, compared case-insensitively with
     // null as empty (`ItemUpdateController.cs:83-86`).
-    let series_display_order_changed = BaseItemKind::from_stored_type_name(&item.type_)
-        == Some(BaseItemKind::Series)
+    let is_series = BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::Series);
+    let series_display_order_changed = is_series
         && !stored_display_order(&item)
             .unwrap_or_default()
             .eq_ignore_ascii_case(request.display_order.as_deref().unwrap_or_default());
@@ -92,6 +89,18 @@ pub(crate) async fn update_item(
     // `ItemUpdateController.cs:295-296`): the cascade moves only the children
     // that followed the item's rating before the edit.
     let previous_ratings = Ratings::of(&item);
+    // A series' `Status` must parse (`GetSeriesStatus`, only in the series
+    // branch), checked before anything is written. Upstream's throw comes
+    // after `UpdatePeople`, leaving the people written; here nothing is.
+    if is_series {
+        parse_series_status(request.status.as_deref()).map_err(ApiError::BadRequest)?;
+    }
+    // "Do this first so that metadata savers can pull the updates from the
+    // database" (`ItemUpdateController.cs:93-103`).
+    if let Some(people) = &request.people {
+        let people: Vec<PeopleEntity> = people.iter().filter_map(PersonRequest::entity).collect();
+        state.library.update_people(&item, &people).await?;
+    }
     // `item.IsLocked = request.LockData ?? false` (`ItemUpdateController.cs:
     // 418`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
@@ -257,6 +266,100 @@ pub(crate) struct UpdateItemRequest {
     /// editor's "Original aspect ratio") — assigned as sent, a null clearing it.
     #[serde(default)]
     aspect_ratio: Option<String>,
+    /// The item's cast and crew, replacing its credits when present.
+    #[serde(default)]
+    people: Option<Vec<PersonRequest>>,
+    /// `Series.Status` as sent; read by [`parse_series_status`] on a series
+    /// only, as upstream reads it.
+    #[serde(default)]
+    status: Option<String>,
+    /// `Series.AirDays`: with [`Self::air_time`], written only when present.
+    #[serde(default)]
+    air_days: Option<Vec<DayOfWeek>>,
+    /// `Series.AirTime`, written with the air days.
+    #[serde(default)]
+    air_time: Option<String>,
+    /// `Episode.AirsBeforeSeasonNumber` — a special's placement.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    airs_before_season_number: Option<i32>,
+    /// `Episode.AirsAfterSeasonNumber`.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    airs_after_season_number: Option<i32>,
+    /// `Episode.AirsBeforeEpisodeNumber`.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    airs_before_episode_number: Option<i32>,
+    /// `Video.Video3DFormat`, a null clearing it.
+    #[serde(default, rename = "Video3DFormat")]
+    video3d_format: Option<Video3DFormat>,
+    /// A Live TV channel's `Height`, written only when present.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    height: Option<i32>,
+    /// A series' `RunTimeTicks` (a file's comes from its probe).
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    run_time_ticks: Option<i64>,
+}
+
+/// One `BaseItemPerson` of the request: what `UpdateItem` keeps of it
+/// (`new PersonInfo { Name, Role, Type }`). An absent `Type` is
+/// `PersonKind.Unknown`, the C# default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct PersonRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default, rename = "Type")]
+    kind: Option<PersonKind>,
+}
+
+impl PersonRequest {
+    /// The credit to write; a person with no name is none. (Upstream's
+    /// `UpdatePeople` trims the name and fails the request on a null one;
+    /// dropping the entry keeps the rest of the edit.)
+    fn entity(&self) -> Option<PeopleEntity> {
+        let name = self
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())?;
+        Some(PeopleEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            name: name.to_owned(),
+            person_type: Some(
+                self.kind
+                    .unwrap_or(PersonKind::Unknown)
+                    .json_name()
+                    .into_owned(),
+            ),
+            role: self.role.clone(),
+            primary_image_url: None,
+            provider_id: None,
+            sort_order: None,
+        })
+    }
+}
+
+/// `GetSeriesStatus`: null or empty is no status, else a member name
+/// ignoring case or its number, 0–2 only (`Enum.Parse<SeriesStatus>(…,
+/// true)` also takes any integer and comma lists, meaningless here).
+///
+/// # Errors
+///
+/// Any other value. Upstream's `Enum.Parse` throws there and the request
+/// ends in a 500; the handler answers 400 instead.
+fn parse_series_status(value: Option<&str>) -> Result<Option<SeriesStatus>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    [
+        ("Continuing", "0", SeriesStatus::Continuing),
+        ("Ended", "1", SeriesStatus::Ended),
+        ("Unreleased", "2", SeriesStatus::Unreleased),
+    ]
+    .into_iter()
+    .find(|(name, number, _)| value.eq_ignore_ascii_case(name) || value == *number)
+    .map(|(_, _, status)| Some(status))
+    .ok_or_else(|| format!("'{value}' is no SeriesStatus"))
 }
 
 /// Deserializes `LockedFields` the way `JsonStringEnumConverter` reads an
@@ -353,12 +456,7 @@ fn apply_update(
     ) {
         set_data_string(item, "DisplayOrder", request.display_order.as_deref());
     }
-    // `if (item is IHasAspectRatio hasAspectRatio) hasAspectRatio.AspectRatio =
-    // request.AspectRatio` (`ItemUpdateController.cs:417-420`): `Video` and its
-    // subclasses, kept in `Data` beside the disc format.
-    if super::videos::is_video(item) {
-        set_data_string(item, "AspectRatio", request.aspect_ratio.as_deref());
-    }
+    apply_kind_fields(item, request);
 
     if let Some(album) = &request.album {
         item.album = Some(album.clone());
@@ -379,6 +477,69 @@ fn apply_update(
     }
 }
 
+/// The fields `UpdateItem` writes only on some kinds: a video's aspect ratio
+/// and 3D format, an episode's special placement, a series' runtime, status
+/// and air schedule, a Live TV channel's height.
+fn apply_kind_fields(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
+    // `if (item is IHasAspectRatio hasAspectRatio) hasAspectRatio.AspectRatio =
+    // request.AspectRatio` (`ItemUpdateController.cs:417-420`): `Video` and its
+    // subclasses, kept in `Data` beside the disc format.
+    if super::videos::is_video(item) {
+        set_data_string(item, "AspectRatio", request.aspect_ratio.as_deref());
+        // `video.Video3DFormat = request.Video3DFormat` (`:434-437`).
+        set_data_value(
+            item,
+            "Video3DFormat",
+            request
+                .video3d_format
+                .and_then(|format| serde_json::to_value(format).ok()),
+        );
+    }
+    let kind = BaseItemKind::from_stored_type_name(&item.type_);
+    match kind {
+        // `episode.AirsAfterSeasonNumber = …` (`:259-264`), kept in `Data`
+        // compactly, where the `AiredDuringSeason` filter matches them.
+        Some(BaseItemKind::Episode) => {
+            for (key, value) in [
+                ("AirsAfterSeasonNumber", request.airs_after_season_number),
+                (
+                    "AirsBeforeEpisodeNumber",
+                    request.airs_before_episode_number,
+                ),
+                ("AirsBeforeSeasonNumber", request.airs_before_season_number),
+            ] {
+                set_data_value(item, key, value.map(serde_json::Value::from));
+            }
+        }
+        // "Only allow this for series. Runtimes for media comes from
+        // ffprobe" (`:423-427`); then `series.Status`, and the air days and
+        // time when the days are sent (`:465-473`).
+        Some(BaseItemKind::Series) => {
+            item.run_time_ticks = request.run_time_ticks;
+            set_data_value(
+                item,
+                "Status",
+                // Validated in `update_item` before anything was written.
+                parse_series_status(request.status.as_deref())
+                    .ok()
+                    .flatten()
+                    .and_then(|status| serde_json::to_value(status).ok()),
+            );
+            if let Some(days) = &request.air_days {
+                set_data_value(item, "AirDays", serde_json::to_value(days).ok());
+                set_data_string(item, "AirTime", request.air_time.as_deref());
+            }
+        }
+        // `if (request.Height is not null && item is LiveTvChannel channel)`.
+        Some(BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel) => {
+            if let Some(height) = request.height {
+                item.height = Some(i64::from(height));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The `DisplayOrder` kept in the row's `Data`, if any.
 fn stored_display_order(item: &BaseItemEntity) -> Option<String> {
     item.data
@@ -393,6 +554,12 @@ fn stored_display_order(item: &BaseItemEntity) -> Option<String> {
 
 /// Stores `value` under `key` in the row's `Data`; `None` removes it.
 fn set_data_string(item: &mut BaseItemEntity, key: &str, value: Option<&str>) {
+    set_data_value(item, key, value.map(serde_json::Value::from));
+}
+
+/// Stores `value` under `key` in the row's `Data`, serialized compactly
+/// (`"Key":value`); `None` removes it.
+fn set_data_value(item: &mut BaseItemEntity, key: &str, value: Option<serde_json::Value>) {
     let mut data: serde_json::Map<String, serde_json::Value> = item
         .data
         .as_deref()
@@ -400,7 +567,7 @@ fn set_data_string(item: &mut BaseItemEntity, key: &str, value: Option<&str>) {
         .unwrap_or_default();
     match value {
         Some(value) => {
-            data.insert(key.to_owned(), value.into());
+            data.insert(key.to_owned(), value);
         }
         None => {
             data.remove(key);
@@ -693,6 +860,10 @@ async fn cascade_to_children(
         }
     } else {
         for child in groups.iter_mut().flatten() {
+            // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`).
+            if kind == Some(BaseItemKind::Season) {
+                child.season_name.clone_from(&item.name);
+            }
             let child_locked = locked(child);
             cascade_onto(child, child_locked, previous, &new, &tags);
         }

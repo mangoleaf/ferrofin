@@ -35,6 +35,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Take a comic's cover from `.cb7` (7z) and `.cbt` (tar) archives as well as `.cbz`, and open
+  every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
+  really a ZIP gets its cover too. The fallback page is the first in .NET's key order
+  (case ignored first), not byte order. A real RAR `.cbr` still gets no cover
 - Give extras their owner's title metadata and dates, as Jellyfin's `RefreshExtras`
   does. Trailers, featurettes and other extras take the movie's or series' genres,
   studios, production locations, overview, ratings, year and premiere date when a
@@ -139,7 +143,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a kind a library saved no fetcher choices for, and an item in no library (an artist known
   only by name), now uses the server-wide metadata options — their disabled fetchers and
   their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
-  artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
+  OMDb for music videos. A music artist with no saved choices may use every metadata
+  downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- TheAudioDB descriptions return for music artists and albums, in the item's metadata
+  language when TheAudioDB has it, else in English
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'
@@ -233,6 +240,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- An episode, season or music track stored without a sort name, which the startup repair
+  fills, now sorts by its numbers, as Jellyfin's own sort names do. Before, the repair gave
+  it an alphabetical key, which put episodes out of order and could break "next episode"
 
 ## [1.0.0] - 2026-09-05
 

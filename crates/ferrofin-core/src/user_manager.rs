@@ -260,7 +260,10 @@ impl FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        self.auth_cache.clear();
+        // Only this user's row changed (a lockout cleared everything above);
+        // a wholesale clear here would let a stream of wrong passwords for one
+        // account keep every other user's cached auth cold.
+        self.auth_cache.invalidate_user(&user.id);
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -628,20 +631,26 @@ fn provider_id(name: &str) -> &str {
     }
 }
 
-/// Validates a username against the C# `ValidUsernameRegex`
-/// (`^(?!\s)[\w \-'._@+]+(?<!\s)$`) plus the `.`/`..` exclusions, without a
-/// regex engine: allowed characters are word characters (Unicode alphanumerics
-/// or `_`), space, and any of `- ' . _ @ +`; it must be non-empty, must not
-/// start or end with whitespace, and must not be `.` or `..`.
+/// The C# `ValidUsernameRegex` (`^(?!\s)[\w\ \-'._@+]+(?<!\s)$`,
+/// `UserManager.cs:119`) without its lookarounds, which [`valid_username`]
+/// checks itself. .NET's `\w` is `[\p{L}\p{Mn}\p{Nd}\p{Pc}]`, narrower than
+/// Rust's: it has no other numerics (`²`, `½`, `Ⅻ`) and no spacing marks.
+static VALID_USERNAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[\p{L}\p{Mn}\p{Nd}\p{Pc} \-'._@+]+$")
+        .expect("ValidUsernameRegex pattern is valid")
+});
+
+/// Validates a username against the C# `ValidUsernameRegex` plus the
+/// `.`/`..` exclusions (`ThrowIfInvalidUsername`, `UserManager.cs:965`): word
+/// characters, space and any of `- ' . _ @ +`, not starting or ending with a
+/// space. One divergence: .NET's `$` also matches before a final newline, so
+/// upstream admits `"alice\n"`; Ferrofin does not.
 fn valid_username(name: &str) -> bool {
-    if name.is_empty() || name == "." || name == ".." {
-        return false;
-    }
-    if name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace) {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | ' ' | '-' | '\'' | '.' | '@' | '+'))
+    VALID_USERNAME.is_match(name)
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && name != "."
+        && name != ".."
 }
 
 /// Validates a username or returns [`ServiceError::InvalidInput`] (C#
@@ -1078,7 +1087,8 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
-        self.auth_cache.clear();
+        // The writes above touch this user's row only.
+        self.auth_cache.invalidate_user(&user.id);
         Ok(Some(user))
     }
 
@@ -1879,17 +1889,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn valid_username_accepts_and_rejects() {
-        assert!(valid_username("alice"));
-        assert!(valid_username("a-b_c.d@e+f 1"));
-        assert!(!valid_username(""));
-        assert!(!valid_username("."));
-        assert!(!valid_username(".."));
-        assert!(!valid_username(" leading"));
-        assert!(!valid_username("trailing "));
-        assert!(!valid_username("has\ttab"));
-        assert!(!valid_username("bad/slash"));
+    /// `UserManagerTests.ThrowIfInvalidUsername_*` (`[InlineData]` verbatim),
+    /// then the word class .NET `\w` is: letters, nonspacing marks (a
+    /// Devanagari virama, a decomposed acute), decimal digits and connector
+    /// punctuation — not spacing marks, nor other numerics such as `²`, `½`
+    /// or `Ⅻ`.
+    #[rstest::rstest]
+    #[case::upstream_valid_1("this_is_valid", true)]
+    #[case::upstream_valid_2("this is also valid", true)]
+    #[case::upstream_valid_3("0@_-' .", true)]
+    #[case::upstream_valid_4("Aa0@_-' .+", true)]
+    #[case::upstream_valid_5("thisisa+testemail@test.foo", true)]
+    #[case::upstream_valid_6(
+        "------@@@--+++----@@--abcdefghijklmn---------@----_-_-___-_ .9foo+",
+        true
+    )]
+    #[case::upstream_invalid_1(" ", false)]
+    #[case::upstream_invalid_2("", false)]
+    #[case::upstream_invalid_3("special characters like & $ ? are not allowed", false)]
+    #[case::upstream_invalid_4("thishasaspaceontheend ", false)]
+    #[case::upstream_invalid_5(" thishasaspaceatthestart", false)]
+    #[case::upstream_invalid_6(" thishasaspaceatbothends ", false)]
+    #[case::upstream_invalid_7(" this has a space at both ends and inbetween ", false)]
+    #[case::upstream_invalid_8(".", false)]
+    #[case::upstream_invalid_9("..", false)]
+    #[case::devanagari_virama("कृष्ण", true)]
+    // ज़ुबैर: a nukta and two vowel signs, all nonspacing (`Mn`).
+    #[case::devanagari_nukta("\u{91c}\u{93c}\u{941}\u{92c}\u{948}\u{930}", true)]
+    // जो: the vowel sign O is a spacing mark (`Mc`), outside .NET's `\w`.
+    #[case::devanagari_spacing_mark("\u{91c}\u{94b}", false)]
+    #[case::decomposed_latin("Jose\u{301}", true)]
+    #[case::connector_punctuation("a\u{203f}b", true)]
+    #[case::superscript_digit("user²", false)]
+    #[case::vulgar_fraction("half½", false)]
+    #[case::roman_numeral("Louis Ⅻ", false)]
+    #[case::tab("has\ttab", false)]
+    #[case::trailing_no_break_space("a\u{a0}", false)]
+    #[case::slash("bad/slash", false)]
+    // .NET's `$` also matches before a final newline, so upstream admits
+    // "alice\n"; Ferrofin does not port that.
+    #[case::trailing_newline("alice\n", false)]
+    fn valid_username_matches_the_upstream_regex(#[case] name: &str, #[case] valid: bool) {
+        assert_eq!(valid_username(name), valid, "{name:?}");
     }
 
     // jellyfin-web refuses to initialize the Cast SDK when CastReceiverId is
@@ -2485,6 +2526,96 @@ mod tests {
             mgr.change_password(id, "   ").await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// A login attempt that does not lock the account changes only that user's
+    /// own row, so it drops only that user's cached auth: a failed or a
+    /// successful login for one user leaves every other user's cached token
+    /// and DTO in place, and a failed password stream cannot keep the whole
+    /// cache cold.
+    #[tokio::test]
+    async fn a_login_attempt_invalidates_only_that_users_cached_auth() {
+        let db = test_db().await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let mgr = FerrofinUserManager::new(db).with_auth_cache(Arc::clone(&cache));
+        let tried = mgr.create_user("tried").await.unwrap();
+        let other = mgr.create_user("other").await.unwrap();
+        mgr.change_password(Uuid::parse_str(&tried.id).unwrap(), "secret")
+            .await
+            .unwrap();
+        let tried = mgr
+            .get_user_by_id(Uuid::parse_str(&tried.id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let cache_both = || {
+            let generation = cache.generation();
+            for (token, user) in [("tried-token", &tried), ("other-token", &other)] {
+                let device = ferrofin_db::entities::security::DeviceEntity {
+                    id: 1,
+                    access_token: token.to_owned(),
+                    app_name: "app".into(),
+                    app_version: "1.0".into(),
+                    date_created: chrono::Utc::now(),
+                    date_last_activity: chrono::Utc::now(),
+                    date_modified: chrono::Utc::now(),
+                    device_id: token.to_owned(),
+                    device_name: "Device".into(),
+                    is_active: true,
+                    user_id: user.id.clone(),
+                };
+                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put_user_dto(generation, user, UserDto::default());
+            }
+        };
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "secret", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        // A failure that locks the account out still clears everyone: the
+        // lock must not wait for any cached resolution to expire.
+        let tried_id = Uuid::parse_str(&tried.id).unwrap();
+        mgr.update_policy(
+            tried_id,
+            &UserPolicy {
+                login_attempts_before_lockout: 1,
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache.get("other-token").is_none(),
+            "a lockout clears everyone"
+        );
     }
 
     #[rstest::rstest]

@@ -143,6 +143,42 @@ pub struct NetworkManager {
     resolver: net_utils::HostResolver,
 }
 
+/// The address half of `IsInLocalNetwork(string)`, independent of the
+/// manager it came from ([`NetworkManager::host_lookup`]).
+#[derive(Clone, Copy)]
+pub struct HostLookup {
+    is_ipv4_enabled: bool,
+    is_ipv6_enabled: bool,
+    resolver: net_utils::HostResolver,
+}
+
+impl std::fmt::Debug for HostLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostLookup")
+            .field("is_ipv4_enabled", &self.is_ipv4_enabled)
+            .field("is_ipv6_enabled", &self.is_ipv6_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostLookup {
+    /// The addresses `address` stands for: itself when it parses as an
+    /// address or subnet (`TryParseToSubnet`), else what `TryParseHost`
+    /// resolves, which can block on DNS. `None` when it is neither.
+    #[must_use]
+    pub fn addresses(&self, address: &str) -> Option<Vec<IpAddr>> {
+        if let Some(subnet) = net_utils::try_parse_to_subnet(address, false) {
+            return Some(vec![subnet.address]);
+        }
+        net_utils::try_parse_host_with(
+            address,
+            self.is_ipv4_enabled,
+            self.is_ipv6_enabled,
+            self.resolver,
+        )
+    }
+}
+
 enum InterfaceSource {
     Mock(String),
     Provided(Vec<IpData>),
@@ -938,19 +974,28 @@ impl NetworkManager {
 
     /// Whether a textual address is in the local network
     /// (`IsInLocalNetwork(string)`).
+    ///
+    /// A host name is resolved, which can block on DNS. A caller holding the
+    /// manager behind a lock can resolve outside it: take
+    /// [`Self::host_lookup`], resolve, and test each address with
+    /// [`Self::is_in_local_network`].
     #[must_use]
     pub fn is_in_local_network_str(&self, address: &str) -> bool {
-        if let Some(subnet) = net_utils::try_parse_to_subnet(address, false) {
-            return self.is_in_local_network(subnet.address);
-        }
+        self.host_lookup()
+            .addresses(address)
+            .is_some_and(|addresses| addresses.iter().any(|a| self.is_in_local_network(*a)))
+    }
 
-        net_utils::try_parse_host_with(
-            address,
-            self.is_ipv4_enabled(),
-            self.is_ipv6_enabled(),
-            self.resolver,
-        )
-        .is_some_and(|addresses| addresses.iter().any(|a| self.is_in_local_network(*a)))
+    /// How [`Self::is_in_local_network_str`] reads a textual address into the
+    /// addresses it tests: the address-family switches and the resolver,
+    /// copied out so the lookup needs no access to the manager.
+    #[must_use]
+    pub fn host_lookup(&self) -> HostLookup {
+        HostLookup {
+            is_ipv4_enabled: self.is_ipv4_enabled(),
+            is_ipv6_enabled: self.is_ipv6_enabled(),
+            resolver: self.resolver,
+        }
     }
 
     /// Whether an address is link-local (`IsLinkLocalAddress`).
@@ -963,7 +1008,7 @@ impl NetworkManager {
     /// Whether an address is in the local network (`IsInLocalNetwork(IPAddress)`).
     #[must_use]
     pub fn is_in_local_network(&self, address: IpAddr) -> bool {
-        let address = unmap_v4_mapped(address);
+        let address = net_utils::unmap_v4_mapped(address);
 
         if (self.trust_all_ipv6_interfaces
             && AddressFamily::of(address) == AddressFamily::InterNetworkV6)
@@ -1140,16 +1185,6 @@ fn is_loopback(address: IpAddr) -> bool {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
     }
-}
-
-/// Unwraps an IPv4-mapped IPv6 address to plain IPv4; others pass through.
-fn unmap_v4_mapped(address: IpAddr) -> IpAddr {
-    if let IpAddr::V6(v6) = address
-        && let Some(v4) = v6.to_ipv4_mapped()
-    {
-        return IpAddr::V4(v4);
-    }
-    address
 }
 
 /// Deduplicates while preserving first-seen order (C# `ToHashSet` keeps the
