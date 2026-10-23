@@ -1010,19 +1010,15 @@ impl FerrofinItemRepository {
     /// 1. a Live TV view stands for itself;
     /// 2. a `DisplayParentId` is followed (and a dangling one resolves to nothing);
     /// 3. so is a `ParentId`;
-    /// 4. a `CollectionFolder` becomes its `PhysicalFolderIds`, and itself
-    ///    ([`library_top_parents_by_view`]);
-    /// 5. anything else a view could be resolves to nothing.
+    /// 4. a view with neither stands for the libraries the user grouped into it,
+    ///    when its type groups at all ([`Self::grouped_library_ids`]), and for
+    ///    nothing otherwise;
+    /// 5. a `CollectionFolder` becomes its `PhysicalFolderIds`, and itself
+    ///    ([`library_top_parents_by_view`]).
     ///
     /// Both of the views a real 10.11.8 database carries take one of the first two
     /// arms: its Live TV view is `ViewType: livetv`, and its Playlists view carries
     /// a `DisplayParentId` pointing at the real `PlaylistsFolder`.
-    ///
-    /// NOT ported: upstream's fifth arm, which groups libraries when the user has a
-    /// non-empty `GroupedFolders` preference. That needs each collection folder's
-    /// `CollectionType`, which this layer has no access to — see the task filed
-    /// against it. A user without that preference (every user of a default install,
-    /// and both users of the verification deployment) never reaches it.
     async fn top_parent_ids_for_query(
         db: &Database,
         id: Uuid,
@@ -1125,11 +1121,18 @@ impl FerrofinItemRepository {
             ));
         }
 
-        Box::pin(Self::grouped_library_ids(db, &blob, user, depth)).await
+        let view_type = crate::user_view_repository::view_type_of(data.as_deref());
+        Box::pin(Self::grouped_library_ids(
+            db,
+            view_type.as_deref(),
+            user,
+            depth,
+        ))
+        .await
     }
 
     /// The libraries a user has GROUPED into this view — C#
-    /// `GetTopParentIdsForQuery`'s fifth arm, reached by a `UserView` that has
+    /// `GetTopParentIdsForQuery`'s grouping arm, reached by a `UserView` that has
     /// no `DisplayParentId` and no `ParentId` of its own.
     ///
     /// `user is not null && ViewType != unknown && IsEligibleForGrouping(ViewType)
@@ -1141,38 +1144,15 @@ impl FerrofinItemRepository {
     /// too — a view that groups no library stands for no library.
     async fn grouped_library_ids(
         db: &Database,
-        blob: &serde_json::Value,
+        view_type: Option<&str>,
         user: Option<&UserEntity>,
         depth: u8,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         let Some(user) = user else {
             return Ok(Some(Vec::new()));
         };
-        let view_type = blob
-            .get("ViewType")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_ascii_lowercase);
-        // `movies`, `tvshows`, and an untyped view — `UserView.cs:22`. A view of any
-        // other type is never a grouping of libraries.
-        if !matches!(view_type.as_deref(), Some("movies" | "tvshows")) {
-            return Ok(Some(Vec::new()));
-        }
-        let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
-        if grouped.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-
         let mut scope = Vec::new();
-        for folder in visible_views(db, user).await? {
-            if !grouped.contains(&folder) {
-                continue;
-            }
-            // `CollectionType is null || CollectionType == view.ViewType` — an
-            // untyped library groups into any view.
-            let folder_type = Self::collection_type_of(db, folder).await?;
-            if folder_type.is_some() && folder_type != view_type {
-                continue;
-            }
+        for folder in grouped_libraries(db, user, view_type).await? {
             match Box::pin(Self::top_parent_ids_for_query(
                 db,
                 folder,
@@ -2580,6 +2560,43 @@ async fn scope_to_user_libraries_prepared(
     let mut resolved = filter.clone();
     resolved.top_parent_ids = scope;
     Ok(Some(resolved))
+}
+
+/// The libraries `user` grouped into a `view_type` view: of the views the
+/// user may see, those in their `GroupedFolders` preference whose
+/// `CollectionType` is the view's or none (an untyped library groups into any
+/// view). Empty unless `view_type` is `movies`, `tvshows` or none (an untyped
+/// view), the set `UserView.IsEligibleForGrouping` accepts (`UserView.cs:22-27`);
+/// an `unknown` view, which upstream excludes by name, groups nothing. An untyped
+/// view therefore stands for the grouped libraries that have no type.
+///
+/// The set a grouped view's browse is scoped to
+/// (`GetTopParentIdsForQuery`'s grouping arm) and the set its `ChildCount`
+/// counts (`DtoService.GetChildCountSourceIds`, v12.2 `DtoService.cs:781-792`).
+pub(crate) async fn grouped_libraries(
+    db: &Database,
+    user: &UserEntity,
+    view_type: Option<&str>,
+) -> Result<Vec<Uuid>, ServiceError> {
+    if !matches!(view_type, None | Some("movies" | "tvshows")) {
+        return Ok(Vec::new());
+    }
+    let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
+    if grouped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut libraries = Vec::new();
+    for folder in visible_views(db, user).await? {
+        if !grouped.contains(&folder) {
+            continue;
+        }
+        let folder_type = FerrofinItemRepository::collection_type_of(db, folder).await?;
+        if folder_type.is_some() && folder_type.as_deref() != view_type {
+            continue;
+        }
+        libraries.push(folder);
+    }
+    Ok(libraries)
 }
 
 /// The library views `user` may see, as item ids.
@@ -9757,8 +9774,73 @@ mod tests {
         );
     }
 
+    /// An untyped view groups too. Upstream's `GetTopParentIdsForQuery` groups
+    /// when `ViewType != unknown && IsEligibleForGrouping(ViewType)`, whose set
+    /// is `{ movies, tvshows, null }` (`UserView.cs:22-27`), and its
+    /// `CollectionType is null || == ViewType` filter then keeps only the
+    /// grouped libraries that have no type. An `unknown` view still groups
+    /// nothing.
+    #[tokio::test]
+    async fn an_untyped_view_stands_for_the_untyped_libraries_grouped_into_it() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (untyped, movies, user_id, user) = two_libraries(&db).await;
+        set_collection_type(&db, movies, "movies").await;
+        set_folder_preference(
+            &db,
+            user_id,
+            PreferenceKind::GroupedFolders,
+            &[untyped, movies],
+        )
+        .await;
+        let untyped_view = Uuid::from_u128(0x9F82);
+        seed_item_with_data(&db, untyped_view, BaseItemKind::UserView, "Media", "{}").await;
+        // `unknown` by name, and by its discriminant (0), as an adopted blob
+        // written without the enum converter stores it.
+        let unknown_views = [Uuid::from_u128(0x9F83), Uuid::from_u128(0x9F84)];
+        for (view, data) in unknown_views
+            .iter()
+            .zip([r#"{"ViewType":"unknown"}"#, r#"{"ViewType":0}"#])
+        {
+            seed_item_with_data(&db, *view, BaseItemKind::UserView, "Unknown", data).await;
+        }
+        let browse = |parent: Uuid| {
+            let repository = &repository;
+            let user = user.clone();
+            async move {
+                let mut names: Vec<String> = repository
+                    .get_item_list(&InternalItemsQuery {
+                        parent_id: parent,
+                        recursive: true,
+                        user: Some(user),
+                        include_item_types: vec![BaseItemKind::Movie],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await
+                    .expect("browse")
+                    .into_iter()
+                    .filter_map(|r| r.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+
+        assert_eq!(
+            browse(untyped_view).await,
+            ["In First"],
+            "an untyped view stands for the grouped untyped library only"
+        );
+        for view in unknown_views {
+            assert!(
+                browse(view).await.is_empty(),
+                "an unknown view groups nothing"
+            );
+        }
+    }
+
     /// A view the user has GROUPED libraries into stands for those libraries —
-    /// C# `GetTopParentIdsForQuery`'s fifth arm.
+    /// C# `GetTopParentIdsForQuery`'s grouping arm.
     ///
     /// Only reachable for a user whose `GroupedFolders` preference is
     /// non-empty, which is why neither the default install nor the adoption

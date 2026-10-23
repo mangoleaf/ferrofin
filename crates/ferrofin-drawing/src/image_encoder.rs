@@ -178,10 +178,9 @@ impl ImageCrateEncoder {
     }
 
     /// Writes `image` to `output_path` in `format` at `quality` (0–100),
-    /// creating the parent directory first. JPEG honours `quality`; PNG/WebP are
-    /// lossless here, so `quality` is ignored (the `image` crate's default WebP
-    /// writer is lossless). Port of the `SKFileWStream`/`Encode(..., quality)`
-    /// tail of `EncodeImage`.
+    /// creating the parent directory first. JPEG and WebP (lossy, via libwebp)
+    /// honour `quality`; PNG is lossless, so it ignores `quality`. Port of the
+    /// `SKFileWStream`/`Encode(..., quality)` tail of `EncodeImage`.
     fn write(
         image: &DynamicImage,
         output_path: &str,
@@ -203,12 +202,27 @@ impl ImageCrateEncoder {
             // WebP encoder is lossless-only and ignores `quality`, which made
             // every poster several times larger than Jellyfin's — so this branch
             // routes around it.
+            //
+            // libwebp cannot write a side over 16383 px. Refused before the RGBA
+            // copy, and as invalid input like the JPEG limit: it is decided by the
+            // input alone and recurs on every request (nothing is cached).
+            if image.width() > WEBP_MAX_DIMENSION || image.height() > WEBP_MAX_DIMENSION {
+                return Err(ServiceError::InvalidInput(format!(
+                    "cannot write {output_path}: {}x{} exceeds WebP's \
+                     {WEBP_MAX_DIMENSION}x{WEBP_MAX_DIMENSION} limit",
+                    image.width(),
+                    image.height()
+                )));
+            }
             let rgba = image.to_rgba8();
             // Precision loss is irrelevant: quality is clamped to 0..=100.
             #[allow(clippy::cast_precision_loss)]
             let quality = quality.clamp(0, 100) as f32;
+            // `encode_simple`, not `encode`: the latter unwraps libwebp's error
+            // and panics on any other encode failure.
             let bytes = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                .encode(quality);
+                .encode_simple(false, quality)
+                .map_err(|code| DrawingError::webp_encode(format!("encode {output_path}"), code))?;
             std::fs::write(output_path, &*bytes)
                 .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
         } else {
@@ -549,6 +563,11 @@ fn get_new_image_size(
 /// The Skia-only formats (`dng`/`astc`/`ktx`/raw/`svg`/`gif`/`bmp`/`ico`) are
 /// dropped because this build cannot decode them.
 const SUPPORTED_INPUT_FORMATS: [&str; 4] = ["jpeg", "jpg", "png", "webp"];
+
+/// The widest or tallest image libwebp can write, its `WEBP_MAX_DIMENSION`
+/// (the bitstream's 14-bit size fields), which the `webp` crate does not
+/// re-export.
+const WEBP_MAX_DIMENSION: u32 = 16_383;
 
 #[async_trait]
 impl ImageEncoder for ImageCrateEncoder {
@@ -1222,6 +1241,61 @@ mod tests {
         for h in handles {
             h.await.expect("task");
         }
+    }
+
+    /// libwebp cannot write a side over 16383 px, and its `encode` panicked on
+    /// one (`VP8_ENC_ERROR_BAD_DIMENSION`). Such an output is now refused as
+    /// invalid input before encoding, like the JPEG limit, so `process_image`
+    /// logs it at debug and serves the original; a side of exactly 16383 px
+    /// still encodes.
+    #[rstest]
+    #[case(16_384, 1)]
+    #[case(1, 16_384)]
+    fn a_webp_output_over_libwebps_limit_is_invalid_input_not_a_panic(
+        #[case] width: u32,
+        #[case] height: u32,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let out = out_path(&dir, "huge.webp");
+
+        let err = ImageCrateEncoder::write(
+            &DynamicImage::new_rgba8(width, height),
+            &out,
+            CrateFormat::WebP,
+            90,
+        )
+        .expect_err("libwebp's dimension limit");
+
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("16383x16383 limit"), "{err}");
+        assert!(!Path::new(&out).exists(), "nothing is written");
+
+        let edge = out_path(&dir, "edge.webp");
+        ImageCrateEncoder::write(
+            &DynamicImage::new_rgba8(width.min(16_383), height.min(16_383)),
+            &edge,
+            CrateFormat::WebP,
+            90,
+        )
+        .expect("16383 px is within the limit");
+        assert!(Path::new(&edge).exists());
+    }
+
+    /// Any other libwebp failure is an ordinary encode error too, not the
+    /// `unwrap` panic of `Encoder::encode`: a zero-width image, which libwebp
+    /// rejects itself.
+    #[test]
+    fn a_libwebp_failure_is_an_encode_error_not_a_panic() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = out_path(&dir, "empty.webp");
+
+        let err =
+            ImageCrateEncoder::write(&DynamicImage::new_rgba8(0, 1), &out, CrateFormat::WebP, 90)
+                .expect_err("libwebp refuses an empty picture");
+
+        assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
+        assert!(err.to_string().contains("libwebp VP8_ENC_ERROR"), "{err}");
+        assert!(!Path::new(&out).exists(), "nothing is written");
     }
 
     #[tokio::test]
