@@ -46,8 +46,9 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
-    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, images_changed,
-    item_values_of, preferred_language, provider_order, search_result_ids, split_pipe,
+    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, first_album_tag,
+    images_changed, item_values_of, preferred_language, provider_order, search_result_ids,
+    split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -1352,13 +1353,7 @@ impl LibraryScanner {
         let name = work
             .identified
             .and_then(|r| r.name.clone())
-            .or_else(|| {
-                children
-                    .iter()
-                    .filter_map(|c| c.album.as_deref())
-                    .find(|a| !a.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+            .or_else(|| first_album_tag(children))
             .or_else(|| current.item.name.clone())
             .unwrap_or_default();
         // `GetAlbumArtist`: the tracks' first album artist, else the album's.

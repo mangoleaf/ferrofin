@@ -41,6 +41,19 @@ proxy's `X-Forwarded-Host` is not used yet (gl-813): those addresses still take 
 from the request's `Host`.
 See [CONFIG.md](CONFIG.md#https).
 
+## Unreleased — the server needs 2 GiB free to start, as Jellyfin does
+
+Ferrofin now checks free space at startup. It refuses to start when `{data_dir}/data`, the
+cache directory (`FERROFIN_CACHE_DIR`, default `{data_dir}/cache`) or `{data_dir}` itself
+has less than 2 GiB free, as Jellyfin does. A scheduled backup restore is checked the same
+way before it is applied. The log names the path and the shortfall: ``The path `…` has
+insufficient free space. Available: …, Required: 2GiB.``
+
+An install that started on a nearly full disk before will stop at boot after this
+upgrade. Free up space on that filesystem, or move the cache to another filesystem with
+`FERROFIN_CACHE_DIR`. A build that cannot read free space (non-Unix, such as Windows) logs
+a warning and starts.
+
 ## Unreleased — TheAudioDB descriptions return, in the library's language
 
 TheAudioDB stopped filling its English-suffixed description fields, and earlier versions
