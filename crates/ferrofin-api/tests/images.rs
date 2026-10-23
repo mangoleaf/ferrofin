@@ -797,11 +797,12 @@ struct Stubs {
     processor: Option<Arc<RecordingProcessor>>,
 }
 
-/// An image processor that records the `auto_orient` of each request and
-/// serves the original file.
+/// An image processor that records each request (its `auto_orient`, and the
+/// whole options) and serves the original file.
 #[derive(Default)]
 struct RecordingProcessor {
     auto_orient: Mutex<Vec<bool>>,
+    asked: Mutex<Vec<ferrofin_traits::options::ImageProcessingOptions>>,
 }
 
 #[async_trait]
@@ -860,6 +861,7 @@ impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
             .lock()
             .expect("lock")
             .push(options.auto_orient);
+        self.asked.lock().expect("lock").push(options.clone());
         Ok(ferrofin_traits::drawing::ProcessedImage {
             path: options.image.path.clone(),
             mime_type: None,
@@ -2181,4 +2183,46 @@ async fn anonymous_profile_image_requires_a_nonempty_user_id() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+}
+
+/// `GetItemImage2` takes `width`, `height`, `quality`, `fillWidth`,
+/// `fillHeight` and `blur` from the query string, and the format, the maximum
+/// size and the tag from the route, where a query parameter of the same name
+/// has no effect.
+#[tokio::test]
+async fn the_positional_route_reads_its_query_string_transforms() {
+    let img = TempImage::new(b"IMAGEBYTES");
+    let s = stubs(img.path(), String::new());
+    let processor = Arc::new(RecordingProcessor::default());
+    let request = Request::builder()
+        .uri(format!(
+            "/Items/{ITEM_ID}/Images/Primary/0/tag/jpg/100/0/0/0\
+             ?width=40&height=30&quality=60&fillWidth=50&fillHeight=20&blur=2\
+             &maxWidth=999&maxHeight=999&format=png"
+        ))
+        .header("Authorization", "Bearer token")
+        .body(Body::empty())
+        .expect("request");
+    let response = create_router(state(&s).with_image_processor(processor.clone()))
+        .oneshot(request)
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let asked = processor.asked.lock().expect("asked lock");
+    let options = asked.first().expect("the image was processed");
+    assert_eq!(
+        (options.width, options.height, options.quality),
+        (Some(40), Some(30), 60)
+    );
+    assert_eq!(
+        (options.fill_width, options.fill_height, options.blur),
+        (Some(50), Some(20), Some(2))
+    );
+    // The route's segments win: 100 wide, no height limit (`0`), JPEG.
+    assert_eq!((options.max_width, options.max_height), (Some(100), None));
+    assert_eq!(
+        options.supported_output_formats,
+        [ferrofin_model::drawing::ImageFormat::Jpg]
+    );
 }

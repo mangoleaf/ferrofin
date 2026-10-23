@@ -763,8 +763,11 @@ async fn get_item_image_by_index(
 /// format`, `int maxWidth`, `int maxHeight`, `double percentPlayed`,
 /// `int unplayedCount` — so an unbindable value is a model-binding failure
 /// (`400`), never a silent fallback to an unrequested format. The bound
-/// `format`/`maxWidth`/`maxHeight` are lifted into an [`ImageQuery`] so the
-/// transform is applied just as the query-string form would.
+/// `format`/`maxWidth`/`maxHeight`/`tag` are set on the request's
+/// [`ImageQuery`], over any same-named query parameter, so the transform is
+/// applied just as the query-string form would. The transforms the path does
+/// not carry (`width`, `height`, `quality`, `fillWidth`, `fillHeight`,
+/// `blur`) come from the query string, as `GetItemImage2` takes them.
 ///
 /// TODO(overlays): `percentPlayed`/`unplayedCount` bind and are validated, but
 /// the overlays themselves are not drawn yet — Jellyfin renders them in
@@ -799,6 +802,7 @@ async fn get_item_image_parametrized(
         String,
         String,
     )>,
+    Query(mut query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
@@ -810,15 +814,13 @@ async fn get_item_image_parametrized(
     // overlay TODO on this handler for why they are not forwarded yet.
     let _percent_played: f64 = bind_route_number(&percent_played, "percentPlayed")?;
     let _unplayed_count: i32 = bind_route_number(&unplayed_count, "unplayedCount")?;
-    // Lift the positional transform segments into a query. A `0` dimension is the
-    // "unset" spelling clients bake into the path for a partial transform.
-    let query = ImageQuery {
-        format: Some(image_format_name(format).to_owned()),
-        max_width: Some(max_width).filter(|w| *w > 0),
-        max_height: Some(max_height).filter(|h| *h > 0),
-        tag: Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0")),
-        ..ImageQuery::default()
-    };
+    // The positional transform segments override the query string's. A `0`
+    // dimension is the "unset" spelling clients bake into the path for a
+    // partial transform.
+    query.format = Some(image_format_name(format).to_owned());
+    query.max_width = Some(max_width).filter(|w| *w > 0);
+    query.max_height = Some(max_height).filter(|h| *h > 0);
+    query.tag = Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0"));
     let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
         &state,
