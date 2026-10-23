@@ -344,9 +344,8 @@ fn stream_pads(
     };
     hw::sw_chain::StreamPads {
         subtitle_is_external: subtitle.is_some_and(|s| s.is_external),
-        subtitle_index: subtitle.map_or(0, |s| {
-            get_subtitle_stream_index_for_ffmpeg(media_source, s)
-        }),
+        subtitle_index: subtitle
+            .map_or(0, |s| get_subtitle_stream_index_for_ffmpeg(media_source, s)),
         video_index: video.map_or(0, |v| find_index(&media_source.media_streams, v)),
     }
 }
