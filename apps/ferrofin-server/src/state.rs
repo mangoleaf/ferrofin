@@ -838,6 +838,21 @@ pub async fn build_app_state(
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
         // back to when a tuner is not a transport stream).
         .with_encoder(Arc::clone(&media_encoder))
+        // A recording NFO's dates, in the `xbmcmetadata` options'
+        // `ReleaseDateFormat`, as the NFO savers write theirs.
+        .with_release_date_format({
+            let nfo = Arc::new(ferrofin_providers::xbmc::config::NfoConfigurationFile::new(
+                std::path::PathBuf::from(paths.user_configuration_directory_path())
+                    .join("named/xbmcmetadata.json"),
+            ));
+            Arc::new(move |date| {
+                ferrofin_providers::xbmc::dotnet_date::format_date_time(
+                    date,
+                    &nfo.current().release_date_format,
+                )
+                .unwrap_or_else(|| date.format("%Y-%m-%d").to_string())
+            })
+        })
         // Where a shared tuner stream buffers, where the DVR records, and where
         // the dashboard's Live TV options live (C# `GetTranscodePath()`,
         // `CommonApplicationPaths.DataPath`, the `livetv` named config).
