@@ -555,6 +555,57 @@ async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
     assert_eq!(saved.skip_forward_length, 30_000);
 }
 
+/// A partial body binds as upstream's `DisplayPreferencesDto` constructor
+/// leaves it: every member left out takes the C# default, and the save writes
+/// those defaults over the stored row (`RememberIndexing`, `SortOrder` and
+/// `ScrollDirection` were stored non-default here).
+#[tokio::test]
+async fn display_preferences_post_binds_a_partial_body_to_the_defaults() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = r#"{"Client":"emby","SortBy":"SortName","CustomPrefs":{"homesection0":"resume"}}"#;
+    let (status, _) = send(
+        app,
+        "POST",
+        "/DisplayPreferences/usersettings?client=emby",
+        Body::from(body),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let saved = prefs.row.lock().unwrap().clone().unwrap();
+    assert_eq!(saved.scroll_direction, 0);
+    assert_eq!(saved.index_by, None);
+    assert!(saved.show_backdrop);
+    assert!(!saved.show_sidebar);
+    let item = prefs.item.lock().unwrap().clone().unwrap();
+    assert!(!item.remember_indexing);
+    assert!(!item.remember_sorting);
+    assert_eq!(item.sort_order, 0);
+    assert_eq!(item.sort_by, "SortName");
+}
+
+/// Only a member left out takes its default: an explicit `null` for a
+/// non-nullable one still fails binding, as it does upstream.
+#[tokio::test]
+async fn display_preferences_post_refuses_null_for_a_non_nullable_member() {
+    for body in [r#"{"RememberIndexing":null}"#, r#"{"CustomPrefs":null}"#] {
+        let prefs = Arc::new(StubDisplayPreferences::default());
+        let app = state_with_display_prefs(prefs.clone());
+        let (status, _) = send(
+            app,
+            "POST",
+            "/DisplayPreferences/usersettings?client=emby",
+            Body::from(body),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(prefs.row.lock().unwrap().is_none(), "{body}");
+    }
+}
+
 /// A `landing-*` key whose value does not name a `ViewType` is dropped rather
 /// than persisted; a valid one survives.
 #[tokio::test]

@@ -99,6 +99,12 @@ requests = ["RevokeKey/key"]
 reason = "The API key the setup step creates carries the time each server created it."
 
 [[rule]]
+paths = ["DateCreated"]
+kind = "opaque"
+requests = ["CreateBackup"]
+reason = "The backup the request creates carries the time each server created it."
+
+[[rule]]
 paths = ["[].DateCreated", "[].DateModified", "[].Size"]
 kind = "opaque"
 requests = ["GetServerLogs"]

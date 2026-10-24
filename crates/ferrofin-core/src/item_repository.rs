@@ -229,6 +229,61 @@ struct ViewRow {
 }
 
 impl FerrofinItemRepository {
+    /// v12's movies arm of `GetLatestItemList` (`GetLatestMovieItems`,
+    /// `Querying.cs:233-256`): stream the caller's rows newest first and keep
+    /// the first of each presentation key until `limit` keys are read
+    /// (`DistinctBy(PresentationUniqueKey).Take(limit)`, lazy, so the read
+    /// stops there), then load those rows newest first (`LoadLatestByIds`,
+    /// `DateCreated DESC, Id DESC`). Stopping early saves reading and decoding
+    /// the rest, not the sort: no index orders the libraries' rows by date, so
+    /// SQLite sorts every matching `(Id, key, date)` before the first row
+    /// streams, as it does for upstream's same `ORDER BY`. The read is a
+    /// `fetch` stream for that reason; dropping it mid-way resets the
+    /// statement.
+    ///
+    /// The newest row of a key stands for it, not the primary version: an
+    /// alternate in the primary's library is already hidden by the caller's
+    /// filter (`ApplyAlternateVersionFiltering`), so this only decides between
+    /// rows the filter kept.
+    async fn latest_movie_items(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use futures_util::TryStreamExt;
+        let limit = filter
+            .limit
+            .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
+        let mut ids: Vec<String> = Vec::new();
+        if limit > 0 {
+            let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut qb = crate::translate_query::build_latest_movies_query(filter);
+            let mut rows = qb
+                .build_query_as::<(String, String)>()
+                .fetch(self.db.pool());
+            while let Some((id, key)) = rows.try_next().await.map_err(db_err)? {
+                if keys.insert(key) {
+                    ids.push(id);
+                    if ids.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids =
+            serde_json::to_string(&ids).map_err(|e| ServiceError::BackendSource(Box::new(e)))?;
+        sqlx::query_as::<_, BaseItemEntity>(
+            r#"SELECT * FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))
+               ORDER BY "DateCreated" DESC, "Id" DESC"#,
+        )
+        .bind(ids)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// Creates a repository over the given database and kind-lookup tables.
     #[must_use]
     pub fn new(db: Database, item_type_lookup: Arc<dyn ItemTypeLookup>) -> Self {
@@ -2036,9 +2091,14 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
         }
         _ => {}
     }
+    // `+`: a plan pin, like `Type` above. Unpinned, the planner drives the
+    // semijoin from every content row of the media type
+    // (`IX_BaseItems_MediaType_…`, `MediaType=?`) and probes the value per
+    // row — `/Artists?mediaTypes=Video` walked 10k videos per artist: 2.6 s for
+    // an empty page on the gl-637 corpus; pinned, the artist's own map rows.
     if !media_types.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"ci."MediaType""#, media_types);
+        push_in_list(qb, r#"+ci."MediaType""#, media_types);
     }
     if !ancestors.is_empty() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = ci."Id" AND "#);
@@ -3528,26 +3588,26 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Ferrofin implements two arms of v12's `BaseItemRepository.
-        // GetLatestItemList`: music (`Querying.cs:147-180`) and tvshows
-        // (`GetLatestTvShowItems`, `:282-540`). Every other collection type
+        // Ferrofin implements three arms of v12's `BaseItemRepository.
+        // GetLatestItemList`: music (`Querying.cs:147-180`), tvshows
+        // (`GetLatestTvShowItems`, `:282-540`) and movies
+        // (`GetLatestMovieItems`, `:233-256`). Every other collection type
         // returns empty and the user-view manager sends it through
         // `get_item_list`. That is WIDER than the C# early exit
         // (`Querying.cs:112-116`, which only rejects types outside
-        // `{movies, tvshows, music, unknown}`): v12's `movies` and `unknown`
-        // arms are an owner-scoped divergence, recorded at the branch itself
-        // in `user_view_manager::items_for_latest_items`.
+        // `{movies, tvshows, music, unknown}`): the `unknown` arm (a mixed
+        // library's movies and shows, `:134-144`) is not ported yet — gl-383.
         // Checked BEFORE `resolve_views` so the early exit costs no query.
         if !matches!(
             collection_type,
-            CollectionType::tvshows | CollectionType::music
+            CollectionType::tvshows | CollectionType::music | CollectionType::movies
         ) {
             return Ok(Vec::new());
         }
         // This is the path jellyfin-web's per-library "Latest in …" rows take
-        // (grouping is on by default for tvshows and music), so it needs the
-        // same view translation as every other browse — without it, Latest for
-        // a TV or Music library on an adopted database comes back empty.
+        // (grouping is on by default for tvshows, music and movies), so it needs
+        // the same view translation as every other browse — without it, Latest
+        // for one of those libraries on an adopted database comes back empty.
         let prepared = grouped_by_metadata_key(filter);
         let filter = prepared.as_ref().unwrap_or(filter);
         let resolved = self.resolve_views(filter).await?;
@@ -3558,6 +3618,9 @@ impl ItemRepository for FerrofinItemRepository {
             // is a folder, so the caller lists it on its own; an Episode
             // groups under its series as before.
             return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter).await;
+        }
+        if collection_type == CollectionType::movies {
+            return self.latest_movie_items(filter).await;
         }
         // v12's music arm: the newest `limit` MusicAlbum rows themselves,
         // one statement — which reads no track at all when the caller is
@@ -9005,6 +9068,55 @@ mod tests {
         }
     }
 
+    /// Plan pin for the by-name semijoin under a media-type filter
+    /// (`/Artists?mediaTypes=Video`): each of the value's map rows reaches its
+    /// item by the item's primary key, with or without the user's libraries.
+    /// Driven from `IX_BaseItems_MediaType_…` instead, every artist walked every
+    /// item of that media type: 2.6 s for an empty page on the gl-637 corpus.
+    #[tokio::test]
+    async fn by_name_semijoin_under_a_media_type_probes_items_by_id() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery::default();
+        let type_ints = [i64::from(i32::from(ItemValueType::Artist))];
+        let media_types = ["Video".to_owned()];
+        let libraries = to_guid_strings(&[Uuid::from_u128(0x8671), Uuid::from_u128(0x8672)]);
+        for top_parents in [&libraries[..], &[]] {
+            let scope = ByNameScope {
+                filter: &filter,
+                type_ints: &type_ints,
+                content_type_names: None,
+                exclude_type_names: &[],
+                media_types: &media_types,
+                ancestors: &[],
+                top_parents,
+            };
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Type" = "#);
+            qb.push_bind(stored_type_name(BaseItemKind::MusicArtist).expect("stored"));
+            push_value_exists(&mut qb, &scope, InnerScope::Page);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|d| d == "SEARCH ci USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.contains("IX_BaseItems_MediaType")),
+                "{plan:#?}"
+            );
+        }
+    }
+
     /// The grouping regression: with a user set, the `build_query` id list
     /// grouped the version pair by `PresentationUniqueKey` and kept only the
     /// primary, so the alternate's French never reached the facet. Upstream
@@ -9251,14 +9363,10 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// Only `tvshows` and `music` take a dedicated path here; everything else
-    /// returns nothing and the user-view manager routes it through
-    /// `get_item_list`. `books` is the C# early exit; `movies` is NOT — v12
-    /// has a movies arm, deliberately not ported (the owner-scoped divergence
-    /// recorded in `user_view_manager::items_for_latest_items`), so this case
-    /// also pins that decision.
+    /// `books` is the C# early exit (`Querying.cs:112-116`): no dedicated
+    /// path, and the user-view manager routes it through `get_item_list`.
     #[tokio::test]
-    async fn latest_item_list_is_empty_for_movies_and_books() {
+    async fn latest_item_list_is_empty_for_books() {
         let db = test_db().await;
         let repository = repo(&db);
         seed_latest_row(
@@ -9271,13 +9379,75 @@ mod tests {
         )
         .await;
 
-        for ct in [CollectionType::movies, CollectionType::books] {
-            let rows = repository
-                .get_latest_item_list(&InternalItemsQuery::default(), ct)
+        let rows = repository
+            .get_latest_item_list(&InternalItemsQuery::default(), CollectionType::books)
+            .await
+            .expect("latest");
+        assert!(rows.is_empty(), "books must early-exit empty");
+    }
+
+    /// v12's movies arm (`GetLatestMovieItems`, `Querying.cs:233-256`): the
+    /// caller's rows newest first (`DateCreated DESC, Id DESC`), the first of
+    /// each presentation key, `limit` of them. The caller's filter runs first,
+    /// so an alternate version whose primary is in the same library stays
+    /// hidden (`ApplyAlternateVersionFiltering`) and its primary stands for the
+    /// film; of two plain rows sharing a key the newer one is listed; a row with
+    /// no key never is; and the higher id wins a date tie.
+    #[tokio::test]
+    async fn latest_movie_items_take_the_newest_row_of_each_key() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let ids = |n: u128| Uuid::from_u128(0xD100 + n);
+        // (id, name, presentation key, created)
+        let rows: [(Uuid, &str, Option<&str>, u32); 8] = [
+            (ids(1), "Primary", Some("film-a"), 2),
+            (ids(2), "Alternate version", Some("film-a"), 6),
+            (ids(3), "Keyless", None, 9),
+            (ids(4), "Tie low id", Some("film-b"), 5),
+            (ids(5), "Tie high id", Some("film-c"), 5),
+            (ids(6), "Oldest", Some("film-d"), 1),
+            (ids(7), "Shared key, newer", Some("film-e"), 7),
+            (ids(8), "Shared key, older", Some("film-e"), 6),
+        ];
+        for (id, name, key, created) in rows {
+            seed_latest_row(&db, id, BaseItemKind::Movie, name, "", day(created)).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1 WHERE "Id" = ?2"#)
+                .bind(key)
+                .bind(guid_to_db(id))
+                .execute(db.writer())
                 .await
-                .expect("latest");
-            assert!(rows.is_empty(), "{ct:?} must early-exit empty");
+                .expect("set key");
         }
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(ids(1)))
+            .bind(guid_to_db(ids(2)))
+            .execute(db.writer())
+            .await
+            .expect("mark the alternate");
+
+        let latest = |limit: i32| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_latest_item_list(
+                        &InternalItemsQuery {
+                            limit: Some(limit),
+                            include_item_types: vec![BaseItemKind::Movie],
+                            ..InternalItemsQuery::default()
+                        },
+                        CollectionType::movies,
+                    )
+                    .await
+                    .expect("latest movies")
+                    .iter()
+                    .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                    .collect::<Vec<Uuid>>()
+            }
+        };
+        assert_eq!(latest(10).await, [ids(7), ids(5), ids(4), ids(1), ids(6)]);
+        // The older `film-e` row sits between the second and third key: the
+        // limit counts keys, so it takes no place.
+        assert_eq!(latest(3).await, [ids(7), ids(5), ids(4)], "limit caps keys");
     }
 
     /// A season's id and its episodes' `(id, DateCreated)`.

@@ -678,18 +678,11 @@ async fn create_playlist_from_body_returns_id() {
 /// leaves it to the manager's `Public ?? false`.
 #[tokio::test]
 async fn create_playlist_is_public_defaults_per_body() {
-    let cases: [(&str, Body, Option<bool>); 5] = [
+    let cases: [(&str, Body, Option<bool>); 4] = [
         (
             "/Playlists",
             Body::from(r#"{"Name":"Roadtrip"}"#),
             Some(true),
-        ),
-        // Upstream's non-nullable `bool` rejects an explicit null (a 400);
-        // Ferrofin keeps reading it as unset, so the playlist is private.
-        (
-            "/Playlists",
-            Body::from(r#"{"Name":"Roadtrip","IsPublic":null}"#),
-            None,
         ),
         (
             "/Playlists",
@@ -710,6 +703,33 @@ async fn create_playlist_is_public_defaults_per_body() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         let created = pl.created.lock().unwrap().clone().expect("recorded");
         assert_eq!(created.public, expected, "{uri}: {expected:?}");
+    }
+}
+
+/// Bodies upstream's model binding refuses before `CreatePlaylist` runs
+/// (v12.2 `CreatePlaylistDto`, nullable annotations on): `required string Name`
+/// fails deserialization when absent, MVC's implicit `[Required]` refuses a
+/// null or blank one, and the non-nullable `bool IsPublic` refuses a null.
+/// A query-string `name` does not rescue a body without one. With no body and
+/// no `name` either, upstream throws on the null name (500); Ferrofin refuses
+/// it the same way (400) rather than create a nameless playlist.
+#[tokio::test]
+async fn create_playlist_rejects_bodies_upstream_binding_refuses() {
+    let cases = [
+        ("/Playlists", ""),
+        ("/Playlists", r#"{"Ids":[]}"#),
+        ("/Playlists?name=Roadtrip", "{}"),
+        ("/Playlists", r#"{"Name":null}"#),
+        ("/Playlists", r#"{"Name":""}"#),
+        ("/Playlists", r#"{"Name":"  "}"#),
+        ("/Playlists", r#"{"Name":"Roadtrip","IsPublic":null}"#),
+    ];
+    for (uri, body) in cases {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{uri} {body}");
     }
 }
 
