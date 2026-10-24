@@ -933,6 +933,8 @@ impl SchedulesDirect {
             "adding the lineup to the Schedules Direct account"
         );
 
+        // `ResponseHeadersRead`: a success ends at its headers; only a
+        // refusal's body is read, to be logged.
         let response = self
             .fetcher
             .send(
@@ -941,7 +943,8 @@ impl SchedulesDirect {
                     &format!("/lineups/{listings_id}"),
                     token.as_deref(),
                 )
-                .to_source(),
+                .to_source()
+                .headers_only(),
             )
             .await
             .map_err(SdError::Backend)?;

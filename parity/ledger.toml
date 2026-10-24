@@ -243,14 +243,6 @@ kind = "value"
 issue = 861
 reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
 
-# Ferrofin sorts AiredEpisodeOrder by season and episode; upstream's /Items maps it to SortName.
-[[entry]]
-request = "GetItems.sortBy.airedepisodeorder"
-path = "Items[].Id"
-kind = "value"
-issue = 859
-reason = "Ferrofin sorts AiredEpisodeOrder by season and episode; upstream's /Items maps it to SortName."
-
 # The page follows the difference gl-827 tracks.
 [[entry]]
 request = "GetItems.sortBy.officialrating"
@@ -1304,14 +1296,6 @@ kind = "value"
 issue = 862
 reason = "A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order."
 
-# Ferrofin returns explicitly requested ids in SortName order, not in request order.
-[[entry]]
-request = "edge-fields-all"
-path = "Items[].Id"
-kind = "value"
-issue = 852
-reason = "Ferrofin returns explicitly requested ids in SortName order, not in request order."
-
 # An unused API key's DateLastActivity is 1970-01-01, not 0001-01-01.
 [[entry]]
 request = "RevokeKey/key"
@@ -1538,62 +1522,6 @@ path = "Items"
 kind = "length"
 issue = 80
 reason = "Ferrofin ignores this /Items filter (an unbound parameter), so the count and the page differ."
-
-[[entry]]
-request = "Get*.includeItemTypes.program"
-path = "TotalRecordCount"
-kind = "value"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.program"
-path = "Items"
-kind = "length"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.recording"
-path = "TotalRecordCount"
-kind = "value"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.recording"
-path = "Items"
-kind = "length"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.channelfolderitem"
-path = "TotalRecordCount"
-kind = "value"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.channelfolderitem"
-path = "Items"
-kind = "length"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*Artists.studios.*"
-path = "TotalRecordCount"
-kind = "value"
-issue = 824
-reason = "/Artists and /Artists/AlbumArtists drop the studios name filter."
-
-[[entry]]
-request = "Get*Artists.studios.*"
-path = "Items"
-kind = "length"
-issue = 824
-reason = "/Artists and /Artists/AlbumArtists drop the studios name filter."
 
 [[entry]]
 request = "edge-parental-rating/counts"

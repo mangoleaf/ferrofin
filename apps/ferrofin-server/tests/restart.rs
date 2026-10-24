@@ -43,18 +43,51 @@ const REFUSAL_DEADLINE: Duration = Duration::from_mins(1);
 /// in one process, where the second backup is refused.
 static BACKUP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn wait_until(client: &reqwest::Client, base: &str, name: &str, up: bool) {
+/// Waits until a new lifetime of this test's server answers on `base`.
+///
+/// A restart cannot be watched as a down-window: the startup server binds the
+/// new lifetime's listener first, so the port is closed for a few milliseconds
+/// at most and a poll can miss it. The restart flag tells the lifetimes apart
+/// instead. The restart and restore endpoints set `HasPendingRestart` on the
+/// old lifetime before they answer, and every lifetime starts with it clear, so
+/// only the new one can name this server without a restart pending. A refused
+/// connection, the startup server's `503` and the old lifetime still draining
+/// all mean "not yet".
+async fn wait_for_new_lifetime(client: &reqwest::Client, base: &str, name: &str, token: &str) {
     let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+    let mut last = String::from("no answer");
     while std::time::Instant::now() < deadline {
-        if is_up(client, base, name).await == up {
-            return;
+        match system_info(client, base, token).await {
+            Ok(info) if info["ServerName"] == name && info["HasPendingRestart"] == false => return,
+            Ok(info) => {
+                last = format!(
+                    "ServerName {}, HasPendingRestart {}",
+                    info["ServerName"], info["HasPendingRestart"]
+                );
+            }
+            Err(error) => last = error,
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!(
-        "server never became {}",
-        if up { "reachable" } else { "unreachable" }
-    );
+    panic!("no new lifetime of the server answered; last answer: {last}");
+}
+
+/// `GET /System/Info`, or why there was nothing to read.
+async fn system_info(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .get(format!("{base}/System/Info"))
+        .header("Authorization", format!("{CLIENT}, Token=\"{token}\""))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(response.status().to_string());
+    }
+    response.json().await.map_err(|error| error.to_string())
 }
 
 async fn token(client: &reqwest::Client, base: &str) -> String {
@@ -140,8 +173,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     let tok = token(&client, &base).await;
     let configuration = prepare_dashboard_restart(&client, &base, &tok).await;
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
-    wait_until(&client, &base, &name, false).await;
-    wait_until(&client, &base, &name, true).await;
+    wait_for_new_lifetime(&client, &base, &name, &tok).await;
     assert!(!server.is_finished(), "a restart must not exit the process");
     assert_dashboard_restarted(&client, &base, &tok, &configuration).await;
     assert_eq!(metrics(&client).await, 200, "/metrics survives the restart");
@@ -164,8 +196,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     assert!(status.is_success());
     assert_eq!(discover(discovery_addr).await, discovered);
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
-    wait_until(&client, &base, &name, false).await;
-    wait_until(&client, &base, &name, true).await;
+    wait_for_new_lifetime(&client, &base, &name, &tok).await;
     let released = std::net::UdpSocket::bind(discovery_addr)
         .expect("disabled lifetime does not bind discovery");
     drop(released);
@@ -363,8 +394,8 @@ async fn backup_restore_applies_on_the_in_process_restart() {
     )
     .await;
     assert_eq!(st, 204);
-    wait_until(&client, &base, &name, false).await;
-    wait_until(&client, &base, &name, true).await;
+    // `tok` predates the backup, so the restored database still knows it.
+    wait_for_new_lifetime(&client, &base, &name, &tok).await;
     assert!(!server.is_finished(), "restore restarts in-process");
     let tok = token(&client, &base).await;
     assert_eq!(

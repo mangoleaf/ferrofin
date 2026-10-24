@@ -1497,22 +1497,8 @@ impl FerrofinLibraryManager {
             }
             None => Vec::new(),
         };
-        let mut episodes = self.items.filter_folder_children(episodes, query).await?;
-        let mut post_query = query.clone();
-        if let [(ferrofin_model::live_tv::ItemSortBy::AiredEpisodeOrder, direction)] =
-            query.order_by.as_slice()
-        {
-            episodes.sort_by(|left, right| {
-                let ordering = episode_air_order(left).compare(&episode_air_order(right));
-                if *direction == ferrofin_model::dto::SortOrder::Descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
-            });
-            post_query.order_by.clear();
-        }
-        self.folder_post_filter_result(episodes, &post_query).await
+        let episodes = self.items.filter_folder_children(episodes, query).await?;
+        self.folder_post_filter_result(episodes, query).await
     }
 
     /// Load physical and linked Folder children with the existing access checks.

@@ -227,8 +227,21 @@ impl AggregateFolderStore {
         // `CreateRootFolder` saves the folder whenever its row is missing, so
         // a fresh server has it — and a user who can see a playlist the
         // library scan found has a Playlists view — before any playlist is
-        // made through the API. A row Jellyfin wrote with a moved data
-        // directory is found by its `%AppDataPath%` path and kept.
+        // made through the API. This is the one place that provisions it:
+        // upstream runs `CreateRootFolder` once per process
+        // (`LibraryManager.RootFolder`, LibraryManager.cs:226), and no request
+        // path here makes the row either.
+        //
+        // Upstream looks the row up by id alone (`GetItemById(folder.Id)`,
+        // LibraryManager.cs:1132). That id is derived from the
+        // program-data-relative key `data\playlists`, so a database adopted
+        // from a Jellyfin whose data directory was elsewhere still carries the
+        // row under this id, and Jellyfin never writes it under another. The
+        // path fallback (`container_at` accepts the resolved path and the
+        // `%AppDataPath%` token) is defensive: a row already at the folder's
+        // path under some other id is kept, rather than given a second folder
+        // beside it that would split the playlists and list two Playlists
+        // views.
         let path = self.playlists_path();
         if !row_exists(&self.db, correct).await?
             && crate::item_persistence_service::container_at(&self.db, &path.to_string_lossy())
@@ -301,8 +314,9 @@ pub(crate) fn playlists_folder_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{fetch_item, seed_folder_item, test_db};
+    use crate::test_support::{fetch_item, seed_folder_item, set_item_path, test_db};
     use ferrofin_db::store::guid_to_db as db_guid;
+    use rstest::rstest;
 
     fn store(db: &Database, tmp: &tempfile::TempDir) -> AggregateFolderStore {
         AggregateFolderStore::new(
@@ -383,6 +397,53 @@ mod tests {
         );
         assert!(store.playlists_path().is_dir());
         assert_eq!(store.ensure().await.expect("again"), ids);
+    }
+
+    /// gl-343: a playlists folder already at the folder's path under another
+    /// id, stored resolved or with Jellyfin's `%AppDataPath%` token, is kept
+    /// as it is: startup provisions no second folder beside it.
+    #[rstest]
+    #[case::resolved_path(false)]
+    #[case::app_data_token(true)]
+    #[tokio::test]
+    async fn ensure_keeps_a_playlists_folder_found_by_path(#[case] token: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let db = test_db().await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let store = store(&db, &tmp);
+            let stored_path = if token {
+                "%AppDataPath%/playlists".to_owned()
+            } else {
+                store.playlists_path().to_string_lossy().into_owned()
+            };
+            let foreign = Uuid::from_u128(0xADA);
+            seed_folder_item(
+                &db,
+                foreign,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                None,
+            )
+            .await;
+            set_item_path(&db, foreign, &stored_path).await;
+
+            store.ensure().await.expect("ensure");
+            store.ensure().await.expect("again");
+
+            let derived = store.playlists_id().expect("id");
+            assert_ne!(derived, foreign);
+            assert!(
+                !row_exists(&db, derived).await.expect("probe"),
+                "no second playlists folder under the derived id"
+            );
+            assert_eq!(
+                fetch_item(&db, foreign).await.path.as_deref(),
+                Some(stored_path.as_str()),
+                "the row found by path is kept as it is"
+            );
+        })
+        .await
+        .expect("the test finishes");
     }
 
     /// The folder carries `CreateRootFolder`'s dates: created and modified

@@ -239,8 +239,10 @@ pub trait ItemRepository: Send + Sync {
     }
 
     /// Sorts an already-filtered child set without grouping or paging. Name
-    /// sorts use the pinned stable ordinal comparison; an empty OrderBy keeps
-    /// input order. Other sorts retain the repository's existing consumer.
+    /// sorts use the pinned stable ordinal comparison and `AiredEpisodeOrder`
+    /// the stable aired-order comparer (non-episodes after the episodes); an
+    /// empty OrderBy keeps input order. Other sorts retain the repository's
+    /// existing consumer.
     async fn sort_folder_children(
         &self,
         rows: Vec<BaseItemEntity>,

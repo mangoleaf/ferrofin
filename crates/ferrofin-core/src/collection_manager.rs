@@ -2207,7 +2207,8 @@ mod tests {
             .join("data/playlists")
             .to_string_lossy()
             .into_owned();
-        // What `user_view_manager::ensure_playlists_folder` leaves behind.
+        // A folder already at the playlists path under an id of its own: the
+        // `ManualPlaylistsFolder` row an earlier Ferrofin wrote there.
         let existing = Uuid::from_u128(0xF0DE);
         crate::item_persistence_service::insert_named_item(
             &db,

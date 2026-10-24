@@ -2012,10 +2012,10 @@ pub trait UserViewManager: Send + Sync {
     /// Port of `LibraryController.GetMediaFolders`, which returns
     /// `GetUserRootFolder().Children` sorted by `SortName`. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
-    /// only), this also includes the auto-provisioned
-    /// [`BaseItemKind`]`::ManualPlaylistsFolder`,
-    /// provisioning it on first read if absent (Jellyfin lazily materializes it as
-    /// a user-root child).
+    /// only), this also includes the playlists folder
+    /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to
+    /// clients), which startup provisions once, as Jellyfin's
+    /// `CreateRootFolder` does; a read never writes it.
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
     /// Gets the user's latest media, grouped by index container.
