@@ -1,6 +1,7 @@
-//! Bitmap subtitles through a real ffmpeg, over HTTP: an embedded PGS track
-//! kept as PGS in a progressive transcode, and an external `.sup` sidecar
-//! embedded, and burned into a seeked HLS segment, on the movie's clock.
+//! Subtitles through a real ffmpeg, over HTTP: an embedded PGS track kept as
+//! PGS in a progressive transcode, an external `.sup` sidecar embedded, and
+//! burned into a seeked HLS segment, on the movie's clock; and an ASS track
+//! burned in with the fonts its file ships, extracted into the cache.
 //!
 //! ffmpeg has no PGS encoder, so the subtitle is written here: display sets
 //! drawing a white box in the middle of a black picture ([`SHOWINGS`]).
@@ -400,6 +401,72 @@ fn brightness_in_the_box(ffmpeg: &Path, path: &Path, seconds: &str) -> f64 {
     output.stdout.iter().map(|&v| f64::from(v)).sum::<f64>() / 64.0
 }
 
+/// A six-second movie with an ASS subtitle track and two font attachments:
+/// `Font.ttf`, and one whose `filename` tag climbs out of any folder it is
+/// dumped in (`../../escape.ttf`). The fonts' bytes are not a real font
+/// (libass falls back), the names are what is tested. The generator's inputs
+/// stay in `scratch`, outside the library.
+fn generate_fonts_movie(ffmpeg: &Path, scratch: &Path, folder: &Path) {
+    std::fs::create_dir_all(scratch).unwrap();
+    std::fs::create_dir_all(folder).unwrap();
+    let ass = scratch.join("track.ass");
+    std::fs::write(
+        &ass,
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\n\n\
+         [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, Alignment\n\
+         Style: Default,Shipped Font,24,&H00FFFFFF,2\n\n\
+         [Events]\nFormat: Layer, Start, End, Style, Text\n\
+         Dialogue: 0,0:00:00.50,0:00:05.00,Default,shipped\n",
+    )
+    .unwrap();
+    let font = scratch.join("font.bin");
+    std::fs::write(&font, b"not really a font").unwrap();
+    let status = Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i"])
+        .arg(format!("color=c=black:s={WIDTH}x{HEIGHT}:r=10:d=6"))
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=6"])
+        .arg("-i")
+        .arg(&ass)
+        .arg("-attach")
+        .arg(&font)
+        .arg("-attach")
+        .arg(&font)
+        .args(["-map", "0:v", "-map", "1:a", "-map", "2:s"])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "ass",
+        ])
+        .args(["-metadata:s:t:0", "mimetype=application/x-truetype-font"])
+        .args(["-metadata:s:t:0", "filename=Font.ttf"])
+        .args(["-metadata:s:t:1", "mimetype=application/x-truetype-font"])
+        .args(["-metadata:s:t:1", "filename=../../escape.ttf"])
+        .arg(folder.join("Fonts (2021).mkv"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "generating the fonts movie");
+}
+
+/// Every file named `name` under `dir`.
+fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_named(&path, name));
+        } else if path.file_name().is_some_and(|n| n == name) {
+            found.push(path);
+        }
+    }
+    found
+}
+
 /// Whether `ffmpeg` can encode the generated media (H.264 and AAC).
 fn can_generate(ffmpeg: &Path) -> bool {
     Command::new(ffmpeg)
@@ -417,25 +484,61 @@ fn has_input_sync(ffmpeg: &Path) -> bool {
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("-isync"))
 }
 
+/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips:
+/// `FERROFIN_FFMPEG_TESTS` unset, a tool missing, no libx264, or an ffmpeg
+/// older than 5.1.
+fn tools() -> Option<(PathBuf, PathBuf)> {
+    if std::env::var("FERROFIN_FFMPEG_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
+        return None;
+    }
+    let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return None;
+    };
+    if !can_generate(&ffmpeg) {
+        eprintln!("skipping: this ffmpeg has no libx264 to generate the media");
+        return None;
+    }
+    if !has_input_sync(&ffmpeg) {
+        eprintln!("skipping: this ffmpeg is older than 5.1 (no -isync)");
+        return None;
+    }
+    Some((ffmpeg, ffprobe))
+}
+
+impl Server {
+    /// Adds `folder` as a movies library with no remote providers, scans it,
+    /// and returns its one movie with its media sources.
+    async fn the_only_movie_in(&self, folder: &Path) -> Value {
+        let options = json!({
+            "PathInfos": [{"Path": folder}],
+            "EnableRealtimeMonitor": false,
+            "EnableInternetProviders": false,
+            "EnableChapterImageExtraction": false,
+            "EnableTrickplayImageExtraction": false,
+            "TypeOptions": [{"Type": "Movie", "MetadataFetchers": [], "ImageFetchers": []}]
+        });
+        self.send(
+            reqwest::Method::POST,
+            "/Library/VirtualFolders?name=Movies&collectionType=movies&refreshLibrary=false",
+            Some(&json!({"LibraryOptions": options})),
+        )
+        .await;
+        self.scan().await;
+        let items = self
+            .get("/Items?Recursive=true&IncludeItemTypes=Movie&Fields=MediaSources")
+            .await;
+        items["Items"][0].clone()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return;
-    }
-    let (Some(real_ffmpeg), Some(real_ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
     };
-    if !can_generate(&real_ffmpeg) {
-        eprintln!("skipping: this ffmpeg has no libx264 to generate the media");
-        return;
-    }
-    if !has_input_sync(&real_ffmpeg) {
-        eprintln!("skipping: this ffmpeg is older than 5.1 (no -isync)");
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let movies = root.join("media").join("movies");
@@ -444,27 +547,7 @@ async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
     let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
 
     let server = Server::boot(root, &ffmpeg, &ffprobe).await;
-    let options = json!({
-        "PathInfos": [{"Path": movies}],
-        "EnableRealtimeMonitor": false,
-        "EnableInternetProviders": false,
-        "EnableChapterImageExtraction": false,
-        "EnableTrickplayImageExtraction": false,
-        "TypeOptions": [{"Type": "Movie", "MetadataFetchers": [], "ImageFetchers": []}]
-    });
-    server
-        .send(
-            reqwest::Method::POST,
-            "/Library/VirtualFolders?name=Movies&collectionType=movies&refreshLibrary=false",
-            Some(&json!({"LibraryOptions": options})),
-        )
-        .await;
-    server.scan().await;
-
-    let items = server
-        .get("/Items?Recursive=true&IncludeItemTypes=Movie&Fields=MediaSources")
-        .await;
-    let movie = &items["Items"][0];
+    let movie = &server.the_only_movie_in(&movies).await;
     let item = movie["Id"].as_str().expect("the movie was scanned");
     let source = &movie["MediaSources"][0];
     let source_id = source["Id"].as_str().unwrap();
@@ -543,5 +626,80 @@ async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
     assert!(
         before < 64.0 && during > 128.0,
         "the box is burned in from 10.5 s (means {before} at 10 s, {during} at 11 s)"
+    );
+}
+
+/// Burning an ASS track in first extracts the fonts its file ships, and the
+/// `subtitles` filter reads them there (gl-108). A font whose `filename` tag
+/// is a path is written inside the cache folder all the same, by its leaf
+/// (gl-414): nothing lands where the tag points.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burned_ass_track_reads_the_fonts_its_file_ships_from_the_cache() {
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let movies = root.join("media").join("movies");
+    generate_fonts_movie(
+        &real_ffmpeg,
+        &root.join("scratch"),
+        &movies.join("Fonts (2021)"),
+    );
+    let ffmpeg = wrapper(root, "ffmpeg", &real_ffmpeg);
+    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
+
+    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
+    let movie = server.the_only_movie_in(&movies).await;
+    let item = movie["Id"].as_str().expect("the movie was scanned");
+    let source = &movie["MediaSources"][0];
+    let source_id = source["Id"].as_str().unwrap();
+    let ass = source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Type"] == "Subtitle")
+        .unwrap_or_else(|| panic!("an ASS track in {source}"))["Index"]
+        .as_i64()
+        .unwrap();
+
+    let body = server
+        .download(&format!(
+            "/Videos/{item}/hls1/main/0.ts?mediaSourceId={source_id}\
+             &videoCodec=h264&audioCodec=aac&segmentContainer=ts&segmentLength=3\
+             &runtimeTicks=0&actualSegmentLengthTicks=30000000\
+             &playSessionId=burn-ass&subtitleStreamIndex={ass}&subtitleMethod=Encode"
+        ))
+        .await;
+    assert!(!body.is_empty());
+
+    // The fonts were dumped one by one to paths of the server's choosing, as
+    // a path-shaped name requires, and both landed in one cache folder.
+    let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    let dump = calls
+        .lines()
+        .find(|line| line.starts_with("ffmpeg ") && line.contains("-dump_attachment:"))
+        .expect("the attachments were extracted");
+    assert!(!dump.contains("-dump_attachment:t"), "{dump}");
+    let fonts = files_named(root, "Font.ttf");
+    let escaped = files_named(root, "escape.ttf");
+    assert_eq!(fonts.len(), 1, "{fonts:?}");
+    assert_eq!(escaped.len(), 1, "nothing outside the cache: {escaped:?}");
+    let folder = fonts[0].parent().unwrap();
+    assert_eq!(escaped[0].parent().unwrap(), folder);
+    assert!(
+        folder.components().any(|c| c.as_os_str() == "attachments"),
+        "{}",
+        folder.display()
+    );
+
+    // The burn-in reads them from there.
+    let burn = calls
+        .lines()
+        .find(|line| line.starts_with("ffmpeg ") && line.contains(" -f hls "))
+        .expect("the burn-in ran");
+    assert!(
+        burn.contains(&format!(":fontsdir='{}'", folder.display())),
+        "{burn}"
     );
 }

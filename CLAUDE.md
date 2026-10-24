@@ -245,16 +245,21 @@ FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_ext
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg
 ```
 
-`no_repeat_extraction_ffmpeg` checks that chapter images, trickplay and Intro Skipper analysis are never
-redone for an unchanged file: library scans, the three scheduled tasks, every choice of
-jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate redo) on a
-library, a series and an episode, and a restart, with extraction both during the scan and
-by the tasks. Intro Skipper's automatic timer is off there (its scheduled task drives the
-same engine). `subtitle_streams_ffmpeg` writes a PGS subtitle (ffmpeg has no PGS encoder)
-and checks it embedded from the movie and from a `.sup` sidecar and burned into a seeked HLS
-segment, at the right time. Both need an ffmpeg with libx264, and `subtitle_streams_ffmpeg`
-also needs ffmpeg 5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`):
-run them by hand for changes to those paths.
+`no_repeat_extraction_ffmpeg` checks that chapter images, trickplay and Intro Skipper
+analysis are never redone for an unchanged file: library scans, the three scheduled tasks,
+every choice of jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate
+redo) on a library, a series and an episode, and a restart, with extraction both during the
+scan and by the tasks. Intro Skipper's automatic timer is off there (its scheduled task
+drives the same engine).
+
+`subtitle_streams_ffmpeg` writes a PGS subtitle (ffmpeg has no PGS encoder) and checks it
+embedded from the movie and from a `.sup` sidecar and burned into a seeked HLS segment, at
+the right time; and it burns an ASS track in with the fonts its file ships, which must be
+extracted into the cache whatever their `filename` tags say.
+
+Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also needs ffmpeg
+5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
+for changes to those paths.
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root

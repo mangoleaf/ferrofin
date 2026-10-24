@@ -300,16 +300,35 @@ pub fn build_media_encoding(
     let subtitles: Arc<dyn SubtitleEncoder> =
         Arc::new(SubtitleEncoderImpl::new(pure_encoder, sub_resolver));
 
+    // ---- attachment extractor (real ffmpeg + filesystem) ------------------
+    // Built before the planner, which extracts a file's fonts before a
+    // subtitle burn-in that may need them (`TranscodeManager.StartFfMpeg`).
+    let resolver = Arc::new(MediaSourceManagerResolver {
+        media_sources: Arc::clone(&media_sources),
+    });
+    let io = Arc::new(FfmpegAttachmentIo {
+        path_manager: Arc::clone(&path_manager),
+    });
+    // `AttachmentExtractorImpl<E, …>` holds an `Arc<E>` with `E: Sized`, so the
+    // trait-object encoder is wrapped in the sized [`DynMediaEncoder`] newtype.
+    let attachments: Arc<dyn AttachmentExtractor> = Arc::new(AttachmentExtractorImpl::new(
+        Arc::new(DynMediaEncoder(Arc::clone(&encoder))),
+        resolver,
+        io,
+    ));
+
     // ---- HLS transcode chain (below the planner seam) ---------------------
+    let ffmpeg_path = encoder.encoder_path();
     let planner = FerrofinStreamStatePlanner::new(
-        Arc::clone(&media_sources),
-        Arc::clone(&encoder),
+        media_sources,
+        encoder,
         EncodingHelper::new(ffmpeg.capabilities.clone()),
         Arc::clone(&config),
         Arc::clone(&paths),
         Arc::clone(&subtitles),
         ffmpeg.supports_filter("tonemapx"),
-    );
+    )
+    .with_attachments(Arc::clone(&attachments), path_manager);
     let planner = match library {
         Some(library) => planner.with_library(library),
         None => planner,
@@ -352,7 +371,7 @@ pub fn build_media_encoding(
         manager,
         generator,
         paths as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
-        encoder.encoder_path(),
+        ffmpeg_path,
     );
     // Without this the master playlist lists no `#EXT-X-IMAGE-STREAM-INF`, so a
     // client sees no trickplay tiles however many the library holds.
@@ -360,17 +379,6 @@ pub fn build_media_encoding(
         hls_impl = hls_impl.with_trickplay(trickplay);
     }
     let hls: Arc<dyn HlsStreamManager> = Arc::new(hls_impl);
-
-    // ---- attachment extractor (real ffmpeg + filesystem) ------------------
-    let resolver = Arc::new(MediaSourceManagerResolver { media_sources });
-    let io = Arc::new(FfmpegAttachmentIo { path_manager });
-    // `AttachmentExtractorImpl<E, …>` holds an `Arc<E>` with `E: Sized`, so the
-    // trait-object encoder is wrapped in the sized [`DynMediaEncoder`] newtype.
-    let attachments: Arc<dyn AttachmentExtractor> = Arc::new(AttachmentExtractorImpl::new(
-        Arc::new(DynMediaEncoder(encoder)),
-        resolver,
-        io,
-    ));
 
     (hls, attachments, subtitles)
 }
