@@ -525,7 +525,9 @@ async fn an_add_keeps_to_what_its_user_may_see() {
         .call(
             "POST",
             "/Playlists",
-            Some(json!({"Name": "Admin's", "Ids": [music.album]})),
+            // A body without `IsPublic` creates an open playlist (C#'s
+            // `IsPublic = true`), so a private one names it.
+            Some(json!({"Name": "Admin's", "Ids": [music.album], "IsPublic": false})),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{private}");

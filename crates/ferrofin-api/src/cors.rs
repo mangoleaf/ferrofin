@@ -3,6 +3,7 @@
 //! (`Jellyfin.Server/Configuration/CorsPolicyProvider.cs`), which builds the
 //! policy from the live configuration on every request.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -10,7 +11,7 @@ use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
 use ferrofin_traits::configuration::ServerConfigurationManager;
-use tower::{Layer as _, ServiceExt as _};
+use tower::{Layer as _, Service, ServiceExt as _};
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 /// The CORS layer `cors_hosts` selects:
@@ -72,18 +73,39 @@ fn entry_host(entry: &str) -> Option<&str> {
     )
 }
 
-/// The CORS middleware: the layer the live configuration's `CorsHosts`
-/// selects ([`layer_for`]) around the rest of the request. A request with no
-/// `Origin` is no CORS request and passes straight through with the policy
-/// unread, as ASP.NET's `CorsMiddleware.Invoke` does. A configuration that
-/// cannot be read leaves the default, any origin.
+/// The CORS middleware: [`with_configured_cors`] around the rest of the
+/// request.
 pub(crate) async fn cors_layer(
     State(config): State<Arc<dyn ServerConfigurationManager>>,
     request: Request,
     next: Next,
 ) -> Response {
+    with_configured_cors(config.as_ref(), request, next).await
+}
+
+/// Answers `request` with `inner` under the layer the live configuration's
+/// `CorsHosts` selects (`layer_for`). A request with no `Origin` is no CORS
+/// request and goes straight to `inner` with the policy unread, as ASP.NET's
+/// `CorsMiddleware.Invoke` does. A configuration that cannot be read leaves the
+/// default, any origin.
+///
+/// Public so middleware the server runs in front of the router, like the HTTPS
+/// redirect, can answer under the same policy, which Jellyfin applies before
+/// it.
+pub async fn with_configured_cors<S>(
+    config: &dyn ServerConfigurationManager,
+    request: Request,
+    inner: S,
+) -> Response
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Send,
+    S::Future: Send,
+{
     if !request.headers().contains_key(axum::http::header::ORIGIN) {
-        return next.run(request).await;
+        return match inner.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
     }
     let layer = match config.configuration().await {
         Ok(configuration) => layer_for(&configuration.cors_hosts),
@@ -94,7 +116,7 @@ pub(crate) async fn cors_layer(
             CorsLayer::permissive()
         }
     };
-    match layer.layer(next).oneshot(request).await {
+    match layer.layer(inner).oneshot(request).await {
         Ok(response) => response,
         Err(never) => match never {},
     }

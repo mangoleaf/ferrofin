@@ -15,6 +15,137 @@ use anyhow::Context as _;
 /// every accepted connection.
 pub type Listener = axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
 
+pub use ferrofin_api::forwarded_headers::Transport;
+
+/// A listener the server serves: plain HTTP, or HTTPS
+/// ([`crate::tls::TlsListener`]).
+pub enum ServedListener {
+    /// Plain HTTP.
+    Plain(Listener),
+    /// HTTPS.
+    Tls(crate::tls::TlsListener),
+}
+
+/// A connection accepted by a [`ServedListener`].
+pub enum Connection {
+    /// Plain HTTP.
+    Plain(tokio::net::TcpStream),
+    /// HTTPS: boxed, the TLS session being much larger than the socket.
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl Connection {
+    /// The local address the connection was accepted on.
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Plain(stream) => stream.local_addr(),
+            Self::Tls(stream) => stream.get_ref().0.local_addr(),
+        }
+    }
+
+    /// How the connection reached the server.
+    #[must_use]
+    pub fn transport(&self) -> Transport {
+        match self {
+            Self::Plain(_) => Transport::Plain,
+            Self::Tls(_) => Transport::Tls,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Connection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Connection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+impl axum::serve::Listener for ServedListener {
+    type Io = Connection;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Connection, SocketAddr) {
+        match self {
+            Self::Plain(listener) => {
+                let (stream, peer) = listener.accept().await;
+                (Connection::Plain(stream), peer)
+            }
+            Self::Tls(listener) => {
+                let (stream, peer) = listener.accept().await;
+                (Connection::Tls(Box::new(stream)), peer)
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Plain(listener) => listener.local_addr(),
+            Self::Tls(listener) => Ok(listener.local_addr()),
+        }
+    }
+}
+
 /// An address the network manager says to bind, with its interface index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindInterface {
