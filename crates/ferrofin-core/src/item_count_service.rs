@@ -1246,8 +1246,8 @@ impl FerrofinItemCountService {
 
     /// The `AggregateFolder`'s virtual children — the plug-in folders
     /// `LibraryManager.CreateRootFolder` parents to it and registers with
-    /// `AddVirtualChild` (LibraryManager.cs:883, the playlists folder, the only
-    /// call site in 10.11.8).
+    /// `AddVirtualChild` (v12.2 LibraryManager.cs:1146, the playlists folder,
+    /// the only call site).
     ///
     /// Type-narrow on purpose: the aggregate's other children (the physical
     /// library folders, `%AppDataPath%/collections`, the recordings folder) are

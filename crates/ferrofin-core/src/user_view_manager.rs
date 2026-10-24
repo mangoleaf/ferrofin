@@ -1059,8 +1059,10 @@ impl UserViewManager for FerrofinUserViewManager {
             // `item_repository::visible_views` still admits them).
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
-                // Both spellings of the playlists folder: Ferrofin provisions
-                // one, an adopted database carries the other.
+                // Both kinds of playlists folder: Ferrofin and Jellyfin both
+                // store `PlaylistsFolder`, but a row an earlier Ferrofin
+                // wrote as `ManualPlaylistsFolder` survives when startup
+                // finds the correct row beside it and does not re-key it.
                 BaseItemKind::ManualPlaylistsFolder,
                 BaseItemKind::PlaylistsFolder,
             ],

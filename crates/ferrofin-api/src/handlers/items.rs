@@ -1300,7 +1300,7 @@ fn short_type(item: &BaseItemEntity) -> &str {
 /// The children of the `UserRootFolder` that are the aggregate's VIRTUAL
 /// children rather than its own rows — the plug-in folders
 /// `LibraryManager.CreateRootFolder` registers with `AddVirtualChild`
-/// (LibraryManager.cs:883, the only call site in 10.11.8: the playlists folder).
+/// (v12.2 LibraryManager.cs:1146, the only call site: the playlists folder).
 ///
 /// Named as a set because that is what it is in the C#: they are members of the
 /// candidate list `TranslateParentItem` searches, and their

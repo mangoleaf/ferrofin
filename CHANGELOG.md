@@ -407,6 +407,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   tuner until a restart
 - The playlists folder is made only at startup, as Jellyfin does, instead of being looked for
   again, with a rule of its own, on every `GET /Library/MediaFolders` and Folders view request
+- After the data directory moves, startup moves the root folder and the playlists folder to
+  it, as Jellyfin's `CreateRootFolder` does, and creating a playlist only looks the playlists
+  folder up. Before, `POST /Playlists` missed the folder at its old path, tried to create it
+  again under the same id and failed with a 500
 - A DVR timer whose row cannot be read when it fires is retried every minute, up to ten
   times, and logged, instead of the recording being missed with no trace. A stored timer or
   series timer that no longer parses is logged when it is first read and when it misses its

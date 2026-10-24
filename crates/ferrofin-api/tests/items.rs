@@ -341,7 +341,7 @@ const COLLECTION_FOLDER_ID: Uuid = Uuid::from_u128(0xC0F);
 const USER_ROOT_ID: Uuid = Uuid::from_u128(0x500);
 
 /// The `PlaylistsFolder` `CreateRootFolder` parents to the `AggregateFolder`
-/// and registers as a virtual child (LibraryManager.cs:855-885).
+/// and registers as a virtual child (v12.2 LibraryManager.cs:1101-1150).
 const PLAYLISTS_FOLDER_ID: Uuid = Uuid::from_u128(0x9F1);
 
 /// A playlist inside it — the chain that exercises the plug-in-folder exemption.

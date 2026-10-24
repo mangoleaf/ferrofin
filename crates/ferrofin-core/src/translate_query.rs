@@ -779,8 +779,8 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
             // concatenates `LibraryManager.RootFolder.VirtualChildren`).
             //
             // Narrowed to the plug-in-folder types on purpose:
-            // `AddVirtualChild` has exactly ONE call site in 10.11.8
-            // (LibraryManager.cs:883, the playlists folder), and the
+            // `AddVirtualChild` has exactly ONE call site in v12.2
+            // (LibraryManager.cs:1146, the playlists folder), and the
             // aggregate's other children — the physical library folders,
             // `%AppDataPath%/collections`, the recordings folder — must not
             // leak into the user root's children.
