@@ -325,9 +325,12 @@ async fn get_playlist_items(
         query.enable_image_types.as_deref(),
         query.enable_user_data,
     );
+    // `GetManageableItems()` resolves the members through
+    // `ResolveLinkedChildren`, with every field loaded whatever the client
+    // asked for.
     let mut dtos = state
         .dto
-        .get_base_item_dtos(&items, &options, user.as_ref(), None, true)
+        .get_linked_children_dtos(&items, &options, user.as_ref())
         .await?;
     // Tag each DTO with its playlist-entry id: C#'s
     // `Item1.ItemId?.ToString("N")`, the linked child's item id — the member's

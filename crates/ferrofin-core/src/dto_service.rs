@@ -86,6 +86,22 @@ use ferrofin_traits::trickplay::TrickplayManager;
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
 
+/// How the projected rows were read, which decides what upstream had loaded
+/// on them before projecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRead {
+    /// `RetrieveItem`: one row by id, provider ids always included
+    /// (`BaseItemRepository.cs:825-829`); projected as `GetBaseItemDto`.
+    ById,
+    /// A list query: provider ids only for `ItemFields.ProviderIds`
+    /// (`ApplyNavigations`, :442-445); projected as `GetBaseItemDtos`.
+    List,
+    /// A playlist's or box set's members: `Folder.ResolveLinkedChildren` with
+    /// every field (v12.2 Folder.cs:1819-1873), or a box set's per-member
+    /// `GetLinkedChild` by id; projected as `GetBaseItemDtos`.
+    LinkedChildren,
+}
+
 /// Relation rows bulk-loaded for a whole page of items, so `build_dto` needs
 /// no per-item queries for them (list endpoints); absent entries mean "no rows"
 /// for that item, not "not prefetched".
@@ -3811,10 +3827,16 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         // list query only does so for `ItemFields.ProviderIds` (:442-445). That
         // difference is observable: it decides whether a movie's `UserData.Key`
         // is its IMDb id or its guid.
-        self.project(std::slice::from_ref(item), options, user, owner_id, true)
-            .await?
-            .pop()
-            .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
+        self.project(
+            std::slice::from_ref(item),
+            options,
+            user,
+            owner_id,
+            RowRead::ById,
+        )
+        .await?
+        .pop()
+        .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
     }
 
     async fn get_base_item_dtos(
@@ -3825,7 +3847,18 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        self.project(items, options, user, owner_id, false).await
+        self.project(items, options, user, owner_id, RowRead::List)
+            .await
+    }
+
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.project(items, options, user, None, RowRead::LinkedChildren)
+            .await
     }
 
     async fn get_item_by_name_dto(
@@ -4043,16 +4076,15 @@ impl FerrofinDtoService {
     /// The shared projection body behind [`DtoService::get_base_item_dto`] and
     /// [`DtoService::get_base_item_dtos`].
     ///
-    /// `retrieved_by_id` says the rows came from the by-id read
-    /// (`RetrieveItem`), which upstream always hydrates provider ids for; a list
-    /// query hydrates them only when `ItemFields.ProviderIds` was requested.
+    /// `read` says how the rows were read, and so what upstream had loaded
+    /// on them (see [`RowRead`]).
     async fn project(
         &self,
         items: &[BaseItemEntity],
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        retrieved_by_id: bool,
+        read: RowRead,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
@@ -4065,8 +4097,8 @@ impl FerrofinDtoService {
                 options,
                 user,
                 owner_id,
-                retrieved_by_id,
-                !retrieved_by_id,
+                read != RowRead::List,
+                read != RowRead::ById,
             )
             .await?;
         // Ids the page lists more than once (a playlist may repeat a track).
@@ -4155,7 +4187,7 @@ impl FerrofinDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        retrieved_by_id: bool,
+        providers_loaded: bool,
         list_page: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
@@ -4209,7 +4241,7 @@ impl FerrofinDtoService {
                 // 10.11.8: the same movie's key is its guid in a plain list and
                 // `tt0111161` with `Fields=ProviderIds` or by id.
                 let hydrate_providers =
-                    retrieved_by_id || options.contains_field(ItemFields::ProviderIds);
+                    providers_loaded || options.contains_field(ItemFields::ProviderIds);
                 self.user_data
                     .get_user_data_dtos_for_rows(items, user_id, hydrate_providers)
                     .await
@@ -6429,6 +6461,56 @@ mod tests {
             ]
         );
         assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
+    }
+
+    /// A playlist's or box set's members are resolved with every field
+    /// (`Folder.ResolveLinkedChildren` with a parameterless `DtoOptions`), so a
+    /// never-written member keys its user data by its provider id, as on its
+    /// own page — where the same row in a plain list without `Fields=ProviderIds`
+    /// keys it by its guid (measured on Jellyfin 12.2: `"101765"` in the
+    /// playlist, the guid in a library list).
+    #[tokio::test]
+    async fn linked_children_key_unwritten_user_data_by_provider_id() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_provider_id(&db, movie, "Tmdb", "101765").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+                db.clone(),
+                crate::test_support::configuration_with_path_substitution(
+                    tmp.path(),
+                    "/unused",
+                    "/unused",
+                )
+                .await,
+            )),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let rows = [fetch_item(&db, movie).await];
+        let options = DtoOptions::with_all_fields(false);
+        let key =
+            |dtos: Vec<BaseItemDto>| dtos[0].user_data.as_ref().expect("user data").key.clone();
+
+        let listed = svc
+            .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+            .await
+            .unwrap();
+        assert_eq!(key(listed), movie.to_string());
+        let members = svc
+            .get_linked_children_dtos(&rows, &options, Some(&user))
+            .await
+            .unwrap();
+        assert_eq!(key(members), "101765");
     }
 
     /// A movie watched to the end on another version shows watched, with that

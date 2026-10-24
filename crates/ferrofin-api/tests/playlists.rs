@@ -293,6 +293,8 @@ impl UserManager for OkUsers {
 #[derive(Default)]
 struct OkDto {
     seen_fields: std::sync::Mutex<Vec<Vec<ferrofin_model::querying::ItemFields>>>,
+    /// Whether the linked-children projection ran.
+    linked_children: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -332,6 +334,17 @@ impl DtoService for OkDto {
                 ..BaseItemDto::default()
             })
             .collect())
+    }
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.linked_children
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.get_base_item_dtos(items, options, user, None, true)
+            .await
     }
     async fn get_item_by_name_dto(
         &self,
@@ -766,6 +779,12 @@ async fn playlist_items_projects_the_fields_the_client_asked_for() {
         fields.len() < 10,
         "asking for one field must not project everything — got {} fields: {fields:?}",
         fields.len()
+    );
+    // `GetManageableItems()` → `ResolveLinkedChildren`: the members are
+    // projected as linked children, loaded with every field.
+    assert!(
+        dto.linked_children
+            .load(std::sync::atomic::Ordering::SeqCst)
     );
 }
 
