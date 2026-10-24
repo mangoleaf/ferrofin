@@ -791,7 +791,7 @@ async fn update_user(
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
-        update_device_access(&state, &user).await?;
+        refresh_device_access(&state, user_id).await;
     }
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
@@ -800,8 +800,28 @@ async fn update_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The pinned `DeviceAccessHost` observes `OnUserUpdated`, emitted by rename.
-/// Policy/configuration saves do not emit that event in the pinned source.
+/// Port of `DeviceAccessHost.OnUserUpdated`, registered since Jellyfin 12.1:
+/// `UserManager.RenameUser` and `UpdatePolicyAsync` raise `OnUserUpdated`, and
+/// the host then logs out every device of the user that the saved policy no
+/// longer allows ([`update_device_access`]). A configuration save raises no
+/// such event.
+///
+/// The change it follows is already saved, so a failure is logged and not
+/// answered, as upstream's handler catches and logs it.
+async fn refresh_device_access(state: &AppState, user_id: Uuid) {
+    let refreshed = async {
+        let user = load_user(state, user_id).await?;
+        update_device_access(state, &user).await
+    }
+    .await;
+    if let Err(error) = refreshed {
+        tracing::error!(user_id = %user_id, %error, "error updating device access for user");
+    }
+}
+
+/// `DeviceAccessHost.UpdateDeviceAccess`: unless the user may use every device
+/// (`EnableAllDevices`), logs out (`Logout(Device)`) each of their devices
+/// `CanAccessDevice` refuses.
 async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(), ApiError> {
     if user_policy(state, user)
         .await?
@@ -838,7 +858,8 @@ async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(),
 /// the last enabled user may not be disabled. The guards are read inside the
 /// save's transaction ([`UserManager::update_policy_guarded`]), so concurrent
 /// saves cannot both pass one. On a successful disable, the user's tokens are
-/// revoked.
+/// revoked, and after every save the devices the saved policy no longer allows
+/// are logged out (Jellyfin 12.1's `DeviceAccessHost`).
 ///
 /// [`UserManager::update_policy_guarded`]: ferrofin_traits::library::UserManager::update_policy_guarded
 #[utoipa::path(
@@ -870,7 +891,10 @@ async fn update_user_policy(
     if saved.newly_disabled {
         state.sessions.revoke_user_tokens(user_id, "").await?;
     }
+    // `UpdatePolicyAsync` publishes `UserUpdated` before it raises
+    // `OnUserUpdated` for the device check.
     notify_user_updated(&state, user_id).await;
+    refresh_device_access(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

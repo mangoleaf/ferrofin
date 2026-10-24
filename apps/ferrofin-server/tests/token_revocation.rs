@@ -8,7 +8,9 @@
 //! `revoke_user_tokens` was called.
 //!
 //! Each case signs the same user in on two devices and asserts which of the two
-//! tokens still works afterwards.
+//! tokens still works afterwards. The last case is the policy save's device
+//! check (Jellyfin 12.1's `DeviceAccessHost`), which signs out a device the
+//! saved policy no longer allows.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -381,4 +383,29 @@ async fn disabling_a_user_revokes_their_tokens_for_good() {
         );
     }
     login(&s.router, USER_NAME, USER_PASSWORD, DEVICE_A).await;
+}
+
+/// Jellyfin 12.1 registers `DeviceAccessHost`, and `UpdatePolicyAsync` raises
+/// `OnUserUpdated`: after a policy save, every device of the user that the
+/// policy no longer allows is logged out. Before, only a new sign-in from it
+/// was refused, and its token kept working.
+#[tokio::test]
+async fn a_policy_that_no_longer_allows_a_device_signs_that_device_out() {
+    let s = signed_in_twice().await;
+    let mut policy = policy_of(&s).await;
+    policy["EnableAllDevices"] = serde_json::Value::Bool(false);
+    policy["EnabledDevices"] = serde_json::json!([DEVICE_A]);
+    save_policy(&s, policy).await;
+
+    assert_eq!(
+        me_status(&s.router, &s.token_a, DEVICE_A).await,
+        StatusCode::OK,
+        "the allowed device stays signed in"
+    );
+    assert_eq!(
+        me_status(&s.router, &s.token_b, DEVICE_B).await,
+        StatusCode::UNAUTHORIZED,
+        "the device the policy dropped is signed out"
+    );
+    assert_eq!(device_ids_of(&s).await, vec![DEVICE_A.to_owned()]);
 }
