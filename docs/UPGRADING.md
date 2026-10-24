@@ -8,6 +8,20 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the Latest row follows Jellyfin 12 for movies libraries
+
+Nothing to do. A grouped **Latest** request whose first library with a content type is a
+movies library is now answered as Jellyfin 12 answers it: the newest items, one per
+presentation key, as many as the page asks for, then grouped into cards. Before, Ferrofin
+read five times as many items first. As in Jellyfin 12, an item with no presentation key is
+not listed, and items added at the same moment are ordered by id.
+
+The visible case is the home screen's library-wide Latest row on a server whose first
+typed library, in name order, is a movies library. If the newest additions are a few albums'
+tracks or a season's episodes, that row now shows a few cards, as Jellyfin 12 does, where
+it used to fill up with older items. A library's own "Latest Movies" row is unchanged in
+nearly every case.
+
 ## Unreleased — the dashboard's HTTPS settings take effect
 
 Ferrofin now serves HTTPS itself, as Jellyfin does. Until now it ignored the HTTPS settings

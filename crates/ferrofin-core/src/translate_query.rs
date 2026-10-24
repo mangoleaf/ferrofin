@@ -372,6 +372,31 @@ pub(crate) fn build_latest_tv_series_query(filter: &InternalItemsQuery) -> Query
     qb
 }
 
+/// v12's movies "latest" (`GetLatestMovieItems`,
+/// `Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs:233-256`):
+/// the rows the caller's filter matches that carry a presentation key, newest
+/// first (`DateCreated DESC, Id DESC`), as `(Id, PresentationUniqueKey)`. The
+/// caller reads it as a stream and stops at `limit` distinct keys, keeping the
+/// first row of each.
+///
+/// No grouping by presentation key and no `LIMIT`: v12's `GetLatestItemList`
+/// builds its base query with `TranslateQuery` alone, and the de-duplication
+/// is what the limit counts. The caller's `order_by` and `start_index` play no
+/// part, as upstream.
+#[must_use]
+pub(crate) fn build_latest_movies_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT bi."Id" AS "Id", bi."PresentationUniqueKey" AS "PresentationUniqueKey"
+           FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(
+        r#" AND bi."PresentationUniqueKey" IS NOT NULL ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#,
+    );
+    qb
+}
+
 /// Step 2 of `GetLatestTvShowItems` (`Querying.cs:313-325`): the rows of
 /// `series_names` the caller's filter matches, created at or after `cutoff`
 /// when there is one, as the lightweight `(Id, SeriesName, DateCreated,
@@ -3122,6 +3147,42 @@ mod tests {
             );
             assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
         }
+    }
+
+    /// The movies arm of the grouped Latest (`build_latest_movies_query`), as
+    /// the user-view manager sends it for a movies library and for the unscoped
+    /// home row: the libraries' rows come off an index seek by top parent,
+    /// never a scan of every item.
+    #[tokio::test]
+    async fn latest_movies_rows_seek_the_libraries() {
+        use ferrofin_model::data::MediaType;
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let filter = InternalItemsQuery {
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            media_types: vec![MediaType::Video, MediaType::Audio],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x8691), uuid::Uuid::from_u128(0x8692)],
+            limit: Some(20),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = super::build_latest_movies_query(&filter);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH bi USING ") && d.contains("TopParentId=?")),
+            "{plan:#?}"
+        );
+        assert!(!plan.iter().any(|d| d.starts_with("SCAN bi")), "{plan:#?}");
     }
 
     /// The `ItemValues` sort keys (`OrderMapper`'s `Artist`, `AlbumArtist`,

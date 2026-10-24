@@ -35,6 +35,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Answer a grouped `/Items/Latest` whose first typed library is a movies library as
+  Jellyfin 12 does (`GetLatestMovieItems`): the newest `limit` items, one per presentation
+  key, then grouped into cards. The "Latest Movies" row is the same in nearly every case.
+  The unscoped home row on a server whose first typed library is Movies now reads `limit`
+  items instead of five times as many, so a batch of new tracks or episodes can fill it
+  with a few cards, and an unscoped request takes half the time (117 → 60 ms on the
+  benchmark corpus, one debug build before and after). See
+  [docs/UPGRADING.md](docs/UPGRADING.md).
 - Keep the playlists folder out of a user's library-wide queries until they can see a
   playlist, and a box-set library until they can see a box set, as Jellyfin's
   `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
