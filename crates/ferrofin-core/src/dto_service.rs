@@ -668,12 +668,13 @@ pub(crate) fn fill_folder_played(
     }
 }
 
-/// `100 × position ÷ runtime` as the C# double division (both counts are tick
-/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact
-/// enough for a display percentage).
+/// `100 × (position ÷ runtime)` in C#'s order — divide, then scale
+/// (`pct = PlaybackPositionTicks / (double)RunTimeTicks; 100 * pct`) — so the
+/// double is the one Jellyfin reports to the last digit (both counts are tick
+/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact).
 #[allow(clippy::cast_precision_loss)]
 fn percent_of_ticks(position: i64, runtime: i64) -> f64 {
-    100.0 * position as f64 / runtime as f64
+    100.0 * (position as f64 / runtime as f64)
 }
 
 /// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
@@ -5599,10 +5600,31 @@ mod tests {
 
     #[test]
     fn percent_of_ticks_is_the_played_percentage_division() {
-        // 50% of a 2 h runtime — the C# `100 * position / runtime` double math.
+        // 50% of a 2 h runtime.
         assert!((percent_of_ticks(36_000_000_000, 72_000_000_000) - 50.0).abs() < 1e-9);
         // Tiny fractions stay positive and precise enough for display.
         assert!(percent_of_ticks(1, 72_000_000_000) > 0.0);
+    }
+
+    /// Byte-equal to Jellyfin 12.2's doubles for the same ticks, measured on
+    /// `GET /UserItems/Resume`: upstream divides first, then scales
+    /// (`pct = PlaybackPositionTicks / (double)RunTimeTicks; 100 * pct`), and
+    /// the other order rounds differently in the last digits.
+    #[rstest::rstest]
+    #[case(13_206_045, 50_210_000, 26.301_623_182_632_945)]
+    #[case(30_347_999, 50_210_000, 60.442_141_007_767_38)]
+    #[case(31_000_576, 50_210_000, 61.741_836_287_592_11)]
+    fn percent_of_ticks_matches_jellyfin_bit_for_bit(
+        #[case] position: i64,
+        #[case] runtime: i64,
+        #[case] jellyfin: f64,
+    ) {
+        assert_eq!(
+            percent_of_ticks(position, runtime).to_bits(),
+            jellyfin.to_bits(),
+            "{} != {jellyfin}",
+            percent_of_ticks(position, runtime)
+        );
     }
 
     /// A folder's `RecursiveItemCount` and its played numbers come from the SAME

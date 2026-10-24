@@ -20,6 +20,7 @@ use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SortOrder};
 use ferrofin_model::entities::ImageType;
@@ -770,18 +771,13 @@ async fn get_seasons(
         query.enable_user_data,
     );
 
-    // C# `SetSeasonQueryOptions`: also drop missing seasons unless the user
-    // opts in; an explicit `isMissing`/`isSpecialSeason` narrows further.
-    let include_missing = user.as_ref().is_some_and(|u| u.display_missing_episodes);
     let internal = InternalItemsQuery {
         user: user.clone(),
         series_presentation_unique_key: Some(series_key),
         include_item_types: vec![BaseItemKind::Season],
         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
         is_special_season: query.is_special_season,
-        is_missing: query
-            .is_missing
-            .or_else(|| (!include_missing).then_some(false)),
+        is_missing: season_is_missing(user.as_ref(), query.is_missing),
         adjacent_to: query.adjacent_to,
         dto_options: options.clone(),
         ..InternalItemsQuery::default()
@@ -794,6 +790,17 @@ async fn get_seasons(
         .get_base_item_dtos(&seasons, &options, user.as_ref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(None, Some(total), dtos)))
+}
+
+/// The seasons query's `IsMissing`: the request's `isMissing`, then C#'s
+/// `SetSeasonQueryOptions` (v12.2 Series.cs:241-253), which runs after the
+/// controller sets it and forces `false` for a user who does not display
+/// missing episodes.
+fn season_is_missing(user: Option<&UserEntity>, requested: Option<bool>) -> Option<bool> {
+    match user {
+        Some(user) if !user.display_missing_episodes => Some(false),
+        _ => requested,
+    }
 }
 
 /// Applies C#'s `ApplyPaging`: skip `start_index`, then take `limit`.
@@ -1030,5 +1037,38 @@ mod episode_season_tests {
         };
         assert_eq!(episode_air_order(&item).airs_before_season, None);
         assert_eq!(episode_air_order(&item).season, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod season_missing_tests {
+    use super::season_is_missing;
+    use crate::test_support::fake_user_entity;
+    use rstest::rstest;
+
+    /// `GetSeasons` sets `IsMissing = isMissing`, then `SetSeasonQueryOptions`
+    /// forces `false` for a user who hides missing episodes: their setting
+    /// wins over the request. A user who displays them, or no user, keeps the
+    /// request's value.
+    #[rstest]
+    #[case(Some(false), Some(true), Some(false))]
+    #[case(Some(false), Some(false), Some(false))]
+    #[case(Some(false), None, Some(false))]
+    #[case(Some(true), Some(true), Some(true))]
+    #[case(Some(true), Some(false), Some(false))]
+    #[case(Some(true), None, None)]
+    #[case(None, Some(true), Some(true))]
+    #[case(None, None, None)]
+    fn the_user_setting_wins_over_is_missing(
+        #[case] display_missing: Option<bool>,
+        #[case] requested: Option<bool>,
+        #[case] expected: Option<bool>,
+    ) {
+        let user = display_missing.map(|display| {
+            let mut user = fake_user_entity(uuid::Uuid::from_u128(1), "viewer");
+            user.display_missing_episodes = display;
+            user
+        });
+        assert_eq!(season_is_missing(user.as_ref(), requested), expected);
     }
 }
