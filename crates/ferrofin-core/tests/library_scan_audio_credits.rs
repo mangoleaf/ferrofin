@@ -315,7 +315,7 @@ async fn a_cast_lock_keeps_the_stored_credits() {
     );
 }
 
-/// After `adoption/unchanged_scan.py`'s audit: from here on, every write to a
+/// After `gates/adoption/unchanged_scan.py`'s audit: from here on, every write to a
 /// credit row and every new `Peoples` row is counted, a delete-and-reinsert of
 /// identical rows included.
 async fn audit_credit_writes(h: &Harness) {

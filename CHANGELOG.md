@@ -24,13 +24,19 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
-- `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
+- The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
+  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Each gate
+  behaves as before; run directories default to `gates/bench/runs/` and
+  `gates/parity/runs/`, and the benchmark corpus to `gates/bench/testdata/`, so an existing
+  `bench/testdata/`, `bench/runs/` or `parity/runs/` is moved by hand (the corpus can also be
+  passed with `--testdata`)
+- `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived
   from one supplied 10.11.8 snapshot
 - All seven 10.11–12.1 live fixture paths passed on 2026-09-16, including both 12.1 upgrade
   routes; 12.2 paths passed the synthetic suite on 2026-10-13.
-  See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+  See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 

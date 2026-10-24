@@ -32,7 +32,7 @@ with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at `UPSTREAM_COMMIT`, pr
 upstream test project the Ferrofin rstest cases that cite an upstream test next to that
 project's `[InlineData]` count (1,833 cases against 2,677 at v12.2, as of 2026-10-19).
 
-Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin
+Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against Jellyfin
 12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
 evidence, not the parity number — it covers 28 requests and only the fields those requests
 happen to exercise.
@@ -56,7 +56,7 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   `boxsets` is the one library type not resolved off disk (its members are curated through
   the collection API). A rescan reprocesses only what changed: see
   [What a library scan does](#what-a-library-scan-does) below, and
-  [`verify/`](../verify/README.md) to check it against any running server. Movie and
+  [`gates/verify/`](../gates/verify/README.md) to check it against any running server. Movie and
   episode probes download missing subtitles in the library's configured languages,
   respecting existing subtitles and provider settings.
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),

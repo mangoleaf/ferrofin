@@ -125,7 +125,7 @@ Open `http://host:8096/web`.
 Ferrofin supports database adoption from **Jellyfin 10.11.8, 10.11.9, 10.11.10, 10.11.11,
 12.0.0, 12.1.0 and 12.2.0**. The 10.11–12.1 releases passed the live adoption suite on
 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. The
-[support matrix and test record](../adoption/README.md#supported-and-tested-versions)
+[support matrix and test record](../gates/adoption/README.md#supported-and-tested-versions)
 identify the nine tested fixture paths and the server images used.
 
 The gate checks the exact migration history and refuses unknown or incomplete histories;

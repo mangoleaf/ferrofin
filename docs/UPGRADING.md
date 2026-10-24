@@ -821,7 +821,7 @@ changed items; **Search for missing metadata** and **Replace all metadata** stil
 everything they cover. A change the disk watcher or a webhook reports refreshes the nearest
 item already in the library; that item's other children are checked, not processed.
 [What a library scan does](FEATURES.md#what-a-library-scan-does) has the details, and
-[`verify/`](../verify/README.md) checks a running server.
+[`gates/verify/`](../gates/verify/README.md) checks a running server.
 
 **The first scan after upgrading from 1.2.x or earlier is one full pass.** Those versions
 cleared, on every scan, the date an item was last refreshed, so this scan finds every item
@@ -1088,7 +1088,7 @@ Behaviour that changed with the shape:
   10.11.8–10.11.11 (exact migration sets, still one-way; a 12.x database baselines `0030`
   and `0032`, whose shape it already has). All six 10.11–12.1 releases passed live adoption
   tests on 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. See the
-  [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
+  [support matrix and tested build](../gates/adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
   as in Jellyfin 12.2 — a playlist file inside a music album counts.
 - **Playlist files in music libraries become playlists.** The next library scan turns each
