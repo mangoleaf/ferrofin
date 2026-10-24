@@ -441,6 +441,69 @@ async fn splashscreen_upload_bad_content_type_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The upload is named from `MimeTypes.ToExtension`: `image/jpg` is `.jpg`
+/// (Jellyfin 12 saves `splashscreen-upload.jpg`), and image types outside the
+/// override table take the base table's extension, as upstream's
+/// `ImageControllerTests` expect for `image/apng` and `image/avif`.
+#[rstest::rstest]
+#[case("image/jpg", "splashscreen-upload.jpg")]
+#[case("image/avif", "splashscreen-upload.avif")]
+#[case("image/apng", "splashscreen-upload.apng")]
+#[tokio::test]
+async fn splashscreen_upload_names_the_file_from_the_content_type(
+    #[case] content_type: &str,
+    #[case] file_name: &str,
+) {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config = make_config(default_branding(), &dir.to_string_lossy());
+
+    let (status, _) = send(
+        config.clone(),
+        "POST",
+        "/Branding/Splashscreen",
+        Some((content_type, "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let location = config
+        .get_branding()
+        .await
+        .expect("branding")
+        .splashscreen_location
+        .expect("location");
+    let location = std::path::Path::new(&location);
+    assert_eq!(
+        location.file_name().and_then(|name| name.to_str()),
+        Some(file_name)
+    );
+    assert!(location.is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An image subtype `ToExtension` does not know is still `400`.
+#[tokio::test]
+async fn splashscreen_upload_unknown_image_subtype_is_400() {
+    let config = make_config(default_branding(), "/nonexistent-ferrofin-data-dir");
+    let (status, _) = send(
+        config.clone(),
+        "POST",
+        "/Branding/Splashscreen",
+        Some(("image/x-unknown", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        config
+            .get_branding()
+            .await
+            .expect("branding")
+            .splashscreen_location
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn splashscreen_delete_no_location_is_204() {
     let config = make_config(default_branding(), "/tmp");

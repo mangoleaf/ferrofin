@@ -13,8 +13,9 @@
 
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_model::entities::ImageType;
 use ferrofin_model::querying::ItemFields;
-use ferrofin_traits::options::DtoOptions;
+use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
 use uuid::Uuid;
 
 /// The stored `BaseItems.Type` name of a Live TV channel.
@@ -51,6 +52,10 @@ pub struct ChannelRow {
     pub channel_type: String,
     /// When the channel first appeared in the lineup.
     pub date_created: Option<String>,
+    /// `ChannelInfo.ImageUrl`: the tuner's logo, or the matched guide
+    /// channel's. Read only by the guide refresh's item mirror.
+    #[sqlx(default)]
+    pub image_url: Option<String>,
     /// Whether the guide airs a movie on this channel (upstream
     /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
     #[sqlx(default)]
@@ -250,16 +255,26 @@ pub fn channel_media_type(channel_type: &str) -> &'static str {
     }
 }
 
-/// Port of `LiveTvChannel.CreateSortName`: a parseable number pads to
-/// `00000.0` form (`"1"` → `"00001.0-Name"`), an unparseable one is used
-/// verbatim (`"A1"` → `"A1-Name"`).
+/// Port of Jellyfin 12's `LiveTvChannel.CreateSortName`: a parseable number
+/// pads to `0000000000.00000` form (`"1"` → `"0000000001.00000-Name"`), so
+/// six-digit numbers and two-decimal subchannels sort numerically; an
+/// unparseable one is used verbatim (`"A1"` → `"A1-Name"`).
 #[must_use]
 pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
     let number = number.unwrap_or("");
     // C# `double.TryParse(Number, InvariantCulture, …)` trims whitespace.
     match number.trim().parse::<f64>() {
-        Ok(n) => format!("{n:07.1}-{name}"),
-        Err(_) => format!("{number}-{name}"),
+        // .NET's custom format keeps the sign outside the zero padding
+        // (`-1` → `-0000000001.00000`), where Rust's width counts it; a number
+        // wider than the pattern keeps all its digits in both.
+        Ok(n) if n.is_finite() => {
+            let sign = if n < 0.0 { "-" } else { "" };
+            format!("{sign}{:016.5}-{name}", n.abs())
+        }
+        // Rust also parses `inf`/`nan`, which have no padded form; keep the
+        // text (.NET rejects `inf`, and formats a parsed `NaN`/`Infinity` as
+        // that word).
+        _ => format!("{number}-{name}"),
     }
 }
 
@@ -337,9 +352,8 @@ pub fn channel_entity(
 ///
 /// `Number`/`ChannelType` are not `BaseItems` columns here — they reach the
 /// wire through `LiveTvManager::add_channel_info` from
-/// `FerrofinLiveTvChannels`, which the same refresh rewrites — and a channel
-/// row carries no image path, so those two upstream assignments have no column
-/// to land on.
+/// `FerrofinLiveTvChannels`, which the same refresh rewrites. The primary
+/// image is an image row, written by [`channel_images_update`]'s caller.
 #[must_use]
 pub fn channel_item_update(
     stored: &BaseItemEntity,
@@ -370,6 +384,115 @@ pub fn channel_item_update(
     }
     // `DateCreated` is stamped only on a NEW item, so the stored one stands.
     (item != *stored).then_some(item)
+}
+
+/// A remote image row for `url`: upstream's `new ItemImageInfo { Path = url,
+/// Type = type }`. The image routes serve it through the remote-image cache.
+fn remote_image(image_type: ImageType, url: &str) -> ItemImageInfo {
+    ItemImageInfo {
+        path: url.to_owned(),
+        image_type,
+        ..ItemImageInfo::default()
+    }
+}
+
+/// `item.SetImage(image, 0)`: the first image of its type is replaced, or the
+/// image is added when the item has none of that type.
+fn set_first_image(images: &mut Vec<ItemImageInfo>, image: ItemImageInfo) {
+    match images.iter().position(|i| i.image_type == image.image_type) {
+        Some(index) => images[index] = image,
+        None => images.push(image),
+    }
+}
+
+/// The channel's image list after `GuideManager.GetChannel`'s Primary rule,
+/// or `None` when it leaves the images as they are.
+///
+/// Upstream (v12.2 GuideManager.cs:460-477) sets the Primary to the
+/// channel's `ImageUrl` when the channel has no Primary, or when the URL is
+/// not blank and differs (ordinally) from the Primary's path. Upstream's
+/// `UpdateImagesAsync` then downloads it into a local file, whose path never
+/// equals the URL again, so every refresh re-sets and re-downloads every
+/// logo. Ferrofin keeps the row at the URL (the image routes serve it from the
+/// remote-image cache), so the comparison holds and an unchanged logo is
+/// left alone. A Primary that is a local file (an adopted Jellyfin channel's
+/// downloaded logo, or one set in the metadata editor) never equals the URL,
+/// so it is replaced by the tuner's or guide's logo, as upstream replaces it
+/// on every refresh.
+#[must_use]
+pub fn channel_images_update(
+    current: &[ItemImageInfo],
+    image_url: Option<&str>,
+) -> Option<Vec<ItemImageInfo>> {
+    let url = image_url.filter(|url| !url.trim().is_empty())?;
+    let primary = current.iter().find(|i| i.image_type == ImageType::Primary);
+    if primary.is_some_and(|p| p.path == url) {
+        return None;
+    }
+    let mut images = current.to_vec();
+    set_first_image(&mut images, remote_image(ImageType::Primary, url));
+    Some(images)
+}
+
+/// The artwork a listing supplies for one programme: `ProgramInfo.ImageUrl`
+/// (the `<icon>`), `ThumbImageUrl` (the first `still` `<image>`) and
+/// `BackdropImageUrl` (the first `backdrop` `<image>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProgramImages {
+    /// The Primary image URL.
+    pub primary: Option<String>,
+    /// The Thumb image URL.
+    pub thumb: Option<String>,
+    /// The Backdrop image URL.
+    pub backdrop: Option<String>,
+}
+
+/// The programme's image list after `GuideManager.UpdateImages`, or `None`
+/// when nothing is to be written.
+///
+/// Port of `UpdateImage` (v12.2 GuideManager.cs:694-748) for Primary, Thumb,
+/// Logo and Backdrop in that order: the first image of a type is left alone
+/// when its path equals the listing's URL ignoring case, replaced when the
+/// listing has a URL, and removed when it has none. XMLTV has no logo URL, so
+/// a programme's Logo goes too. A removal alone does not mark the programme
+/// updated upstream (`UpdateImage` returns `false`), so it is only written
+/// when the programme's other fields changed (`item_updated`) — then the item,
+/// removal included, is saved.
+#[must_use]
+pub fn program_images_update(
+    current: &[ItemImageInfo],
+    listing: &ProgramImages,
+    item_updated: bool,
+) -> Option<Vec<ItemImageInfo>> {
+    let mut images = current.to_vec();
+    let mut updated = false;
+    let mut removed = false;
+    for (image_type, url) in [
+        (ImageType::Primary, listing.primary.as_deref()),
+        (ImageType::Thumb, listing.thumb.as_deref()),
+        (ImageType::Logo, None),
+        (ImageType::Backdrop, listing.backdrop.as_deref()),
+    ] {
+        let first = images.iter().position(|i| i.image_type == image_type);
+        let same = first
+            .zip(url)
+            .is_some_and(|(index, url)| images[index].path.eq_ignore_ascii_case(url));
+        if same {
+            continue;
+        }
+        match (url.filter(|url| !url.trim().is_empty()), first) {
+            (Some(url), _) => {
+                set_first_image(&mut images, remote_image(image_type, url));
+                updated = true;
+            }
+            (None, Some(index)) => {
+                images.remove(index);
+                removed = true;
+            }
+            (None, None) => {}
+        }
+    }
+    (updated || (removed && item_updated)).then_some(images)
 }
 
 /// One `FerrofinLiveTvRecordings` row, as the recording query paths read it.
@@ -705,18 +828,122 @@ mod tests {
         s.parse().ok()
     }
 
+    fn image(image_type: ImageType, path: &str) -> ItemImageInfo {
+        remote_image(image_type, path)
+    }
+
+    /// `GuideManager.GetChannel`'s Primary rule.
+    #[test]
+    fn a_channel_takes_its_logo_when_it_has_none_or_it_moved() {
+        let logo = image(ImageType::Primary, "http://img/a.png");
+        // No Primary: the URL becomes it.
+        assert_eq!(
+            channel_images_update(&[], Some("http://img/a.png")),
+            Some(vec![logo.clone()])
+        );
+        // The same URL (ordinal): nothing to write.
+        assert_eq!(
+            channel_images_update(std::slice::from_ref(&logo), Some("http://img/a.png")),
+            None
+        );
+        // A different URL, even by case only, replaces it and keeps the rest.
+        let backdrop = image(ImageType::Backdrop, "/meta/b.jpg");
+        assert_eq!(
+            channel_images_update(&[logo.clone(), backdrop.clone()], Some("http://img/A.png")),
+            Some(vec![
+                image(ImageType::Primary, "http://img/A.png"),
+                backdrop
+            ])
+        );
+        // No URL, or a blank one, never removes the logo it has.
+        assert_eq!(
+            channel_images_update(std::slice::from_ref(&logo), None),
+            None
+        );
+        assert_eq!(channel_images_update(&[logo], Some("  ")), None);
+        assert_eq!(channel_images_update(&[], None), None);
+    }
+
+    /// `GuideManager.UpdateImages`/`UpdateImage`.
+    #[test]
+    fn a_programmes_images_follow_its_listing() {
+        let listing = ProgramImages {
+            primary: Some("http://img/p.png".to_owned()),
+            thumb: Some("http://img/t.jpg".to_owned()),
+            backdrop: None,
+        };
+        let primary = image(ImageType::Primary, "http://img/p.png");
+        let thumb = image(ImageType::Thumb, "http://img/t.jpg");
+        assert_eq!(
+            program_images_update(&[], &listing, false),
+            Some(vec![primary.clone(), thumb.clone()])
+        );
+        // Unchanged, ignoring case: nothing to write.
+        let upper = image(ImageType::Primary, "HTTP://IMG/P.PNG");
+        assert_eq!(
+            program_images_update(&[upper, thumb.clone()], &listing, false),
+            None
+        );
+        // A logo or backdrop the listing no longer has is removed, but a
+        // removal alone is written only with the programme's other changes.
+        let logo = image(ImageType::Logo, "/meta/logo.png");
+        let current = [primary.clone(), thumb.clone(), logo];
+        assert_eq!(program_images_update(&current, &listing, false), None);
+        assert_eq!(
+            program_images_update(&current, &listing, true),
+            Some(vec![primary.clone(), thumb.clone()])
+        );
+        // A moved URL replaces the image of its type.
+        let moved = ProgramImages {
+            backdrop: Some("http://img/b.jpg".to_owned()),
+            ..listing
+        };
+        assert_eq!(
+            program_images_update(&[primary.clone(), thumb.clone()], &moved, false),
+            Some(vec![
+                primary,
+                thumb,
+                image(ImageType::Backdrop, "http://img/b.jpg")
+            ])
+        );
+    }
+
     #[test]
     fn sort_name_pads_numeric_channel_numbers_like_upstream() {
-        // C# string.Format("{0:00000.0}", n) + "-" + name.
+        // v12.2 C# string.Format("{0:0000000000.00000}", n) + "-" + name.
         assert_eq!(
             channel_sort_name(Some("1"), "Parity One"),
-            "00001.0-Parity One"
+            "0000000001.00000-Parity One"
         );
-        assert_eq!(channel_sort_name(Some("8.5"), "Eight"), "00008.5-Eight");
-        assert_eq!(channel_sort_name(Some("123456"), "Big"), "123456.0-Big");
+        assert_eq!(
+            channel_sort_name(Some("8.5"), "Eight"),
+            "0000000008.50000-Eight"
+        );
+        assert_eq!(
+            channel_sort_name(Some("123456"), "Big"),
+            "0000123456.00000-Big"
+        );
+        assert_eq!(
+            channel_sort_name(Some("4.11"), "Sub"),
+            "0000000004.11000-Sub"
+        );
+        // .NET keeps the sign outside the zero padding, and a number wider
+        // than the pattern keeps all its digits.
+        assert_eq!(
+            channel_sort_name(Some("-1"), "Neg"),
+            "-0000000001.00000-Neg"
+        );
+        assert_eq!(
+            channel_sort_name(Some("12345678901"), "Wide"),
+            "12345678901.00000-Wide"
+        );
         // An unparseable number is used verbatim.
         assert_eq!(channel_sort_name(Some("A1"), "Alpha"), "A1-Alpha");
+        assert_eq!(channel_sort_name(Some("inf"), "X"), "inf-X");
         assert_eq!(channel_sort_name(None, "Bare"), "-Bare");
+        // The keys order numerically (jellyfin/jellyfin#15399).
+        assert!(channel_sort_name(Some("10002"), "") < channel_sort_name(Some("100010"), ""));
+        assert!(channel_sort_name(Some("4.11"), "Z") < channel_sort_name(Some("4.12"), "A"));
     }
 
     #[test]
@@ -859,6 +1086,7 @@ mod tests {
             number: Some("1".to_owned()),
             channel_type: "Tv".to_owned(),
             date_created: None,
+            image_url: None,
             is_movie: false,
             is_series: false,
             is_kids: false,
@@ -867,7 +1095,10 @@ mod tests {
         assert_eq!(entity.type_, CHANNEL_TYPE_NAME);
         assert_eq!(entity.path, None); // upstream channel items carry no path
         assert_eq!(entity.media_type.as_deref(), Some("Video"));
-        assert_eq!(entity.sort_name.as_deref(), Some("00001.0-Parity One"));
+        assert_eq!(
+            entity.sort_name.as_deref(),
+            Some("0000000001.00000-Parity One")
+        );
         assert_eq!(entity.external_service_id.as_deref(), Some("Emby"));
         assert_eq!(entity.unrated_type.as_deref(), Some("LiveTvChannel"));
         // `ExternalId` is the TUNER's id, which is what the GUID was hashed
@@ -894,6 +1125,7 @@ mod tests {
             number: Some("1".to_owned()),
             channel_type: "Tv".to_owned(),
             date_created: None,
+            image_url: None,
             is_movie: false,
             is_series: false,
             is_kids: false,

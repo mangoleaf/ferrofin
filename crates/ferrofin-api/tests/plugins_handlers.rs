@@ -88,7 +88,8 @@ impl PluginManager for RecordingPlugins {
     }
     async fn get_plugin_configuration(&self, id: Uuid) -> Result<Vec<u8>, ServiceError> {
         if id == known_id() {
-            Ok(br#"{"k":1}"#.to_vec())
+            // An unset `string?` at the top level and inside a listed object.
+            Ok(br#"{"k":1,"PosterSize":null,"Items":[{"a":null,"b":2},null]}"#.to_vec())
         } else {
             Err(Self::not_found(id))
         }
@@ -186,7 +187,10 @@ async fn get_configuration_known_and_unknown() {
         .await
         .expect("resp");
     assert_eq!(ok.status(), StatusCode::OK);
-    assert_eq!(body_string(ok).await, r#"{"k":1}"#);
+    // `JsonIgnoreCondition.WhenWritingNull`: a null property is left out,
+    // an array element is not.
+    let body: serde_json::Value = serde_json::from_str(&body_string(ok).await).expect("json");
+    assert_eq!(body, serde_json::json!({"k": 1, "Items": [{"b": 2}, null]}));
 
     let missing = router(fake)
         .oneshot(authed(
@@ -767,6 +771,40 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A plugin with no room for another web request, as the WASM host reports it.
+struct BusyRequestHandler;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::plugins::PluginRequestHandler for BusyRequestHandler {
+    async fn handle(
+        &self,
+        _plugin_id: Uuid,
+        _request: ferrofin_traits::plugins::PluginWebRequest,
+    ) -> Result<Option<ferrofin_traits::plugins::PluginWebResponse>, ServiceError> {
+        Err(ServiceError::unavailable(
+            "plugin `Hello` is busy; retry the request later",
+        ))
+    }
+}
+
+/// A busy plugin turns an anonymous request away with `503`, the retry-later
+/// status, rather than a `500` that reads as a server fault.
+#[tokio::test]
+async fn plugin_route_answers_503_when_the_plugin_is_busy() {
+    let state = authed_state_with_plugins(Arc::new(RecordingPlugins::default()))
+        .with_plugin_request_handler(Arc::new(BusyRequestHandler));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Plugins/{}/web/ping", known_id()))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // ── GET /Packages/{name} — InstallationManager.FilterPackages semantics ─────

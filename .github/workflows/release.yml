@@ -9,7 +9,8 @@ name: Release
 #   vX.Y.Z-rc.N   → image :vX.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
 #
-# To release: run this workflow manually (workflow_dispatch) on main — it
+# To release: run this workflow manually (workflow_dispatch) on the current release/vX.Y.Z
+# branch (feature releases) or on main (patch releases of the version already out) — it
 # requires green CI on the commit, derives the next version from Conventional
 # Commits, and pushes the tag; the tag push then re-triggers this workflow to
 # build and publish. Requires the RELEASE_TOKEN secret: a PAT with
@@ -30,7 +31,11 @@ permissions: {} # each job grants only what it needs
 jobs:
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
   create-release:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # main (patch releases of the released line) or the current release/vX.Y.Z branch
+    # (feature releases; only one exists at a time). See RELEASE.md.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-latest
     permissions:
       contents: read # the tag push uses RELEASE_TOKEN, not GITHUB_TOKEN
@@ -47,7 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --json conclusion -q '.[0].conclusion')
+          # The push run only: the release PR's run on the same commit skips every job.
+          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --event push --json conclusion -q '.[0].conclusion')
           if [ "$conclusion" != "success" ]; then
             echo "CI for $GITHUB_SHA is '${conclusion:-missing}', not success — not releasing"
             exit 1
@@ -140,10 +146,15 @@ jobs:
           docker exec smoke ffmpeg -version | head -1 | tee ffmpeg.txt
           grep -qi jellyfin ffmpeg.txt || { echo "ffmpeg in the image is not jellyfin-ffmpeg"; exit 1; }
           docker rm -f smoke
-      # Upgrade smoke: a database created by the PREVIOUS release must open under
-      # this one. v1.0.0 shipped with a modified released migration and locked every
-      # existing install out; a fresh-database boot cannot see that, this can.
-      - name: upgrade a database from the previous release
+      # Upgrade check: a populated install of the PREVIOUS release and of v1.0.0, the oldest,
+      # must keep its user data under this one. v1.0.0 shipped with a modified released
+      # migration and locked every existing install out; a fresh-database boot cannot see that,
+      # this can. Each start release adopts a synthetic Jellyfin 10.11.8 fixture built here
+      # (invented media and accounts), scans it and gets user state through its API; this
+      # image then boots on the same data and must keep the accounts, watch history and
+      # metadata (gates/adoption/README.md, "Populated Ferrofin upgrade"). Probed from the runner:
+      # release images have no curl.
+      - name: upgrade a populated install from earlier releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -152,31 +163,23 @@ jobs:
           if [ -z "$prev" ]; then echo "no previous release to upgrade from"; exit 0; fi
           img="ghcr.io/$GITHUB_REPOSITORY"
           echo "previous release: $prev"
-          docker volume create upg >/dev/null
-          # Probe from the runner: release images do not include curl.
-          docker run -d --rm --name old -v upg:/data -p 127.0.0.1:8096:8096 "$img:$prev"
-          ok=
-          for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1; then ok=1; break; fi
-            docker ps -q --filter name=old | grep -q . || break
-            sleep 1
-          done
-          if [ -z "$ok" ]; then
-            echo "the $prev image did not become healthy"; docker logs old 2>&1 | tail -20; exit 1
-          fi
-          docker rm -f old
-          docker run -d --rm --name new -v upg:/data -p 8096:8096 "$img:$GITHUB_REF_NAME"
-          ok=
-          for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8096/health/live > up.json 2>/dev/null; then ok=1; break; fi
-            docker ps -q --filter name=new | grep -q . || break
-            sleep 1
-          done
-          if [ -z "$ok" ] || ! grep -q "\"build\":\"$GITHUB_REF_NAME\"" up.json; then
-            echo "the $GITHUB_REF_NAME image cannot open a $prev database"; docker logs new 2>&1 | tail -20; exit 1
-          fi
-          echo "upgrade $prev → $GITHUB_REF_NAME: ok"
-          docker rm -f new
+          starts="--from $img:$prev"
+          [ "$prev" = v1.0.0 ] || starts="$starts --from $img:v1.0.0"
+          # The image build's cache is not needed again; the fixture and three images are.
+          docker builder prune --all --force >/dev/null
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pil python3-icu
+          python3 gates/adoption/synthetic.py build --fixtures "$RUNNER_TEMP/adoption" --only jellyfin-10.11.8
+          # shellcheck disable=SC2086 # starts is a list of --from arguments
+          python3 gates/adoption/synthetic.py upgrade --fixtures "$RUNNER_TEMP/adoption" \
+            --image "$img:$GITHUB_REF_NAME" $starts
+          df -h /
+      # The failed copy, its server logs and snapshots; all synthetic data.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: upgrade-work
+          path: ${{ runner.temp }}/adoption/work
+          if-no-files-found: ignore
 
   # ── server binaries, one archive per target, attached to the Release ──
   # Linux x86_64 and aarch64 are the supported set. macOS and Windows are

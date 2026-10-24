@@ -555,6 +555,57 @@ async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
     assert_eq!(saved.skip_forward_length, 30_000);
 }
 
+/// A partial body binds as upstream's `DisplayPreferencesDto` constructor
+/// leaves it: every member left out takes the C# default, and the save writes
+/// those defaults over the stored row (`RememberIndexing`, `SortOrder` and
+/// `ScrollDirection` were stored non-default here).
+#[tokio::test]
+async fn display_preferences_post_binds_a_partial_body_to_the_defaults() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = r#"{"Client":"emby","SortBy":"SortName","CustomPrefs":{"homesection0":"resume"}}"#;
+    let (status, _) = send(
+        app,
+        "POST",
+        "/DisplayPreferences/usersettings?client=emby",
+        Body::from(body),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let saved = prefs.row.lock().unwrap().clone().unwrap();
+    assert_eq!(saved.scroll_direction, 0);
+    assert_eq!(saved.index_by, None);
+    assert!(saved.show_backdrop);
+    assert!(!saved.show_sidebar);
+    let item = prefs.item.lock().unwrap().clone().unwrap();
+    assert!(!item.remember_indexing);
+    assert!(!item.remember_sorting);
+    assert_eq!(item.sort_order, 0);
+    assert_eq!(item.sort_by, "SortName");
+}
+
+/// Only a member left out takes its default: an explicit `null` for a
+/// non-nullable one still fails binding, as it does upstream.
+#[tokio::test]
+async fn display_preferences_post_refuses_null_for_a_non_nullable_member() {
+    for body in [r#"{"RememberIndexing":null}"#, r#"{"CustomPrefs":null}"#] {
+        let prefs = Arc::new(StubDisplayPreferences::default());
+        let app = state_with_display_prefs(prefs.clone());
+        let (status, _) = send(
+            app,
+            "POST",
+            "/DisplayPreferences/usersettings?client=emby",
+            Body::from(body),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(prefs.row.lock().unwrap().is_none(), "{body}");
+    }
+}
+
 /// A `landing-*` key whose value does not name a `ViewType` is dropped rather
 /// than persisted; a valid one survives.
 #[tokio::test]
@@ -598,6 +649,142 @@ async fn display_preferences_post_strips_invalid_landing_keys() {
     assert!(custom.contains_key("keepMe"), "unrelated keys untouched");
 }
 
+/// Posts `custom_prefs` and returns the status and the persisted custom prefs.
+async fn post_custom_prefs(
+    custom_prefs: serde_json::Value,
+) -> (
+    StatusCode,
+    Option<std::collections::HashMap<String, Option<String>>>,
+) {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = serde_json::json!({
+        "CustomPrefs": custom_prefs,
+        "ScrollDirection": "Horizontal",
+        "SortOrder": "Ascending",
+        "ShowBackdrop": false,
+        "ShowSidebar": true,
+        "RememberIndexing": false,
+        "RememberSorting": true,
+        "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250
+    });
+    let (status, _) = send(
+        app,
+        "POST",
+        "/DisplayPreferences/home?client=web",
+        Body::from(body.to_string()),
+        Some("application/json"),
+    )
+    .await;
+    let custom = prefs.custom.lock().unwrap().clone();
+    (status, custom)
+}
+
+/// Every value C# `Enum.TryParse<ViewType>(value, true, out _)` accepts keeps
+/// its `landing-*` key: each of the 30 names (Jellyfin 12.0 added the last
+/// nine), any casing, an integer, a comma list.
+#[rstest::rstest]
+#[case::albums("Albums")]
+#[case::album_artists("AlbumArtists")]
+#[case::artists("Artists")]
+#[case::channels("Channels")]
+#[case::collections("Collections")]
+#[case::episodes("Episodes")]
+#[case::favorites("Favorites")]
+#[case::genres("Genres")]
+#[case::guide("Guide")]
+#[case::movies("Movies")]
+#[case::networks("Networks")]
+#[case::playlists("Playlists")]
+#[case::programs("Programs")]
+#[case::recordings("Recordings")]
+#[case::schedule("Schedule")]
+#[case::series("Series")]
+#[case::shows("Shows")]
+#[case::songs("Songs")]
+#[case::suggestions("Suggestions")]
+#[case::trailers("Trailers")]
+#[case::upcoming("Upcoming")]
+#[case::authors("Authors")]
+#[case::books("Books")]
+#[case::folders("Folders")]
+#[case::mixed("Mixed")]
+#[case::photos("Photos")]
+#[case::photo_albums("photoalbums")]
+#[case::series_timers("seriestimers")]
+#[case::studios("studios")]
+#[case::videos("videos")]
+#[case::upper_case("STUDIOS")]
+#[case::integer("26")]
+#[case::unnamed_integer("999")]
+#[case::negative_integer("-1")]
+#[case::signed_integer("+5")]
+#[case::padded_name(" movies ")]
+#[case::comma_list("movies, studios")]
+#[tokio::test]
+async fn display_preferences_keep_every_view_type(#[case] value: &str) {
+    let (status, custom) = post_custom_prefs(serde_json::json!({ "landing-lib": value })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        custom.unwrap().get("landing-lib"),
+        Some(&Some(value.to_owned()))
+    );
+}
+
+/// The cases above name every `ViewType`: a variant added later must be added
+/// there too.
+#[test]
+fn every_view_type_is_a_case() {
+    assert_eq!(ferrofin_db::enums::ViewType::ALL.len(), 30);
+}
+
+/// What C# `Enum.TryParse<ViewType>` refuses is dropped: an integer out of
+/// `int` range, an empty list part, a list of integers, hex, blanks.
+#[rstest::rstest]
+#[case::overflow("2147483648")]
+#[case::trailing_comma("movies,")]
+#[case::integer_list("1,2")]
+#[case::hex("0x1")]
+#[case::blank("   ")]
+#[tokio::test]
+async fn display_preferences_drop_what_try_parse_refuses(#[case] value: &str) {
+    let (status, custom) = post_custom_prefs(serde_json::json!({ "landing-lib": value })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!custom.unwrap().contains_key("landing-lib"));
+}
+
+/// jellyfin-web posts `""` for every library left on its default screen; C#
+/// drops an empty or null value (without logging) and a bare `landing-` key is
+/// checked too.
+#[tokio::test]
+async fn display_preferences_drop_empty_and_invalid_landing_values() {
+    let (status, custom) = post_custom_prefs(serde_json::json!({
+        "landing-empty": "",
+        "landing-null": null,
+        "landing-": "notaviewtype",
+        "landing-list": "movies,nope",
+    }))
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(custom.unwrap().is_empty());
+}
+
+/// A key whose prefix-length byte falls inside a multi-byte character is
+/// simply not a `landing-` or `homesection` key: it is kept, never a panic.
+#[tokio::test]
+async fn display_preferences_accept_non_ascii_keys() {
+    let (status, custom) = post_custom_prefs(serde_json::json!({
+        "landin€x": "x",
+        "homesectioé1": "x",
+    }))
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let custom = custom.unwrap();
+    assert!(custom.contains_key("landin€x"));
+    assert!(custom.contains_key("homesectioé1"));
+}
+
 /// Home sections round-trip through `CustomPrefs`, and an unparseable type
 /// falls back to `defaults[order]` (order 3 -> ResumeBook), while an order at or
 /// beyond that 8-entry table falls back to `None`.
@@ -629,6 +816,42 @@ async fn display_preferences_home_sections_round_trip_with_default_substitution(
     assert_eq!(v["CustomPrefs"]["homesection3"], "resumebook");
     // order >= 8 has no default entry -> None
     assert_eq!(v["CustomPrefs"]["homesection9"], "none");
+}
+
+/// `Enum.TryParse<HomeSectionType>(value, true, out var type)`: an integer of
+/// the underlying type, named or not, or a comma-separated list of names
+/// (OR'd); anything else takes the order's default. The GET echoes
+/// `type.ToString().ToLowerInvariant()`, which for an unnamed value is the
+/// number itself.
+#[rstest::rstest]
+#[case::number("4", "resume")]
+#[case::padded_number(" 7 ", "nextup")]
+#[case::signed_number("+6", "latestmedia")]
+#[case::unnamed_number("99", "99")]
+#[case::negative_number("-1", "-1")]
+#[case::name_any_case("ReSuMe", "resume")]
+#[case::name_list("resume, resumeaudio", "resumeaudio")]
+#[case::not_a_name("bogus", "smalllibrarytiles")]
+#[case::list_with_a_bad_name("resume,bogus", "smalllibrarytiles")]
+#[case::list_with_an_empty_name("resume,", "smalllibrarytiles")]
+#[case::number_out_of_range("99999999999", "smalllibrarytiles")]
+#[tokio::test]
+async fn home_section_values_parse_as_enum_try_parse(#[case] value: &str, #[case] echoed: &str) {
+    let body = format!(
+        r#"{{
+            "CustomPrefs": {{ "homesection0": "{value}" }},
+            "ScrollDirection": "Horizontal",
+            "SortOrder": "Ascending",
+            "ShowBackdrop": false,
+            "ShowSidebar": true,
+            "RememberIndexing": false,
+            "RememberSorting": true,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250
+        }}"#
+    );
+    let (v, _saved) = round_trip(Box::leak(body.into_boxed_str())).await;
+    assert_eq!(v["CustomPrefs"]["homesection0"], echoed, "{value:?}");
 }
 
 /// A display-preferences manager that actually round-trips: `get` returns the

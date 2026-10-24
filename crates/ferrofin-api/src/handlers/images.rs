@@ -40,6 +40,8 @@
 //! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
 //! final while the on-disk pipeline is a later wave.
 
+use std::borrow::Cow;
+
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -58,34 +60,44 @@ use uuid::Uuid;
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::image_upload::{
-    decode_base64, image_extension_from_content_type, image_mime_from_content_type,
-};
-use crate::handlers::items::resolve_user_opt;
+use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
+use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
-/// Parses the `{imageType}` path segment into an [`ImageType`].
-///
-/// Jellyfin serializes the enum by its variant name (case-insensitive over the
-/// wire in practice); an unknown value is a `400`.
+/// Binds a `{imageType}` path segment: `[FromRoute, Required] ImageType`, which
+/// MVC hands to `EnumTypeModelBinder` as it does the route `{format}`
+/// ([`parse_image_format`]). A member name in any case, a defined number
+/// (`0` is `Primary`) or a comma list (ORed: `Primary,Art` is `Art`) binds;
+/// an unparseable value or one no member has is a `400`.
 fn parse_image_type(raw: &str) -> Result<ImageType, ApiError> {
-    let parsed = match raw.to_ascii_lowercase().as_str() {
-        "primary" => ImageType::Primary,
-        "art" => ImageType::Art,
-        "backdrop" => ImageType::Backdrop,
-        "banner" => ImageType::Banner,
-        "logo" => ImageType::Logo,
-        "thumb" => ImageType::Thumb,
-        "disc" => ImageType::Disc,
-        "box" => ImageType::Box,
-        "screenshot" => ImageType::Screenshot,
-        "menu" => ImageType::Menu,
-        "chapter" => ImageType::Chapter,
-        "boxrear" => ImageType::BoxRear,
-        "profile" => ImageType::Profile,
-        other => return Err(ApiError::BadRequest(format!("unknown image type {other}"))),
+    use ferrofin_model::json::enums::JsonEnum as _;
+    let member = |name: &str| {
+        ImageType::members()
+            .iter()
+            .find(|(member, _)| member.eq_ignore_ascii_case(name))
+            .map(|&(_, value)| value)
     };
-    Ok(parsed)
+    match dotnet_enum_parse(raw, member).map(ImageType::from_json_value) {
+        Some(ImageType::Unrecognized(_)) | None => {
+            Err(ApiError::BadRequest(format!("unknown image type {raw}")))
+        }
+        Some(image_type) => Ok(image_type),
+    }
+}
+
+/// Port of .NET `Enum.Parse(type, value, ignoreCase: true)` for an `int`-backed
+/// enum, whose member names `member` maps to their C# values: each
+/// comma-separated part, trimmed, is a member name in any case or an integer,
+/// and the parts are bitwise-ORed (see [`bind_image_format`], where every rule
+/// was measured). `None` when a part is neither, which is a parse failure;
+/// the result may name no member, which the caller decides about.
+fn dotnet_enum_parse(text: &str, member: impl Fn(&str) -> Option<i32>) -> Option<i32> {
+    let mut combined: i32 = 0;
+    for part in text.split(',') {
+        let part = part.trim();
+        combined |= member(part).or_else(|| part.parse::<i32>().ok())?;
+    }
+    Some(combined)
 }
 
 /// The query parameters accepted by every image-serving route.
@@ -124,7 +136,7 @@ pub(crate) struct ImageQuery {
     fill_width: Option<i32>,
     #[serde(default)]
     fill_height: Option<i32>,
-    /// JPEG/WebP quality (1–100); the encoder default is used when omitted.
+    /// JPEG/WebP quality (1–100); 100 when omitted, as `GetImageInternal`.
     #[serde(default)]
     quality: Option<i32>,
     /// Gaussian blur radius.
@@ -139,11 +151,12 @@ pub(crate) struct ImageQuery {
 
 impl ImageQuery {
     /// A query naming only a cache `tag` and an output `format`, as the
-    /// splashscreen route accepts.
+    /// splashscreen route accepts. Its quality is `GetSplashscreen`'s fixed 90.
     pub(crate) fn tagged(tag: Option<String>, format: Option<String>) -> Self {
         Self {
             format,
             tag,
+            quality: Some(90),
             ..Self::default()
         }
     }
@@ -302,17 +315,11 @@ enum ImageFormatBinding {
 /// * a value that overflows the enum's `Int32` backing store throws inside
 ///   `Enum.Parse`, i.e. it is a *parse failure*, not an undefined value.
 fn bind_image_format(format: &str) -> ImageFormatBinding {
-    let mut combined: i32 = 0;
-    for part in format.split(',') {
-        let part = part.trim();
-        let Some(value) = image_format_member(part).map_or_else(
-            || part.parse::<i32>().ok(),
-            |member| Some(image_format_ordinal(member)),
-        ) else {
-            return ImageFormatBinding::Unparseable;
-        };
-        combined |= value;
-    }
+    let Some(combined) = dotnet_enum_parse(format, |part| {
+        image_format_member(part).map(image_format_ordinal)
+    }) else {
+        return ImageFormatBinding::Unparseable;
+    };
     ImageFormat::try_from(combined)
         .map_or(ImageFormatBinding::Undefined, ImageFormatBinding::Defined)
 }
@@ -404,33 +411,72 @@ fn select_image(
         .nth(usize::try_from(index).unwrap_or(0))
 }
 
-/// Serves one [`ItemImageInfo`]'s file, or a `404` when the file is remote or
-/// cannot be served.
+/// `image` with a local path: itself when local, else its downloaded copy
+/// (`ImageController.ConvertImageToLocal`), or a `404` when that fails.
+async fn local_image<'a>(
+    state: &AppState,
+    image: &'a ItemImageInfo,
+) -> Result<Cow<'a, ItemImageInfo>, ApiError> {
+    if image.is_local_file() {
+        return Ok(Cow::Borrowed(image));
+    }
+    let path = state
+        .providers
+        .cached_remote_image(&image.path)
+        .await
+        .map_err(|err| {
+            ApiError::NotFound(format!(
+                "remote image {:?} is unavailable: {err}",
+                image.image_type
+            ))
+        })?;
+    Ok(Cow::Owned(ItemImageInfo {
+        path,
+        ..image.clone()
+    }))
+}
+
+/// Serves one [`ItemImageInfo`]'s file, or a `404` when it cannot be served.
 ///
 /// This is the shared tail of every image route once an image row is resolved.
-/// A remote (`http(s)`) path has no local file to serve without the not-yet-ported
-/// image processor, so it is a `404` (the contract's not-found outcome).
+/// A remote (`http(s)`) row is served from its local copy, downloaded on first
+/// request: `ImageController`'s `if (!imageInfo.IsLocalFile) imageInfo =
+/// ConvertImageToLocal(...)`, through [`ProviderManager::cached_remote_image`]
+/// (which says why the row itself stays remote). One that cannot be
+/// downloaded is a `404` (upstream's exception is a `500`).
+///
+/// `auto_orient` is `ImageProcessor.ProcessImage`'s photo flag: the image is
+/// turned upright from its EXIF orientation, so it goes through the processor
+/// even when nothing else is asked for, as upstream re-encodes it.
+///
+/// [`ProviderManager::cached_remote_image`]: ferrofin_traits::providers::ProviderManager::cached_remote_image
 pub(crate) async fn serve_image_file(
     state: &AppState,
     item_id: Uuid,
     image: &ItemImageInfo,
     index: i32,
+    auto_orient: bool,
     query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
-    if !image.is_local_file() || image.path.is_empty() {
+    if image.path.is_empty() {
         return Err(ApiError::NotFound(format!(
-            "no local file for image {:?}",
+            "no file for image {:?}",
             image.image_type
         )));
     }
+    let local = local_image(state, image).await?;
+    let image: &ItemImageInfo = &local;
 
     // Run the image through the processor for the requested resize/format. It
     // short-circuits to the original file when nothing is asked for (or the source
     // already matches), so a plain request still serves the untouched original.
     let mut serve_path = image.path.clone();
     let mut content_type: Option<String> = None;
-    if let (true, Some(processor)) = (query.wants_transform(), state.image_processor.as_ref()) {
+    if let (true, Some(processor)) = (
+        query.wants_transform() || auto_orient,
+        state.image_processor.as_ref(),
+    ) {
         let options = ImageProcessingOptions {
             item_id,
             image: image.clone(),
@@ -442,7 +488,7 @@ pub(crate) async fn serve_image_file(
             fill_width: query.fill_width,
             fill_height: query.fill_height,
             blur: query.blur,
-            quality: query.quality.unwrap_or(90),
+            quality: query.quality.unwrap_or(100),
             // C# `GetOutputFormats(format)`: an explicit `format` wins outright,
             // otherwise the list is derived from what the *client* advertised.
             supported_output_formats: bind_query_image_format(query.format.as_deref())?
@@ -455,6 +501,7 @@ pub(crate) async fn serve_image_file(
                     },
                     |f| vec![f],
                 ),
+            auto_orient,
             ..Default::default()
         };
         let processed = processor.process_image(&options).await?;
@@ -632,10 +679,13 @@ async fn serve_item_image(
     } else {
         None
     };
-    let images = if chapter_image.is_some() {
-        Vec::new()
+    let (images, auto_orient) = if chapter_image.is_some() {
+        (Vec::new(), false)
     } else {
-        state.library.get_item_images(item_id).await?
+        state
+            .library
+            .get_item_images_with_auto_orient(item_id)
+            .await?
     };
     let image = chapter_image
         .as_ref()
@@ -648,7 +698,7 @@ async fn serve_item_image(
             "item {item_id} has no {image_type:?} image at {index}"
         )));
     };
-    serve_image_file(state, item_id, image, index, query, request).await
+    serve_image_file(state, item_id, image, index, auto_orient, query, request).await
 }
 
 /// Resolve authenticated item access even on image-cache hits. Anonymous
@@ -746,8 +796,11 @@ async fn get_item_image_by_index(
 /// format`, `int maxWidth`, `int maxHeight`, `double percentPlayed`,
 /// `int unplayedCount` — so an unbindable value is a model-binding failure
 /// (`400`), never a silent fallback to an unrequested format. The bound
-/// `format`/`maxWidth`/`maxHeight` are lifted into an [`ImageQuery`] so the
-/// transform is applied just as the query-string form would.
+/// `format`/`maxWidth`/`maxHeight`/`tag` are set on the request's
+/// [`ImageQuery`], over any same-named query parameter, so the transform is
+/// applied just as the query-string form would. The transforms the path does
+/// not carry (`width`, `height`, `quality`, `fillWidth`, `fillHeight`,
+/// `blur`) come from the query string, as `GetItemImage2` takes them.
 ///
 /// TODO(overlays): `percentPlayed`/`unplayedCount` bind and are validated, but
 /// the overlays themselves are not drawn yet — Jellyfin renders them in
@@ -782,6 +835,7 @@ async fn get_item_image_parametrized(
         String,
         String,
     )>,
+    Query(mut query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
@@ -793,15 +847,13 @@ async fn get_item_image_parametrized(
     // overlay TODO on this handler for why they are not forwarded yet.
     let _percent_played: f64 = bind_route_number(&percent_played, "percentPlayed")?;
     let _unplayed_count: i32 = bind_route_number(&unplayed_count, "unplayedCount")?;
-    // Lift the positional transform segments into a query. A `0` dimension is the
-    // "unset" spelling clients bake into the path for a partial transform.
-    let query = ImageQuery {
-        format: Some(image_format_name(format).to_owned()),
-        max_width: Some(max_width).filter(|w| *w > 0),
-        max_height: Some(max_height).filter(|h| *h > 0),
-        tag: Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0")),
-        ..ImageQuery::default()
-    };
+    // The positional transform segments override the query string's. A `0`
+    // dimension is the "unset" spelling clients bake into the path for a
+    // partial transform.
+    query.format = Some(image_format_name(format).to_owned());
+    query.max_width = Some(max_width).filter(|w| *w > 0);
+    query.max_height = Some(max_height).filter(|h| *h > 0);
+    query.tag = Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0"));
     let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
         &state,
@@ -1086,17 +1138,20 @@ async fn get_user_image(
         .get_profile_image(user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {user_id} has no profile image")))?;
-    serve_image_file(&state, user_id, &image, 0, &query, request).await
+    serve_image_file(&state, user_id, &image, 0, false, &query, request).await
 }
 
 /// `POST /UserImage` — upload a user's profile image.
 ///
-/// Port of `ImageController.PostUserImage`. Resolves the target user (the `userId`
-/// query parameter or the caller; a missing user is `404`, a nil effective user a
-/// `400`), validates the `Content-Type` is an image type (`400` otherwise),
-/// base64-decodes the body, and stores it via
-/// [`UserManager::save_profile_image`], which clears any prior image and persists
-/// the user. Returns `204`.
+/// Port of `ImageController.PostUserImage`. Resolves the target user with
+/// [`resolve_user`] (the `userId` query parameter or the caller; a nil effective
+/// user is `GetUserById(Guid.Empty)`'s `400`, an id with no account the action's
+/// `404`), applies `AssertCanUpdateUser` (`403`), validates the `Content-Type`
+/// with `TryGetImageExtensionFromContentType` (an image type `ToExtension` knows,
+/// else `400 Incorrect ContentType.`), base64-decodes the body, and stores it via
+/// [`UserManager::save_profile_image`], which writes
+/// `{config}/users/{Username}/profile{ext}` (a username escaping that directory is
+/// a `400`), replaces any prior image row and persists the user. Returns `204`.
 #[utoipa::path(
     post,
     path = "/UserImage",
@@ -1115,31 +1170,30 @@ async fn post_user_image(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    let user = resolve_user_opt(&state, &auth, query.user_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    let user = resolve_user(&state, &auth, query.user_id).await?;
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let mime = image_mime_from_content_type(content_type)
+    let image = try_get_image_extension_from_content_type(content_type)
         .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
-    let extension = image_extension_from_content_type(content_type).unwrap_or_default();
     let bytes = decode_base64(body.trim())
         .ok_or_else(|| ApiError::BadRequest("image data is not valid base64".to_owned()))?;
     state
         .users
-        .save_profile_image(&user, &bytes, &mime, &extension)
+        .save_profile_image(&user, &bytes, &image.mime_type, image.extension)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /UserImage` — clear a user's profile image.
 ///
-/// Port of `ImageController.DeleteUserImage`. Resolves the target user (the
-/// `userId` query parameter or the caller) and clears its profile-image row via
-/// [`UserManager::clear_profile_image`]; a user with no image is still a `204`
-/// (idempotent, as in C#). A nil effective user is a `400`, a missing user a
-/// `404`.
+/// Port of `ImageController.DeleteUserImage`. Resolves the target user with
+/// [`resolve_user`] (the `userId` query parameter or the caller; a nil effective
+/// user is a `400`, an id with no account a `404`), applies `AssertCanUpdateUser`
+/// (`403`), and deletes its profile-image file and
+/// row via [`UserManager::clear_profile_image`]; a user with no image is still a `204`
+/// (idempotent, as in C#).
 #[utoipa::path(
     delete,
     path = "/UserImage",
@@ -1156,11 +1210,8 @@ async fn delete_user_image(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    // `resolve_user_opt` keeps the API-key-with-no-user path a 400 below, while a
-    // present-but-missing user is a 404.
-    let user = resolve_user_opt(&state, &auth, query.user_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    let user = resolve_user(&state, &auth, query.user_id).await?;
+    super::users::assert_can_update_user(&state, &auth, &user).await?;
     state.users.clear_profile_image(&user).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1171,15 +1222,18 @@ async fn delete_user_image(
 /// Upstream keeps these `/Users/{userId}/Images/…` forms `[Obsolete]` and
 /// hidden from the OpenAPI doc but still serves them, and jellyfin-web's
 /// bundled `jellyfin-apiclient` still requests avatars this way. Users only
-/// carry a single profile image, so the path's image type/index are accepted
-/// and ignored, as upstream does.
+/// carry a single profile image, so the path's image type and index are bound
+/// (an invalid type or a non-integer index is a `400`) and then ignored, as
+/// upstream does.
 async fn get_user_image_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     get_user_image(state, auth, Query(query), request).await
 }
@@ -1189,10 +1243,12 @@ async fn get_user_image_legacy(
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((user_id, _image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((user_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     query.image_index = Some(image_index);
     get_user_image(state, auth, Query(query), request).await
@@ -1203,11 +1259,13 @@ async fn get_user_image_by_index_legacy(
 async fn post_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     post_user_image(state, auth, Query(query), headers, body).await
 }
@@ -1217,9 +1275,47 @@ async fn post_user_image_legacy(
 async fn delete_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
+    query.user_id = Some(user_id);
+    delete_user_image(state, auth, Query(query)).await
+}
+
+/// `POST /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed path-scoped
+/// form of `POST /UserImage` (`PostUserImageByIndexLegacy`).
+///
+/// The image type and index are ignored, as upstream does, but both must still
+/// bind: upstream binds the type as an `ImageType` ([`parse_image_type`]) and
+/// the index as an `int`, so anything else fails model binding with a `400`.
+async fn post_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Query(mut query): Query<ImageQuery>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
+    query.user_id = Some(user_id);
+    post_user_image(state, auth, Query(query), headers, body).await
+}
+
+/// `DELETE /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed
+/// path-scoped form of `DELETE /UserImage` (`DeleteUserImageByIndexLegacy`),
+/// ignoring the image type and the (integer) index as
+/// [`post_user_image_by_index_legacy`] does.
+async fn delete_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Query(mut query): Query<ImageQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
+    parse_image_type(&image_type)?;
     query.user_id = Some(user_id);
     delete_user_image(state, auth, Query(query)).await
 }
@@ -1227,7 +1323,8 @@ async fn delete_user_image_legacy(
 /// Reads the raw base64 upload body and its image MIME type, then saves it.
 ///
 /// Shared tail of `SetItemImage`/`SetItemImageByIndex`: validates the
-/// `Content-Type` is an image type (`400` otherwise), base64-decodes the body
+/// `Content-Type` with `TryGetImageExtensionFromContentType` (an image type
+/// `ToExtension` knows, else `400 Incorrect ContentType.`), base64-decodes the body
 /// (`400` on invalid base64), and stores the bytes via
 /// [`ProviderManager::save_image`] at `image_type`/`index`. Returns `204`.
 async fn save_item_image(
@@ -1238,22 +1335,22 @@ async fn save_item_image(
     content_type: Option<&str>,
     body: &str,
 ) -> Result<StatusCode, ApiError> {
-    let mime = image_mime_from_content_type(content_type)
+    let image = try_get_image_extension_from_content_type(content_type)
         .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
     let bytes = decode_base64(body.trim())
         .ok_or_else(|| ApiError::BadRequest("image data is not valid base64".to_owned()))?;
     state
         .providers
-        .save_image(item_id, &bytes, &mime, image_type, image_index)
+        .save_image(item_id, &bytes, &image.mime_type, image_type, image_index)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /Items/{itemId}/Images/{imageType}` — upload an item's image.
 ///
-/// Port of `ImageController.SetItemImage`. A missing item is `404`, a non-image
-/// `Content-Type` (or non-base64 body) is `400`, and on success the image is
-/// saved and the handler returns `204`.
+/// Port of `ImageController.SetItemImage`. A missing item is `404`, a
+/// `Content-Type` that is not a known image type (or a non-base64 body) is
+/// `400`, and on success the image is saved and the handler returns `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Images/{imageType}",
@@ -1537,7 +1634,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/Users/{userId}/Images/{imageType}/{imageIndex}",
-            get(get_user_image_by_index_legacy).head(get_user_image_by_index_legacy),
+            get(get_user_image_by_index_legacy)
+                .head(get_user_image_by_index_legacy)
+                .post(post_user_image_by_index_legacy)
+                .delete(delete_user_image_by_index_legacy),
         )
 }
 
@@ -1669,6 +1769,30 @@ mod tests {
         assert_eq!(parse_image_format("Jpg,Png,Webp"), None); // 7 is undefined
         assert_eq!(parse_image_format("Png,bogus"), None);
         assert_eq!(parse_image_format("99999999999999999999"), None); // Int32 overflow
+    }
+
+    /// `{imageType}` goes through the same `EnumTypeModelBinder` as the route
+    /// `{format}` above, so the same `Enum.Parse` rules bind it (gl-691).
+    #[test]
+    fn image_type_binds_like_the_route_format() {
+        let bind = |raw: &str| parse_image_type(raw).ok();
+        assert_eq!(bind("Primary"), Some(ImageType::Primary));
+        assert_eq!(bind("boxrear"), Some(ImageType::BoxRear));
+        assert_eq!(bind("PROFILE"), Some(ImageType::Profile));
+        assert_eq!(bind("0"), Some(ImageType::Primary));
+        assert_eq!(bind("12"), Some(ImageType::Profile));
+        assert_eq!(bind(" Primary "), Some(ImageType::Primary));
+        assert_eq!(bind("+1"), Some(ImageType::Art));
+        assert_eq!(bind("01"), Some(ImageType::Art));
+        assert_eq!(bind("Box,Art"), Some(ImageType::Box)); // 7 | 1
+        // Unparseable, or a value no member has: the route 400s.
+        assert_eq!(bind("NotAType"), None);
+        assert_eq!(bind(""), None);
+        assert_eq!(bind("Primary,"), None);
+        assert_eq!(bind("13"), None);
+        assert_eq!(bind("-1"), None);
+        assert_eq!(bind("Disc,Menu"), None); // 6 | 9 == 15
+        assert_eq!(bind("99999999999"), None); // Int32 overflow
     }
 
     /// The QUERY arm is a *nullable* enum, so it skips the undefined-value check

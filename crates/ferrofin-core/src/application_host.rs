@@ -28,7 +28,7 @@ use ferrofin_traits::configuration::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
-use ferrofin_traits::system::{ServerApplicationHost, ServerApplicationPaths};
+use ferrofin_traits::system::{LocalApiAccess, ServerApplicationHost, ServerApplicationPaths};
 
 use crate::app_paths::FerrofinServerApplicationPaths;
 use crate::virtual_paths::replace_ignore_ascii_case;
@@ -61,7 +61,10 @@ pub struct HostNetworkInfo {
     /// `/jellyfin`; empty for none.
     pub base_url: String,
     /// Whether the smart API URL should echo the request's own host
-    /// (`EnablePublishedServerUriByRequest`).
+    /// (`EnablePublishedServerUriByRequest`). Only a host without a network
+    /// manager reads it: one with a manager reads the live network
+    /// configuration instead, as upstream reads `GetNetworkConfiguration()`
+    /// per request.
     pub enable_published_server_uri_by_request: bool,
 }
 
@@ -90,6 +93,8 @@ pub struct FerrofinServerApplicationHost {
     network_manager: Option<Arc<RwLock<NetworkManager>>>,
     http_bind: Option<IpAddr>,
     bound_http_port: AtomicU16,
+    /// The HTTPS port actually bound, recorded as the HTTP one is.
+    bound_https_port: AtomicU16,
     machine_name: String,
     /// The last-published server name (`Configuration.ServerName`), or `None`
     /// when empty — in which case the friendly name is the machine name.
@@ -126,6 +131,7 @@ impl FerrofinServerApplicationHost {
             paths,
             configuration_manager,
             bound_http_port: AtomicU16::new(network.http_port),
+            bound_https_port: AtomicU16::new(network.https_port),
             network,
             network_manager: None,
             http_bind: None,
@@ -135,17 +141,28 @@ impl FerrofinServerApplicationHost {
         }
     }
 
-    /// Shares live network policy and constrains advertisement to the HTTP bind.
+    /// Shares live network policy and constrains advertisement to the HTTP
+    /// bind: `http_bind` is the address the operator pinned the listener to,
+    /// or `None` when the listeners follow the network manager's interfaces.
     #[must_use]
-    pub fn with_network(mut self, manager: Arc<RwLock<NetworkManager>>, http_bind: IpAddr) -> Self {
+    pub fn with_network(
+        mut self,
+        manager: Arc<RwLock<NetworkManager>>,
+        http_bind: Option<IpAddr>,
+    ) -> Self {
         self.network_manager = Some(manager);
-        self.http_bind = (!http_bind.is_unspecified()).then_some(http_bind);
+        self.http_bind = http_bind;
         self
     }
 
     /// Records the actual HTTP port after binding, including an ephemeral port.
     pub fn set_bound_http_port(&self, port: u16) {
         self.bound_http_port.store(port, Ordering::Relaxed);
+    }
+
+    /// Records the actual HTTPS port after binding, including an ephemeral port.
+    pub fn set_bound_https_port(&self, port: u16) {
+        self.bound_https_port.store(port, Ordering::Relaxed);
     }
 
     /// Marks core startup as complete (the composition root calls this once the
@@ -180,12 +197,68 @@ impl FerrofinServerApplicationHost {
     pub fn configuration_listener(self: &Arc<Self>) -> Arc<ConfigurationListener> {
         let host = Arc::downgrade(self);
         Arc::new(move |update| {
-            if let ConfigurationUpdate::Server(configuration) = update
-                && let Some(host) = host.upgrade()
-            {
-                host.publish_server_name(&configuration.server_name);
+            let Some(host) = host.upgrade() else {
+                return;
+            };
+            match update {
+                ConfigurationUpdate::Server(configuration) => {
+                    host.publish_server_name(&configuration.server_name);
+                }
+                // `InitializeOverrides` re-runs the check on every network save.
+                ConfigurationUpdate::Named { key, .. } if key == "network" => {
+                    host.warn_if_published_url_base_path_differs();
+                }
+                ConfigurationUpdate::Named { .. } => {}
             }
         })
+    }
+
+    /// `NetworkManager.WarnIfPublishedUrlBasePathDiffers`: logs a warning for
+    /// each full-URL published server override whose public path does not end
+    /// with the mounted base URL, because the base URL is then appended to the
+    /// Live TV stream URLs handed to clients, which a path-translating reverse
+    /// proxy may not serve. The override checked is the bootstrap published URL
+    /// when one is set (upstream's startup override, which wins over the
+    /// others), else the network configuration's per-subnet overrides. Returns
+    /// the `host:port` of each one warned about; user info, query and fragment
+    /// never reach the log.
+    pub fn warn_if_published_url_base_path_differs(&self) -> Vec<String> {
+        let overrides: Vec<String> = match self
+            .network
+            .published_server_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+        {
+            Some(published) => vec![published.to_owned()],
+            None => self
+                .network_manager
+                .as_ref()
+                .and_then(|manager| manager.read().ok())
+                .map(|manager| {
+                    manager
+                        .published_server_urls()
+                        .iter()
+                        .map(|entry| entry.override_uri.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let hosts = ferrofin_networking::published_urls_missing_base_url(
+            overrides.iter().map(String::as_str),
+            &self.network.base_url,
+        );
+        for host in &hosts {
+            tracing::warn!(
+                published_server_host = %host,
+                base_url = %self.network.base_url,
+                "the published server URL for this host does not end with the configured base \
+                 URL; the base URL is appended to the Live TV stream URLs given to clients, which \
+                 fails if a reverse proxy translates public paths. Update the published server \
+                 URIs on the dashboard's Networking page, the published URL setting, or the \
+                 proxy's path mapping"
+            );
+        }
+        hosts
     }
 
     fn publish_server_name(&self, name: &str) {
@@ -226,7 +299,7 @@ impl FerrofinServerApplicationHost {
         });
         let is_https = scheme.eq_ignore_ascii_case("https");
         let port = port.unwrap_or(if is_https {
-            self.network.https_port
+            self.https_port()
         } else {
             self.http_port()
         });
@@ -247,11 +320,28 @@ impl FerrofinServerApplicationHost {
         url.trim_end_matches('/').to_owned()
     }
 
+    /// `EnablePublishedServerUriByRequest`, read per request
+    /// (`ApplicationHost.cs:947`): the shared network manager's live
+    /// configuration when one is attached, else the startup fact.
+    fn published_server_uri_by_request(&self) -> bool {
+        self.network_manager.as_ref().map_or(
+            self.network.enable_published_server_uri_by_request,
+            |manager| {
+                manager
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .enable_published_server_uri_by_request()
+            },
+        )
+    }
+
     /// Parses the `Host` header of a request into `(host, port)`.
     ///
     /// The port is `None` when absent or unparseable. IPv6 literals in
     /// brackets (`[::1]:8096`) are handled.
     fn parse_request_host(request: &RequestContext) -> Option<(String, Option<u16>)> {
+        // TODO(gl-813): behind a known proxy, upstream's `request.Host` (host
+        // and port) is the proxy's `X-Forwarded-Host` (ForwardedHeadersMiddleware).
         let host = request.header("host")?;
         if let Some(rest) = host.strip_prefix('[') {
             // IPv6 literal: [addr]:port
@@ -265,19 +355,55 @@ impl FerrofinServerApplicationHost {
         }
     }
 
-    /// Infers the request scheme from the forwarded-proto header, defaulting to
-    /// the host's listen mode.
-    fn request_scheme(&self, request: &RequestContext) -> String {
-        request.header("x-forwarded-proto").map_or_else(
-            || {
-                if self.network.listen_with_https {
-                    "https".to_owned()
+    /// The scheme the request arrived with (`request.Scheme`): the one the
+    /// API layer resolved from its listener and known proxies, else `http`.
+    fn request_scheme(request: &RequestContext) -> String {
+        request.scheme.clone().unwrap_or_else(|| "http".to_owned())
+    }
+
+    /// `NetworkManager.GetBindAddress(null)` for the local access URL.
+    fn local_access_hostname(&self) -> String {
+        // `NetworkManager.GetBindAddress(null)` (`ApplicationHost.cs:981`)
+        // over its known interfaces: the first non-loopback one, local ones
+        // first, else loopback. A specific address pinned at startup is the one
+        // listener (`listen.rs`), so it is the address; a pinned `0.0.0.0`
+        // serves IPv4 only, so the pick is the first local IPv4 interface,
+        // else loopback. Without a network manager only loopback is known.
+        match (self.http_bind, &self.network_manager) {
+            (Some(bind), _) if !bind.is_unspecified() => bind.to_string(),
+            (bind, Some(manager)) => {
+                let manager = manager
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if bind == Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+                    manager
+                        .get_internal_bind_addresses()
+                        .into_iter()
+                        .map(|interface| interface.address)
+                        .find(|address| address.is_ipv4() && !address.is_loopback())
+                        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                        .to_string()
                 } else {
-                    "http".to_owned()
+                    manager.get_bind_address_for_ip(None, false).0
                 }
-            },
-            str::to_owned,
-        )
+            }
+            (_, None) => Ipv4Addr::LOCALHOST.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl LocalApiAccess for FerrofinServerApplicationHost {
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        Ok(self.build_local_api_url(&self.local_access_hostname(), None, None))
+    }
+
+    async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        Ok(self.build_local_api_url(
+            &self.local_access_hostname(),
+            Some("http"),
+            Some(self.http_port()),
+        ))
     }
 }
 
@@ -293,7 +419,7 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
     }
 
     fn https_port(&self) -> u16 {
-        self.network.https_port
+        self.bound_https_port.load(Ordering::Relaxed)
     }
 
     fn listen_with_https(&self) -> bool {
@@ -304,6 +430,10 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         // C# `ApplicationHost.Name => ApplicationProductName` — a build
         // constant, deliberately NOT the friendly name.
         PRODUCT_NAME.to_owned()
+    }
+
+    fn base_url(&self) -> String {
+        self.network.base_url.clone()
     }
 
     fn friendly_name(&self) -> String {
@@ -318,10 +448,10 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
     }
 
     async fn get_smart_api_url(&self, request: &RequestContext) -> Result<String, ServiceError> {
-        if self.network.enable_published_server_uri_by_request
+        if self.published_server_uri_by_request()
             && let Some((host, req_port)) = Self::parse_request_host(request)
         {
-            let scheme = self.request_scheme(request);
+            let scheme = Self::request_scheme(request);
             // C# passes -1 when Host omits the port, so UriBuilder omits it
             // rather than substituting the server's internal listen port.
             let port = Some(req_port.unwrap_or(if scheme.eq_ignore_ascii_case("https") {
@@ -453,6 +583,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_published_url_off_the_base_url_is_warned_about_by_host_only() {
+        let host = host(HostNetworkInfo {
+            published_server_url: Some(
+                "https://user:password@media.example.com?access_token=secret#fragment".into(),
+            ),
+            base_url: "/jellyfin/".into(),
+            ..HostNetworkInfo::default()
+        })
+        .await;
+        assert_eq!(host.base_url(), "/jellyfin");
+        assert_eq!(
+            host.warn_if_published_url_base_path_differs(),
+            vec!["media.example.com:443".to_owned()]
+        );
+        let at_base = self::host(HostNetworkInfo {
+            published_server_url: Some("https://media.example.com/jellyfin".into()),
+            base_url: "/jellyfin".into(),
+            ..HostNetworkInfo::default()
+        })
+        .await;
+        assert!(at_base.warn_if_published_url_base_path_differs().is_empty());
+    }
+
+    #[tokio::test]
     async fn base_url_is_appended() {
         let net = HostNetworkInfo {
             base_url: "/jellyfin".to_owned(),
@@ -487,16 +641,69 @@ mod tests {
         };
         let h = host(net).await;
         let req = RequestContext {
-            headers: vec![
-                ("Host".to_owned(), "media.lan:8096".to_owned()),
-                ("X-Forwarded-Proto".to_owned(), "http".to_owned()),
-            ],
+            headers: vec![("Host".to_owned(), "media.lan:8096".to_owned())],
+            scheme: Some("http".to_owned()),
             ..Default::default()
         };
         assert_eq!(
             h.get_smart_api_url(&req).await.unwrap(),
             "http://media.lan:8096"
         );
+    }
+
+    /// `GetSmartApiUrl(HttpRequest)` builds from `request.Scheme`, the scheme
+    /// the request came with, not from whether the server also listens with
+    /// HTTPS: a plain HTTP request is answered with an `http://` address.
+    #[tokio::test]
+    async fn the_request_scheme_wins_over_listening_with_https() {
+        let h = host(HostNetworkInfo {
+            enable_published_server_uri_by_request: true,
+            listen_with_https: true,
+            https_port: 8920,
+            ..Default::default()
+        })
+        .await;
+        for scheme in [None, Some("http")] {
+            let req = RequestContext {
+                headers: vec![("Host".to_owned(), "media.lan:8096".to_owned())],
+                scheme: scheme.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(
+                h.get_smart_api_url(&req).await.unwrap(),
+                "http://media.lan:8096"
+            );
+        }
+        let req = RequestContext {
+            headers: vec![("Host".to_owned(), "media.lan:8920".to_owned())],
+            scheme: Some("https".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            h.get_smart_api_url(&req).await.unwrap(),
+            "https://media.lan:8920"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_access_over_http_keeps_the_http_port_when_https_is_served() {
+        let h = host(HostNetworkInfo {
+            listen_with_https: true,
+            https_port: 8920,
+            ..Default::default()
+        })
+        .await;
+        h.set_bound_http_port(18096);
+        h.set_bound_https_port(18920);
+        assert_eq!(
+            h.get_api_url_for_local_access().await.expect("url"),
+            "https://127.0.0.1:18920"
+        );
+        assert_eq!(
+            h.get_http_api_url_for_local_access().await.expect("url"),
+            "http://127.0.0.1:18096"
+        );
+        assert_eq!(h.https_port(), 18920);
     }
 
     #[tokio::test]
@@ -509,10 +716,8 @@ mod tests {
         .await;
         for host in ["media.example.test", "media.example.test:443"] {
             let request = RequestContext {
-                headers: vec![
-                    ("Host".into(), host.into()),
-                    ("X-Forwarded-Proto".into(), "https".into()),
-                ],
+                headers: vec![("Host".into(), host.into())],
+                scheme: Some("https".into()),
                 ..Default::default()
             };
             assert_eq!(
@@ -547,7 +752,7 @@ mod tests {
     async fn peer_urls_select_matching_subnet_and_http_uses_remote_endpoint() {
         let h = host(HostNetworkInfo::default())
             .await
-            .with_network(test_network(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            .with_network(test_network(), None);
         for (peer, expected) in [
             ("192.168.1.45", "http://192.168.1.2:8096"),
             ("10.20.0.45", "http://10.20.0.2:8096"),
@@ -578,7 +783,7 @@ mod tests {
             ..Default::default()
         })
         .await
-        .with_network(test_network(), "192.168.1.2".parse().expect("bind"));
+        .with_network(test_network(), Some("192.168.1.2".parse().expect("bind")));
         h.set_bound_http_port(18096);
         assert_eq!(h.http_port(), 18096);
         assert_eq!(
@@ -594,7 +799,7 @@ mod tests {
         let network = test_network();
         let h = host(HostNetworkInfo::default())
             .await
-            .with_network(Arc::clone(&network), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            .with_network(Arc::clone(&network), None);
         let peer = "192.168.1.45".parse().expect("peer");
         assert_eq!(
             h.get_smart_api_url_for_peer(peer).await.expect("url"),
@@ -614,6 +819,147 @@ mod tests {
         );
     }
 
+    /// `GetApiUrlForLocalAccess()` (`ApplicationHost.cs:978-985`): the bind
+    /// address `GetBindAddress(null)` picks — the first non-loopback interface,
+    /// local ones first — with the listen scheme, the bound port and the base
+    /// URL, never the published URL. A bind pinned at startup is the one
+    /// listener, so it is the address; with no other interface (or no network
+    /// manager) it is loopback.
+    #[tokio::test]
+    async fn the_local_access_url_is_the_bind_address_with_the_bound_port() {
+        let published = HostNetworkInfo {
+            base_url: "/jellyfin".into(),
+            published_server_url: Some("https://public.example.test".into()),
+            ..Default::default()
+        };
+        let all = host(published.clone())
+            .await
+            .with_network(test_network(), None);
+        all.set_bound_http_port(18096);
+        assert_eq!(
+            all.get_api_url_for_local_access().await.expect("url"),
+            "http://192.168.1.2:18096/jellyfin"
+        );
+        let pinned = host(published)
+            .await
+            .with_network(test_network(), Some("10.20.0.2".parse().expect("bind")));
+        assert_eq!(
+            pinned.get_api_url_for_local_access().await.expect("url"),
+            "http://10.20.0.2:8096/jellyfin"
+        );
+        let pinned_v6 = host(HostNetworkInfo::default())
+            .await
+            .with_network(test_network(), Some("fd12::2".parse().expect("bind")));
+        assert_eq!(
+            pinned_v6.get_api_url_for_local_access().await.expect("url"),
+            "http://[fd12::2]:8096"
+        );
+        let loopback_only = host(HostNetworkInfo::default()).await.with_network(
+            Arc::new(RwLock::new(NetworkManager::with_defaults(
+                ferrofin_networking::NetworkConfiguration::default(),
+                "",
+            ))),
+            None,
+        );
+        assert_eq!(
+            loopback_only
+                .get_api_url_for_local_access()
+                .await
+                .expect("url"),
+            "http://127.0.0.1:8096"
+        );
+        assert_eq!(
+            host(HostNetworkInfo::default())
+                .await
+                .get_api_url_for_local_access()
+                .await
+                .expect("url"),
+            "http://127.0.0.1:8096"
+        );
+    }
+
+    /// A listener pinned to `0.0.0.0` serves no IPv6 address, so where
+    /// `GetBindAddress(null)` would pick an IPv6 interface first the local
+    /// access URL takes the first local IPv4 one; a pinned `::` is dual-stack
+    /// and takes upstream's pick.
+    #[tokio::test]
+    async fn an_ipv4_wildcard_listener_is_reached_over_ipv4() {
+        let v6_first = || {
+            Arc::new(RwLock::new(NetworkManager::with_defaults(
+                ferrofin_networking::NetworkConfiguration {
+                    enable_ipv6: true,
+                    ..Default::default()
+                },
+                "fd12::2/64,1,eth0|192.168.1.2/24,2,eth1",
+            )))
+        };
+        for (bind, expected) in [
+            (None, "http://[fd12::2]:8096"),
+            (
+                Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+                "http://[fd12::2]:8096",
+            ),
+            (
+                Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                "http://192.168.1.2:8096",
+            ),
+        ] {
+            let h = host(HostNetworkInfo::default())
+                .await
+                .with_network(v6_first(), bind);
+            assert_eq!(
+                h.get_api_url_for_local_access().await.expect("url"),
+                expected,
+                "{bind:?}"
+            );
+        }
+        let v6_only = host(HostNetworkInfo::default()).await.with_network(
+            Arc::new(RwLock::new(NetworkManager::with_defaults(
+                ferrofin_networking::NetworkConfiguration {
+                    enable_ipv6: true,
+                    ..Default::default()
+                },
+                "fd12::2/64,1,eth0",
+            ))),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        );
+        assert_eq!(
+            v6_only.get_api_url_for_local_access().await.expect("url"),
+            "http://127.0.0.1:8096"
+        );
+    }
+
+    /// `EnablePublishedServerUriByRequest` is read from the live network
+    /// configuration on every request (`ApplicationHost.cs:947`), so an
+    /// adopted `network.xml` or a dashboard save applies without a restart.
+    #[tokio::test]
+    async fn the_request_host_branch_follows_the_live_network_configuration() {
+        let network = test_network();
+        let h = host(HostNetworkInfo::default())
+            .await
+            .with_network(Arc::clone(&network), None);
+        let request = RequestContext {
+            headers: vec![("Host".into(), "media.example.test:8920".into())],
+            remote_endpoint: Some("192.168.1.45:51000".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            h.get_smart_api_url(&request).await.expect("url"),
+            "http://192.168.1.2:8096"
+        );
+        network.write().expect("lock").update_settings(
+            &ferrofin_networking::NetworkConfiguration {
+                enable_published_server_uri_by_request: true,
+                enable_ipv6: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            h.get_smart_api_url(&request).await.expect("url"),
+            "http://media.example.test:8920"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_published_url_wins_over_bind_and_network_overrides() {
         let h = host(HostNetworkInfo {
@@ -621,7 +967,7 @@ mod tests {
             ..Default::default()
         })
         .await
-        .with_network(test_network(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        .with_network(test_network(), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert_eq!(
             h.get_smart_api_url_for_peer("10.20.0.45".parse().expect("peer"))
                 .await

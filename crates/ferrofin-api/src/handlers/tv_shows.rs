@@ -1,6 +1,6 @@
 //! `TvShowsController` — the "Next Up" queue, upcoming episodes, and a series'
-//! seasons/episodes under the `/Shows` path, plus the `/Shows/{itemId}/Similar`
-//! alias of the similar-items surface.
+//! seasons/episodes under the `/Shows` path. The `/Shows/{itemId}/Similar`
+//! alias of the similar-items surface lives in [`super::similar`].
 //!
 //! Ports the portable `/Shows` surface:
 //!
@@ -12,8 +12,6 @@
 //! - `GET /Shows/{seriesId}/Episodes` — a series' episodes, optionally scoped to
 //!   one season (by season id or season number).
 //! - `GET /Shows/{seriesId}/Seasons` — a series' seasons.
-//! - `GET /Shows/{itemId}/Similar` — items similar to a show, delegated to the
-//!   [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 //!
 //! Season filters and aired special positioning use persisted season identities,
 //! presentation keys and episode metadata, with user visibility applied first.
@@ -22,11 +20,12 @@ use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SortOrder};
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
-use ferrofin_model::querying::{ItemFields, QueryResult};
+use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::tv::NextUpQuery;
 use uuid::Uuid;
@@ -35,7 +34,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{resolve_user, resolve_user_opt, user_uuid};
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
 /// Builds a [`DtoOptions`] from the request's `fields` / image parameters.
@@ -163,7 +162,11 @@ fn season_episode_rows(
         })
         .collect();
     if number != Some(0) {
-        matches.sort_by(|(left, _, _), (right, _, _)| left.compare(right));
+        // `LibraryManager.Sort`'s LINQ `OrderBy`: stable, and the aired-order
+        // comparer is not a total order, on which `sort_by` may panic.
+        ferrofin_util::stable_sort::stable_sort_by(&mut matches, |(left, _, _), (right, _, _)| {
+            left.compare(right)
+        });
     }
     // Stable input SortName order remains for season zero and comparator ties.
     matches
@@ -772,18 +775,13 @@ async fn get_seasons(
         query.enable_user_data,
     );
 
-    // C# `SetSeasonQueryOptions`: also drop missing seasons unless the user
-    // opts in; an explicit `isMissing`/`isSpecialSeason` narrows further.
-    let include_missing = user.as_ref().is_some_and(|u| u.display_missing_episodes);
     let internal = InternalItemsQuery {
         user: user.clone(),
         series_presentation_unique_key: Some(series_key),
         include_item_types: vec![BaseItemKind::Season],
         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
         is_special_season: query.is_special_season,
-        is_missing: query
-            .is_missing
-            .or_else(|| (!include_missing).then_some(false)),
+        is_missing: season_is_missing(user.as_ref(), query.is_missing),
         adjacent_to: query.adjacent_to,
         dto_options: options.clone(),
         ..InternalItemsQuery::default()
@@ -798,80 +796,15 @@ async fn get_seasons(
     Ok(Json(QueryResult::new(None, Some(total), dtos)))
 }
 
-/// The query parameters honoured by `GET /Shows/{itemId}/Similar`.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SimilarParams {
-    /// Comma-delimited artist ids to exclude.
-    #[serde(default)]
-    exclude_artist_ids: Option<String>,
-    /// The target user; scopes visibility and attaches user data when present.
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
-    )]
-    user_id: Option<Uuid>,
-    /// The maximum number of records to return.
-    #[serde(default)]
-    limit: Option<i32>,
-    /// Comma-delimited additional fields.
-    #[serde(default)]
-    fields: Option<String>,
-}
-
-/// `GET /Shows/{itemId}/Similar` — items similar to a show.
-///
-/// Port of `LibraryController.GetSimilarItems` (the `GetSimilarShows` route).
-/// Delegates to the
-/// [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager), whose
-/// `get_similar_items` answers empty for an `Episode` or a by-name seed other
-/// than a `MusicArtist` (the C# controller guard) and otherwise runs the
-/// providers with the user's access and the per-kind filter set.
-#[utoipa::path(
-    get,
-    path = "/Shows/{itemId}/Similar",
-    params(("itemId" = String, Path, description = "The item id")),
-    responses(
-        (status = 200, description = "Similar items returned (QueryResult<BaseItemDto>)"),
-        (status = 404, description = "Item not found")
-    ),
-    tag = "ferrofin"
-)]
-async fn get_similar_shows(
-    State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
-    Query(query): Query<SimilarParams>,
-) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
-    let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
-    let mut options = build_dto_options(query.fields.as_deref(), None, None, None, None);
-    // `SimilarItemsManager.GetSimilarItemsAsync` forces `ProviderIds` into the
-    // options the controller then projects with (v12
-    // SimilarItemsManager.cs:108-112) — same as the five aliases in
-    // `handlers::similar`.
-    if !options.contains_field(ItemFields::ProviderIds) {
-        options.fields.push(ItemFields::ProviderIds);
+/// The seasons query's `IsMissing`: the request's `isMissing`, then C#'s
+/// `SetSeasonQueryOptions` (v12.2 Series.cs:241-253), which runs after the
+/// controller sets it and forces `false` for a user who does not display
+/// missing episodes.
+fn season_is_missing(user: Option<&UserEntity>, requested: Option<bool>) -> Option<bool> {
+    match user {
+        Some(user) if !user.display_missing_episodes => Some(false),
+        _ => requested,
     }
-
-    // Same C# seed resolution as the other five aliases: a nil id falls back to
-    // the root folder, and an id that resolves to nothing is a `404`.
-    let Some(seed_id) = crate::handlers::similar::resolve_similar_seed(&state, item_id).await?
-    else {
-        return Ok(Json(QueryResult::new(Some(0), Some(0), Vec::new())));
-    };
-    let items = state
-        .similar_items
-        .get_similar_items(seed_id, &exclude_artist_ids, user_id, &options, query.limit)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
-    let dtos = state
-        .dto
-        .get_base_item_dtos(&items, &options, user.as_ref(), None, true)
-        .await?;
-    Ok(Json(QueryResult::new(Some(0), Some(total), dtos)))
 }
 
 /// Applies C#'s `ApplyPaging`: skip `start_index`, then take `limit`.
@@ -902,7 +835,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Shows/Upcoming", get(get_upcoming_episodes))
         .route("/Shows/{itemId}/Episodes", get(get_episodes))
         .route("/Shows/{itemId}/Seasons", get(get_seasons))
-        .route("/Shows/{itemId}/Similar", get(get_similar_shows))
 }
 crate::query::query_parameters! {
     NextUpParams {
@@ -921,10 +853,6 @@ crate::query::query_parameters! {
         "fields" => ',',
         "enableImageTypes" => ',',
     } => [("get", "/Shows/{seriesId}/Seasons")];
-    SimilarParams {
-        "excludeArtistIds" => ',',
-        "fields" => ',',
-    } => [("get", "/Shows/{itemId}/Similar")];
 }
 
 #[cfg(test)]
@@ -1113,5 +1041,38 @@ mod episode_season_tests {
         };
         assert_eq!(episode_air_order(&item).airs_before_season, None);
         assert_eq!(episode_air_order(&item).season, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod season_missing_tests {
+    use super::season_is_missing;
+    use crate::test_support::fake_user_entity;
+    use rstest::rstest;
+
+    /// `GetSeasons` sets `IsMissing = isMissing`, then `SetSeasonQueryOptions`
+    /// forces `false` for a user who hides missing episodes: their setting
+    /// wins over the request. A user who displays them, or no user, keeps the
+    /// request's value.
+    #[rstest]
+    #[case(Some(false), Some(true), Some(false))]
+    #[case(Some(false), Some(false), Some(false))]
+    #[case(Some(false), None, Some(false))]
+    #[case(Some(true), Some(true), Some(true))]
+    #[case(Some(true), Some(false), Some(false))]
+    #[case(Some(true), None, None)]
+    #[case(None, Some(true), Some(true))]
+    #[case(None, None, None)]
+    fn the_user_setting_wins_over_is_missing(
+        #[case] display_missing: Option<bool>,
+        #[case] requested: Option<bool>,
+        #[case] expected: Option<bool>,
+    ) {
+        let user = display_missing.map(|display| {
+            let mut user = fake_user_entity(uuid::Uuid::from_u128(1), "viewer");
+            user.display_missing_episodes = display;
+            user
+        });
+        assert_eq!(season_is_missing(user.as_ref(), requested), expected);
     }
 }

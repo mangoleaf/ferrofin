@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use ferrofin_model::net::EndPointInfo;
 use ferrofin_model::system::{LogFile, PublicSystemInfo, SystemInfo};
 use ferrofin_model::system_info_dtos::SystemStorageDto;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
@@ -24,13 +25,17 @@ use crate::state::AppState;
 
 /// Builds a [`RequestContext`] from an axum request's [`Parts`] (headers +
 /// query), mirroring the auth middleware's construction so the system manager
-/// sees the same request view.
-fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
-    crate::auth::request_context(
-        &parts.headers,
-        parts.uri.query(),
-        Some(state.client_address(parts).to_string()),
-    )
+/// sees the same request view, plus the request's scheme for the addresses
+/// built from it.
+pub(crate) fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
+    RequestContext {
+        scheme: Some(state.request_scheme(parts)),
+        ..crate::auth::request_context(
+            &parts.headers,
+            parts.uri.query(),
+            Some(state.client_address(parts).to_string()),
+        )
+    }
 }
 
 /// `GET /System/Info` — the full system information for an authenticated client.
@@ -162,7 +167,10 @@ async fn get_server_logs(
     _auth: RequireAdmin,
 ) -> Result<Json<Vec<LogFile>>, ApiError> {
     let dir = state.config.application_paths().log_directory_path();
-    let files = state.file_system.get_files(&dir, &[".txt", ".log"]);
+    let file_system = std::sync::Arc::clone(&state.file_system);
+    let files = tokio::task::spawn_blocking(move || file_system.get_files(&dir, &[".txt", ".log"]))
+        .await
+        .map_err(|error| ServiceError::backend(format!("log directory listing: {error}")))?;
     let mut logs: Vec<LogFile> = files
         .into_iter()
         .map(|f| LogFile {
@@ -193,7 +201,9 @@ struct LogFileQuery {
 /// `GET /System/Logs/Log` — the contents of one log file.
 ///
 /// Port of `SystemController.GetLogFile`: finds the file by (case-insensitive)
-/// name in the log directory (`404` if absent) and streams it as UTF-8 text.
+/// name in the log directory (`404` if absent) and returns it as UTF-8 text.
+/// Upstream streams the file; this reads it whole, on the blocking pool,
+/// through the [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam.
 #[utoipa::path(
     get,
     path = "/System/Logs/Log",
@@ -214,13 +224,19 @@ async fn get_log_file(
         .filter(|n| !n.is_empty())
         .ok_or_else(|| ApiError::BadRequest("missing required 'name'".to_owned()))?;
     let dir = state.config.application_paths().log_directory_path();
-    let file = state
-        .file_system
-        .get_files(&dir, &[])
-        .into_iter()
-        .find(|f| f.name.eq_ignore_ascii_case(&name))
-        .ok_or_else(|| ApiError::NotFound("Log file not found.".to_owned()))?;
-    let bytes = state.file_system.read_file(&file.full_name)?;
+    // The listing and the read on the blocking pool: a debug server log or a
+    // long encode's ffmpeg log runs to hundreds of megabytes.
+    let file_system = std::sync::Arc::clone(&state.file_system);
+    let bytes = tokio::task::spawn_blocking(move || {
+        let file = file_system
+            .get_files(&dir, &[])
+            .into_iter()
+            .find(|f| f.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| ApiError::NotFound("Log file not found.".to_owned()))?;
+        Ok::<_, ApiError>(file_system.read_file(&file.full_name)?)
+    })
+    .await
+    .map_err(|error| ServiceError::backend(format!("log file read: {error}")))??;
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -279,12 +295,10 @@ async fn get_endpoint_info(
 /// [`ferrofin_networking::NetworkManager::is_in_local_network`].
 ///
 /// This is `NetworkManager`'s *fallback* subnet set, without the configured
-/// `LocalNetworkSubnets` / excluded-subnet list. See
-/// [`crate::auth::RequireLocalAccessOrAdmin`] for what that costs.
-///
-/// Shared with the HLS master playlist, which (like upstream's
-/// `DynamicHlsHelper.EnableAdaptiveBitrateStreaming`) skips the adaptive
-/// variants for local peers.
+/// `LocalNetworkSubnets` / excluded-subnet list: the answer of
+/// [`AppState::is_in_local_network`](crate::state::AppState::is_in_local_network)
+/// only when no network policy is wired (unit tests). Request paths ask
+/// `AppState`, never this.
 pub(crate) fn is_in_local_network(ip: std::net::IpAddr) -> bool {
     let ip = match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),

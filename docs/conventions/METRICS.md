@@ -82,8 +82,9 @@ is to routes.
 Cardinality is the way `/metrics` dies. Every label value set must be finite and
 enumerable at review time:
 
-- Allowed: route template, HTTP method, status code, controller/action derived
-  from the vendored spec, `PlayMethod`, `BaseItemKind`, pool name (`read`/`write`).
+- Allowed: route template, HTTP method (the standard methods, else `_OTHER`),
+  status code, controller/action derived from the vendored spec, `PlayMethod`,
+  `BaseItemKind`, pool name (`read`/`write`).
 - **Forbidden**: user IDs, item IDs, device IDs, session/play-session IDs, raw URL
   paths, filenames, client-supplied strings of any kind, tokens.
 - The HTTP `endpoint` label comes from axum's `MatchedPath` (else `""`,

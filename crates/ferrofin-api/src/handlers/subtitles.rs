@@ -26,11 +26,13 @@
 
 use std::fmt::Write as _;
 
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::subtitles::FontFile;
@@ -62,7 +64,8 @@ const FALLBACK_FONT_MAX_TOTAL_BYTES: i64 = 20 * 1024 * 1024;
 /// (`.woff`/`.woff2`/`.ttf`/`.otf`).
 const FALLBACK_FONT_EXTENSIONS: &[&str] = &[".woff", ".woff2", ".ttf", ".otf"];
 
-/// Ensures an item exists, returning `404` otherwise.
+/// Ensures an item exists, returning `404` otherwise
+/// (`GetItemById<BaseItem>`, as `DeleteSubtitle` resolves it).
 async fn require_item(
     state: &AppState,
     item_id: Uuid,
@@ -74,6 +77,28 @@ async fn require_item(
         .await?
         .is_none()
     {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+    Ok(())
+}
+
+/// Ensures the item exists **and is a video**, returning `404` otherwise.
+///
+/// Mirrors the C# `GetItemById<Video>(itemId, User.GetUserId())` null check of
+/// `SearchRemoteSubtitles`, `DownloadRemoteSubtitles`, `UploadSubtitle` and
+/// `GetSubtitlePlaylist`: a series, season or audio id is a `404`, so no
+/// subtitle sidecar is ever written beside a non-video path.
+async fn require_video(
+    state: &AppState,
+    item_id: Uuid,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
+    let is_video = state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_some_and(|item| super::videos::is_video(&item));
+    if !is_video {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     Ok(())
@@ -151,7 +176,7 @@ async fn upload_subtitle(
     Path(item_id): Path<Uuid>,
     JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
     let content = decode_base64(&body.data)
         .ok_or_else(|| ApiError::BadRequest("subtitle data is not valid base64".to_owned()))?;
     let response = SubtitleResponse {
@@ -199,7 +224,7 @@ async fn search_remote_subtitles(
     Path((item_id, language)): Path<(Uuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
     // The manager enriches this from the resolved item (name/year/imdb/…) before
     // querying providers; the handler supplies the caller-visible fields.
     let request = SubtitleSearchRequest {
@@ -237,7 +262,7 @@ async fn download_remote_subtitles(
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path((item_id, subtitle_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
     // The C# logs-and-continues on a provider failure, still returning 204, then
     // queues a refresh. A download that succeeds queues the refresh too.
     if state
@@ -274,13 +299,15 @@ async fn get_remote_subtitles(
 }
 
 /// The MIME type for a subtitle of the given format (a small, common-format map;
-/// unknown formats fall back to `text/plain`).
+/// unknown formats fall back to `text/plain`). `ttml` is the `MimeTypes` package
+/// entry `MimeTypes.GetMimeType("file.ttml")` falls back to.
 fn subtitle_mime(format: &str) -> &'static str {
     match format.to_ascii_lowercase().as_str() {
         "vtt" => "text/vtt",
         "srt" | "subrip" => "application/x-subrip",
         "ass" | "ssa" => "text/x-ssa",
         "json" => "application/json",
+        "ttml" => "application/ttml+xml",
         _ => "text/plain",
     }
 }
@@ -353,8 +380,8 @@ async fn encode_subtitle_response(
     // (port of the `WEBVTT` → `WEBVTT\nX-TIMESTAMP-MAP=…` string replace).
     if format.eq_ignore_ascii_case("vtt") && query.add_vtt_time_map {
         // Jellyfin reads the encoded stream through a BOM-detecting StreamReader and
-        // re-encodes the text without a preamble, so the writer's BOM does not survive
-        // this path.
+        // re-encodes the text without a preamble. Its WebVTT writer emits no BOM, but a
+        // `.vtt` file served verbatim can carry one, and it does not survive this path.
         let text = String::from_utf8_lossy(&bytes);
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace(
             "WEBVTT",
@@ -366,14 +393,95 @@ async fn encode_subtitle_response(
     Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
 }
 
+/// `SubtitleController.GetGraphicalSubtitlePath` (v12.2): the local file a
+/// PGS or VobSub track can be handed to the client untouched, a `.sup`/PGS
+/// payload or an extracted `.mks`, or `None` when it has to be encoded: a
+/// VobSub `.idx`/`.sub` pair (which the encoder converts), a remotely hosted
+/// file, or a track that is not graphical.
+async fn graphical_subtitle_path(
+    state: &AppState,
+    item_id: Uuid,
+    media_source_id: &str,
+    index: i32,
+) -> Result<Option<String>, ApiError> {
+    let sources = state
+        .media_sources
+        .get_static_media_sources(item_id, false, None)
+        .await?;
+    let Some(source) = sources.into_iter().find(|source| {
+        source
+            .id
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case(media_source_id))
+    }) else {
+        return Ok(None);
+    };
+    let Some(stream) = source
+        .media_streams
+        .iter()
+        .find(|stream| stream.stream_type == MediaStreamType::Subtitle && stream.index == index)
+    else {
+        return Ok(None);
+    };
+    if !(stream.is_pgs_subtitle_stream() || stream.is_vob_sub_subtitle_stream()) {
+        return Ok(None);
+    }
+    // Extracts an embedded track first.
+    let path = state
+        .subtitle_encoder
+        .get_subtitle_file_path(stream, &source)
+        .await?;
+    let extension = std::path::Path::new(&path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if !(MediaStream::is_pgs_format(Some(extension)) || extension.eq_ignore_ascii_case("mks")) {
+        return Ok(None);
+    }
+    Ok(tokio::fs::try_exists(&path)
+        .await
+        .unwrap_or(false)
+        .then_some(path))
+}
+
+/// `GetSubtitle`'s graphical branch: a PGS or VobSub request whose track has
+/// a local file is answered with that file, Range processing on and typed by
+/// `MimeTypes.GetMimeType(path)` (`PhysicalFile(path, mime, true)`). `None`
+/// leaves the request to the encoder.
+async fn serve_graphical_subtitle(
+    state: &AppState,
+    item_id: Uuid,
+    media_source_id: &str,
+    index: i32,
+    format: &str,
+    request: Request,
+) -> Result<Option<Response>, ApiError> {
+    if !(MediaStream::is_pgs_format(Some(format)) || MediaStream::is_vob_sub_format(Some(format))) {
+        return Ok(None);
+    }
+    let Some(path) = graphical_subtitle_path(state, item_id, media_source_id, index).await? else {
+        return Ok(None);
+    };
+    let mut response = crate::handlers::streaming::serve_static_file(&path, request).await?;
+    if response.status().is_success() {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(ferrofin_model::net::mime_types::get_mime_type(&path)),
+        );
+    }
+    Ok(Some(response))
+}
+
 /// `GET /Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}` — convert a
 /// subtitle stream to the requested format on the fly.
 ///
 /// Port of `SubtitleController.GetSubtitle` (the `Stream.{format}` route). The
 /// `{container}` segment is the media source id; `{routeFormat}` collapses the
-/// `Stream.{format}` literal. The [`SubtitleEncoder`] resolves the source,
-/// charset-normalizes the stream and converts it over `[start, end]`; with no
-/// encoder wired (disabled stub) this surfaces as `404`.
+/// `Stream.{format}` literal. A PGS or VobSub track with a local `.sup` or
+/// `.mks` is served raw, with Range ([`serve_graphical_subtitle`]). Otherwise
+/// the [`SubtitleEncoder`] resolves the source, charset-normalizes the stream
+/// and converts it over `[start, end]`; with no encoder wired (disabled stub)
+/// this surfaces as `404`.
 #[utoipa::path(
     get,
     path = "/Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}",
@@ -394,8 +502,14 @@ async fn get_subtitle(
     State(state): State<AppState>,
     Path((item_id, media_source_id, index, route_format)): Path<(Uuid, String, i32, String)>,
     Query(query): Query<SubtitleStreamQuery>,
+    request: Request,
 ) -> Result<Response, ApiError> {
     let format = parse_subtitle_format(&route_format);
+    if let Some(response) =
+        serve_graphical_subtitle(&state, item_id, &media_source_id, index, &format, request).await?
+    {
+        return Ok(response);
+    }
     encode_subtitle_response(&state, item_id, &media_source_id, index, &format, &query).await
 }
 
@@ -431,6 +545,7 @@ async fn get_subtitle_with_ticks(
         String,
     )>,
     Query(mut query): Query<SubtitleStreamQuery>,
+    request: Request,
 ) -> Result<Response, ApiError> {
     // The route-supplied start position applies unless the query names one
     // (the C# `startPositionTicks ?? routeStartPositionTicks`).
@@ -438,6 +553,11 @@ async fn get_subtitle_with_ticks(
         .start_position_ticks
         .get_or_insert(start_position_ticks);
     let format = parse_subtitle_format(&route_format);
+    if let Some(response) =
+        serve_graphical_subtitle(&state, item_id, &media_source_id, index, &format, request).await?
+    {
+        return Ok(response);
+    }
     encode_subtitle_response(&state, item_id, &media_source_id, index, &format, &query).await
 }
 
@@ -482,7 +602,7 @@ async fn get_subtitle_playlist(
     Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
 ) -> Result<Response, ApiError> {
-    require_item(&state, item_id, &auth).await?;
+    require_video(&state, item_id, &auth).await?;
 
     let user = resolve_user_opt(&state, &auth, None).await?;
     let user_id = user
@@ -766,5 +886,7 @@ mod tests {
     #[test]
     fn base64_rejects_invalid_chars() {
         assert!(decode_base64("!!!!").is_none());
+        // `=` is padding only at the end; FromBase64Transform refuses it inside.
+        assert!(decode_base64("aG=k").is_none());
     }
 }

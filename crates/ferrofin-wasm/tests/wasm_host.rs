@@ -331,6 +331,49 @@ async fn events_published_on_the_manager_reach_the_guest() {
     assert!(seen.contains('2'), "guest never saw both events");
 }
 
+/// A plugin's `LibraryChanged` is each batch of library changes the notifier
+/// publishes in process (`ItemsChanged`). The client push never crosses the
+/// bus, so a `LibraryChanged` published there reaches no plugin.
+#[tokio::test]
+async fn library_changes_reach_the_guest_from_the_notifiers_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "hello", FIXTURE_WAT);
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let events = ferrofin_core::FerrofinEventManager::new();
+    host.subscribe_events(&events, &manager());
+    events.publish("LibraryChanged", "{}").await.unwrap();
+    events
+        .publish(ferrofin_core::library_changed_notifier::ITEMS_CHANGED, "{}")
+        .await
+        .unwrap();
+    events.publish("PlaybackStart", "{}").await.unwrap();
+
+    let task = &host.scheduled_tasks(&manager())[0];
+    let progress = ferrofin_core::TaskProgress::default();
+    let count = || async { task.execute(&progress).await.unwrap_err().to_string() };
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let seen = count().await;
+        if seen.contains('2') || seen.contains('3') {
+            break;
+        }
+    }
+    // Long enough for a third delivery to land, were there one.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let seen = count().await;
+    assert!(
+        seen.contains('2') && !seen.contains('3'),
+        "the guest should see the batch and the playback event only: {seen}"
+    );
+}
+
 #[tokio::test]
 async fn memory_limiter_denies_growth_beyond_the_cap() {
     let dir = tempfile::tempdir().unwrap();
@@ -391,6 +434,128 @@ async fn epoch_deadline_interrupts_a_spinning_guest_and_breaker_trips() {
     assert!(
         err.contains("disabled until restart"),
         "breaker should be open after 3 consecutive failures, got: {err}"
+    );
+}
+
+/// The fixture plus real `wasi:clocks/monotonic-clock` + `wasi:io/poll`
+/// imports, shaped like a std guest's. Extra `run-task` ids: `slep` loops
+/// on `subscribe-duration(u64::MAX).block()` (`std::thread::sleep(MAX)`),
+/// `wait` does the same with a far-future `subscribe-instant`, and `nap!`
+/// blocks 10 ms, then succeeds.
+fn clock_sleeper_wat() -> String {
+    let prelude = r#"
+  (type $poll-interface (instance
+    (export "pollable" (type $pollable (sub resource)))
+    (type $borrowed (borrow $pollable))
+    (type $block (func (param "self" $borrowed)))
+    (export "[method]pollable.block" (func (type $block)))
+  ))
+  (import "wasi:io/poll@0.2.0" (instance $poll (type $poll-interface)))
+  (alias export $poll "pollable" (type $pollable))
+  (type $clock-interface (instance
+    (alias outer 1 $pollable (type $outer-pollable))
+    (export "pollable" (type $pollable (eq $outer-pollable)))
+    (type $owned (own $pollable))
+    (type $subscribe (func (param "when" u64) (result $owned)))
+    (export "subscribe-duration" (func (type $subscribe)))
+    (export "subscribe-instant" (func (type $subscribe)))
+  ))
+  (import "wasi:clocks/monotonic-clock@0.2.0" (instance $clock (type $clock-interface)))
+  (alias export $clock "subscribe-duration" (func $subscribe-duration))
+  (alias export $clock "subscribe-instant" (func $subscribe-instant))
+  (alias export $poll "[method]pollable.block" (func $block))
+  (core func $subscribe-duration (canon lower (func $subscribe-duration)))
+  (core func $subscribe-instant (canon lower (func $subscribe-instant)))
+  (core func $block (canon lower (func $block)))
+  (core instance $wasi
+    (export "subscribe-duration" (func $subscribe-duration))
+    (export "subscribe-instant" (func $subscribe-instant))
+    (export "block" (func $block)))
+"#;
+    let imports = r#"(core module $m
+    (import "wasi" "subscribe-duration" (func $subscribe-duration (param i64) (result i32)))
+    (import "wasi" "subscribe-instant" (func $subscribe-instant (param i64) (result i32)))
+    (import "wasi" "block" (func $block (param i32)))"#;
+    let tasks = r";; 's'lep / 'w'ait: wait forever, like a std guest's sleep loop
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 115))
+        (then (loop $again
+          (call $block (call $subscribe-duration (i64.const -1)))
+          (br $again))))
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 119))
+        (then (loop $again
+          (call $block (call $subscribe-instant (i64.const -1)))
+          (br $again))))
+      ;; 'n'ap: a 10 ms sleep well inside the deadline, then ok
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 110))
+        (then
+          (call $block (call $subscribe-duration (i64.const 10000000)))
+          (i32.store (i32.const 768) (i32.const 0))
+          (i32.store (i32.const 772) (i32.const 0))
+          (i32.store (i32.const 776) (i32.const 0))
+          (return (i32.const 768))))
+      ;; len-4 ids dispatch on the first byte";
+    FIXTURE_WAT
+        .replace("(core module $m", imports)
+        .replace(";; len-4 ids dispatch on the first byte", tasks)
+        .replace(
+            "(core instance $i (instantiate $m))",
+            "(core instance $i (instantiate $m (with \"wasi\" (instance $wasi))))",
+        )
+        .replace("(component", &format!("(component{prelude}"))
+}
+
+#[tokio::test]
+async fn a_guest_waiting_on_a_wasi_clock_is_held_to_the_call_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "sleeper", &clock_sleeper_wat());
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &tight_settings())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin = &host.plugins()[0];
+
+    // A short sleep inside the budget is untouched.
+    plugin.run_task_for_test("nap!".to_owned()).await.unwrap();
+
+    // An unbounded wait in host code must still end at the 1 s deadline.
+    for task in ["slep", "wait"] {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            plugin.run_task_for_test(task.to_owned()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("`{task}` blocked in a WASI clock past the call deadline"));
+        let err = outcome.unwrap_err();
+        assert!(err.contains("plugin call failed"), "{task}: {err}");
+    }
+}
+
+#[test]
+fn a_descriptor_waiting_on_a_wasi_clock_cannot_hang_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let wat = clock_sleeper_wat().replace(
+        "(func (export \"descriptor\") (result i32)",
+        "(func (export \"descriptor\") (result i32)
+      (loop $again (call $block (call $subscribe-duration (i64.const -1))) (br $again))",
+    );
+    write_fixture(dir.path(), "sleeper", &wat);
+    // A plain thread, not spawn_blocking: if load hangs, the test must fail
+    // rather than wait on the blocking pool's shutdown forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = dir.path().to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(WasmPluginHost::load(&path, &tight_settings()));
+    });
+    let host = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("plugin load blocked in a WASI clock past the call deadline")
+        .unwrap();
+    assert!(
+        host.plugins().is_empty(),
+        "the stuck plugin must be skipped"
     );
 }
 
@@ -595,6 +760,143 @@ async fn dispatcher_routes_by_id_and_gates_on_enabled() {
             .expect("dispatch")
             .is_none()
     );
+}
+
+/// How long the back-pressure tests give a spawned call to reach the runtime
+/// thread, or its queue slot, before probing.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// What "at once" means for a turned-away web request: well inside the 2 s
+/// deadline that a waiting request would sit out.
+const AT_ONCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The fixture loaded with a 2 s deadline and a queue of four commands (so
+/// web requests get two slots), and a dispatcher over it.
+async fn backpressure_host(
+    dir: &std::path::Path,
+) -> (WasmPluginHost, Arc<ferrofin_wasm::WasmRequestDispatcher>) {
+    write_fixture(dir, "hello", FIXTURE_WAT);
+    let settings = WasmSettings {
+        call_timeout_secs: 2,
+        event_queue_capacity: 4,
+        ..tight_settings()
+    };
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.to_path_buf();
+        move || WasmPluginHost::load(&dir, &settings)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let dispatcher = Arc::new(ferrofin_wasm::WasmRequestDispatcher::new(
+        &host,
+        Arc::new(common::EnabledStub(b"{}".to_vec())),
+    ));
+    (host, dispatcher)
+}
+
+/// An anonymous `GET` of `path` in the plugin's URL space.
+fn web_get(path: &str) -> ferrofin_traits::plugins::PluginWebRequest {
+    ferrofin_traits::plugins::PluginWebRequest {
+        method: "GET".to_owned(),
+        path: path.to_owned(),
+        query: String::new(),
+        headers: vec![],
+        body: None,
+        user_id: None,
+        is_admin: false,
+        is_authenticated: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_plugin_queue_turns_a_web_request_away_at_once() {
+    use ferrofin_traits::plugins::PluginRequestHandler as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (host, dispatcher) = backpressure_host(dir.path()).await;
+    let plugin = Arc::clone(&host.plugins()[0]);
+    let plugin_id = plugin.descriptor.id;
+
+    // The runtime thread spins on `loop` until its deadline...
+    let spinning = {
+        let plugin = Arc::clone(&plugin);
+        tokio::spawn(async move { plugin.run_task_for_test("loop".to_owned()).await })
+    };
+    tokio::time::sleep(SETTLE).await;
+    // ...while four task runs fill the whole queue behind it.
+    let queued: Vec<_> = (0..4)
+        .map(|_| {
+            let plugin = Arc::clone(&plugin);
+            tokio::spawn(async move { plugin.run_task_for_test("ok".to_owned()).await })
+        })
+        .collect();
+    tokio::time::sleep(SETTLE).await;
+
+    // A web request finds no room and is answered at once, not parked.
+    let answer = tokio::time::timeout(AT_ONCE, dispatcher.handle(plugin_id, web_get("/ping")))
+        .await
+        .expect("the web request waited for queue room instead of failing fast");
+    assert!(
+        matches!(answer, Err(ServiceError::Unavailable(_))),
+        "{answer:?}"
+    );
+
+    // The task runs keep their place, and all run once the loop is cut off.
+    assert!(
+        spinning.await.unwrap().is_err(),
+        "the loop hits its deadline"
+    );
+    for run in queued {
+        run.await.unwrap().expect("a queued task run still runs");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_requests_hold_at_most_half_the_plugin_queue() {
+    use ferrofin_traits::plugins::PluginRequestHandler as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (host, dispatcher) = backpressure_host(dir.path()).await;
+    let plugin_id = host.plugins()[0].descriptor.id;
+    let send = |path: &'static str| {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.handle(plugin_id, web_get(path)).await })
+    };
+
+    // One web request spins on the runtime thread and a second queues
+    // behind it: together they hold both web slots (half the queue of four).
+    let spinning = send("/spin");
+    tokio::time::sleep(SETTLE).await;
+    let waiting = send("/ping");
+    tokio::time::sleep(SETTLE).await;
+
+    // A third is turned away at once, though the queue still has room: that
+    // room stays for scans, tasks and events.
+    let answer = tokio::time::timeout(AT_ONCE, dispatcher.handle(plugin_id, web_get("/ping")))
+        .await
+        .expect("the third web request was queued instead of turned away");
+    assert!(
+        matches!(answer, Err(ServiceError::Unavailable(_))),
+        "{answer:?}"
+    );
+
+    // The spin is cut off at its deadline, the queued request is answered,
+    // and the slots come back: the next request goes through.
+    assert!(
+        spinning.await.unwrap().is_err(),
+        "the spin hits its deadline"
+    );
+    let queued = waiting
+        .await
+        .unwrap()
+        .expect("dispatch")
+        .expect("known plugin");
+    assert_eq!(queued.status, 200);
+    let reply = dispatcher
+        .handle(plugin_id, web_get("/ping"))
+        .await
+        .expect("the web slots were released")
+        .expect("known plugin");
+    assert_eq!(reply.status, 200);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -905,6 +1207,195 @@ async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_
     assert!(count.contains('2'), "{count}");
 }
 
+/// The analysis collaborators over `library`, every other seam stubbed.
+fn analysis_collaborators(
+    library: Arc<dyn ferrofin_traits::library::LibraryManager>,
+) -> ferrofin_wasm::capabilities::Collaborators {
+    ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library,
+        media_segments: Arc::new(common::RecordingSegments::default()),
+        plugins: Arc::new(common::EnabledStub(b"{}".to_vec())),
+        lyrics: Arc::new(common::StubLyrics::default()),
+        subtitles: Arc::new(common::StubSubtitles::default()),
+        collections: Arc::new(common::StubCollections::default()),
+        media_streams: Arc::new(common::StubStreams),
+        extractor: Arc::new(common::StubExtractor::default()),
+        analysis: Arc::new(tokio::sync::Semaphore::new(1)),
+        users: Arc::new(common::StubUsers),
+        user_data: Arc::new(common::StubUserData),
+        tv: Arc::new(common::StubTv),
+    }
+}
+
+/// `wat` with its `count` task reporting the offer count in three digits.
+fn count_in_three_digits(wat: &str) -> String {
+    let one_digit = concat!(
+        "(i32.store8 (i32.const 300)\n",
+        "            (i32.add (i32.const 48) (global.get $events)))\n",
+        "          (i32.store (i32.const 768) (i32.const 1))\n",
+        "          (i32.store (i32.const 772) (i32.const 300))\n",
+        "          (i32.store (i32.const 776) (i32.const 1))",
+    );
+    assert!(wat.contains(one_digit), "the fixture's count task changed");
+    wat.replace(
+        one_digit,
+        "(i32.store8 (i32.const 300) (i32.add (i32.const 48) (i32.div_u (global.get $events) (i32.const 100)))) \
+         (i32.store8 (i32.const 301) (i32.add (i32.const 48) (i32.rem_u (i32.div_u (global.get $events) (i32.const 10)) (i32.const 10)))) \
+         (i32.store8 (i32.const 302) (i32.add (i32.const 48) (i32.rem_u (global.get $events) (i32.const 10)))) \
+         (i32.store (i32.const 768) (i32.const 1)) \
+         (i32.store (i32.const 772) (i32.const 300)) \
+         (i32.store (i32.const 776) (i32.const 3))",
+    )
+}
+
+/// A breaker trip mid-pass must not burn the items the pass never reached:
+/// they are offered after the restart (gl-70). Items are saved newest first,
+/// so only a pass ordered by DateCreated offers the three oldest before the
+/// breaker trips, and the dated cases offer those three only once.
+/// - 250 items span three pages.
+/// - An undated item the pass never reached keeps the first pass unfiltered,
+///   so it still gets its one offer, and the three that trapped are offered
+///   again.
+#[rstest::rstest]
+#[case::dated(vec![Some(50), Some(40), Some(30), Some(20), Some(10)], Some(&b"30"[..]), 2, b"50")]
+#[case::over_three_pages((1..=250).rev().map(Some).collect(), Some(&b"3"[..]), 247, b"250")]
+#[case::undated_not_reached(vec![Some(10), None, None, None, None], None, 5, b"10")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart(
+    #[case] dates: Vec<Option<i64>>,
+    #[case] watermark_after_the_trip: Option<&[u8]>,
+    #[case] offered_after_the_restart: u32,
+    #[case] final_watermark: &[u8],
+) {
+    use ferrofin_traits::library::LibraryManager;
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    let scan_media = "(func (export \"scan-media\") (param i32) (result i32)";
+    // Every offer traps, so the third one trips the breaker.
+    write_fixture(
+        dir.path(),
+        "analyzer",
+        &FIXTURE_WAT.replace(scan_media, &format!("{scan_media} unreachable")),
+    );
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let persistence = Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+        db.clone(),
+    ));
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+    let library: Arc<dyn LibraryManager> = Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        persistence.clone(),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db)),
+    ));
+    let movies: Vec<_> = dates
+        .iter()
+        .enumerate()
+        .map(
+            |(index, date)| ferrofin_db::entities::base_items::BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
+                type_: ferrofin_core::item_type_lookup::stored_type_name(
+                    ferrofin_model::data::BaseItemKind::Movie,
+                )
+                .unwrap()
+                .to_owned(),
+                path: Some(
+                    dir.path()
+                        .join(format!("{index}.mkv"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                date_created: date.and_then(chrono::DateTime::from_timestamp_micros),
+                ..Default::default()
+            },
+        )
+        .collect();
+    persistence.save_items(&movies).await.unwrap();
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin_id = host.plugins()[0].descriptor.id;
+    host.set_runtime_collaborators(analysis_collaborators(library.clone()));
+    let progress = ferrofin_core::TaskProgress::default();
+    let task = host.analysis_task(&plugins).unwrap();
+    task.execute(&progress)
+        .await
+        .expect("a dead plugin never fails the task");
+    let state = dir.path().join(format!("{plugin_id}.state.json"));
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").as_deref(),
+        watermark_after_the_trip,
+        "the watermark stops below the first item the dead plugin never saw"
+    );
+    // Another pass before the restart leaves the watermark where it is.
+    task.execute(&progress).await.unwrap();
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").as_deref(),
+        watermark_after_the_trip
+    );
+    drop(task);
+    drop(host);
+
+    // The restart: the same plugin, now healthy and counting its offers.
+    // Each offer copies the item, temp-dir path included, into the fixture's
+    // one-page memory, whose bump allocator never frees. So every offer
+    // starts again at the allocator's first address. Otherwise a few hundred
+    // offers fill the page (fewer under a long TMPDIR), and the trap
+    // restarts the guest and its count.
+    assert!(
+        FIXTURE_WAT.contains("(global $bump (mut i32) (i32.const 4096))"),
+        "the fixture's allocator start moved"
+    );
+    write_fixture(
+        dir.path(),
+        "analyzer",
+        &count_in_three_digits(&FIXTURE_WAT.replace(
+            scan_media,
+            &format!(
+                "{scan_media} (global.set $bump (i32.const 4096)) \
+                 (global.set $events (i32.add (global.get $events) (i32.const 1)))"
+            ),
+        )),
+    );
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    host.set_runtime_collaborators(analysis_collaborators(library));
+    host.analysis_task(&plugins)
+        .unwrap()
+        .execute(&progress)
+        .await
+        .unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        count.parse::<u32>().unwrap(),
+        offered_after_the_restart,
+        "offers after the restart"
+    );
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").unwrap(),
+        final_watermark
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn persisted_task_producer_registration_is_restored_only_for_a_loaded_guest() {
     use ferrofin_traits::media_segments::MediaSegmentProvider;
@@ -1013,7 +1504,7 @@ impl ferrofin_traits::library::VirtualFolderManager for SwitchDuringWriteFolders
         name: &str,
         collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
         options: &ferrofin_model::configuration::LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         self.inner
             .add_virtual_folder(name, collection_type, options)
             .await

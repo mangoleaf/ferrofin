@@ -56,7 +56,9 @@ pub use local_xml::{
     LocalContainerXml, LocalLinkedChild, parse_container_xml, save_collection_xml,
     save_playlist_xml,
 };
-pub use playlist_file::{is_playlist_file, read_playlist_file, write_playlist_file};
+pub use playlist_file::{
+    decode_playlist, is_playlist_file, playlist_xml_path, read_playlist_file, write_playlist_file,
+};
 
 #[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};

@@ -139,8 +139,10 @@ fn _assert_object_safe_task_manager(_: &dyn TaskManager) {}
 /// derived exactly as upstream derives it, which is what makes a task id stable
 /// across the two servers.
 ///
-/// The first twenty rows are Jellyfin 10.11.8's own task classes (namespace +
-/// class name read from the `v10.11.8` tag). The last three are the two
+/// The first nineteen rows are Jellyfin 10.11.8's own task classes (namespace +
+/// class name read from the `v10.11.8` tag), less
+/// `CleanupCollectionAndPlaylistPathsTask`, which Jellyfin 12 deleted and
+/// Ferrofin no longer registers. The last four are the tasks of the two
 /// third-party plugins Ferrofin ports as Tier-1a extensions, at the upstream
 /// commits pinned in `docs/PLUGINS_UPSTREAM.md`, so a dashboard link made
 /// against a Jellyfin install carrying those plugins keeps working.
@@ -170,10 +172,6 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
     (
         "DeleteTranscodeFiles",
         "Emby.Server.Implementations.ScheduledTasks.Tasks.DeleteTranscodeFileTask",
-    ),
-    (
-        "CleanCollectionsAndPlaylists",
-        "Emby.Server.Implementations.ScheduledTasks.Tasks.CleanupCollectionAndPlaylistPathsTask",
     ),
     (
         "RefreshChapterImages",
@@ -219,6 +217,10 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
     (
         "MoveTrickplayImages",
         "MediaBrowser.Providers.Trickplay.TrickplayMoveImagesTask",
+    ),
+    (
+        "TmdbRefreshUpcomingEpisodes",
+        "MediaBrowser.Providers.Plugins.Tmdb.TV.TmdbUpcomingEpisodesTask",
     ),
     // src/Jellyfin.*/**
     (
@@ -288,18 +290,15 @@ mod task_id_tests {
 
     /// The ids a real Jellyfin 10.11.8 server returns from `GET /ScheduledTasks`
     /// for its twenty built-in tasks, captured from the parity lab pair on
-    /// 2026-08-30. This is the oracle: the derivation is only correct if it
-    /// reproduces these byte for byte.
+    /// 2026-08-30, less `CleanCollectionsAndPlaylists` (deleted in Jellyfin 12,
+    /// not registered here). This is the oracle: the derivation is only correct
+    /// if it reproduces these byte for byte.
     const JELLYFIN_10_11_8_TASK_IDS: &[(&str, &str)] = &[
         ("AudioNormalization", "ec2f221fd8e7706b3d3afd2c4591b4d7"),
         ("CleanActivityLog", "b461ef918ab28520928183e794350e3c"),
         ("DeleteCacheFiles", "241d4fcb19a1d557ee62428e411da609"),
         ("CleanLogFiles", "1c8ede62c521bea0bf851344f5b8ca40"),
         ("DeleteTranscodeFiles", "7d8088c10902f1bf4072ded42437bcfb"),
-        (
-            "CleanCollectionsAndPlaylists",
-            "3a025083141d3c17dd96d5f9b951287b",
-        ),
         ("DownloadLyrics", "26649fe0aad57557245351f220da916c"),
         ("DownloadSubtitles", "2c66a88bca43e565d7f8099f825478f1"),
         ("RefreshChapterImages", "4e6637c832ed644d1af3370a2506e80a"),
@@ -327,6 +326,16 @@ mod task_id_tests {
         for (key, expected) in JELLYFIN_10_11_8_TASK_IDS {
             assert_eq!(&task_id_for_key(key), expected, "task id for {key}");
         }
+    }
+
+    /// Jellyfin 12's TMDb task: the MD5 of its type's full name, as every
+    /// task id above is.
+    #[test]
+    fn the_tmdb_upcoming_episodes_task_has_jellyfins_id() {
+        assert_eq!(
+            task_id_for_key("TmdbRefreshUpcomingEpisodes"),
+            "1ee23a5dd39fb4225715375c91bc2990"
+        );
     }
 
     #[test]

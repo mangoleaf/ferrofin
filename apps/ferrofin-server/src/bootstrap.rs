@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
 use ferrofin_db::Database;
@@ -368,6 +368,35 @@ pub fn shutdown_tracing() {
     }
 }
 
+/// The directory layout under the program-data root, ported from
+/// `ServerApplicationPaths`: {data}/log, {config}, {cache}, {web}.
+#[must_use]
+pub fn application_paths(config: &Config) -> ferrofin_core::FerrofinServerApplicationPaths {
+    ferrofin_core::FerrofinServerApplicationPaths::new(
+        &config.data_dir,
+        config.data_dir.join("log"),
+        &config.config_dir,
+        &config.cache_dir,
+        &config.web_dir,
+    )
+}
+
+/// Port of `ServerApplicationPaths.MakeSanityCheckOrThrow`, which
+/// `Program.StartApp` runs before anything else touches the paths (Ferrofin runs
+/// it once logging has started): every
+/// server directory exists and carries its `.jellyfin-<kind>` marker.
+///
+/// # Errors
+///
+/// Returns the first directory that cannot be created or marked, or the
+/// conflict when a directory carries another kind's marker (two server paths
+/// point at one directory).
+pub fn check_application_paths(config: &Config) -> anyhow::Result<()> {
+    application_paths(config)
+        .make_sanity_check()
+        .context("the server's directories failed their startup check")
+}
+
 /// Opens the SQLite database at `{data_dir}/ferrofin.db` and applies migrations.
 ///
 /// Creates the data directory (and the DB file) if missing, then runs all
@@ -402,7 +431,13 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     // The one-shot ports of 12.0's data routines: membership from Data JSON
     // for a database newly adopted from 10.11.8 (never from a 12.0 one, whose
     // JSON is frozen), orphaned extras, OwnerId relationships, version links.
-    ferrofin_core::adoption_repairs::run_all(&db)
+    // The membership import expands a container's `%AppDataPath%` path; the
+    // configured metadata path is not loaded yet and not needed, as 10.11
+    // keeps playlists and box sets under the data path.
+    let paths = ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::new(
+        application_paths(config),
+    ));
+    ferrofin_core::adoption_repairs::run_all(&db, &paths)
         .await
         .context("failed to run the adoption repairs")?;
     // Rows written before the persistence service derived `SortName` still
@@ -508,8 +543,10 @@ fn spawn_pool_sampler(db: &Database) {
 ///   phase 6, alongside reading the macOS release in [`read_os_version`].
 ///
 /// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
-/// key) and `CheckSupportedProberOption` calls are outside the hardware matrix
-/// and are recorded as numbered work items in the hardware-transcoding roadmap.
+/// key) is [`probe_pause_keys`], run in the background after boot because the
+/// upstream probe is a real-time job. Its `CheckSupportedProberOption` call is
+/// outside the hardware matrix and is recorded as a numbered work item in the
+/// hardware-transcoding roadmap.
 ///
 /// # Errors
 ///
@@ -543,6 +580,7 @@ pub async fn discover_ffmpeg(
         filter_options,
         bsf_options,
         low_priority_hwaccel_flag,
+        prober_first_video_frame,
         os_version,
     ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
     let ffmpeg_version = ffmpeg_version
@@ -558,7 +596,6 @@ pub async fn discover_ffmpeg(
             path: ffmpeg.clone(),
         })?;
 
-    let pkey_pause_supported = probe_runtime_pause(&ffmpeg, ffmpeg_version).await;
     let mut builder = FfmpegCapabilities::builder()
         .filters(filters)
         .encoders(encoders)
@@ -569,7 +606,8 @@ pub async fn discover_ffmpeg(
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
         .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
-        .pkey_pause_supported(pkey_pause_supported);
+        .prober_first_video_frame(prober_first_video_frame)
+        .validated(true);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
     }
@@ -592,7 +630,6 @@ pub async fn discover_ffmpeg(
         platform = ?capabilities.platform(),
         tonemapx = capabilities.supports_filter("tonemapx"),
         libfdk_aac = capabilities.supports_encoder("libfdk_aac"),
-        pkey_pause_supported,
         chromaprint_muxer,
         "media encoder ready"
     );
@@ -609,38 +646,59 @@ pub async fn discover_ffmpeg(
     })
 }
 
+/// The arguments of `EncoderValidator.CheckSupportedRuntimeKey`'s dummy encode
+/// (Jellyfin 12.1, unchanged in 12.2): a 1x1 source at 1 fps, paced in real time
+/// and capped at 5 s, so it cannot finish before ffmpeg first polls stdin. The
+/// earlier form (`nullsrc=s=1x1:d=10000`, no `-re`) finished in about 0.3 s on a
+/// fast CPU, before the `?` was read, and never printed the help.
+const PAUSE_PROBE_ARGS: [&str; 9] = [
+    "-hide_banner",
+    "-re",
+    "-f",
+    "lavfi",
+    "-i",
+    "nullsrc=s=1x1:r=1:d=5",
+    "-f",
+    "null",
+    "-",
+];
+
+/// Probes the ffmpeg at `ffmpeg` for its keyboard pause controls and publishes
+/// them to `slot`, which the transcode manager reads on every throttle tick.
+///
+/// The probe is a real-time ffmpeg job (about a second or more), so it runs in
+/// the background after boot, never on the path to the listening socket.
+pub async fn probe_pause_keys(
+    ffmpeg: PathBuf,
+    version: Option<FfmpegVersion>,
+    slot: ferrofin_mediaencoding::transcoding::throttler::PauseKeySlot,
+) {
+    use ferrofin_mediaencoding::transcoding::throttler::PauseKeys;
+    let pkey_pause_supported = probe_runtime_pause(&ffmpeg).await;
+    let keys = PauseKeys::select(pkey_pause_supported, version);
+    slot.set(keys);
+    tracing::info!(pkey_pause_supported, ?keys, "ffmpeg pause key probed");
+}
+
 /// Detects Jellyfin-ffmpeg's explicit pause key from its interactive help.
 ///
-/// Matches EncoderValidator.CheckSupportedRuntimeKey's input/duration and
-/// exact, case-sensitive help description. An absent key or failed probe does
-/// not grant keyboard support; the manager separately checks the legacy gate.
-async fn probe_runtime_pause(ffmpeg: &Path, version: Option<FfmpegVersion>) -> bool {
+/// Matches EncoderValidator.CheckSupportedRuntimeKey's arguments, stdin (`?q`)
+/// and exact, case-sensitive help description. An absent key or failed probe
+/// does not grant keyboard support; [`probe_pause_keys`] applies the legacy
+/// version gate through `PauseKeys::select`.
+async fn probe_runtime_pause(ffmpeg: &Path) -> bool {
     use tokio::io::AsyncWriteExt as _;
-    let duration = if version.is_some_and(|version| version >= FfmpegVersion::new(7, 0)) {
-        "10000"
-    } else {
-        "1000"
-    };
-    let input = format!("nullsrc=s=1x1:d={duration}");
     let probe = async {
         let mut child = tokio::process::Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-f",
-                "lavfi",
-                "-i",
-                &input,
-                "-f",
-                "null",
-                "-",
-            ])
+            .args(PAUSE_PROBE_ARGS)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(b"?").await?;
+            // `?` prints the key help; `q` then stops the job at once.
+            stdin.write_all(b"?q").await?;
             // Closing stdin matches disposing EncoderValidator's test writer.
             stdin.shutdown().await?;
         }
@@ -689,6 +747,7 @@ async fn probe_round(
     [bool; FilterOption::ALL.len()],
     [bool; BsfOption::ALL.len()],
     bool,
+    bool,
     Option<FfmpegVersion>,
 ) {
     tokio::join!(
@@ -702,6 +761,7 @@ async fn probe_round(
         probe_filter_options(ffmpeg),
         probe_bsf_options(ffmpeg),
         probe_hwaccel_flag(ffmpeg, "low_priority"),
+        probe_prober_option(ffprobe, "only_first_vframe"),
         read_os_version(),
     )
 }
@@ -800,6 +860,34 @@ async fn probe_help_pages(
         }
     }
     pages
+}
+
+/// Whether `ffprobe` accepts `-<option>`, decided by its exit status on a 1x1
+/// one-second null source. Port of `EncoderValidator.CheckSupportedProberOption`
+/// (`-loglevel quiet -f lavfi -i nullsrc=s=1x1:d=1 -{option}`).
+async fn probe_prober_option(ffprobe: &Path, option: &str) -> bool {
+    let status = tokio::process::Command::new(ffprobe)
+        .args([
+            "-loglevel",
+            "quiet",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=1x1:d=1",
+            &format!("-{option}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(status) => status.success(),
+        Err(e) => {
+            tracing::debug!(error = %e, option, "error probing ffprobe option");
+            false
+        }
+    }
 }
 
 /// Whether ffmpeg accepts `-hwaccel_flags +<flag>`, decided by exit status on a
@@ -1079,6 +1167,69 @@ async fn validate_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::CapturedLogs;
+
+    /// Startup runs `MakeSanityCheckOrThrow` (`Program.StartApp`): every
+    /// server directory exists and carries its `.jellyfin-<kind>` marker, and
+    /// the cache its `CACHEDIR.TAG`.
+    #[test]
+    fn the_startup_check_creates_and_marks_the_server_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        check_application_paths(&Config::test_stub(tmp.path())).expect("checked");
+
+        // `test_stub`'s data directory is `data/`, beside `config/` and `cache/`.
+        for (dir, marker) in [
+            ("config", "config"),
+            ("data/log", "log"),
+            ("data/plugins", "plugin"),
+            ("data", "data"),
+            ("cache", "cache"),
+            ("data/data", "data"),
+            ("data/root", "root"),
+        ] {
+            let path = tmp.path().join(dir).join(format!(".jellyfin-{marker}"));
+            assert!(path.is_file(), "missing {}", path.display());
+        }
+        assert!(tmp.path().join("cache/CACHEDIR.TAG").is_file());
+    }
+
+    /// A server directory carrying another kind's marker means two server
+    /// paths point at one directory: startup refuses it, as upstream's
+    /// `CheckOrCreateMarker` throws.
+    #[test]
+    fn the_startup_check_refuses_a_directory_marked_for_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data/root")).unwrap();
+        std::fs::write(tmp.path().join("data/root/.jellyfin-config"), "").unwrap();
+
+        let error = check_application_paths(&Config::test_stub(tmp.path()))
+            .expect_err("startup refuses the directory");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-root but found marker for")
+                && message.contains(".jellyfin-config"),
+            "{message}"
+        );
+    }
+
+    /// The likeliest clash: the cache directory set to the data directory.
+    #[test]
+    fn the_startup_check_refuses_a_cache_in_the_data_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::test_stub(tmp.path());
+        config.cache_dir = config.data_dir.clone();
+
+        let error = check_application_paths(&config).expect_err("startup refuses the layout");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-cache but found marker for")
+                && message.contains(".jellyfin-data"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn derive_ffprobe_replaces_basename_in_dir() {
@@ -1298,25 +1449,6 @@ mod tests {
         );
     }
 
-    /// An in-memory `MakeWriter` capturing fmt-layer output for assertions.
-    #[derive(Clone, Default)]
-    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn json_stdout_line_carries_trace_id_for_in_span_events() {
         // The headline correlation requirement: with the OTel layer active and the
@@ -1328,7 +1460,7 @@ mod tests {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let provider = SdkTracerProvider::builder()
             .with_sampler(Sampler::AlwaysOn)
             .with_simple_exporter(InMemorySpanExporter::default())
@@ -1348,7 +1480,7 @@ mod tests {
             tracing::info!("inside the request");
         });
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         let line = out
             .lines()
             .find(|l| l.contains("inside the request"))
@@ -1476,7 +1608,7 @@ mod tests {
         // sink). catch_unwind still fires the hook on this thread, where the scoped
         // subscriber captures it.
         use tracing_subscriber::layer::SubscriberExt as _;
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -1486,7 +1618,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let _ = std::panic::catch_unwind(|| panic!("kaboom"));
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         assert!(
             out.contains("panicked"),
             "hook emitted the error line: {out}"
@@ -1515,7 +1647,6 @@ mod tests {
     /// discovery happy path run without a real ffmpeg install.
     #[cfg(unix)]
     fn write_fake_ffmpeg(dir: &Path, name: &str, banner_tool: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
         // First line satisfies our `<tool> version` prefix check; the `libav*`
         // lines satisfy `EncoderValidator`'s library-version cross-check for the
@@ -1525,8 +1656,7 @@ mod tests {
         // falls through to the version banner, which is what an ffmpeg without
         // that capability effectively produces for our purposes.
         let script = format!(
-            "#!/bin/sh\n\
-             if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
+            "if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
              \x20 T.. = Timeline support\n\
              \x20T.C scale             V->V       Scale the input video size.\n\
              \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
@@ -1561,10 +1691,7 @@ mod tests {
              libavdevice    60.  3.100\nlibavfilter     9. 12.100\nlibswscale      7.  5.100\n\
              libswresample   4. 12.100\nEOF\n"
         );
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        crate::test_exec::stub_script(&path, &script);
         path
     }
 
@@ -1623,6 +1750,9 @@ mod tests {
         // a mistyped flag, or a probe that stopped running (and so fell through
         // to the version banner's exit 0) all report true and fail this.
         assert!(!caps.low_priority_hwaccel_flag());
+        // `CheckSupportedProberOption("only_first_vframe")`, by exit status too:
+        // the fake accepts it, so an unwired or inverted probe reads false.
+        assert!(caps.prober_supports_first_video_frame());
         // Populated from the host rather than left at the "nothing probed"
         // default; on Linux the OS version is read too.
         assert_eq!(caps.platform(), Platform::current());
@@ -1692,6 +1822,79 @@ mod tests {
             .await
             .expect("discovery succeeds");
         assert_eq!(paths.ffprobe, ffprobe);
+    }
+
+    /// A fake ffmpeg that records its arguments and, like Jellyfin's build, prints
+    /// the pause key's help only after reading `?` and then `q` on stdin.
+    #[cfg(unix)]
+    fn write_fake_pause_ffmpeg(dir: &Path, prints_help: bool) -> PathBuf {
+        let path = dir.join("ffmpeg");
+        let help = if prints_help {
+            "p      pause transcoding"
+        } else {
+            "Press [q] to stop"
+        };
+        crate::test_exec::stub_script(
+            &path,
+            &format!(
+                "echo \"$*\" > '{}/args'\nkeys=$(dd bs=1 count=2 2>/dev/null)\n\
+                 if [ \"$keys\" = '?q' ]; then echo '{help}' >&2; fi\n",
+                dir.display()
+            ),
+        );
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_probe_runs_upstreams_realtime_form_and_reads_the_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = write_fake_pause_ffmpeg(tmp.path(), true);
+        assert!(probe_runtime_pause(&ffmpeg).await);
+        // EncoderValidator.CheckSupportedRuntimeKey at v12.2: real-time and 5 s at most,
+        // so it cannot finish before ffmpeg first polls stdin; `q` stops it at once.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("args"))
+                .unwrap()
+                .trim(),
+            "-hide_banner -re -f lavfi -i nullsrc=s=1x1:r=1:d=5 -f null -"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_probe_is_false_without_the_exact_help_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = write_fake_pause_ffmpeg(tmp.path(), false);
+        assert!(!probe_runtime_pause(&ffmpeg).await);
+        assert!(!probe_runtime_pause(&tmp.path().join("missing")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probed_pause_keys_follow_upstreams_version_gate() {
+        use ferrofin_mediaencoding::transcoding::throttler::{PauseKeySlot, PauseKeys};
+        let with_dir = tempfile::tempdir().unwrap();
+        let without_dir = tempfile::tempdir().unwrap();
+        let with_key = write_fake_pause_ffmpeg(with_dir.path(), true);
+        let without_key = write_fake_pause_ffmpeg(without_dir.path(), false);
+        for (ffmpeg, version, expected) in [
+            (
+                &with_key,
+                FfmpegVersion::new(8, 0),
+                Some(PauseKeys::Patched),
+            ),
+            (
+                &without_key,
+                FfmpegVersion::new(6, 1),
+                Some(PauseKeys::Legacy),
+            ),
+            (&without_key, FfmpegVersion::new(7, 0), None),
+        ] {
+            let slot = PauseKeySlot::default();
+            probe_pause_keys(ffmpeg.clone(), Some(version), slot.clone()).await;
+            assert_eq!(slot.get(), expected, "{version:?} via {ffmpeg:?}");
+        }
     }
 
     #[test]

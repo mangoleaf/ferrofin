@@ -54,6 +54,7 @@
 // is allowed for this module.
 #![allow(clippy::assigning_clones)]
 
+use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -78,12 +79,28 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, MediaSourceManager, UserDataManager,
 };
-use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow};
 use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
+
+/// How the projected rows were read, which decides what upstream had loaded
+/// on them before projecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRead {
+    /// `RetrieveItem`: one row by id, provider ids always included
+    /// (`BaseItemRepository.cs:825-829`); projected as `GetBaseItemDto`.
+    ById,
+    /// A list query: provider ids only for `ItemFields.ProviderIds`
+    /// (`ApplyNavigations`, :442-445); projected as `GetBaseItemDtos`.
+    List,
+    /// A playlist's or box set's members: `Folder.ResolveLinkedChildren` with
+    /// every field (v12.2 Folder.cs:1819-1873), or a box set's per-member
+    /// `GetLinkedChild` by id; projected as `GetBaseItemDtos`.
+    LinkedChildren,
+}
 
 /// Relation rows bulk-loaded for a whole page of items, so `build_dto` needs
 /// no per-item queries for them (list endpoints); absent entries mean "no rows"
@@ -92,13 +109,16 @@ use crate::item_type_lookup::kind_from_type_name;
 struct Prefetched {
     /// Counts of owned extras, loaded only when either count field is requested.
     extra_counts: HashMap<Uuid, ExtraCounts>,
+    /// The configured `PathSubstitutions`, read once per page when the `Path`
+    /// or `MediaSources` field is requested.
+    path_substitutions: Vec<PathSubstitution>,
     /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
     user_data: HashMap<Uuid, UserItemDataDto>,
     /// Media streams per item id (populated when EITHER the `MediaStreams` or
     /// the `MediaSources` field is requested), so a page builds them in one
-    /// query instead of N. Read three times — see [`take_or_clone`].
+    /// query instead of N. Read up to three times — see [`take_or_clone`].
     media_streams: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaStream>>,
     /// Media attachments per item id (when `MediaSources` is requested).
     media_attachments: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaAttachment>>,
@@ -132,15 +152,16 @@ struct Prefetched {
     /// Image rows per *person* id, for the whole page's cast/crew at once, so the
     /// primary-image tag lookup does not re-query per person per item.
     person_images: HashMap<Uuid, Vec<ItemImageInfo>>,
-    /// `ItemValues` id per clean value, bucketed by value type, for every
-    /// studio/genre/artist name across the page, so `attach_studios`/`_genres`/
-    /// `_artists` resolve from memory instead of a query per name. Nested (not
-    /// keyed by a `(i32, String)` tuple) so a lookup borrows the clean `&str`
+    /// By-name item id per clean name, bucketed by the by-name kind (`Studio`,
+    /// `Genre`, `MusicGenre`, `MusicArtist`), for every studio/genre/artist name
+    /// across the page, so `attach_studios`/`_genres`/`_artists` resolve from
+    /// memory instead of a query per name. Nested (not keyed by a
+    /// `(BaseItemKind, String)` tuple) so a lookup borrows the clean `&str`
     /// instead of allocating a key per name per item.
-    value_ids: HashMap<i32, HashMap<String, Uuid>>,
+    by_name_ids: HashMap<BaseItemKind, HashMap<String, Uuid>>,
     /// The clean value ([`crate::text_util::get_clean_value`]) of every distinct
     /// studio/genre/artist name on the page, computed once by the prefetch that
-    /// already had to compute it to build `value_ids`. `Prefetched::value_id`
+    /// already had to compute it to build `by_name_ids`. `Prefetched::by_name_id`
     /// reads it instead of re-cleaning the same name once per item.
     clean_values: HashMap<String, String>,
     /// Chapters per item id (populated only when the `Chapters` field is requested).
@@ -171,9 +192,27 @@ struct Prefetched {
     /// a user, on a page holding versions); `None` means every one.
     version_visible: Option<std::collections::HashSet<Uuid>>,
     /// The user's data for the page's version groups (populated only for a
-    /// user, with `MediaSources`, on a page holding versions), which puts the
-    /// version being resumed first.
+    /// user, with `MediaSources` or user data, on a page holding versions),
+    /// which puts the version being resumed first.
     version_user_data: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto>,
+    /// For each page video with versions (and user data, for a user), the
+    /// version played last, whose completion its `UserData` takes
+    /// (`GetResumeUserDataBatch`).
+    version_resume: HashMap<Uuid, crate::video_versions::VersionResumeData>,
+    /// The `(AudioStreamIndex, SubtitleStreamIndex)` the user remembers for
+    /// each page video (populated only for a user, with `MediaSources`; an
+    /// item remembering neither is absent) — `SetDefaultAudioAndSubtitle
+    /// StreamIndices`' `GetUserData(user, item)`, read once for the page.
+    remembered_streams: HashMap<Uuid, (Option<i32>, Option<i32>)>,
+    /// `OriginalLanguage` per *series* id, for the page's episodes that have
+    /// none of their own (populated only for a user, with
+    /// `MediaSources`): their inherited original language, which the default
+    /// audio stream follows.
+    series_original_languages: HashMap<Uuid, String>,
+    /// The user's playback permissions (populated only for a user, with
+    /// `MediaSources`), which overwrite each source's `SupportsTranscoding`/
+    /// `SupportsDirectStream` (`MediaSourceManager.cs:409-417`).
+    playback_permissions: Option<ferrofin_traits::library::PlaybackPermissions>,
     /// How many alternate versions each primary has (populated when either
     /// the `MediaSources` or the `MediaSourceCount` field is requested; a
     /// primary with none is absent). Keyed by the PRIMARY, which for a page
@@ -229,9 +268,11 @@ struct Prefetched {
 /// **Only safe where no reader of that id remains after this point.** For most
 /// maps that is trivially true — they have exactly one read site, keyed by the
 /// item's own id. `media_streams` is the exception and needs care: it is read
-/// three times (the `MediaSources` block, once more there per merged alternate
-/// keyed by the *alternate's* id, and the `MediaStreams` field). It may be
-/// drained ONLY at the last of those, the `MediaStreams` field, and only when
+/// up to three times (the `MediaSources` block, once more there per merged
+/// alternate keyed by the *alternate's* id, and the `MediaStreams` field — which
+/// reads the item's own source instead when the DTO has one, and the map only
+/// otherwise). It may be drained ONLY at the last of those, the `MediaStreams`
+/// field, and only when
 /// `repeated` also folds in `Prefetched::alt_referenced` — otherwise a page item
 /// that lists this id as its alternate is projected later and finds the entry
 /// gone. Do not drain it at the `MediaSources` block: that read comes first, and
@@ -252,8 +293,9 @@ impl Prefetched {
     /// from that exact function, and a name the prefetch never saw (an unpopulated
     /// `Prefetched`, or a name reached outside the collected fields) falls back
     /// to computing it. Never normalize differently here — the clean value is the
-    /// join key against the stored `ItemValues.CleanValue` column, so a divergence
-    /// silently empties Genres/Studios/Artists.
+    /// join key against the stored `BaseItems.CleanName` (and the fallback's
+    /// `ItemValues.CleanValue`) column, so a divergence silently empties or
+    /// misdirects Genres/Studios/Artists.
     fn clean_key<'a>(&'a self, name: &str) -> std::borrow::Cow<'a, str> {
         self.clean_values.get(name).map_or_else(
             || std::borrow::Cow::Owned(crate::text_util::get_clean_value(name)),
@@ -261,30 +303,44 @@ impl Prefetched {
         )
     }
 
-    /// The `ItemValues` id stored for an already-cleaned value under `value_type`,
-    /// or `None` when the page's prefetch found no such row.
-    fn lookup_clean(&self, value_type: i32, clean: &str) -> Option<Uuid> {
-        self.value_ids.get(&value_type)?.get(clean).copied()
+    /// The `kind` by-name item id for an already-cleaned name, or `None` when the
+    /// page's prefetch found none.
+    fn lookup_clean(&self, kind: BaseItemKind, clean: &str) -> Option<Uuid> {
+        self.by_name_ids.get(&kind)?.get(clean).copied()
     }
 
-    /// [`Self::lookup_clean`] with the nil id for a missing row — exactly what the
-    /// per-name lookup resolved a missing row to.
-    fn value_id_clean(&self, value_type: i32, clean: &str) -> Uuid {
-        self.lookup_clean(value_type, clean)
+    /// A studio/genre id from the prefetched map. A `MusicGenre` with no row
+    /// takes the derived id its row is created with (`music_genre_row`,
+    /// `ensure_by_name_item`); a `Genre`/`Studio` with neither a row nor a
+    /// stored value row takes the nil id.
+    fn by_name_id(&self, kind: BaseItemKind, name: &str) -> Uuid {
+        self.lookup_clean(kind, &self.clean_key(name))
+            .or_else(|| {
+                (kind == BaseItemKind::MusicGenre)
+                    .then(|| crate::item_type_lookup::derive_item_id(kind, name.trim()))
+                    .flatten()
+            })
             .unwrap_or_else(Uuid::nil)
-    }
-
-    /// A studio/genre/artist id from the prefetched `ItemValues` map — the nil
-    /// id when the name has no stored value row, exactly as the per-name lookup
-    /// resolved a missing row.
-    fn value_id(&self, value_type: i32, name: &str) -> Uuid {
-        self.value_id_clean(value_type, &self.clean_key(name))
     }
 }
 use crate::kinds;
 
-/// `(ItemValues.Type, clean value)` keys to resolve.
-type CleanKeys = Vec<(i32, String)>;
+/// The by-name kind an item's `GenreItems` link to: `MusicGenre` for a music
+/// owner, `Genre` otherwise (C# `DtoService.GetGenreId`).
+///
+/// "Music owner" is the scanner's test (`ItemTypeLookup.MusicGenreTypes`, the
+/// one that picks which row a genre gets), not C#'s `is IHasMusicGenres`. They
+/// differ only for `AudioBook`, whose genres both trees store as `Genre` rows:
+/// upstream links them to the `MusicGenre` id, which has a row only when a
+/// music item carries the same genre; Ferrofin links them to their `Genre` row.
+/// Jellyfin bug not ported.
+fn genre_kind(item: &BaseItemEntity) -> BaseItemKind {
+    if crate::item_type_lookup::MUSIC_GENRE_TYPES.contains(&item.type_.as_str()) {
+        BaseItemKind::MusicGenre
+    } else {
+        BaseItemKind::Genre
+    }
+}
 
 /// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
 /// multiple" (backdrops/chapters) — the single-image loop skips
@@ -567,15 +623,17 @@ fn client_kind(kind: BaseItemKind) -> BaseItemKind {
     }
 }
 
-/// Whether this row enters the C# `AttachUserSpecificInfo` folder branch — the
-/// *runtime* `BaseItem.IsFolder`, not just the stored column. Pure by-name kinds
-/// (`Genre`/`MusicGenre`/`Studio`/`Person`/`Year`) are `BaseItem` subclasses in
-/// C#, never folders, whatever the stored flag says (Ferrofin materializes their
-/// rows with `IsFolder = 1`). `MusicArtist` is the one by-name kind that *is* a
-/// C# `Folder`, but overrides `IsFolder => !IsAccessedByName`, and
-/// `IsAccessedByName => ParentId.IsEmpty()` — so only a physically-parented
-/// artist folder counts as a folder here.
-fn folder_emits_counts(item: &BaseItemEntity) -> bool {
+/// The C# computed `BaseItem.IsFolder` property, ported: the DTO's and the
+/// search hint's `IsFolder`, and the gate of the `AttachUserSpecificInfo`
+/// folder branch. Pure by-name kinds (`Genre`/`MusicGenre`/`Studio`/`Person`/
+/// `Year`) are `BaseItem` subclasses in C#, never folders. `MusicArtist` is the
+/// one by-name kind that *is* a C# `Folder`, but overrides
+/// `IsFolder => !IsAccessedByName`, and `IsAccessedByName => ParentId.IsEmpty()`
+/// — so only a physically-parented artist folder counts as a folder here.
+/// It is the stored column, forced false for the pure by-name kinds and for a
+/// parentless artist, whatever that column says (earlier builds stored 1 on
+/// by-name rows; migration 0043 repairs the column for the SQL that reads it).
+pub(crate) fn runtime_is_folder(item: &BaseItemEntity) -> bool {
     if !item.is_folder {
         return false;
     }
@@ -594,12 +652,45 @@ fn folder_emits_counts(item: &BaseItemEntity) -> bool {
     }
 }
 
-/// `100 × position ÷ runtime` as the C# double division (both counts are tick
-/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact
-/// enough for a display percentage).
+/// A leaf's played numbers — `BaseItem.FillUserDataDtoValues` (v12.2
+/// BaseItem.cs:2746-2767): a positive resume position over a known runtime
+/// becomes `PlayedPercentage`.
+pub(crate) fn fill_leaf_played_percentage(ud: &mut UserItemDataDto, run_time_ticks: Option<i64>) {
+    if ud.playback_position_ticks > 0
+        && let Some(runtime) = run_time_ticks.filter(|rt| *rt > 0)
+    {
+        ud.played_percentage = Some(percent_of_ticks(ud.playback_position_ticks, runtime));
+    }
+}
+
+/// A folder's played numbers from its leaf counts — the `SupportsPlayedStatus`
+/// half of `Folder.FillUserDataDtoValues` (v12.2 Folder.cs:2067-2081).
+///
+/// The played state is derived from the COUNTS, with no field gate (10.11.8
+/// keyed it off the `RecursiveItemCount` DTO field, which is why a seasons
+/// page without that field lost its `PlayedPercentage`):
+///   `if (totalCount > 0) { PlayedPercentage = playedCount / (double)totalCount * 100;
+///    Played = playedCount >= totalCount; } else { Played = true; }`
+pub(crate) fn fill_folder_played(
+    ud: &mut UserItemDataDto,
+    c: ferrofin_traits::persistence::PlayedAndTotal,
+) {
+    ud.unplayed_item_count = Some(c.total - c.played);
+    if c.total > 0 {
+        ud.played_percentage = Some(f64::from(c.played) / f64::from(c.total) * 100.0);
+        ud.played = c.played >= c.total;
+    } else {
+        ud.played = true;
+    }
+}
+
+/// `100 × (position ÷ runtime)` in C#'s order — divide, then scale
+/// (`pct = PlaybackPositionTicks / (double)RunTimeTicks; 100 * pct`) — so the
+/// double is the one Jellyfin reports to the last digit (both counts are tick
+/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact).
 #[allow(clippy::cast_precision_loss)]
 fn percent_of_ticks(position: i64, runtime: i64) -> f64 {
-    100.0 * position as f64 / runtime as f64
+    100.0 * (position as f64 / runtime as f64)
 }
 
 /// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
@@ -621,30 +712,45 @@ fn empty_user_data_dto(item_id: Uuid) -> UserItemDataDto {
     }
 }
 
-/// Sets `ChildCount` on a folder DTO from the prefetched per-parent counts.
+/// Sets `ChildCount` on a folder DTO from the prefetched per-folder counts
+/// ([`FerrofinDtoService::child_count_batch`]).
 ///
-/// Port of the `AttachUserSpecificInfo` ChildCount attach + `GetChildCount`:
-/// only folders get a count, and an already-set value is kept (`??=`).
-/// `ICollectionFolder` and `UserView` rows skip the count: C# returns
-/// `Random.Shared.Next(1, 10)` there (DtoService.cs:649-656, "too slow to
-/// calculate for top level folders on a per-user basis — just return something
-/// so that apps that are expecting a value won't think the folders are empty");
-/// an id-derived 1..=9 honors the same contract (nonzero, meaningless) without a
-/// rand dependency. `ICollectionFolder` covers `BasePluginFolder`
-/// (BasePluginFolder.cs:12) too, hence the playlists folder.
+/// Port of the `AttachUserSpecificInfo` ChildCount attach + `GetChildCount`
+/// (v12.2 `DtoService.cs:653-656,797-810`): only folders get a count, and an
+/// already-set value is kept (`??=`). Libraries and views are counted too, since
+/// 12.1 (jellyfin/jellyfin#17881), where 12.0 returned a random 1..10.
 fn attach_child_count(dto: &mut BaseItemDto, item: &BaseItemEntity, counts: &HashMap<Uuid, i32>) {
     if dto.child_count.is_some() || !item.is_folder {
         return;
     }
-    let id = row_id(item);
-    dto.child_count = Some(match row_kind(item) {
-        BaseItemKind::CollectionFolder
-        | BaseItemKind::UserView
-        | BaseItemKind::BasePluginFolder
-        | BaseItemKind::ManualPlaylistsFolder
-        | BaseItemKind::PlaylistsFolder => i32::from(id.as_bytes()[15] % 9) + 1,
-        _ => counts.get(&id).copied().unwrap_or(0),
-    });
+    dto.child_count = Some(counts.get(&row_id(item)).copied().unwrap_or(0));
+}
+
+/// A view's `DisplayParentId`, else its `ParentId`, when set: the folder
+/// `UserView.GetItemsInternal` browses and `GetChildCountSourceIds` follows.
+fn view_parent_id(view: &BaseItemEntity) -> Option<Uuid> {
+    crate::item_data::parse_data(view.data.as_deref())
+        .get("DisplayParentId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())
+        .or_else(|| {
+            view.parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        })
+}
+
+/// `UserView.EnableOriginalFolder` (`UserView.cs:29-37,182-185`): the view
+/// types that show a library's own folder tree. A view of one of these, or of
+/// `movies`/`tvshows`, that stands for one library counts that library's
+/// children; any other view counts its own browse.
+fn enables_original_folder(view_type: Option<&str>) -> bool {
+    matches!(
+        view_type,
+        Some("books" | "musicvideos" | "homevideos" | "photos" | "music" | "boxsets")
+    )
 }
 
 /// The `CollectionType` of an `IHasCollectionType` row (`DtoService`
@@ -692,7 +798,7 @@ fn split_multi_str(stored: Option<&str>) -> impl Iterator<Item = &str> {
 
 /// Parses a stored `MediaType` string into the enum, defaulting to
 /// [`MediaType::Unknown`].
-fn parse_media_type(stored: Option<&str>) -> MediaType {
+pub(crate) fn parse_media_type(stored: Option<&str>) -> MediaType {
     match stored {
         Some("Video") => MediaType::Video,
         Some("Audio") => MediaType::Audio,
@@ -705,7 +811,7 @@ fn parse_media_type(stored: Option<&str>) -> MediaType {
 /// Maps a stored `ExtraType` discriminant onto the enum, or `None` for a value
 /// with no corresponding extra type (the `0`/`Unknown` sentinel and any
 /// out-of-range discriminant).
-fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
+pub(crate) fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
     Some(match disc {
         1 => ExtraType::Clip,
         2 => ExtraType::Trailer,
@@ -1201,6 +1307,15 @@ pub struct FerrofinDtoService {
     /// is `Clone` and the composition root wires the seam after the clones
     /// exist — every copy must see the value once it lands.
     live_tv: Arc<OnceLock<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>>,
+    /// The server configuration whose `PathSubstitutions` the `Path` field and
+    /// the static media sources go through (`DtoService.GetMappedPath`).
+    /// Without it, paths are served as stored.
+    configuration: Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
+    /// The localization the per-user default-stream selection normalizes
+    /// languages through (`MediaSourceManager.NormalizeLanguage`) — the same
+    /// one the media-source manager holds, so the item DTO and `PlaybackInfo`
+    /// select alike. `None` (unit tests) compares languages as given.
+    localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinDtoService {
@@ -1242,7 +1357,33 @@ impl FerrofinDtoService {
             virtual_paths: VirtualPathExpander::identity(),
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
+            localization: None,
+            configuration: None,
         }
+    }
+
+    /// Installs the server configuration whose `PathSubstitutions` map the
+    /// `Path` field and the media sources' paths. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_configuration(
+        mut self,
+        configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.configuration = Some(configuration);
+        self
+    }
+
+    /// Installs the localization the `MediaSources`' default-stream selection
+    /// normalizes languages through. Called once by the composition root,
+    /// with the media-source manager's.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
+        self
     }
 
     /// Attaches the Live TV manager whose `AddChannelInfo` finishes a channel
@@ -1275,11 +1416,11 @@ impl FerrofinDtoService {
     }
 
     /// Loads an item's image rows from `BaseItemImageInfos`, ordered by type then
-    /// by row id for a stable presentation order.
+    /// by insertion order (`rowid`), the order the image routes address them.
     async fn load_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
         let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
             r#"SELECT * FROM "BaseItemImageInfos"
-               WHERE "ItemId" = ?1 ORDER BY "ImageType", "Id""#,
+               WHERE "ItemId" = ?1 ORDER BY "ImageType", rowid"#,
         )
         .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
@@ -1307,12 +1448,9 @@ impl FerrofinDtoService {
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!(
-                r#"SELECT * FROM "BaseItemImageInfos"
-                   WHERE "ItemId" IN ({placeholders})
-                   ORDER BY "ItemId", "ImageType", "Id""#,
-            );
-            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(sql));
+            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
+                crate::item_repository::images_of_items_sql(&placeholders),
+            ));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -1612,101 +1750,62 @@ impl FerrofinDtoService {
         Ok(graph)
     }
 
-    /// Resolves many `(value type, CLEAN value)` pairs to their `ItemValues` ids
-    /// in one query — the page's studios/genres/artists — bucketed by type.
-    /// Pairs with no row are simply absent.
+    /// Resolves many `(by-name kind, CLEAN name)` pairs — the page's
+    /// studios/genres/artists — to the by-name item ids their links open, in
+    /// one query per family, bucketed by kind. Pairs with no id are absent.
     ///
     /// The caller passes values already normalized by
     /// [`crate::text_util::get_clean_value`] (the prefetch computes each name's
     /// clean form once and caches it for the projection); this must stay the
-    /// same normalization the stored `ItemValues.CleanValue` column holds.
+    /// same normalization the stored `CleanName`/`CleanValue` columns hold.
     ///
-    /// Port of the `_libraryManager.GetGenreId`/`GetStudioId`/… helpers, which
-    /// hash-map a clean value to a stable id; here the stored `ItemValues` row
-    /// carries the fallback id. Adopted music libraries can have a distinct
-    /// physical artist row, so artist links must prefer that browsable item's id.
-    async fn resolve_value_ids(
+    /// Port of `_libraryManager.GetGenreId`/`GetMusicGenreId`/`GetStudioId`
+    /// and `LinkedChildrenService.FindArtists`. Upstream hashes a name to the
+    /// by-name item's id; here the item is found by type and clean name (see
+    /// [`crate::item_repository::by_name_ids_by_clean_name`]), because a
+    /// Ferrofin-scanned row carries its `ItemValues` id, an adopted row
+    /// Jellyfin's path-derived id, and a `MusicGenre` row a derived id.
+    async fn resolve_by_name_ids(
         &self,
-        clean_pairs: &[(i32, String)],
-    ) -> Result<HashMap<i32, HashMap<String, Uuid>>, ServiceError> {
-        let mut map: HashMap<i32, HashMap<String, Uuid>> = HashMap::new();
-        // Dedup the (type, clean) keys we need.
-        let mut want: std::collections::HashSet<(i32, String)> = std::collections::HashSet::new();
-        for (t, clean) in clean_pairs {
-            want.insert((*t, clean.clone()));
-        }
-        if want.is_empty() {
-            return Ok(map);
-        }
-        // Artists and album artists link to an actual `MusicArtist` item found by
-        // its clean name (`LinkedChildrenService.FindArtists`), independent of
-        // the `ItemValues` rows; a name with no such item has no id at all.
-        let (artist_keys, keys): (CleanKeys, CleanKeys) = want
+        clean_pairs: &[(BaseItemKind, String)],
+    ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
+        // Artist names link to an actual `MusicArtist` item found by its clean
+        // name (`LinkedChildrenService.FindArtists`), and a music video's album
+        // to the `MusicAlbum` of that name (`SetMusicVideoProperties`) — both
+        // independent of the `ItemValues` rows; a name with no such item has
+        // no id at all.
+        const ITEM_KINDS: [BaseItemKind; 2] = [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum];
+        // Dedup the (kind, clean) keys we need.
+        let want: std::collections::HashSet<&(BaseItemKind, String)> = clean_pairs.iter().collect();
+        let (item_keys, keys): (Vec<_>, Vec<_>) = want
             .into_iter()
-            .partition(|(value_type, _)| matches!(value_type, 0 | 1));
-        let artist_cleans: Vec<&String> = artist_keys
-            .iter()
-            .map(|(_, clean)| clean)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let artists =
-            crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
+            .partition(|(kind, _)| ITEM_KINDS.contains(kind));
+        let keys: Vec<(BaseItemKind, String)> = keys.into_iter().cloned().collect();
+        let mut map = crate::item_repository::by_name_ids_by_clean_name(&self.db, &keys).await?;
+        for kind in ITEM_KINDS {
+            let cleans: Vec<&String> = item_keys
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, clean)| clean)
+                .collect();
+            let type_name = crate::item_type_lookup::stored_type_name(kind).ok_or_else(|| {
+                ServiceError::backend(format!("no stored type name for {kind:?}"))
+            })?;
+            let ids = crate::item_repository::item_ids_by_clean_name(&self.db, type_name, &cleans)
                 .await?;
-        for (value_type, clean) in artist_keys {
-            if let Some(id) = artists.get(&clean) {
-                map.entry(value_type).or_default().insert(clean, *id);
-            }
-        }
-        // Two host variables per key.
-        for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 2) {
-            let ph = (0..chunk.len())
-                .map(|_| "(?, ?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                r#"SELECT iv."Type", iv."CleanValue", iv."ItemValueId"
-                   FROM "ItemValues" iv
-                   WHERE (iv."Type", iv."CleanValue") IN ({ph})"#,
-            );
-            let mut query = sqlx::query_as::<_, (i32, String, String)>(sqlx::AssertSqlSafe(sql));
-            for (t, clean) in chunk {
-                query = query.bind(*t).bind(clean);
-            }
-            for (t, clean, id) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
-                if let Ok(uuid) = Uuid::parse_str(&id) {
-                    map.entry(t).or_default().insert(clean, uuid);
-                }
-            }
+            map.insert(kind, ids);
         }
         Ok(map)
     }
 
-    /// `DtoService.GetPrimaryImageAspectRatio` (v12 :1745-1775) over a set of
-    /// already-loaded image rows: `None` when there is no primary image; the
-    /// kind's `GetDefaultPrimaryImageAspectRatio()` for a remote image or one
-    /// whose dimensions cannot be read (`Series` 2/3, `BaseItem` 0 — emitted
-    /// as `0`, as upstream does); else width / height.
+    /// [`primary_image_aspect_ratio`] through this service's image processor.
     async fn primary_aspect_ratio(
         &self,
         item_id: Uuid,
         kind: BaseItemKind,
         images: &[ItemImageInfo],
     ) -> Option<f64> {
-        let primary = images.iter().find(|i| i.image_type == ImageType::Primary)?;
-        if !primary.is_local_file() {
-            return Some(kinds::default_primary_image_aspect_ratio(kind));
-        }
-        match self
-            .image_processor
-            .get_item_image_dimensions(item_id, primary)
-            .await
-        {
-            Ok(dim) if dim.width > 0 && dim.height > 0 => {
-                Some(f64::from(dim.width) / f64::from(dim.height))
-            }
-            _ => Some(kinds::default_primary_image_aspect_ratio(kind)),
-        }
+        primary_image_aspect_ratio(self.image_processor.as_ref(), item_id, kind, images).await
     }
 
     /// Computes the cache tag for one image, tolerating processor failures
@@ -1765,36 +1864,47 @@ impl FerrofinDtoService {
 
         let mut list = Vec::with_capacity(people.len());
         for person in people {
-            // The by-name item id (one per name, what favorites key on);
-            // pre-unification rows fall back to the credit id.
-            //
-            // A credit that resolves to neither has no id a client could follow.
-            // C# `AttachPeople` only ever adds a `BaseItemPerson` once the name
+            // The by-name `Person` item id (one per name, what favorites key
+            // on). C# `AttachPeople` adds a `BaseItemPerson` only once the name
             // resolved to a `Person` item (`list.Add` sits inside the
-            // `dictionary.TryGetValue` branch), so dropping the credit is the
-            // upstream behaviour — emitting one carrying the nil GUID would give
-            // the client a `People[].Id` that 404s on every follow-up request.
+            // `dictionary.TryGetValue` branch): a credit without one has no id a
+            // client could follow, its `Peoples` row id being no item id.
             let Some(person_id) = prefetched
                 .person_ids_by_name
                 .get(person.name.as_str())
                 .copied()
-                .or_else(|| Uuid::parse_str(&person.id).ok())
             else {
-                tracing::warn!(
-                    person = %person.name,
-                    "skipping credit: stored person id is not a guid"
-                );
                 continue;
             };
-            // Resolve the person's primary image tag (from the materialized Person
-            // item's image rows) so the client renders cast/crew artwork.
+            // `GetTagAndFillBlurhash(dto, entity, ImageType.Primary)`: the
+            // person's primary image tag, its blurhash recorded on the item.
             let primary_image_tag = match images_by_person
                 .get(&person_id)
                 .and_then(|images| images.iter().find(|i| i.image_type == ImageType::Primary))
             {
-                Some(primary) => self.image_tag(person_id, primary).await,
+                Some(primary) => self.tag_and_fill_blur_hash(dto, person_id, primary).await,
                 None => None,
             };
+            // Only the blurhash of the person's own image, under every image
+            // type the item's map has (C# copies the map, keeping the entries
+            // whose tag is the person's).
+            let image_blur_hashes = dto.image_blur_hashes.as_ref().map(|hashes| {
+                hashes
+                    .iter()
+                    .map(|(image_type, by_tag)| {
+                        let own: HashMap<String, String> = by_tag
+                            .iter()
+                            .filter(|(tag, _)| {
+                                primary_image_tag
+                                    .as_deref()
+                                    .is_some_and(|own| own.eq_ignore_ascii_case(tag))
+                            })
+                            .map(|(tag, hash)| (tag.clone(), hash.clone()))
+                            .collect();
+                        (*image_type, own)
+                    })
+                    .collect()
+            });
             list.push(BaseItemPerson {
                 name: Some(person.name.clone()),
                 id: person_id,
@@ -1803,10 +1913,10 @@ impl FerrofinDtoService {
                     .person_type
                     .as_deref()
                     .map_or(ferrofin_model::data::PersonKind::Unknown, |t| {
-                        person_kind_from_str(t)
+                        ferrofin_model::data::PersonKind::from_stored(t)
                     }),
                 primary_image_tag,
-                image_blur_hashes: None,
+                image_blur_hashes,
             });
         }
         dto.people = Some(list); // Jellyfin emits [] when People is requested but there are none
@@ -1850,7 +1960,7 @@ impl FerrofinDtoService {
         let pairs = studios
             .into_iter()
             .map(|name| NameGuidPair {
-                id: prefetched.value_id(3, &name), // 3 = Studios
+                id: prefetched.by_name_id(BaseItemKind::Studio, &name),
                 name: Some(name),
             })
             .collect();
@@ -1859,22 +1969,14 @@ impl FerrofinDtoService {
 
     /// Attaches the item's genres as names and as name/id pairs (port of the
     /// `Genres`/`AttachGenreItems` block).
-    fn attach_genres(
-        dto: &mut BaseItemDto,
-        item: &BaseItemEntity,
-        kind: BaseItemKind,
-        prefetched: &Prefetched,
-    ) {
+    fn attach_genres(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
         let genres = split_multi(item.genres.as_deref());
-        // Music items resolve against the MusicGenre value space; everything else
-        // against the plain Genre space. Both are stored as `ItemValueType::Genre`
-        // (2) in this schema, so the id lookup is the same table.
-        let _is_music_genres = kinds::is_music(kind);
+        let kind = genre_kind(item);
         let pairs = genres
             .iter()
             .map(|name| NameGuidPair {
                 name: Some(name.clone()),
-                id: prefetched.value_id(2, name), // 2 = Genre
+                id: prefetched.by_name_id(kind, name),
             })
             .collect();
         dto.genre_items = Some(pairs);
@@ -1882,8 +1984,8 @@ impl FerrofinDtoService {
     }
 
     /// Attaches artist / album-artist names and name-id pairs (port of the
-    /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are resolved from
-    /// the shared `ItemValues` table (`Artist`/`AlbumArtist` value types).
+    /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are the
+    /// `MusicArtist` rows found by clean name.
     fn attach_artists(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
         // The distinct, non-blank names that match an actual `MusicArtist` item
         // (`GetArtists` → `FindArtists`), each paired with that item's id; a name
@@ -1895,10 +1997,8 @@ impl FerrofinDtoService {
                 .filter(|name| !name.trim().is_empty() && seen.insert(name.as_str()))
                 .filter_map(|name| {
                     let clean = prefetched.clean_key(name);
-                    // Both name kinds resolve to the same `MusicArtist` item.
                     prefetched
-                        .lookup_clean(0, &clean)
-                        .or_else(|| prefetched.lookup_clean(1, &clean))
+                        .lookup_clean(BaseItemKind::MusicArtist, &clean)
                         .map(|id| NameGuidPair {
                             name: Some(name.clone()),
                             id,
@@ -2245,18 +2345,22 @@ impl FerrofinDtoService {
                 dto.user_data = take_or_clone(&mut prefetched.user_data, &item_id, repeated);
                 // C# `BaseItem.FillUserDataDtoValues`: a positive resume position
                 // over a known runtime becomes `PlayedPercentage` — the value
-                // client progress bars render on posters and resume rows.
-                if !item.is_folder
+                // client progress bars render on posters and resume rows. Chosen
+                // by class: `Folder` overrides it without calling the base
+                // (Folder.cs:2024), so a by-name artist never gets one.
+                if !kinds::is_folder(kind)
                     && let Some(ud) = dto.user_data.as_mut()
-                    && ud.playback_position_ticks > 0
-                    && let Some(runtime) = item.run_time_ticks.filter(|rt| *rt > 0)
                 {
-                    ud.played_percentage =
-                        Some(percent_of_ticks(ud.playback_position_ticks, runtime));
+                    fill_leaf_played_percentage(ud, item.run_time_ticks);
+                    // `resumeData?.ApplyTo(dto.UserData)` (DtoService.cs:680):
+                    // a video's completion follows its version played last.
+                    if let Some(resume) = prefetched.version_resume.get(&item_id) {
+                        resume.apply_to(ud);
+                    }
                 }
                 // Folder UserData carries UnplayedItemCount = unplayed leaf
                 // descendants; leaf items leave it unset. The branch keys on the
-                // runtime C# `IsFolder` (`folder_emits_counts`): pure by-name
+                // runtime C# `IsFolder` (`runtime_is_folder`): pure by-name
                 // kinds never enter it, a MusicArtist only when physically
                 // parented.
                 //
@@ -2273,7 +2377,7 @@ impl FerrofinDtoService {
                 // MusicAlbum overrides SupportsPlayedStatus to false while
                 // SupportsUserDataFromChildren stays true. Ferrofin emitted
                 // neither, on any folder.
-                if folder_emits_counts(item)
+                if runtime_is_folder(item)
                     && kinds::supports_user_data_from_children(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
@@ -2293,28 +2397,15 @@ impl FerrofinDtoService {
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
-                    if kinds::supports_played_status(kind) {
-                        let unplayed = c.total - c.played;
-                        let ud = dto
-                            .user_data
-                            .get_or_insert_with(|| empty_user_data_dto(item_id));
-                        ud.unplayed_item_count = Some(unplayed);
-                        // Folder.cs:1983-1990 — the played state is derived from
-                        // the COUNTS, with no field gate (10.11.8 keyed it off
-                        // the `RecursiveItemCount` DTO field, which is why a
-                        // seasons page without that field lost its
-                        // `PlayedPercentage`):
-                        //   if (totalCount > 0) {
-                        //     PlayedPercentage = playedCount / (double)totalCount * 100;
-                        //     Played = playedCount >= totalCount;
-                        //   } else { Played = true; }
-                        if c.total > 0 {
-                            ud.played_percentage =
-                                Some(f64::from(c.played) / f64::from(c.total) * 100.0);
-                            ud.played = c.played >= c.total;
-                        } else {
-                            ud.played = true;
-                        }
+                    if kinds::supports_played_status(
+                        kind,
+                        parse_media_type(item.media_type.as_deref()),
+                    ) {
+                        fill_folder_played(
+                            dto.user_data
+                                .get_or_insert_with(|| empty_user_data_dto(item_id)),
+                            c,
+                        );
                     }
                 }
             }
@@ -2377,10 +2468,10 @@ impl FerrofinDtoService {
         // The value is the folder's own stored runtime — measured: J's
         // MusicAlbum returns CumulativeRunTimeTicks=60000000 next to the
         // RunTimeTicks=60000000.
-        // Both gates key on the runtime `IsFolder` (`folder_emits_counts`):
-        // a by-name Genre row is stored as a folder but is a plain `BaseItem`
-        // upstream, and never enters the branch.
-        let runtime_folder = user.is_some() && folder_emits_counts(item);
+        // Both gates key on the runtime `IsFolder` (`runtime_is_folder`):
+        // a by-name Genre row is a plain `BaseItem` upstream, and never enters
+        // the branch, whatever its stored flag.
+        let runtime_folder = user.is_some() && runtime_is_folder(item);
         if runtime_folder && options.contains_field(ItemFields::CumulativeRunTimeTicks) {
             dto.cumulative_run_time_ticks = item.run_time_ticks;
         }
@@ -2407,7 +2498,7 @@ impl FerrofinDtoService {
         // A Live TV channel IS `IHasMediaSources`, but its `GetMediaSources`
         // override returns the one Placeholder source, not a probed file.
         if options.contains_field(ItemFields::MediaSources) && is_live_tv_channel(kind) {
-            dto.media_sources = Some(vec![ferrofin_model::dto::MediaSourceInfo {
+            let mut source = ferrofin_model::dto::MediaSourceInfo {
                 id: Some(item_id.simple().to_string()),
                 name: item.name.clone(),
                 path: item.path.clone(),
@@ -2415,7 +2506,29 @@ impl FerrofinDtoService {
                 type_: ferrofin_model::dto::MediaSourceType::Placeholder,
                 is_infinite_stream: item.run_time_ticks.is_none(),
                 ..ferrofin_model::dto::MediaSourceInfo::default()
-            }]);
+            };
+            // `GetStaticMediaSources`' per-user tail runs for a channel too
+            // (`MediaSourceManager.cs:405-418`), never with a remembered
+            // selection (`LiveTvChannel.EnableRememberingTrackSelections` is
+            // false), and with the row's media type: Audio for a radio
+            // channel, as `PlaybackInfo` reads it.
+            if let Some(user) = user {
+                let media_type = item.media_type.as_deref();
+                crate::media_source_manager::StreamDefaults {
+                    localization: self.localization.as_deref(),
+                }
+                .apply(
+                    media_type,
+                    &mut source,
+                    user,
+                    (None, None),
+                    item.original_language.as_deref(),
+                );
+                if let Some(permissions) = prefetched.playback_permissions {
+                    permissions.apply(media_type, &mut source);
+                }
+            }
+            dto.media_sources = Some(vec![source]);
         } else if options.contains_field(ItemFields::MediaSources)
             && (kinds::is_video(kind) || kinds::is_audio(kind))
         {
@@ -2433,6 +2546,14 @@ impl FerrofinDtoService {
                     attachments.get(&id).cloned().unwrap_or_default(),
                 )
             });
+            // `GetStaticMediaSources(item, true, user)`: the DTO always asks for
+            // path substitution.
+            for source in &mut sources {
+                crate::media_source_manager::map_source_path(
+                    source,
+                    &prefetched.path_substitutions,
+                );
+            }
             // A version the user may not open is no source for them; the item
             // itself always is (`MediaSourceManager.cs:397-403`).
             if let Some(visible) = &prefetched.version_visible {
@@ -2441,6 +2562,38 @@ impl FerrofinDtoService {
                         .and_then(|id| Uuid::parse_str(id).ok())
                         .is_none_or(|id| id == item_id || visible.contains(&id))
                 });
+            }
+            // The rest of `GetStaticMediaSources`' per-user tail
+            // (`MediaSourceManager.cs:405-418`), as `PlaybackInfo` runs it:
+            // each source gets the user's default audio and subtitle streams
+            // and subtitle scores, then the policy's `Supports*` flags.
+            if let Some(user) = user {
+                let defaults = crate::media_source_manager::StreamDefaults {
+                    localization: self.localization.as_deref(),
+                };
+                let remembered = prefetched
+                    .remembered_streams
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or_default();
+                // `GetInheritedOriginalLanguage()`: an episode without its
+                // own falls back to its series' (`Episode.cs:157-160`; a
+                // season has no sources, so it never gets here).
+                let original_language = item.original_language.as_deref().or_else(|| {
+                    (kind == BaseItemKind::Episode)
+                        .then_some(item.series_id.as_deref())
+                        .flatten()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .and_then(|id| prefetched.series_original_languages.get(&id))
+                        .map(String::as_str)
+                });
+                let media_type = item.media_type.as_deref();
+                for source in &mut sources {
+                    defaults.apply(media_type, source, user, remembered, original_language);
+                    if let Some(permissions) = prefetched.playback_permissions {
+                        permissions.apply(media_type, source);
+                    }
+                }
             }
             let resume = &prefetched.version_user_data;
             crate::video_versions::put_resumed_version_first(item, &mut sources, |id| {
@@ -2533,14 +2686,23 @@ impl FerrofinDtoService {
 
         dto.end_date = item.end_date;
 
-        // Container is always set from the file extension (C# `dto.Container = item.Container`,
-        // which resolution fills from the extension) — folders have none, so it stays absent.
-        dto.container = item
-            .path
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).extension())
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase);
+        // `dto.Container = item.Container` (`DtoService.cs:1125`): the container
+        // the probe stored (`FFProbeVideoInfo`/`AudioFileProber` are its only
+        // writers), so folders, by-name items, photos and books have none. A
+        // video or audio file not probed yet answers its extension where
+        // upstream answers null, so it keeps a label: one scanned before audio
+        // probes stored their container, or on a server without ffprobe.
+        dto.container = crate::item_data::stored_container(item.data.as_deref()).or_else(|| {
+            // A disc rip's path is its folder (`/m/Movie.2010`), which has
+            // no extension to give.
+            let media = matches!(item.media_type.as_deref(), Some("Video" | "Audio"));
+            (media && !item.is_folder && !crate::item_data::path_is_directory(item))
+                .then_some(item.path.as_deref())
+                .flatten()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+        });
 
         // Gated scalar defaults Jellyfin emits when the field is requested (item_detail, not lists).
         if options.contains_field(ItemFields::EnableMediaSourceDisplay) {
@@ -2635,23 +2797,16 @@ impl FerrofinDtoService {
         }
 
         if options.contains_field(ItemFields::Genres) {
-            Self::attach_genres(dto, item, kind, prefetched);
+            Self::attach_genres(dto, item, prefetched);
         }
 
         dto.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
         dto.parent_index_number = item.parent_index_number.and_then(|n| i32::try_from(n).ok());
 
-        // Jellyfin's `IsFolder` is a per-type property, not a stored flag: a
-        // Genre/Studio/Person is `BaseItem` (not a folder) even though Ferrofin stores
-        // `is_folder=true` for some of them. For by-name items use the kind-faithful
-        // value (`kinds::is_folder` — false for Genre/Studio/Person/Year/MusicGenre,
-        // true only for MusicArtist), matching the C# class hierarchy.
-        let item_is_folder = if kinds::is_item_by_name(kind) {
-            kinds::is_folder(kind)
-        } else {
-            item.is_folder
-        };
-        if item_is_folder {
+        // `if (item.IsFolder) dto.IsFolder = true; else if (item is IHasMediaSources)
+        // dto.IsFolder = false;` (DtoService.cs:1180-1187): a by-name artist is not
+        // a folder, so its DTO carries no `IsFolder`.
+        if runtime_is_folder(item) {
             dto.is_folder = Some(true);
         } else if kinds::is_video(kind) || kinds::is_audio(kind) || is_live_tv_channel(kind) {
             // A Live TV channel is `IHasMediaSources`, so C# sets IsFolder=false;
@@ -2721,13 +2876,29 @@ impl FerrofinDtoService {
             .as_deref()
             .map(crate::localization_manager::normalize_original_language);
         if options.contains_field(ItemFields::ParentId) {
-            dto.parent_id = item
-                .parent_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
+            // `dto.ParentId = item.DisplayParentId` (`DtoService.cs:1237-1240`):
+            // an episode's season (a virtual season's episode is stored under
+            // the series), a season's series, else the stored parent. An
+            // empty id is written as null.
+            let display_parent = match BaseItemKind::from_stored_type_name(&item.type_) {
+                Some(BaseItemKind::Episode) => item.season_id.as_deref(),
+                Some(BaseItemKind::Season) => item.series_id.as_deref(),
+                _ => item.parent_id.as_deref(),
+            };
+            dto.parent_id = display_parent
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .filter(|id| !id.is_nil());
         }
         if options.contains_field(ItemFields::Path) {
-            dto.path = item.path.clone();
+            // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
+            // path after the network substitutions.
+            dto.path = item.path.as_deref().map(|path| {
+                if crate::media_info_resolver::is_file_protocol(path) {
+                    path_after_network_substitution(path, &prefetched.path_substitutions)
+                } else {
+                    path.to_owned()
+                }
+            });
         }
 
         dto.premiere_date = item.premiere_date;
@@ -2832,6 +3003,23 @@ impl FerrofinDtoService {
             dto.video_type = Some(format.video_type);
             dto.video3d_format = format.video3d_format;
             dto.iso_type = format.iso_type;
+            // `IHasAspectRatio.AspectRatio` (v12.2 DtoService.cs:1138) and,
+            // only when true, `ISupportsPlaceHolders.IsPlaceHolder` (:1290):
+            // `Video` implements both, off its `Data`.
+            let display = crate::item_data::video_display(item.data.as_deref());
+            dto.aspect_ratio = display.aspect_ratio;
+            if display.is_place_holder {
+                dto.is_place_holder = Some(true);
+            }
+            // `SetMusicVideoProperties` (:842-860): the album, and the id of the
+            // `MusicAlbum` of that name when one exists.
+            if kind == BaseItemKind::MusicVideo {
+                if let Some(album) = item.album.as_deref().filter(|a| !a.is_empty()) {
+                    dto.album_id = prefetched
+                        .lookup_clean(BaseItemKind::MusicAlbum, &prefetched.clean_key(album));
+                }
+                dto.album = item.album.clone();
+            }
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // C# only assigns when true, so the key is absent otherwise (the
             // `skip_serializing_if` on the DTO matches that omission).
@@ -2926,8 +3114,9 @@ impl FerrofinDtoService {
             dto.chapters = Some(chapters);
         }
 
-        // Media streams. This is the LAST read of this id's stream rows, so
-        // no reader remains and the entry can be moved out rather than cloned —
+        // Media streams. When the map is read here (no source on the DTO to
+        // read instead, below), this is the LAST read of this id's stream rows,
+        // so no reader remains and the entry can be moved out rather than cloned —
         // unless one does: a repeated id is projected again, and an id some
         // other page item lists as a merged alternate is read while projecting
         // THAT item, both after this point. (The earlier `MediaSources` read,
@@ -2942,9 +3131,28 @@ impl FerrofinDtoService {
             } else if is_live_tv_program(kind) {
                 // A programme is not `IHasMediaSources`; C# never assigns.
             } else {
-                let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
-                let streams = take_or_clone(&mut prefetched.media_streams, &item_id, pinned)
-                    .unwrap_or_default();
+                // With the item's sources on the DTO, C# reads the streams
+                // off the item's own source (`DtoService.cs:1473-1485`) — the
+                // very objects the per-user tail scored — so a detail page
+                // asking for both fields sees the same subtitle `Score`s in
+                // both. That source was built from these same rows, so they
+                // are read only when there is no source to read instead.
+                let own_id = item_id.simple().to_string();
+                let streams = match dto.media_sources.as_deref() {
+                    Some(sources) if !sources.is_empty() => sources
+                        .iter()
+                        .filter(|s| {
+                            s.id.as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(&own_id))
+                        })
+                        .flat_map(|s| s.media_streams.iter().cloned())
+                        .collect(),
+                    _ => {
+                        let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
+                        take_or_clone(&mut prefetched.media_streams, &item_id, pinned)
+                            .unwrap_or_default()
+                    }
+                };
                 if !streams.is_empty() {
                     dto.media_streams = Some(streams);
                 }
@@ -3244,6 +3452,30 @@ impl FerrofinDtoService {
         Ok(map)
     }
 
+    /// The `OriginalLanguage` of the given series rows, which their episodes
+    /// inherit when they have none (`Episode.GetInheritedOriginalLanguage`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn load_series_original_languages(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ServiceError> {
+        if series_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
+        Ok(self
+            .db
+            .item_original_languages(&stored)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .into_iter()
+            .filter_map(|(id, language)| Uuid::parse_str(&id).ok().map(|id| (id, language)))
+            .collect())
+    }
+
     /// Names the given PhotoAlbum rows, for the `Album`/`AlbumId` a photo's DTO
     /// carries (C# `DtoService.SetPhotoProperties` reads `Photo.AlbumEntity`).
     ///
@@ -3472,7 +3704,6 @@ fn f64_to_f32(value: f64) -> f32 {
     value as f32
 }
 
-/// Maps a stored `PersonType` string onto a [`PersonKind`].
 /// `AttachPeople`'s order (`DtoService.cs:900-935`) over an item's credits
 /// as `GetPeople` returns them (`ListOrder`): by `SortOrder ?? int.MaxValue`,
 /// then by kind — actors, guest stars, directors, writers, then producers
@@ -3486,7 +3717,7 @@ fn attach_order(
     let kind_rank = |person: &ferrofin_db::entities::base_items::PeopleEntity| match person
         .person_type
         .as_deref()
-        .map(person_kind_from_str)
+        .map(ferrofin_model::data::PersonKind::from_stored)
     {
         Some(PersonKind::Actor) => 0,
         Some(PersonKind::GuestStar) => 1,
@@ -3504,25 +3735,6 @@ fn attach_order(
         )
     });
     ordered
-}
-
-fn person_kind_from_str(value: &str) -> ferrofin_model::data::PersonKind {
-    use ferrofin_model::data::PersonKind;
-    match value {
-        "Actor" => PersonKind::Actor,
-        "Director" => PersonKind::Director,
-        "Composer" => PersonKind::Composer,
-        "Writer" => PersonKind::Writer,
-        "GuestStar" => PersonKind::GuestStar,
-        "Producer" => PersonKind::Producer,
-        "Conductor" => PersonKind::Conductor,
-        "Lyricist" => PersonKind::Lyricist,
-        "Artist" => PersonKind::Artist,
-        "AlbumArtist" => PersonKind::AlbumArtist,
-        "Author" => PersonKind::Author,
-        "Narrator" => PersonKind::Narrator,
-        _ => PersonKind::Unknown,
-    }
 }
 
 /// Maps the trickplay-manager manifest of stored rows onto the DTO's
@@ -3557,6 +3769,30 @@ fn to_trickplay_dto(
     }
 }
 
+/// `DtoService.GetPrimaryImageAspectRatio` (v12 :1745-1775) over a set of
+/// already-loaded image rows: `None` when there is no primary image; the kind's
+/// `GetDefaultPrimaryImageAspectRatio()` for a remote image or one whose
+/// dimensions cannot be read (`Series` 2/3, `BaseItem` 0 — emitted as `0`, as
+/// upstream does); else width / height. Shared with the search hints, which
+/// upstream fill through the same `IDtoService` call.
+pub(crate) async fn primary_image_aspect_ratio(
+    processor: &dyn ImageProcessor,
+    item_id: Uuid,
+    kind: BaseItemKind,
+    images: &[ItemImageInfo],
+) -> Option<f64> {
+    let primary = images.iter().find(|i| i.image_type == ImageType::Primary)?;
+    if !primary.is_local_file() {
+        return Some(kinds::default_primary_image_aspect_ratio(kind));
+    }
+    match processor.get_item_image_dimensions(item_id, primary).await {
+        Ok(dim) if dim.width > 0 && dim.height > 0 => {
+            Some(f64::from(dim.width) / f64::from(dim.height))
+        }
+        _ => Some(kinds::default_primary_image_aspect_ratio(kind)),
+    }
+}
+
 #[async_trait]
 impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
     async fn get_primary_image_aspect_ratio(
@@ -3583,8 +3819,8 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
         // A single item is a batch of one: the same prefetched projection path
-        // as a page, so a per-item N+1 fallback no longer exists for new
-        // handlers to reach.
+        // as a page. Only a folder's played/total counts differ: by id they
+        // are counted per item, as upstream's `GetBaseItemDto` counts them.
         //
         // `retrieved_by_id: true` — this is the projection of a row the caller
         // fetched by id, and C# `BaseItemRepository.RetrieveItem` unconditionally
@@ -3592,10 +3828,16 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         // list query only does so for `ItemFields.ProviderIds` (:442-445). That
         // difference is observable: it decides whether a movie's `UserData.Key`
         // is its IMDb id or its guid.
-        self.project(std::slice::from_ref(item), options, user, owner_id, true)
-            .await?
-            .pop()
-            .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
+        self.project(
+            std::slice::from_ref(item),
+            options,
+            user,
+            owner_id,
+            RowRead::ById,
+        )
+        .await?
+        .pop()
+        .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
     }
 
     async fn get_base_item_dtos(
@@ -3606,7 +3848,18 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        self.project(items, options, user, owner_id, false).await
+        self.project(items, options, user, owner_id, RowRead::List)
+            .await
+    }
+
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.project(items, options, user, None, RowRead::LinkedChildren)
+            .await
     }
 
     async fn get_item_by_name_dto(
@@ -3672,19 +3925,167 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
 }
 
 impl FerrofinDtoService {
+    /// `GetChildCountBatch` with `GetChildCount`'s fallback (v12.2
+    /// `DtoService.cs:714-748,797-810`): the `ChildCount` of every folder on
+    /// the page. The sources of all of them ([`Self::child_count_source_ids`])
+    /// go into one count batch, and each folder sums its own. A view with no
+    /// source counts its own browse instead ([`Self::view_child_count`]), as
+    /// `folder.GetChildCount(user)` does.
+    async fn child_count_batch(
+        &self,
+        items: &[BaseItemEntity],
+        user: &UserEntity,
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        let mut with_sources = Vec::new();
+        let mut by_browse = Vec::new();
+        for folder in items.iter().filter(|i| runtime_is_folder(i)) {
+            let sources = self.child_count_source_ids(folder, user).await?;
+            if sources.is_empty() {
+                by_browse.push(folder);
+            } else {
+                with_sources.push((row_id(folder), sources));
+            }
+        }
+        let mut distinct: Vec<Uuid> = with_sources
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let counts = if distinct.is_empty() {
+            HashMap::new()
+        } else {
+            self.item_counts
+                .get_child_count_batch(&distinct, Uuid::parse_str(&user.id).ok())
+                .await?
+        };
+        let mut out: HashMap<Uuid, i32> = with_sources
+            .into_iter()
+            .map(|(folder, ids)| {
+                let total = ids
+                    .iter()
+                    .map(|id| counts.get(id).copied().unwrap_or(0))
+                    .fold(0, i32::saturating_add);
+                (folder, total)
+            })
+            .collect();
+        for view in by_browse {
+            if let std::collections::hash_map::Entry::Vacant(slot) = out.entry(row_id(view)) {
+                slot.insert(self.view_child_count(view, user).await?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `GetChildCountSourceIds` (v12.2 `DtoService.cs:750-795`): the folders
+    /// whose children `folder`'s `ChildCount` sums.
+    ///
+    /// - A folder that is not a view is its own source. That includes a library,
+    ///   whose `PhysicalFolderIds` upstream sums: the count batch counts a
+    ///   library's physical folders and the library itself
+    ///   (`library_top_parents_by_view`).
+    /// - A view of an original-folder type or of `movies`/`tvshows` whose display
+    ///   parent (else relational parent) is a folder and not a view stands for
+    ///   that folder. Sub-views such as "Continue Watching" hang off the same
+    ///   library but hold a query, so they never count the library.
+    /// - A `movies`/`tvshows` view with no usable library parent (none, a
+    ///   view, a missing row or a non-folder) stands for the libraries the user
+    ///   grouped into it
+    ///   ([`crate::item_repository::grouped_libraries`]).
+    /// - Every other view has none.
+    async fn child_count_source_ids(
+        &self,
+        folder: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let id = row_id(folder);
+        if row_kind(folder) != BaseItemKind::UserView {
+            return Ok(vec![id]);
+        }
+        let view_type = crate::user_view_repository::view_type_of(folder.data.as_deref());
+        let view_type = view_type.as_deref();
+        let movies_or_shows = matches!(view_type, Some("movies" | "tvshows"));
+        if !movies_or_shows && !enables_original_folder(view_type) {
+            return Ok(Vec::new());
+        }
+        if let Some(parent_id) = view_parent_id(folder).filter(|parent| *parent != id)
+            && let Some(parent) = self.library.get_item_by_id(parent_id).await?
+            && runtime_is_folder(&parent)
+            && row_kind(&parent) != BaseItemKind::UserView
+        {
+            // Upstream recurses into the parent; a parent that is not a view
+            // is its own source.
+            return Ok(vec![parent_id]);
+        }
+        if movies_or_shows {
+            return crate::item_repository::grouped_libraries(&self.db, user, view_type).await;
+        }
+        Ok(Vec::new())
+    }
+
+    /// `UserView.GetChildCount(user)`, which is `GetChildren(user, true).Count`
+    /// (`UserView.cs:90-93`): how many items the view's own browse lists, for
+    /// a view with no count source. Those are the Playlists view, the folders
+    /// view and Live TV.
+    ///
+    /// The query is what the plain `GET /Items?parentId=<view>` browse runs
+    /// for every view Ferrofin builds. A view over a playlists folder lists
+    /// every playlist the user may open (`PlaylistsFolder.GetItemsInternal`,
+    /// re-rooted at the user root as that browse is). Any other view is
+    /// browsed as itself. The handler's other view arms (a default-type view
+    /// over a library, the `moviemovies`/`tvshowseries` sub-views) apply only
+    /// to views an adopted database can hold, and are not mirrored here.
+    ///
+    /// Divergence: upstream's `UserViewBuilder` has no `livetv` case, so its
+    /// Live TV view takes the default branch and lists, and counts, the
+    /// children of the libraries the user grouped (none for most users).
+    /// Ferrofin's browse of that view lists its channels, and the count
+    /// follows the browse, so the view never reports a number its own listing
+    /// does not show.
+    async fn view_child_count(
+        &self,
+        view: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<i32, ServiceError> {
+        let mut query = InternalItemsQuery {
+            user: Some(user.clone()),
+            limit: Some(0),
+            enable_total_record_count: true,
+            ..InternalItemsQuery::default()
+        };
+        let id = row_id(view);
+        let parent = match view_parent_id(view).filter(|parent| *parent != id) {
+            Some(parent) => self.library.get_item_by_id(parent).await?,
+            None => None,
+        };
+        if parent.as_ref().map(row_kind).is_some_and(|kind| {
+            matches!(
+                kind,
+                BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder
+            )
+        }) {
+            query.recursive = true;
+            query.include_item_types = vec![BaseItemKind::Playlist];
+            query.apply_folder_display_options = true;
+        } else {
+            query.parent_id = id;
+            query.parent_type = Some(BaseItemKind::UserView);
+        }
+        Ok(self.library.query_items(&query).await?.total_record_count)
+    }
+
     /// The shared projection body behind [`DtoService::get_base_item_dto`] and
     /// [`DtoService::get_base_item_dtos`].
     ///
-    /// `retrieved_by_id` says the rows came from the by-id read
-    /// (`RetrieveItem`), which upstream always hydrates provider ids for; a list
-    /// query hydrates them only when `ItemFields.ProviderIds` was requested.
+    /// `read` says how the rows were read, and so what upstream had loaded
+    /// on them (see [`RowRead`]).
     async fn project(
         &self,
         items: &[BaseItemEntity],
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        retrieved_by_id: bool,
+        read: RowRead,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
@@ -3697,8 +4098,8 @@ impl FerrofinDtoService {
                 options,
                 user,
                 owner_id,
-                retrieved_by_id,
-                !retrieved_by_id,
+                read != RowRead::List,
+                read != RowRead::ById,
             )
             .await?;
         // Ids the page lists more than once (a playlist may repeat a track).
@@ -3743,10 +4144,10 @@ impl FerrofinDtoService {
                 apply_name_counts(&mut dto, counts);
             }
             // ChildCount only where the C# runtime `IsFolder` is true (see
-            // `folder_emits_counts`) — by-name rows are folders in storage only.
+            // `runtime_is_folder`), not where the stored column says so.
             if user.is_some()
                 && options.contains_field(ItemFields::ChildCount)
-                && folder_emits_counts(item)
+                && runtime_is_folder(item)
             {
                 attach_child_count(&mut dto, item, &prefetched.child_counts);
             }
@@ -3787,7 +4188,7 @@ impl FerrofinDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        retrieved_by_id: bool,
+        providers_loaded: bool,
         list_page: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
@@ -3841,7 +4242,7 @@ impl FerrofinDtoService {
                 // 10.11.8: the same movie's key is its guid in a plain list and
                 // `tt0111161` with `Fields=ProviderIds` or by id.
                 let hydrate_providers =
-                    retrieved_by_id || options.contains_field(ItemFields::ProviderIds);
+                    providers_loaded || options.contains_field(ItemFields::ProviderIds);
                 self.user_data
                     .get_user_data_dtos_for_rows(items, user_id, hydrate_providers)
                     .await
@@ -3995,14 +4396,55 @@ impl FerrofinDtoService {
             }
             _ => None,
         };
-        // `SetAlternateVersionResumeStates`: with a user, the version they are
-        // part-way through leads a primary's sources — the user data of every
-        // version on or reached from the page, in one read, and only when the
-        // page holds a version group.
+        // `GetResumeUserDataBatch` (DtoService.cs:176-180): with a user and
+        // user data, a page video that is no version itself takes its
+        // completion from the version played last. Its group is in
+        // `versions` when the page read them (for the sources, or for a
+        // user's `MediaSourceCount`); otherwise one read for the page's
+        // videos finds the groups — none on a page without a video.
+        let resume_candidates: Vec<&BaseItemEntity> = match user {
+            Some(_) if options.enable_user_data => items
+                .iter()
+                .filter(|i| kinds::is_video(row_kind(i)) && i.primary_version_id.is_none())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let resume_versions = if resume_candidates.is_empty()
+            || want_sources
+            || options.contains_field(ItemFields::MediaSourceCount)
+        {
+            None
+        } else {
+            Some(
+                crate::video_versions::VersionRows::load(
+                    &DtoVersionReader {
+                        db: &self.db,
+                        media_sources: self.media_sources.as_ref(),
+                    },
+                    &resume_candidates,
+                )
+                .await?,
+            )
+        };
+        let groups = resume_versions.as_ref().unwrap_or(&versions);
+        // `SetAlternateVersionResumeStates` and `GetResumeUserDataBatch`: the
+        // user data of every version on or reached from the page, in one
+        // read, and only when the page holds a version group. With the
+        // sources, the version the user is part-way through leads them.
         let version_user_data = match user {
-            Some(user) if want_sources && versions.ids().next().is_some() => {
-                let mut wanted: Vec<Uuid> =
-                    media_ids.iter().copied().chain(versions.ids()).collect();
+            Some(user)
+                if (want_sources || !resume_candidates.is_empty())
+                    && groups.ids().next().is_some() =>
+            {
+                // The page's own rows as well, since a group's winner may be
+                // the queried video itself: every media row for the sources,
+                // only the resume candidates otherwise.
+                let page: Vec<Uuid> = if want_sources {
+                    media_ids.clone()
+                } else {
+                    resume_candidates.iter().map(|item| row_id(item)).collect()
+                };
+                let mut wanted: Vec<Uuid> = page.into_iter().chain(groups.ids()).collect();
                 wanted.sort_unstable();
                 wanted.dedup();
                 self.user_data
@@ -4010,6 +4452,67 @@ impl FerrofinDtoService {
                     .await?
             }
             _ => HashMap::new(),
+        };
+        let version_resume: HashMap<Uuid, crate::video_versions::VersionResumeData> =
+            if version_user_data.is_empty() {
+                HashMap::new()
+            } else {
+                resume_candidates
+                    .iter()
+                    .filter_map(|item| {
+                        crate::video_versions::resume_user_data(groups, item, |id| {
+                            version_user_data.get(&id)
+                        })
+                        .map(|resume| (row_id(item), resume))
+                    })
+                    .collect()
+            };
+        // `GetStaticMediaSources(item, true, user)`'s per-user tail
+        // (`MediaSourceManager.cs:397-421`, reached from `DtoService.cs:410`)
+        // reads, per item, the user's remembered streams and the item's
+        // inherited original language, and the user's permissions: here one
+        // read each for the whole page, and none without a user or the field.
+        // A Live TV channel takes the permissions but never a remembered
+        // stream (`EnableRememberingTrackSelections` is false for it).
+        let sourced = items.iter().filter(|i| {
+            let kind = row_kind(i);
+            kinds::is_video(kind) || kinds::is_audio(kind) || is_live_tv_channel(kind)
+        });
+        let (remembered_streams, series_original_languages, playback_permissions) = match user {
+            Some(user) if want_sources && sourced.clone().next().is_some() => {
+                let user_id = parse_user_id(&user.id)?;
+                let videos: Vec<&BaseItemEntity> = sourced
+                    .filter(|i| !is_live_tv_channel(row_kind(i)))
+                    .filter(|i| i.media_type.as_deref().unwrap_or("Video") == "Video")
+                    .collect();
+                let mut video_ids: Vec<Uuid> = videos.iter().map(|i| row_id(i)).collect();
+                video_ids.sort_unstable();
+                video_ids.dedup();
+                let mut series_ids: Vec<Uuid> = videos
+                    .iter()
+                    .filter(|i| i.original_language.is_none())
+                    .filter(|i| row_kind(i) == BaseItemKind::Episode)
+                    .filter_map(|i| i.series_id.as_deref())
+                    .filter_map(|id| Uuid::parse_str(id).ok())
+                    .collect();
+                series_ids.sort_unstable();
+                series_ids.dedup();
+                let remembered = async {
+                    if video_ids.is_empty() {
+                        Ok(HashMap::new())
+                    } else {
+                        self.user_data
+                            .get_stream_default_data_batch(&video_ids, user_id)
+                            .await
+                    }
+                };
+                tokio::try_join!(
+                    remembered,
+                    self.load_series_original_languages(&series_ids),
+                    self.user_data.get_playback_permissions(user_id),
+                )?
+            }
+            _ => (HashMap::new(), HashMap::new(), None),
         };
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
@@ -4132,11 +4635,19 @@ impl FerrofinDtoService {
             // id — not the row. Materializing a full `BaseItemEntity` per
             // credited name was the single most expensive statement on an
             // all-fields page (hundreds of 72-column rows decoded and dropped).
-            let resolved = self
+            let resolved = match self
                 .library
                 .get_named_item_ids(ferrofin_model::data::BaseItemKind::Person, &names)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    // C# `AttachPeople` logs each failed `GetPerson` and
+                    // leaves its credits out.
+                    tracing::error!(%error, "person lookup failed; leaving the page's credits out");
+                    Vec::new()
+                }
+            };
             let mut id_by_slot: Vec<Option<Uuid>> = vec![None; names.len()];
             let mut person_ids: Vec<Uuid> = Vec::new();
             for (slot, resolved_id) in resolved.into_iter().enumerate() {
@@ -4147,20 +4658,38 @@ impl FerrofinDtoService {
                     person_ids.push(id);
                 }
             }
-            let by_name: HashMap<String, Uuid> = slot_by_name
+            let mut by_name: HashMap<String, Uuid> = slot_by_name
                 .into_iter()
                 .filter_map(|(name, slot)| {
                     id_by_slot.get(slot).copied().flatten().map(|id| (name, id))
                 })
                 .collect();
-            // Pre-unification rows keyed images on the credit id; keep
-            // loading those too so old databases still render cast art.
-            person_ids.extend(
-                people
-                    .values()
-                    .flatten()
-                    .filter_map(|p| Uuid::parse_str(&p.id).ok()),
-            );
+            // C# `.Where(i => user is null || i!.IsVisible(user))`: a person the
+            // user may not see leaves the credits. `Person.IsVisible` is the
+            // parental check with the allowed tags skipped.
+            if let Some(user) = user
+                && !person_ids.is_empty()
+            {
+                // A failed check leaves the credits out, as a failed lookup
+                // does above: failing open would show persons the user may
+                // not see.
+                let allowed: std::collections::HashSet<Uuid> = match self
+                    .library
+                    .get_parentally_allowed_item_ids(&person_ids, user, true)
+                    .await
+                {
+                    Ok(allowed) => allowed.into_iter().collect(),
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "person visibility check failed; leaving the page's credits out"
+                        );
+                        std::collections::HashSet::new()
+                    }
+                };
+                person_ids.retain(|id| allowed.contains(id));
+                by_name.retain(|_, id| allowed.contains(id));
+            }
             (person_ids, by_name)
         } else {
             (Vec::new(), HashMap::new())
@@ -4203,30 +4732,41 @@ impl FerrofinDtoService {
         // exactly what the attach steps resolve: studios/genres only when their
         // field is requested, artists/album-artists only for the kinds that carry
         // artist fields — so a prefetched miss never wrongly nils a real id.
-        let (value_ids, clean_values) = {
+        let (by_name_ids, clean_values) = {
             // Dedup by the RAW name first, borrowing from the rows, so each
             // distinct name is cleaned exactly once for the whole page (the
             // projection then reads those cleans back out of `clean_values`
             // instead of recomputing them per name per item).
-            let mut wanted: std::collections::HashSet<(i32, &str)> =
+            let mut wanted: std::collections::HashSet<(BaseItemKind, &str)> =
                 std::collections::HashSet::new();
             let want_studios = options.contains_field(ItemFields::Studios);
             let want_genres = options.contains_field(ItemFields::Genres);
             for item in items {
                 if want_studios {
-                    wanted.extend(split_multi_str(item.studios.as_deref()).map(|n| (3, n)));
+                    wanted.extend(
+                        split_multi_str(item.studios.as_deref()).map(|n| (BaseItemKind::Studio, n)),
+                    );
                 }
                 if want_genres {
-                    wanted.extend(split_multi_str(item.genres.as_deref()).map(|n| (2, n)));
+                    let kind = genre_kind(item);
+                    wanted.extend(split_multi_str(item.genres.as_deref()).map(|n| (kind, n)));
                 }
                 if kinds::has_artist_fields(row_kind(item)) {
-                    wanted.extend(split_multi_str(item.artists.as_deref()).map(|n| (0, n)));
-                    wanted.extend(split_multi_str(item.album_artists.as_deref()).map(|n| (1, n)));
+                    let artist = |n| (BaseItemKind::MusicArtist, n);
+                    wanted.extend(split_multi_str(item.artists.as_deref()).map(artist));
+                    wanted.extend(split_multi_str(item.album_artists.as_deref()).map(artist));
+                }
+                // `SetMusicVideoProperties`: the `MusicAlbum` named like the
+                // music video's album.
+                if row_kind(item) == BaseItemKind::MusicVideo
+                    && let Some(album) = item.album.as_deref().filter(|a| !a.is_empty())
+                {
+                    wanted.insert((BaseItemKind::MusicAlbum, album));
                 }
             }
             let mut clean_values: HashMap<String, String> = HashMap::new();
-            let mut pairs: Vec<(i32, String)> = Vec::with_capacity(wanted.len());
-            for (value_type, name) in wanted {
+            let mut pairs: Vec<(BaseItemKind, String)> = Vec::with_capacity(wanted.len());
+            for (kind, name) in wanted {
                 let clean = if let Some(clean) = clean_values.get(name) {
                     clean.clone()
                 } else {
@@ -4234,9 +4774,9 @@ impl FerrofinDtoService {
                     clean_values.insert(name.to_owned(), clean.clone());
                     clean
                 };
-                pairs.push((value_type, clean));
+                pairs.push((kind, clean));
             }
-            (self.resolve_value_ids(&pairs).await?, clean_values)
+            (self.resolve_by_name_ids(&pairs).await?, clean_values)
         };
         let chapters = if options.contains_field(ItemFields::Chapters) && !media_ids.is_empty() {
             self.chapters.get_chapters_batch(&media_ids).await?
@@ -4254,25 +4794,7 @@ impl FerrofinDtoService {
         // same way before `AttachUserSpecificInfo`, which is user-gated).
         let child_counts = match user {
             Some(user) if options.contains_field(ItemFields::ChildCount) => {
-                let folder_ids: Vec<Uuid> = items
-                    .iter()
-                    .filter(|i| {
-                        folder_emits_counts(i)
-                            && !matches!(
-                                row_kind(i),
-                                BaseItemKind::CollectionFolder | BaseItemKind::UserView
-                            )
-                    })
-                    .map(row_id)
-                    .collect();
-                if folder_ids.is_empty() {
-                    HashMap::new()
-                } else {
-                    let user_id = Uuid::parse_str(&user.id).ok();
-                    self.item_counts
-                        .get_child_count_batch(&folder_ids, user_id)
-                        .await?
-                }
+                self.child_count_batch(items, user).await?
             }
             _ => HashMap::new(),
         };
@@ -4309,24 +4831,76 @@ impl FerrofinDtoService {
         // UserData can carry UnplayedItemCount (C# AttachUserSpecificInfo folder branch).
         let played_counts = match user {
             Some(user) if options.enable_user_data => {
-                let folder_ids: Vec<Uuid> = items
-                    .iter()
-                    .filter(|i| {
-                        folder_emits_counts(i)
-                            && !matches!(
-                                row_kind(i),
-                                BaseItemKind::CollectionFolder | BaseItemKind::UserView
-                            )
-                    })
-                    .map(row_id)
-                    .collect();
-                if folder_ids.is_empty() {
+                // The folders whose `UserData` reads the counts: v12.2 batches
+                // `SupportsUserDataFromChildren && (SupportsPlayedStatus ||
+                // RecursiveItemCount)` (DtoService.cs:207-209), the guards the
+                // fill site applies. A music artist supports no played status,
+                // so an artists page without `RecursiveItemCount` counts
+                // nothing — batched anyway, the plain `/Artists` list paid two
+                // closure counts over every artist and dropped them.
+                let counted = |i: &&BaseItemEntity| {
+                    let kind = row_kind(i);
+                    runtime_is_folder(i)
+                        && !matches!(
+                            kind,
+                            BaseItemKind::CollectionFolder | BaseItemKind::UserView
+                        )
+                        && kinds::supports_user_data_from_children(kind)
+                        && (kinds::supports_played_status(
+                            kind,
+                            parse_media_type(i.media_type.as_deref()),
+                        ) || options.contains_field(ItemFields::RecursiveItemCount))
+                };
+                let folder_ids: Vec<Uuid> = items.iter().filter(counted).map(row_id).collect();
+                // Only a page has a batch: `GetBaseItemDto` (by id) passes none
+                // (v12.2 DtoService.cs:319-321), so `AttachUserSpecificInfo`
+                // takes `GetUserDataDto` (:629-633) and the folder counts per
+                // item below.
+                let mut counts = if folder_ids.is_empty() || !list_page {
                     HashMap::new()
                 } else {
                     self.item_counts
                         .get_played_and_total_count_batch(&folder_ids, user)
                         .await?
+                };
+                // `Folder.FillUserDataDtoValues` (v12.2 Folder.cs:2032-2060)
+                // counts a folder with no batch entry (0/0 on a page, or read by
+                // id) per item, behind the same guards: through its links when
+                // it has any, else through its descendants.
+                let unbatched: Vec<Uuid> = items
+                    .iter()
+                    .filter(counted)
+                    .map(row_id)
+                    .filter(|id| !counts.contains_key(id))
+                    .collect();
+                if !unbatched.is_empty() {
+                    let linked = self
+                        .item_counts
+                        .get_linked_children_count_batch(&unbatched)
+                        .await?;
+                    let mut query = ferrofin_traits::options::InternalItemsQuery::default();
+                    query.set_user(user.clone());
+                    // Resolved once for every folder below.
+                    let query = crate::query_restrictions::resolve(&self.db, &query)
+                        .await?
+                        .unwrap_or(query);
+                    for id in unbatched {
+                        if counts.contains_key(&id) {
+                            continue; // repeated on the page
+                        }
+                        let c = if linked.contains_key(&id) {
+                            self.item_counts
+                                .get_played_and_total_count_from_linked_children(&query, id)
+                                .await?
+                        } else {
+                            self.item_counts
+                                .get_played_and_total_count(&query, id)
+                                .await?
+                        };
+                        counts.insert(id, c);
+                    }
                 }
+                counts
             }
             _ => HashMap::new(),
         };
@@ -4423,8 +4997,24 @@ impl FerrofinDtoService {
         } else {
             crate::item_deletion::DeleteFacts::default()
         };
+        // `GetMappedPath` maps the `Path` field and the static sources through
+        // the configured substitutions: read them once for the page.
+        let path_substitutions = match &self.configuration {
+            Some(configuration)
+                if options.contains_field(ItemFields::Path)
+                    || options.contains_field(ItemFields::MediaSources) =>
+            {
+                configuration
+                    .configuration()
+                    .await?
+                    .path_substitutions
+                    .clone()
+            }
+            _ => Vec::new(),
+        };
         Ok(Prefetched {
             extra_counts,
+            path_substitutions,
             images,
             user_data,
             media_streams,
@@ -4437,7 +5027,7 @@ impl FerrofinDtoService {
             locked_fields,
             people,
             person_images,
-            value_ids,
+            by_name_ids,
             clean_values,
             chapters,
             trickplay,
@@ -4447,6 +5037,10 @@ impl FerrofinDtoService {
             versions,
             version_visible,
             version_user_data,
+            version_resume,
+            remembered_streams,
+            series_original_languages,
+            playback_permissions,
             alternate_counts,
             has_subtitles,
             has_lyrics,
@@ -4711,19 +5305,19 @@ mod tests {
 
     use super::*;
 
-    use chrono::{DateTime, TimeZone as _, Utc};
+    use crate::test_support::FakeImages;
+    use chrono::{TimeZone as _, Utc};
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
-    use ferrofin_model::drawing::{ImageDimensions, ImageFormat};
     use ferrofin_model::dto::{MediaSourceInfo, UserItemDataDto};
     use ferrofin_model::entities_media::{ChapterInfo, MediaAttachment, MediaStream};
-    use ferrofin_traits::drawing::ProcessedImage;
     use ferrofin_traits::dto::DtoService as _;
 
     use crate::test_support::{
         fetch_item, fetch_item_opt, image_info, link_alternate_version, save_item, seed_child_item,
-        seed_folder_item, seed_images, seed_item_of_series, seed_item_with_data, seed_named_item,
-        seed_provider_id, seed_series_with_studios, seed_user, test_db,
+        seed_folder_item, seed_folder_with_data, seed_images, seed_item_of_series,
+        seed_item_with_data, seed_named_item, seed_provider_id, seed_series_with_studios,
+        seed_user, test_db,
     };
 
     // ---- Fakes for the injected siblings -------------------------------------
@@ -4740,10 +5334,49 @@ mod tests {
         named_items: Vec<BaseItemEntity>,
     }
 
+    /// The by-name `Person` item of each name, as the scan materializes one
+    /// for every credit it saves (`update_people`), for `named_items`.
+    async fn person_rows(db: &Database, names: &[&str]) -> Vec<BaseItemEntity> {
+        let mut rows = Vec::new();
+        for name in names {
+            let id = Uuid::new_v4();
+            seed_named_item(db, id, BaseItemKind::Person, name).await;
+            rows.push(fetch_item(db, id).await);
+        }
+        rows
+    }
+
     #[async_trait]
     impl LibraryManager for FakeLibrary {
         async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             Ok(None)
+        }
+        /// A named item tagged `Hidden` fails the parental check; one tagged
+        /// `Fail` makes the check itself fail.
+        async fn get_parentally_allowed_item_ids(
+            &self,
+            ids: &[Uuid],
+            _user: &UserEntity,
+            _skip_allowed_tags: bool,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            if self
+                .named_items
+                .iter()
+                .any(|row| row.tags.as_deref() == Some("Fail"))
+            {
+                return Err(ServiceError::backend("visibility unavailable"));
+            }
+            let hidden: Vec<Uuid> = self
+                .named_items
+                .iter()
+                .filter(|row| row.tags.as_deref() == Some("Hidden"))
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            Ok(ids
+                .iter()
+                .copied()
+                .filter(|id| !hidden.contains(id))
+                .collect())
         }
         async fn get_item_images(
             &self,
@@ -5003,10 +5636,31 @@ mod tests {
 
     #[test]
     fn percent_of_ticks_is_the_played_percentage_division() {
-        // 50% of a 2 h runtime — the C# `100 * position / runtime` double math.
+        // 50% of a 2 h runtime.
         assert!((percent_of_ticks(36_000_000_000, 72_000_000_000) - 50.0).abs() < 1e-9);
         // Tiny fractions stay positive and precise enough for display.
         assert!(percent_of_ticks(1, 72_000_000_000) > 0.0);
+    }
+
+    /// Byte-equal to Jellyfin 12.2's doubles for the same ticks, measured on
+    /// `GET /UserItems/Resume`: upstream divides first, then scales
+    /// (`pct = PlaybackPositionTicks / (double)RunTimeTicks; 100 * pct`), and
+    /// the other order rounds differently in the last digits.
+    #[rstest::rstest]
+    #[case(13_206_045, 50_210_000, 26.301_623_182_632_945)]
+    #[case(30_347_999, 50_210_000, 60.442_141_007_767_38)]
+    #[case(31_000_576, 50_210_000, 61.741_836_287_592_11)]
+    fn percent_of_ticks_matches_jellyfin_bit_for_bit(
+        #[case] position: i64,
+        #[case] runtime: i64,
+        #[case] jellyfin: f64,
+    ) {
+        assert_eq!(
+            percent_of_ticks(position, runtime).to_bits(),
+            jellyfin.to_bits(),
+            "{} != {jellyfin}",
+            percent_of_ticks(position, runtime)
+        );
     }
 
     /// A folder's `RecursiveItemCount` and its played numbers come from the SAME
@@ -5136,6 +5790,79 @@ mod tests {
         assert_eq!(ud.played_percentage, None);
         assert!(ud.played);
         assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `DtoService.GetMappedPath` (`DtoService.cs:1827`) and
+    /// `GetStaticMediaSources(item, true, user)`: a file-protocol `Path` and the
+    /// item's media source go through `PathSubstitutions`; a remote path is
+    /// left as it is.
+    #[tokio::test]
+    async fn path_and_media_sources_apply_path_substitutions() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = service(db.clone()).with_configuration(
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/media",
+                "//nas/media",
+            )
+            .await,
+        );
+        let id = Uuid::new_v4();
+        crate::test_support::seed_video_item(&db, id, BaseItemKind::Movie).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::Path, ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let mut movie = fetch_item(&db, id).await;
+        movie.path = Some("/media/movies/a.mkv".to_owned());
+        movie.media_type = Some("Video".to_owned());
+        let dto = svc
+            .get_base_item_dto(&movie, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("//nas/media/movies/a.mkv"));
+        let sources = dto.media_sources.expect("sources");
+        assert_eq!(sources[0].path.as_deref(), Some("//nas/media/movies/a.mkv"));
+
+        movie.path = Some("http://origin/stream".to_owned());
+        let dto = svc
+            .get_base_item_dto(&movie, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("http://origin/stream"));
+    }
+
+    /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
+    /// only a video playlist carries the folder played numbers.
+    #[tokio::test]
+    async fn only_a_video_playlist_carries_played_counts() {
+        let db = test_db().await;
+        let playlist_id = Uuid::new_v4();
+        seed_folder_item(&db, playlist_id, BaseItemKind::Playlist, "Mix", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service_with_counts(
+            db.clone(),
+            FakeCounts {
+                played: 1,
+                ..FakeCounts::default()
+            },
+        );
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        for (media_type, counted) in [("Video", true), ("Audio", false)] {
+            let mut playlist = fetch_item(&db, playlist_id).await;
+            playlist.media_type = Some(media_type.to_owned());
+            let dto = svc
+                .get_base_item_dto(&playlist, &narrow, Some(&user), None)
+                .await
+                .unwrap();
+            let ud = dto.user_data.as_ref().unwrap();
+            assert_eq!(ud.unplayed_item_count.is_some(), counted, "{media_type}");
+            assert_eq!(ud.played_percentage.is_some(), counted, "{media_type}");
+        }
     }
 
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
@@ -5631,6 +6358,73 @@ mod tests {
         );
     }
 
+    /// `dto.Container = item.Container` (`DtoService.cs:1125`): the container
+    /// the probe stored (`FFProbeVideoInfo`/`AudioFileProber`), and nothing for
+    /// a folder, whatever dots its name has. A video or audio file not probed
+    /// yet falls back to its extension, unless it is a disc rip's folder; a
+    /// photo has no container.
+    #[tokio::test]
+    async fn the_dto_container_is_the_probed_one_and_folders_have_none() {
+        let db = test_db().await;
+        let mut rows = Vec::new();
+        for (kind, data, path, is_folder, media_type) in [
+            (BaseItemKind::Series, "{}", "/tv/Mr. Robot", true, None),
+            (
+                BaseItemKind::Movie,
+                r#"{"Container":"mkv"}"#,
+                "/m/Film.mp4",
+                false,
+                Some("Video"),
+            ),
+            (
+                BaseItemKind::Audio,
+                "{}",
+                "/music/Song.FLAC",
+                false,
+                Some("Audio"),
+            ),
+            (
+                BaseItemKind::Photo,
+                "{}",
+                "/photos/Shot.jpg",
+                false,
+                Some("Photo"),
+            ),
+            (
+                BaseItemKind::Audio,
+                r#"{"Container":"mp3"}"#,
+                "/music/Song.mp3",
+                false,
+                Some("Audio"),
+            ),
+            (
+                BaseItemKind::Movie,
+                r#"{"VideoType":"BluRay"}"#,
+                "/m/Movie.2010",
+                false,
+                Some("Video"),
+            ),
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_item_with_data(&db, id, kind, "X", data).await;
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.is_folder = is_folder;
+            row.media_type = media_type.map(str::to_owned);
+            rows.push(row);
+        }
+        let dtos = service(db.clone())
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            dtos.iter()
+                .map(|d| d.container.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("mkv"), Some("flac"), None, Some("mp3"), None]
+        );
+    }
+
     /// `MediaSources` lists every version of a video, the queried one first
     /// and each named by what sets it apart (`Video.GetMediaSources`): from a
     /// local alternate as much as from its primary, both on one page.
@@ -5693,6 +6487,186 @@ mod tests {
             ]
         );
         assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
+    }
+
+    /// A playlist's or box set's members are resolved with every field
+    /// (`Folder.ResolveLinkedChildren` with a parameterless `DtoOptions`), so a
+    /// never-written member keys its user data by its provider id, as on its
+    /// own page — where the same row in a plain list without `Fields=ProviderIds`
+    /// keys it by its guid (measured on Jellyfin 12.2: `"101765"` in the
+    /// playlist, the guid in a library list).
+    #[tokio::test]
+    async fn linked_children_key_unwritten_user_data_by_provider_id() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_provider_id(&db, movie, "Tmdb", "101765").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+                db.clone(),
+                crate::test_support::configuration_with_path_substitution(
+                    tmp.path(),
+                    "/unused",
+                    "/unused",
+                )
+                .await,
+            )),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let rows = [fetch_item(&db, movie).await];
+        let options = DtoOptions::with_all_fields(false);
+        let key =
+            |dtos: Vec<BaseItemDto>| dtos[0].user_data.as_ref().expect("user data").key.clone();
+
+        let listed = svc
+            .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+            .await
+            .unwrap();
+        assert_eq!(key(listed), movie.to_string());
+        let members = svc
+            .get_linked_children_dtos(&rows, &options, Some(&user))
+            .await
+            .unwrap();
+        assert_eq!(key(members), "101765");
+    }
+
+    /// A movie watched to the end on another version shows watched, with that
+    /// version's last-played date and no stale resume bar of its own
+    /// (`resumeData?.ApplyTo(dto.UserData)`, DtoService.cs:179, 680) — on a
+    /// page without `MediaSources`, as the grid and the home rows ask. Here
+    /// the versions were grouped after the watch, so nothing propagated the
+    /// played state to the primary's own row.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_movie_finished_on_another_version_shows_played() {
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let (primary, alternate) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_named_item(&db, primary, BaseItemKind::Movie, "Movie").await;
+        seed_named_item(&db, alternate, BaseItemKind::Movie, "Movie").await;
+        for (id, path) in [
+            (primary, "/Movies/Movie/Movie.mkv"),
+            (alternate, "/Movies/Movie/Movie - 4K.mkv"),
+        ] {
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.media_type = Some("Video".to_owned());
+            row.run_time_ticks = Some(1_000);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        link_alternate_version(&db, alternate, primary).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let user_data = Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+            db.clone(),
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/unused",
+                "/unused",
+            )
+            .await,
+        ));
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            user_data.clone(),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let finished = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Part-way through the primary long ago, then the 4K copy to the end.
+        user_data
+            .save_user_data(
+                user_id,
+                primary,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    playback_position_ticks: Some(500),
+                    last_played_date: Some(finished - chrono::Duration::days(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        user_data
+            .save_user_data(
+                user_id,
+                alternate,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    played: Some(true),
+                    last_played_date: Some(finished),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The groups come from the page's own version read with the sources
+        // or a user's `MediaSourceCount` (the grid asks for that), and from
+        // a read of their own otherwise; the fold is the same each way.
+        let page = [
+            fetch_item(&db, primary).await,
+            fetch_item(&db, alternate).await,
+        ];
+        for fields in [
+            vec![],
+            vec![ItemFields::MediaSources],
+            vec![ItemFields::MediaSourceCount],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dtos = svc
+                .get_base_item_dtos(&page, &options, Some(&user), None, true)
+                .await
+                .unwrap();
+            let ud = dtos[0].user_data.as_ref().expect("user data");
+            assert!(ud.played, "finished on the 4K version ({fields:?})");
+            assert_eq!(ud.last_played_date, Some(finished), "{fields:?}");
+            assert_eq!(
+                ud.playback_position_ticks, 0,
+                "no stale resume bar ({fields:?})"
+            );
+            assert_eq!(ud.played_percentage, None, "{fields:?}");
+            // The version on the page is read as itself.
+            let own = dtos[1].user_data.as_ref().expect("user data");
+            assert_eq!(own.item_id, alternate);
+            assert!(own.played);
+        }
+        // No user data asked for: none folded, none sent.
+        let dtos = svc
+            .get_base_item_dtos(
+                &page,
+                &DtoOptions {
+                    enable_user_data: false,
+                    ..DtoOptions::default()
+                },
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(dtos[0].user_data.is_none());
     }
 
     /// v12 assigns `Chapters` outside the `item is Video` block
@@ -5912,6 +6886,74 @@ mod tests {
         );
     }
 
+    /// v12.2 `DtoService.cs:207-209`: a page batches the played/total counts
+    /// only of the folders whose `UserData` reads them —
+    /// `SupportsUserDataFromChildren && (SupportsPlayedStatus ||
+    /// RecursiveItemCount)`. A music artist folder supports no played status
+    /// (`MusicArtist.cs:48`), so an artists page without `RecursiveItemCount`
+    /// has nothing to count: batched anyway, the plain `/Artists` list paid two
+    /// closure counts over every artist (22 ms of its 47 on the gl-637 corpus)
+    /// and dropped them at the fill site.
+    #[tokio::test]
+    async fn a_page_batches_only_the_folders_its_user_data_reads() {
+        let db = test_db().await;
+        let music = Uuid::new_v4();
+        seed_folder_item(&db, music, BaseItemKind::Folder, "music", None).await;
+        let artist_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            artist_id,
+            BaseItemKind::MusicArtist,
+            "OnDisk",
+            Some(music),
+        )
+        .await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let page = [
+            fetch_item(&db, artist_id).await,
+            fetch_item(&db, season_id).await,
+        ];
+        for (fields, expected) in [
+            (vec![], vec![season_id]),
+            (
+                vec![ItemFields::RecursiveItemCount],
+                vec![artist_id, season_id],
+            ),
+        ] {
+            let counts = FakeCounts::default();
+            let asks = Arc::clone(&counts.played_batch_asks);
+            let svc = service_with_counts(db.clone(), counts);
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dtos = svc
+                .get_base_item_dtos(&page, &options, Some(&user), None, true)
+                .await
+                .unwrap();
+            assert_eq!(*asks.lock().expect("asks"), expected, "fields {fields:?}");
+            let artist = &dtos[0];
+            assert_eq!(
+                artist.recursive_item_count,
+                (!fields.is_empty()).then_some(4),
+                "fields {fields:?}"
+            );
+            assert_eq!(
+                artist
+                    .user_data
+                    .as_ref()
+                    .and_then(|u| u.unplayed_item_count),
+                None
+            );
+            assert_eq!(
+                dtos[1].user_data.as_ref().unwrap().unplayed_item_count,
+                Some(3)
+            );
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // a flat sequence of per-kind assertions
     async fn folder_user_data_carries_unplayed_item_count() {
@@ -6116,6 +7158,89 @@ mod tests {
         }
     }
 
+    /// A box set holding only another box set reads the inner set's members.
+    /// v12.2 `GetPlayedAndTotalCountBatch` has no entry for the outer set (its
+    /// branches stop at the inner set's own closure, and `if (total > 0 ||
+    /// played > 0)` drops the 0/0), so `Folder.FillUserDataDtoValues`
+    /// (Folder.cs:2042-2060) counts it per item through
+    /// `GetAllDescendantIdsBatch`, which follows the inner set's links. A set
+    /// read by id always counts per item (`GetBaseItemDto` passes no batch).
+    #[tokio::test]
+    async fn a_box_set_of_box_sets_counts_the_inner_set_s_members() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let [outer, inner, mixed, empty, played, unplayed, single] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, name) in [
+            (outer, "Saga"),
+            (inner, "Trilogy"),
+            (mixed, "Mixed"),
+            (empty, "Empty"),
+        ] {
+            seed_folder_item(&db, id, BaseItemKind::BoxSet, name, None).await;
+        }
+        for (id, name) in [(played, "Part 1"), (unplayed, "Part 2"), (single, "Other")] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+        }
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        crate::test_support::seed_user_data(&db, user_id, played, true, None).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        for (parent, child) in [
+            (outer, inner),
+            (inner, played),
+            (inner, unplayed),
+            (mixed, single),
+            (mixed, inner),
+        ] {
+            links.upsert_linked_child(parent, child, 0).await.unwrap();
+        }
+        let rows = [
+            fetch_item(&db, outer).await,
+            fetch_item(&db, inner).await,
+            fetch_item(&db, mixed).await,
+            fetch_item(&db, empty).await,
+        ];
+        let mut svc = service(db.clone());
+        svc.item_counts = Arc::new(crate::FerrofinItemCountService::new(db));
+        let options = DtoOptions {
+            fields: vec![ItemFields::RecursiveItemCount],
+            ..DtoOptions::default()
+        };
+        let counts = |dto: &BaseItemDto| {
+            let ud = dto.user_data.as_ref().unwrap();
+            (
+                ud.played,
+                ud.unplayed_item_count,
+                ud.played_percentage,
+                dto.recursive_item_count,
+            )
+        };
+        let page = svc
+            .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+            .await
+            .unwrap();
+        let half = (false, Some(1), Some(50.0), Some(2));
+        // The mixed set has a batch entry on a page: its linked movie, as
+        // upstream's batch counts it (the inner set's closure is empty).
+        let one_unplayed = (false, Some(1), Some(0.0), Some(1));
+        // An empty set has nothing to count either way: 0/0 reads played.
+        let nothing = (true, Some(0), None, Some(0));
+        let got: Vec<_> = page.iter().map(counts).collect();
+        assert_eq!(got, [half, half, one_unplayed, nothing]);
+        let mut by_id = Vec::new();
+        for row in &rows {
+            let dto = svc
+                .get_base_item_dto(row, &options, Some(&user), None)
+                .await
+                .unwrap();
+            by_id.push(counts(&dto));
+        }
+        // By id, the mixed set follows the inner set's links too.
+        let all_three = (false, Some(2), Some(1.0 / 3.0 * 100.0), Some(3));
+        assert_eq!(by_id, [half, half, all_three, nothing]);
+    }
+
     /// An [`ItemCountService`] fake returning fixed name-item counts.
     ///
     /// `linked` is how many LINKED children every parent reports
@@ -6131,6 +7256,10 @@ mod tests {
         linked: i32,
         played: i32,
         total: i32,
+        /// Every parent id the child-count batch was asked for, in order.
+        child_count_asks: Arc<std::sync::Mutex<Vec<Uuid>>>,
+        /// Every folder id the played/total batch was asked for, in order.
+        played_batch_asks: Arc<std::sync::Mutex<Vec<Uuid>>>,
     }
 
     impl Default for FakeCounts {
@@ -6139,6 +7268,8 @@ mod tests {
                 linked: 0,
                 played: 1,
                 total: 4,
+                child_count_asks: Arc::default(),
+                played_batch_asks: Arc::default(),
             }
         }
     }
@@ -6196,14 +7327,17 @@ mod tests {
             _filter: &ferrofin_traits::options::InternalItemsQuery,
             _ancestor_id: Uuid,
         ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
-            Ok(ferrofin_traits::persistence::PlayedAndTotal::default())
+            Ok(ferrofin_traits::persistence::PlayedAndTotal {
+                played: self.played,
+                total: self.total,
+            })
         }
         async fn get_played_and_total_count_from_linked_children(
             &self,
-            _filter: &ferrofin_traits::options::InternalItemsQuery,
-            _parent_id: Uuid,
+            filter: &ferrofin_traits::options::InternalItemsQuery,
+            parent_id: Uuid,
         ) -> Result<ferrofin_traits::persistence::PlayedAndTotal, ServiceError> {
-            Ok(ferrofin_traits::persistence::PlayedAndTotal::default())
+            self.get_played_and_total_count(filter, parent_id).await
         }
         async fn get_played_and_total_count_batch(
             &self,
@@ -6211,8 +7345,16 @@ mod tests {
             _user: &UserEntity,
         ) -> Result<HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>, ServiceError>
         {
+            self.played_batch_asks
+                .lock()
+                .expect("asks")
+                .extend_from_slice(folder_ids);
             // Every folder reports the same counts (1 of 4 leaf descendants
-            // played → 3 unplayed, by default).
+            // played → 3 unplayed, by default); 0/0 is left out, as the real
+            // service leaves it.
+            if self.played == 0 && self.total == 0 {
+                return Ok(HashMap::new());
+            }
             Ok(folder_ids
                 .iter()
                 .map(|&f| {
@@ -6243,78 +7385,11 @@ mod tests {
             _user_id: Option<Uuid>,
         ) -> Result<HashMap<Uuid, i32>, ServiceError> {
             // Every requested parent reports a fixed 4 children.
+            self.child_count_asks
+                .lock()
+                .expect("asks lock")
+                .extend_from_slice(parent_ids);
             Ok(parent_ids.iter().map(|&p| (p, 4)).collect())
-        }
-    }
-
-    /// An [`ImageProcessor`] fake: a deterministic cache tag per path, a fixed
-    /// 2:1 dimension.
-    #[derive(Default)]
-    struct FakeImages;
-
-    #[async_trait]
-    impl ImageProcessor for FakeImages {
-        fn supported_input_formats(&self) -> Vec<String> {
-            vec![]
-        }
-        fn supports_image_collage_creation(&self) -> bool {
-            false
-        }
-        fn supported_image_output_formats(&self) -> Vec<ImageFormat> {
-            vec![]
-        }
-        async fn get_image_dimensions(&self, _path: &str) -> Result<ImageDimensions, ServiceError> {
-            Ok(ImageDimensions {
-                width: 400,
-                height: 200,
-            })
-        }
-        async fn get_item_image_dimensions(
-            &self,
-            _item_id: Uuid,
-            _info: &ItemImageInfo,
-        ) -> Result<ImageDimensions, ServiceError> {
-            Ok(ImageDimensions {
-                width: 400,
-                height: 200,
-            })
-        }
-        async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
-            Ok("blur".into())
-        }
-        async fn get_image_blur_hash_sized(
-            &self,
-            _path: &str,
-            _image_dimensions: ImageDimensions,
-        ) -> Result<String, ServiceError> {
-            Ok("blur".into())
-        }
-        async fn get_image_cache_tag(
-            &self,
-            _item_id: Uuid,
-            image: &ItemImageInfo,
-        ) -> Result<Option<String>, ServiceError> {
-            Ok(Some(format!("tag:{}", image.path)))
-        }
-        async fn get_image_cache_tag_for_path(
-            &self,
-            _base_item_path: &str,
-            _image_date_modified: DateTime<Utc>,
-        ) -> Result<Option<String>, ServiceError> {
-            Ok(None)
-        }
-        async fn process_image(
-            &self,
-            _options: &ferrofin_traits::options::ImageProcessingOptions,
-        ) -> Result<ProcessedImage, ServiceError> {
-            Err(ServiceError::NotFound("process_image".into()))
-        }
-        async fn create_image_collage(
-            &self,
-            _options: &ferrofin_traits::options::ImageCollageOptions,
-            _library_name: Option<&str>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
     }
 
@@ -6340,6 +7415,8 @@ mod tests {
         /// When set, the alternate versions are the rows stored here (the
         /// real repository's read), not the canned one.
         stored_alternates: Option<Database>,
+        /// When set, every item's streams are these instead of the canned ones.
+        streams: Option<Vec<MediaStream>>,
     }
 
     #[async_trait]
@@ -6377,6 +7454,9 @@ mod tests {
             // (MediaSources, then the MediaStreams field) plus once per merged
             // alternate keyed by the alternate's id, which is why it may only
             // be drained at its last read. An empty map would hide a regression there.
+            if let Some(streams) = &self.streams {
+                return Ok(item_ids.iter().map(|id| (*id, streams.clone())).collect());
+            }
             Ok(item_ids
                 .iter()
                 .map(|id| {
@@ -8155,6 +9235,68 @@ mod tests {
         }
     }
 
+    /// `DtoService.AttachBasicFields` (v12.2 :1138, :1290, :842-860): a video
+    /// carries its stored `AspectRatio`, and `IsPlaceHolder` only when true;
+    /// a music video its `Album` and the id of the `MusicAlbum` of that name,
+    /// on the single and the page path alike.
+    #[tokio::test]
+    async fn videos_carry_aspect_ratio_place_holder_and_music_video_album() {
+        let db = test_db().await;
+        let (wide, stub, clip, album) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, wide, BaseItemKind::Movie, "Wide").await;
+        seed_named_item(&db, stub, BaseItemKind::Movie, "Stub").await;
+        seed_named_item(&db, clip, BaseItemKind::MusicVideo, "Clip").await;
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Greatest Hits").await;
+        crate::test_support::set_clean_name(&db, album, "Greatest Hits").await;
+        let mut wide = fetch_item(&db, wide).await;
+        wide.data = Some(r#"{"AspectRatio":"2.35:1"}"#.to_owned());
+        let mut stub = fetch_item(&db, stub).await;
+        stub.data = Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#.to_owned());
+        let mut clip = fetch_item(&db, clip).await;
+        clip.album = Some("Greatest Hits".to_owned());
+        let svc = service(db);
+        let options = DtoOptions {
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+
+        let page = svc
+            .get_base_item_dtos(
+                &[wide.clone(), stub, clip.clone()],
+                &options,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page[0].aspect_ratio.as_deref(), Some("2.35:1"));
+        assert_eq!(page[0].is_place_holder, None, "only a placeholder says so");
+        assert_eq!(page[1].is_place_holder, Some(true));
+        assert_eq!(page[1].aspect_ratio, None);
+        assert_eq!(page[2].album.as_deref(), Some("Greatest Hits"));
+        assert_eq!(page[2].album_id, Some(album));
+
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album_id, Some(album));
+        clip.album = Some("No Such Album".to_owned());
+        let single = svc
+            .get_base_item_dto(&clip, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(single.album.as_deref(), Some("No Such Album"));
+        assert_eq!(single.album_id, None, "no album of that name, no id");
+    }
+
     #[tokio::test]
     async fn can_delete_true_for_non_virtual_item() {
         let db = test_db().await;
@@ -8184,6 +9326,38 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(dto.can_delete, Some(false), "{path:?}");
+        }
+    }
+
+    /// `MusicArtist.IsFolder => !IsAccessedByName` (v12.2 MusicArtist.cs:30-33):
+    /// a by-name artist's DTO carries no `IsFolder`, even from a row an earlier
+    /// build stored as a folder; an artist directory under a library is one.
+    #[tokio::test]
+    async fn only_a_parented_artist_is_a_folder() {
+        let db = test_db().await;
+        let (library, by_name, directory) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, library, BaseItemKind::CollectionFolder, "Music", None).await;
+        seed_folder_item(&db, by_name, BaseItemKind::MusicArtist, "By name", None).await;
+        seed_folder_item(
+            &db,
+            directory,
+            BaseItemKind::MusicArtist,
+            "Dir",
+            Some(library),
+        )
+        .await;
+        let svc = service(db.clone());
+        for (id, expected) in [(by_name, None), (directory, Some(true))] {
+            let dto = svc
+                .get_base_item_dto(
+                    &fetch_item(&db, id).await,
+                    &DtoOptions::default(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(dto.is_folder, expected, "{:?}", dto.name);
         }
     }
 
@@ -8471,6 +9645,168 @@ mod tests {
         );
     }
 
+    /// The item DTO's sources run `GetStaticMediaSources(item, true, user)`'s
+    /// per-user tail (v12.2 `DtoService.cs:410` → `MediaSourceManager.cs:
+    /// 397-421`), from page-wide reads: an episode with no original language
+    /// of its own takes its series' for an `OriginalLanguage` audio
+    /// preference, the subtitle the user remembers wins, and the user's
+    /// policy sets the `Supports*` flags. Without a user the sources stay as
+    /// built.
+    #[tokio::test]
+    async fn media_sources_carry_the_users_default_streams_and_permissions() {
+        use ferrofin_db::enums::PermissionKind;
+        use ferrofin_model::entities::MediaStreamType::{Audio, Subtitle, Video};
+
+        let db = test_db().await;
+        let series = Uuid::new_v4();
+        let episode = Uuid::new_v4();
+        seed_folder_item(&db, series, BaseItemKind::Series, "Show", None).await;
+        let mut row = fetch_item(&db, series).await;
+        row.original_language = Some("fra".to_owned());
+        save_item(&db, &row).await;
+        seed_item_of_series(&db, episode, BaseItemKind::Episode, "Pilot", series).await;
+        let mut row = fetch_item(&db, episode).await;
+        row.media_type = Some("Video".to_owned());
+        save_item(&db, &row).await;
+        let item = fetch_item(&db, episode).await;
+
+        let user_id = Uuid::new_v4();
+        let mut user = seed_user(&db, user_id).await;
+        user.audio_language_preference = Some("OriginalLanguage".to_owned());
+        user.play_default_audio_track = false;
+        user.remember_subtitle_selections = true;
+        crate::user_data_manager::seed_content_permissions(
+            &db,
+            user_id,
+            &[
+                PermissionKind::EnableAudioPlaybackTranscoding,
+                PermissionKind::EnablePlaybackRemuxing,
+            ],
+            &[],
+        )
+        .await;
+        crate::test_support::seed_user_data(&db, user_id, episode, false, None).await;
+        crate::user_data_manager::remember_streams(&db, user_id, episode, None, Some(4)).await;
+
+        let stream = |index, stream_type, language: &str, is_default| MediaStream {
+            index,
+            stream_type,
+            language: Some(language.to_owned()),
+            is_default,
+            ..MediaStream::default()
+        };
+        let (mut svc, _tmp) = service_with_real_permissions(&db).await;
+        svc.media_sources = Arc::new(FakeSources {
+            no_alternates: true,
+            streams: Some(vec![
+                stream(0, Video, "und", true),
+                stream(1, Audio, "eng", true),
+                stream(2, Audio, "fra", false),
+                stream(3, Subtitle, "eng", true),
+                stream(4, Subtitle, "fra", false),
+            ]),
+            ..FakeSources::default()
+        });
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let single = svc
+            .get_base_item_dto(&item, &options, Some(&user), None)
+            .await
+            .expect("dto");
+        let page = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&item),
+                &options,
+                Some(&user),
+                None,
+                false,
+            )
+            .await
+            .expect("page");
+        for dto in [&single, &page[0]] {
+            let source = &dto.media_sources.as_ref().expect("sources")[0];
+            assert_eq!(source.default_audio_stream_index, Some(2), "series' French");
+            assert_eq!(source.default_subtitle_stream_index, Some(4), "remembered");
+            assert!(
+                !source.supports_transcoding,
+                "no video transcoding permission"
+            );
+            assert!(source.supports_direct_stream, "remuxing permitted");
+            assert_eq!(
+                dto.media_streams.as_ref(),
+                Some(&source.media_streams),
+                "MediaStreams are the item's own source's, scores included"
+            );
+        }
+
+        let anonymous = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .expect("dto");
+        let source = &anonymous.media_sources.as_ref().expect("sources")[0];
+        assert_eq!(source.default_subtitle_stream_index, None);
+        assert!(source.supports_transcoding, "as built");
+    }
+
+    /// A Live TV channel is `IHasMediaSources` too, so its placeholder source
+    /// gets the same per-user policy flags (`MediaSourceManager.cs:409-417`):
+    /// a television channel by video transcoding and remuxing, a radio
+    /// channel (`MediaType` Audio) by audio transcoding. Without a user it
+    /// stays as built.
+    #[tokio::test]
+    async fn a_channels_source_carries_the_users_permissions() {
+        use ferrofin_db::enums::PermissionKind;
+
+        let db = test_db().await;
+        let (tv, radio) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, name, media_type) in [(tv, "News", "Video"), (radio, "Jazz", "Audio")] {
+            seed_named_item(&db, id, BaseItemKind::LiveTvChannel, name).await;
+            let mut row = fetch_item(&db, id).await;
+            row.media_type = Some(media_type.to_owned());
+            save_item(&db, &row).await;
+        }
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        crate::user_data_manager::seed_content_permissions(
+            &db,
+            user_id,
+            &[PermissionKind::EnableAudioPlaybackTranscoding],
+            &[],
+        )
+        .await;
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let channels = [fetch_item(&db, tv).await, fetch_item(&db, radio).await];
+        let flags = |dto: &BaseItemDto| {
+            let source = &dto.media_sources.as_ref().expect("sources")[0];
+            (source.supports_transcoding, source.supports_direct_stream)
+        };
+
+        let page = svc
+            .get_base_item_dtos(&channels, &options, Some(&user), None, false)
+            .await
+            .expect("page");
+        let single = svc
+            .get_base_item_dto(&channels[0], &options, Some(&user), None)
+            .await
+            .expect("dto");
+        assert_eq!(flags(&page[0]), (false, false), "television channel");
+        assert_eq!(flags(&single), (false, false), "television channel, alone");
+        assert_eq!(flags(&page[1]), (true, true), "radio channel");
+
+        let anonymous = svc
+            .get_base_item_dto(&channels[0], &options, None, None)
+            .await
+            .expect("dto");
+        assert_eq!(flags(&anonymous), (true, true), "as built");
+    }
+
     #[tokio::test]
     async fn an_items_alternate_version_keeps_its_streams_when_also_on_the_page() {
         // The other half of the `media_streams` exclusion: the map is read once
@@ -8750,43 +10086,367 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn child_count_placeholder_for_collection_folders() {
-        // C# `GetChildCount` returns a random 1..10 for collection folders and
-        // user views instead of a real count; the port derives a stable 1..=9.
-        let db = test_db().await;
+    /// A library of `collection_type` (`None`: untyped).
+    async fn seed_library(db: &Database, collection_type: Option<&str>) -> Uuid {
         let id = Uuid::new_v4();
-        seed_folder_item(&db, id, BaseItemKind::CollectionFolder, "Shows", None).await;
-        let user = seed_user(&db, Uuid::new_v4()).await;
-        let item = fetch_item(&db, id).await;
-        let svc = service(db);
-        let options = DtoOptions {
-            fields: vec![ItemFields::ChildCount],
-            ..DtoOptions::default()
-        };
-
-        let dto = svc
-            .get_base_item_dto(&item, &options, Some(&user), None)
-            .await
-            .unwrap();
-        let count = dto.child_count.expect("placeholder set");
-        assert!((1..=9).contains(&count));
+        let data = collection_type.map_or_else(
+            || "{}".to_owned(),
+            |kind| format!(r#"{{"CollectionType":"{kind}"}}"#),
+        );
+        seed_folder_with_data(
+            db,
+            id,
+            BaseItemKind::CollectionFolder,
+            "Library",
+            &data,
+            None,
+        )
+        .await;
+        id
     }
 
-    /// `UserRootFolder` is neither `ICollectionFolder` nor `UserView`, so C#
-    /// falls through to `folder.GetChildCount(user)` — a REAL count
-    /// (DtoService.cs:648-665). Its children are the libraries plus the
-    /// playlists plugin folder `CreateRootFolder()` parents to it, and getting
-    /// this wrong is what made `GET /Items/Root` report 3 where 10.11.8
-    /// reports 4.
+    /// [`service`] over a library that reads the database and a count
+    /// service that records what it is asked.
+    fn child_count_service(db: Database, counts: FakeCounts) -> FerrofinDtoService {
+        FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(DbBackedLibrary { db }),
+            Arc::new(FakeUserData),
+            Arc::new(counts),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        )
+    }
+
+    fn child_count_options() -> DtoOptions {
+        DtoOptions {
+            fields: vec![ItemFields::ChildCount],
+            ..DtoOptions::default()
+        }
+    }
+
+    /// v12.2 `GetChildCountSourceIds`: a library counts its own children (the
+    /// real count batch counts its physical folders), where 12.0 returned a
+    /// random 1..10.
+    #[tokio::test]
+    async fn a_library_counts_its_children() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("tvshows")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let item = fetch_item(&db, library).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().expect("asks"), [library]);
+        assert_eq!(dto.child_count, Some(4));
+    }
+
+    /// Upstream `DtoServiceTests.GetBaseItemDtos_NoUser_SkipsTheChildCountBatch`:
+    /// a child count is attached only to a user's DTO, so with no user the batch
+    /// never runs.
+    #[tokio::test]
+    async fn without_a_user_the_child_count_batch_never_runs() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("movies")).await;
+        let item = fetch_item(&db, library).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.child_count, None);
+        assert!(asks.lock().expect("asks").is_empty());
+    }
+
+    /// Upstream `DtoServiceTests.GetBaseItemDtos_GroupedMoviesView_CountsEveryLibraryGroupedIntoIt`:
+    /// a grouped `movies` view has no library of its own, so it sums the
+    /// libraries the user grouped into it, an untyped one included. A grouped
+    /// tvshows library and an ungrouped movies library are not counted. Upstream
+    /// asks for each library's two physical folders (4 each, 16); the real
+    /// count batch here translates a library to its physical folders itself, so
+    /// the libraries are what it is asked for (4 each, 8).
+    #[tokio::test]
+    async fn a_grouped_movies_view_counts_every_library_grouped_into_it() {
+        let db = test_db().await;
+        let grouped = seed_library(&db, Some("movies")).await;
+        let untyped = seed_library(&db, None).await;
+        let shows = seed_library(&db, Some("tvshows")).await;
+        let _ungrouped = seed_library(&db, Some("movies")).await;
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        let values: Vec<String> = [grouped, untyped, shows]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::GroupedFolders,
+            &values,
+        )
+        .await
+        .expect("group the folders");
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            r#"{"ViewType":"movies"}"#,
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        let mut expected = vec![grouped, untyped];
+        expected.sort_unstable();
+        assert_eq!(*asks.lock().expect("asks"), expected);
+        assert_eq!(dto.child_count, Some(8));
+    }
+
+    /// Upstream `DtoServiceTests.GetBaseItemDtos_SubViewOfALibrary_DoesNotCountTheLibrary`:
+    /// a sub-view such as "Continue Watching" hangs off the library its view
+    /// was built over, but it holds a query, so it never counts the library. It
+    /// counts its own browse instead (the fake's is empty).
+    #[tokio::test]
+    async fn a_sub_view_of_a_library_does_not_count_the_library() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("movies")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let sub_view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            sub_view,
+            BaseItemKind::UserView,
+            "Continue Watching",
+            &format!(r#"{{"ViewType":"movieresume","DisplayParentId":"{library}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, sub_view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert!(asks.lock().expect("asks").is_empty());
+        assert_eq!(dto.child_count, Some(0));
+    }
+
+    /// `GetChildCountSourceIds`'s parent guards: a `movies` view whose parent
+    /// is another view, is missing, or is not a folder does not stand for it,
+    /// and falls through to the libraries the user grouped.
+    #[rstest::rstest]
+    #[case::the_parent_is_a_view(Some(BaseItemKind::UserView))]
+    #[case::the_parent_is_not_a_folder(Some(BaseItemKind::Movie))]
+    #[case::the_parent_is_missing(None)]
+    #[tokio::test]
+    async fn a_movies_view_without_a_library_parent_counts_the_grouped_libraries(
+        #[case] parent_kind: Option<BaseItemKind>,
+    ) {
+        let db = test_db().await;
+        let grouped = seed_library(&db, Some("movies")).await;
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::GroupedFolders,
+            &[grouped.to_string()],
+        )
+        .await
+        .expect("group the folder");
+        let parent = Uuid::new_v4();
+        match parent_kind {
+            Some(BaseItemKind::UserView) => {
+                seed_folder_with_data(
+                    &db,
+                    parent,
+                    BaseItemKind::UserView,
+                    "Parent",
+                    r#"{"ViewType":"movies"}"#,
+                    None,
+                )
+                .await;
+            }
+            Some(kind) => seed_named_item(&db, parent, kind, "Parent").await,
+            None => {}
+        }
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            &format!(r#"{{"ViewType":"movies","DisplayParentId":"{parent}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().expect("asks"), [grouped]);
+        assert_eq!(dto.child_count, Some(4));
+    }
+
+    /// `!parentId.Equals(view.Id)`: a view whose `DisplayParentId` is itself
+    /// has no parent. Upstream does not fall back to its `ParentId` then, so
+    /// the library that column names is not counted.
+    #[tokio::test]
+    async fn a_view_that_is_its_own_display_parent_does_not_fall_back_to_its_parent_id() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("movies")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            &format!(r#"{{"ViewType":"movies","DisplayParentId":"{view}"}}"#),
+            Some(library),
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert!(asks.lock().expect("asks").is_empty());
+        assert_eq!(dto.child_count, Some(0), "the fake browse is empty");
+    }
+
+    /// `GetChildCountBatch` asks for the distinct source ids: two views over
+    /// one library on a page ask for it once, and each counts it.
+    #[tokio::test]
+    async fn two_views_over_one_library_ask_for_it_once() {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("music")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let mut views = Vec::new();
+        for name in ["Music", "Music again"] {
+            let view = Uuid::new_v4();
+            seed_folder_with_data(
+                &db,
+                view,
+                BaseItemKind::UserView,
+                name,
+                &format!(r#"{{"ViewType":"music","DisplayParentId":"{library}"}}"#),
+                None,
+            )
+            .await;
+            views.push(fetch_item(&db, view).await);
+        }
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dtos = svc
+            .get_base_item_dtos(&views, &child_count_options(), Some(&user), None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().expect("asks"), [library]);
+        assert!(
+            dtos.iter().all(|dto| dto.child_count == Some(4)),
+            "{dtos:?}"
+        );
+    }
+
+    /// `GetChildCountSourceIds`: a view over one library, whatever its
+    /// original-folder or movies/tvshows type, counts that library; a view of
+    /// another type over the same library does not.
+    #[rstest::rstest]
+    #[case("music", true)]
+    #[case("movies", true)]
+    #[case("tvshows", true)]
+    #[case("boxsets", true)]
+    #[case("homevideos", true)]
+    #[case("livetv", false)]
+    #[case("playlists", false)]
+    #[tokio::test]
+    async fn a_view_over_one_library_counts_that_library(
+        #[case] view_type: &str,
+        #[case] counts_the_library: bool,
+    ) {
+        let db = test_db().await;
+        let library = seed_library(&db, Some("music")).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "View",
+            &format!(r#"{{"ViewType":"{view_type}","DisplayParentId":"{library}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let counts = FakeCounts::default();
+        let asks = Arc::clone(&counts.child_count_asks);
+        let svc = child_count_service(db, counts);
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        if counts_the_library {
+            assert_eq!(*asks.lock().expect("asks"), [library]);
+            assert_eq!(dto.child_count, Some(4));
+        } else {
+            assert!(asks.lock().expect("asks").is_empty());
+            assert_eq!(dto.child_count, Some(0), "the fake browse is empty");
+        }
+    }
+
+    /// `UserRootFolder` is not a view, so `GetChildCountSourceIds` makes it its
+    /// own source (v12.2 `DtoService.cs:750-760`). Its children are the
+    /// libraries plus the playlists plugin folder `CreateRootFolder()` parents
+    /// to it, and getting this wrong is what made `GET /Items/Root` report 3
+    /// where 10.11.8 reports 4.
     #[tokio::test]
     async fn child_count_is_real_for_the_user_root_folder() {
         let db = test_db().await;
-        // A fixed id whose id-derived placeholder is NOT the count service's
-        // canned value, so the assertion below can only pass on the real branch.
-        let root = Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7700);
-        let placeholder = i32::from(root.as_bytes()[15] % 9) + 1;
-        assert_ne!(placeholder, 4, "the fixture must separate the two branches");
+        let root = Uuid::new_v4();
         seed_folder_item(
             &db,
             root,
@@ -8797,7 +10457,7 @@ mod tests {
         .await;
         // The children upstream's root has: the libraries plus the playlists
         // plugin folder. (`FakeCounts` reports a fixed 4 per parent, so what is
-        // under test is which branch `attach_child_count` takes, not the sum.)
+        // under test is that the root is counted as itself, not the sum.)
         for (kind, name) in [
             (BaseItemKind::CollectionFolder, "Movies"),
             (BaseItemKind::CollectionFolder, "Shows"),
@@ -8817,11 +10477,7 @@ mod tests {
             .get_base_item_dto(&item, &options, Some(&user), None)
             .await
             .unwrap();
-        assert_eq!(
-            dto.child_count,
-            Some(4),
-            "the root takes the real-count branch, not the id-derived placeholder"
-        );
+        assert_eq!(dto.child_count, Some(4), "the root is counted as itself");
     }
 
     /// `BasePluginFolder.CanDelete() => false` (v10.11.8
@@ -9111,7 +10767,7 @@ mod tests {
                 person_type: Some("Actor".into()),
                 ..Default::default()
             }],
-            ..Default::default()
+            named_items: person_rows(&db, &["Leonardo DiCaprio"]).await,
         });
         let svc = service_with(db, library);
         let dto = svc
@@ -9146,11 +10802,10 @@ mod tests {
         }
         let svc = service(db);
         let map = svc
-            .resolve_value_ids(&[(0, clean.clone()), (1, clean.clone())])
+            .resolve_by_name_ids(&[(BaseItemKind::MusicArtist, clean.clone())])
             .await
             .unwrap();
-        assert_eq!(map[&0][&clean], artist);
-        assert_eq!(map[&1][&clean], artist);
+        assert_eq!(map[&BaseItemKind::MusicArtist][&clean], artist);
     }
 
     #[tokio::test]
@@ -9170,43 +10825,51 @@ mod tests {
         let svc = service(db);
 
         // The batch resolver finds the stored id under its (type, clean) key.
-        let map = svc.resolve_value_ids(&[(3, clean.clone())]).await.unwrap();
-        assert_eq!(map.get(&3).and_then(|m| m.get(&clean)).copied(), Some(vid));
+        let map = svc
+            .resolve_by_name_ids(&[(BaseItemKind::Studio, clean.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            map.get(&BaseItemKind::Studio)
+                .and_then(|m| m.get(&clean))
+                .copied(),
+            Some(vid)
+        );
 
-        // Prefetched::value_id reads the map without a query, and nil-s a name
+        // Prefetched::by_name_id reads the map without a query, and nil-s a name
         // with no row. With an empty clean cache it falls back to cleaning the
         // name itself, so an un-prefetched name still resolves.
         let pf = Prefetched {
-            value_ids: map,
+            by_name_ids: map,
             ..Prefetched::default()
         };
-        assert_eq!(pf.value_id(3, "Warner Bros."), vid);
-        assert!(pf.value_id(3, "Nobody").is_nil());
+        assert_eq!(pf.by_name_id(BaseItemKind::Studio, "Warner Bros."), vid);
+        assert!(pf.by_name_id(BaseItemKind::Studio, "Nobody").is_nil());
 
         // ...and the cached clean value resolves the same id, for every spelling
         // that cleans to it.
         let pf = Prefetched {
-            value_ids: pf.value_ids,
+            by_name_ids: pf.by_name_ids,
             clean_values: [("WARNER BROS.".to_owned(), clean.clone())]
                 .into_iter()
                 .collect(),
             ..Prefetched::default()
         };
-        assert_eq!(pf.value_id(3, "WARNER BROS."), vid);
+        assert_eq!(pf.by_name_id(BaseItemKind::Studio, "WARNER BROS."), vid);
     }
 
-    /// Studios/genres/artists must resolve to the SAME `ItemValues` ids the
+    /// Studios/genres/artists must resolve to the SAME by-name items the
     /// per-name lookup found, for names whose clean form differs from the stored
     /// spelling — the page's cached clean keys are the join key against
-    /// `ItemValues.CleanValue`, so any normalization drift empties these fields.
+    /// `BaseItems.CleanName` (and `ItemValues.CleanValue`, the fallback), so any
+    /// normalization drift empties or misdirects these fields.
     ///
-    /// The spellings below differ only in case and diacritics, which is exactly
-    /// what the clean value folds: C# `GetCleanValue` is
-    /// `RemoveDiacritics().ToLowerInvariant()` and keeps punctuation and
-    /// whitespace, so `'WARNER   BROS!'` is NOT another spelling of
-    /// `'Warner Bros.'` — to Jellyfin those are two different studios.
+    /// The spellings below differ in case and diacritics, which the clean value
+    /// folds along with punctuation and whitespace runs (C# 12 `GetCleanValue`:
+    /// diacritics removed, lower-cased, every non-letter/digit a space,
+    /// whitespace collapsed and trimmed).
     #[tokio::test]
-    async fn value_ids_resolve_end_to_end_for_awkward_names() {
+    async fn by_name_ids_resolve_end_to_end_for_awkward_names() {
         let db = test_db().await;
 
         // Seed one ItemValues row per (type, clean value).
@@ -9228,11 +10891,20 @@ mod tests {
                 vid
             }
         };
-        let studio_id = seed_value(3, "Warner Bros.").await;
-        let genre_id = seed_value(2, "Sci-Fi").await;
+        let studio_value = seed_value(3, "Warner Bros.").await;
+        let genre_value = seed_value(2, "Sci-Fi").await;
+        // The by-name rows, under ids unrelated to the value ids (an adopted
+        // shape), so a link that fell back to the value id would show.
+        let (studio_id, genre_id) = (Uuid::from_u128(0xA_9997), Uuid::from_u128(0xA_9998));
+        for (id, kind, name) in [
+            (studio_id, BaseItemKind::Studio, "Warner Bros."),
+            (genre_id, BaseItemKind::Genre, "Sci-Fi"),
+        ] {
+            seed_named_item(&db, id, kind, name).await;
+            crate::test_support::set_clean_name(&db, id, name).await;
+        }
         // The artist is stored under BOTH value types, with different spellings
-        // that share a clean value — attach_artists must prefer the AlbumArtist
-        // (1) row, which is the browsable one.
+        // that share a clean value; neither value id is the link.
         let artist_id = seed_value(0, "Sigur Rós").await;
         let album_artist_id = seed_value(1, "sigur ros").await;
         // The browsable artist: a `MusicArtist` item with that clean name.
@@ -9278,8 +10950,10 @@ mod tests {
         let studios = dtos[0].studios.as_ref().expect("studios");
         assert_eq!(studios[0].name.as_deref(), Some("WARNER BROS."));
         assert_eq!(studios[0].id, studio_id, "studio id");
+        assert_ne!(studios[0].id, studio_value);
         let genres = dtos[0].genre_items.as_ref().expect("genre items");
         assert_eq!(genres[0].id, genre_id, "genre id");
+        assert_ne!(genres[0].id, genre_value);
 
         // The links are the `MusicArtist` item whose clean name matches
         // (`FindArtists`), never an `ItemValues` id.
@@ -9290,6 +10964,119 @@ mod tests {
         assert_ne!(artists[0].id, album_artist_id);
         let album_artists = dtos[1].album_artists.as_ref().expect("album artists");
         assert_eq!(album_artists[0].id, artist_item, "album-artist id");
+    }
+
+    /// A music owner's genres link to `MusicGenre` rows, everyone else's to
+    /// `Genre` rows — the scanner's split, so `AudioBook` (an `IHasMusicGenres`
+    /// upstream) links to the `Genre` row its genre actually has.
+    #[rstest::rstest]
+    #[case(BaseItemKind::Audio, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::MusicAlbum, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::MusicVideo, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::MusicArtist, BaseItemKind::MusicGenre)]
+    #[case(BaseItemKind::AudioBook, BaseItemKind::Genre)]
+    #[case(BaseItemKind::Movie, BaseItemKind::Genre)]
+    #[case(BaseItemKind::Series, BaseItemKind::Genre)]
+    fn genre_links_follow_the_scanners_music_split(
+        #[case] owner: BaseItemKind,
+        #[case] expected: BaseItemKind,
+    ) {
+        let item = BaseItemEntity {
+            type_: crate::item_type_lookup::stored_type_name(owner)
+                .unwrap()
+                .to_owned(),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(genre_kind(&item), expected);
+    }
+
+    /// `GenreItems`/`Studios` link to the by-name ITEM a client can open
+    /// (C# `GetGenreId`/`GetMusicGenreId`/`GetStudioId`), found by type and
+    /// name — not to the `ItemValues` id, which on an adopted database is a
+    /// random guid no row carries, and which a music genre's row never takes.
+    #[tokio::test]
+    async fn genre_and_studio_links_open_the_by_name_item() {
+        use crate::test_support::{seed_item_value, set_clean_name};
+        use ferrofin_db::enums::ItemValueType;
+        let db = test_db().await;
+        // An adopted shape: the by-name rows already exist under Jellyfin's
+        // path-derived ids, unrelated to the `ItemValues` ids, so the scanner's
+        // type-and-name guard adds no row of its own beside them.
+        let (jazz, drama, acme, music_jazz) = (
+            Uuid::from_u128(0xD_0003),
+            Uuid::from_u128(0xD_0004),
+            Uuid::from_u128(0xD_0005),
+            Uuid::from_u128(0xD_0006),
+        );
+        for (id, kind, name) in [
+            (jazz, BaseItemKind::Genre, "Jazz"),
+            (drama, BaseItemKind::Genre, "Drama"),
+            (acme, BaseItemKind::Studio, "Acme"),
+            (music_jazz, BaseItemKind::MusicGenre, "Jazz"),
+        ] {
+            seed_named_item(&db, id, kind, name).await;
+            set_clean_name(&db, id, name).await;
+        }
+        // A movie and an album share "Jazz": the album's genre is a music
+        // genre, so it links to the `MusicGenre` row. "Blues" is music-only and
+        // has no adopted row, so the scanner writes one (derived id).
+        let movie = Uuid::from_u128(0xD_0001);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        let album = Uuid::from_u128(0xD_0002);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Record").await;
+        for (id, value_type, value) in [
+            (movie, ItemValueType::Genre, "Jazz"),
+            (movie, ItemValueType::Genre, "Drama"),
+            (movie, ItemValueType::Studios, "Acme"),
+            (album, ItemValueType::Genre, "Jazz"),
+            (album, ItemValueType::Genre, "Blues"),
+        ] {
+            seed_item_value(&db, id, value_type, value).await;
+        }
+        let music_genre =
+            |name| crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, name).unwrap();
+
+        let mut movie_row = fetch_item(&db, movie).await;
+        movie_row.genres = Some("Jazz|Drama".to_owned());
+        movie_row.studios = Some("Acme".to_owned());
+        let mut album_row = fetch_item(&db, album).await;
+        album_row.genres = Some("Jazz|Blues".to_owned());
+        let svc = service(db);
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie_row, album_row],
+                &DtoOptions::default(),
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let ids = |pairs: Option<&Vec<NameGuidPair>>| -> Vec<Uuid> {
+            pairs.expect("pairs").iter().map(|p| p.id).collect()
+        };
+        assert_eq!(
+            ids(dtos[0].genre_items.as_ref()),
+            vec![jazz, drama],
+            "a movie links to the Genre rows"
+        );
+        assert_eq!(ids(dtos[0].studios.as_ref()), vec![acme], "studio row");
+        assert_eq!(
+            ids(dtos[1].genre_items.as_ref()),
+            vec![music_jazz, music_genre("Blues")],
+            "an album links to the MusicGenre rows, not the movie's Genre row"
+        );
+        assert_ne!(music_jazz, music_genre("Jazz"));
+
+        // With no row at all, a music genre takes the id its row will be
+        // created with; a genre has nothing to fall back to.
+        let empty = Prefetched::default();
+        assert_eq!(
+            empty.by_name_id(BaseItemKind::MusicGenre, "Bebop"),
+            music_genre("Bebop")
+        );
+        assert!(empty.by_name_id(BaseItemKind::Genre, "Bebop").is_nil());
     }
 
     /// `DtoService` pairs only the distinct, non-blank artist names that match a
@@ -9475,7 +11262,11 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            named_items: Vec::new(),
+            named_items: person_rows(
+                &db,
+                &credits.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
+            )
+            .await,
         });
         let svc = service_with(db, library);
         let dto = svc
@@ -9490,6 +11281,55 @@ mod tests {
             .filter_map(|p| p.name.as_deref())
             .collect();
         assert_eq!(names, expected);
+    }
+
+    /// `People[].Type` is the stored `PersonType` parsed the way upstream's
+    /// `PeopleRepository` does (`Enum.TryParse<PersonKind>(row.PersonType, out
+    /// var kind)`, `PeopleRepository.cs:346`, `:380`): every member name,
+    /// case-sensitively; anything else leaves `Unknown`.
+    #[tokio::test]
+    async fn people_carry_every_stored_person_kind() {
+        use ferrofin_model::json::enums::JsonEnum as _;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let item = fetch_item(&db, movie).await;
+        let mut stored: Vec<(&str, &str)> = ferrofin_model::data::PersonKind::members()
+            .iter()
+            .map(|(name, _)| (*name, *name))
+            .collect();
+        stored.extend([("actor", "Unknown"), ("Colorer", "Unknown")]);
+        let names: Vec<String> = (0..stored.len())
+            .map(|order| format!("Person {order}"))
+            .collect();
+        let library = Arc::new(FakeLibrary {
+            people: (0_i64..)
+                .zip(&stored)
+                .map(|(order, (kind, _))| PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: format!("Person {order}"),
+                    person_type: Some((*kind).to_owned()),
+                    sort_order: Some(order),
+                    ..Default::default()
+                })
+                .collect(),
+            named_items: person_rows(&db, &names.iter().map(String::as_str).collect::<Vec<_>>())
+                .await,
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let types: Vec<String> = dto
+            .people
+            .as_ref()
+            .expect("people")
+            .iter()
+            .map(|person| person.type_.json_name().into_owned())
+            .collect();
+        let expected: Vec<&str> = stored.iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(types, expected);
     }
 
     #[tokio::test]
@@ -9628,9 +11468,8 @@ mod tests {
     /// about the key for every one of [`AWKWARD_CREDITS`].
     ///
     /// If they ever disagree (one side lowercasing, trimming or cleaning while
-    /// the other does not) every cast member silently falls back to its
-    /// per-credit `Peoples` row id — which is NOT what favorites are written
-    /// against — and nothing else in the suite would notice, because tidy ASCII
+    /// the other does not) every such cast member silently drops out of the
+    /// credits, and nothing else in the suite would notice, because tidy ASCII
     /// names key the same under either convention.
     #[tokio::test]
     async fn person_ids_resolve_for_awkwardly_spelled_credits() {
@@ -9639,20 +11478,17 @@ mod tests {
         seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
 
         // One by-name Person item per credit, plus one per-credit Peoples row
-        // with a DIFFERENT id, so a fallback to the credit id is visible.
+        // with a DIFFERENT id, so the credit's id is never mistaken for it.
         let mut person_rows = Vec::new();
         let mut expected = Vec::new();
         let mut credits = Vec::new();
-        let mut credit_ids = Vec::new();
         for (i, (credited_as, item_name)) in AWKWARD_CREDITS.iter().enumerate() {
             let person_id = Uuid::from_u128(0xB_9100 + idx(i));
             seed_named_item(&db, person_id, BaseItemKind::Person, item_name).await;
             person_rows.push(fetch_item(&db, person_id).await);
             expected.push(person_id);
-            let credit_id = Uuid::from_u128(0xB_9200 + idx(i));
-            credit_ids.push(credit_id);
             credits.push(PeopleEntity {
-                id: credit_id.to_string(),
+                id: Uuid::from_u128(0xB_9200 + idx(i)).to_string(),
                 name: (*credited_as).into(),
                 person_type: Some("Actor".into()),
                 ..Default::default()
@@ -9680,11 +11516,6 @@ mod tests {
                 "credit name for {credited_as:?}"
             );
             // …and resolves to the by-name Person item, not the credit row.
-            assert_ne!(
-                people[i].id, credit_ids[i],
-                "{credited_as:?} fell back to its per-credit row id — the build \
-                 and lookup sides of person_ids_by_name disagree about the key"
-            );
             assert_eq!(
                 people[i].id, expected[i],
                 "by-name Person id for {credited_as:?}"
@@ -9694,8 +11525,10 @@ mod tests {
 
     /// The lookup half of the same convention, pinned in isolation: the map is
     /// keyed by the credit row's name EXACTLY as stored (the contract its doc
-    /// comment states), and a name the prefetch never resolved falls back to the
-    /// per-credit row id — or is dropped when that is not a GUID.
+    /// comment states), and a credit whose name the prefetch never resolved to a
+    /// `Person` item is dropped, as C# `AttachPeople` adds a `BaseItemPerson`
+    /// only inside `dictionary.TryGetValue` (its `Peoples` row id is no item id
+    /// a client could follow).
     #[tokio::test]
     async fn attach_people_looks_up_the_raw_stored_credit_name() {
         let db = test_db().await;
@@ -9719,7 +11552,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        // An unresolved credit keeps its own row id…
+        // An unresolved credit is dropped, whatever its row id…
         let unresolved = Uuid::from_u128(0xB_95FF);
         credits.push(PeopleEntity {
             id: unresolved.to_string(),
@@ -9727,9 +11560,7 @@ mod tests {
             person_type: Some("Actor".into()),
             ..Default::default()
         });
-        // …and a credit whose stored id is not a GUID is dropped entirely
-        // rather than emitted with the nil GUID (C# `AttachPeople` only adds a
-        // `BaseItemPerson` for a credit it could resolve).
+        // …a GUID or not.
         credits.push(PeopleEntity {
             id: "not-a-guid".into(),
             name: "Also Nobody".into(),
@@ -9748,29 +11579,196 @@ mod tests {
             .unwrap();
 
         let people = dto.people.as_ref().expect("people");
-        // The non-GUID credit is dropped, so only the resolvable ones survive.
-        assert_eq!(people.len(), AWKWARD_CREDITS.len() + 1);
+        // Only the resolved credits survive.
+        assert_eq!(people.len(), AWKWARD_CREDITS.len());
         for (i, (credited_as, _)) in AWKWARD_CREDITS.iter().enumerate() {
             assert_eq!(
                 people[i].id, expected[i],
                 "{credited_as:?} must be looked up under its raw stored spelling"
             );
         }
-        assert_eq!(
-            people[AWKWARD_CREDITS.len()].id,
-            unresolved,
-            "unresolved credit keeps its per-credit row id"
-        );
         assert!(
-            people.iter().all(|p| !p.id.is_nil()),
-            "no credit is emitted with the nil GUID"
+            people.iter().all(|p| p.id != unresolved),
+            "an unresolved credit is not emitted with its `Peoples` row id"
         );
         assert!(
             people
                 .iter()
-                .all(|p| p.name.as_deref() != Some("Also Nobody")),
-            "a credit whose stored id is not a GUID is dropped, not emitted as nil"
+                .all(|p| !matches!(p.name.as_deref(), Some("Nobody At All" | "Also Nobody"))),
+            "unresolved credits are dropped"
         );
+    }
+
+    /// C# `AttachPeople` keeps only the persons the user may see
+    /// (`.Where(i => user is null || i!.IsVisible(user))`): with a user, a
+    /// person the parental check rejects leaves the credits; with none, every
+    /// resolved credit stays.
+    #[tokio::test]
+    async fn a_person_the_user_may_not_see_leaves_the_credits() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let user = crate::test_support::seed_user(&db, Uuid::new_v4()).await;
+        let mut named = person_rows(&db, &["Seen", "Unseen"]).await;
+        named[1].tags = Some("Hidden".into());
+        let credit = |name: &str| PeopleEntity {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            person_type: Some("Actor".into()),
+            ..Default::default()
+        };
+        let library = Arc::new(FakeLibrary {
+            people: vec![credit("Seen"), credit("Unseen")],
+            named_items: named,
+        });
+        let svc = service_with(db, library);
+        let credited = |dto: BaseItemDto| -> Vec<String> {
+            dto.people
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.name)
+                .collect()
+        };
+
+        let for_user = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(credited(for_user), ["Seen"]);
+        let for_nobody = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(credited(for_nobody), ["Seen", "Unseen"]);
+    }
+
+    /// A visibility check that fails leaves the page's credits out rather
+    /// than showing persons the user may not see.
+    #[tokio::test]
+    async fn a_failed_visibility_check_leaves_the_credits_out() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let user = crate::test_support::seed_user(&db, Uuid::new_v4()).await;
+        let mut named = person_rows(&db, &["Anyone"]).await;
+        named[0].tags = Some("Fail".into());
+        let library = Arc::new(FakeLibrary {
+            people: vec![PeopleEntity {
+                id: Uuid::new_v4().to_string(),
+                name: "Anyone".into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            }],
+            named_items: named,
+        });
+        let dto = service_with(db, library)
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.people, Some(Vec::new()));
+    }
+
+    /// C# `AttachPeople` tags a person's primary image with
+    /// `GetTagAndFillBlurhash`: its blurhash lands on the item's
+    /// `ImageBlurHashes`, and the person's own `ImageBlurHashes` is the item's
+    /// map filtered to the person's tag — every image type the item has, empty
+    /// but for that one entry.
+    #[tokio::test]
+    async fn a_person_carries_the_blurhash_of_its_primary_image() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xB_9701);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let svc = service(db);
+        let person = Uuid::from_u128(0xB_9702);
+        let image = ItemImageInfo {
+            path: "/people/someone/folder.jpg".into(),
+            image_type: ImageType::Primary,
+            date_modified: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            width: 10,
+            height: 10,
+            blur_hash: Some("LKO2?U%2Tw=w".into()),
+        };
+        let prefetched = Prefetched {
+            people: [(
+                movie,
+                vec![PeopleEntity {
+                    id: Uuid::from_u128(0xB_9703).to_string(),
+                    name: "Someone".into(),
+                    person_type: Some("Actor".into()),
+                    ..Default::default()
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            person_ids_by_name: [("Someone".to_owned(), person)].into_iter().collect(),
+            person_images: [(person, vec![image.clone()])].into_iter().collect(),
+            ..Prefetched::default()
+        };
+        // Whatever the map already holds when the people are attached (in C#
+        // and here the item's own images are attached afterwards, onto a fresh
+        // map, so in a page this is the hashes of the persons before): the
+        // person's copy keeps every image type, empty but for its own entry.
+        let mut dto = BaseItemDto {
+            image_blur_hashes: Some(
+                [(
+                    ImageType::Backdrop,
+                    [("backdrop-tag".to_owned(), "backdrop-hash".to_owned())]
+                        .into_iter()
+                        .collect(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..BaseItemDto::default()
+        };
+        svc.attach_people(&mut dto, &item, &prefetched)
+            .await
+            .unwrap();
+
+        let tag = svc.image_tag(person, &image).await.expect("tag");
+        let people = dto.people.as_ref().expect("people");
+        assert_eq!(people[0].primary_image_tag.as_deref(), Some(tag.as_str()));
+        let person_hash: HashMap<String, String> = [(tag.clone(), "LKO2?U%2Tw=w".to_owned())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            people[0].image_blur_hashes,
+            Some(
+                [
+                    (ImageType::Backdrop, HashMap::new()),
+                    (ImageType::Primary, person_hash.clone()),
+                ]
+                .into_iter()
+                .collect()
+            )
+        );
+        let item_hashes = dto.image_blur_hashes.as_ref().expect("item blurhashes");
+        assert_eq!(item_hashes.get(&ImageType::Primary), Some(&person_hash));
+        assert_eq!(
+            item_hashes[&ImageType::Backdrop]["backdrop-tag"],
+            "backdrop-hash"
+        );
+
+        // With no map yet and no blurhash on the person's image, the person
+        // has no map either (C# `dto.ImageBlurHashes is not null` is false).
+        let unhashed = ItemImageInfo {
+            blur_hash: None,
+            ..image
+        };
+        let prefetched = Prefetched {
+            person_images: [(person, vec![unhashed])].into_iter().collect(),
+            ..prefetched
+        };
+        let mut dto = BaseItemDto::default();
+        svc.attach_people(&mut dto, &item, &prefetched)
+            .await
+            .unwrap();
+        let people = dto.people.as_ref().expect("people");
+        assert!(people[0].primary_image_tag.is_some());
+        assert_eq!(people[0].image_blur_hashes, None);
     }
 
     /// The clean lookup key the projection uses must be byte-identical to
@@ -9822,13 +11820,13 @@ mod tests {
 
         // The prefetched (cached-clean) path and the uncached fallback path must
         // agree with each other AND with a fresh get_clean_value lookup.
-        let pairs: Vec<(i32, String)> = NAMES
+        let pairs: Vec<(BaseItemKind, String)> = NAMES
             .iter()
-            .map(|n| (3, crate::text_util::get_clean_value(n)))
+            .map(|n| (BaseItemKind::Studio, crate::text_util::get_clean_value(n)))
             .collect();
-        let value_ids = svc.resolve_value_ids(&pairs).await.unwrap();
+        let by_name_ids = svc.resolve_by_name_ids(&pairs).await.unwrap();
         let cached = Prefetched {
-            value_ids: value_ids.clone(),
+            by_name_ids: by_name_ids.clone(),
             clean_values: NAMES
                 .iter()
                 .map(|n| ((*n).to_owned(), crate::text_util::get_clean_value(n)))
@@ -9836,7 +11834,7 @@ mod tests {
             ..Prefetched::default()
         };
         let uncached = Prefetched {
-            value_ids,
+            by_name_ids,
             ..Prefetched::default()
         };
         for name in NAMES {
@@ -9849,8 +11847,16 @@ mod tests {
                 crate::text_util::get_clean_value(name),
                 "clean key diverged for {name:?}"
             );
-            assert_eq!(cached.value_id(3, name), want, "cached id for {name:?}");
-            assert_eq!(uncached.value_id(3, name), want, "uncached id for {name:?}");
+            assert_eq!(
+                cached.by_name_id(BaseItemKind::Studio, name),
+                want,
+                "cached id for {name:?}"
+            );
+            assert_eq!(
+                uncached.by_name_id(BaseItemKind::Studio, name),
+                want,
+                "uncached id for {name:?}"
+            );
         }
     }
 
@@ -9965,7 +11971,7 @@ mod tests {
             type_: "MediaBrowser.Controller.LiveTv.LiveTvChannel".to_owned(),
             name: Some("Parity One".to_owned()),
             media_type: Some("Video".to_owned()),
-            sort_name: Some("00001.0-Parity One".to_owned()),
+            sort_name: Some("0000000001.00000-Parity One".to_owned()),
             date_created: Some(Utc.with_ymd_and_hms(2026, 8, 23, 18, 0, 0).unwrap()),
             is_folder: false,
             ..BaseItemEntity::default()
@@ -9997,7 +12003,10 @@ mod tests {
         assert_eq!(dto.can_delete, Some(false));
         assert_eq!(dto.can_download, Some(false));
         assert_eq!(dto.media_type, MediaType::Video);
-        assert_eq!(dto.sort_name.as_deref(), Some("00001.0-Parity One"));
+        assert_eq!(
+            dto.sort_name.as_deref(),
+            Some("0000000001.00000-Parity One")
+        );
         assert!(dto.date_created.is_some());
         // The all-fields channel detail carries a present-and-empty stream list
         // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).

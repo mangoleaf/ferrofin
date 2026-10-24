@@ -27,7 +27,7 @@ use ferrofin_model::media_info::{MediaInfo, MediaProtocol};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-use super::encoding_utils::get_input_argument;
+use super::encoding_utils::{get_input_argument, quote};
 use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::probing::dtos::InternalMediaInfoResult;
 use crate::probing::localization::{
@@ -38,6 +38,50 @@ use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
 /// The number of 100-nanosecond ticks in one second (`TimeSpan.TicksPerSecond`).
 #[cfg(test)]
 const TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// `MediaEncoder.DefaultSdrImageExtractionTimeout`: how long one frame
+/// extraction may run when `ImageExtractionTimeoutMs` is unset (0 or less).
+const DEFAULT_SDR_IMAGE_EXTRACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// `MediaEncoder.DefaultHdrImageExtractionTimeout`: the same for a tone-mapped
+/// frame, and the trickplay watchdog's window.
+pub(crate) const DEFAULT_HDR_IMAGE_EXTRACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// The configured `ImageExtractionTimeoutMs`, or `default` when it is unset
+/// (0 or less), as `ExtractImageInternal` and the trickplay watchdog read it.
+pub(crate) fn image_extraction_timeout(
+    configured: i32,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    u64::try_from(configured)
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map_or(default, std::time::Duration::from_millis)
+}
+
+/// Jellyfin's default `FFmpeg:analyzeduration` (`ConfigurationOptions.cs:19`):
+/// how long ffmpeg and ffprobe analyse an input to find its streams, when the
+/// source names no duration of its own.
+pub const DEFAULT_ANALYZE_DURATION: &str = "200M";
+
+/// Jellyfin's default `FFmpeg:probesize` (`ConfigurationOptions.cs:18`): how
+/// much of an input ffmpeg and ffprobe read to find its streams.
+pub const DEFAULT_PROBE_SIZE: &str = "1G";
+
+/// The `-analyzeduration` value upstream picks for an input
+/// (`EncodingHelper.GetFfmpegAnalyzeDurationArg` and
+/// `MediaEncoder.GetExtraArguments`): the source's own `AnalyzeDurationMs` in
+/// microseconds when it is positive, else `configured`. Empty when neither is
+/// set, which omits the flag.
+#[must_use]
+pub fn analyze_duration_value(source_ms: Option<i32>, configured: &str) -> String {
+    match source_ms {
+        Some(ms) if ms > 0 => (i64::from(ms) * 1000).to_string(),
+        _ => configured.to_owned(),
+    }
+}
 
 /// Tunable knobs read from the encoding configuration.
 ///
@@ -79,12 +123,25 @@ pub struct MediaEncoderImpl<T: Transcoder> {
     transcoder: Arc<T>,
     image_encoding_pool: Arc<tokio::sync::Semaphore>,
     chapter_image_resolution: Option<Arc<dyn Fn() -> ImageResolution + Send + Sync>>,
+    image_extraction_timeout_ms: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
     config: MediaEncoderConfig,
     paths: RwLock<Paths>,
     normalizer: ProbeResultNormalizer<Box<dyn ProbeLocalization + Send + Sync>>,
+    /// `_proberSupportsFirstVideoFrame`: whether ffprobe accepts
+    /// `-only_first_vframe`. Off until the host reports the probed answer.
+    prober_first_video_frame: bool,
 }
 
 impl<T: Transcoder> MediaEncoderImpl<T> {
+    /// Lets a local video probe ask ffprobe for its first frame
+    /// (`-show_frames -only_first_vframe`), which is what flags HDR10+. The host
+    /// passes the startup capability probe's answer.
+    #[must_use]
+    pub fn with_first_video_frame_probe(mut self, supported: bool) -> Self {
+        self.prober_first_video_frame = supported;
+        self
+    }
+
     /// Shares the startup thumbnail/trickplay ceiling with the other extractor.
     /// The host resolves the dashboard setting and supplies a nonzero pool.
     #[must_use]
@@ -102,6 +159,50 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     ) -> Self {
         self.chapter_image_resolution = Some(Arc::new(read));
         self
+    }
+
+    /// Reads the live `ImageExtractionTimeoutMs` before each image extraction.
+    /// Without it, or when it is 0 or less, upstream's default applies.
+    #[must_use]
+    pub fn with_image_extraction_timeout(
+        mut self,
+        read: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
+        self.image_extraction_timeout_ms = Some(Arc::new(read));
+        self
+    }
+
+    /// Runs one image-extraction ffmpeg, giving up when it outlives the
+    /// timeout: `ExtractImageInternal`'s `WaitForExitAsync(timeoutMs)`, then
+    /// `Kill`. Dropping the run kills the child (`kill_on_drop`), and the
+    /// caller's error return then frees its thumbnail-pool permit.
+    ///
+    /// Upstream takes the HDR default when it tone-maps the frame
+    /// (`enableHdrExtraction`). These arguments never tone-map (see
+    /// [`Self::extract_image_arguments`]), so the SDR default applies.
+    async fn run_image_extraction(
+        &self,
+        ffmpeg: &str,
+        args: &str,
+        input: &str,
+    ) -> Result<ProcessOutput, String> {
+        let configured = self
+            .image_extraction_timeout_ms
+            .as_ref()
+            .map_or(0, |read| read());
+        let timeout = image_extraction_timeout(configured, DEFAULT_SDR_IMAGE_EXTRACTION_TIMEOUT);
+        tokio::time::timeout(
+            timeout,
+            self.transcoder
+                .get_process_output(ffmpeg, args, true, None, &[]),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "ffmpeg image extraction timed out for `{input}` after {}ms",
+                timeout.as_millis()
+            ))
+        })
     }
 
     /// Stamps probe output with the server's real localized labels and
@@ -132,11 +233,13 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
             )),
             config,
             chapter_image_resolution: None,
+            image_extraction_timeout_ms: None,
             paths: RwLock::new(Paths {
                 ffmpeg: ffmpeg_path.into(),
                 ffprobe: ffprobe_path.into(),
             }),
             normalizer: ProbeResultNormalizer::new(Box::new(PassthroughLocalization)),
+            prober_first_video_frame: false,
         }
     }
 
@@ -151,18 +254,11 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         let ffmpeg_probe_size = self.config.probe_size.as_deref().unwrap_or_default();
         let source = &request.media_source;
 
-        let mut analyze_duration = String::new();
-        if source.analyze_duration_ms.unwrap_or(0) > 0 {
-            // C# multiplies the millisecond value by 1000 (into microseconds).
-            let micros = i64::from(source.analyze_duration_ms.unwrap_or(0)) * 1000;
-            analyze_duration = format!("-analyzeduration {micros}");
-        } else if !ffmpeg_analyze_duration.is_empty() {
-            analyze_duration = format!("-analyzeduration {ffmpeg_analyze_duration}");
-        }
-
+        let analyze_duration =
+            analyze_duration_value(source.analyze_duration_ms, ffmpeg_analyze_duration);
         let mut extra_args = String::new();
         if !analyze_duration.is_empty() {
-            extra_args = analyze_duration;
+            extra_args = format!("-analyzeduration {analyze_duration}");
         }
 
         if !ffmpeg_probe_size.is_empty() {
@@ -170,7 +266,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         }
 
         if let Some(user_agent) = source.required_http_headers.get("User-Agent") {
-            let _ = write!(extra_args, " -user_agent \"{user_agent}\"");
+            let _ = write!(extra_args, " -user_agent {}", quote(user_agent));
         }
 
         if source.protocol == MediaProtocol::Rtsp {
@@ -197,23 +293,40 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     }
 
     /// Builds the ffprobe argument line for a probe (mirrors
-    /// `GetMediaInfoInternal`'s format string, minus the deferred
-    /// first-video-frame probe).
-    fn probe_arguments(&self, input_path: &str, extract_chapters: bool, extra: &str) -> String {
-        let template = if extract_chapters {
-            "-i {input} -threads {threads} -v warning -print_format json -show_streams -show_chapters -show_format"
+    /// `GetMediaInfoInternal`'s format string).
+    ///
+    /// One `format!`, as upstream fills the line with one `string.Format`: the
+    /// input path is inserted once and never re-scanned, so a file name
+    /// holding `{threads}` reaches ffprobe unchanged.
+    ///
+    /// A local, non-audio probe also asks for the first video frame
+    /// (`-show_frames -only_first_vframe`) when ffprobe supports it, so the
+    /// normalizer can read that frame's side data and set
+    /// `Hdr10PlusPresentFlag`.
+    fn probe_arguments(
+        &self,
+        input_path: &str,
+        extract_chapters: bool,
+        extra: &str,
+        first_video_frame: bool,
+    ) -> String {
+        let chapters = if extract_chapters {
+            " -show_chapters"
         } else {
-            "-i {input} -threads {threads} -v warning -print_format json -show_streams -show_format"
+            ""
         };
-        let body = template
-            .replace("{input}", input_path)
-            .replace("{threads}", &self.config.threads.to_string());
-        let combined = if extra.is_empty() {
-            body
+        let frames = if first_video_frame {
+            " -show_frames -only_first_vframe"
         } else {
-            format!("{extra} {body}")
+            ""
         };
-        combined.trim().to_owned()
+        let threads = self.config.threads;
+        format!(
+            "{extra} -i {input_path} -threads {threads} -v warning -print_format json \
+             -show_streams{chapters} -show_format{frames}"
+        )
+        .trim()
+        .to_owned()
     }
 
     /// Builds the `ExtractImageInternal` argument line (software path only).
@@ -288,8 +401,14 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // which is what upstream passes here.
         let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
         let resolution = image_resolution_parameter(image_resolution);
+        // The graph is quoted, unlike upstream's bare `-vf {3}`: the 3D
+        // scalers contain spaces, so the split into argv would cut them into
+        // stray ffmpeg arguments and 3D sources would get no images (a
+        // Jellyfin bug, not ported).
         let mut args = format!(
-            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 \"{output_path}\""
+            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 {output}",
+            vf = quote(&vf),
+            output = quote(output_path),
         );
 
         if let Some(offset) = offset_ticks {
@@ -383,7 +502,16 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         };
         let input_path = get_input_argument(prefix, input_file, source.protocol);
         let extra = self.get_extra_arguments(request);
-        let args = self.probe_arguments(&input_path, request.extract_chapters, &extra);
+        // `protocol == MediaProtocol.File && !isAudio && _proberSupportsFirstVideoFrame`.
+        let first_video_frame = source.protocol == MediaProtocol::File
+            && !request.media_is_audio
+            && self.prober_first_video_frame;
+        let args = self.probe_arguments(
+            &input_path,
+            request.extract_chapters,
+            &extra,
+            first_video_frame,
+        );
 
         let probe = self.probe_path();
         let output = self
@@ -434,7 +562,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .to_string_lossy()
             .into_owned();
         let args = Self::extract_image_arguments(
-            &format!("file:\"{path}\""),
+            &get_input_argument("file", path, MediaProtocol::File),
             "",
             None,
             image_stream_index,
@@ -452,10 +580,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
-        let result = self
-            .transcoder
-            .get_process_output(&ffmpeg, &args, true, None, &[])
-            .await;
+        let result = self.run_image_extraction(&ffmpeg, &args, path).await;
         let output = match result {
             Ok(output) => output,
             Err(err) => {
@@ -554,12 +679,13 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
-        let stderr = self
-            .transcoder
-            .get_process_output(&ffmpeg, &args, true, None, &[])
-            .await
-            .map(ProcessOutput::into_output)
-            .map_err(MediaEncodingError::process)?;
+        let stderr = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
+            Ok(output) => output.into_output(),
+            Err(err) => {
+                let _ = std::fs::remove_file(&output_path);
+                return Err(MediaEncodingError::process(err).into());
+            }
+        };
         // The process runner mirrors the C# `GetProcessOutput` and ignores the
         // exit code, so a failed ffmpeg (unreadable input, no frame at the
         // offset) surfaces only as a missing output file — check it here so
@@ -642,12 +768,25 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                     .as_ref()
                     .map_or(ImageResolution::MatchSource, |read| read()),
             );
-            let output = self
-                .transcoder
-                .get_process_output(&ffmpeg, &args, true, None, &[])
-                .await
-                .map(ProcessOutput::into_output)
-                .map_err(MediaEncodingError::process)?;
+            // `ExtractImage` falls through to the standard attempt on any
+            // failure of the I-frame one, a timed-out run among them.
+            let output = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
+                Ok(output) => output.into_output(),
+                Err(err) => {
+                    let _ = std::fs::remove_file(&output_path);
+                    // A hung or unstartable ffmpeg is rare; the routine
+                    // "no image the quick way" fallback below stays quiet.
+                    if use_iframe {
+                        tracing::warn!(
+                            path = input_file,
+                            error = %err,
+                            "I-frame image extraction failed, retrying the standard way"
+                        );
+                    }
+                    last_error = err;
+                    continue;
+                }
+            };
             if std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
                 return Ok(output_path);
             }
@@ -775,6 +914,23 @@ mod tests {
         assert!(extra_arg.contains(&format!("-user_agent \"{user_agent}\"")));
     }
 
+    /// Upstream interpolates the tuner User-Agent raw; a value that closes the
+    /// quote must stay the one `-user_agent` argument instead.
+    #[test]
+    fn a_hostile_user_agent_stays_one_argument() {
+        let user_agent = r#"x\" -y -i /etc/passwd ""#;
+        let request = MediaInfoRequest {
+            media_source: http_source_with_user_agent(user_agent),
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let extra = encoder().get_extra_arguments(&request);
+        let tokens = crate::encoder::split_args(&extra).unwrap();
+        let at = tokens.iter().position(|a| a == "-user_agent").unwrap();
+        assert_eq!(tokens[at + 1], user_agent);
+        assert!(!tokens.iter().any(|a| a == "-y"), "{tokens:?}");
+    }
+
     #[test]
     fn rtsp_source_adds_transport_flags() {
         let enc = encoder();
@@ -789,6 +945,23 @@ mod tests {
         };
         let extra = enc.get_extra_arguments(&request);
         assert!(extra.contains("-rtsp_transport tcp+udp -rtsp_flags prefer_tcp"));
+    }
+
+    #[rstest::rstest]
+    #[case(Some(3000), "200M", "3000000")]
+    #[case(Some(0), "200M", "200M")]
+    #[case(Some(-1), "200M", "200M")]
+    #[case(None, "200M", "200M")]
+    #[case(None, "", "")]
+    fn analyze_duration_prefers_a_positive_source_value(
+        #[case] source_ms: Option<i32>,
+        #[case] configured: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            super::analyze_duration_value(source_ms, configured),
+            expected
+        );
     }
 
     #[test]
@@ -849,9 +1022,10 @@ mod tests {
         assert!(enc.set_ffmpeg_path().await.unwrap());
     }
 
-    /// A [`Transcoder`] fake that "extracts a frame": it parses the quoted
-    /// output path off the argument tail (the shape `extract_image_arguments`
-    /// emits) and writes a stub file there, like a successful ffmpeg run.
+    /// A [`Transcoder`] fake that "extracts a frame": it splits the arguments
+    /// as the real spawn does, takes the output path off the tail (the shape
+    /// `extract_image_arguments` emits) and writes a stub file there, like a
+    /// successful ffmpeg run.
     struct FrameWritingTranscoder;
 
     #[async_trait]
@@ -864,10 +1038,8 @@ mod tests {
             _test_key: Option<&str>,
             _env: &[(String, String)],
         ) -> Result<ProcessOutput, String> {
-            let out = arguments
-                .rsplit('"')
-                .nth(1)
-                .expect("quoted output path is the last argument");
+            let argv = crate::encoder::split_args(arguments)?;
+            let out = argv.last().expect("the output path is the last argument");
             std::fs::write(out, b"jpg").expect("write frame");
             Ok(ProcessOutput {
                 output: String::new(),
@@ -904,7 +1076,8 @@ mod tests {
                 calls.len() - 1
             };
             if attempt >= self.succeed_on {
-                let out = arguments.rsplit('"').nth(1).expect("output path");
+                let argv = crate::encoder::split_args(arguments)?;
+                let out = argv.last().expect("output path");
                 std::fs::write(out, b"png").expect("write picture");
             }
             Ok(ProcessOutput {
@@ -1103,6 +1276,213 @@ mod tests {
             index: 0,
             ..ferrofin_model::entities_media::MediaStream::default()
         }
+    }
+
+    /// A transcoder whose ffmpeg never exits for its first `hangs` runs, the
+    /// way one stalls on a dead network mount, and writes the output file on
+    /// later runs. A hung run that is given up on is counted in `abandoned`:
+    /// the real runner kills ffmpeg when its future is dropped.
+    struct HangingTranscoder {
+        hangs: std::sync::atomic::AtomicUsize,
+        runs: std::sync::atomic::AtomicUsize,
+        abandoned: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HangingTranscoder {
+        fn hanging(hangs: usize) -> Self {
+            Self {
+                hangs: hangs.into(),
+                runs: 0.into(),
+                abandoned: Arc::default(),
+            }
+        }
+
+        fn runs(&self) -> usize {
+            self.runs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn abandoned(&self) -> usize {
+            self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Counts a dropped (abandoned) run.
+    struct Abandoned(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Abandoned {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Transcoder for HangingTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            use std::sync::atomic::Ordering;
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let hang = self
+                .hangs
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if hang {
+                let _abandoned = Abandoned(Arc::clone(&self.abandoned));
+                std::future::pending::<()>().await;
+            }
+            let argv = crate::encoder::split_args(arguments)?;
+            let out = argv.last().expect("the output path is the last argument");
+            std::fs::write(out, b"jpg").expect("write frame");
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// An encoder over `transcoder` writing into `temp`, with one pool permit.
+    fn hanging_encoder(
+        transcoder: &Arc<HangingTranscoder>,
+        temp: &std::path::Path,
+        pool: &Arc<tokio::sync::Semaphore>,
+    ) -> MediaEncoderImpl<HangingTranscoder> {
+        MediaEncoderImpl::new(
+            Arc::clone(transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        )
+        .with_image_encoding_pool(Arc::clone(pool))
+    }
+
+    /// `ExtractImageInternal`: an ffmpeg that does not exit within the
+    /// timeout (10 s for an SDR frame when `ImageExtractionTimeoutMs` is
+    /// unset) is killed, the extraction fails, and its thumbnail-pool permit
+    /// is free again.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_frame_extraction_is_stopped_at_the_default_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_video_image(
+                "/media/stalled.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                Some(10 * TICKS_PER_SECOND),
+            ),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg");
+
+        let err = result.expect_err("a hung ffmpeg is a failure");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!(transcoder.abandoned(), 1, "the hung run is given up");
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// `ImageExtractionTimeoutMs` is read live; 0 or less takes the default.
+    #[rstest]
+    #[case::configured(2500, 2500)]
+    #[case::unset(0, 10_000)]
+    #[case::negative(-1, 10_000)]
+    #[tokio::test(start_paused = true)]
+    async fn the_configured_image_extraction_timeout_applies(
+        #[case] configured: i32,
+        #[case] expected_ms: u64,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool)
+            .with_image_extraction_timeout(move || configured);
+        let start = tokio::time::Instant::now();
+        let err = enc
+            .extract_video_image(
+                "/media/stalled.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a hung ffmpeg is a failure");
+
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(expected_ms)
+        );
+        assert!(
+            err.to_string().contains(&format!("after {expected_ms}ms")),
+            "{err}"
+        );
+    }
+
+    /// `ExtractImage`: a timed-out I-frame attempt falls through to the
+    /// standard one, as any other failure of it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_iframe_attempt_falls_back_to_the_standard_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_image_stream(
+                "/media/cover.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                2,
+                ImageFormat::Jpg,
+            ),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg")
+        .expect("the standard attempt extracts the image");
+
+        assert!(std::path::Path::new(&out).exists());
+        assert_eq!((transcoder.runs(), transcoder.abandoned()), (2, 1));
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// An audio cover extraction is bounded the same way, and leaves no
+    /// partial file behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_audio_image_extraction_is_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_audio_image("/media/song.flac", None),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg")
+        .expect_err("a hung ffmpeg is a failure");
+
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert_eq!(pool.available_permits(), 1);
     }
 
     // The extraction writes into the configured temp dir — NEVER next to the
@@ -1306,6 +1686,43 @@ mod tests {
         }
     }
 
+    // The 3D graphs carry spaces and ffmpeg's `\,` escape, and the argument
+    // string is split into argv by `split_args`. Upstream's bare `-vf {3}`
+    // splits such a graph at every space; quoted, ffmpeg gets it whole.
+    #[test]
+    fn each_3d_scaler_reaches_ffmpeg_as_one_filter_argument() {
+        for threed_format in [
+            Video3DFormat::HalfSideBySide,
+            Video3DFormat::FullSideBySide,
+            Video3DFormat::HalfTopAndBottom,
+            Video3DFormat::FullTopAndBottom,
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "",
+                None,
+                None,
+                Some(threed_format),
+                None,
+                true,
+                "/tmp/out.jpg",
+                None,
+                0,
+                ImageResolution::MatchSource,
+            );
+            let tokens = crate::encoder::split_args(&args).unwrap();
+            let vf = tokens.iter().position(|a| a == "-vf").unwrap() + 1;
+            let graph = &tokens[vf];
+            assert!(
+                graph.starts_with("crop=iw")
+                    && graph.contains(",crop=min(iw\\,ih*dar):min(ih\\,iw/dar):")
+                    && graph.ends_with(":(ih - min (ih\\,ih/sar))/2,setsar=sar=1,thumbnail=n=24"),
+                "{threed_format:?}: {tokens:?}"
+            );
+            assert_eq!(tokens[vf + 1], "-vsync", "{threed_format:?}: {tokens:?}");
+        }
+    }
+
     // An extraction temp directory the process cannot write fails every frame
     // for every video while ffmpeg itself is healthy. Catch it where the path
     // is known and say so, instead of reporting each video as frameless.
@@ -1370,7 +1787,7 @@ mod tests {
         ) -> Result<ProcessOutput, String> {
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
-            let args = shlex::split(arguments).unwrap();
+            let args = crate::encoder::split_args(arguments)?;
             let path = args.last().unwrap().replace("%08d", "00000001");
             std::fs::write(path, b"jpg").unwrap();
             Ok(ProcessOutput {
@@ -1441,10 +1858,12 @@ mod tests {
                 .extract_trickplay_frames(&TrickplayExtraction {
                     input_path: "/movie.mkv",
                     video_stream: None,
+                    media_streams: &[],
                     interval_ms: 10_000,
                     max_width: 320,
                     qscale: 4,
                     threads: 1,
+                    priority: ferrofin_model::configuration::ProcessPriorityClass::BelowNormal,
                     output_dir: &output_dir,
                     allow_hw_accel: false,
                     enable_hw_encoding: false,
@@ -1555,6 +1974,31 @@ mod tests {
                 .unwrap()
                 .contains(" -s ")
         );
+    }
+
+    /// Cover art is extracted unprompted during a music scan, so a track named
+    /// to close the quote must not inject options: the whole name stays the
+    /// one `-i` value, as upstream's `GetInputArgument` keeps it.
+    #[tokio::test]
+    async fn audio_image_keeps_a_hostile_path_as_one_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(RecordingFrames(std::sync::Mutex::new(Vec::new())));
+        let encoder = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "ffmpeg",
+            "ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.path().to_path_buf().into(),
+                ..Default::default()
+            },
+        );
+        let path = r#"/m/a" -y -f mjpeg /data/ferrofin.db ".flac"#;
+        let image = encoder.extract_audio_image(path, Some(1)).await.unwrap();
+        std::fs::remove_file(image).unwrap();
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        let tokens = crate::encoder::split_args(&arguments).unwrap();
+        assert_eq!(tokens[..2], ["-i".to_owned(), format!("file:{path}")]);
+        assert!(!tokens.iter().any(|a| a == "-y"), "{tokens:?}");
     }
 
     #[test]
@@ -1708,5 +2152,120 @@ mod tests {
             Some("localized Original")
         );
         assert!(!streams[1].is_original);
+    }
+
+    /// A [`Transcoder`] fake that records each ffprobe argument line and
+    /// answers with an empty probe.
+    struct RecordingProbe(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Transcoder for RecordingProbe {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            self.0.lock().unwrap().push(arguments.to_owned());
+            Ok(ProcessOutput {
+                output: r#"{"streams":[],"format":{}}"#.to_owned(),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    // Upstream fills the probe line with one `string.Format`, so a file name
+    // is never re-scanned for the template's own placeholders. A library file
+    // whose name holds `{threads}` or `{input}` must reach ffprobe unchanged,
+    // or it is probed under another name and silently gets no streams.
+    #[rstest]
+    #[case::without_chapters(false)]
+    #[case::with_chapters(true)]
+    #[tokio::test]
+    async fn a_path_holding_template_placeholders_reaches_ffprobe_unchanged(
+        #[case] extract_chapters: bool,
+    ) {
+        let transcoder = Arc::new(RecordingProbe(std::sync::Mutex::new(Vec::new())));
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                threads: 3,
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let path = "/media/{threads} {input} Live.mkv";
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(path.to_owned()),
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters,
+            media_is_audio: false,
+        };
+        enc.get_media_info(&request).await.expect("probe parses");
+
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        let tokens = crate::encoder::split_args(&arguments).unwrap();
+        let input = tokens.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(tokens[input + 1], format!("file:{path}"), "{arguments}");
+        let threads = tokens.iter().position(|a| a == "-threads").unwrap();
+        assert_eq!(tokens[threads + 1], "3", "{arguments}");
+        assert_eq!(
+            tokens.iter().any(|a| a == "-show_chapters"),
+            extract_chapters,
+            "{arguments}"
+        );
+    }
+
+    /// `GetMediaInfoInternal`: `-show_frames -only_first_vframe` is appended
+    /// only for a local (`File`), non-audio probe, and only when ffprobe
+    /// supports `only_first_vframe` — the first frame's side data is what sets
+    /// `Hdr10PlusPresentFlag`.
+    #[rstest]
+    #[case::local_video(true, MediaProtocol::File, false, true)]
+    #[case::unsupported_prober(false, MediaProtocol::File, false, false)]
+    #[case::audio(true, MediaProtocol::File, true, false)]
+    #[case::remote(true, MediaProtocol::Http, false, false)]
+    #[tokio::test]
+    async fn a_local_video_probe_asks_for_its_first_frame(
+        #[case] supported: bool,
+        #[case] protocol: MediaProtocol,
+        #[case] media_is_audio: bool,
+        #[case] expected: bool,
+    ) {
+        let transcoder = Arc::new(RecordingProbe(std::sync::Mutex::new(Vec::new())));
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        )
+        .with_first_video_frame_probe(supported);
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some("/media/hdr.mkv".to_owned()),
+                protocol,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio,
+        };
+        enc.get_media_info(&request).await.expect("probe parses");
+
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            arguments.ends_with("-show_format -show_frames -only_first_vframe"),
+            expected,
+            "{arguments}"
+        );
+        assert!(arguments.contains("-show_format"), "{arguments}");
     }
 }

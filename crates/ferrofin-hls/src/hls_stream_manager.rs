@@ -9,9 +9,9 @@
 //! [`DynamicHlsPlaylistGenerator`] (its own) — so the wiring belongs here, not in
 //! either dependency (`RULES_CODE_REUSE`: the join lives above both).
 //!
-//! ## What is ported vs. deferred
+//! ## What lives here
 //!
-//! The **orchestration** is ported and unit-tested here against a fake
+//! The **orchestration**, unit-tested here against a fake
 //! [`SegmentTranscoder`] and a fake [`StreamStatePlanner`]:
 //!
 //! - playlist generation → [`DynamicHlsPlaylistGenerator::create_main_playlist`];
@@ -22,13 +22,13 @@
 //!   [`HlsSegmentController.ValidateTranscodePath`] path-traversal guard;
 //! - stop-encoding → [`TranscodeManager::kill_transcoding_jobs`].
 //!
-//! The **un-ported** piece — turning the raw [`HlsStreamRequest`] into a concrete
-//! transcode plan (media-source resolution, `StreamState`, and the ffmpeg
-//! command-line) — is Jellyfin's `StreamingHelpers.GetStreamingState` +
-//! `EncodingHelper.GetCommandLineArguments`, the last large slice of the port.
-//! It sits behind the [`StreamStatePlanner`] seam so
-//! everything above it stays testable; the Wave-8 wiring supplies the real
-//! planner over `ferrofin-core`'s media-source manager + the ported
+//! Turning the raw [`HlsStreamRequest`] into a concrete transcode plan
+//! (media-source resolution, `StreamState`, and the ffmpeg command line) —
+//! Jellyfin's `StreamingHelpers.GetStreamingState` +
+//! `EncodingHelper.GetCommandLineArguments` — sits behind the
+//! [`StreamStatePlanner`] seam, so everything above it stays testable. The
+//! server supplies the real planner, over `ferrofin-core`'s media-source
+//! manager and the ported
 //! [`EncodingHelper`](ferrofin_mediaencoding::EncodingHelper) arg builder.
 
 use std::path::{Component, Path, PathBuf};
@@ -41,7 +41,7 @@ use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
 use ferrofin_mediaencoding::transcoding::{
     FsFileCleaner, SessionReporter, WAIT_FOR_FILE_TIMEOUT_MS,
 };
-use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeManagerImpl};
+use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeDisplayNames, TranscodeManagerImpl};
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{
@@ -52,7 +52,7 @@ use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
 use crate::dynamic_hls_playlist_generator::{
-    DynamicHlsPlaylistGenerator, EncodingOptionsProvider, TICKS_PER_MILLISECOND,
+    DynamicHlsPlaylistGenerator, EncodingOptionsProvider, segment_start_ticks,
 };
 use crate::master_playlist::{MasterPlaylistContext, TrickplayResolution, build_master_playlist};
 
@@ -62,7 +62,8 @@ use crate::master_playlist::{MasterPlaylistContext, TrickplayResolution, build_m
 /// Port of the useful output of `StreamingHelpers.GetStreamingState` +
 /// `EncodingHelper.GetCommandLineArguments` — the fields the ported HLS
 /// orchestration consumes. Built by a [`StreamStatePlanner`]; the [`state`] is
-/// handed straight to [`TranscodeManagerImpl::start_ffmpeg`].
+/// handed to [`TranscodeManagerImpl::start_ffmpeg`] once named by
+/// [`StreamStatePlanner::display_names`].
 pub struct TranscodePlan {
     /// The fully-populated job state (media path, run-time ticks, segment
     /// container, output path, session/device ids) for `start_ffmpeg`.
@@ -98,6 +99,14 @@ pub struct TranscodePlan {
     /// the request's `MinSegments`, else 2 for segments of ten seconds or
     /// longer, else 3.
     pub min_segments: i32,
+    /// Whether the transcode strips a copied video's Dolby Vision metadata
+    /// (`EncodingHelper.IsDoviRemoved`), so the master playlist does not
+    /// advertise it. Evaluated by the planner, which has the ffmpeg build's
+    /// capabilities.
+    pub is_dovi_removed: bool,
+    /// Whether the transcode strips a copied video's HDR10+ metadata
+    /// (`EncodingHelper.IsHdr10PlusRemoved`); see [`Self::is_dovi_removed`].
+    pub is_hdr10_plus_removed: bool,
 }
 
 /// Which playlist shape the transcode's HLS muxer writes — the
@@ -118,7 +127,7 @@ pub enum PlaylistKind {
 
 /// Resolves an [`HlsStreamRequest`] into a concrete [`TranscodePlan`].
 ///
-/// The seam over the un-ported `GetStreamingState` + `GetCommandLineArguments`
+/// The seam over Jellyfin's `GetStreamingState` + `GetCommandLineArguments`
 /// (see the module docs). Real implementations resolve the media source via
 /// `ferrofin-core` and build args via the ported
 /// [`EncodingHelper`](ferrofin_mediaencoding::EncodingHelper); unit tests supply a
@@ -137,6 +146,15 @@ pub trait StreamStatePlanner: Send + Sync {
         segment_id: Option<i32>,
         kind: PlaylistKind,
     ) -> Result<TranscodePlan, ServiceError>;
+
+    /// The item, series and library names the transcode logs show for
+    /// `item_id`. Asked only when a transcode actually starts, never by
+    /// [`plan`](Self::plan): every segment request plans, and resolving the
+    /// library walks every configured library. Best-effort; the default is
+    /// empty.
+    async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
+        TranscodeDisplayNames::default()
+    }
 }
 
 /// How long [`HlsStreamManagerImpl::wait_for_minimum_segment_count`] pauses
@@ -197,7 +215,7 @@ const RESTART_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_
 /// The concrete [`HlsStreamManager`]: playlist generation + segment transcode
 /// orchestration + legacy file resolution, over the injected runtime.
 ///
-/// Generic over the [`StreamStatePlanner`] (the un-ported request→plan glue), the
+/// Generic over the [`StreamStatePlanner`] (the request→plan seam), the
 /// [`SegmentTranscoder`] (the ffmpeg spawn seam), the [`EncodingOptionsProvider`]
 /// (the generator's config accessor), and the [`SessionReporter`] (job teardown).
 pub struct HlsStreamManagerImpl<P, T, C, S>
@@ -262,6 +280,13 @@ where
     /// beside the playlist instead kept them out of the dashboard entirely.
     fn log_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(self.paths.log_directory_path())
+    }
+
+    /// `state` named for the transcode logs, for a job about to start.
+    async fn labelled(&self, state: &EncodingJobInfo, item_id: uuid::Uuid) -> EncodingJobInfo {
+        let mut state = state.clone();
+        state.display = self.planner.display_names(item_id).await;
+        state
     }
 
     /// Wires the trickplay store so master playlists advertise the
@@ -420,25 +445,37 @@ where
             .planner
             .plan(request, is_audio, None, PlaylistKind::Vod)
             .await?;
-        let media_source_id = request
-            .media_source_id
-            .as_deref()
-            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-        let create = CreateMainPlaylistRequest::new(
-            media_source_id,
-            plan.media_path,
-            plan.segment_length_ms,
-            plan.run_time_ticks,
-            plan.segment_container,
-            "hls1/main/",
-            request.query_string.clone(),
-            plan.is_remuxing_video,
-        );
         // `HlsError` converts into `ServiceError::BackendSource` (HTTP 500),
         // preserving the typed playlist-generation failure as the cause.
         self.generator
-            .create_main_playlist(&create)
+            .create_main_playlist(&main_playlist_request(request, &plan))
+            .await
             .map_err(ServiceError::from)
+    }
+
+    /// The segment of the variant playlist that contains the resume offset
+    /// `request.start_time_ticks`, and the playlist time it starts at: `(0, 0)`
+    /// when the client is not resuming.
+    ///
+    /// The segments are the playlist's own, so for a remux cut on keyframes the
+    /// index and start match the segment URLs the client then requests.
+    async fn resume_segment(&self, request: &HlsStreamRequest, plan: &TranscodePlan) -> (i32, i64) {
+        let Some(ticks) = request.start_time_ticks.filter(|&ticks| ticks > 0) else {
+            return (0, 0);
+        };
+        match self
+            .generator
+            .segment_lengths(&main_playlist_request(request, plan))
+            .await
+        {
+            Ok(segments) => segment_containing(&segment_start_ticks(&segments), ticks),
+            Err(error) => {
+                // The init then starts at segment 0, as for a client not
+                // resuming; the playlist request reports the same error.
+                tracing::debug!(error = %error, "no playlist segments to resume in");
+                (0, 0)
+            }
+        }
     }
 
     /// Serves `segment_path` if it is already on disk, marking the owning
@@ -455,6 +492,7 @@ where
         segment_path: &Path,
         ext: &str,
         ending_ticks: i64,
+        segment_index: i64,
     ) -> Option<ServedFile> {
         if !segment_path.exists() {
             return None;
@@ -464,12 +502,15 @@ where
             .manager
             .begin_request_guard(playlist_key, TranscodingJobType::Hls);
         let mut file = served(segment_path, ext);
-        file.progress = self.manager.segment_progress(playlist_key, ending_ticks);
+        file.progress = self
+            .manager
+            .segment_progress(playlist_key, ending_ticks, segment_index);
         Some(file)
     }
 
     /// Starts (or reuses) the transcode for `request` and resolves segment
     /// `segment_id` on disk. Port of `GetDynamicSegment`.
+    #[allow(clippy::too_many_lines)]
     async fn resolve_dynamic_segment(
         &self,
         request: &HlsStreamRequest,
@@ -482,7 +523,7 @@ where
         // written by the transcode itself via `-hls_fmp4_init_filename`, not a
         // normal segment. Serve it once a transcode has produced it.
         if segment_id < 0 {
-            return self.resolve_init_segment(request, is_audio).await;
+            return Box::pin(self.resolve_init_segment(request, is_audio)).await;
         }
 
         let plan = self
@@ -502,7 +543,13 @@ where
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext, ending_ticks) {
+        if let Some(file) = self.serve_if_present(
+            &playlist_key,
+            &segment_path,
+            ext,
+            ending_ticks,
+            i64::from(segment_id),
+        ) {
             return Ok(file);
         }
 
@@ -517,7 +564,13 @@ where
         // it open-coded the check without the keep-alive it left
         // `last_activity` stale and the idle reaper free to kill a job that was
         // actively being consumed.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext, ending_ticks) {
+        if let Some(file) = self.serve_if_present(
+            &playlist_key,
+            &segment_path,
+            ext,
+            ending_ticks,
+            i64::from(segment_id),
+        ) {
             return Ok(file);
         }
 
@@ -552,7 +605,11 @@ where
                 {
                     self.clear_restart_failures(&playlist_key);
                     let mut file = served(&segment_path, ext);
-                    file.progress = self.manager.segment_progress(&playlist_key, ending_ticks);
+                    file.progress = self.manager.segment_progress(
+                        &playlist_key,
+                        ending_ticks,
+                        i64::from(segment_id),
+                    );
                     return Ok(file);
                 }
             }
@@ -580,9 +637,10 @@ where
         }
 
         // (Re)start the transcode from this segment and wait for it.
+        let state = self.labelled(&plan.state, request.item_id).await;
         let start = StartFfMpegRequest {
             program: &self.ffmpeg_path,
-            state: &plan.state,
+            state: &state,
             output_path: &playlist_path,
             arguments: plan.arguments.clone(),
             log_dir: self.log_dir(),
@@ -612,7 +670,9 @@ where
         {
             self.clear_restart_failures(&playlist_key);
             let mut file = served(&segment_path, ext);
-            file.progress = self.manager.segment_progress(&playlist_key, ending_ticks);
+            file.progress =
+                self.manager
+                    .segment_progress(&playlist_key, ending_ticks, i64::from(segment_id));
             Ok(file)
         } else {
             // A 5xx, not a 404: HLS clients skip past a 404'd segment and walk
@@ -663,12 +723,18 @@ where
         // non-resuming client (`start == 0`) needs no second plan at all. That
         // second plan is a full media-source resolution (3 DB round trips) plus
         // an arg rebuild, paid on every fMP4 playback start.
-        let start = resume_segment_index(request.start_time_ticks, plan.segment_length_ms);
+        let (start, start_ticks) = self.resume_segment(request, &plan).await;
         let plan = if start == 0 {
             plan
         } else {
+            // The transcode starts at the segment's playlist time, which a
+            // segment request carries as `runtimeTicks`.
+            let resume = HlsStreamRequest {
+                current_runtime_ticks: start_ticks,
+                ..request.clone()
+            };
             self.planner
-                .plan(request, is_audio, Some(start), PlaylistKind::Vod)
+                .plan(&resume, is_audio, Some(start), PlaylistKind::Vod)
                 .await?
         };
         let start_segment = segment_file(&plan.playlist_path, start, ext);
@@ -681,6 +747,7 @@ where
                 request
                     .current_runtime_ticks
                     .wrapping_add(request.actual_segment_length_ticks),
+                -1,
             );
             return Ok(file);
         }
@@ -722,7 +789,7 @@ where
                 // request then starts a second writer onto the same segment
                 // files — torn, unparsable fragments (the fragParsingError
                 // regression).
-                let mut state = plan.state.clone();
+                let mut state = self.labelled(&plan.state, request.item_id).await;
                 state.wait_for_path = Some(start_segment.clone());
                 let start_request = StartFfMpegRequest {
                     program: &self.ffmpeg_path,
@@ -755,6 +822,7 @@ where
                 request
                     .current_runtime_ticks
                     .wrapping_add(request.actual_segment_length_ticks),
+                -1,
             );
             Ok(file)
         } else {
@@ -764,9 +832,13 @@ where
         }
     }
 
-    /// The transcode cache directory (`GetTranscodePath`).
-    fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
-        Ok(PathBuf::from(self.paths.prepare_transcode_path()?))
+    /// The transcode cache directory (`GetTranscodePath`), prepared on the
+    /// blocking pool: the preparation walks the whole transcode tree.
+    async fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
+        Ok(PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(Arc::clone(&self.paths))
+                .await?,
+        ))
     }
 
     /// Resolves `file_name` inside the transcode cache, guarding traversal.
@@ -774,12 +846,12 @@ where
     /// Port of `HlsSegmentController.ValidateTranscodePath`: the resolved path must
     /// stay inside the transcode folder. `require_m3u8` additionally requires a
     /// `.m3u8` extension (the legacy playlist route).
-    fn resolve_in_transcode_dir(
+    async fn resolve_in_transcode_dir(
         &self,
         file_name: &str,
         require_m3u8: bool,
     ) -> Result<PathBuf, ServiceError> {
-        let dir = self.transcode_dir()?;
+        let dir = self.transcode_dir().await?;
         let candidate = dir.join(file_name);
         // Reject any name that escapes the transcode dir (`..`, absolute, etc.).
         let escapes = Path::new(file_name).components().any(|c| {
@@ -899,9 +971,10 @@ where
                         log_dir.display()
                     )));
                 }
+                let state = self.labelled(&plan.state, request.item_id).await;
                 let start = StartFfMpegRequest {
                     program: &self.ffmpeg_path,
-                    state: &plan.state,
+                    state: &state,
                     output_path: &playlist_path,
                     arguments: plan.arguments.clone(),
                     log_dir: log_dir.clone(),
@@ -979,7 +1052,9 @@ where
         file_name: &str,
         require_m3u8: bool,
     ) -> Result<ServedFile, ServiceError> {
-        let path = self.resolve_in_transcode_dir(file_name, require_m3u8)?;
+        let path = self
+            .resolve_in_transcode_dir(file_name, require_m3u8)
+            .await?;
         if !path.exists() {
             return Err(ServiceError::invalid_input("invalid segment"));
         }
@@ -1024,9 +1099,10 @@ where
         let lock = self.playlist_lock(&output);
         let _guard = lock.lock().await;
         if !Path::new(&output).exists() {
+            let state = self.labelled(&plan.state, request.item_id).await;
             let start = StartFfMpegRequest {
                 program: &self.ffmpeg_path,
-                state: &plan.state,
+                state: &state,
                 output_path: Path::new(&output),
                 arguments: plan.arguments.clone(),
                 log_dir: self.log_dir(),
@@ -1245,18 +1321,41 @@ fn init_segment_file(playlist: &Path, extension: &str) -> PathBuf {
     segment_file(playlist, -1, extension)
 }
 
-/// The segment index containing a resume offset of `start_time_ticks`, given a
-/// segment length of `segment_length_ms`. Returns 0 (start) when the client is
-/// not resuming or on any degenerate input. Used to start the fMP4 init
-/// transcode where a resuming client will actually play, so the cached init
-/// matches the seek-offset segments.
-fn resume_segment_index(start_time_ticks: Option<i64>, segment_length_ms: i32) -> i32 {
-    let ticks = start_time_ticks.unwrap_or(0);
-    if ticks <= 0 || segment_length_ms <= 0 {
-        return 0;
+/// The variant playlist's generator request for `request` under `plan`
+/// (`GetVariantPlaylistInternal`'s `CreateMainPlaylistRequest`).
+fn main_playlist_request(
+    request: &HlsStreamRequest,
+    plan: &TranscodePlan,
+) -> CreateMainPlaylistRequest {
+    let media_source_id = request
+        .media_source_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    CreateMainPlaylistRequest::new(
+        media_source_id,
+        plan.media_path.clone(),
+        plan.segment_length_ms,
+        plan.run_time_ticks,
+        plan.segment_container.clone(),
+        "hls1/main/",
+        request.query_string.clone(),
+        plan.is_remuxing_video,
+    )
+}
+
+/// The index and start of the segment containing `ticks`, given each
+/// segment's start (see [`segment_start_ticks`]): the last segment for an
+/// offset past the end, `(0, 0)` for an empty playlist. Used to start the fMP4
+/// init transcode where a resuming client will actually play, so the cached
+/// init matches the seek-offset segments.
+fn segment_containing(starts: &[i64], ticks: i64) -> (i32, i64) {
+    let index = starts
+        .partition_point(|&start| start <= ticks)
+        .saturating_sub(1);
+    match (i32::try_from(index), starts.get(index)) {
+        (Ok(index), Some(&start)) => (index, start),
+        _ => (0, 0),
     }
-    let segment_ticks = i64::from(segment_length_ms) * TICKS_PER_MILLISECOND;
-    i32::try_from(ticks / segment_ticks).unwrap_or(0)
 }
 
 /// The highest segment index a transcode has written for `playlist` on disk.
@@ -1345,6 +1444,7 @@ fn mime_for_extension(ext: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dynamic_hls_playlist_generator::KeyframeExtractor;
     use ferrofin_mediaencoding::TranscodeDisplayNames;
     use ferrofin_mediaencoding::transcoding::{
         FakeScript, FakeSegmentTranscoder, NoopSessionReporter,
@@ -1420,13 +1520,19 @@ mod tests {
         dir: PathBuf,
         segment_container: String,
         requests: PlanCalls,
+        /// Whether the plan copies the video (the keyframe-playlist path).
+        remux: bool,
+        /// Each plan's segment and the `runtimeTicks` its request carried.
+        runtime_ticks: PlanTicks,
+        /// How often the manager asked for display names.
+        labels: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
     impl StreamStatePlanner for FakePlanner {
         async fn plan(
             &self,
-            _request: &HlsStreamRequest,
+            request: &HlsStreamRequest,
             is_audio: bool,
             segment_id: Option<i32>,
             kind: PlaylistKind,
@@ -1435,6 +1541,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((is_audio, segment_id, kind));
+            self.runtime_ticks
+                .lock()
+                .unwrap()
+                .push((segment_id, request.current_runtime_ticks));
             let playlist = self.dir.join(if kind == PlaylistKind::Progressive {
                 "out.ts"
             } else {
@@ -1466,6 +1576,7 @@ mod tests {
                 },
                 supported_video_codecs: Vec::new(),
                 supported_audio_codecs: Vec::new(),
+                supported_subtitle_codecs: Vec::new(),
                 segment_length_secs: 6,
                 wait_for_path: (kind == PlaylistKind::Progressive).then(|| playlist.clone()),
                 segment_container: Some(self.segment_container.clone()),
@@ -1486,11 +1597,19 @@ mod tests {
                 media_path: "/media/in.mkv".to_owned(),
                 run_time_ticks: 60 * 10_000_000,
                 segment_length_ms: 6000,
-                is_remuxing_video: false,
+                is_remuxing_video: self.remux,
                 segment_container: self.segment_container.clone(),
                 encoding_options: EncodingOptions::default(),
                 min_segments: 3,
+                is_dovi_removed: false,
+                is_hdr10_plus_removed: false,
             })
+        }
+
+        async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
+            self.labels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            TranscodeDisplayNames::default()
         }
     }
 
@@ -1517,11 +1636,30 @@ mod tests {
         script: FakeScript,
         container: &str,
     ) -> (Mgr, PlanCalls, FakeSegmentTranscoder) {
+        let (mgr, requests, spawns, _) = manager_remuxing(dir, script, container, None);
+        (mgr, requests, spawns)
+    }
+
+    /// The runtime ticks each plan's request carried, by segment.
+    type PlanTicks = Arc<Mutex<Vec<(Option<i32>, i64)>>>;
+
+    /// [`manager_full`], copying the video when `keyframes` is given, with a
+    /// generator whose extractor yields those keyframes.
+    fn manager_remuxing(
+        dir: &Path,
+        script: FakeScript,
+        container: &str,
+        keyframes: Option<ferrofin_keyframes::keyframe_data::KeyframeData>,
+    ) -> (Mgr, PlanCalls, FakeSegmentTranscoder, PlanTicks) {
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime_ticks = Arc::new(Mutex::new(Vec::new()));
         let planner = FakePlanner {
             dir: dir.to_path_buf(),
             segment_container: container.to_owned(),
             requests: requests.clone(),
+            remux: keyframes.is_some(),
+            runtime_ticks: Arc::clone(&runtime_ticks),
+            labels: std::sync::atomic::AtomicUsize::new(0),
         };
         let transcoder = FakeSegmentTranscoder::new(script);
         let spawns = transcoder.clone();
@@ -1529,15 +1667,42 @@ mod tests {
         let paths = Arc::new(FakePaths {
             transcode: dir.to_string_lossy().into_owned(),
         });
+        let generator = match keyframes {
+            Some(keyframes) => {
+                let cfg: Box<dyn Fn() -> EncodingOptions + Send + Sync> =
+                    Box::new(EncodingOptions::default);
+                let extractor: Arc<dyn KeyframeExtractor> = Arc::new(FixedKeyframes(keyframes));
+                Arc::new(DynamicHlsPlaylistGenerator::new(cfg, vec![extractor]))
+            }
+            None => generator(),
+        };
         let mgr = HlsStreamManagerImpl::new(
             planner,
             transcoder,
             manager,
-            generator(),
+            generator,
             paths,
             TEST_FFMPEG_PATH,
         );
-        (mgr, requests, spawns)
+        (mgr, requests, spawns, runtime_ticks)
+    }
+
+    /// A metadata-based keyframe extractor answering fixed keyframes.
+    struct FixedKeyframes(ferrofin_keyframes::keyframe_data::KeyframeData);
+
+    #[async_trait]
+    impl KeyframeExtractor for FixedKeyframes {
+        fn is_metadata_based(&self) -> bool {
+            true
+        }
+
+        async fn try_extract_keyframes(
+            &self,
+            _item_id: uuid::Uuid,
+            _file_path: &str,
+        ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData> {
+            Some(self.0.clone())
+        }
     }
 
     fn manager_with(dir: &Path, script: FakeScript, container: &str) -> (Mgr, PlanCalls) {
@@ -1948,6 +2113,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn display_names_are_resolved_only_when_a_transcode_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        let labels = || mgr.planner.labels.load(std::sync::atomic::Ordering::SeqCst);
+
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        assert_eq!(labels(), 1, "the start names its job");
+
+        // The segment is on disk now: serving it again starts nothing, so it
+        // must not resolve names (a library walk) either.
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        mgr.variant_playlist(&req(), false).await.unwrap();
+        assert_eq!(
+            labels(),
+            1,
+            "a request that starts nothing resolves no names"
+        );
+    }
+
+    #[tokio::test]
     async fn dynamic_segment_fast_path_when_file_exists() {
         let tmp = tempfile::tempdir().unwrap();
         // Pre-create the segment so the fast path (no spawn) is taken.
@@ -1993,25 +2184,26 @@ mod tests {
     }
 
     #[test]
-    fn resume_segment_index_maps_offset_to_segment() {
-        // 6s segments (6000 ms). 60s resume → segment 10.
-        assert_eq!(resume_segment_index(Some(60 * 10_000_000), 6000), 10);
-        // No resume / zero / negative / bad length → segment 0.
-        assert_eq!(resume_segment_index(None, 6000), 0);
-        assert_eq!(resume_segment_index(Some(0), 6000), 0);
-        assert_eq!(resume_segment_index(Some(-5), 6000), 0);
-        assert_eq!(resume_segment_index(Some(60 * 10_000_000), 0), 0);
+    fn segment_containing_finds_the_segment_and_its_start() {
+        let starts = [0, 71_200_000, 90_000_000, 133_200_000];
+        assert_eq!(segment_containing(&starts, 0), (0, 0));
+        assert_eq!(segment_containing(&starts, 71_199_999), (0, 0));
+        assert_eq!(segment_containing(&starts, 71_200_000), (1, 71_200_000));
+        assert_eq!(segment_containing(&starts, 100_000_000), (2, 90_000_000));
+        // Past the last start: the last segment.
+        assert_eq!(segment_containing(&starts, 900_000_000), (3, 133_200_000));
+        assert_eq!(segment_containing(&[], 50), (0, 0));
     }
 
     #[tokio::test]
     async fn init_segment_starts_transcode_at_resume_offset() {
         // A resuming client fetches the fMP4 init first; it must start the
         // transcode at the resume segment (not 0) so the cached init matches the
-        // seek-offset segments it then plays. 60s / 6s segments → segment 10.
+        // seek-offset segments it then plays. 30s / 6s segments → segment 5.
         let tmp = tempfile::tempdir().unwrap();
         let script = FakeScript {
             // The fake writes the init header + the resume segment on spawn.
-            segment_files: vec!["out10.mp4".to_owned()],
+            segment_files: vec!["out5.mp4".to_owned()],
             extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
             exits_immediately: true,
             ..FakeScript::default()
@@ -2019,17 +2211,53 @@ mod tests {
         let (mgr, recorded) = manager_with(tmp.path(), script, "mp4");
         let resume_req = HlsStreamRequest {
             segment_container: Some("mp4".to_owned()),
-            start_time_ticks: Some(60 * 10_000_000),
+            start_time_ticks: Some(30 * 10_000_000),
             ..req()
         };
         // Segment id -1 routes to the init serve.
         let served = mgr.dynamic_segment(&resume_req, -1, false).await.unwrap();
         assert!(served.path.ends_with("out-1.mp4"));
-        // The init serve started the transcode at the resume segment (10), not 0.
+        // The init serve started the transcode at the resume segment (5), not 0.
         let calls = recorded.lock().unwrap();
         assert!(
-            calls.contains(&(false, Some(10), PlaylistKind::Vod)),
-            "expected a plan at resume segment 10, got {calls:?}"
+            calls.contains(&(false, Some(5), PlaylistKind::Vod)),
+            "expected a plan at resume segment 5, got {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_remux_init_starts_at_the_keyframe_segment_holding_the_offset() {
+        // A remux playlist is cut on the keyframes: with 6 s segments and
+        // keyframes at 0, 7.12, 13.32, 19 and 26.5 s the segments start at 0,
+        // 7.12, 13.32, 19 and 26.5 s. A resume at 21 s plays segment 3, which
+        // starts at 19 s — not segment 3 of 6 s segments (18 s).
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out3.mp4".to_owned()],
+            extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let keyframes = ferrofin_keyframes::keyframe_data::KeyframeData::new(
+            60 * 10_000_000,
+            vec![0, 71_200_000, 133_200_000, 190_000_000, 265_000_000],
+        );
+        let (mgr, _, _, runtime_ticks) =
+            manager_remuxing(tmp.path(), script, "mp4", Some(keyframes));
+        let resume_req = HlsStreamRequest {
+            media_source_id: Some(uuid::Uuid::from_u128(1).to_string()),
+            segment_container: Some("mp4".to_owned()),
+            start_time_ticks: Some(210_000_000),
+            ..req()
+        };
+
+        let served = mgr.dynamic_segment(&resume_req, -1, false).await.unwrap();
+
+        assert!(served.path.ends_with("out-1.mp4"));
+        let seen = runtime_ticks.lock().unwrap();
+        assert!(
+            seen.contains(&(Some(3), 190_000_000)),
+            "expected segment 3 planned from 19 s, got {seen:?}"
         );
     }
 
@@ -2069,6 +2297,47 @@ mod tests {
         let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
         assert!(served.path.ends_with("abc0.ts"));
         assert_eq!(served.content_type, "video/mp2t");
+    }
+
+    /// Serving a segment prepares the transcode directory, a walk of the whole
+    /// tree, on the blocking pool and never inline on a runtime worker: with
+    /// the pool's only thread held busy the request cannot finish, which an
+    /// inline walk would ignore.
+    #[test]
+    fn serving_a_segment_prepares_the_directory_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("abc0.ts"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                mgr.resolve_transcode_file("abc0.ts", false),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "the segment was served with the blocking pool starved, so the walk ran inline"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
+            assert!(served.path.ends_with("abc0.ts"));
+        });
     }
 
     /// Upstream `HlsSegmentController.GetFileResult` refreshes the owning

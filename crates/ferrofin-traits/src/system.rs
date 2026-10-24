@@ -7,7 +7,7 @@
 //!
 //! Port rules applied throughout:
 //! - `HttpRequest` arguments become the transport-agnostic
-//!   [`RequestContext`](crate::net::RequestContext).
+//!   [`RequestContext`].
 //! - `IServerApplicationHost`/`IServerApplicationPaths` extend the generic
 //!   `IApplicationHost`/`IApplicationPaths` bases. Those bases carry plugin/DI
 //!   machinery that is out of scope here; only the server-relevant members plus
@@ -62,9 +62,48 @@ pub trait SystemManager: Send + Sync {
         let _ = dest;
         Ok(())
     }
+
+    /// The free space, in bytes, of the filesystem holding `path`:
+    /// `StorageHelper.GetFreeSpaceOf(path).FreeSpace`, the space an
+    /// unprivileged writer may still use, or `-1` when it cannot be read (the
+    /// C# catch arm). The backup's free-space check reads it.
+    ///
+    /// The default reports `-1`: an implementation with no filesystem to probe
+    /// (a test fake) cannot know; the server's implementation probes the real
+    /// one.
+    async fn free_space_of(&self, path: &std::path::Path) -> i64 {
+        let _ = path;
+        -1
+    }
 }
 
 fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}
+
+/// The URL this server's own processes reach its API at.
+///
+/// The one `IServerApplicationHost` member the Live TV stream buffer, the DVR
+/// and the File Transformation callbacks need, split out so they depend on
+/// nothing else of the host.
+#[async_trait]
+pub trait LocalApiAccess: Send + Sync {
+    /// C# `GetApiUrlForLocalAccess()`: the server's own bind address
+    /// (`NetworkManager.GetBindAddress(null)`), its listen scheme and port and
+    /// the base URL, computed per call from the live network state. It never
+    /// consults the published server URL.
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError>;
+
+    /// C# `GetApiUrlForLocalAccess(allowHttps: false)`: the same address over
+    /// plain HTTP on the HTTP port, for in-process callers whose HTTP client
+    /// would not accept the server's own certificate.
+    ///
+    /// The default is [`Self::get_api_url_for_local_access`], right for a host
+    /// that never listens with HTTPS.
+    async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        self.get_api_url_for_local_access().await
+    }
+}
+
+fn _assert_object_safe_local_api_access(_: &dyn LocalApiAccess) {}
 
 /// Exposes host-level networking facts and URL construction.
 ///
@@ -72,7 +111,7 @@ fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}
 /// `IApplicationHost` base). URL builders are fallible `async fn` (they consult
 /// live network state); the simple facts are synchronous getters.
 #[async_trait]
-pub trait ServerApplicationHost: Send + Sync {
+pub trait ServerApplicationHost: LocalApiAccess + Send + Sync {
     /// Whether core startup has finished.
     fn core_startup_has_completed(&self) -> bool;
 
@@ -98,6 +137,11 @@ pub trait ServerApplicationHost: Send + Sync {
     /// both as distinct fields (`ProductName` / `ServerName`).
     /// `GET`/`POST /System/Ping` and `PublicSystemInfo.ProductName` return this.
     fn name(&self) -> String;
+
+    /// The base URL prefix the HTTP API is mounted under (Jellyfin's
+    /// `NetworkConfiguration.BaseUrl`): a leading `/` and no trailing one,
+    /// empty when the server is mounted at the root.
+    fn base_url(&self) -> String;
 
     /// Builds the best externally reachable API URL for a request.
     async fn get_smart_api_url(&self, request: &RequestContext) -> Result<String, ServiceError>;
@@ -211,6 +255,9 @@ pub trait ServerApplicationPaths: Send + Sync {
 
     /// Resolves and prepares the current transcode directory (`GetTranscodePath`).
     ///
+    /// Blocking: it walks the whole transcode tree for a conflicting marker. An
+    /// async caller uses [`prepare_transcode_path_off_runtime`] instead.
+    ///
     /// # Errors
     /// Returns directory/marker creation errors or a conflicting ownership marker.
     fn prepare_transcode_path(&self) -> Result<String, ServiceError> {
@@ -238,6 +285,47 @@ pub trait ServerApplicationPaths: Send + Sync {
 }
 
 fn _assert_object_safe_server_application_paths(_: &dyn ServerApplicationPaths) {}
+
+/// [`ServerApplicationPaths::prepare_transcode_path`] on the blocking pool.
+///
+/// Preparing the directory walks the whole transcode tree for a conflicting
+/// ownership marker, as upstream's `CreateAndCheckMarker(path, "transcode",
+/// true)` does on every `GetTranscodePath`. HLS prepares it on every segment
+/// request, and the tree holds every segment of every live transcode, so an
+/// async caller runs it here rather than on a runtime worker.
+///
+/// # Errors
+/// As [`ServerApplicationPaths::prepare_transcode_path`], or the blocking task
+/// failing.
+pub async fn prepare_transcode_path_off_runtime(
+    paths: std::sync::Arc<dyn ServerApplicationPaths>,
+) -> Result<String, ServiceError> {
+    tokio::task::spawn_blocking(move || paths.prepare_transcode_path())
+        .await
+        .map_err(|error| ServiceError::backend(format!("prepare transcode directory: {error}")))?
+}
+
+/// Prepares the transcode directory at `path`, which a caller resolved itself,
+/// on the blocking pool; see [`prepare_transcode_path_off_runtime`].
+///
+/// # Errors
+/// Directory or marker creation errors, a conflicting ownership marker, or the
+/// blocking task failing.
+pub async fn prepare_transcode_directory_off_runtime(
+    path: std::path::PathBuf,
+) -> Result<std::path::PathBuf, ServiceError> {
+    tokio::task::spawn_blocking(move || {
+        ferrofin_util::directory_path::prepare_transcode_directory(&path).map_err(|error| {
+            ServiceError::backend(format!(
+                "prepare transcode directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    })
+    .await
+    .map_err(|error| ServiceError::backend(format!("prepare transcode directory: {error}")))?
+}
 
 /// Where an item's media sits on disk: the two `BaseItem` properties
 /// `IPathManager` reads off the item.
@@ -352,3 +440,34 @@ pub trait ExternalDataManager: Send + Sync {
 }
 
 fn _assert_object_safe_external_data_manager(_: &dyn ExternalDataManager) {}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_transcode_directory_off_runtime;
+
+    /// The helper hands back the prepared path, and a conflicting marker keeps
+    /// the error text the callers reported before it moved off the runtime.
+    #[tokio::test]
+    async fn preparing_a_directory_off_the_runtime_returns_it_or_the_conflict() {
+        let root =
+            std::env::temp_dir().join(format!("ferrofin-transcode-{}", uuid::Uuid::new_v4()));
+        let prepared = prepare_transcode_directory_off_runtime(root.clone())
+            .await
+            .expect("an empty directory is ours");
+        assert_eq!(prepared, root);
+        assert!(root.join(".jellyfin-transcode").is_file());
+
+        std::fs::create_dir_all(root.join("job")).expect("a nested directory");
+        std::fs::write(root.join("job").join(".jellyfin-data"), b"").expect("foreign marker");
+        let error = prepare_transcode_directory_off_runtime(root.clone())
+            .await
+            .expect_err("conflicting owner")
+            .to_string();
+        assert!(
+            error.contains(&format!("prepare transcode directory {}: ", root.display()))
+                && error.contains(".jellyfin-data"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+}

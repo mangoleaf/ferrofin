@@ -38,6 +38,9 @@ use uuid::Uuid;
 const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
 const SERIES_ID: Uuid = Uuid::from_u128(0x005E_21E5);
 const SEASON_ID: Uuid = Uuid::from_u128(0x05EA_5074);
+/// A series whose season 2 holds more rows than `slice::sort_by` insertion-sorts.
+const LONG_SERIES_ID: Uuid = Uuid::from_u128(0x1005_E21E);
+const LONG_SEASON_ID: Uuid = Uuid::from_u128(0x1005_EA50);
 
 /// Builds a minimal [`UserEntity`]; every non-id field is a neutral zero value.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
@@ -165,6 +168,41 @@ fn season_entity(id: Uuid, number: i64) -> BaseItemEntity {
     season.series_presentation_unique_key = Some("key-The Series".to_owned());
     season.path = Some(format!("/media/season{number}"));
     season
+}
+
+/// Season 2 of [`LONG_SERIES_ID`] in `SortName` order: 22 unnumbered episodes
+/// premiered on days 20 to 11, then one undated, then days 10 to 0. The
+/// aired-episode comparer orders two dated rows by date but calls the undated
+/// one equal to both, which is no total order; `slice::sort_by` may panic on
+/// it beyond 20 rows (gl-905).
+fn long_season_rows() -> Vec<BaseItemEntity> {
+    let mut season = season_entity(LONG_SEASON_ID, 2);
+    season.parent_id = Some(LONG_SERIES_ID.to_string());
+    let days = (11..=20)
+        .rev()
+        .map(Some)
+        .chain([None])
+        .chain((0..=10).rev().map(Some));
+    let episodes = days.enumerate().map(|(row, day)| {
+        let name = day.map_or_else(
+            || format!("Row {row:02} undated"),
+            |day| format!("Row {row:02} day {day:02}"),
+        );
+        let mut item = item_entity(
+            Uuid::from_u128(0x0E00 + u128::try_from(row).expect("row")),
+            &name,
+            "Episode",
+        );
+        item.parent_index_number = Some(2);
+        item.season_id = Some(LONG_SEASON_ID.to_string());
+        item.parent_id = Some(LONG_SEASON_ID.to_string());
+        item.path = Some(format!("/media/long/row{row:02}.mkv"));
+        item.premiere_date = day.map(|day| {
+            chrono::DateTime::from_timestamp(1_600_000_000 + day * 86_400, 0).expect("date")
+        });
+        item
+    });
+    std::iter::once(season).chain(episodes).collect()
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
@@ -371,6 +409,9 @@ impl LibraryManager for StubLibrary {
         Ok(match id {
             _ if id == SERIES_ID => Some(item_entity(SERIES_ID, "The Series", "Series")),
             _ if id == SEASON_ID => Some(season_entity(SEASON_ID, 1)),
+            _ if id == LONG_SERIES_ID => {
+                Some(item_entity(LONG_SERIES_ID, "The Long Series", "Series"))
+            }
             _ => None,
         })
     }
@@ -379,6 +420,9 @@ impl LibraryManager for StubLibrary {
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         use ferrofin_model::data::BaseItemKind;
+        if query.series_presentation_unique_key.as_deref() == Some("key-The Long Series") {
+            return Ok(long_season_rows());
+        }
         let mut items = Vec::new();
         if query.include_item_types.contains(&BaseItemKind::Season) {
             items.extend([
@@ -664,6 +708,23 @@ async fn episodes_returns_series_episodes() {
 }
 
 #[tokio::test]
+async fn a_long_season_the_aired_order_cannot_totally_order_lists_every_episode() {
+    let (status, body) = get(&format!("/Shows/{LONG_SERIES_ID}/Episodes?season=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+    assert_eq!(result.total_record_count, 22);
+    let names: Vec<_> = result.items.iter().filter_map(|i| i.name.clone()).collect();
+    assert_eq!(names.len(), 22);
+    let dated: Vec<_> = names
+        .iter()
+        .filter(|name| !name.ends_with("undated"))
+        .collect();
+    let mut by_day = dated.clone();
+    by_day.sort_by_key(|name| name.rsplit(' ').next().map(str::to_owned));
+    assert_eq!(dated, by_day, "the dated episodes keep their date order");
+}
+
+#[tokio::test]
 async fn episodes_paginate_with_start_and_limit() {
     let (status, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?startIndex=1&limit=1")).await;
     assert_eq!(status, StatusCode::OK);
@@ -719,7 +780,7 @@ async fn similar_shows_returns_items() {
 /// `DtoOptions` the controller then projects with (v12
 /// SimilarItemsManager.cs:108-112, LibraryController.cs:835-849), so every
 /// Similar row carries the field even when `fields` never named it — on the
-/// `/Shows` route and on the `LibraryController` aliases alike.
+/// `/Shows` alias and the other `LibraryController` aliases alike.
 #[tokio::test]
 async fn similar_rows_always_carry_provider_ids() {
     for path in [

@@ -9,8 +9,6 @@
 //! - [`DeleteCacheFileTask`] — `DeleteCacheFileTask` (`DeleteCacheFiles`)
 //! - [`DeleteLogFileTask`] — `DeleteLogFileTask` (`CleanLogFiles`)
 //! - [`DeleteTranscodeFileTask`] — `DeleteTranscodeFileTask` (`DeleteTranscodeFiles`)
-//! - [`CleanupCollectionAndPlaylistPathsTask`] —
-//!   `CleanupCollectionAndPlaylistPathsTask` (`CleanCollectionsAndPlaylists`)
 //! - [`OptimizeDatabaseTask`] — `OptimizeDatabaseTask` (`OptimizeDatabaseTask`)
 //! - [`CleanupUserDataTask`] — `CleanupUserDataTask` (`CleanupUserDataTask`)
 //!
@@ -25,15 +23,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ferrofin_db::Database;
 use ferrofin_db::store::datetime_to_db;
-use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::activity::ActivityManager;
-use ferrofin_traits::collections::{CollectionManager, PlaylistManager};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
-use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::LinkedChildrenService;
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
@@ -91,6 +85,35 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Port of `TranscodeManager.DeleteEncodedMediaCache`
+/// (`TranscodeManager.cs:718-736`), which the upstream constructor runs at
+/// startup: deletes every file under the transcode directory, whatever its
+/// age, so the segments and outputs a crash left behind do not outlive the
+/// restart. Directories stay. The `.jellyfin-transcode` marker goes with the
+/// rest, as upstream, and the next `prepare_transcode_path` recreates it. A
+/// directory that cannot be prepared (a conflicting marker says it is not
+/// ours) is left alone. Per-file failures are logged and skipped.
+///
+/// Run it before any transcode job can start. Returns how many files were
+/// deleted.
+pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
+    let dir = match paths.prepare_transcode_path() {
+        Ok(dir) => PathBuf::from(dir),
+        Err(error) => {
+            tracing::error!(%error, "cannot clear the transcode cache");
+            return 0;
+        }
+    };
+    let mut deleted = 0;
+    for file in files_under(&dir) {
+        match std::fs::remove_file(&file) {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
+        }
+    }
+    deleted
 }
 
 /// Deletes every file under `dir` last modified before `cutoff`, then prunes
@@ -227,7 +250,8 @@ impl ScheduledTask for CleanActivityLogTask {
 
 /// "Clean Cache Directory" — deletes cache files no longer needed by the
 /// system. Port of `DeleteCacheFileTask`: cache files older than 30 days, temp
-/// files (`{cache}/temp`) older than 1 day, then empty-folder pruning.
+/// files ([`ServerApplicationPaths::temp_path`], `{cache}/temp`) older than 1
+/// day, then empty-folder pruning.
 pub struct DeleteCacheFileTask {
     paths: Arc<dyn ServerApplicationPaths>,
 }
@@ -266,7 +290,7 @@ impl ScheduledTask for DeleteCacheFileTask {
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let cache = PathBuf::from(self.paths.cache_path());
-        let temp = cache.join("temp");
+        let temp = PathBuf::from(self.paths.temp_path());
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let now = SystemTime::now();
@@ -412,7 +436,10 @@ impl ScheduledTask for DeleteTranscodeFileTask {
             tracing::info!("skipping transcode-directory sweep: playback is active");
             return Ok(());
         }
-        let dir = PathBuf::from(self.paths.prepare_transcode_path()?);
+        let dir = PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(Arc::clone(&self.paths))
+                .await?,
+        );
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let cutoff = SystemTime::now() - std::time::Duration::from_hours(24);
@@ -420,135 +447,6 @@ impl ScheduledTask for DeleteTranscodeFileTask {
         })
         .await?;
         tracing::info!(deleted, "cleaned transcode directory");
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Clean up collections and playlists
-// ---------------------------------------------------------------------------
-
-/// "Clean up collections and playlists" — removes items from collections and
-/// playlists that no longer exist. Port of
-/// `CleanupCollectionAndPlaylistPathsTask`: for every box set and playlist,
-/// linked children whose item row is gone or whose path no longer exists on
-/// disk are removed.
-pub struct CleanupCollectionAndPlaylistPathsTask {
-    library: Arc<dyn LibraryManager>,
-    collections: Arc<dyn CollectionManager>,
-    playlists: Arc<dyn PlaylistManager>,
-    linked: Arc<dyn LinkedChildrenService>,
-}
-
-impl CleanupCollectionAndPlaylistPathsTask {
-    /// Builds the task over the library, collection, playlist and
-    /// linked-children seams.
-    #[must_use]
-    pub fn new(
-        library: Arc<dyn LibraryManager>,
-        collections: Arc<dyn CollectionManager>,
-        playlists: Arc<dyn PlaylistManager>,
-        linked: Arc<dyn LinkedChildrenService>,
-    ) -> Self {
-        Self {
-            library,
-            collections,
-            playlists,
-            linked,
-        }
-    }
-
-    /// The linked children of `parent_id` whose item row is missing or whose
-    /// path no longer exists on disk (the C# `CleanupLinkedChildren` check:
-    /// `!File.Exists(path) && !Directory.Exists(path)`).
-    async fn dead_children(&self, parent_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
-        let mut dead = Vec::new();
-        for child_id in self.linked.get_linked_children_ids(parent_id, None).await? {
-            let missing = match self.library.get_item_by_id(child_id).await? {
-                None => true,
-                Some(item) => item
-                    .path
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                    .is_none_or(|p| !Path::new(p).exists()),
-            };
-            if missing {
-                dead.push(child_id);
-            }
-        }
-        Ok(dead)
-    }
-
-    /// Cleans one category (box sets or playlists), reporting progress across
-    /// `progress_base..progress_base + 50`.
-    async fn clean_folders(
-        &self,
-        kind: BaseItemKind,
-        progress: &TaskProgress,
-        progress_base: f64,
-    ) -> Result<(), ServiceError> {
-        let folders = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![kind],
-                recursive: true,
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let total = folders.len();
-        for (index, folder) in folders.into_iter().enumerate() {
-            let Ok(folder_id) = Uuid::parse_str(&folder.id) else {
-                continue;
-            };
-            let dead = self.dead_children(folder_id).await?;
-            if !dead.is_empty() {
-                tracing::info!(
-                    folder = folder.name.as_deref().unwrap_or_default(),
-                    removed = dead.len(),
-                    "removing dead linked children"
-                );
-                if kind == BaseItemKind::BoxSet {
-                    self.collections
-                        .remove_from_collection(folder_id, &dead)
-                        .await?;
-                } else {
-                    let entry_ids: Vec<String> = dead.iter().map(ToString::to_string).collect();
-                    self.playlists
-                        .remove_item_from_playlist(&folder.id, &entry_ids)
-                        .await?;
-                }
-            }
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(progress_base + 50.0 * ((index + 1) as f64 / total as f64));
-        }
-        progress.report(progress_base + 50.0);
-        Ok(())
-    }
-}
-
-#[allow(clippy::unnecessary_literal_bound)]
-#[async_trait]
-impl ScheduledTask for CleanupCollectionAndPlaylistPathsTask {
-    fn key(&self) -> &str {
-        "CleanCollectionsAndPlaylists"
-    }
-    fn name(&self) -> &str {
-        "Clean up collections and playlists"
-    }
-    fn description(&self) -> &str {
-        "Removes items from collections and playlists that no longer exist."
-    }
-    fn category(&self) -> &str {
-        MAINTENANCE
-    }
-    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
-        vec![startup()]
-    }
-    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
-        self.clean_folders(BaseItemKind::BoxSet, progress, 0.0)
-            .await?;
-        self.clean_folders(BaseItemKind::Playlist, progress, 50.0)
-            .await?;
         Ok(())
     }
 }
@@ -563,16 +461,27 @@ impl ScheduledTask for CleanupCollectionAndPlaylistPathsTask {
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
+    library: Arc<dyn LibraryManager>,
 }
 
 impl OptimizeDatabaseTask {
-    /// Builds the task over the database handle and the session manager (the
+    /// Builds the task over the database handle (skipped while a backup
+    /// snapshot holds its maintenance turn), the session manager (the
     /// vacuum is skipped while anything is playing — `VACUUM` and the
     /// truncating checkpoint take exclusive locks that fail live requests; a
-    /// real mid-playback black-screen traced to exactly this window).
+    /// real mid-playback black-screen traced to exactly this window) and the
+    /// library manager (skipped, as upstream, while a library scan runs).
     #[must_use]
-    pub fn new(db: Database, sessions: Arc<dyn SessionManager>) -> Self {
-        Self { db, sessions }
+    pub fn new(
+        db: Database,
+        sessions: Arc<dyn SessionManager>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            db,
+            sessions,
+            library,
+        }
     }
 }
 
@@ -603,6 +512,13 @@ impl ScheduledTask for OptimizeDatabaseTask {
         vec![interval_hours(6)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `OptimizeDatabaseTask.ExecuteAsync`: the vacuum and the truncating
+        // checkpoint hold the only writer a library scan writes through, and
+        // can stall it, so the run waits for the next trigger.
+        if self.library.is_scan_running() {
+            tracing::info!("skipping database optimization: a library scan is running");
+            return Ok(());
+        }
         // Playback guard: VACUUM + wal_checkpoint(TRUNCATE) take exclusive
         // locks; concurrent requests (HLS auth, playstate) hard-fail once the
         // reader busy-timeout elapses. Skip while anything is playing — the
@@ -611,6 +527,15 @@ impl ScheduledTask for OptimizeDatabaseTask {
             tracing::info!("skipping database optimize/vacuum: playback is active");
             return Ok(());
         }
+        // A backup snapshot holds a read for its whole copy: the truncating
+        // checkpoint would wait on it through the busy timeout holding the
+        // one writer, and the vacuum would grow the WAL by the database's
+        // size. Skipped like the guards above. A snapshot asked for while
+        // this pass runs waits for it.
+        let Some(_turn) = self.db.try_maintenance_turn() else {
+            tracing::info!("skipping database optimization: a database snapshot is running");
+            return Ok(());
+        };
         tracing::info!("optimizing and vacuuming the database");
         for (statement, pct) in [
             ("PRAGMA optimize", 25.0),
@@ -808,7 +733,7 @@ mod tests {
             device_id: &str,
             device_name: &str,
             remote_endpoint: &str,
-            user: &UserEntity,
+            user: Option<&UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
@@ -1216,12 +1141,39 @@ mod tests {
         assert!(fresh.exists(), "in-flight transcode file should remain");
     }
 
+    /// The boot purge deletes every file whatever its age and keeps the
+    /// directories; a transcode directory carrying another directory's marker
+    /// is not ours, so nothing in it is touched.
+    #[test]
+    fn delete_encoded_media_cache_clears_only_its_own_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FakeConfig::over(dir.path(), |_| {});
+        let paths = config.application_paths();
+        let transcodes = std::path::PathBuf::from(paths.transcode_path());
+        let fresh = touch(&transcodes, "abc/segment0.ts");
+        let playlist = touch(&transcodes, "abc.m3u8");
+
+        // The two files and the `.jellyfin-transcode` marker, as upstream.
+        assert_eq!(delete_encoded_media_cache(&*paths), 3);
+        assert!(!fresh.exists() && !playlist.exists());
+        assert!(transcodes.join("abc").is_dir(), "directories stay");
+
+        let kept = touch(&transcodes, "abc/segment1.ts");
+        let foreign = touch(&transcodes, "media/.jellyfin-data");
+        assert_eq!(delete_encoded_media_cache(&*paths), 0);
+        assert!(kept.exists() && foreign.exists());
+    }
+
     // -- Optimize database -------------------------------------------------
 
     #[tokio::test]
     async fn optimize_database_runs_pragmas_and_vacuum() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db, idle_sessions());
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db),
+        );
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
             task.default_triggers()[0].interval_ticks,
@@ -1235,13 +1187,60 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_skips_while_playback_is_active() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db, playing_sessions());
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            playing_sessions(),
+            crate::test_support::library_manager_over(db),
+        );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
         assert!(
             progress.current().abs() < f64::EPSILON,
             "guarded run must not have executed the vacuum steps"
         );
+    }
+
+    /// `OptimizeDatabaseTask.ExecuteAsync` returns at once while a library
+    /// scan runs (`IsScanRunning`): the vacuum and the truncating checkpoint
+    /// would hold the only writer the scan writes through. The skipped run
+    /// still succeeds, so the task records `Completed`.
+    #[tokio::test]
+    async fn optimize_database_skips_while_a_library_scan_runs() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_mid_scan(db).await,
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "a run during a library scan must not have executed the vacuum steps"
+        );
+    }
+
+    /// While a backup snapshot holds the database's maintenance turn, the
+    /// optimize run is skipped: its truncating checkpoint would wait on the
+    /// snapshot's read through the busy timeout, holding the one writer.
+    #[tokio::test]
+    async fn optimize_database_skips_while_a_snapshot_runs() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
+        let snapshot = db.try_maintenance_turn().expect("free");
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "a run during a snapshot must not have executed the vacuum steps"
+        );
+        drop(snapshot);
+        task.execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1260,110 +1259,6 @@ mod tests {
         assert!(
             old.exists(),
             "a live playback session must protect even day-old transcode files"
-        );
-    }
-
-    // -- Collections/playlists cleanup --------------------------------------
-
-    #[tokio::test]
-    async fn collections_cleanup_removes_dead_children_only() {
-        use crate::test_support::{item_repository_over, library_manager_over, seed_named_item};
-        use crate::{
-            FerrofinCollectionManager, FerrofinLinkedChildrenService, FerrofinPlaylistManager,
-        };
-        use ferrofin_model::data::BaseItemKind;
-        use uuid::Uuid;
-
-        let db = test_db().await;
-        let media_dir = tempfile::tempdir().expect("tempdir");
-        let library = library_manager_over(db.clone());
-        let linked: Arc<dyn LinkedChildrenService> =
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
-        let task_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
-            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-                media_dir.path(),
-                media_dir.path(),
-                media_dir.path(),
-                media_dir.path(),
-                media_dir.path(),
-            ));
-        let collections: Arc<dyn CollectionManager> = Arc::new(FerrofinCollectionManager::new(
-            db.clone(),
-            Arc::clone(&library),
-            Arc::clone(&linked),
-            Arc::clone(&task_paths),
-        ));
-        let playlists: Arc<dyn PlaylistManager> = Arc::new(FerrofinPlaylistManager::new(
-            db.clone(),
-            Arc::clone(&library),
-            item_repository_over(db.clone()),
-            Arc::clone(&task_paths),
-        ));
-
-        // A box set with one live child (file on disk) and one dead child
-        // (path points nowhere), and a playlist with a dead child.
-        let boxset = Uuid::from_u128(0xB0);
-        let live = Uuid::from_u128(0xC1);
-        let dead = Uuid::from_u128(0xC2);
-        let playlist = Uuid::from_u128(0xB1);
-        seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Box").await;
-        seed_named_item(&db, live, BaseItemKind::Movie, "Live").await;
-        seed_named_item(&db, dead, BaseItemKind::Movie, "Dead").await;
-        seed_named_item(&db, playlist, BaseItemKind::Playlist, "List").await;
-
-        let live_path = media_dir.path().join("live.mkv");
-        std::fs::write(&live_path, b"x").expect("write");
-        let set_path = |id: Uuid, path: String| {
-            let db = db.clone();
-            async move {
-                sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
-                    .bind(path)
-                    .bind(guid_to_db(id))
-                    .execute(db.writer())
-                    .await
-                    .expect("set path");
-            }
-        };
-        set_path(live, live_path.to_string_lossy().into_owned()).await;
-        set_path(dead, "/nonexistent/definitely/gone.mkv".to_owned()).await;
-
-        for (parent, child) in [(boxset, live), (boxset, dead), (playlist, dead)] {
-            sqlx::query(
-                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
-                   VALUES (?1, (SELECT COALESCE(MAX("SortOrder"), -1) + 1 FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 0)"#,
-            )
-            .bind(guid_to_db(parent))
-            .bind(guid_to_db(child))
-            .execute(db.writer())
-            .await
-            .expect("link");
-        }
-
-        let task = CleanupCollectionAndPlaylistPathsTask::new(
-            library,
-            collections,
-            playlists,
-            Arc::clone(&linked),
-        );
-        assert_eq!(task.key(), "CleanCollectionsAndPlaylists");
-        assert_eq!(
-            task.default_triggers()[0].type_,
-            TaskTriggerInfoType::StartupTrigger
-        );
-        task.execute(&TaskProgress::default()).await.expect("run");
-
-        let remaining = linked
-            .get_linked_children_ids(boxset, None)
-            .await
-            .expect("children");
-        assert_eq!(remaining, vec![live], "only the live child survives");
-        assert!(
-            linked
-                .get_linked_children_ids(playlist, None)
-                .await
-                .expect("children")
-                .is_empty(),
-            "playlist's dead child is removed"
         );
     }
 

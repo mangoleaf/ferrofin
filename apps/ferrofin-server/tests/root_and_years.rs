@@ -203,14 +203,32 @@ async fn items_root_ancestors_and_years_over_real_http() {
     );
 
     // ---- a movies library, created + scanned through the real endpoints ----
+    // No remote metadata or image fetchers: the years come from the file
+    // names, and a scan that asks the real TMDb or OMDb waits on them, so a
+    // slow provider outlasted the scan wait below.
     let media = urlencoding(&harness.media_dir);
-    let (status, body) = send(
-        &router,
-        &auth_header,
-        "POST",
-        &format!("/Library/VirtualFolders?name=Movies&collectionType=movies&paths={media}&refreshLibrary=false"),
-    )
-    .await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={media}&refreshLibrary=false"
+                ))
+                .header(header::AUTHORIZATION, &auth_header)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"LibraryOptions": {"TypeOptions": [
+                        {"Type": "Movie", "MetadataFetchers": [], "ImageFetchers": []}
+                    ]}})
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = body_json(response).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "library added: {body}");
     let (status, folders) = send(&router, &auth_header, "GET", "/Library/VirtualFolders").await;
     assert_eq!(status, StatusCode::OK);

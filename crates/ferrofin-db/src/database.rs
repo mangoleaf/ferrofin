@@ -1,6 +1,7 @@
 //! The [`Database`] connection handle — a [`sqlx::SqlitePool`] wrapper.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -13,6 +14,17 @@ use crate::error::Result;
 /// `sqlx::migrate!()` reads the directory at **compile time**, so building
 /// this crate needs no live database or `DATABASE_URL`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// The version of the last migration in this build's chain: a database
+/// migrated past it was written by a newer build, and this one cannot open it
+/// (`MIGRATOR.run` refuses applied versions it does not know).
+#[must_use]
+pub fn schema_head() -> i64 {
+    MIGRATOR
+        .iter()
+        .last()
+        .map_or(0, |migration| migration.version)
+}
 
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
@@ -49,7 +61,8 @@ pub struct ImageParentRow {
 
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
-/// single-connection **writer** pool ([`Database::writer`]).
+/// single-connection **writer** pool ([`Database::writer`]), plus a private
+/// one-connection pool for [`Database::snapshot_to`].
 ///
 /// SQLite under WAL serves many concurrent readers but exactly one writer at a
 /// time. Funnelling every write through a 1-connection pool turns would-be
@@ -64,6 +77,13 @@ pub struct ImageParentRow {
 pub struct Database {
     pool: SqlitePool,
     writer: SqlitePool,
+    /// One connection, opened on first use, for [`Database::snapshot_to`], so
+    /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
+    /// [`Database::close`] still waits for it.
+    snapshotter: SqlitePool,
+    /// One snapshot or one vacuum-and-checkpoint pass at a time
+    /// ([`Database::try_maintenance_turn`]), shared by every clone.
+    maintenance: Arc<tokio::sync::Mutex<()>>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -102,7 +122,7 @@ impl Database {
         // SQLITE_BUSY failures for every in-flight request (a real
         // mid-playback black-screen). The maintenance task now also skips the
         // vacuum during playback; the long timeout is the second seatbelt.
-        configure_sqlite_for_concurrency();
+        init_sqlite();
         let read_options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
@@ -144,6 +164,7 @@ impl Database {
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            log_dangling_row_cleanup(&mut conn).await?;
             crate::normalized_usernames::repair(&mut conn).await?;
             foreign_key_check(&mut conn).await?;
             sqlx::Connection::close(conn).await?;
@@ -164,7 +185,7 @@ impl Database {
         // Same process-wide setup as the file-backed path: without it this
         // pool's connection would have no `ferrofin_random()` and every
         // random-ordered query would fail with "no such function".
-        configure_sqlite_for_concurrency();
+        init_sqlite();
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -173,14 +194,18 @@ impl Database {
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
         let writer = pool.clone();
+        let snapshotter = pool.clone();
         Ok(Self {
             pool,
             writer,
+            snapshotter,
+            maintenance: Arc::default(),
             file_path: None,
         })
     }
 
-    /// Builds the reader + writer pools from fully-formed connect options.
+    /// Builds the reader, writer and snapshot pools from fully-formed connect
+    /// options.
     ///
     /// `pool_size` `None` selects [`default_pool_size`] for the reader pool;
     /// the writer pool is always exactly one connection (SQLite allows one
@@ -194,6 +219,9 @@ impl Database {
         file_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let max_connections = pool_size.unwrap_or_else(default_pool_size);
+        let snapshotter = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(read_options.clone());
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(read_options)
@@ -213,6 +241,8 @@ impl Database {
         Ok(Self {
             pool,
             writer,
+            snapshotter,
+            maintenance: Arc::default(),
             file_path,
         })
     }
@@ -581,6 +611,37 @@ impl Database {
         Ok(out)
     }
 
+    /// The `OriginalLanguage` of each of `ids` that has one, as `(Id,
+    /// OriginalLanguage)` pairs in the stored GUID form.
+    ///
+    /// One query for a page of episodes, whose default audio stream follows
+    /// `GetInheritedOriginalLanguage()` — the SERIES' original language when
+    /// the episode has none of its own (v12.2
+    /// MediaBrowser.Controller/Entities/TV/Episode.cs:157-160).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// How many alternate-version rows point at each of `primary_ids` through
     /// `PrimaryVersionId`, keyed by the primary's id in its stored (uppercase,
     /// hyphenated) GUID form. Primaries with no alternate are absent.
@@ -712,8 +773,9 @@ impl Database {
 
     /// `Playlist.OwnerUserId` of each of the playlists among `ids` (stored
     /// GUID form) that has an owner: `(PlaylistId, OwnerUserId)` from
-    /// `FerrofinPlaylists`. A playlist with no owner (made through an API key)
-    /// and an id that is no playlist are absent.
+    /// `FerrofinPlaylists`. A playlist with no owner (an older build's
+    /// user-less API-key create, or a `Data` naming none) and an id that is
+    /// no playlist are absent.
     ///
     /// # Errors
     ///
@@ -777,6 +839,31 @@ impl Database {
         }))
     }
 
+    /// Whether Jellyfin's `__EFMigrationsHistory` records `migration_id`, i.e.
+    /// Jellyfin already ran that routine here before Ferrofin adopted the
+    /// database. Always `false` on a Ferrofin-native database, which has no
+    /// such table (adoption keeps it untouched).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn jellyfin_migration_applied(&self, migration_id: &str) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        let applied: Option<i64> = sqlx::query_scalar(
+            r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
+        )
+        .bind(migration_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(applied.is_some())
+    }
+
     /// Plants an adoption record as the gate would — for tests of the boot
     /// repairs that key on it (an in-memory database never goes through the
     /// gate).
@@ -824,7 +911,23 @@ impl Database {
         &self.writer
     }
 
-    /// Closes both pools, waiting for checked-out connections to be returned.
+    /// Checks that a reader connection can be had and answers a query: the
+    /// `/health` and `/health/ready` probe (upstream
+    /// `DbContextFactoryHealthCheck`, which asks `CanConnectAsync`). It never
+    /// touches the writer, so a long write cannot fail it. It waits at most
+    /// the reader pool's acquire timeout, which is not set here (sqlx's
+    /// default, 30 s).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when no connection can be acquired (the pool is
+    /// closed, or saturated past its acquire timeout) or the query fails.
+    pub async fn can_connect(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Closes every pool, waiting for checked-out connections to be returned.
     ///
     /// The composition root calls this when a server lifetime ends so that an
     /// in-process restart reopens the file with NO connection from the previous
@@ -833,6 +936,7 @@ impl Database {
     pub async fn close(&self) {
         self.pool.close().await;
         self.writer.close().await;
+        self.snapshotter.close().await;
     }
 
     /// Whether [`Database::close`] has run.
@@ -847,15 +951,45 @@ impl Database {
     /// WAL-mode database, which a checkpoint can tear mid-read. `dest` must not
     /// exist.
     ///
+    /// It runs on the snapshot pool's one connection. `VACUUM INTO` needs only
+    /// a read transaction, and holding a writer or reader connection for the
+    /// whole copy would queue every write behind it (the writer pool has one
+    /// connection) or, on a one-connection reader pool, every read. The cost
+    /// is a WAL that cannot be checkpointed back to empty until the snapshot's
+    /// read transaction ends, so the copy waits for, and then holds, the
+    /// maintenance turn ([`Database::try_maintenance_turn`]).
+    ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the statement fails
     /// (including when `dest` already exists).
     pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
+        let _turn = if let Ok(turn) = Arc::clone(&self.maintenance).try_lock_owned() {
+            turn
+        } else {
+            // A vacuum of a large database can take minutes: say why the
+            // backup is not copying yet.
+            tracing::info!("database snapshot waiting for database maintenance to finish");
+            Arc::clone(&self.maintenance).lock_owned().await
+        };
         let dest = dest.to_string_lossy().replace('\'', "''");
         sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
-            .execute(&self.writer)
+            .execute(&self.snapshotter)
             .await?;
         Ok(())
+    }
+
+    /// The database's maintenance turn when it is free, `None` while a
+    /// snapshot or another maintenance pass holds it. A vacuum and a truncating checkpoint
+    /// (`OptimizeDatabaseTask`) take it for their whole pass, and
+    /// [`Database::snapshot_to`] waits for it. A snapshot holds a read
+    /// transaction for the whole copy. A truncating checkpoint would wait
+    /// for that read through the busy timeout while holding the one writer,
+    /// and every write would queue behind it. A vacuum would grow the WAL
+    /// by the database's size, which no checkpoint can reclaim until the
+    /// snapshot ends.
+    #[must_use]
+    pub fn try_maintenance_turn(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.maintenance).try_lock_owned().ok()
     }
 
     /// Snapshots a file-backed database once, before a boot repair rewrites
@@ -1167,8 +1301,8 @@ pub struct JellyfinGeneration {
 /// generation already has; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
 /// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
-/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041` and `0042` are
-/// never baselined: they are data-only or Ferrofin-side convergence and must run
+/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041`, `0042` and
+/// `0043` are never baselined: they are data-only or Ferrofin-side convergence and must run
 /// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
 /// matches both an upgraded install and a fresh one (see
 /// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
@@ -1410,9 +1544,10 @@ const ADOPTION_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS "FerrofinAdoption
 )"#;
 
 /// The migrations that rebuild Jellyfin-owned tables (the 12-step SQLite
-/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape). Each
-/// gets a file snapshot before it first applies — see [`backup_before_rebuild`].
-const REBUILD_MIGRATIONS: &[i64] = &[7, 32];
+/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape), plus
+/// `0044`, which deletes the rows of deleted users outright. Each gets a file
+/// snapshot before it first applies — see [`backup_before_rebuild`].
+const REBUILD_MIGRATIONS: &[i64] = &[7, 32, 44];
 
 /// Snapshots the database file before a table-rebuilding migration first
 /// applies.
@@ -1466,7 +1601,7 @@ async fn backup_before_rebuild(
     tracing::info!(
         backup = %backup.display(),
         migration = version,
-        "database snapshot taken before a schema-rebuild migration"
+        "database snapshot taken before a table-rebuilding or row-deleting migration"
     );
     Ok(())
 }
@@ -1505,6 +1640,8 @@ pub async fn inspect_migration_history(path: &std::path::Path) -> Result<Migrati
     if !path.try_exists().map_err(sqlx::Error::Io)? {
         return Ok(MigrationHistory::Missing);
     }
+    // On a set-up server this is the first SQLite open of the process.
+    init_sqlite();
     let mut conn = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -1572,17 +1709,57 @@ async fn applied_migration_count(conn: &mut sqlx::SqliteConnection) -> Result<i6
 /// crash window. The scan is **O(rows × foreign keys)** — measured at 0.14 s
 /// on a real 42k-item, 250 MB library — noise against a cold start.
 async fn foreign_key_check(conn: &mut sqlx::SqliteConnection) -> Result<()> {
-    let violations = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *conn)
-        .await?
-        .len();
-    if violations > 0 {
-        tracing::error!(
-            violations,
-            "foreign-key violations after migration — database integrity is compromised"
-        );
-        return Err(crate::DbError::MigrationIntegrity { violations });
+    // Rows of `foreign_key_check` are (table, rowid, parent, fkid); count them per table.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(r#"SELECT "table", "parent" FROM pragma_foreign_key_check"#)
+            .fetch_all(&mut *conn)
+            .await?;
+    if rows.is_empty() {
+        return Ok(());
     }
+    let mut per_table = std::collections::BTreeMap::<String, usize>::new();
+    for (table, parent) in &rows {
+        *per_table.entry(format!("{table} → {parent}")).or_default() += 1;
+    }
+    let tables = per_table
+        .iter()
+        .map(|(table, n)| format!("{table}: {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(crate::DbError::MigrationIntegrity {
+        violations: rows.len(),
+        tables,
+    })
+}
+
+/// Logs what migration `0044` deleted: the rows of users that no longer exist
+/// and `AncestorIds` rows naming missing items, counted per table in the
+/// temporary table the migration leaves on this connection (present only on
+/// the boot that applied it). Drops that table.
+async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    let present: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM temp.sqlite_master WHERE name = 'FerrofinDanglingRowCleanup'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if present.is_none() {
+        return Ok(());
+    }
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "Table", "Rows" FROM temp."FerrofinDanglingRowCleanup" WHERE "Rows" > 0"#,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for (table, rows) in counts {
+        tracing::info!(
+            table,
+            rows,
+            "removed rows of a deleted user or item left behind by an earlier server"
+        );
+    }
+    sqlx::query(r#"DROP TABLE temp."FerrofinDanglingRowCleanup""#)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -1718,20 +1895,28 @@ const MMAP_SIZE_BYTES: i64 = 0x7FFF_0000;
 /// sort on the global PRNG mutex.
 ///
 /// Must run before the first connection is opened — `sqlite3_config` fails once
-/// SQLite has initialized, which is why this is a process-wide `Once` on the
-/// connect path rather than per-pool setup. A failure is not fatal: it means
-/// SQLite was already initialized and we keep the default behaviour.
-fn configure_sqlite_for_concurrency() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// SQLite has initialized, which is why this is a process-wide one-shot on the
+/// connect path rather than per-pool setup. Every path in this crate that opens
+/// SQLite calls it first, and the server calls it before anything else at boot;
+/// any new raw open (a `SqliteConnectOptions` connect) must call it first too.
+/// A failure is not fatal: SQLite was already initialized and keeps its default
+/// allocator bookkeeping, which is logged as a warning because it brings the
+/// capacity cliff back.
+///
+/// Returns whether `MEMSTATUS` was turned off (the answer of the first call).
+pub fn init_sqlite() -> bool {
+    static MEMSTATUS_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MEMSTATUS_OFF.get_or_init(|| {
         // SAFETY: `sqlite3_config` is only unsafe because it must not race with
-        // an initialized library or a live connection. The `Once` plus its
-        // placement before the first pool open give that ordering.
+        // an initialized library or a live connection. The `OnceLock` serializes
+        // callers of this function; ordering against other SQLite use rests on
+        // every opener calling it first, and `serve_once` calling it before any
+        // other boot work.
         let rc = unsafe {
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MEMSTATUS, 0_i32)
         };
         if rc != libsqlite3_sys::SQLITE_OK {
-            tracing::debug!(
+            tracing::warn!(
                 rc,
                 "sqlite3_config(MEMSTATUS, 0) declined — SQLite was already \
                  initialized; keeping default allocator bookkeeping"
@@ -1742,7 +1927,8 @@ fn configure_sqlite_for_concurrency() {
         // once that has happened.
         crate::sqlite_random::register_random_function();
         crate::sqlite_casing::register();
-    });
+        rc == libsqlite3_sys::SQLITE_OK
+    })
 }
 
 #[cfg(test)]
@@ -2394,23 +2580,27 @@ mod tests {
             .connect()
             .await
             .expect("connect with enforcement off");
-        // `AccessSchedules`, not `Permissions`: 0032 ports 12.0's
-        // RemoveOrphanedUserPermissionsAndPreferences and would legitimately
-        // delete an orphaned permission row before the check ever saw it.
+        // A provider id of a missing item: no migration removes it (0044
+        // deletes only the rows of missing users and `AncestorIds` of missing
+        // items), so it reaches the check.
         sqlx::query(
-            r#"INSERT INTO "AccessSchedules" ("Id","DayOfWeek","EndHour","StartHour","UserId")
-               VALUES (99,0,23.0,1.0,'ffffffff-ffff-ffff-ffff-ffffffffffff')"#,
+            r#"INSERT INTO "BaseItemProviders" ("ItemId","ProviderId","ProviderValue")
+               VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff','Tmdb','1')"#,
         )
         .execute(&mut conn)
         .await
-        .expect("plant an access schedule whose user does not exist");
+        .expect("plant a provider id whose item does not exist");
         sqlx::Connection::close(conn).await.expect("close");
 
         let err = Database::connect_sized(&url, Some(1))
             .await
             .expect_err("a foreign-key violation after migrating must refuse the open");
         assert!(
-            matches!(err, crate::DbError::MigrationIntegrity { violations: 1 }),
+            matches!(
+                &err,
+                crate::DbError::MigrationIntegrity { violations: 1, tables }
+                    if tables == "BaseItemProviders → BaseItems: 1"
+            ),
             "unexpected error: {err}"
         );
     }
@@ -2550,6 +2740,42 @@ mod tests {
         for r in readers {
             r.await.expect("reader task");
         }
+    }
+
+    /// `jellyfin_migration_applied` reads Jellyfin's own history: false with no
+    /// `__EFMigrationsHistory` (a Ferrofin-native database) or for an id the
+    /// table does not hold, true for one it does.
+    #[rstest::rstest]
+    #[case::no_history_table(None, false)]
+    #[case::another_id(Some("20260910120000_MigrateRatingLevels"), false)]
+    #[case::recorded(Some("20260915120000_MigrateRatingLevels"), true)]
+    #[tokio::test]
+    async fn jellyfin_migration_applied_reads_the_ef_history(
+        #[case] recorded: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        if let Some(id) = recorded {
+            sqlx::query(
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+            )
+            .execute(db.writer())
+            .await
+            .expect("history table");
+            sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.0.0')"#)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .expect("history row");
+        }
+        assert_eq!(
+            db.jellyfin_migration_applied("20260915120000_MigrateRatingLevels")
+                .await
+                .expect("history read"),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -2698,10 +2924,11 @@ mod tests {
         assert!(by_name("12.0.0").baselined_versions.contains(&30));
         assert!(by_name("12.2.0").baselined_versions.contains(&30));
         // Retention (`0035`), intro skipper (`0036`–`0038`), the duplicate-index
-        // drop (`0039`), the fresh-install convergence (`0041`) and the orphan
-        // clean-up (`0042`) run on every path.
+        // drop (`0039`), the fresh-install convergence (`0041`), the orphan
+        // clean-up (`0042`) and the by-name `IsFolder` repair (`0043`) run on
+        // every path.
         for generation in &JELLYFIN_GENERATIONS {
-            for version in [35, 36, 37, 38, 39, 41, 42] {
+            for version in [35, 36, 37, 38, 39, 41, 42, 43] {
                 assert!(
                     !generation.baselined_versions.contains(&version),
                     "{}: {version:04} must run on every path",

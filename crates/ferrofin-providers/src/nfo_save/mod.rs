@@ -13,7 +13,9 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::configuration::XbmcMetadataOptions;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{UserDataManager, UserManager, VirtualFolderManager};
+use ferrofin_traits::library::{
+    SelfWrite, SelfWriteGuard, UserDataManager, UserManager, VirtualFolderManager,
+};
 use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{
@@ -29,15 +31,44 @@ use crate::xbmc::{
     saver,
 };
 
+/// The credit's kind as upstream's saver sees it: the `PersonInfo.Type`
+/// `PeopleRepository` read back with `Enum.TryParse<PersonKind>` (case-sensitive,
+/// `Unknown` when it does not parse).
 fn person_kind(person: &PeopleEntity) -> ferrofin_model::data::PersonKind {
-    person
-        .person_type
-        .as_ref()
-        .and_then(|kind| serde_json::from_value(serde_json::Value::String(kind.clone())).ok())
-        .unwrap_or(ferrofin_model::data::PersonKind::Unknown)
+    person.person_type.as_deref().map_or(
+        ferrofin_model::data::PersonKind::Unknown,
+        ferrofin_model::data::PersonKind::from_stored,
+    )
 }
 
 type SaveLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+
+/// Whether the Nfo saver is enabled for `row` at `MetadataEdit`: upstream's
+/// `isSavingMetadata` (`ProviderManager.GetMetadataSavers(item,
+/// libraryOptions).Any()`, `MetadataService.cs:184`), under which "Replace
+/// all metadata" skips the local readers (`:803`). An existing sidecar counts
+/// even with local saving off (`IsSaverEnabledForItem`, `:880-889`).
+///
+/// `library` is the item's library options and `global` the server-wide
+/// options for its kind, as [`NfoSaver`] resolves them.
+#[must_use]
+pub fn saves_metadata(
+    row: &BaseItemEntity,
+    library: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+) -> bool {
+    let (Some(kind), Some(path)) = (policy::kind(row), policy::save_path(row)) else {
+        return false;
+    };
+    policy::enabled(
+        library,
+        global,
+        kind,
+        ItemUpdateType::MetadataEdit,
+        false,
+        &path,
+    )
+}
 
 /// The registered Nfo saver, using repository interfaces rather than SQL.
 /// A per-path lock keeps concurrent edits from interleaving file replacement.
@@ -51,6 +82,9 @@ pub struct NfoSaver {
     users: Option<(Arc<dyn UserManager>, Arc<dyn UserDataManager>)>,
     localization: Option<Arc<dyn LocalizationManager>>,
     locks: SaveLocks,
+    /// Brackets the files written beside the media (`ILibraryMonitor`).
+    /// `None` in unit tests.
+    self_writes: Option<Arc<dyn SelfWriteGuard>>,
 }
 
 impl NfoSaver {
@@ -74,7 +108,18 @@ impl NfoSaver {
             users: None,
             localization: None,
             locks: Mutex::default(),
+            self_writes: None,
         }
+    }
+
+    /// Brackets each file this saver writes on `guard`, as upstream does
+    /// (`ReportFileSystemChangeBeginning`/`Complete` in `ProviderManager.SaveMetadataAsync`), so the
+    /// library monitor takes it for the server's own write. Called once by
+    /// the composition root.
+    #[must_use]
+    pub fn with_self_writes(mut self, guard: Arc<dyn SelfWriteGuard>) -> Self {
+        self.self_writes = Some(guard);
+        self
     }
 
     /// Attaches the selected user's playback/favorite data for NFO export.
@@ -201,8 +246,10 @@ impl NfoSaver {
             Vec::new()
         };
         let user = self.user_data(item_id, row, options).await?;
-        let old = match tokio::fs::read_to_string(&path).await {
-            Ok(old) => Some(old),
+        // `BaseNfoSaver` reads the old document through `new StreamReader(fs,
+        // Encoding.UTF8)`, so a Latin-1 or UTF-16 NFO merges instead of failing.
+        let old = match tokio::fs::read(&path).await {
+            Ok(old) => Some(ferrofin_util::stream_extensions::decode_stream_text(old)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(ServiceError::backend(format!(
@@ -226,11 +273,13 @@ impl NfoSaver {
         if old.as_deref() == Some(&xml) {
             return Ok(());
         }
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), path.to_string_lossy());
         tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            ferrofin_util::file_helper::atomic_write(&path, xml.as_bytes())
+            // A media-folder file: Kodi or a share's other users read it.
+            ferrofin_util::file_helper::atomic_write_media(&path, xml.as_bytes())
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))?
@@ -500,5 +549,29 @@ impl ferrofin_traits::library::UserDataSaveListener for NfoSaver {
         // Save applies live owning-library saver selection and the source
         // filesystem/local-metadata eligibility before writing Nfo alone.
         self.save(item_id, ItemUpdateType::MetadataDownload).await
+    }
+}
+
+#[cfg(test)]
+mod person_kind_tests {
+    use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_model::data::PersonKind;
+
+    /// The saver reads a stored `PersonType` as `PeopleRepository` does:
+    /// case-sensitively, an integer as its C# value, anything else `Unknown`.
+    #[rstest::rstest]
+    #[case(Some("Penciller"), PersonKind::Penciller)]
+    #[case(Some("actor"), PersonKind::Unknown)]
+    #[case(Some("27"), PersonKind::Unrecognized(27))]
+    #[case(None, PersonKind::Unknown)]
+    fn stored_person_types_read_like_people_repository(
+        #[case] stored: Option<&str>,
+        #[case] expected: PersonKind,
+    ) {
+        let person = PeopleEntity {
+            person_type: stored.map(str::to_owned),
+            ..PeopleEntity::default()
+        };
+        assert_eq!(super::person_kind(&person), expected);
     }
 }

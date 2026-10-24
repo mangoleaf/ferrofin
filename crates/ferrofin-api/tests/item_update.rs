@@ -22,7 +22,9 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::MetadataEditorInfo;
+use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
+use ferrofin_model::dto::{MetadataEditorInfo, NameValuePair};
 use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::ExternalIdInfo;
 use ferrofin_model::querying::QueryResult;
@@ -330,6 +332,12 @@ struct Tree {
     locked_written: Mutex<Vec<(Uuid, Vec<i32>)>>,
     /// Other items the library resolves by id (a folder's parent).
     others: Vec<BaseItemEntity>,
+    /// What `get_inherited_content_type` answers: `None` is a mixed library.
+    inherited_content_type: Option<CollectionType>,
+    /// What `get_configured_content_type` answers: the item's override.
+    configured_content_type: Option<CollectionType>,
+    /// `update_people` calls: the item and the credits written.
+    people_written: Mutex<Vec<(String, Vec<PeopleEntity>)>>,
 }
 
 /// The folder-refresh scans the library was asked to queue.
@@ -337,6 +345,19 @@ type RecordedScans = Arc<Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>>;
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        self.tree
+            .people_written
+            .lock()
+            .unwrap()
+            .push((item.id.clone(), people.to_vec()));
+        Ok(())
+    }
+
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -409,7 +430,10 @@ impl LibraryManager for OkLibrary {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        if query.recursive && query.ancestor_ids == [self.item_id] {
+        if query.recursive
+            && query.ancestor_ids == [self.item_id]
+            && !self.tree.descendants.is_empty()
+        {
             return Ok(self.tree.descendants.clone());
         }
         // `RefreshArtist`'s query: the albums crediting the artist, which
@@ -428,6 +452,17 @@ impl LibraryManager for OkLibrary {
             .iter()
             .filter_map(|k| k.stored_type_name())
             .collect();
+        // The cascade queries a season's episodes by ancestor_ids.
+        if !query.ancestor_ids.is_empty() {
+            return Ok(query
+                .ancestor_ids
+                .iter()
+                .filter_map(|id| self.tree.children.get(id))
+                .flatten()
+                .filter(|c| kinds.is_empty() || kinds.contains(&c.type_.as_str()))
+                .cloned()
+                .collect());
+        }
         Ok(self
             .tree
             .children
@@ -542,6 +577,18 @@ impl LibraryManager for OkLibrary {
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         unimplemented!()
+    }
+    async fn get_inherited_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(self.tree.inherited_content_type)
+    }
+    async fn get_configured_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(self.tree.configured_content_type)
     }
 }
 
@@ -791,12 +838,30 @@ fn state_with_library(library: Arc<OkLibrary>, queued: Arc<Mutex<Vec<Uuid>>>) ->
     state_recording_options(library, queued, RecordedOptions::default())
 }
 
+/// [`state_with_library`] over `config` (the content-type tests).
+fn state_with_library_and_config(
+    library: Arc<OkLibrary>,
+    config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+) -> AppState {
+    build_state(library, Arc::default(), RecordedOptions::default(), config)
+}
+
 /// [`state_with_library`] recording the options of each provider refresh
 /// into `options`.
 fn state_recording_options(
     library: Arc<OkLibrary>,
     queued: Arc<Mutex<Vec<Uuid>>>,
     options: RecordedOptions,
+) -> AppState {
+    build_state(library, queued, options, Arc::new(FakeConfig))
+}
+
+/// The item-update [`AppState`] over `config`.
+fn build_state(
+    library: Arc<OkLibrary>,
+    queued: Arc<Mutex<Vec<Uuid>>>,
+    options: RecordedOptions,
+    config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
 ) -> AppState {
     AppState::new(
         library,
@@ -807,7 +872,7 @@ fn state_recording_options(
         Arc::new(FakeSessions),
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
-        Arc::new(FakeConfig),
+        config,
         Arc::new(RecordingProviders { queued, options }),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
@@ -1064,10 +1129,10 @@ fn child(id: u128, kind: &str, parent: Uuid, tags: Option<&str>) -> BaseItemEnti
     }
 }
 
-/// `ItemUpdateController.UpdateItem`'s series walk (`:315-356`): the
-/// series' name, rating, custom rating and tag edit reach its seasons and
-/// their episodes, and each child's own `LockedFields` shields its
-/// `OfficialRating` and `Tags`.
+/// `ItemUpdateController.UpdateItem`'s series walk: the series' name,
+/// rating, custom rating and tag edit reach its seasons and their episodes
+/// (every child here follows the series' ratings), and each child's own
+/// `LockedFields` shields its `OfficialRating` and `Tags`.
 #[tokio::test]
 async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() {
     let series_id = Uuid::from_u128(0x5E);
@@ -1080,6 +1145,8 @@ async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() 
             type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
             is_folder: true,
             tags: Some("Old|Keep".into()),
+            official_rating: Some("Old rating".into()),
+            custom_rating: Some("Old custom".into()),
             ..base_item_entity(series_id)
         }),
         children: std::collections::HashMap::from([
@@ -1135,6 +1202,218 @@ async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() 
     let open = by_id(0xE2);
     assert_eq!(open.official_rating.as_deref(), Some("TV-MA"));
     assert_eq!(open.tags.as_deref(), Some("Keep|New"));
+}
+
+/// The last row `update_items` was given for `id`.
+fn written(library: &OkLibrary, id: u128) -> BaseItemEntity {
+    library
+        .updated
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e.id == Uuid::from_u128(id).to_string())
+        .cloned()
+        .expect("row written")
+}
+
+/// A row of `kind` under `parent` rated `rating`.
+fn rated(id: u128, kind: &str, parent: Uuid, rating: Option<&str>) -> BaseItemEntity {
+    BaseItemEntity {
+        official_rating: rating.map(ToOwned::to_owned),
+        custom_rating: None,
+        ..child(id, kind, parent, None)
+    }
+}
+
+/// Upstream `ItemUpdateControllerTests.CreateSeries(seriesRating,
+/// episodeRatings)`: a series (`0x5E`) and its season (`0x51`) both rated
+/// `series_rating`, the season's episodes (`0xE0`, `0xE1`, …) rated
+/// `episode_ratings`.
+fn rated_series(series_rating: &str, episode_ratings: &[Option<&str>]) -> Tree {
+    let series_id = Uuid::from_u128(0x5E);
+    let season_id = Uuid::from_u128(0x51);
+    let episodes = (0u128..)
+        .zip(episode_ratings)
+        .map(|(i, rating)| rated(0xE0 + i, "TV.Episode", season_id, *rating))
+        .collect();
+    Tree {
+        root: Some(BaseItemEntity {
+            is_folder: true,
+            ..rated(0x5E, "TV.Series", series_id, Some(series_rating))
+        }),
+        children: std::collections::HashMap::from([
+            (
+                series_id,
+                vec![rated(0x51, "TV.Season", series_id, Some(series_rating))],
+            ),
+            (season_id, episodes),
+        ]),
+        ..Tree::default()
+    }
+}
+
+/// `UpdateItem_SeriesRatingUnchanged_KeepsEpisodeRatings` (jellyfin#18241):
+/// saving a series without changing its rating leaves every child's alone.
+#[tokio::test]
+async fn a_series_edit_that_keeps_its_rating_leaves_the_children_alone() {
+    let library = post_update(
+        tree_library(
+            Uuid::from_u128(0x5E),
+            rated_series("TV-PG", &[Some("TV-PG"), Some("TV-14"), None]),
+        ),
+        r#"{"Overview":"New overview","OfficialRating":"TV-PG"}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(
+        written(&library, 0x51).official_rating.as_deref(),
+        Some("TV-PG")
+    );
+    assert_eq!(
+        written(&library, 0xE1).official_rating.as_deref(),
+        Some("TV-14")
+    );
+    assert_eq!(written(&library, 0xE2).official_rating, None);
+}
+
+/// `UpdateItem_SeriesRatingChanged_PropagatesOnlyToChildrenFollowingIt`: a
+/// changed series rating reaches the season and the episodes that had the
+/// old one or none, not an episode with its own or a locked one.
+#[tokio::test]
+async fn a_changed_series_rating_reaches_only_the_children_following_it() {
+    let mut tree = rated_series("TV-PG", &[Some("TV-PG"), Some("TV-14"), None]);
+    let season_id = Uuid::from_u128(0x51);
+    tree.children.get_mut(&season_id).unwrap().push(rated(
+        0xEF,
+        "TV.Episode",
+        season_id,
+        Some("TV-PG"),
+    ));
+    tree.locked = std::collections::HashMap::from([(
+        Uuid::from_u128(0xEF),
+        vec![MetadataField::OfficialRating],
+    )]);
+    let library = post_update(
+        tree_library(Uuid::from_u128(0x5E), tree),
+        r#"{"OfficialRating":"TV-MA"}"#.to_owned(),
+    )
+    .await;
+    for (id, expected) in [
+        (0x51, "TV-MA"),
+        (0xE0, "TV-MA"),
+        (0xE1, "TV-14"),
+        (0xE2, "TV-MA"),
+        (0xEF, "TV-PG"),
+    ] {
+        assert_eq!(
+            written(&library, id).official_rating.as_deref(),
+            Some(expected),
+            "{id:#x}"
+        );
+    }
+}
+
+/// `UpdateItem_SeriesCustomRatingChanged_PropagatesIt`: `CustomRating`
+/// follows the same rule, and the unchanged official rating stays put.
+#[tokio::test]
+async fn a_changed_series_custom_rating_reaches_the_children_following_it() {
+    let mut tree = rated_series("TV-PG", &[Some("TV-PG"), Some("TV-14"), None]);
+    tree.children.get_mut(&Uuid::from_u128(0x51)).unwrap()[0].custom_rating = Some("TV-Y".into());
+    let library = post_update(
+        tree_library(Uuid::from_u128(0x5E), tree),
+        r#"{"OfficialRating":"TV-PG","CustomRating":"XXX"}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(
+        written(&library, 0x51).custom_rating.as_deref(),
+        Some("XXX")
+    );
+    assert_eq!(
+        written(&library, 0xE0).custom_rating.as_deref(),
+        Some("TV-Y")
+    );
+    let open = written(&library, 0xE1);
+    assert_eq!(open.custom_rating.as_deref(), Some("XXX"));
+    assert_eq!(open.official_rating.as_deref(), Some("TV-14"));
+}
+
+/// A series' episodes follow their SEASON's change: a season with a
+/// rating of its own keeps it, and so do the episodes that followed it.
+#[tokio::test]
+async fn series_episodes_follow_their_seasons_rating_change() {
+    let mut tree = rated_series("TV-PG", &[Some("TV-Y7"), None]);
+    tree.children.get_mut(&Uuid::from_u128(0x5E)).unwrap()[0].official_rating =
+        Some("TV-Y7".into());
+    let library = post_update(
+        tree_library(Uuid::from_u128(0x5E), tree),
+        r#"{"OfficialRating":"TV-MA"}"#.to_owned(),
+    )
+    .await;
+    for (id, expected) in [(0x51, Some("TV-Y7")), (0xE0, Some("TV-Y7")), (0xE1, None)] {
+        assert_eq!(
+            written(&library, id).official_rating.as_deref(),
+            expected,
+            "{id:#x}"
+        );
+    }
+}
+
+/// `UpdateItem_SeasonRatingChanged_KeepsEpisodesWithTheirOwnRating`, and the
+/// album walk by the same rule, matching the old rating case-insensitively.
+#[tokio::test]
+async fn season_and_album_rating_changes_reach_only_the_children_following_them() {
+    for (kind, child_kind, previous, new, kids) in [
+        (
+            "TV.Season",
+            "TV.Episode",
+            "TV-PG",
+            "TV-MA",
+            [
+                (Some("TV-PG"), Some("TV-MA")),
+                (Some("TV-14"), Some("TV-14")),
+                (None, Some("TV-MA")),
+            ],
+        ),
+        (
+            "Audio.MusicAlbum",
+            "Audio.Audio",
+            "PG-13",
+            "R",
+            [
+                (Some("pg-13"), Some("R")),
+                (Some("PG"), Some("PG")),
+                (Some(""), Some("R")),
+            ],
+        ),
+    ] {
+        let parent = Uuid::from_u128(0x70);
+        let tree = Tree {
+            root: Some(BaseItemEntity {
+                is_folder: true,
+                ..rated(0x70, kind, parent, Some(previous))
+            }),
+            children: std::collections::HashMap::from([(
+                parent,
+                (0u128..)
+                    .zip(&kids)
+                    .map(|(i, (rating, _))| rated(0x71 + i, child_kind, parent, *rating))
+                    .collect(),
+            )]),
+            ..Tree::default()
+        };
+        let library = post_update(
+            tree_library(parent, tree),
+            format!(r#"{{"OfficialRating":"{new}"}}"#),
+        )
+        .await;
+        for (i, (_, expected)) in (0u128..).zip(&kids) {
+            assert_eq!(
+                written(&library, 0x71 + i).official_rating.as_deref(),
+                *expected,
+                "{kind} child {i}"
+            );
+        }
+    }
 }
 
 /// `IHasDisplayOrder.DisplayOrder = request.DisplayOrder` (`:412-415`): a box
@@ -1232,8 +1511,8 @@ async fn a_display_order_edit_is_stored_and_a_series_one_refreshes_it() {
     }
 }
 
-/// The season and album walks (`:357-381`): episodes / tracks take the
-/// rating and tag edit, not the series name.
+/// The season and album walks: episodes / tracks that followed the
+/// parent's rating take the rating and tag edit, not the series name.
 #[tokio::test]
 async fn season_and_album_edits_cascade_to_their_children() {
     for (kind, child_kind) in [
@@ -1246,6 +1525,7 @@ async fn season_and_album_edits_cascade_to_their_children() {
             root: Some(BaseItemEntity {
                 type_: format!("MediaBrowser.Controller.Entities.{kind}"),
                 is_folder: true,
+                official_rating: Some("Old rating".into()),
                 ..base_item_entity(parent)
             }),
             children: std::collections::HashMap::from([(parent, vec![kid])]),
@@ -1264,7 +1544,201 @@ async fn season_and_album_edits_cascade_to_their_children() {
         assert_eq!(kid.official_rating, None, "{kind}: a blank rating clears");
         assert_eq!(kid.tags.as_deref(), Some("T"), "{kind}");
         assert_eq!(kid.series_name.as_deref(), Some("Old series"), "{kind}");
+        // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`):
+        // a season's episodes take its new name; an album's tracks have none.
+        let season_name = (kind == "TV.Season").then_some("P");
+        assert_eq!(kid.season_name.as_deref(), season_name, "{kind}");
     }
+}
+
+/// The fixture item stored as `kind` with `data`, edited with `fields`;
+/// returns the row the handler wrote.
+async fn edit_kind(kind: &str, data: Option<&str>, fields: &str) -> BaseItemEntity {
+    let id = Uuid::from_u128(0x80);
+    let tree = Tree {
+        root: Some(BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.{kind}"),
+            data: data.map(ToOwned::to_owned),
+            ..base_item_entity(id)
+        }),
+        ..Tree::default()
+    };
+    let library = post_update(
+        tree_library(id, tree),
+        format!(r#"{{"Id":"{id}","Name":"N"{fields}}}"#),
+    )
+    .await;
+    let written = library.updated.lock().unwrap().clone();
+    written.into_iter().next().expect("item written")
+}
+
+/// The row's `Data` blob.
+fn data_of(item: &BaseItemEntity) -> serde_json::Value {
+    item.data
+        .as_deref()
+        .map_or(serde_json::Value::Null, |data| {
+            serde_json::from_str(data).expect("json")
+        })
+}
+
+/// The editor fields `UpdateItem` writes per kind (v12.2
+/// `ItemUpdateController.cs:259-264, 423-437, 465-473`): a series' status,
+/// air days, air time and runtime; an episode's special placement, kept in
+/// `Data` compactly; a video's 3D format; a Live TV channel's height.
+#[tokio::test]
+async fn an_edit_writes_each_kinds_editor_fields() {
+    let series = edit_kind(
+        "Entities.TV.Series",
+        None,
+        r#","Status":"ended","AirDays":["Friday","Saturday"],"AirTime":"20:00","RunTimeTicks":"25000000000""#,
+    )
+    .await;
+    let data = data_of(&series);
+    assert_eq!(data["Status"], "Ended");
+    assert_eq!(data["AirDays"], serde_json::json!(["Friday", "Saturday"]));
+    assert_eq!(data["AirTime"], "20:00");
+    assert_eq!(series.run_time_ticks, Some(25_000_000_000));
+    // No air days sent: the stored ones stay; an empty status clears it.
+    let series = edit_kind(
+        "Entities.TV.Series",
+        Some(r#"{"Status":"Ended","AirDays":["Friday"],"AirTime":"20:00"}"#),
+        r#","Status":"""#,
+    )
+    .await;
+    let data = data_of(&series);
+    assert!(data.get("Status").is_none(), "{data}");
+    assert_eq!(data["AirDays"], serde_json::json!(["Friday"]));
+    assert_eq!(data["AirTime"], "20:00");
+
+    let episode = edit_kind(
+        "Entities.TV.Episode",
+        None,
+        r#","AirsBeforeSeasonNumber":"2","AirsBeforeEpisodeNumber":3,"AirsAfterSeasonNumber":null"#,
+    )
+    .await;
+    let raw = episode.data.clone().expect("data");
+    assert!(
+        raw.contains(r#""AirsBeforeSeasonNumber":2"#)
+            && raw.contains(r#""AirsBeforeEpisodeNumber":3"#),
+        "compact, as the AiredDuringSeason filter matches them: {raw}"
+    );
+    assert!(!raw.contains("AirsAfterSeasonNumber"), "{raw}");
+
+    let movie = edit_kind(
+        "Entities.Movies.Movie",
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        r#","Video3DFormat":"HalfSideBySide""#,
+    )
+    .await;
+    assert_eq!(data_of(&movie)["Video3DFormat"], "HalfSideBySide");
+    assert_eq!(data_of(&movie)["VideoType"], "VideoFile");
+
+    let channel = edit_kind("LiveTv.LiveTvChannel", None, r#","Height":"1080""#).await;
+    assert_eq!(channel.height, Some(1080));
+    // A field of another kind is ignored.
+    let movie = edit_kind(
+        "Entities.Movies.Movie",
+        None,
+        r#","AirsBeforeSeasonNumber":2,"Status":"Ended""#,
+    )
+    .await;
+    assert!(
+        movie
+            .data
+            .as_deref()
+            .is_none_or(|d| !d.contains("Airs") && !d.contains("Status"))
+    );
+}
+
+/// A status `Enum.Parse` cannot read, on a series: upstream throws (500);
+/// the request is refused with a 400 instead, and nothing is written. On any
+/// other kind `Status` is never read, so the edit applies.
+#[tokio::test]
+async fn an_unreadable_series_status_is_a_bad_request() {
+    let id = Uuid::from_u128(0x82);
+    let send_to = |kind: &'static str| {
+        let library = tree_library(
+            id,
+            Tree {
+                root: Some(BaseItemEntity {
+                    type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+                    ..base_item_entity(id)
+                }),
+                ..Tree::default()
+            },
+        );
+        async move {
+            let router = create_router(state_with_library(
+                Arc::clone(&library),
+                Arc::new(Mutex::new(Vec::new())),
+            ));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/Items/{id}"))
+                        .header("X-Emby-Token", "valid")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"Id":"{id}","Name":"N","Status":"Cancelled","People":[{{"Name":"X"}}]}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (
+                response.status(),
+                library.updated.lock().unwrap().len(),
+                library.tree.people_written.lock().unwrap().len(),
+            )
+        }
+    };
+    assert_eq!(send_to("TV.Series").await, (StatusCode::BAD_REQUEST, 0, 0));
+    assert_eq!(
+        send_to("Movies.Movie").await,
+        (StatusCode::NO_CONTENT, 1, 1)
+    );
+}
+
+/// `request.People` replaces the item's credits before the save, each as
+/// `new PersonInfo { Name, Role, Type }`; a nameless entry is dropped and an
+/// absent `Type` is `Unknown`. Without the key nothing is written.
+#[tokio::test]
+async fn an_edit_writes_the_items_people() {
+    let id = Uuid::from_u128(0x81);
+    let library = post_update(
+        tree_library(id, Tree::default()),
+        format!(
+            r#"{{"Id":"{id}","Name":"N","People":[{{"Name":"Al Pacino","Role":"Lt. Hanna","Type":"Actor"}},{{"Name":"Michael Mann","Type":"Director"}},{{"Role":"nobody"}},{{"Name":"Unsure"}}]}}"#
+        ),
+    )
+    .await;
+    let written = library.tree.people_written.lock().unwrap().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].0, id.to_string());
+    let credits: Vec<(String, Option<String>, Option<String>)> = written[0]
+        .1
+        .iter()
+        .map(|p| (p.name.clone(), p.role.clone(), p.person_type.clone()))
+        .collect();
+    assert_eq!(
+        credits,
+        [
+            (
+                "Al Pacino".into(),
+                Some("Lt. Hanna".into()),
+                Some("Actor".into())
+            ),
+            ("Michael Mann".into(), None, Some("Director".into())),
+            ("Unsure".into(), None, Some("Unknown".into())),
+        ]
+    );
+    let library = post_update(
+        tree_library(id, Tree::default()),
+        format!(r#"{{"Id":"{id}","Name":"N"}}"#),
+    )
+    .await;
+    assert!(library.tree.people_written.lock().unwrap().is_empty());
 }
 
 /// `if (isLockedChanged && item.IsFolder)`: a change of `LockData` on a
@@ -1541,12 +2015,16 @@ async fn refresh_library_folder_scans_that_library_with_the_request_options() {
         )
     };
     let (scans, queued) = refresh_folder(library(), Vec::new(), SCAN_FOR_NEW).await;
-    // "Scan for new and updated files" is the scan's own default refresh.
+    // "Scan for new and updated files" is the scan's own default refresh,
+    // not automated (`ItemRefreshController.cs:86`).
     assert_eq!(
         scans,
         vec![(
             ScanTarget::Library(folder_id),
-            MetadataRefreshOptions::default()
+            MetadataRefreshOptions {
+                is_automated: false,
+                ..MetadataRefreshOptions::default()
+            }
         )]
     );
     assert!(
@@ -1561,6 +2039,7 @@ async fn refresh_library_folder_scans_that_library_with_the_request_options() {
         replace_all_images: true,
         force_save: true,
         regenerate_trickplay: true,
+        is_automated: false,
         ..MetadataRefreshOptions::default()
     };
     assert_eq!(scans, vec![(ScanTarget::Library(folder_id), expected)]);
@@ -1573,6 +2052,7 @@ async fn refresh_library_folder_scans_that_library_with_the_request_options() {
         replace_all_images: true,
         remove_old_metadata: true,
         force_save: true,
+        is_automated: false,
         ..MetadataRefreshOptions::default()
     };
     assert_eq!(scans, vec![(ScanTarget::Library(folder_id), expected)]);
@@ -1599,6 +2079,7 @@ async fn refresh_nested_folder_scans_only_its_subtree() {
             MetadataRefreshOptions {
                 metadata_refresh_mode: MetadataRefreshMode::None,
                 image_refresh_mode: MetadataRefreshMode::None,
+                is_automated: false,
                 ..MetadataRefreshOptions::default()
             }
         )]
@@ -1762,7 +2243,7 @@ async fn refresh_root_folder_scans_every_library() {
     let (scans, _) = refresh_folder(root, Vec::new(), SCAN_FOR_NEW).await;
     assert_eq!(
         scans,
-        vec![(ScanTarget::All, MetadataRefreshOptions::default())]
+        vec![(ScanTarget::All, controller_options(SCAN_FOR_NEW))]
     );
 }
 
@@ -1952,8 +2433,7 @@ async fn refresh_missing_item_is_404() {
     assert!(queued.lock().unwrap().is_empty());
 }
 
-/// `POST /Items/{itemId}/ContentType` for a missing item is a `404` (the
-/// success path needs a full `ServerConfiguration`, exercised in `ferrofin-core`).
+/// `POST /Items/{itemId}/ContentType` for a missing item is a `404`.
 #[tokio::test]
 async fn content_type_missing_item_is_404() {
     let router = create_router(state(
@@ -1989,10 +2469,11 @@ async fn metadata_editor_returns_descriptor() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
-    // A plain library item (e.g. a Movie) gets an empty ContentTypeOptions —
-    // Jellyfin only populates it for a collection-folder whose content type is
-    // configurable. See get_metadata_editor.
-    assert!(info.content_type_options.is_empty());
+    // The fixture item's library type is unknown (a mixed library) and it has
+    // no override: the selector offers Inherit, Movies and Shows
+    // (`content_type_*` tests below cover the rest).
+    assert_eq!(info.content_type_options.len(), 3);
+    assert_eq!(info.content_type, None);
     assert_eq!(info.external_id_infos.len(), 1);
 
     // Cultures are deduped case-insensitively and ordered case-insensitively, the
@@ -2021,6 +2502,311 @@ async fn metadata_editor_missing_item_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- folder content-type overrides -------------------------------------------
+
+/// A [`ServerConfigurationManager`] holding one configuration, which
+/// `update_configuration` replaces.
+#[derive(Default)]
+struct RecordingConfig(Mutex<ServerConfiguration>);
+
+#[async_trait]
+impl ferrofin_traits::configuration::ServerConfigurationManager for RecordingConfig {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        Arc::new(ferrofin_api::test_support::FakePaths)
+    }
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(self.0.lock().unwrap().clone()))
+    }
+    async fn update_configuration(
+        &self,
+        configuration: &ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        configuration.clone_into(&mut self.0.lock().unwrap());
+        Ok(())
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// The library for the content-type tests: `ITEM_ID` is `item`, its library's
+/// type is `inherited` and its override `configured`.
+fn content_type_library(
+    item: BaseItemEntity,
+    inherited: Option<CollectionType>,
+    configured: Option<CollectionType>,
+) -> Arc<OkLibrary> {
+    Arc::new(OkLibrary {
+        item_id: ITEM_ID,
+        is_folder: item.is_folder,
+        top_parent_id: None,
+        refresh_scans: Arc::default(),
+        provider_ids: Arc::default(),
+        updated: Arc::default(),
+        tree: Arc::new(Tree {
+            root: Some(item),
+            inherited_content_type: inherited,
+            configured_content_type: configured,
+            ..Tree::default()
+        }),
+    })
+}
+
+/// A row of `kind` at `path`.
+fn item_at(kind: BaseItemKind, path: &str, is_folder: bool) -> BaseItemEntity {
+    let mut item = base_item_entity(ITEM_ID);
+    kind.stored_type_name()
+        .expect("a stored kind")
+        .clone_into(&mut item.type_);
+    item.path = Some(path.to_owned());
+    item.is_folder = is_folder;
+    item
+}
+
+/// One request against `state`: (status, body bytes).
+async fn send_to(state: AppState, method: &str, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", "Token abc")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, bytes.to_vec())
+}
+
+/// The editor's `(ContentType, option values)` for `item`.
+async fn content_type_editor(
+    item: BaseItemEntity,
+    inherited: Option<CollectionType>,
+    configured: Option<CollectionType>,
+) -> (Option<CollectionType>, Vec<String>) {
+    let state = state_with_library(
+        content_type_library(item, inherited, configured),
+        Arc::default(),
+    );
+    let (status, body) = send_to(state, "GET", &format!("/Items/{ITEM_ID}/MetadataEditor")).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
+    let values = info
+        .content_type_options
+        .into_iter()
+        .map(|option| option.value.unwrap_or_default())
+        .collect();
+    (info.content_type, values)
+}
+
+/// v12.2 `GetMetadataEditorInfo`: in a mixed library (no inherited type) a
+/// folder is offered Inherit, Movies and Shows (#15797 added Movies); with an
+/// override it shows it.
+#[tokio::test]
+async fn a_mixed_library_folder_is_offered_inherit_movies_and_shows() {
+    let folder = || item_at(BaseItemKind::Series, "/media/mixed/Blade (1998)", true);
+    assert_eq!(
+        content_type_editor(folder(), None, None).await,
+        (None, vec![String::new(), "movies".into(), "tvshows".into()])
+    );
+    assert_eq!(
+        content_type_editor(folder(), None, Some(CollectionType::movies)).await,
+        (
+            Some(CollectionType::movies),
+            vec![String::new(), "movies".into(), "tvshows".into()]
+        )
+    );
+}
+
+/// Where the library has a type, the selector appears only for an item that
+/// already has an override, and only movies and shows libraries filter it.
+#[tokio::test]
+async fn a_typed_library_offers_the_selector_only_with_an_override() {
+    let folder = || item_at(BaseItemKind::Folder, "/media/movies/Sets", true);
+    assert_eq!(
+        content_type_editor(folder(), Some(CollectionType::movies), None).await,
+        (None, Vec::new())
+    );
+    assert_eq!(
+        content_type_editor(
+            folder(),
+            Some(CollectionType::tvshows),
+            Some(CollectionType::movies)
+        )
+        .await,
+        (
+            Some(CollectionType::movies),
+            vec![String::new(), "movies".into(), "tvshows".into()]
+        )
+    );
+    assert_eq!(
+        content_type_editor(
+            folder(),
+            Some(CollectionType::music),
+            Some(CollectionType::homevideos)
+        )
+        .await,
+        (
+            Some(CollectionType::homevideos),
+            [
+                "",
+                "movies",
+                "music",
+                "tvshows",
+                "homevideos",
+                "musicvideos",
+                "photos"
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        )
+    );
+}
+
+/// The option names go through the server's localization
+/// (`GetLocalizedString`); the stub returns the phrase.
+#[tokio::test]
+async fn the_option_names_are_the_localized_phrases() {
+    let state = state_with_library(
+        content_type_library(
+            item_at(BaseItemKind::Folder, "/media/x", true),
+            Some(CollectionType::music),
+            Some(CollectionType::music),
+        ),
+        Arc::default(),
+    );
+    let (_, body) = send_to(state, "GET", &format!("/Items/{ITEM_ID}/MetadataEditor")).await;
+    let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
+    let names: Vec<_> = info
+        .content_type_options
+        .into_iter()
+        .map(|option| option.name.unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Inherit",
+            "Movies",
+            "Music",
+            "Shows",
+            "HomeVideos",
+            "MusicVideos",
+            "Photos"
+        ]
+    );
+}
+
+/// The guard: a virtual item, a library, a user view, a by-name item, a Live
+/// TV channel or a channel's item never offers the selector, whatever the
+/// library.
+#[tokio::test]
+async fn items_outside_a_library_are_offered_nothing() {
+    let virtual_item = {
+        let mut item = item_at(
+            BaseItemKind::Episode,
+            "/media/mixed/Show/missing.mkv",
+            false,
+        );
+        item.is_virtual_item = true;
+        item
+    };
+    let channel_item = {
+        let mut item = item_at(BaseItemKind::Movie, "/media/mixed/x.mkv", false);
+        item.channel_id = Some(Uuid::from_u128(0xC4).to_string());
+        item
+    };
+    for item in [
+        virtual_item,
+        channel_item,
+        item_at(
+            BaseItemKind::CollectionFolder,
+            "/config/root/default/Mixed",
+            true,
+        ),
+        item_at(BaseItemKind::UserView, "/config/views/x", true),
+        item_at(BaseItemKind::AggregateFolder, "/config/root", true),
+        item_at(BaseItemKind::Person, "/config/metadata/People/A/Ada", false),
+        item_at(BaseItemKind::MusicArtist, "/media/music/Artist", true),
+        item_at(BaseItemKind::TvChannel, "/livetv/1", false),
+    ] {
+        let type_ = item.type_.clone();
+        assert_eq!(
+            content_type_editor(item, None, Some(CollectionType::movies)).await,
+            (None, Vec::new()),
+            "{type_}"
+        );
+    }
+}
+
+/// v12.2 `UpdateItemContentType`: the override is keyed on the item's
+/// `ContainingFolderPath` — a folder's own path, a file's directory — and the
+/// folder's previous entry is replaced; a blank type only clears it.
+#[tokio::test]
+async fn setting_a_content_type_keys_the_items_containing_folder() {
+    async fn post(item: BaseItemEntity, config: &Arc<RecordingConfig>, value: &str) {
+        let state = state_with_library_and_config(
+            content_type_library(item, None, None),
+            Arc::clone(config) as _,
+        );
+        let (status, _) = send_to(
+            state,
+            "POST",
+            // jellyfin-web's spelling; the query binds ignoring case.
+            &format!("/Items/{ITEM_ID}/ContentType?ContentType={value}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let entries = |config: &RecordingConfig| config.0.lock().unwrap().content_types.clone();
+    let pair = |name: &str, value: &str| NameValuePair {
+        name: Some(name.to_owned()),
+        value: Some(value.to_owned()),
+    };
+    let config = Arc::new(RecordingConfig::default());
+    let series = || item_at(BaseItemKind::Series, "/media/mixed/Blade (1998)", true);
+    post(series(), &config, "tvshows").await;
+    post(series(), &config, "movies").await;
+    assert_eq!(
+        entries(&config),
+        vec![pair("/media/mixed/Blade (1998)", "movies")]
+    );
+    post(
+        item_at(
+            BaseItemKind::Movie,
+            "/media/mixed/Heat (1995)/Heat.mkv",
+            false,
+        ),
+        &config,
+        "movies",
+    )
+    .await;
+    assert_eq!(
+        entries(&config),
+        vec![
+            pair("/media/mixed/Blade (1998)", "movies"),
+            pair("/media/mixed/Heat (1995)", "movies"),
+        ]
+    );
+    post(series(), &config, "").await;
+    assert_eq!(
+        entries(&config),
+        vec![pair("/media/mixed/Heat (1995)", "movies")]
+    );
 }
 
 // ---- from batch14_handlers.rs -------------------------------------------------

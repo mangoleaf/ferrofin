@@ -21,7 +21,7 @@ use ferrofin_model::live_tv::TunerHostInfo;
 use ferrofin_traits::error::ServiceError;
 
 use crate::fetch::SourceFetcher;
-use crate::m3u::parse_m3u;
+use crate::m3u::{M3uParser, is_valid_channel_url};
 
 /// One channel as a tuner reported it, before anything is persisted.
 ///
@@ -207,6 +207,9 @@ pub(crate) fn m3u_external_channel_id(tuner_url: &str, stream_url: &str) -> Stri
 pub struct M3uTunerHost {
     /// The HTTP/file seam the playlist is read through.
     fetcher: std::sync::Arc<dyn SourceFetcher>,
+    /// The server's local-network check, shared with the manager that sets it
+    /// once the network policy is wired; empty in unit tests.
+    local_network: std::sync::Arc<std::sync::OnceLock<crate::stream::LocalNetworkCheck>>,
 }
 
 impl std::fmt::Debug for M3uTunerHost {
@@ -219,7 +222,41 @@ impl M3uTunerHost {
     /// Creates the host over the given source fetcher.
     #[must_use]
     pub fn new(fetcher: std::sync::Arc<dyn SourceFetcher>) -> Self {
-        Self { fetcher }
+        Self {
+            fetcher,
+            local_network: std::sync::Arc::default(),
+        }
+    }
+
+    /// Reads the server's local-network check from `local_network` once it
+    /// is set; until then (unit tests) the stateless
+    /// [`is_in_local_network`](crate::stream::is_in_local_network) applies.
+    #[must_use]
+    pub fn sharing_local_network(
+        mut self,
+        local_network: std::sync::Arc<std::sync::OnceLock<crate::stream::LocalNetworkCheck>>,
+    ) -> Self {
+        self.local_network = local_network;
+        self
+    }
+
+    /// `M3UTunerHost.CreateMediaSourceInfo`'s `isRemote`: a source is remote
+    /// unless its URL's host is on the local network
+    /// (`!_networkManager.IsInLocalNetwork(uri.Host)`). The check resolves a
+    /// host name, which can block on DNS, so it runs off the async workers.
+    async fn is_remote(&self, path: &str) -> bool {
+        let Some(host) = crate::stream::url_host(path) else {
+            return true;
+        };
+        match self.local_network.get() {
+            Some(check) => {
+                let (check, host) = (std::sync::Arc::clone(check), host.to_owned());
+                tokio::task::spawn_blocking(move || !check(&host))
+                    .await
+                    .unwrap_or(true)
+            }
+            None => !crate::stream::is_in_local_network(host),
+        }
     }
 }
 
@@ -237,12 +274,25 @@ impl TunerHost for M3uTunerHost {
 
     async fn get_channels(&self, tuner: &TunerHostInfo) -> Result<Vec<TunerChannel>, ServiceError> {
         let url = tuner.url.as_deref().unwrap_or_default();
-        // `M3uParser.GetListingsStream` presents the tuner's user agent.
-        let body = self
-            .fetcher
-            .fetch_as(url, tuner.user_agent.as_deref())
-            .await?;
-        Ok(parse_m3u(&body)
+        // `M3uParser.GetListingsStream` presents the tuner's user agent and
+        // fails on a non-success status (`EnsureSuccessStatusCode`); `Parse`
+        // then reads the playlist line by line as it arrives (v12.2
+        // M3uParser.cs:39-70), never holding it whole. Like upstream, an
+        // endless body is read for ever, and one that never ends a line
+        // grows that line.
+        let mut opened = self.fetcher.open(url, tuner.user_agent.as_deref()).await?;
+        if !opened.is_success() {
+            return Err(ServiceError::backend(format!(
+                "fetch {url} answered {}",
+                opened.status
+            )));
+        }
+        let mut parser = M3uParser::new();
+        while let Some(chunk) = opened.body.next_chunk().await? {
+            parser.push(&chunk);
+        }
+        Ok(parser
+            .finish()
             .into_iter()
             .map(|ch| TunerChannel {
                 external_id: m3u_external_channel_id(url, &ch.url),
@@ -269,9 +319,8 @@ impl TunerHost for M3uTunerHost {
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         // `M3UTunerHost.GetChannelStreamMediaSources` returns the ONE source
         // `CreateMediaSourceInfo` builds from the playlist URL.
-        let mut source = crate::stream::create_media_source_info(&channel.path, tuner);
-        crate::stream::normalize(&mut source);
-        Ok(vec![source])
+        let is_remote = self.is_remote(&channel.path).await;
+        Ok(vec![m3u_channel_source(tuner, channel, is_remote)?])
     }
 
     async fn channel_stream(
@@ -282,13 +331,35 @@ impl TunerHost for M3uTunerHost {
     ) -> Result<ChannelStream, ServiceError> {
         // `M3UTunerHost.GetChannelStream` ignores the stream id: the playlist
         // offers exactly one source per channel.
-        let mut source = crate::stream::create_media_source_info(&channel.path, tuner);
-        crate::stream::normalize(&mut source);
+        let is_remote = self.is_remote(&channel.path).await;
         Ok(ChannelStream {
-            source,
+            source: m3u_channel_source(tuner, channel, is_remote)?,
             kind: ChannelStreamKind::Http,
         })
     }
+}
+
+/// The one source an M3U channel plays from (`M3UTunerHost.CreateMediaSourceInfo`).
+///
+/// A stored path that [`is_valid_channel_url`] rejects is refused. Upstream
+/// re-parses the playlist after a restart, so its parser check covers every
+/// channel it serves. Channels persist here, and a row saved before the check
+/// existed stays until the next guide refresh drops it. Serving it would hand
+/// its path to the anonymous stream routes as a file.
+fn m3u_channel_source(
+    tuner: &TunerHostInfo,
+    channel: &StoredChannel,
+    is_remote: bool,
+) -> Result<MediaSourceInfo, ServiceError> {
+    if !is_valid_channel_url(&channel.path) {
+        return Err(ServiceError::not_found(format!(
+            "playable URL for M3U channel {}",
+            channel.external_id
+        )));
+    }
+    let mut source = crate::stream::create_media_source_info(&channel.path, tuner, is_remote);
+    crate::stream::normalize(&mut source);
+    Ok(source)
 }
 
 /// The advertised tuner-host types, ordered by name.
@@ -339,7 +410,7 @@ mod tests {
         ChannelStreamKind, M3uTunerHost, StoredChannel, TunerHost, find_host,
         m3u_external_channel_id, tuner_host_types,
     };
-    use crate::fetch::SourceFetcher;
+    use crate::fetch::{SourceBody, SourceFetcher};
     use ferrofin_model::live_tv::TunerHostInfo;
     use ferrofin_traits::error::ServiceError;
 
@@ -367,13 +438,13 @@ mod tests {
             async fn fetch(&self, _url: &str) -> Result<String, ServiceError> {
                 Ok(String::new())
             }
-            async fn fetch_as(
+            async fn open(
                 &self,
                 _url: &str,
                 user_agent: Option<&str>,
-            ) -> Result<String, ServiceError> {
+            ) -> Result<SourceBody, ServiceError> {
                 self.0.lock().unwrap().push(user_agent.map(str::to_owned));
-                Ok(String::new())
+                Ok(SourceBody::from_bytes(200, Vec::new()))
             }
         }
         let fetcher = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
@@ -389,6 +460,135 @@ mod tests {
         assert_eq!(
             *fetcher.0.lock().unwrap(),
             [Some("VLC/3.0".to_owned()), None]
+        );
+    }
+
+    /// `EnsureSuccessStatusCode` (v12.2 M3uParser.cs:67): a playlist URL that
+    /// answers a failure status is an error, whatever its body says, not a
+    /// lineup.
+    #[tokio::test]
+    async fn a_failure_status_is_an_error_not_a_lineup() {
+        struct NotFound;
+
+        #[async_trait::async_trait]
+        impl SourceFetcher for NotFound {
+            async fn fetch(&self, _url: &str) -> Result<String, ServiceError> {
+                Ok(String::new())
+            }
+            async fn open(
+                &self,
+                _url: &str,
+                _user_agent: Option<&str>,
+            ) -> Result<SourceBody, ServiceError> {
+                Ok(SourceBody::from_bytes(
+                    404,
+                    b"#EXTINF:-1,Error page\nhttp://iptv.example/404\n".to_vec(),
+                ))
+            }
+        }
+        let tuner = TunerHostInfo {
+            url: Some("http://iptv.example/list.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let err = M3uTunerHost::new(Arc::new(NotFound))
+            .get_channels(&tuner)
+            .await
+            .expect_err("a 404 is no playlist");
+        assert!(
+            matches!(&err, ServiceError::Backend(why)
+                if why == "fetch http://iptv.example/list.m3u answered 404"),
+            "{err:?}"
+        );
+    }
+
+    /// Where a playlist test serves its bytes from.
+    #[derive(Debug, Clone, Copy)]
+    enum Source {
+        /// A local file (`AsyncFile.OpenRead`).
+        File,
+        /// A one-shot HTTP peer (`ReadAsStreamAsync`).
+        Http,
+    }
+
+    /// Serves `body` from `source` and answers the URL a tuner points at; the
+    /// directory keeps a file alive for the test.
+    fn serve_playlist(source: Source, body: Vec<u8>) -> (String, tempfile::TempDir) {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().expect("tmp");
+        match source {
+            Source::File => {
+                let path = dir.path().join("list.m3u");
+                std::fs::write(&path, body).expect("write");
+                (path.to_str().expect("utf-8 path").to_owned(), dir)
+            }
+            Source::Http => {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                let url = format!("http://{}/list.m3u", listener.local_addr().expect("addr"));
+                std::thread::spawn(move || {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        let mut buffer = [0_u8; 4096];
+                        let _ = stream.read(&mut buffer);
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                });
+                (url, dir)
+            }
+        }
+    }
+
+    /// `text` as UTF-16 in `unit`'s byte order behind its byte-order mark.
+    fn utf16(text: &str, bom: [u8; 2], unit: fn(u16) -> [u8; 2]) -> Vec<u8> {
+        let mut bytes = bom.to_vec();
+        bytes.extend(text.encode_utf16().flat_map(unit));
+        bytes
+    }
+
+    /// `M3uParser.Parse` reads the playlist through `new StreamReader(stream)`
+    /// and `ReadLineAsync` (v12.2 M3uParser.cs:42-45,77): UTF-8 unless a
+    /// byte-order mark names UTF-16 or UTF-32, the mark dropped, an invalid
+    /// byte read as U+FFFD, and a line ended by `\n`, `\r` or `\r\n` — from a
+    /// file and over HTTP alike.
+    #[rstest::rstest]
+    #[case::cr_only(
+        b"#EXTM3U\r#EXTINF:-1,One\rhttp://tuner/1\r#EXTINF:-1,Two\rhttp://tuner/2\r".to_vec(),
+        &["One", "Two"]
+    )]
+    #[case::mixed_endings(
+        b"#EXTM3U\r\n#EXTINF:-1,One\rhttp://tuner/1\n\n#EXTINF:-1,Two\r\nhttp://tuner/2".to_vec(),
+        &["One", "Two"]
+    )]
+    #[case::utf8_bom(b"\xEF\xBB\xBF#EXTINF:-1,One\nhttp://tuner/1\n".to_vec(), &["One"])]
+    #[case::latin1(b"#EXTINF:-1,Caf\xE9\nhttp://tuner/1\n".to_vec(), &["Caf\u{FFFD}"])]
+    #[case::utf16_le(
+        utf16("#EXTINF:-1,Café\r\nhttp://tuner/1\r\n", [0xFF, 0xFE], u16::to_le_bytes),
+        &["Café"]
+    )]
+    #[case::utf16_be(
+        utf16("#EXTINF:-1,Café\nhttp://tuner/1", [0xFE, 0xFF], u16::to_be_bytes),
+        &["Café"]
+    )]
+    #[tokio::test]
+    async fn the_playlist_is_read_like_a_dotnet_stream_reader(
+        #[case] body: Vec<u8>,
+        #[case] names: &[&str],
+        #[values(Source::File, Source::Http)] source: Source,
+    ) {
+        let (url, _dir) = serve_playlist(source, body);
+        let host = M3uTunerHost::new(Arc::new(crate::fetch::ReqwestFetcher::new()));
+        let tuner = TunerHostInfo {
+            url: Some(url),
+            ..TunerHostInfo::default()
+        };
+        let channels = host.get_channels(&tuner).await.expect("lineup");
+        assert_eq!(
+            channels.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            names,
+            "{source:?}"
         );
     }
 
@@ -426,6 +626,53 @@ mod tests {
         assert_eq!(channels[0].video_codec, None);
     }
 
+    /// `IsInLocalNetwork(uri.Host)` is the server's network policy, which
+    /// resolves host names: a tuner addressed by name on the LAN is local,
+    /// one the policy calls remote is remote, and with no policy wired an
+    /// IPv4-mapped literal counts as the private IPv4 address it is.
+    #[tokio::test]
+    async fn an_m3u_source_is_remote_as_the_network_policy_says() {
+        let tuner = TunerHostInfo::default();
+        let channel = |path: &str| StoredChannel {
+            external_id: "m3u_abc".to_owned(),
+            path: path.to_owned(),
+            ..StoredChannel::default()
+        };
+        let policy = Arc::new(std::sync::OnceLock::new());
+        let check: crate::stream::LocalNetworkCheck =
+            Arc::new(|host: &str| host == "tvheadend.lan");
+        assert!(policy.set(check).is_ok());
+        let host = m3u_host("").sharing_local_network(Arc::clone(&policy));
+        for (path, remote) in [
+            ("http://tvheadend.lan:9981/stream/channel/1", false),
+            ("http://tv.example.com/bbc1.ts", true),
+            ("http://192.168.1.20/bbc1.ts", true),
+        ] {
+            let sources = host
+                .channel_media_sources(&tuner, &channel(path))
+                .await
+                .expect("sources");
+            assert_eq!(sources[0].is_remote, remote, "{path}");
+            let stream = host
+                .channel_stream(&tuner, &channel(path), None)
+                .await
+                .expect("stream");
+            assert_eq!(stream.source.is_remote, remote, "{path}");
+        }
+        let unwired = m3u_host("");
+        for (path, remote) in [
+            ("http://[::ffff:192.168.1.5]:8080/bbc1.ts", false),
+            ("http://192.168.1.20/bbc1.ts", false),
+            ("http://tvheadend.lan/bbc1.ts", true),
+        ] {
+            let sources = unwired
+                .channel_media_sources(&tuner, &channel(path))
+                .await
+                .expect("sources");
+            assert_eq!(sources[0].is_remote, remote, "no policy: {path}");
+        }
+    }
+
     #[tokio::test]
     async fn the_m3u_stream_is_always_a_plain_http_one() {
         let host = m3u_host("");
@@ -447,6 +694,27 @@ mod tests {
             .expect("stream");
         assert_eq!(stream.kind, ChannelStreamKind::Http);
         assert_eq!(stream.source.path.as_deref(), Some("http://tuner/bbc1.ts"));
+    }
+
+    /// A channel stored before the parser rejected file paths is never served.
+    #[tokio::test]
+    async fn a_stored_m3u_channel_with_a_file_path_has_no_source() {
+        let host = m3u_host("");
+        let tuner = TunerHostInfo::default();
+        let channel = StoredChannel {
+            external_id: "m3u_abc".to_owned(),
+            path: "/var/lib/ferrofin/jellyfin.db".to_owned(),
+            ..StoredChannel::default()
+        };
+        let err = host
+            .channel_media_sources(&tuner, &channel)
+            .await
+            .expect_err("a file path is refused");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(
+            host.channel_stream(&tuner, &channel, None).await.is_err(),
+            "opening it is refused too"
+        );
     }
 
     /// A host that reports itself unsupported, to prove the filter runs.

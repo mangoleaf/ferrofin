@@ -15,6 +15,8 @@ use std::sync::Arc;
 use ferrofin_mediaencoding::{
     EncoderValidator, FfmpegVersion, TokioTranscoder, TrickplayFrameExtractorImpl,
 };
+use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor as _};
 
 /// The version of the `ffmpeg` on `PATH`, probed the way the composition root
@@ -33,6 +35,27 @@ fn probed_ffmpeg_version() -> Option<FfmpegVersion> {
         .get_ffmpeg_version_internal(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The stream ffprobe reports for [`make_clip`]'s output: 128x72 H.264 at
+/// 10 fps.
+///
+/// Production always hands the extractor the item's probed video stream (the
+/// trickplay manager refuses a source without one), and a full decode rebuilds
+/// timestamps at that stream's frame rate (`setpts=N/10.000/TB`). Passing no
+/// stream would rebuild them at the 30 fps fallback and squeeze this 10 fps
+/// clip into a third of its length — a failure production never sees.
+fn clip_stream() -> MediaStream {
+    MediaStream {
+        codec: Some("h264".to_owned()),
+        index: 0,
+        stream_type: MediaStreamType::Video,
+        width: Some(128),
+        height: Some(72),
+        average_frame_rate: Some(10.0),
+        real_frame_rate: Some(10.0),
+        ..MediaStream::default()
+    }
+}
+
 /// A 2 s-interval, 64 px-wide software extraction request.
 ///
 /// Hardware is off here deliberately: this test runs on whatever ffmpeg and
@@ -40,14 +63,20 @@ fn probed_ffmpeg_version() -> Option<FfmpegVersion> {
 /// reproducible enough to assert on. The hardware argument builders are
 /// covered by unit goldens; this proves the process spawn and the software
 /// filter chain against a live ffmpeg.
-fn extraction<'a>(input_path: &'a str, output_dir: &'a str) -> TrickplayExtraction<'a> {
+fn extraction<'a>(
+    input_path: &'a str,
+    video_stream: &'a MediaStream,
+    output_dir: &'a str,
+) -> TrickplayExtraction<'a> {
     TrickplayExtraction {
         input_path,
-        video_stream: None,
+        video_stream: Some(video_stream),
+        media_streams: std::slice::from_ref(video_stream),
         interval_ms: 2_000,
         max_width: 64,
         qscale: 4,
         threads: 1,
+        priority: ferrofin_model::configuration::ProcessPriorityClass::BelowNormal,
         output_dir,
         allow_hw_accel: false,
         enable_hw_encoding: false,
@@ -126,6 +155,7 @@ async fn extracts_interval_frames_from_a_real_clip() {
     let frames = extractor
         .extract_trickplay_frames(&extraction(
             &clip.to_string_lossy(),
+            &clip_stream(),
             &out_dir.to_string_lossy(),
         ))
         .await
@@ -165,6 +195,7 @@ async fn missing_input_is_an_error() {
     let err = extractor
         .extract_trickplay_frames(&extraction(
             &tmp.path().join("nope.mp4").to_string_lossy(),
+            &clip_stream(),
             &out_dir.to_string_lossy(),
         ))
         .await

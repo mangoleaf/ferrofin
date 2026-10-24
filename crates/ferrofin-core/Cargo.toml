@@ -10,7 +10,7 @@ description = "Core manager implementations for Ferrofin (port of Emby/Jellyfin.
 workspace = true
 
 [dependencies]
-ferrofin-util.workspace = true
+ferrofin-util = { workspace = true, features = ["tokio"] }
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
@@ -20,7 +20,8 @@ ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true
 ferrofin-networking.workspace = true
 async-trait.workspace = true
-# `catch_unwind` on a future: a served lane refresh that panics fails alone.
+# `catch_unwind` on a future: a served lane refresh or a scheduled task that
+# panics fails alone.
 futures-util.workspace = true
 tokio = { workspace = true }
 notify.workspace = true
@@ -34,6 +35,8 @@ chrono.workspace = true
 # Root linguistic comparison for UserViewBuilder literal name filters.
 icu_collator.workspace = true
 unicode-normalization.workspace = true
+# The C# `ValidUsernameRegex` word class (`\p{Mn}`, `\p{Pc}`).
+regex.workspace = true
 tracing.workspace = true
 # Deep-internal scan metrics (docs/conventions/METRICS.md rule 8): the OTel API
 # only; the pipeline lives in ferrofin-metrics.
@@ -42,6 +45,8 @@ reqwest.workspace = true
 sha2.workspace = true
 # The photo embedded-information provider (EXIF) runs during the scan.
 ferrofin-drawing.workspace = true
+# Embedded lyrics (SYLT, file order) for the scan's lyric pick.
+lofty.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -49,6 +54,8 @@ libc.workspace = true
 [dev-dependencies]
 # Paused-clock debounce tests (tokio::time::pause / start_paused).
 tokio = { workspace = true, features = ["test-util"] }
+# `rate_limit::test_support::skip_backoff`, for tests whose fake provider fails.
+ferrofin-providers = { workspace = true, features = ["test-util"] }
 ferrofin-drawing.workspace = true
 image.workspace = true
 rstest.workspace = true

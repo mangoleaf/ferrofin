@@ -237,7 +237,10 @@ impl HdHomerunHost {
         // not the HttpRequestException the fallback catches — so an empty URL
         // is an error even with `throwAllExceptions: false`.
         let url = format!("{}/discover.json", get_api_url(info)?);
-        let (status, body) = self.fetcher.fetch_with_status(&url).await?;
+        // `ResponseHeadersRead`, then `ReadFromJsonAsync` (v12.2
+        // HdHomerunHost.cs:124-128): the body is parsed as it arrives.
+        let opened = self.fetcher.open(&url, None).await?;
+        let status = opened.status;
 
         if status == 404 && !throw_all_exceptions {
             // HDHR4 doesn't have this api.
@@ -250,14 +253,16 @@ impl HdHomerunHost {
             }
             return Ok(fallback);
         }
-        if !(200..300).contains(&status) {
+        if !opened.is_success() {
             // `response.EnsureSuccessStatusCode()`.
             return Err(ServiceError::backend(format!(
                 "hdhomerun {url} answered {status}"
             )));
         }
 
-        let discover: DiscoverResponse = serde_json::from_str(&body)
+        let discover: DiscoverResponse = opened
+            .read_json()
+            .await
             .map_err(|e| LiveTvError::serialize(format!("parse {url}"), e))?;
         if !cache_key.is_empty() {
             self.cache().insert(cache_key, discover.clone());
@@ -286,9 +291,17 @@ impl HdHomerunHost {
             .lineup_url
             .clone()
             .unwrap_or_else(|| format!("{}/lineup.json", model.base_url.unwrap_or_default()));
-        let (_status, body) = self.fetcher.fetch_with_status(&url).await?;
-        let lineup: Vec<LineupChannel> = serde_json::from_str(&body)
-            .map_err(|e| LiveTvError::serialize(format!("parse {url}"), e))?;
+        // Read as it arrives, whatever the status (v12.2
+        // HdHomerunHost.cs:77-78); a `null` document is an empty lineup
+        // (`?? Enumerable.Empty<Channels>()`).
+        let lineup: Vec<LineupChannel> = self
+            .fetcher
+            .open(&url, None)
+            .await?
+            .read_json::<Option<Vec<LineupChannel>>>()
+            .await
+            .map_err(|e| LiveTvError::serialize(format!("parse {url}"), e))?
+            .unwrap_or_default();
         Ok(lineup
             .into_iter()
             .filter(|c| !info.import_favorites_only || c.favorite)
@@ -315,13 +328,15 @@ impl HdHomerunHost {
         Ok(host_info)
     }
 
-    /// `HdHomerunHost.GetMediaSource` (v10.11.8 HdHomerunHost.cs:182-311) — the
+    /// `HdHomerunHost.GetMediaSource` (v12.2 HdHomerunHost.cs:187-343) — the
     /// media source for one `(channel, profile)` pair.
     ///
     /// The profile table, the HD/SD bit-rate defaults, the `mpeg2 → mpeg2video`
     /// normalization, the `NalLengthSize = "0"` marker on h264 and the
     /// `{profile}_{md5(channelId)}_{md5(apiUrl)}` id are all upstream's, byte
-    /// for byte.
+    /// for byte. `SupportsDirectPlay` is `true` since v12.0-rc6
+    /// (jellyfin/jellyfin#17682; v12.2 HdHomerunHost.cs:329), so a client whose
+    /// profile plays MPEG-TS with the channel's codecs direct plays the stream.
     ///
     /// # Errors
     ///
@@ -413,7 +428,7 @@ impl HdHomerunHost {
             buffer_ms: Some(0),
             container: Some("ts".to_owned()),
             id: Some(id),
-            supports_direct_play: false,
+            supports_direct_play: true,
             supports_direct_stream: true,
             supports_transcoding: true,
             is_infinite_stream: true,
@@ -831,6 +846,10 @@ mod tests {
         assert_eq!(video.is_interlaced, codec == "mpeg2video");
         // `isHd` ⇒ 448 kbps audio.
         assert_eq!(source.media_streams[1].bit_rate, Some(448_000));
+        // v12.0-rc6 (HdHomerunHost.cs:329): every profile may direct play.
+        assert!(source.supports_direct_play);
+        assert!(source.supports_direct_stream);
+        assert!(source.supports_transcoding);
         // `{profile}_{md5(channelId)}_{md5(apiUrl)}`.
         let expected_id = format!(
             "{profile}_{}_{}",
@@ -916,6 +935,18 @@ mod tests {
                 .as_deref()
                 .is_some_and(|id| id.starts_with("native_"))
         );
+    }
+
+    /// `ReadFromJsonAsync<IEnumerable<Channels>>(…) ?? Enumerable.Empty<Channels>()`
+    /// (v12.2 HdHomerunHost.cs:78): a `null` lineup is an empty one.
+    #[tokio::test]
+    async fn a_null_lineup_is_an_empty_lineup() {
+        let host = HdHomerunHost::new(Arc::new(Canned {
+            discover: r#"{"ModelNumber":"HDHR5-4US","BaseURL":"http://10.0.0.5:80"}"#.to_owned(),
+            lineup: "null".to_owned(),
+        }));
+        let lineup = host.get_lineup(&tuner("10.0.0.5")).await.expect("lineup");
+        assert!(lineup.is_empty());
     }
 
     #[tokio::test]

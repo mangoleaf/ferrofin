@@ -9,18 +9,23 @@
 //!
 //! "Latest" is a faithful port of `GetLatestItems` / `GetItemsForLatestItems`:
 //! one newest-first query across every parent (over-fetched `limit * 5`, or
-//! the tvshows/music grouped-threshold query), then grouped by each row's
+//! the tvshows/music query of its own), then grouped by each row's
 //! `LatestItemsIndexContainer` (episode → series, track → album, photo → photo
 //! album) until `limit` groups exist. The per-library collection types come
 //! from the injected [`VirtualFolderManager`] (C# `CollectionFolder.CollectionType`).
 //!
-//! Not ported here: the special "grouped" views (all-movies/all-tv merges),
-//! channel views, and per-user view ordering from display preferences. Hidden
-//! views (`MyMediaExcludes`) are filtered from the row set returned here.
+//! The views follow the user's display preferences: libraries the user grouped
+//! (`GroupedFolders`) become one Movies and one TV Shows view
+//! ([`FerrofinUserViewManager::with_grouped_views`]), hidden views
+//! (`MyMediaExcludes`) are left out, and the saved order (`OrderedViews`) is
+//! kept.
+//!
+//! TODO(parity, open work item gl-346): `GetUserViews`' channel views
+//! (`IncludeExternalContent`) and preset views (`PresetViews`, shadow views of
+//! a library) are not built yet.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -137,16 +142,13 @@ pub struct FerrofinUserViewManager {
     items: Arc<dyn ItemRepository>,
     configuration: Option<Arc<dyn ServerConfigurationManager>>,
     localization: Option<Arc<dyn LocalizationManager>>,
-    /// The item store, set by the composition root. It provisions the Live TV
-    /// `UserView` row, and — together with a
-    /// [`playlists_path`](Self::playlists_path) — [`get_media_folders`] uses it
-    /// to lazily provision the [`BaseItemKind::PlaylistsFolder`] row on first
-    /// read —
-    /// the same self-healing stance `FerrofinVirtualFolderManager` takes for a
-    /// library's `CollectionFolder`. The store memoizes, so this costs nothing
-    /// after the first call. `None` in unit tests.
-    ///
-    /// [`get_media_folders`]: UserViewManager::get_media_folders
+    /// The item store, set by the composition root, through which the
+    /// `UserView` rows this manager provisions are saved: Live TV, Folders,
+    /// the per-user Playlists views and grouped libraries. The
+    /// [`BaseItemKind::PlaylistsFolder`] row those views hang off is not one
+    /// of them: [`AggregateFolderStore::ensure`](crate::AggregateFolderStore::ensure)
+    /// provisions it once at startup, as upstream's
+    /// `LibraryManager.CreateRootFolder` does. `None` in unit tests.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
     /// The user-root provisioner. [`get_media_folders`] settles it on first
     /// read so the `UserRootFolder` row this endpoint browses exists even on a
@@ -155,16 +157,6 @@ pub struct FerrofinUserViewManager {
     ///
     /// [`get_media_folders`]: UserViewManager::get_media_folders
     user_root: Option<crate::user_root_folder::UserRootFolderStore>,
-    /// The on-disk playlists directory (`{data}/playlists`), the provisioned
-    /// folder's `Path`. Only meaningful alongside [`persistence`](Self::persistence).
-    playlists_path: Option<PathBuf>,
-    /// The physical root directory (`{program data}/root`), whose
-    /// `AggregateFolder` row is the playlists folder's parent
-    /// (`LibraryManager.CreateRootFolder`: `folder.ParentId = rootFolder.Id`).
-    /// `None` in unit tests: the row is then provisioned parentless and the
-    /// startup [`AggregateFolderStore`](crate::AggregateFolderStore) repair
-    /// attaches it.
-    root_folder_path: Option<PathBuf>,
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
@@ -181,10 +173,12 @@ pub struct FerrofinUserViewManager {
     /// the manager from provisioning the view.
     metadata_path: Option<DirectoryPath>,
     /// The user manager — needed to load the [`UserEntity`] whose visibility
-    /// rules decide whether a playlists/boxsets library has a visible child
-    /// (12.1 `UserViewManager.HasVisibleChild`). Without it (unit tests) the
+    /// rules decide whether a playlists/boxsets library has a visible item
+    /// (12.2 `UserViewManager.HasVisibleItem`). Without it (unit tests) the
     /// check is skipped and such views are always listed.
     users: Option<Arc<dyn UserManager>>,
+    /// The batched `IsVisible` evaluator. Without it (unit tests) an item the
+    /// user-scoped query returns counts as visible.
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
 }
 
@@ -199,6 +193,68 @@ impl std::fmt::Debug for FerrofinUserViewManager {
     }
 }
 
+/// C# `LibraryManager.GetNamedViewId`: a user's view of a library,
+/// `GetNewItemId("38_namedview_" + user("N") + parent("N") + viewType,
+/// typeof(UserView))`.
+pub(crate) fn named_view_id(
+    derivation: &item_type_lookup::IdDerivation,
+    user_id: Uuid,
+    parent_id: Uuid,
+    view_type: &str,
+) -> Option<Uuid> {
+    item_type_lookup::derive_item_id_with(
+        derivation,
+        BaseItemKind::UserView,
+        &format!(
+            "38_namedview_{}{}{view_type}",
+            user_id.simple(),
+            parent_id.simple()
+        ),
+    )
+}
+
+/// C# `LibraryManager.GetNamedViewId(user, Guid.Empty, viewType)`: a user's
+/// view grouping several libraries (`GetNamedView(user, name, viewType,
+/// sortName)`), `GetNewItemId("38_namedview_" + user("N") + viewType,
+/// typeof(UserView))`. It has no parent, so the id has no parent part.
+pub(crate) fn grouped_view_id(
+    derivation: &item_type_lookup::IdDerivation,
+    user_id: Uuid,
+    view_type: &str,
+) -> Option<Uuid> {
+    item_type_lookup::derive_item_id_with(
+        derivation,
+        BaseItemKind::UserView,
+        &format!("38_namedview_{}{view_type}", user_id.simple()),
+    )
+}
+
+/// A library's collection type as `CollectionFolder.CollectionType` reads it:
+/// the `CollectionType` its row's `Data` carries, lower-cased. A mixed library
+/// (`mixed.collection`) has none, as upstream parses it.
+fn library_collection_type(row: &BaseItemEntity) -> Option<String> {
+    crate::item_data::stored_collection_type(row.data.as_deref())
+        .filter(|collection_type| collection_type != "mixed")
+}
+
+/// C# `LibraryManager.GetShadowViewId`: the shadow view built from a library,
+/// `GetNewItemId("38_namedview_" + name + parentId + viewType,
+/// typeof(UserView))`, the parent id in its default (`D`) form. Ferrofin builds
+/// no shadow views, but a database adopted from Jellyfin can hold their ids in
+/// users' preferences.
+pub(crate) fn shadow_view_id(
+    derivation: &item_type_lookup::IdDerivation,
+    name: &str,
+    parent_id: Uuid,
+    view_type: &str,
+) -> Option<Uuid> {
+    item_type_lookup::derive_item_id_with(
+        derivation,
+        BaseItemKind::UserView,
+        &format!("38_namedview_{name}{}{view_type}", parent_id.hyphenated()),
+    )
+}
+
 impl FerrofinUserViewManager {
     /// Creates a user-view manager over the injected item repository.
     #[must_use]
@@ -209,8 +265,6 @@ impl FerrofinUserViewManager {
             localization: None,
             persistence: None,
             user_root: None,
-            playlists_path: None,
-            root_folder_path: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
             db: None,
@@ -250,7 +304,6 @@ impl FerrofinUserViewManager {
         if let Some(root) = &self.user_root {
             root.ensure().await?;
         }
-        self.ensure_playlists_folder().await?;
         let metadata_path = metadata_path.resolve();
         let view_path = crate::user_view_repository::named_view_path(&metadata_path, "folders");
         let Some(id) = crate::user_view_repository::named_view_id(
@@ -389,43 +442,19 @@ impl FerrofinUserViewManager {
         self
     }
 
-    /// Attaches the physical root directory, so a newly provisioned playlists
-    /// folder is parented to the `AggregateFolder` the way
-    /// `LibraryManager.CreateRootFolder` parents it. Called once by the
-    /// composition root.
-    #[must_use]
-    pub fn with_root_folder_path(mut self, root_folder_path: impl Into<PathBuf>) -> Self {
-        self.root_folder_path = Some(root_folder_path.into());
-        self
-    }
-
-    /// Attaches the item store, so the Live TV `UserView` row can be
-    /// provisioned. Called once by the composition root.
+    /// Attaches the item store, so the views this manager provisions (see the
+    /// `persistence` field) can be saved. Called once by the composition root.
     #[must_use]
     pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
         self.persistence = Some(persistence);
         self
     }
 
-    /// Attaches the item store and the playlists directory so
-    /// [`get_media_folders`](UserViewManager::get_media_folders) can lazily
-    /// provision the `PlaylistsFolder` row (and create its directory) on
-    /// first read. Called once by the composition root.
-    #[must_use]
-    pub fn with_playlists_store(
-        mut self,
-        persistence: Arc<dyn ItemPersistenceService>,
-        playlists_path: impl Into<PathBuf>,
-    ) -> Self {
-        self.persistence = Some(persistence);
-        self.playlists_path = Some(playlists_path.into());
-        self
-    }
-
     /// Attaches the user-root provisioner, so
     /// [`get_media_folders`](UserViewManager::get_media_folders) settles the
-    /// root — and with it the playlists plugin folder it must list — on first
-    /// read. Called once by the composition root.
+    /// `UserRootFolder` row on first read. The playlists plugin folder it also
+    /// lists is not this store's: startup provisions it. Called once by the
+    /// composition root.
     #[must_use]
     pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
         self.user_root = Some(store);
@@ -462,100 +491,6 @@ impl FerrofinUserViewManager {
         Ok(views.into_iter().filter(|v| !is_live_tv(v)).collect())
     }
 
-    /// The deterministic `PlaylistsFolder` item id (`GetNewItemIdInternal` over
-    /// the folder path).
-    ///
-    /// `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
-    /// the latter name — it is only `PlaylistsFolder.GetClientTypeName()`
-    /// (PlaylistsFolder.cs:52-55) — and `GetNewItemIdInternal` hashes
-    /// `type.FullName + key`, so the fabricated name yields a DIFFERENT id for
-    /// the same directory. Ferrofin used to write it, which meant an adopted
-    /// Jellyfin database grew a second playlists folder beside its own.
-    fn playlists_folder_id(&self, playlists_path: &std::path::Path) -> Option<Uuid> {
-        item_type_lookup::derive_item_id_with(
-            &self.id_derivation,
-            BaseItemKind::PlaylistsFolder,
-            &playlists_path.to_string_lossy(),
-        )
-    }
-
-    /// The `AggregateFolder` row the playlists folder hangs off, when it is
-    /// there. Read on the cold provisioning path only — never on a warm read,
-    /// which returns at the single existence probe above it.
-    async fn aggregate_parent(
-        &self,
-        persistence: &Arc<dyn ItemPersistenceService>,
-    ) -> Result<Option<Uuid>, ServiceError> {
-        let Some(root) = self.root_folder_path.as_deref() else {
-            return Ok(None);
-        };
-        let Some(id) =
-            item_type_lookup::aggregate_folder_id(&self.id_derivation, &root.to_string_lossy())
-        else {
-            return Ok(None);
-        };
-        // `BaseItems.ParentId` is a foreign key: pointing at a row that is not
-        // there would fail the insert outright.
-        Ok(persistence.item_exists(id).await?.then_some(id))
-    }
-
-    /// Upserts the `PlaylistsFolder` row (and its directory) when it is
-    /// missing (idempotent). No-op without an item store + playlists path wired.
-    ///
-    /// Port of `LibraryManager.CreateRootFolder()`'s plug-in-folder step
-    /// (LibraryManager.cs:855-885): the folder is `Name="Playlists"`,
-    /// `Path={data}/playlists`, its `ParentId` is the **`AggregateFolder`**,
-    /// and `rootFolder.AddVirtualChild(folder)` is what still puts it among the
-    /// user root's children (ported as the virtual-children concat in
-    /// `item_repository`/`item_count_service`).
-    async fn ensure_playlists_folder(&self) -> Result<(), ServiceError> {
-        let (Some(persistence), Some(playlists_path)) = (&self.persistence, &self.playlists_path)
-        else {
-            return Ok(());
-        };
-        let Some(id) = self.playlists_folder_id(playlists_path) else {
-            return Ok(());
-        };
-        if persistence.item_exists(id).await? {
-            return Ok(());
-        }
-        let parent = self.aggregate_parent(persistence).await?;
-        // Create the backing directory (C# `PlaylistsFolder` lives on disk).
-        tokio::fs::create_dir_all(playlists_path)
-            .await
-            .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
-        let entity = BaseItemEntity {
-            // `guid_to_db`, NOT `to_string()`. Jellyfin stores Guid columns
-            // UPPERCASE-hyphenated and `BaseItems."Id"` is plain TEXT with no
-            // COLLATE NOCASE, so a lowercase id is a different row as far as
-            // SQLite is concerned. Writing one here meant the `item_exists`
-            // check above — which binds `guid_to_db(id)` — could never see the
-            // row it had just written, so EVERY `GET /Library/MediaFolders`
-            // re-ran `create_dir_all` plus this upsert through the single
-            // writer connection. Under load that serialized the endpoint:
-            // 1355 ms p50 and 31% errors in the benchmark against Jellyfin's
-            // 0.23 ms. It also leaked into the response — the folder came back
-            // with a lowercase `Id` where Jellyfin sends uppercase, which is
-            // why the suite scored this operation as diverging from upstream.
-            id: ferrofin_db::store::guid_to_db(id),
-            type_: item_type_lookup::stored_type_name(BaseItemKind::PlaylistsFolder)
-                .unwrap_or_default()
-                .to_owned(),
-            name: Some(PLAYLISTS_FOLDER_NAME.to_owned()),
-            sort_name: Some(create_sort_name(PLAYLISTS_FOLDER_NAME)),
-            path: Some(playlists_path.to_string_lossy().into_owned()),
-            parent_id: parent.map(ferrofin_db::store::guid_to_db),
-            top_parent_id: Some(ferrofin_db::store::guid_to_db(id)),
-            is_folder: true,
-            date_created: Some(Utc::now()),
-            ..BaseItemEntity::default()
-        };
-        persistence
-            .save_items(std::slice::from_ref(&entity))
-            .await?;
-        Ok(())
-    }
-
     /// The id of the per-user, per-parent named view — C# `GetNamedView(user,
     /// name, parentId, viewType, sortName)` (LibraryManager.cs:3038-3052, 12.0):
     /// `GetNewItemId("38_namedview_" + user("N") + parent("N") + viewType,
@@ -567,21 +502,17 @@ impl FerrofinUserViewManager {
         parent_id: Uuid,
         view_type: &str,
     ) -> Option<Uuid> {
-        item_type_lookup::derive_item_id_with(
-            &self.id_derivation,
-            BaseItemKind::UserView,
-            &format!(
-                "38_namedview_{}{}{view_type}",
-                user_id.simple(),
-                parent_id.simple()
-            ),
-        )
+        named_view_id(&self.id_derivation, user_id, parent_id, view_type)
     }
 
     /// Keeps, of the `UserView` rows in `views`, only the ones `GetUserViews`
     /// would derive for `user_id`: a per-user/per-parent view (one carrying a
     /// `DisplayParentId`) only when its id is [`Self::user_named_view_id`] of
-    /// its own `ViewType` and parent, a type-wide view (Live TV) always.
+    /// its own `ViewType` and parent, a type-wide view (Live TV) always. A
+    /// per-user view without a parent (a `UserId` and no `DisplayParentId`)
+    /// groups libraries: it comes from the user's grouping
+    /// ([`Self::with_grouped_views`]), never from the table, so a user who
+    /// ungrouped or another user does not get it.
     fn only_canonical_user_views(
         &self,
         user_id: Uuid,
@@ -601,7 +532,11 @@ impl FerrofinUserViewManager {
                     .and_then(|p| Uuid::parse_str(p).ok())
                     .filter(|p| !p.is_nil())
                 else {
-                    return true;
+                    return data
+                        .get("UserId")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|u| Uuid::parse_str(u).ok())
+                        .is_none_or(|u| u.is_nil());
                 };
                 let Some(view_type) = data.get("ViewType").and_then(serde_json::Value::as_str)
                 else {
@@ -615,50 +550,38 @@ impl FerrofinUserViewManager {
             .collect()
     }
 
-    /// 12.1 `UserViewManager.GetUserViews` (`UserViewManager.cs:60-64`): a
+    /// 12.2 `UserViewManager.GetUserViews` (`UserViewManager.cs:62-73`): a
     /// playlists or boxsets library "only references linked items", so its
-    /// view is listed only when [`Self::has_visible_child`] holds — an
-    /// account with no playlist it may see has no Playlists view at all.
+    /// view is listed only when [`Self::has_visible_item`] holds for its kind
+    /// — an account with no playlist it may see has no Playlists view at all.
     /// Skipped when no user manager is wired.
-    async fn without_childless_linked_libraries(
+    async fn without_itemless_linked_libraries(
         &self,
-        user_id: Uuid,
+        user: Option<&UserEntity>,
         views: Vec<BaseItemEntity>,
+        visible_items: &mut HashMap<BaseItemKind, bool>,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let Some(user) = self.user_entity(user_id).await? else {
+        let Some(user) = user else {
             return Ok(views);
         };
         let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView);
         let mut kept = Vec::with_capacity(views.len());
         for row in views {
-            let Ok(id) = Uuid::parse_str(&row.id) else {
-                continue;
-            };
             // Both kinds of row say what they are in `Data`: a derived view
             // carries `ViewType` + `DisplayParentId`, a `CollectionFolder`
             // carries `CollectionType` (Jellyfin's rows and Ferrofin's own).
             // Reading it here keeps this off the virtual-folder listing, which
             // walks the library root and every options file per call — that
             // cost doubled `/Users/{id}/Views` on the bench when tried.
-            let data = crate::item_data::parse_data(row.data.as_deref());
-            let linked_folder = if Some(row.type_.as_str()) == user_view {
-                if data.get("ViewType").and_then(serde_json::Value::as_str) == Some("playlists") {
-                    data.get("DisplayParentId")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|p| Uuid::parse_str(p).ok())
-                } else {
-                    None
-                }
+            // Both read the way their DTOs read them: case-insensitively, and
+            // a numeric `ViewType` from an adopted blob by its discriminant.
+            let collection_type = if Some(row.type_.as_str()) == user_view {
+                crate::user_view_repository::view_type_of(row.data.as_deref())
             } else {
-                matches!(
-                    data.get("CollectionType")
-                        .and_then(serde_json::Value::as_str),
-                    Some("playlists" | "boxsets")
-                )
-                .then_some(id)
+                crate::item_data::stored_collection_type(row.data.as_deref())
             };
-            if let Some(folder) = linked_folder
-                && !self.has_visible_child(folder, &user).await?
+            if let Some(kind) = crate::item_visibility::linked_kind(collection_type.as_deref())
+                && !self.has_visible_item(kind, user, visible_items).await?
             {
                 continue;
             }
@@ -667,27 +590,172 @@ impl FerrofinUserViewManager {
         Ok(kept)
     }
 
-    /// 12.1 `UserViewManager.HasVisibleChild`: whether any direct child of
-    /// the folder — or of its physical folders, for a `CollectionFolder` that
-    /// has some — is visible to `user`. One key lookup, ungrouped, stored
-    /// columns only: the item repository's direct-children read of a
-    /// collection folder already takes its physical folders' children with
-    /// its own (`parent_physical_folder_ids`), which covers an adopted
-    /// library's rows whether they still hang off Jellyfin's physical folder
-    /// or a Ferrofin scan saved them under the collection folder.
-    async fn has_visible_child(
+    /// 12.2 `UserViewManager.HasVisibleItem` for `GetUserViews`
+    /// ([`ItemVisibility::has_visible_root_item`]): whether `user` can see at
+    /// least one `kind` (`Playlist` or `BoxSet`) item under the top parents
+    /// of their root folders. Memoized in `visible_items`: the answer depends
+    /// on the kind alone, so a request pays for it at most once per kind.
+    ///
+    /// Without a visibility evaluator wired (unit tests over a fake store)
+    /// any matching id counts.
+    ///
+    /// [`ItemVisibility::has_visible_root_item`]: crate::item_visibility::ItemVisibility::has_visible_root_item
+    async fn has_visible_item(
         &self,
-        folder: Uuid,
+        kind: BaseItemKind,
         user: &UserEntity,
+        visible_items: &mut HashMap<BaseItemKind, bool>,
     ) -> Result<bool, ServiceError> {
-        let query = InternalItemsQuery {
-            parent_id: folder,
-            user: Some(user.clone()),
-            group_by_presentation_unique_key: false,
-            limit: Some(1),
-            ..Default::default()
+        if let Some(known) = visible_items.get(&kind) {
+            return Ok(*known);
+        }
+        let visible = match &self.visibility {
+            Some(visibility) => visibility.has_visible_root_item(kind, user).await?,
+            None => !self
+                .items
+                .get_item_ids(&visible_item_query(kind, user, Vec::new()))
+                .await?
+                .is_empty(),
         };
-        Ok(!self.items.get_item_list(&query).await?.is_empty())
+        visible_items.insert(kind, visible);
+        Ok(visible)
+    }
+
+    /// 12.2 `UserViewManager.GetUserViews`' grouping (`UserViewManager.cs:79-84,
+    /// 96-110`). The libraries `user_id` grouped (`GroupedFolders`) that can be
+    /// grouped (`UserView.IsEligibleForGrouping`: movies, tvshows or untyped)
+    /// leave `views`. Then for movies and for shows, the grouped libraries of
+    /// that type or untyped come back as one view (`GetUserView(parents, …)`):
+    /// a single library of exactly that type as itself, else the user's grouped
+    /// view ([`Self::grouped_view`]). An untyped library joins both.
+    ///
+    /// Returns whether anything was grouped, when the list needs sorting by
+    /// name again. Without an item store and a metadata path no view can be
+    /// made, so nothing is grouped.
+    async fn with_grouped_views(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Result<(Vec<BaseItemEntity>, bool), ServiceError> {
+        let (Some(db), Some(_), Some(_)) = (&self.db, &self.persistence, &self.metadata_path)
+        else {
+            return Ok((views, false));
+        };
+        let grouped = user_entity_ext::guid_preference(
+            db.pool(),
+            &ferrofin_db::store::guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::GroupedFolders,
+        )
+        .await?;
+        if grouped.is_empty() {
+            return Ok((views, false));
+        }
+        let collection_folder = item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder);
+        let mut kept = Vec::with_capacity(views.len());
+        let mut parents: Vec<(BaseItemEntity, Option<String>)> = Vec::new();
+        for row in views {
+            let collection_type = library_collection_type(&row);
+            if Some(row.type_.as_str()) == collection_folder
+                && matches!(
+                    collection_type.as_deref(),
+                    None | Some("movies" | "tvshows")
+                )
+                && Uuid::parse_str(&row.id).is_ok_and(|id| grouped.contains(&id))
+            {
+                parents.push((row, collection_type));
+            } else {
+                kept.push(row);
+            }
+        }
+        if parents.is_empty() {
+            return Ok((kept, false));
+        }
+        for (view_type, name_key) in [("movies", "Movies"), ("tvshows", "TvShows")] {
+            let of_type: Vec<&(BaseItemEntity, Option<String>)> = parents
+                .iter()
+                .filter(|(_, collection_type)| {
+                    collection_type.as_deref().is_none_or(|t| t == view_type)
+                })
+                .collect();
+            match of_type.as_slice() {
+                [] => {}
+                [(library, Some(collection_type))] if collection_type == view_type => {
+                    kept.push(library.clone());
+                }
+                _ => match self.grouped_view(user_id, view_type, name_key).await? {
+                    Some(view) => kept.push(view),
+                    // No view to put them in: the libraries stay listed on
+                    // their own rather than leave the list.
+                    None => {
+                        for (library, _) in of_type {
+                            if !kept.iter().any(|row| row.id == library.id) {
+                                kept.push(library.clone());
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        Ok((kept, true))
+    }
+
+    /// `LibraryManager.GetNamedView(user, name, Guid.Empty, viewType, sortName)`
+    /// (`LibraryManager.cs:3054-3083`) for a grouped view: the row with
+    /// [`grouped_view_id`], created on first read under
+    /// `{InternalMetadataPath}/views/{id N}` with its `ViewType` and `UserId`,
+    /// and renamed when the server-localized `name_key` reads differently.
+    /// `None` without an item store and a metadata path.
+    async fn grouped_view(
+        &self,
+        user_id: Uuid,
+        view_type: &str,
+        name_key: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
+        else {
+            return Ok(None);
+        };
+        let Some(id) = grouped_view_id(&self.id_derivation, user_id, view_type) else {
+            return Ok(None);
+        };
+        let name = self.localization.as_ref().map_or_else(
+            || name_key.to_owned(),
+            |localization| localization.get_server_localized_string(name_key),
+        );
+        if let Some(mut row) = self.items.retrieve_item(id).await? {
+            if row.name.as_deref() != Some(name.as_str()) {
+                row.sort_name = Some(create_sort_name(&name));
+                row.name = Some(name);
+                persistence.save_items(std::slice::from_ref(&row)).await?;
+            }
+            return Ok(Some(row));
+        }
+        let view_path = metadata_path.join("views").join(id.simple().to_string());
+        tokio::fs::create_dir_all(&view_path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create grouped view directory: {e}")))?;
+        let data = serde_json::json!({
+            "ViewType": view_type,
+            "UserId": user_id.simple().to_string(),
+        });
+        let entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
+                .unwrap_or_default()
+                .to_owned(),
+            sort_name: Some(create_sort_name(&name)),
+            name: Some(name),
+            path: Some(view_path.to_string_lossy().into_owned()),
+            parent_id: None,
+            is_folder: true,
+            date_created: Some(Utc::now()),
+            data: Some(data.to_string()),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&entity))
+            .await?;
+        Ok(Some(entity))
     }
 
     async fn user_entity(&self, user_id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
@@ -703,7 +771,12 @@ impl FerrofinUserViewManager {
     /// N}`, `Name = folder.Name`, `ViewType = playlists`, `UserId`,
     /// `DisplayParentId = folder.Id`. Idempotent; a no-op without an item
     /// store and a metadata path.
-    async fn ensure_user_playlists_view(&self, user_id: Uuid) -> Result<(), ServiceError> {
+    async fn ensure_user_playlists_view(
+        &self,
+        user_id: Uuid,
+        user: Option<&UserEntity>,
+        visible_items: &mut HashMap<BaseItemKind, bool>,
+    ) -> Result<(), ServiceError> {
         let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
         else {
             return Ok(());
@@ -718,7 +791,6 @@ impl FerrofinUserViewManager {
                 ..Default::default()
             })
             .await?;
-        let user = self.user_entity(user_id).await?;
         for folder in folders {
             let Ok(parent) = Uuid::parse_str(&folder.id) else {
                 continue;
@@ -729,10 +801,12 @@ impl FerrofinUserViewManager {
             if persistence.item_exists(id).await? {
                 continue;
             }
-            // 12.1: the folder is skipped before `GetNamedView`, so a user
-            // with nothing to see in it never gets the view row either.
-            if let Some(user) = &user
-                && !self.has_visible_child(parent, user).await?
+            // 12.2: the folder is skipped before `GetNamedView`, so a user
+            // with no playlist to see never gets the view row either.
+            if let Some(user) = user
+                && !self
+                    .has_visible_item(BaseItemKind::Playlist, user, visible_items)
+                    .await?
             {
                 continue;
             }
@@ -908,7 +982,10 @@ impl UserViewManager for FerrofinUserViewManager {
         // playlists library is user-specific, so its view is
         // `GetNamedView(user, folder.Name, folder.Id, playlists)` — derived,
         // created on demand, never listed from the table.
-        self.ensure_user_playlists_view(user_id).await?;
+        let user = self.user_entity(user_id).await?;
+        let mut visible_items = HashMap::new();
+        self.ensure_user_playlists_view(user_id, user.as_ref(), &mut visible_items)
+            .await?;
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::CollectionFolder, BaseItemKind::UserView],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
@@ -920,12 +997,11 @@ impl UserViewManager for FerrofinUserViewManager {
             .into_iter()
             .filter(|row| !is_folders_view_row(row))
             .collect();
-        let views = if let (Some(visibility), Some(users)) = (&self.visibility, &self.users) {
-            let user = users
-                .get_user_by_id(user_id)
-                .await?
+        let views = if let (Some(visibility), Some(_)) = (&self.visibility, &self.users) {
+            let user = user
+                .as_ref()
                 .ok_or_else(|| ServiceError::not_found("user"))?;
-            let visible = visibility.visible(&views, &user, false).await?;
+            let visible = visibility.visible(&views, user, false).await?;
             views
                 .into_iter()
                 .zip(visible)
@@ -935,11 +1011,16 @@ impl UserViewManager for FerrofinUserViewManager {
             views
         };
         let views = self
-            .without_childless_linked_libraries(user_id, views)
+            .without_itemless_linked_libraries(user.as_ref(), views, &mut visible_items)
             .await?;
+        let (views, regrouped) = self.with_grouped_views(user_id, views).await?;
         let mut views = self.without_disabled_live_tv(user_id, views).await?;
+        let mut resort = regrouped;
         if let Some(view) = self.folders_view().await? {
             views.push(view);
+            resort = true;
+        }
+        if resort {
             views.sort_by(|a, b| {
                 crate::item_repository::folder_ordinal_compare(
                     Some(&crate::item_repository::folder_sort_name(a)),
@@ -963,14 +1044,14 @@ impl UserViewManager for FerrofinUserViewManager {
         // Jellyfin's LibraryController.GetMediaFolders returns
         // GetUserRootFolder().Children sorted by SortName — the library collection
         // folders plus the playlists plugin folder `CreateRootFolder()` parents
-        // to the `AggregateFolder`. Settle the user root on first read (lazy,
-        // self-healing, memoized by the store) and provision the playlists
-        // folder the same way, then project the user-root child kinds,
-        // name-sorted.
+        // to the `AggregateFolder`. That folder is provisioned once at startup
+        // (`AggregateFolderStore::ensure`), as upstream's `RootFolder` runs
+        // `CreateRootFolder` once per process, so this read never writes it.
+        // Settle the user root on first read (lazy, self-healing, memoized by
+        // the store), then project the user-root child kinds, name-sorted.
         if let Some(root) = &self.user_root {
             root.ensure().await?;
         }
-        self.ensure_playlists_folder().await?;
         let query = InternalItemsQuery {
             // `GetUserRootFolder().Children` holds the libraries and the
             // playlists folder — never a `UserView` (those are derived views,
@@ -978,8 +1059,10 @@ impl UserViewManager for FerrofinUserViewManager {
             // `item_repository::visible_views` still admits them).
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
-                // Both spellings of the playlists folder: Ferrofin provisions
-                // one, an adopted database carries the other.
+                // Both kinds of playlists folder: Ferrofin and Jellyfin both
+                // store `PlaylistsFolder`, but a row an earlier Ferrofin
+                // wrote as `ManualPlaylistsFolder` survives when startup
+                // finds the correct row beside it and does not re-key it.
                 BaseItemKind::ManualPlaylistsFolder,
                 BaseItemKind::PlaylistsFolder,
             ],
@@ -1071,6 +1154,28 @@ pub(crate) struct LatestParent {
     /// (a `UserView`'s `ViewType` is not persisted at this seam, so a view
     /// parent reports `None`, the C# `CollectionType.unknown`-equivalent).
     collection_type: Option<CollectionType>,
+}
+
+/// The candidate query behind `UserViewManager.HasVisibleItem`
+/// ([`ItemVisibility::has_visible_item`]): every `kind` item under
+/// `top_parent_ids`, ungrouped (`GroupByPresentationUniqueKey = false`). No
+/// top parents leaves the user's own scope to the repository, which only the
+/// evaluator-less fallback of [`FerrofinUserViewManager::has_visible_item`]
+/// asks for.
+///
+/// [`ItemVisibility::has_visible_item`]: crate::item_visibility::ItemVisibility::has_visible_item
+pub(crate) fn visible_item_query(
+    kind: BaseItemKind,
+    user: &UserEntity,
+    top_parent_ids: Vec<Uuid>,
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        include_item_types: vec![kind],
+        user: Some(user.clone()),
+        top_parent_ids,
+        group_by_presentation_unique_key: false,
+        ..Default::default()
+    }
 }
 
 /// The `IHasCollectionType.CollectionType` of a latest-items parent row —
@@ -1301,9 +1406,9 @@ impl FerrofinUserViewManager {
             return Ok(HashMap::new());
         };
         Ok(virtual_folders
-            .get_virtual_folders()
+            .library_folders()
             .await?
-            .into_iter()
+            .iter()
             .filter_map(|vf| {
                 let id = vf
                     .item_id
@@ -1384,8 +1489,9 @@ impl FerrofinUserViewManager {
     /// query that feeds the grouping in
     /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
     /// or, for a grouped request whose first typed parent is a library of one of
-    /// the two short-circuited types, that type's own query (the
-    /// grouped-threshold statement for tvshows, the newest albums for music).
+    /// the three short-circuited types, that type's own query (one card per
+    /// newest series for tvshows, the newest albums for music, the newest row
+    /// of each presentation key for movies).
     async fn items_for_latest_items(
         &self,
         query: &LatestItemsQuery,
@@ -1437,43 +1543,40 @@ impl FerrofinUserViewManager {
         }
 
         if query.group_items {
-            // The first typed parent decides (v12 `UserViewManager.cs:371-405`,
-            // `FirstOrDefault(type => type is not null)`): a tvshows or music
-            // library short-circuits into its own per-collection-type query,
-            // with `limit` now capping GROUPS (tvshows) or ALBUMS (music)
-            // rather than rows.
-            //
-            // Following that citation upward also reaches `Limit = limit * 2`
-            // (`:365`), which Ferrofin has NOT adopted — the plain path above
-            // still over-fetches 10.11.8's `limit * 5`
-            // ([`LATEST_OVER_FETCH_FACTOR`]). It cannot affect either
-            // short-circuit, both of which overwrite `limit` on the next line,
-            // so it is a live question only for the plain path: v12 returns
-            // fewer groups from a page of many small containers. Un-adopted,
-            // not decided.
+            // The first typed parent decides (v12 `UserViewManager.cs:396-430`,
+            // `FirstOrDefault(type => type is not null)`): a tvshows, music or
+            // movies library short-circuits into its own per-collection-type
+            // query, with `limit` now capping GROUPS (tvshows), ALBUMS (music)
+            // or presentation keys (movies) rather than rows.
             //
             // "First" is the parents' order, and with no `parentId` the parents
             // are the user's whole view list — so on a server whose first view
-            // by `SortName` is a music library, the UNSCOPED `/Items/Latest`
-            // (the home row) is albums too, not just `ParentId=<music view>`.
-            // That is upstream's behaviour, not an artifact of this port.
+            // by `SortName` is a movies library, the UNSCOPED `/Items/Latest`
+            // (the home row) is the movies arm too: the newest `limit` rows of
+            // EVERY library, one per key, grouped below — a burst of new tracks
+            // can fill it with a few album cards. That is upstream's behaviour
+            // (the owner chose to follow v12 here on 2026-10-24), not an
+            // artifact of this port.
             //
-            // The movies and `null`-collection-type branches v12 added
-            // alongside them (`:394-404`) are deliberately NOT taken here, and
-            // that divergence is an owner decision to leave standing: the
-            // movies arm changes which movies a movies library answers with,
-            // and the `null` arm changes a MIXED library's answer for both
-            // movies and episodes. They are also not the same size of job —
-            // movies needs `GetLatestMovieItems` (`Querying.cs:233-256`) alone,
-            // while `null` (`:134-144`) needs that AND `GetLatestTvShowItems`
-            // (`:282+`), then their concat re-sorted `DateCreated DESC, Id
-            // DESC` and cut to `limit`. Either way the routing is one more arm
+            // The `null`-collection-type arm v12 added beside them
+            // (`:425-429`, a MIXED library's latest movies and shows) is not
+            // ported yet — gl-383. Port path: `GetLatestItemList`'s `unknown`
+            // arm (`Querying.cs:134-144`), the movies arm over the rows with no
+            // `SeriesName` concatenated with `latest_tv_repository`, re-sorted
+            // `DateCreated DESC, Id DESC` and cut to `limit`, then one more arm
             // on the match below.
+            //
+            // The plain path below still over-fetches 10.11.8's `limit * 5`
+            // ([`LATEST_OVER_FETCH_FACTOR`]) where v12 fetches `limit * 2`
+            // (`:390`); the short-circuits overwrite it on the next line.
             let collection_type = parents
                 .iter()
                 .filter(|p| p.is_collection_folder() || p.is_user_view())
                 .find_map(|p| p.collection_type);
-            if let Some(ct @ (CollectionType::tvshows | CollectionType::music)) = collection_type {
+            if let Some(
+                ct @ (CollectionType::tvshows | CollectionType::music | CollectionType::movies),
+            ) = collection_type
+            {
                 internal.limit = Some(limit);
                 return self.items.get_latest_item_list(&internal, ct).await;
             }
@@ -1595,8 +1698,8 @@ mod tests {
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
     use crate::test_support::{
-        seed_item, seed_item_with_data, seed_named_item, seed_user, seed_user_data, set_item_path,
-        test_db,
+        seed_item, seed_item_with_data, seed_named_item, seed_named_user, seed_user,
+        seed_user_data, set_item_path, test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_db::store::guid_to_db;
@@ -1701,92 +1804,451 @@ mod tests {
         assert_eq!(after, vec![(canonical, Some("Playlists".to_owned()))]);
     }
 
-    /// 12.1 `HasVisibleChild`: a playlists folder with nothing the user can
-    /// see is not listed and gets no derived view; the moment it has a visible
-    /// child the view appears. The owner's library is the real case — every
-    /// playlist there sits under a music album, none under the folder — and
-    /// Jellyfin 12.1 answers `/Users/{id}/Views` without `Playlists` for it.
-    #[tokio::test]
-    async fn a_playlists_folder_without_a_visible_child_has_no_view() {
-        let db = test_db().await;
-        let user_id = Uuid::from_u128(0x5301);
-        seed_user(&db, user_id).await;
-        let folder = Uuid::from_u128(0x5302);
-        seed_named_item(
-            &db,
-            folder,
-            BaseItemKind::ManualPlaylistsFolder,
-            "Playlists",
-        )
-        .await;
-        let mode = item_type_lookup::IdDerivation::Jellyfin {
-            program_data_path: Some("/config".to_owned()),
-        };
+    /// `ItemVisibility`'s data directory: a playlist under it is a shared
+    /// (`Playlist.IsSharedItem`) one, visible by owner, shares and `OpenAccess`.
+    const DATA: &str = "/config/data";
+
+    /// A manager wired as the composition root wires it for `GetUserViews`.
+    fn manager_with_visibility(
+        db: &Database,
+        metadata_path: &std::path::Path,
+    ) -> FerrofinUserViewManager {
         let users: Arc<dyn UserManager> =
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
-        let persistence: Arc<dyn ItemPersistenceService> = Arc::new(
-            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
-        );
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manager = manager(&db)
+        let persistence: Arc<dyn ItemPersistenceService> =
+            Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            crate::test_support::item_repository_over(db.clone()),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            DATA.to_owned(),
+        ));
+        manager(db)
             .with_database(db.clone())
             .with_item_store(persistence)
-            .with_metadata_path(tmp.path())
-            .with_id_derivation(mode)
-            .with_users(users);
+            .with_metadata_path(metadata_path)
+            .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            })
+            .with_users(users)
+            .with_visibility(visibility)
+    }
 
-        let names = |views: Vec<BaseItemEntity>| {
-            views.into_iter().filter_map(|v| v.name).collect::<Vec<_>>()
+    /// Saves one row through the real upsert.
+    async fn put(
+        db: &Database,
+        id: Uuid,
+        (kind, name): (BaseItemKind, &str),
+        (parent, top_parent): (Option<Uuid>, Uuid),
+        path: &str,
+        data: &serde_json::Value,
+    ) {
+        let row = BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(kind).unwrap_or_default().to_owned(),
+            name: Some(name.to_owned()),
+            sort_name: Some(name.to_owned()),
+            parent_id: parent.map(guid_to_db),
+            top_parent_id: Some(guid_to_db(top_parent)),
+            path: Some(path.to_owned()),
+            is_folder: kinds::is_folder(kind),
+            data: Some(data.to_string()),
+            ..BaseItemEntity::default()
         };
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("save row");
+    }
+
+    async fn lists(manager: &FerrofinUserViewManager, user: Uuid, view: &str) -> bool {
+        manager
+            .get_user_views(user)
+            .await
+            .expect("views")
+            .iter()
+            .any(|v| v.name.as_deref() == Some(view))
+    }
+
+    async fn block_folders(db: &Database, user: Uuid, folders: &[Uuid]) {
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user),
+            ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
+            &folders.iter().map(|id| guid_to_db(*id)).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("block folders");
+    }
+
+    /// 12.2 `HasVisibleItem` for the playlists folder: the view is listed when
+    /// the user can see a `Playlist` whose `TopParentId` is among their root
+    /// folders' top parents — `Playlist.IsVisible` decides, so another user's
+    /// private playlist does not count — wherever below its top parent the
+    /// playlist sits. The owner's library is the real case for the last part:
+    /// every playlist there is a file inside a music album, and 12.1's
+    /// direct-child rule served no Playlists view for it.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one user and folder walked through every case the rule distinguishes"
+    )]
+    async fn the_playlists_view_needs_a_playlist_the_user_can_see() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x5301);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let owner = Uuid::from_u128(0x5309);
+        let folder = Uuid::from_u128(0x5302);
+        put(
+            &db,
+            folder,
+            (BaseItemKind::ManualPlaylistsFolder, "Playlists"),
+            (None, folder),
+            &format!("{DATA}/playlists"),
+            &serde_json::json!({}),
+        )
+        .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_with_visibility(&db, tmp.path());
         assert!(
-            !names(manager.get_user_views(user_id).await.expect("views"))
-                .contains(&"Playlists".to_owned()),
-            "no visible child: no Playlists view"
+            !lists(&manager, user, "Playlists").await,
+            "no playlist: no view"
         );
 
-        // A playlist the user may see, directly under the folder.
         let playlist = Uuid::from_u128(0x5303);
-        crate::test_support::seed_child_item(&db, playlist, BaseItemKind::Playlist, "Mine", folder)
-            .await;
+        let save_playlist = |data: serde_json::Value| {
+            let db = db.clone();
+            async move {
+                put(
+                    &db,
+                    playlist,
+                    (BaseItemKind::Playlist, "Theirs"),
+                    (Some(folder), folder),
+                    &format!("{DATA}/playlists/Theirs"),
+                    &data,
+                )
+                .await;
+            }
+        };
+        save_playlist(serde_json::json!({"OwnerUserId": owner, "OpenAccess": false})).await;
         assert!(
-            names(manager.get_user_views(user_id).await.expect("views"))
-                .contains(&"Playlists".to_owned()),
-            "a visible child lists the view"
+            !lists(&manager, user, "Playlists").await,
+            "another user's private playlist does not list the view"
+        );
+
+        save_playlist(serde_json::json!({
+            "OwnerUserId": owner,
+            "OpenAccess": false,
+            "Shares": [{"UserId": user, "CanEdit": false}],
+        }))
+        .await;
+        assert!(
+            lists(&manager, user, "Playlists").await,
+            "a playlist shared with the user lists the view"
+        );
+
+        save_playlist(serde_json::json!({"OwnerUserId": owner, "OpenAccess": true})).await;
+        assert!(
+            lists(&manager, user, "Playlists").await,
+            "an open-access playlist lists the view"
         );
 
         // The profile's "Display on home screen" toggle stores the view id in
         // MyMediaExcludes. That hides the home view while leaving the playlist
         // folder and playlist endpoints untouched.
         let playlist_view_id = manager
-            .get_user_views(user_id)
+            .get_user_views(user)
             .await
             .expect("views")
             .into_iter()
             .find(|view| view.name.as_deref() == Some("Playlists"))
             .and_then(|view| Uuid::parse_str(&view.id).ok())
             .expect("derived Playlists view");
-        crate::user_entity_ext::set_preference(
-            db.pool(),
-            &guid_to_db(user_id),
-            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
-            &[guid_to_db(playlist_view_id)],
-        )
-        .await
-        .expect("hide Playlists on home");
+        let hide = |ids: Vec<String>| {
+            let db = db.clone();
+            async move {
+                crate::user_entity_ext::set_preference(
+                    db.pool(),
+                    &guid_to_db(user),
+                    ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+                    &ids,
+                )
+                .await
+                .expect("MyMediaExcludes");
+            }
+        };
+        hide(vec![guid_to_db(playlist_view_id)]).await;
         assert!(
-            !names(manager.get_user_views(user_id).await.expect("views"))
-                .contains(&"Playlists".to_owned()),
+            !lists(&manager, user, "Playlists").await,
             "MyMediaExcludes hides the Playlists home view"
         );
         assert!(
-            names(
-                manager
-                    .get_user_views_with_hidden(user_id, true)
-                    .await
-                    .expect("views including hidden")
-            )
-            .contains(&"Playlists".to_owned()),
+            manager
+                .get_user_views_with_hidden(user, true)
+                .await
+                .expect("views including hidden")
+                .iter()
+                .any(|v| v.name.as_deref() == Some("Playlists")),
             "profile settings can still list the hidden view to re-enable it"
+        );
+        hide(Vec::new()).await;
+
+        save_playlist(serde_json::json!({"OwnerUserId": owner, "OpenAccess": false})).await;
+        assert!(
+            !lists(&manager, user, "Playlists").await,
+            "private again: the view row the user already has is not listed"
+        );
+
+        // A playlist file inside a music album: not a child of the playlists
+        // folder, but its top parent is one of the user's.
+        let music = Uuid::from_u128(0x5304);
+        let album = Uuid::from_u128(0x5305);
+        put(
+            &db,
+            music,
+            (BaseItemKind::CollectionFolder, "Music"),
+            (None, music),
+            "/music",
+            &serde_json::json!({"CollectionType": "music"}),
+        )
+        .await;
+        put(
+            &db,
+            album,
+            (BaseItemKind::MusicAlbum, "Album"),
+            (Some(music), music),
+            "/music/Album",
+            &serde_json::json!({}),
+        )
+        .await;
+        put(
+            &db,
+            Uuid::from_u128(0x5306),
+            (BaseItemKind::Playlist, "Album"),
+            (Some(album), music),
+            "/music/Album/Album.m3u",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            lists(&manager, user, "Playlists").await,
+            "a playlist inside a music album lists the view"
+        );
+
+        block_folders(&db, user, &[music]).await;
+        assert!(
+            !lists(&manager, user, "Playlists").await,
+            "a library the user may not open is not one of their top parents"
+        );
+    }
+
+    /// A playlists view an adopted blob stores with a numeric `ViewType`
+    /// (11, `CollectionType.playlists`) answers to the same rule as the named
+    /// one: listed only once the user can see a playlist.
+    #[tokio::test]
+    async fn a_numeric_playlists_view_type_needs_a_visible_playlist_too() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x5601);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let folder = Uuid::from_u128(0x5602);
+        put(
+            &db,
+            folder,
+            (BaseItemKind::ManualPlaylistsFolder, "Playlists"),
+            (None, folder),
+            &format!("{DATA}/playlists"),
+            &serde_json::json!({}),
+        )
+        .await;
+        let view = Uuid::from_u128(0x5603);
+        put(
+            &db,
+            view,
+            (BaseItemKind::UserView, "Adopted"),
+            (None, view),
+            "/config/metadata/views/adopted",
+            &serde_json::json!({"ViewType": 11}),
+        )
+        .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_with_visibility(&db, tmp.path());
+        assert!(!lists(&manager, user, "Adopted").await, "no playlist");
+
+        put(
+            &db,
+            Uuid::from_u128(0x5604),
+            (BaseItemKind::Playlist, "Open"),
+            (Some(folder), folder),
+            &format!("{DATA}/playlists/Open"),
+            &serde_json::json!({"OpenAccess": true}),
+        )
+        .await;
+        assert!(lists(&manager, user, "Adopted").await, "an open playlist");
+    }
+
+    /// The `boxsets` side of 12.2 `HasVisibleItem`: the Collections library is
+    /// listed when the user can see a `BoxSet` below it, nested or not, and
+    /// `BoxSet.IsVisible` decides — a box set whose movies all sit in a library
+    /// the user may not open does not count.
+    #[tokio::test]
+    async fn the_collections_view_needs_a_box_set_the_user_can_see() {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x5401);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let collections = Uuid::from_u128(0x5402);
+        let movies = Uuid::from_u128(0x5403);
+        let movie = Uuid::from_u128(0x5404);
+        let shelf = Uuid::from_u128(0x5405);
+        let boxset = Uuid::from_u128(0x5406);
+        for (id, kind_name, parents, path, data) in [
+            (
+                collections,
+                (BaseItemKind::CollectionFolder, "Collections"),
+                (None, collections),
+                format!("{DATA}/collections"),
+                serde_json::json!({"CollectionType": "boxsets"}),
+            ),
+            (
+                movies,
+                (BaseItemKind::CollectionFolder, "Movies"),
+                (None, movies),
+                "/movies".to_owned(),
+                serde_json::json!({"CollectionType": "movies"}),
+            ),
+            (
+                movie,
+                (BaseItemKind::Movie, "Heat"),
+                (Some(movies), movies),
+                "/movies/Heat.mkv".to_owned(),
+                serde_json::json!({}),
+            ),
+        ] {
+            put(&db, id, kind_name, parents, &path, &data).await;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_with_visibility(&db, tmp.path());
+        assert!(
+            !lists(&manager, user, "Collections").await,
+            "no box set: no view"
+        );
+
+        // Below a sub-folder, not a direct child of the library.
+        put(
+            &db,
+            shelf,
+            (BaseItemKind::Folder, "Shelf"),
+            (Some(collections), collections),
+            &format!("{DATA}/collections/Shelf"),
+            &serde_json::json!({}),
+        )
+        .await;
+        put(
+            &db,
+            boxset,
+            (BaseItemKind::BoxSet, "Heat Collection"),
+            (Some(shelf), collections),
+            &format!("{DATA}/collections/Shelf/Heat Collection [boxset]"),
+            &serde_json::json!({}),
+        )
+        .await;
+        crate::FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(boxset, movie, 0)
+            .await
+            .expect("link");
+        block_folders(&db, user, &[movies]).await;
+        assert!(
+            !lists(&manager, user, "Collections").await,
+            "a box set of movies the user may not open does not list the view"
+        );
+
+        block_folders(&db, user, &[]).await;
+        assert!(
+            lists(&manager, user, "Collections").await,
+            "a visible box set below the library lists the view"
+        );
+    }
+
+    /// `HasVisibleItem` counts a playlist only when `IsVisible(user)` passes
+    /// it, and a private playlist has no administrator exception: an
+    /// administrator who neither owns nor shares the only playlist gets no
+    /// Playlists view, as Jellyfin 12.2 answers (issue #53). The owner does.
+    #[tokio::test]
+    async fn an_administrator_gets_no_playlists_view_for_others_private_playlists() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().expect("tempdir");
+        let metadata = tempfile::tempdir().expect("tempdir");
+        let (owner, admin) = (Uuid::from_u128(0x5401), Uuid::from_u128(0x5402));
+        crate::test_support::seed_named_user(&db, owner, "owner").await;
+        crate::test_support::seed_named_user(&db, admin, "admin").await;
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &guid_to_db(admin),
+            ferrofin_db::enums::PermissionKind::IsAdministrator,
+            true,
+        )
+        .await
+        .expect("admin");
+        let folder = Uuid::from_u128(0x5403);
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let playlist = Uuid::from_u128(0x5404);
+        crate::test_support::seed_child_item(&db, playlist, BaseItemKind::Playlist, "Mine", folder)
+            .await;
+        let mut row = crate::test_support::fetch_item(&db, playlist).await;
+        row.path = Some(data.path().join("playlists/Mine").display().to_string());
+        // Created playlists sit under the playlists folder, their top parent.
+        row.top_parent_id = Some(guid_to_db(folder));
+        row.data = Some(
+            serde_json::json!({"OwnerUserId": owner, "OpenAccess": false, "Shares": []})
+                .to_string(),
+        );
+        crate::test_support::save_item(&db, &row).await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(metadata.path())
+            .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            })
+            .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
+                db.clone(),
+            )))
+            .with_visibility(visibility);
+        let lists_playlists = |user| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_user_views(user)
+                    .await
+                    .expect("views")
+                    .iter()
+                    .any(|v| v.name.as_deref() == Some("Playlists"))
+            }
+        };
+
+        assert!(!lists_playlists(admin).await, "an administrator non-member");
+        assert!(lists_playlists(owner).await, "the owner");
+
+        // The first child (by SortName) stays hidden; a later open one counts.
+        let open = Uuid::from_u128(0x5405);
+        crate::test_support::seed_child_item(&db, open, BaseItemKind::Playlist, "Zed", folder)
+            .await;
+        let mut row = crate::test_support::fetch_item(&db, open).await;
+        row.path = Some(data.path().join("playlists/Zed").display().to_string());
+        row.top_parent_id = Some(guid_to_db(folder));
+        row.data = Some(serde_json::json!({"OwnerUserId": owner, "OpenAccess": true}).to_string());
+        crate::test_support::save_item(&db, &row).await;
+        assert!(
+            lists_playlists(admin).await,
+            "an open playlist lists the view"
         );
     }
 
@@ -1796,12 +2258,13 @@ mod tests {
         FerrofinUserViewManager::new(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
     }
 
-    /// A manager that provisions the playlists folder, plus the user-root store
-    /// `get_media_folders` settles on the way in.
-    fn manager_with_playlists(
+    /// A manager wired for `get_media_folders` as the composition root wires
+    /// it: an item store, plus the user-root store it settles on the way in.
+    /// The playlists folder is not its to make: [`provision_at_startup`] does
+    /// that, as the server's boot does.
+    fn media_folders_manager(
         db: &Database,
-        root_path: impl Into<PathBuf>,
-        playlists_path: impl Into<PathBuf>,
+        root_path: impl Into<std::path::PathBuf>,
     ) -> FerrofinUserViewManager {
         let persistence: Arc<dyn ItemPersistenceService> =
             Arc::new(FerrofinItemPersistenceService::new(db.clone()));
@@ -1811,7 +2274,7 @@ mod tests {
             root_path,
         );
         manager(db)
-            .with_playlists_store(persistence, playlists_path)
+            .with_item_store(persistence)
             .with_user_root(root)
     }
 
@@ -1894,7 +2357,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<CollectionTypeOptions>,
             _options: &LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!("fake")
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -2213,6 +2676,61 @@ mod tests {
                 (None, vec![m2]),
                 (None, vec![m1]),
             ]
+        );
+    }
+
+    /// A grouped request whose first typed view is a movies library takes v12's
+    /// movies arm (`UserViewManager.cs:419-423`, `GetLatestMovieItems`): the
+    /// newest `limit` rows of every view, one per presentation key, then
+    /// grouped. Two new episodes of one series fill a `limit=2` page, which
+    /// then shows ONE card; the plain path read `limit * 5` rows and filled
+    /// both cards (the series, then the movie).
+    #[tokio::test]
+    async fn latest_with_a_movies_first_view_reads_limit_rows_then_groups() {
+        let db = test_db().await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "Shows").await;
+        let series = Uuid::from_u128(0x251);
+        let (movie, e1, e2) = (
+            Uuid::from_u128(0x351),
+            Uuid::from_u128(0x352),
+            Uuid::from_u128(0x353),
+        );
+        seed(
+            &db,
+            &[
+                Row::new(series, BaseItemKind::Series, "Series 01", day(1), SHOWS),
+                Row::new(movie, BaseItemKind::Movie, "Movie 0001", day(3), MOVIES),
+                Row::new(e1, BaseItemKind::Episode, "S1E1", day(8), SHOWS)
+                    .under(series)
+                    .of_series(series, "Series 01"),
+                Row::new(e2, BaseItemKind::Episode, "S1E2", day(9), SHOWS)
+                    .under(series)
+                    .of_series(series, "Series 01"),
+            ],
+        )
+        .await;
+        let mgr = manager_with_folders(
+            &db,
+            vec![
+                (MOVIES, Some(CollectionTypeOptions::movies)),
+                (SHOWS, Some(CollectionTypeOptions::tvshows)),
+            ],
+        );
+
+        let query = |group_items| LatestItemsQuery {
+            limit: Some(2),
+            group_items,
+            ..LatestItemsQuery::default()
+        };
+        assert_eq!(
+            shape(&latest(&mgr, query(true)).await),
+            vec![(Some(series), vec![e2, e1])]
+        );
+        // Ungrouped requests never short-circuit: the plain path, two rows.
+        assert_eq!(
+            shape(&latest(&mgr, query(false)).await),
+            vec![(None, vec![e2]), (None, vec![e1])]
         );
     }
 
@@ -2565,11 +3083,11 @@ mod tests {
     }
 
     /// The music branch fires on the parents' collection type and nothing else,
-    /// so a request scoped to a NON-music parent keeps the generic path even on
-    /// a server that does have a music library — and a stray `MusicAlbum` row
-    /// sitting in a movies library is a folder, which the generic query filters
-    /// out. The other half: a music library with no albums answers empty rather
-    /// than widening its top-parent scope.
+    /// so a request scoped to a movies parent takes the movies arm even on a
+    /// server that does have a music library — and a stray `MusicAlbum` row
+    /// sitting in a movies library is a folder, which the movies arm's filter
+    /// (`IsFolder = false`) leaves out. The other half: a music library with
+    /// no albums answers empty rather than widening its top-parent scope.
     #[tokio::test]
     async fn latest_music_branch_needs_a_music_parent() {
         let db = test_db().await;
@@ -2610,7 +3128,7 @@ mod tests {
         assert_eq!(
             shape(&movies),
             vec![(None, vec![movie])],
-            "a movies parent still takes the generic path, folders excluded"
+            "a movies parent takes the movies arm, folders excluded"
         );
 
         let empty = latest(
@@ -2631,9 +3149,11 @@ mod tests {
 
     /// `isPlayed` is a SQL predicate (it needs the user), not a post-filter
     /// over an already-cut page: SIX played movies are newer than the one
-    /// unplayed movie and the request over-fetches `limit * 5 = 5` rows, so a
-    /// post-filter over the page would return nothing while the SQL predicate
-    /// finds the fresh one. A music parent drops the filter entirely.
+    /// unplayed movie, and the plain path (ungrouped) over-fetches
+    /// `limit * 5 = 5` rows while the movies arm (grouped, Movies the first
+    /// view) reads `limit = 1`, so a post-filter over either page would return
+    /// nothing while the SQL predicate finds the fresh one. A music parent
+    /// drops the filter entirely.
     #[tokio::test]
     async fn latest_pushes_is_played_into_sql() {
         let db = test_db().await;
@@ -2663,20 +3183,27 @@ mod tests {
             ],
         );
 
-        let unplayed = latest(
-            &mgr,
-            LatestItemsQuery {
-                user: Some(user.clone()),
-                is_played: Some(false),
-                limit: Some(1),
-                ..LatestItemsQuery::default()
-            },
-        )
-        .await;
-        // The played movies are out; the played TRACK is out too — the views
-        // fallback keeps `isPlayed` (the music exemption is decided on the
-        // explicit parent only, as upstream).
-        assert_eq!(shape(&unplayed), vec![(None, vec![fresh])]);
+        for group_items in [false, true] {
+            let unplayed = latest(
+                &mgr,
+                LatestItemsQuery {
+                    user: Some(user.clone()),
+                    is_played: Some(false),
+                    group_items,
+                    limit: Some(1),
+                    ..LatestItemsQuery::default()
+                },
+            )
+            .await;
+            // The played movies are out; the played TRACK is out too — the
+            // views fallback keeps `isPlayed` (the music exemption is decided
+            // on the explicit parent only, as upstream).
+            assert_eq!(
+                shape(&unplayed),
+                vec![(None, vec![fresh])],
+                "group_items={group_items}"
+            );
+        }
 
         // `GroupItems = false` keeps a music parent on the generic path, which
         // is where `isPlayed` would still be a predicate — and it is not:
@@ -2702,16 +3229,16 @@ mod tests {
         );
     }
 
-    /// `parentId` = a tvshows library takes the grouped-threshold query, and
+    /// `parentId` = a tvshows library takes v12's `GetLatestTvShowItems`, and
     /// this is only provable where the plain path would answer differently:
     /// series A has TWELVE same-day episodes — more than the plain path's
     /// `limit * 5 = 10` row cap — so the plain query never reaches series B
-    /// at all, while the grouped query (limit caps GROUPS, rows are unpaged
-    /// above the threshold) returns all twelve plus B's episode. The
-    /// threshold is the smallest of the top-2 maxima (day 8): A's old
-    /// episode (day 2) and series C (day 3) fall below it.
+    /// at all, while the TV path (limit caps SERIES) answers one card for each
+    /// of the two newest series. Their episodes carry no season, so each card
+    /// is the series' newest episode (same day: the highest id), grouped under
+    /// its series; series C (day 3) is not among the newest two.
     #[tokio::test]
-    async fn latest_parent_tvshows_library_uses_grouped_threshold_query() {
+    async fn latest_parent_tvshows_library_answers_one_card_per_series() {
         let db = test_db().await;
         seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "Shows").await;
         let (sa, sb, sc) = (
@@ -2759,12 +3286,10 @@ mod tests {
             },
         )
         .await;
-        // Same-day ties break on SortName DESC: e12, e11, …, e01.
-        let mut a_desc = a_eps.clone();
-        a_desc.reverse();
+        // Same-day ties break on `Id DESC`: A's newest is its last episode.
         assert_eq!(
             shape(&groups),
-            vec![(Some(sa), a_desc), (Some(sb), vec![b_new])]
+            vec![(Some(sa), vec![a_eps[11]]), (Some(sb), vec![b_new])]
         );
 
         // The same request through a type-less parent (no virtual-folder
@@ -3143,16 +3668,16 @@ mod tests {
         let libraries = 2usize;
         let tmp = tempfile::tempdir().expect("tempdir");
         let playlists_path = tmp.path().join("data").join("playlists");
-        let root_path = tmp.path().join("root").join("default");
-        let mgr = manager_with_playlists(&db, &root_path, &playlists_path);
+        provision_at_startup(&db, tmp.path()).await;
+        let mgr = media_folders_manager(&db, tmp.path().join("root").join("default"));
 
         let folders = mgr
             .get_media_folders(Uuid::from_u128(9))
             .await
             .expect("media folders");
 
-        // The user-root children are the libraries plus the auto-provisioned
-        // Playlists folder (C# GetUserRootFolder().Children).
+        // The user-root children are the libraries plus the Playlists folder
+        // startup provisioned (C# GetUserRootFolder().Children).
         assert_eq!(folders.len(), libraries + 1);
         let playlists = folders
             .iter()
@@ -3177,8 +3702,8 @@ mod tests {
 
         // The id is stored the way Jellyfin stores Guid columns: UPPERCASE
         // hyphenated. `BaseItems."Id"` is plain TEXT with no COLLATE NOCASE, so
-        // a lowercase id is a different row to SQLite — the existence check
-        // below would never match it, and the folder would also come back to
+        // a lowercase id is a different row to SQLite — an existence check by
+        // id would never match it, and the folder would also come back to
         // clients with a lowercase `Id` where Jellyfin sends uppercase.
         assert_eq!(
             playlists.id,
@@ -3187,13 +3712,12 @@ mod tests {
             playlists.id
         );
 
-        // Provisioning is idempotent — and this checks that the second read
-        // does not WRITE, not merely that it does not duplicate. An upsert on
-        // the same id can never duplicate, so a row count proves nothing; the
-        // bug this guards against re-ran the upsert on every single request and
-        // still left exactly one row. Renaming the row out from under the
-        // manager makes a rewrite observable: if provisioning runs again it
-        // stamps `Name` back to "Playlists".
+        // A read never WRITES the folder, not merely never duplicates it. An
+        // upsert on the same id can never duplicate, so a row count proves
+        // nothing; the bug this guards against re-ran the upsert on every
+        // single request and still left exactly one row. Renaming the row out
+        // from under the manager makes a rewrite observable: if a read
+        // provisions it again it stamps `Name` back to "Playlists".
         let persistence = FerrofinItemPersistenceService::new(db.clone());
         let mut renamed_row = playlists.clone();
         renamed_row.name = Some("SENTINEL".to_owned());
@@ -3214,10 +3738,74 @@ mod tests {
         assert_eq!(
             renamed.name.as_deref(),
             Some("SENTINEL"),
-            "a second read re-provisioned the folder — the existence check did \
-             not match the row it wrote, so every request pays a filesystem \
-             call and a write through the single writer connection"
+            "a read re-provisioned the folder, so every request pays a \
+             filesystem call and a write through the single writer connection"
         );
+    }
+
+    /// What the composition root runs once before serving anything
+    /// (`AggregateFolderStore::ensure`, upstream's `CreateRootFolder`): the
+    /// aggregate root at `{tmp}/root` and the playlists folder at
+    /// `{tmp}/data/playlists`.
+    async fn provision_at_startup(db: &Database, tmp: &std::path::Path) {
+        crate::AggregateFolderStore::new(
+            db.clone(),
+            item_type_lookup::IdDerivation::LegacyLowercase,
+            tmp.join("root"),
+            tmp.join("data"),
+        )
+        .ensure()
+        .await
+        .expect("startup provisioning");
+    }
+
+    /// gl-343: startup keeps a playlists folder it finds at the folder's
+    /// path under another id, and the media folders list that one. Nothing
+    /// on the request path provisions a second beside it, so the folder is
+    /// listed once and every playlist stays in it.
+    #[tokio::test]
+    async fn media_folders_keep_a_playlists_folder_found_by_path() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let db = test_db().await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let playlists_path = tmp.path().join("data").join("playlists");
+            let foreign = Uuid::from_u128(0xADA);
+            seed_named_item(&db, foreign, BaseItemKind::PlaylistsFolder, "Playlists").await;
+            set_item_path(&db, foreign, &playlists_path.to_string_lossy()).await;
+            provision_at_startup(&db, tmp.path()).await;
+            let mgr = media_folders_manager(&db, tmp.path().join("root").join("default"));
+
+            for _ in 0..2 {
+                let folders = mgr
+                    .get_media_folders(Uuid::from_u128(9))
+                    .await
+                    .expect("media folders");
+                let playlists: Vec<_> = folders
+                    .iter()
+                    .filter(|f| {
+                        matches!(
+                            item_type_lookup::kind_from_type_name(&f.type_),
+                            Some(
+                                BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder
+                            )
+                        )
+                    })
+                    .map(|f| f.id.clone())
+                    .collect();
+                assert_eq!(
+                    playlists,
+                    vec![guid_to_db(foreign)],
+                    "one playlists folder, the one already at the path"
+                );
+            }
+            assert_eq!(
+                crate::test_support::items_at_path(&db, &playlists_path.to_string_lossy()).await,
+                1,
+                "no second playlists folder was written at that path"
+            );
+        })
+        .await
+        .expect("the test finishes");
     }
 
     /// The per-user named-view id, pinned against the owner's real 12.0
@@ -3300,10 +3888,7 @@ mod tests {
             }),
         );
         let manager = manager(&db)
-            .with_playlists_store(
-                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-                tmp.path().join("playlists"),
-            )
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
             .with_metadata_path(tmp.path().join("metadata"))
             .with_database(db.clone())
             .with_dashboard_configuration(config.clone(), localization);
@@ -3497,10 +4082,7 @@ mod tests {
             }),
         );
         let manager = manager(&db)
-            .with_playlists_store(
-                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-                tmp.path().join("playlists"),
-            )
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
             .with_metadata_path(metadata.clone())
             .with_id_derivation(mode)
             .with_dashboard_configuration(config.clone(), localization);
@@ -3563,10 +4145,7 @@ mod tests {
             .await
             .unwrap();
         let manager = manager(&db)
-            .with_playlists_store(
-                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-                tmp.path().join("playlists"),
-            )
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
             .with_metadata_path(tmp.path().join("metadata"))
             .with_dashboard_configuration(config, localization);
         let views = manager.get_user_views(user).await.unwrap();
@@ -3579,5 +4158,269 @@ mod tests {
             folders < zulu,
             "source SortNameComparer folds case before comparing"
         );
+    }
+
+    /// A library row of `collection_type` (its `Data`'s `CollectionType`,
+    /// `None` for one written without it).
+    async fn seed_library(db: &Database, id: Uuid, name: &str, collection_type: Option<&str>) {
+        let row = BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::CollectionFolder)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(name.to_owned()),
+            sort_name: Some(create_sort_name(name)),
+            is_folder: true,
+            data: collection_type.map(|t| format!(r#"{{"CollectionType":"{t}"}}"#)),
+            ..BaseItemEntity::default()
+        };
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("seed library");
+    }
+
+    /// A manager that can make grouped views: preferences, an item store and
+    /// a metadata path.
+    fn grouping_manager(db: &Database, metadata: &std::path::Path) -> FerrofinUserViewManager {
+        manager(db)
+            .with_database(db.clone())
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(metadata.to_path_buf())
+    }
+
+    async fn group(db: &Database, user: Uuid, libraries: &[Uuid]) {
+        let ids: Vec<String> = libraries.iter().map(|id| guid_to_db(*id)).collect();
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user),
+            ferrofin_db::enums::PreferenceKind::GroupedFolders,
+            &ids,
+        )
+        .await
+        .expect("save GroupedFolders");
+    }
+
+    async fn view_names(mgr: &FerrofinUserViewManager, user: Uuid) -> Vec<String> {
+        mgr.get_user_views(user)
+            .await
+            .expect("views")
+            .into_iter()
+            .filter_map(|view| view.name)
+            .collect()
+    }
+
+    /// 12.2 `GetUserViews`: the movies, shows and untyped libraries a user
+    /// grouped become one Movies and one TV Shows view. An untyped library
+    /// joins both; a music library, grouped or not, stays itself, as does
+    /// every library left ungrouped. The list stays in name order.
+    #[tokio::test]
+    async fn grouped_libraries_become_one_view_per_type() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0x7701);
+        seed_user(&db, user).await;
+        let (action, comedy, series, mixed, songs) = (
+            Uuid::from_u128(0x7711),
+            Uuid::from_u128(0x7712),
+            Uuid::from_u128(0x7713),
+            Uuid::from_u128(0x7714),
+            Uuid::from_u128(0x7715),
+        );
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, comedy, "Comedy", Some("movies")).await;
+        seed_library(&db, series, "Series", Some("tvshows")).await;
+        seed_library(&db, mixed, "Mixed", Some("mixed")).await;
+        seed_library(&db, songs, "Songs", Some("music")).await;
+        group(&db, user, &[action, comedy, mixed, songs]).await;
+        let mgr = grouping_manager(&db, tmp.path());
+
+        assert_eq!(
+            view_names(&mgr, user).await,
+            ["Movies", "Series", "Songs", "TvShows"]
+        );
+        let views = mgr.get_user_views(user).await.expect("views");
+        let movies = views
+            .iter()
+            .find(|view| view.name.as_deref() == Some("Movies"))
+            .expect("the Movies view");
+        assert_eq!(
+            Some(uuid(movies)),
+            grouped_view_id(
+                &item_type_lookup::IdDerivation::LegacyLowercase,
+                user,
+                "movies"
+            )
+        );
+        let data = crate::item_data::parse_data(movies.data.as_deref());
+        assert_eq!(data["ViewType"], "movies");
+        assert_eq!(data["UserId"], user.simple().to_string());
+        assert!(data.get("DisplayParentId").is_none());
+        assert!(
+            tmp.path()
+                .join("views")
+                .join(uuid(movies).simple().to_string())
+                .is_dir(),
+            "GetNamedView creates the view's folder"
+        );
+        // A second read finds the rows, and makes no others.
+        assert_eq!(
+            view_names(&mgr, user).await,
+            ["Movies", "Series", "Songs", "TvShows"]
+        );
+    }
+
+    /// `GetUserView(parents, …)`: a single grouped library of exactly the
+    /// view's type is listed as itself, not as a grouped view.
+    #[tokio::test]
+    async fn a_single_grouped_library_of_the_type_stays_itself() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0x7721);
+        seed_user(&db, user).await;
+        let (action, series) = (Uuid::from_u128(0x7722), Uuid::from_u128(0x7723));
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, series, "Series", Some("tvshows")).await;
+        group(&db, user, &[action]).await;
+        let mgr = grouping_manager(&db, tmp.path());
+        assert_eq!(view_names(&mgr, user).await, ["Action", "Series"]);
+    }
+
+    /// A grouped view is the user's alone, and only while they group: another
+    /// user lists the libraries, and ungrouping brings them back, the stored
+    /// view row left out.
+    #[tokio::test]
+    async fn a_grouped_view_follows_its_users_grouping() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (user, other) = (Uuid::from_u128(0x7731), Uuid::from_u128(0x7732));
+        seed_named_user(&db, user, "grouping").await;
+        seed_named_user(&db, other, "other").await;
+        let (action, comedy) = (Uuid::from_u128(0x7733), Uuid::from_u128(0x7734));
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, comedy, "Comedy", Some("movies")).await;
+        group(&db, user, &[action, comedy]).await;
+        let mgr = grouping_manager(&db, tmp.path());
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        assert_eq!(view_names(&mgr, other).await, ["Action", "Comedy"]);
+        group(&db, user, &[]).await;
+        assert_eq!(view_names(&mgr, user).await, ["Action", "Comedy"]);
+    }
+
+    /// `GetNamedViewId(user, Guid.Empty, viewType)`: no parent part.
+    #[test]
+    fn the_grouped_view_id_has_no_parent_part() {
+        let user = Uuid::from_u128(0x7741);
+        let mode = item_type_lookup::IdDerivation::LegacyLowercase;
+        assert_eq!(
+            grouped_view_id(&mode, user, "tvshows"),
+            item_type_lookup::derive_item_id_with(
+                &mode,
+                BaseItemKind::UserView,
+                &format!("38_namedview_{}tvshows", user.simple()),
+            )
+        );
+        assert_ne!(
+            grouped_view_id(&mode, user, "tvshows"),
+            named_view_id(&mode, user, Uuid::nil(), "tvshows"),
+            "a nil parent would add 32 zeros"
+        );
+    }
+
+    /// A lone untyped grouped library joins both views (`GetUserView` takes
+    /// the library itself only when its type is the view's), and several
+    /// grouped shows libraries make one TV Shows view.
+    #[tokio::test]
+    async fn an_untyped_library_joins_both_views_and_shows_group_too() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0x7751);
+        seed_user(&db, user).await;
+        let (mixed, anime, drama) = (
+            Uuid::from_u128(0x7752),
+            Uuid::from_u128(0x7753),
+            Uuid::from_u128(0x7754),
+        );
+        seed_library(&db, mixed, "Mixed", None).await;
+        seed_library(&db, anime, "Anime", Some("tvshows")).await;
+        seed_library(&db, drama, "Drama", Some("tvshows")).await;
+        let mgr = grouping_manager(&db, tmp.path());
+        group(&db, user, &[mixed]).await;
+        assert_eq!(
+            view_names(&mgr, user).await,
+            ["Anime", "Drama", "Movies", "TvShows"]
+        );
+        group(&db, user, &[anime, drama]).await;
+        assert_eq!(view_names(&mgr, user).await, ["Mixed", "TvShows"]);
+    }
+
+    /// `GetNamedView` renames a stored view whose name no longer reads as the
+    /// server-localized one, and the view can be hidden and ordered like any
+    /// other (`MyMediaExcludes`, `OrderedViews` by its own id).
+    #[tokio::test]
+    async fn a_grouped_view_is_renamed_hidden_and_ordered_like_any_view() {
+        use ferrofin_db::enums::PreferenceKind;
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0x7761);
+        seed_user(&db, user).await;
+        let (action, comedy, series) = (
+            Uuid::from_u128(0x7762),
+            Uuid::from_u128(0x7763),
+            Uuid::from_u128(0x7764),
+        );
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, comedy, "Comedy", Some("movies")).await;
+        seed_library(&db, series, "Series", Some("tvshows")).await;
+        group(&db, user, &[action, comedy]).await;
+        let mgr = grouping_manager(&db, tmp.path());
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Series"]);
+
+        let id = grouped_view_id(
+            &item_type_lookup::IdDerivation::LegacyLowercase,
+            user,
+            "movies",
+        )
+        .expect("id");
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        let mut row = mgr
+            .items
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row");
+        row.name = Some("Old Name".to_owned());
+        persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("rename");
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Series"]);
+        let row = mgr
+            .items
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.name.as_deref(), Some("Movies"));
+        assert_eq!(row.sort_name.as_deref(), Some("movies"));
+
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user),
+            PreferenceKind::OrderedViews,
+            &[guid_to_db(series), guid_to_db(id)],
+        )
+        .await
+        .expect("order");
+        assert_eq!(view_names(&mgr, user).await, ["Series", "Movies"]);
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user),
+            PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(id)],
+        )
+        .await
+        .expect("hide");
+        assert_eq!(view_names(&mgr, user).await, ["Series"]);
     }
 }

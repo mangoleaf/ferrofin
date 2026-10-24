@@ -60,6 +60,71 @@ impl StartupConfig {
     }
 }
 
+/// The published server overrides among `overrides` that are full URLs whose
+/// public path does not end with `base_url`: the test inside
+/// `NetworkManager.WarnIfPublishedUrlBasePathDiffers`. Returns each one's
+/// `host:port` (the scheme's default port when it names none), once per
+/// override ignoring case, never its user info, query or fragment. Bare host
+/// or IP overrides are exempt, since the base URL is appended when the API URL
+/// is built from them; an empty `base_url` leaves nothing to compare.
+#[must_use]
+pub fn published_urls_missing_base_url<'a>(
+    overrides: impl IntoIterator<Item = &'a str>,
+    base_url: &str,
+) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if base_url.is_empty() {
+        return hosts;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for uri in overrides {
+        let lowered = uri.to_ascii_lowercase();
+        let (scheme_len, default_port) = if lowered.starts_with("http://") {
+            ("http://".len(), 80)
+        } else if lowered.starts_with("https://") {
+            ("https://".len(), 443)
+        } else {
+            continue;
+        };
+        if !seen.insert(lowered) {
+            continue;
+        }
+        let rest = uri[scheme_len..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
+        let (authority, path) = rest.find('/').map_or((rest, "/"), |at| rest.split_at(at));
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        // `Uri.TryCreate` rejects an override without a host.
+        if host.is_empty() {
+            continue;
+        }
+        let path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+        let path = path.trim_end_matches('/');
+        if path
+            .len()
+            .checked_sub(base_url.len())
+            .and_then(|at| path.get(at..))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+        {
+            continue;
+        }
+        // `GetComponents(HostAndPort)`: the explicit port, else the default.
+        let has_port = !host.ends_with(']')
+            && host.rsplit_once(':').is_some_and(|(_, port)| {
+                !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+            });
+        hosts.push(if has_port {
+            host.to_owned()
+        } else {
+            format!("{host}:{default_port}")
+        });
+    }
+    hosts
+}
+
 /// Network interface manager — port of `NetworkManager` (`INetworkManager`).
 pub struct NetworkManager {
     logger: Arc<dyn Logger>,
@@ -73,6 +138,45 @@ pub struct NetworkManager {
     excluded_subnets: Vec<IpNetwork>,
     trust_all_ipv6_interfaces: bool,
     interface_source: InterfaceSource,
+    /// Host-name lookups (`Dns.GetHostAddresses`): the OS resolver unless
+    /// [`NetworkManager::with_resolver`] replaced it.
+    resolver: net_utils::HostResolver,
+}
+
+/// The address half of `IsInLocalNetwork(string)`, independent of the
+/// manager it came from ([`NetworkManager::host_lookup`]).
+#[derive(Clone, Copy)]
+pub struct HostLookup {
+    is_ipv4_enabled: bool,
+    is_ipv6_enabled: bool,
+    resolver: net_utils::HostResolver,
+}
+
+impl std::fmt::Debug for HostLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostLookup")
+            .field("is_ipv4_enabled", &self.is_ipv4_enabled)
+            .field("is_ipv6_enabled", &self.is_ipv6_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostLookup {
+    /// The addresses `address` stands for: itself when it parses as an
+    /// address or subnet (`TryParseToSubnet`), else what `TryParseHost`
+    /// resolves, which can block on DNS. `None` when it is neither.
+    #[must_use]
+    pub fn addresses(&self, address: &str) -> Option<Vec<IpAddr>> {
+        if let Some(subnet) = net_utils::try_parse_to_subnet(address, false) {
+            return Some(vec![subnet.address]);
+        }
+        net_utils::try_parse_host_with(
+            address,
+            self.is_ipv4_enabled,
+            self.is_ipv6_enabled,
+            self.resolver,
+        )
+    }
 }
 
 enum InterfaceSource {
@@ -107,6 +211,7 @@ impl NetworkManager {
             excluded_subnets: Vec::new(),
             trust_all_ipv6_interfaces: false,
             interface_source: InterfaceSource::Mock(mock_network_settings.into()),
+            resolver: net_utils::resolve_host,
         };
 
         let config = manager.config.clone();
@@ -145,6 +250,18 @@ impl NetworkManager {
         manager
     }
 
+    /// Looks host names up with `resolver` instead of the operating system's
+    /// resolver, builder-style.
+    ///
+    /// Only the textual-source paths ([`Self::get_bind_address`],
+    /// [`Self::is_in_local_network_str`]) resolve names, so tests use this to
+    /// keep them off live DNS. Every other constructor keeps the OS resolver.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: net_utils::HostResolver) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
     /// Replaces the supplied snapshot, including with an intentionally empty list.
     /// This switches a live manager to deterministic supplied interfaces.
     pub fn set_interfaces(&mut self, interfaces: Vec<IpData>) {
@@ -161,10 +278,24 @@ impl NetworkManager {
         }
     }
 
+    /// The network configuration the manager was last given
+    /// (`GetNetworkConfiguration`).
+    #[must_use]
+    pub fn configuration(&self) -> &NetworkConfiguration {
+        &self.config
+    }
+
     /// Whether discovery should start for the next server lifetime.
     #[must_use]
     pub fn auto_discovery(&self) -> bool {
         self.config.auto_discovery
+    }
+
+    /// Whether smart URLs echo the request's own host
+    /// (`EnablePublishedServerUriByRequest`).
+    #[must_use]
+    pub fn enable_published_server_uri_by_request(&self) -> bool {
+        self.config.enable_published_server_uri_by_request
     }
 
     /// Whether IPv4 is enabled (`IsIPv4Enabled`).
@@ -423,6 +554,9 @@ impl NetworkManager {
     ///
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
     /// whole chain is walkable.
+    ///
+    /// TODO(gl-184): the chain it gets has unparsable entries already dropped;
+    /// `ApplyForwarders` stops the walk at the first one instead.
     #[must_use]
     pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
         if self.known_proxies.is_empty() {
@@ -710,9 +844,13 @@ impl NetworkManager {
     /// parsed out of a matching published-server override.
     #[must_use]
     pub fn get_bind_address(&self, source: &str) -> (String, Option<u16>) {
-        let addresses =
-            net_utils::try_parse_host(source, self.is_ipv4_enabled(), self.is_ipv6_enabled())
-                .unwrap_or_default();
+        let addresses = net_utils::try_parse_host_with(
+            source,
+            self.is_ipv4_enabled(),
+            self.is_ipv6_enabled(),
+            self.resolver,
+        )
+        .unwrap_or_default();
         let resolved = self.get_bind_address_for_ip(addresses.first().copied(), false);
         // Per-request published-URL resolution → debug (RULES_LOGGING volume rule);
         // the startup banner already logs the configured result at info. This
@@ -846,14 +984,28 @@ impl NetworkManager {
 
     /// Whether a textual address is in the local network
     /// (`IsInLocalNetwork(string)`).
+    ///
+    /// A host name is resolved, which can block on DNS. A caller holding the
+    /// manager behind a lock can resolve outside it: take
+    /// [`Self::host_lookup`], resolve, and test each address with
+    /// [`Self::is_in_local_network`].
     #[must_use]
     pub fn is_in_local_network_str(&self, address: &str) -> bool {
-        if let Some(subnet) = net_utils::try_parse_to_subnet(address, false) {
-            return self.is_in_local_network(subnet.address);
-        }
-
-        net_utils::try_parse_host(address, self.is_ipv4_enabled(), self.is_ipv6_enabled())
+        self.host_lookup()
+            .addresses(address)
             .is_some_and(|addresses| addresses.iter().any(|a| self.is_in_local_network(*a)))
+    }
+
+    /// How [`Self::is_in_local_network_str`] reads a textual address into the
+    /// addresses it tests: the address-family switches and the resolver,
+    /// copied out so the lookup needs no access to the manager.
+    #[must_use]
+    pub fn host_lookup(&self) -> HostLookup {
+        HostLookup {
+            is_ipv4_enabled: self.is_ipv4_enabled(),
+            is_ipv6_enabled: self.is_ipv6_enabled(),
+            resolver: self.resolver,
+        }
     }
 
     /// Whether an address is link-local (`IsLinkLocalAddress`).
@@ -866,7 +1018,7 @@ impl NetworkManager {
     /// Whether an address is in the local network (`IsInLocalNetwork(IPAddress)`).
     #[must_use]
     pub fn is_in_local_network(&self, address: IpAddr) -> bool {
-        let address = unmap_v4_mapped(address);
+        let address = net_utils::unmap_v4_mapped(address);
 
         if (self.trust_all_ipv6_interfaces
             && AddressFamily::of(address) == AddressFamily::InterNetworkV6)
@@ -943,15 +1095,7 @@ impl NetworkManager {
             return None;
         }
 
-        // Handle override specifying a port.
-        let parts: Vec<&str> = bind_preference.split(':').collect();
-        if parts.len() > 1
-            && let Ok(p) = parts[1].parse::<u16>()
-        {
-            return Some((parts[0].to_owned(), Some(p)));
-        }
-
-        Some((bind_preference, None))
+        Some(parse_host_and_port(bind_preference))
     }
 
     /// Matches `source` against the user-defined bind interfaces
@@ -1045,16 +1189,6 @@ fn is_loopback(address: IpAddr) -> bool {
     }
 }
 
-/// Unwraps an IPv4-mapped IPv6 address to plain IPv4; others pass through.
-fn unmap_v4_mapped(address: IpAddr) -> IpAddr {
-    if let IpAddr::V6(v6) = address
-        && let Some(v4) = v6.to_ipv4_mapped()
-    {
-        return IpAddr::V4(v4);
-    }
-    address
-}
-
 /// Deduplicates while preserving first-seen order (C# `ToHashSet` keeps the
 /// set membership; order here only needs to be stable for `contains` checks).
 fn dedup(addresses: &mut Vec<IpAddr>) {
@@ -1080,4 +1214,77 @@ fn distinct_by_address(interfaces: Vec<IpData>) -> Vec<IpData> {
         }
     }
     result
+}
+
+/// `NetworkManager.ParseHostAndPort` (v12.2): a published-server override's
+/// host and explicit port. A full URL (`://`) is returned whole, its port
+/// left in it. Otherwise the value is read as the authority of
+/// `any://{value}`, the subset of `Uri.TryCreate` an override uses: a
+/// bracketed IPv6 literal or a host with one colon, followed by a port,
+/// gives the host (`DnsSafeHost`: unbracketed, lowercased) and the port;
+/// anything else — an unbracketed IPv6 literal, no port, a port that is not a
+/// number in range — is returned whole, with no port. Not read as `Uri`
+/// would: an IPv6 zone id (`[fe80::1%eth0]:80`, returned whole), userinfo
+/// (`user@host:80`), a path after the host, and a host with characters `Uri`
+/// refuses.
+fn parse_host_and_port(value: String) -> (String, Option<u16>) {
+    fn port(text: &str) -> Option<u16> {
+        text.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| text.parse().ok())
+            .flatten()
+    }
+    if value.contains("://") {
+        return (value, None);
+    }
+    let parsed = if let Some(rest) = value.strip_prefix('[') {
+        rest.split_once(']').and_then(|(host, tail)| {
+            let port = port(tail.strip_prefix(':')?)?;
+            let host: std::net::Ipv6Addr = host.parse().ok()?;
+            Some((host.to_string(), port))
+        })
+    } else {
+        value
+            .split_once(':')
+            .filter(|(host, _)| !host.is_empty())
+            .and_then(|(host, tail)| Some((host.to_ascii_lowercase(), port(tail)?)))
+    };
+    match parsed {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::parse_host_and_port;
+
+    /// What `Uri.TryCreate("any://" + value)` refuses, or gives no port for,
+    /// is returned whole; a parsed host is `DnsSafeHost`'s.
+    #[rstest]
+    #[case("Internal.Jellyfin:8097", "internal.jellyfin", Some(8097))]
+    #[case("[FD00:1234::1]:8097", "fd00:1234::1", Some(8097))]
+    #[case("[fd00:1234::1]", "[fd00:1234::1]", None)]
+    #[case("[not-ipv6]:8097", "[not-ipv6]:8097", None)]
+    #[case("host:", "host:", None)]
+    #[case("host:+80", "host:+80", None)]
+    #[case("host:70000", "host:70000", None)]
+    #[case(":8097", ":8097", None)]
+    #[case("host", "host", None)]
+    #[case("http://host:8097", "http://host:8097", None)]
+    #[case("host:0080", "host", Some(80))]
+    #[case("Host.LAN", "Host.LAN", None)]
+    #[case("[fe80::1%eth0]:80", "[fe80::1%eth0]:80", None)]
+    fn parse_host_and_port_reads_the_override_as_a_uri_authority(
+        #[case] value: &str,
+        #[case] host: &str,
+        #[case] port: Option<u16>,
+    ) {
+        assert_eq!(
+            parse_host_and_port(value.to_owned()),
+            (host.to_owned(), port)
+        );
+    }
 }

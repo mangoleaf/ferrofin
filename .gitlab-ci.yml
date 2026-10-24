@@ -24,11 +24,25 @@
 #   chart-vA.B.C  → chart only @ A.B.C
 #   main commit   → dev image v{M.m.p}-{N}-{sha12} when build-relevant paths change
 #   merge request → dev image v{M.m.p}-{branch-slug}-{N}-{sha12}, MANUAL (play
-#                   docker-image in the MR pipeline) — for homelab testing before merge
+#                   docker-image in the MR pipeline) — for homelab testing before merge;
+#                   a release/* MR always offers it (see image-version)
 #
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
 stages: [test, tag, build, release, chart]
+
+# A new push to a merge request replaces its still-running test jobs: the test-stage
+# jobs and their .pre helpers set `interruptible: true` on their merge-request rule
+# only, and `on_new_commit: interruptible` cancels exactly the interruptible jobs.
+# (The default, `conservative`, would cancel nothing once any non-interruptible job
+# had started, and a merge request that edits .gitlab-ci.yml or ci/*Dockerfile starts
+# ci-image, web-image and runtime-image.) Those image jobs, docker-image and the
+# release and chart jobs stay non-interruptible on purpose, so a new commit never
+# kills an image build mid-upload. main and tag pipelines never set it, so a newer
+# commit can never cancel them.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
 
 # Pinned jellyfin-web version — single source of truth. web-image builds
 # ci:web-$JELLYFIN_WEB_VERSION; the service image pulls it via WEB_IMAGE.
@@ -78,6 +92,10 @@ create-release:
     - job: request-release
     - job: lint
     - job: coverage
+      parallel:
+        matrix:
+          - SHARD: [core, heavy, rest]   # every shard; keep in step with the `coverage` job's matrix
+    - job: benchmark-report
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
@@ -255,6 +273,7 @@ sccache-creds:
     SCCACHE_VAULT_PATH: "secret/data/gitlab/sccache"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
   script:
@@ -285,6 +304,11 @@ sccache-creds:
     # published before lint/coverage pull it; ignored on runs where it's skipped.
     - job: ci-image
       optional: true
+  # Runs on failure too, in the job's container, so the sccache server started by
+  # .sccache-setup is still up. The creds are re-passed in case it is not. A no-op when
+  # sccache is off (no creds); the stats are informational, so never fail the job on them.
+  after_script:
+    - '[ -z "${SCCACHE_ACCESS_KEY:-}" ] || AWS_ACCESS_KEY_ID="$SCCACHE_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SCCACHE_SECRET_KEY" sccache --show-stats || true'
 
 # Install the sccache binary and enable it when Vault creds are present.
 # !reference'd as the first step of each rust job's before_script.
@@ -305,6 +329,19 @@ sccache-creds:
 # ---------------------------------------------------------------------------
 # test
 # ---------------------------------------------------------------------------
+benchmark-report:
+  stage: test
+  image: python:3.13-slim
+  script:
+    # Reporter correctness only; never run performance measurements on shared CI.
+    - python3 -m unittest discover -s gates/bench -p test_report.py
+    - python3 -m unittest discover -s gates/bench -p test_ramp.py
+    - python3 -m unittest discover -s gates/bench -p test_soak.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
 lint:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in
@@ -316,6 +353,9 @@ lint:
     # limit: `--all-targets` links every test binary, 16 concurrent rust-lld's
     # OOM-kill the job mid-link (same rationale as the GitHub workflow).
     CARGO_PROFILE_DEV_DEBUG: "0"
+    # Cap parallel rustc/linker processes: the workspace has enough crates that
+    # unrestricted parallelism peaks above 12Gi during the link phase.
+    CARGO_BUILD_JOBS: "4"
     # Build+run the real WASM example guest (ferrofin-wasm's end-to-end test)
     # so the WIT contract can't drift silently.
     FERROFIN_WASM_GUEST_TESTS: "1"
@@ -331,56 +371,55 @@ lint:
     - cargo test --workspace --doc   # nextest can't run doctests
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
 # The shell tooling has its own tests: scripts/version.sh and the adoption harness
-# (adoption/lib.sh driven with canned logs and throwaway SQLite files — no docker, no fixtures).
+# (gates/adoption/lib.sh driven with canned logs and throwaway SQLite files — no docker, no fixtures).
 shell-tests:
   stage: test
   image: alpine:3.22
   before_script:
     # Adoption checks invoke Python and use Pillow to validate preserved artwork.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml
   script:
-    - shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
-    - shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats
-    - bats scripts/tests adoption/tests
+    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh
+    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats
+    - bats scripts/tests gates/adoption/tests
+    - scripts/ci-config-check.sh check
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Per-crate 80% line-coverage gate. Gate EACH crate independently: a merged
-# `-p a -p b --fail-under-lines` check lets a sub-80% crate hide behind a
-# stronger sibling. Line coverage only (branch needs nightly; we pin stable).
+# Per-crate 80% line-coverage gate, run as three parallel shards from
+# scripts/coverage-gate.sh (which documents the rule and the shards). Each shard
+# pays its own build. The OOM limits below (CARGO_PROFILE_DEV_DEBUG,
+# CARGO_BUILD_JOBS) apply to each shard; shards that land on one runner add up.
 # Runs on MRs and main — a tag is cut from an already-green main, so it is not
 # re-gated on the release pipeline.
 coverage:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
+  parallel:
+    matrix:
+      - SHARD: [core, heavy, rest]
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    # Same 12Gi OOM as `lint` (see its variables): full-debuginfo links of the
+    # instrumented test binaries, many at once. Line coverage reads the coverage
+    # mapping sections, not DWARF, so dropping debuginfo changes no percentage.
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_BUILD_JOBS: "4"
   before_script:
     - !reference [.sccache-setup, script]
   script:
-    - |
-      set -euo pipefail
-      fail=0
-      # ferrofin-traits is exempt (trait definitions only — see CLAUDE.md).
-      for dir in crates/*/; do
-        crate=$(basename "$dir")
-        [ "$crate" = ferrofin-traits ] && continue
-        echo "── coverage: $crate ──"
-        # `-p X` still instruments X's workspace deps, so their (uncovered) source
-        # lands in the TOTAL the gate compares against. Exclude every sibling.
-        others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
-        cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
-          --ignore-filename-regex "(crates/($others)|apps)/" || fail=1
-      done
-      exit $fail
+    - scripts/coverage-gate.sh "$SHARD"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # ---------------------------------------------------------------------------
@@ -413,6 +452,10 @@ image-version:
       dotenv: image.env
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+    # A release/* MR is always build-worthy: its diff against main may be only
+    # docs and CI, but the branch carries all of main's code. No `changes:`.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^release\//'
+      interruptible: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - crates/**/*
@@ -421,6 +464,7 @@ image-version:
         - Cargo.lock
         - Dockerfile
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
       changes:
         - crates/**/*
         - apps/**/*
@@ -495,6 +539,10 @@ docker-image:
         - Cargo.toml
         - Cargo.lock
         - Dockerfile
+    # A release/* MR: always offer the button (no `changes:`, as in image-version).
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^release\//'
+      when: manual
+      allow_failure: true
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - crates/**/*

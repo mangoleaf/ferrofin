@@ -290,6 +290,60 @@ pub trait LibraryManager: Send + Sync {
         Ok(Some(item))
     }
 
+    /// `BaseItem.ContainingFolderPath`: the folder a folder content-type
+    /// override for `item` is keyed on. That is the item's own path for a
+    /// folder, a disc rip that is no placeholder and a by-name item, a
+    /// playlist file's directory, and the directory of its file (of the first
+    /// part, for a stack) otherwise. `None` for an item without a path.
+    ///
+    /// The default knows only folders and files.
+    async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
+        let path = item.path.as_deref()?;
+        if item.is_folder {
+            return Some(path.to_owned());
+        }
+        std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .map(str::to_owned)
+    }
+
+    /// `LibraryManager.GetInheritedContentType(item)`: the collection type of
+    /// the library `item`'s top folder belongs to, else the configured type
+    /// ([`Self::get_configured_content_type`]) of the parent farthest from
+    /// `item` that has one.
+    ///
+    /// The default finds none, for a seam without libraries.
+    async fn get_inherited_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(None)
+    }
+
+    /// `LibraryManager.GetConfiguredContentType(item)`: a library's own
+    /// collection type for its `CollectionFolder`, else the folder
+    /// content-type override (`ServerConfiguration.ContentTypes`) naming
+    /// `item`'s [`containing folder`](Self::containing_folder_path) exactly.
+    ///
+    /// The default finds none, for a seam without a configuration.
+    async fn get_configured_content_type(
+        &self,
+        _item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        Ok(None)
+    }
+
+    /// The [`InternalPeopleQuery::access_filter`] for `user`: `None` when
+    /// nothing is hidden from them (`PersonsController.BuildAccessFilter`).
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn build_access_filter(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Err(ServiceError::backend("access filtering is not configured"))
+    }
+
     /// `BaseItem.IsVisible`: the item's own policy, used by parent browse gates.
     /// Managers must supply policy evaluation; the default fails closed.
     async fn is_item_visible(
@@ -348,6 +402,23 @@ pub trait LibraryManager: Send + Sync {
         Ok(visible)
     }
 
+    /// The ids of `ids` that pass the parental check for `user`, in input
+    /// order: C# `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)`, the
+    /// rating, unrated and tag rules with no folder or library access check.
+    /// The DTO service filters a page's cast through it, as `AttachPeople`
+    /// does with `Person.IsVisible(user)`. The default applies the stricter
+    /// standalone check ([`Self::get_visible_item_ids`]), so an
+    /// implementation that does not override it never shows a person the user
+    /// may not see.
+    async fn get_parentally_allowed_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &UserEntity,
+        _skip_allowed_tags: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        self.get_visible_item_ids(ids, user).await
+    }
+
     /// Resolve the distinct physical owners whose extras an item presents.
     /// Concrete managers batch movie-version links and grouped-series folders.
     async fn get_extra_owner_ids_batch(
@@ -386,6 +457,21 @@ pub trait LibraryManager: Send + Sync {
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
         let _ = item_id;
         Ok(Vec::new())
+    }
+
+    /// [`Self::get_item_images`] in the same read as whether they are
+    /// auto-oriented when served; delegates to
+    /// [`ItemRepository::get_image_infos_with_auto_orient`](crate::persistence::ItemRepository::get_image_infos_with_auto_orient).
+    /// The default reads the images and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_item_images(item_id).await?, false))
     }
 
     /// The image of the item's `index`-th chapter, if it has one.
@@ -571,6 +657,25 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
+    /// Saves only `item`'s rating: its `OfficialRating` and the parental score
+    /// [`update_items`](Self::update_items) would re-derive from it, leaving
+    /// the rest of the stored row as it is. A box set or playlist re-rated
+    /// from its members (`BaseItem.UpdateRatingToItems`) saves through this,
+    /// so the rest of a row it read earlier never overwrites a concurrent
+    /// write — a share change to `Data` above all.
+    ///
+    /// The default is a no-op so the API-layer test doubles keep compiling;
+    /// the real manager writes through the item repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the score cannot be derived or the row
+    /// cannot be written.
+    async fn update_item_rating(&self, item: BaseItemEntity) -> Result<(), ServiceError> {
+        let _ = item;
+        Ok(())
+    }
+
     /// The locked metadata fields (upstream's `BaseItem.LockedFields`) of
     /// each of `item_ids`; an item with none is absent.
     ///
@@ -670,11 +775,40 @@ pub trait LibraryManager: Send + Sync {
         Err(ServiceError::backend("get_additional_parts not supported"))
     }
 
+    /// Replaces `item`'s cast and crew with `people` when its kind credits
+    /// any (`LibraryManager.UpdatePeople`, gated on `SupportsPeople`),
+    /// creating the `Person` item each new name needs. The default writes
+    /// nothing (stub and fake libraries).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[ferrofin_db::entities::base_items::PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        let _ = (item, people);
+        Ok(())
+    }
+
     /// Gets the people rows attached to an item.
     async fn get_people(
         &self,
         query: &InternalPeopleQuery,
     ) -> Result<Vec<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError>;
+
+    /// [`Self::get_people`] with the repository's total for the whole filtered
+    /// set (C# `IPeopleRepository.GetPeople` returns a `QueryResult`). The
+    /// default can only report the page it was handed; the concrete manager
+    /// overrides it with the repository's count.
+    async fn get_people_page(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError> {
+        let people = self.get_people(query).await?;
+        Ok(QueryResult::new(query.start_index, None, people))
+    }
 
     /// Gets the credited people for a set of item ids at once, keyed by item —
     /// the batch form used to project a page of DTOs without a per-item
@@ -833,26 +967,41 @@ pub trait LibraryManager: Send + Sync {
 
     /// Resolves the people matching `query` to their by-name `Person` item rows.
     ///
-    /// Port of `ILibraryManager.GetPeopleItems`: it fetches the credited people
-    /// via [`Self::get_people`], then resolves each name to its `Person`
-    /// [`BaseItemEntity`] (dropping any that no longer resolve), preserving the
-    /// people query's paging. The default folds the two calls so every impl gets
-    /// it for free from [`Self::get_people`] + [`Self::get_named_item`].
+    /// Port of `ILibraryManager.GetPeopleItems` (Jellyfin 12.2): it sets
+    /// [`must_have_item`](InternalPeopleQuery::must_have_item), fetches the
+    /// credited people via [`Self::get_people_page`], then resolves each name to
+    /// its `Person` [`BaseItemEntity`] (dropping any that no longer resolve, or
+    /// that the access filter's user may not see), preserving the people
+    /// query's paging. The total is the repository's, so
+    /// it counts exactly the people a page can hand back. The default folds the
+    /// calls so every impl gets it for free.
     async fn get_people_items(
         &self,
         query: &InternalPeopleQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let people = self.get_people(query).await?;
-        let names: Vec<String> = people.into_iter().map(|p| p.name).collect();
+        let query = InternalPeopleQuery {
+            must_have_item: true,
+            ..query.clone()
+        };
+        let page = self.get_people_page(&query).await?;
+        let names: Vec<String> = page.items.into_iter().map(|p| p.name).collect();
         let items: Vec<BaseItemEntity> = self
             .get_named_items(BaseItemKind::Person, &names)
             .await?
             .into_iter()
             .flatten()
             .collect();
+        // C# drops the people that fail `IsVisible(query.User)`. A person skips
+        // the allowed-tags check and an item-by-name is never blocked as
+        // unrated, so only a user with content restrictions — the one the
+        // access filter exists for — can fail it.
+        let items = match query.access_filter.as_ref().and_then(|f| f.user.as_ref()) {
+            Some(user) => self.filter_visible_items(items, user).await?,
+            None => items,
+        };
         Ok(QueryResult::new(
             query.start_index,
-            Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
+            Some(page.total_record_count),
             items,
         ))
     }
@@ -999,6 +1148,19 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<Vec<i32>, ServiceError> {
         Ok(self.get_query_filters_legacy(query).await?.years)
+    }
+
+    /// Gets the tag names of the matching items — the `Tags` facet of
+    /// `GET /Items/Filters2`.
+    ///
+    /// Port of `ILibraryManager.GetTagNames` (Jellyfin 12.1+, v12.2
+    /// `LibraryManager.cs:4203`): the `Tags` values (never `InheritedTags`) of
+    /// the items the query matches, one per clean value (its smallest
+    /// spelling), in value order. That is the legacy facet set's `tags`, which
+    /// the default reads; the repository-backed manager overrides it with the
+    /// one statement.
+    async fn get_tag_names(&self, query: &InternalItemsQuery) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(query).await?.tags)
     }
 
     /// Gets the distinct language codes of the matching items' media streams of
@@ -1156,6 +1318,23 @@ pub trait LibraryManager: Send + Sync {
         self.queue_library_scan().await.map(|()| true)
     }
 
+    /// Whether a full library validation is running: upstream's
+    /// `ILibraryManager.IsScanRunning`, which `ValidateMediaLibraryInternal`
+    /// holds for the whole of a full scan (the "Scan Media Library" task,
+    /// `POST /Library/Refresh`), its closing passes included. The library
+    /// monitor's path-scoped scans, one library's or one folder's refresh and
+    /// the item refreshes never enter that method upstream, so they do not
+    /// count.
+    ///
+    /// The database-heavy maintenance work stands down while it holds: the
+    /// "Optimize database" and "Refresh People" tasks skip their run, and
+    /// `POST /Backup/Create` refuses.
+    ///
+    /// A manager with no scanner runs no scan, so the default is `false`.
+    fn is_scan_running(&self) -> bool {
+        false
+    }
+
     /// Stops scanning for good, as the host tears down: cancels the running
     /// scan (it stops before its next item, the one in progress written
     /// whole), drops the queued ones, refuses new ones, and returns once no
@@ -1290,6 +1469,27 @@ pub trait UserManager: Send + Sync {
     /// Persists changes to a user row.
     async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError>;
 
+    /// The user write of `SessionManager.LogSessionActivity`
+    /// (`SessionManager.cs:262-275`): stamps `user`'s `LastActivityDate` with
+    /// `at`, never moving it backwards, and leaves the rest of the row as
+    /// stored. Upstream saves the whole user (`UpdateUserAsync`) to change
+    /// that one column.
+    ///
+    /// The default stamps nothing, so impls without a user store compile
+    /// unchanged; the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error the concrete write surfaces.
+    async fn record_user_activity(
+        &self,
+        user: &UserEntity,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ServiceError> {
+        let _ = (user, at);
+        Ok(())
+    }
+
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
@@ -1320,8 +1520,8 @@ pub trait UserManager: Send + Sync {
     /// Projects a user row into the full public [`UserDto`].
     ///
     /// Port of `UserManager.GetUserDto`: assembles the user's
-    /// [`UserConfiguration`](ferrofin_model::configuration::UserConfiguration) and
-    /// [`UserPolicy`](ferrofin_model::users::UserPolicy) from the `Users` row plus
+    /// [`UserConfiguration`] and
+    /// [`UserPolicy`] from the `Users` row plus
     /// its `Permissions`/`Preferences`/`AccessSchedules`. `server_id` is the
     /// hosting application's system id; `remote_endpoint` is accepted for parity
     /// (the profile-image cache tag it feeds is not yet ported).
@@ -1341,25 +1541,33 @@ pub trait UserManager: Send + Sync {
     /// Updates a user's policy (stopgap; prefer [`Self::update_user`]).
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError>;
 
-    /// Clears a user's profile image.
+    /// Clears a user's profile image: deletes the stored file (a missing file is
+    /// not an error) and the `ImageInfos` row, as `DELETE /UserImage` does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the file cannot be deleted for lack of
+    /// permission (C# `UnauthorizedAccessException`); the row is then kept.
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError>;
 
     /// Stores caller-supplied profile-image bytes for a user.
     ///
-    /// Port of the `POST /UserImage` tail: clear any existing profile image, write
-    /// the decoded bytes to the user's `profile{extension}` path, and persist the
-    /// user (`_providerManager.SaveImage(stream, mime, path)` +
+    /// Port of the `POST /UserImage` tail: replace any existing profile-image row
+    /// (like upstream, a previous file at a different path is left on disk), write
+    /// the decoded bytes to `{UserConfigurationDirectoryPath}/{Username}/profile{extension}`,
+    /// and persist the user (`_providerManager.SaveImage(stream, mime, path)` +
     /// `UpdateUserAsync`). `extension` is the image extension derived from the
     /// upload `Content-Type` (e.g. `.png`).
     ///
-    /// The default implementation reports the image pipeline as deferred (as the
-    /// shell provider manager does for `save_image`), so impls without a
+    /// The default implementation returns an error, so impls without a
     /// profile-image store compile unchanged; the concrete manager overrides it.
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] while the image store is deferred, or whatever
-    /// error the concrete write surfaces.
+    /// [`ServiceError::InvalidInput`] when the username would escape the user
+    /// configuration directory (C# `PathHelper.IsContainedIn` → `400 Invalid
+    /// user.`), [`ServiceError::Backend`] from the default implementation, or
+    /// whatever error the concrete write surfaces.
     async fn save_profile_image(
         &self,
         user: &UserEntity,
@@ -1410,6 +1618,60 @@ pub trait UserDataSaveListener: Send + Sync {
     ) -> Result<(), ServiceError>;
 }
 
+/// The audio and subtitle tracks a playback progress report names, with the
+/// user's "Remember audio selections" / "Remember subtitle selections"
+/// settings, which decide what is kept of them (C#
+/// `SessionManager.UpdatePlaybackSettings`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedStreams {
+    /// `PlaybackProgressInfo.AudioStreamIndex`.
+    pub audio_stream_index: Option<i32>,
+    /// `PlaybackProgressInfo.SubtitleStreamIndex`.
+    pub subtitle_stream_index: Option<i32>,
+    /// `User.RememberAudioSelections`.
+    pub remember_audio: bool,
+    /// `User.RememberSubtitleSelections`.
+    pub remember_subtitles: bool,
+}
+
+impl ReportedStreams {
+    /// Whether the report names a track of a kind the user does not want
+    /// remembered, which resets both of the user's remembered tracks for the
+    /// item (`OnPlaybackProgress`'s `ResetPlaybackStreamSelections` call,
+    /// v12.2 `SessionManager.cs:1009-1013`).
+    ///
+    /// Deliberately as upstream: with one setting on and the other off, the
+    /// reset also drops the index of the remembered kind that the same report
+    /// just saved. Keeping it would diverge from v12.2, which is the owner's
+    /// call (gl-116), not a fix to make here.
+    #[must_use]
+    pub fn resets_selections(&self) -> bool {
+        (!self.remember_audio && self.audio_stream_index.is_some())
+            || (!self.remember_subtitles && self.subtitle_stream_index.is_some())
+    }
+
+    /// Applies the report to the remembered `(audio, subtitle)` indices,
+    /// returning whether either changed — `UpdatePlaybackSettings` (v12.2
+    /// `SessionManager.cs:1016-1055`): with a setting on, a reported index
+    /// replaces the remembered one and a report without one keeps it; with a
+    /// setting off, the remembered index is cleared.
+    pub fn apply_to(&self, audio: &mut Option<i32>, subtitle: &mut Option<i32>) -> bool {
+        fn apply(remember: bool, reported: Option<i32>, kept: &mut Option<i32>) -> bool {
+            let next = if remember { reported.or(*kept) } else { None };
+            let changed = next != *kept;
+            *kept = next;
+            changed
+        }
+        let audio_changed = apply(self.remember_audio, self.audio_stream_index, audio);
+        let subtitle_changed = apply(
+            self.remember_subtitles,
+            self.subtitle_stream_index,
+            subtitle,
+        );
+        audio_changed || subtitle_changed
+    }
+}
+
 /// Reads and writes per-user, per-item playback/rating data.
 ///
 /// Port of `IUserDataManager`. User/item arguments become [`Uuid`] identities;
@@ -1436,6 +1698,45 @@ pub trait UserDataManager: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = reason;
         self.save_user_data(user_id, item_id, user_data).await
+    }
+
+    /// Gets the remembered audio and subtitle stream indices for an item.
+    ///
+    /// Port of the `UserDataManager.GetUserData(user, item)` call inside
+    /// `SetDefaultAudioAndSubtitleStreamIndices`: only the stream-index fields
+    /// are needed, so this avoids constructing the full DTO.  Returns
+    /// `(audio_stream_index, subtitle_stream_index)`, both `None` when no
+    /// user-data row exists.
+    async fn get_stream_default_data(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
+        let _ = (item_id, user_id);
+        Ok((None, None))
+    }
+
+    /// Batch form of [`Self::get_stream_default_data`] for one user across
+    /// many items, keyed by item id; an item that remembers neither index
+    /// (or has no user-data row) is absent.
+    ///
+    /// Lets the item DTO's `MediaSources` select each page item's default
+    /// streams (`GetStaticMediaSources(item, true, user)`, v12.2
+    /// `DtoService.cs:410`) in one read instead of one per item. The default
+    /// loops the single-item form; the concrete manager overrides it.
+    async fn get_stream_default_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, (Option<i32>, Option<i32>)>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &item_id in item_ids {
+            let remembered = self.get_stream_default_data(item_id, user_id).await?;
+            if remembered != (None, None) {
+                map.insert(item_id, remembered);
+            }
+        }
+        Ok(map)
     }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.
@@ -1471,11 +1772,11 @@ pub trait UserDataManager: Send + Sync {
     /// `UserDataManager.GetUserData(User, BaseItem)` synthesizes one keyed by
     /// `item.GetUserDataKeys()[0]` — `"Year-2020"` for a year, `"Studio-Acme"`
     /// for a studio, `"<series guid>001001"` for an episode. Deriving that needs
-    /// the item's *metadata*, not just its id, so the id-only batch above can
-    /// only ever answer with the guid.
+    /// the item's *metadata*, not just its id, so the id-only batch above has to
+    /// read every unwritten item's identity again to answer with it.
     ///
     /// The DTO service already holds the rows it is projecting, so passing them
-    /// through costs nothing and keeps the derivation off the N+1 path. The
+    /// through saves that read and keeps the derivation off the N+1 path. The
     /// default delegates to the id-only form, leaving fakes and any impl that
     /// has not overridden it exactly as they were.
     ///
@@ -1555,6 +1856,34 @@ pub trait UserDataManager: Send + Sync {
             .await
     }
 
+    /// Records a playback progress report for one user, returning whether the
+    /// item is now played to completion — C# `SessionManager.OnPlaybackProgress
+    /// (user, item, info)`: the reported position as [`Self::update_play_state`]
+    /// takes it, the reported tracks as `UpdatePlaybackSettings` keeps them
+    /// ([`ReportedStreams`]), one save for both (also when the report carries no
+    /// position but changes a track), then
+    /// [`Self::reset_playback_stream_selections`] when
+    /// [`ReportedStreams::resets_selections`] holds.
+    ///
+    /// The default saves only the position before the reset, so fakes compile
+    /// unchanged; the concrete manager keeps the tracks too.
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        let played = self
+            .update_play_state(user_id, item_id, reported_position_ticks)
+            .await?;
+        if streams.resets_selections() {
+            self.reset_playback_stream_selections(user_id, item_id)
+                .await?;
+        }
+        Ok(played)
+    }
+
     /// Records that playback of an item just started for a user.
     ///
     /// Port of the user-data half of C# `SessionManager.OnPlaybackStart`:
@@ -1577,7 +1906,11 @@ pub trait UserDataManager: Send + Sync {
     ///
     /// Port of `BaseItem.MarkPlayed`: sets `Played`, resets the resume position,
     /// stamps `LastPlayedDate` (defaulting to now), and — when `date_played` is
-    /// supplied — increments `PlayCount` (always at least one).
+    /// supplied — increments `PlayCount` (always at least one). A container (a
+    /// series, season, album, box set, playlist or folder) is not marked
+    /// itself: the `Folder`/`BoxSet` overrides mark the items under it. The DTO
+    /// is the container's user data, with its played state rolled up from
+    /// those items where the kind takes it from its children.
     async fn mark_played(
         &self,
         user_id: Uuid,
@@ -1588,7 +1921,9 @@ pub trait UserDataManager: Send + Sync {
     /// Marks an item as unplayed for a user, returning the refreshed data DTO.
     ///
     /// Port of `BaseItem.MarkUnplayed` / `ResetPlayedState`: clears `Played`,
-    /// the play count, the resume position, and `LastPlayedDate`.
+    /// the play count, the resume position, and `LastPlayedDate`. A container
+    /// resets the items under it instead, as [`Self::mark_played`] describes,
+    /// and drops any play state left on its own row.
     async fn mark_unplayed(
         &self,
         user_id: Uuid,
@@ -1677,10 +2012,10 @@ pub trait UserViewManager: Send + Sync {
     /// Port of `LibraryController.GetMediaFolders`, which returns
     /// `GetUserRootFolder().Children` sorted by `SortName`. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
-    /// only), this also includes the auto-provisioned
-    /// [`BaseItemKind`](ferrofin_model::data::BaseItemKind)`::ManualPlaylistsFolder`,
-    /// provisioning it on first read if absent (Jellyfin lazily materializes it as
-    /// a user-root child).
+    /// only), this also includes the playlists folder
+    /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to
+    /// clients), which startup provisions once, as Jellyfin's
+    /// `CreateRootFolder` does; a read never writes it.
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
     /// Gets the user's latest media, grouped by index container.
@@ -1690,8 +2025,8 @@ pub trait UserViewManager: Send + Sync {
     /// folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
     /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
     /// its own per-collection-type query instead
-    /// ([`ItemRepository::get_latest_item_list`] — the grouped-threshold form
-    /// for tvshows, the newest albums for music).
+    /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or
+    /// Series card per newest series for tvshows, the newest albums for music).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
     /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,
@@ -1907,6 +2242,49 @@ pub trait MediaSourceManager: Send + Sync {
     /// Gets an already-open live stream's media source by id.
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError>;
 
+    /// Resolves the media source a stream request reads, for direct play and
+    /// transcoding alike.
+    ///
+    /// Port of the selection in `StreamingHelpers.GetStreamingState`: an open
+    /// live stream (`live_stream_id`) wins outright, since its source is the
+    /// buffered copy of the tuner and the static sources would dial it again.
+    /// Otherwise the item's static sources (unsubstituted: the server reads
+    /// the file itself), taking the one `media_source_id` names, the first when
+    /// none is named, and the first when the named id is the item's own. An id
+    /// naming no source is `NotFound`, a deliberate divergence: upstream fails
+    /// the request by accident, `400` for an unknown GUID (a null-source
+    /// `ArgumentNullException`) and `500` for a non-GUID (`Guid.Parse`).
+    ///
+    /// TODO: two upstream steps are not ported. Upstream picks from
+    /// `GetPlaybackMediaSources`, whose list has symlinked paths resolved and is
+    /// ordered by `SortMediaSources` (placeholders dropped, widest first after
+    /// the preferred version). It also first reuses the source of the
+    /// `PlaySessionId`'s running transcode job. Fix path: select from
+    /// [`Self::get_playback_media_sources`] once it can be called without a
+    /// user, and look the job up through the transcode manager.
+    async fn get_stream_media_source(
+        &self,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+        live_stream_id: Option<&str>,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        if let Some(live_stream_id) = live_stream_id.map(str::trim).filter(|id| !id.is_empty()) {
+            return self.get_live_stream(live_stream_id).await;
+        }
+        let sources = self.get_static_media_sources(item_id, false, None).await?;
+        let chosen = match media_source_id.filter(|id| !id.is_empty()) {
+            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
+                Some(i) => sources.into_iter().nth(i),
+                None if Uuid::parse_str(id).is_ok_and(|g| g == item_id) => {
+                    sources.into_iter().next()
+                }
+                None => None,
+            },
+            None => sources.into_iter().next(),
+        };
+        chosen.ok_or_else(|| ServiceError::NotFound(format!("no media source for item {item_id}")))
+    }
+
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
 }
@@ -2008,6 +2386,106 @@ pub trait LibraryMonitor: Send + Sync {
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 
+/// The server's own file writes, which the library monitor must not take for
+/// a change to rescan: `ILibraryMonitor.ReportFileSystemChangeBeginning` and
+/// `ReportFileSystemChangeComplete` as upstream's writers call them around a
+/// subtitle, lyric, NFO or image save, and around a collection's or a
+/// playlist's folder. Synchronous, so a blocking write can bracket itself; a
+/// [`SelfWrite`] span ends a write on every way out, as upstream's `finally`.
+pub trait SelfWriteGuard: Send + Sync {
+    /// The server starts writing `path`: a change to it, under it, or to the
+    /// folder holding it is ignored until it completes.
+    fn begin(&self, path: &str);
+
+    /// The write to `path` is over. The change stays ignored a while longer,
+    /// since filesystem events often arrive late; with `refresh_path` the path
+    /// is then reported as changed.
+    fn complete(&self, path: &str, refresh_path: bool);
+}
+
+fn _assert_object_safe_self_write_guard(_: &dyn SelfWriteGuard) {}
+
+/// A [`SelfWriteGuard`] the composition root fills once the library monitor
+/// exists. The writers are built before the monitor, so they hold this slot;
+/// a write before it is filled is not bracketed, and the monitor watches
+/// nothing yet then.
+#[derive(Default)]
+pub struct SelfWriteSlot {
+    guard: std::sync::OnceLock<std::sync::Arc<dyn SelfWriteGuard>>,
+}
+
+impl std::fmt::Debug for SelfWriteSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfWriteSlot")
+            .field("filled", &self.guard.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SelfWriteSlot {
+    /// Fills the slot with the monitor's guard. The composition root fills
+    /// it once; a second call is ignored (and asserted against in debug
+    /// builds, as a wiring mistake).
+    pub fn set(&self, guard: std::sync::Arc<dyn SelfWriteGuard>) {
+        let first = self.guard.set(guard).is_ok();
+        debug_assert!(first, "SelfWriteSlot filled twice");
+    }
+}
+
+impl SelfWriteGuard for SelfWriteSlot {
+    fn begin(&self, path: &str) {
+        if let Some(guard) = self.guard.get() {
+            guard.begin(path);
+        }
+    }
+
+    fn complete(&self, path: &str, refresh_path: bool) {
+        if let Some(guard) = self.guard.get() {
+            guard.complete(path, refresh_path);
+        }
+    }
+}
+
+/// One server write under `path`: begun when created, completed (without a
+/// refresh, as every upstream writer does) when dropped, so an early return
+/// or an error still ends it. With no guard it does nothing.
+#[must_use = "the write is complete as soon as this is dropped"]
+pub struct SelfWrite {
+    guard: Option<std::sync::Arc<dyn SelfWriteGuard>>,
+    path: String,
+}
+
+impl std::fmt::Debug for SelfWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfWrite")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SelfWrite {
+    /// Begins the write of `path` on `guard`, when there is one.
+    pub fn begin(
+        guard: Option<&std::sync::Arc<dyn SelfWriteGuard>>,
+        path: impl Into<String>,
+    ) -> Self {
+        let path = path.into();
+        let guard = guard.cloned();
+        if let Some(guard) = &guard {
+            guard.begin(&path);
+        }
+        Self { guard, path }
+    }
+}
+
+impl Drop for SelfWrite {
+    fn drop(&mut self) {
+        if let Some(guard) = &self.guard {
+            guard.complete(&self.path, false);
+        }
+    }
+}
+
 /// Manages the on-disk **virtual-folder** tree that backs the library-structure
 /// admin routes (`/Library/VirtualFolders*`, `/Library/PhysicalPaths`).
 ///
@@ -2023,6 +2501,15 @@ fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 /// [`LibraryOptions`]. This trait models exactly that filesystem contract — it
 /// is independent of the DB-backed item tree, so a concrete impl only needs the
 /// root user-views path and is fully testable over a temp directory.
+///
+/// Every caller-supplied library name must denote one directory directly under
+/// that root, as upstream's `FileSystemHelper.GetChildPath` enforces: a blank
+/// name, `.`/`..`, an absolute path or anything with a separator never reaches
+/// the filesystem. A blank name to remove or rename is a
+/// [`ServiceError::InvalidInput`], as is a rename's new name that is not such a
+/// folder (checked before the current name); any other such name is a
+/// [`ServiceError::NotFound`] for the library being looked up. Adding a library
+/// named `.` or `..` de-duplicates it to `.2`/`..2`, as upstream does.
 ///
 /// The `refresh_library` flag and the C# `ILibraryMonitor` stop/start dance are
 /// dropped: the scan pipeline and filesystem watcher are later-wave subsystems,
@@ -2043,6 +2530,22 @@ pub trait VirtualFolderManager: Send + Sync {
     /// folder has not yet been materialized as an item).
     async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError>;
 
+    /// The configured libraries' names, item ids, locations, collection types
+    /// and options, for per-item and per-request lookups.
+    ///
+    /// Upstream reads these from memory: `LibraryManager.GetLibraryOptions(item)`
+    /// returns the `CollectionFolder`'s cached options, refreshed when they are
+    /// saved, and `CollectionFolder.CollectionType` is an item property. An
+    /// implementation may therefore serve a snapshot, as long as every change
+    /// made through this manager is visible to the next call. The refresh
+    /// state fields are not meaningful here; use
+    /// [`get_virtual_folders`](Self::get_virtual_folders) for the dashboard.
+    ///
+    /// The default lists the folders afresh.
+    async fn library_folders(&self) -> Result<std::sync::Arc<[VirtualFolderInfo]>, ServiceError> {
+        Ok(self.get_virtual_folders().await?.into())
+    }
+
     /// Adds a virtual folder with the given name, optional collection type,
     /// media paths, and library options.
     ///
@@ -2051,12 +2554,17 @@ pub trait VirtualFolderManager: Send + Sync {
     /// exists), each media path must exist on disk (else
     /// [`ServiceError::InvalidInput`]), the collection marker + `options.xml` are
     /// written, and one `.mblink` shortcut is created per media path.
+    ///
+    /// Returns the created library's `CollectionFolder` id (`None` when its
+    /// folder projects none). A caller acting on the new library must use it,
+    /// not `name`: sanitizing and de-duplicating can store it under another
+    /// name, possibly an existing library's.
     async fn add_virtual_folder(
         &self,
         name: &str,
         collection_type: Option<CollectionTypeOptions>,
         options: &LibraryOptions,
-    ) -> Result<(), ServiceError>;
+    ) -> Result<Option<Uuid>, ServiceError>;
 
     /// Removes the named virtual folder (its whole directory).
     ///
@@ -2176,6 +2684,19 @@ pub struct SimilarItemReference {
     pub score: Option<f32>,
 }
 
+/// One page of a remote similarity provider's references — what one step of
+/// the C# provider's `IAsyncEnumerable` walk yields (a TMDB results page).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SimilarItemsPage {
+    /// The page's references, in the provider's order. Empty when the walk is
+    /// over: no such page, the seed has no id the provider is keyed by, or the
+    /// source failed.
+    pub references: Vec<SimilarItemReference>,
+    /// How many pages the source reports in all (TMDB's `total_pages`); the
+    /// manager asks for the next page only below it.
+    pub total_pages: i32,
+}
+
 /// The query options a similarity provider is handed — port of
 /// `MediaBrowser.Controller.Library.SimilarItemsQuery`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2212,21 +2733,29 @@ pub trait RemoteSimilarItemsProvider: Send + Sync {
         None
     }
 
-    /// The similar-item references for `seed`.
+    /// Page `page` (1-based) of the similar-item references for `seed`.
+    ///
+    /// Upstream's provider is an `IAsyncEnumerable` that pages its source as
+    /// it is consumed, so the manager's early stop also stops the paging. Here
+    /// the manager drives the walk itself: page 1, then each next page while
+    /// the last one was not empty, is below its `total_pages`, and the manager
+    /// still wants references. A source with no pages answers everything on
+    /// page 1 and reports one page.
     ///
     /// `seed_provider_ids` are the seed's external ids (`BaseItemProviders`),
     /// resolved by the manager: a remote provider is keyed by one of them and
     /// has no repository of its own. C# reads them off the item, which carries
     /// its `ProviderIds` dictionary in memory.
     ///
-    /// Best-effort: a provider that fails returns an empty list rather than an
-    /// error, matching the C# manager's per-provider `catch`.
-    async fn get_similar_items(
+    /// Best-effort: a provider that fails returns an empty page rather than an
+    /// error, matching the C# provider's `yield break` on a failed request.
+    async fn similar_items_page(
         &self,
         seed: &BaseItemEntity,
         seed_provider_ids: &std::collections::HashMap<String, String>,
         query: &SimilarItemsQuery,
-    ) -> Vec<SimilarItemReference>;
+        page: i32,
+    ) -> SimilarItemsPage;
 }
 
 fn _assert_object_safe_remote_similar_items_provider(_: &dyn RemoteSimilarItemsProvider) {}
@@ -2278,6 +2807,52 @@ mod tests {
     };
     use ferrofin_model::dto::RecommendationType;
     use ferrofin_model::entities::ImageType;
+    use std::sync::Arc;
+
+    use super::{SelfWrite, SelfWriteGuard, SelfWriteSlot};
+
+    /// A [`SelfWriteGuard`] recording each call, in order.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl SelfWriteGuard for Recording {
+        fn begin(&self, path: &str) {
+            self.0.lock().unwrap().push(format!("begin {path}"));
+        }
+        fn complete(&self, path: &str, refresh_path: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {path} {refresh_path}"));
+        }
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A [`SelfWrite`] begins when made and completes, without a refresh,
+    /// when dropped; the slot forwards only once filled, and no guard is no
+    /// bracketing.
+    #[test]
+    fn a_self_write_completes_when_dropped_and_the_slot_forwards_once_filled() {
+        let slot = Arc::new(SelfWriteSlot::default());
+        let guard: Arc<dyn SelfWriteGuard> = slot.clone();
+        drop(SelfWrite::begin(Some(&guard), "/media/a.srt"));
+        let recording = Arc::new(Recording::default());
+        slot.set(recording.clone());
+        {
+            let _write = SelfWrite::begin(Some(&guard), "/media/b.srt");
+            assert_eq!(recording.calls(), ["begin /media/b.srt"]);
+        }
+        drop(SelfWrite::begin(None, "/media/c.srt"));
+        assert_eq!(
+            recording.calls(),
+            ["begin /media/b.srt", "complete /media/b.srt false"]
+        );
+    }
 
     #[test]
     fn only_backdrop_and_chapter_allow_multiple_images() {
@@ -2298,6 +2873,57 @@ mod tests {
         ] {
             assert!(!image_type_allows_multiple(other), "{other:?}");
         }
+    }
+
+    /// `UpdatePlaybackSettings` and the reset condition (v12.2
+    /// `SessionManager.cs:1009-1055`, jellyfin#16769 and #17044), for one kind
+    /// (audio): `(remember, reported, stored) → (kept, changed, resets)`.
+    #[test]
+    fn reported_streams_keep_and_reset_as_upstream() {
+        use super::ReportedStreams;
+        for (remember, reported, stored, kept, changed, resets) in [
+            // On: a new index is saved, the same one is no change, none keeps it.
+            (true, Some(2), Some(1), Some(2), true, false),
+            (true, Some(1), Some(1), Some(1), false, false),
+            (true, None, Some(1), Some(1), false, false),
+            (true, Some(2), None, Some(2), true, false),
+            // Off: the stored index is cleared; a reported one also resets.
+            (false, None, Some(1), None, true, false),
+            (false, None, None, None, false, false),
+            (false, Some(2), Some(1), None, true, true),
+            (false, Some(2), None, None, false, true),
+        ] {
+            let streams = ReportedStreams {
+                audio_stream_index: reported,
+                subtitle_stream_index: None,
+                remember_audio: remember,
+                remember_subtitles: true,
+            };
+            let (mut audio, mut subtitle) = (stored, None);
+            let case = format!("{remember} {reported:?} {stored:?}");
+            assert_eq!(
+                streams.apply_to(&mut audio, &mut subtitle),
+                changed,
+                "{case}"
+            );
+            assert_eq!(audio, kept, "{case}");
+            assert_eq!(subtitle, None, "{case}");
+            assert_eq!(streams.resets_selections(), resets, "{case}");
+        }
+
+        // Mixed: audio remembered, subtitles not, and the report names both.
+        // The audio index is kept by `apply_to` and the subtitle one cleared,
+        // and the report still resets both afterwards, as upstream.
+        let mixed = ReportedStreams {
+            audio_stream_index: Some(2),
+            subtitle_stream_index: Some(4),
+            remember_audio: true,
+            remember_subtitles: false,
+        };
+        let (mut audio, mut subtitle) = (Some(1), Some(3));
+        assert!(mixed.apply_to(&mut audio, &mut subtitle));
+        assert_eq!((audio, subtitle), (Some(2), None));
+        assert!(mixed.resets_selections());
     }
 
     #[test]

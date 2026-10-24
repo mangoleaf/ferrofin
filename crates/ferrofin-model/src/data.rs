@@ -401,6 +401,19 @@ crate::json::enums::wire_enum! {
     }
 }
 
+impl PersonKind {
+    /// A stored `PersonType` read back the way upstream's `PeopleRepository`
+    /// does (`Enum.TryParse<PersonKind>(row.PersonType, out var kind)`): a
+    /// member name, case-sensitively, or the C# value of an integer, with
+    /// surrounding white space ignored and a comma list OR'ed
+    /// ([`crate::json::enums::try_parse`]); anything else is
+    /// [`PersonKind::Unknown`], the `default` the failed parse leaves.
+    #[must_use]
+    pub fn from_stored(value: &str) -> Self {
+        crate::json::enums::try_parse(value, false).unwrap_or(Self::Unknown)
+    }
+}
+
 /// The base item kind (generated upstream from all `BaseItem` subclasses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

@@ -226,17 +226,28 @@ pub fn path_protocol(path: &str) -> MediaProtocol {
     MediaProtocol::File
 }
 
-/// Whether a tuner URL's host is on the local network.
-///
-/// Port of the state-free subset of `NetworkManager.IsInLocalNetwork`: loopback,
-/// the RFC 1918 / RFC 4193 private ranges and link-local addresses are local. A
-/// host that is not an IP literal is treated as remote, the way the C# check
-/// falls through when the name resolves to nothing on the LAN.
+/// `NetworkManager.IsInLocalNetwork(string)`: whether a tuner URL's host
+/// (an IP literal or a host name, which the real check resolves) is on the
+/// local network as the server's network policy defines it. The composition
+/// root supplies the configured `NetworkManager`'s answer.
+pub type LocalNetworkCheck = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The answer when no [`LocalNetworkCheck`] is wired (unit tests): loopback,
+/// the RFC 1918 / RFC 4193 private ranges and link-local addresses are local,
+/// an IPv4-mapped IPv6 address counting as the IPv4 address it is. A host that
+/// is not an IP literal counts as remote, because nothing here resolves names
+/// and the configured subnets are unknown.
 #[must_use]
 pub fn is_in_local_network(host: &str) -> bool {
     // An IPv6 literal in a URL is bracketed.
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<std::net::IpAddr>() {
+    let address = host
+        .parse::<std::net::IpAddr>()
+        .map(|address| match address {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, std::net::IpAddr::V4),
+            std::net::IpAddr::V4(_) => address,
+        });
+    match address {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         // `fc00::/7` is IPv6's private range; `fe80::/10` is link-local.
         Ok(std::net::IpAddr::V6(v6)) => {
@@ -248,8 +259,9 @@ pub fn is_in_local_network(host: &str) -> bool {
     }
 }
 
-/// The host component of a URL, or `None` when it does not parse as one.
-fn url_host(url: &str) -> Option<&str> {
+/// The host component of a URL (`Uri.Host`, an IPv6 literal kept in its
+/// brackets), or `None` when it does not parse as one.
+pub(crate) fn url_host(url: &str) -> Option<&str> {
     let after_scheme = url.split_once("://")?.1;
     let authority = after_scheme.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
@@ -268,13 +280,22 @@ fn url_host(url: &str) -> Option<&str> {
 /// two placeholder `Index = -1` streams (the container's real layout is unknown
 /// until something probes it), `RequiresOpening`/`RequiresClosing`, and the
 /// tuner host's own switches (looping, tuner count, DTS, native framerate, fMP4
-/// container, fallback bitrate, user agent).
+/// container, fallback bitrate, user agent). `is_remote` is whether the URL's
+/// host is off the local network (`!IsInLocalNetwork(uri.Host)`, and remote
+/// when the URL has no host), which the caller decides.
 #[must_use]
-pub fn create_media_source_info(path: &str, tuner: &TunerHostInfo) -> MediaSourceInfo {
-    let supports_direct_play = !tuner.enable_stream_looping && tuner.tuner_count == 0;
+pub fn create_media_source_info(
+    path: &str,
+    tuner: &TunerHostInfo,
+    is_remote: bool,
+) -> MediaSourceInfo {
+    let mut supports_direct_play = !tuner.enable_stream_looping && tuner.tuner_count == 0;
     let supports_direct_stream = !tuner.enable_stream_looping;
+
+    if is_manifest_path(path) {
+        supports_direct_play = false;
+    }
     let protocol = path_protocol(path);
-    let is_remote = url_host(path).is_none_or(|host| !is_in_local_network(host));
 
     let mut required_http_headers = std::collections::HashMap::new();
     if protocol == MediaProtocol::Http {
@@ -376,31 +397,44 @@ fn clear_non_positive_f32(value: &mut Option<f32>) {
 }
 
 /// The share decision `M3UTunerHost.GetChannelStream` makes from the stream
-/// URL's file extension: `Some(true)`/`Some(false)` when the URL carries one,
-/// `None` when it does not (upstream then falls back to a `HEAD` probe of the
-/// `Content-Type`).
-#[must_use]
-pub fn extension_can_share(url: &str) -> Option<bool> {
-    // `Path.GetExtension(new UriBuilder(path).Path)` — only the URL's PATH is
-    // examined, so neither the query string, the fragment, nor the host's own
-    // dots (`http://tuner.example.com`) ever supply the extension.
+/// Extracts the file extension from a URL, ignoring query/fragment and authority dots.
+fn url_extension(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let path = match path.split_once("://") {
-        // Everything from the first `/` after the authority; a URL with no path
-        // at all is `/`, which has no extension.
         Some((_, rest)) => rest.find('/').map_or("/", |at| &rest[at..]),
         None => path,
     };
     let last_segment = path.rsplit('/').next().unwrap_or("");
     let (_, extension) = last_segment.rsplit_once('.')?;
     if extension.is_empty() {
-        return None;
+        None
+    } else {
+        Some(extension)
     }
+}
+
+/// URL's file extension: `Some(true)`/`Some(false)` when the URL carries one,
+/// `None` when it does not (upstream then falls back to a `HEAD` probe of the
+/// `Content-Type`).
+#[must_use]
+pub fn extension_can_share(url: &str) -> Option<bool> {
+    let extension = url_extension(url)?;
     Some(
         EXTENSIONS_CAN_SHARE_HTTP_STREAM
             .iter()
             .any(|e| e.eq_ignore_ascii_case(extension)),
     )
+}
+
+/// Whether a channel path points at an HLS or DASH manifest rather than a byte stream.
+fn is_manifest_path(path: &str) -> bool {
+    const MANIFEST_EXTENSIONS: &[&str] = &["m3u8", "m3u", "mpd"];
+    let Some(ext) = url_extension(path) else {
+        return false;
+    };
+    MANIFEST_EXTENSIONS
+        .iter()
+        .any(|m| ext.eq_ignore_ascii_case(m))
 }
 
 /// Whether a `HEAD` `Content-Type` allows sharing the tuner's HTTP stream.
@@ -648,10 +682,12 @@ impl Drop for SharingGuard {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        LiveStreamHandle, LiveStreamKind, TunerStreamBody, TunerStreamSource, extension_can_share,
-        mime_type_can_share, open_shared_http_stream,
+        LiveStreamHandle, LiveStreamKind, TunerStreamBody, TunerStreamSource,
+        create_media_source_info, extension_can_share, is_manifest_path, mime_type_can_share,
+        open_shared_http_stream,
     };
     use async_trait::async_trait;
+    use ferrofin_model::live_tv::TunerHostInfo;
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::error::ServiceError;
     use std::collections::HashMap;
@@ -741,6 +777,32 @@ pub(crate) mod tests {
         // Nor does the host's own dots, on a URL with no path.
         assert_eq!(extension_can_share("http://tuner.example.com"), None);
         assert_eq!(extension_can_share("http://tuner.example.com/"), None);
+    }
+
+    #[test]
+    fn manifest_paths_are_detected() {
+        assert!(is_manifest_path("http://tuner/live.m3u8"));
+        assert!(is_manifest_path("http://tuner/live.M3U8?token=x"));
+        assert!(is_manifest_path("http://tuner/live.m3u"));
+        assert!(is_manifest_path("http://tuner/live.mpd"));
+        assert!(!is_manifest_path("http://tuner/live.ts"));
+        assert!(!is_manifest_path("http://tuner/live"));
+        assert!(!is_manifest_path("http://tuner/live.mkv"));
+    }
+
+    #[test]
+    fn manifest_channel_disables_direct_play() {
+        let tuner = TunerHostInfo {
+            enable_stream_looping: false,
+            tuner_count: 0,
+            ..TunerHostInfo::default()
+        };
+        let source = create_media_source_info("http://tuner/live.m3u8", &tuner, false);
+        assert!(!source.supports_direct_play);
+        assert!(source.supports_direct_stream);
+
+        let ts_source = create_media_source_info("http://tuner/live.ts", &tuner, false);
+        assert!(ts_source.supports_direct_play);
     }
 
     #[test]

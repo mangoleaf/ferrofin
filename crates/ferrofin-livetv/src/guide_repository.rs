@@ -35,7 +35,7 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// Fails when the database read fails.
 pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
                          WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsMovie" = 1) AS "IsMovie",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
@@ -404,6 +404,48 @@ pub async fn existing_config_id(
         .map_err(db_err)
 }
 
+/// Stores a listings provider's row (`Type`, `Path` and the JSON `Data`),
+/// first renaming the stored row to `id` when `renamed_from` is the same id
+/// spelled differently.
+///
+/// The configuration half of `ListingsManager.SaveListingProvider`, whose
+/// `config.ListingProviders[index] = info` keeps the posted spelling of a
+/// matched id. One transaction, so a failed write leaves the old row as it was.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub async fn store_listing_provider(
+    db: &Database,
+    renamed_from: Option<&str>,
+    id: &str,
+    provider_type: &str,
+    path: &str,
+    data: &str,
+) -> Result<(), ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    if let Some(stored) = renamed_from.filter(|stored| *stored != id) {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvListingProviders" SET "Id" = ?1 WHERE "Id" = ?2"#)
+            .bind(id)
+            .bind(stored)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
+           ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
+    )
+    .bind(id)
+    .bind(provider_type)
+    .bind(path)
+    .bind(data)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)
+}
+
 /// The tuner-facing external id of one channel, or `None` when the lineup does
 /// not hold it (or holds it empty, as a row written before migration 0023).
 ///
@@ -543,6 +585,22 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every programme item's genre links as `(Id, genre)`, ordered — the
+    /// `ItemValues` the guide refresh's mirror wrote for its airings.
+    pub async fn program_genre_links(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT bi."Id", v."Value" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               JOIN "BaseItems" bi ON bi."Id" = m."ItemId"
+               WHERE bi."Type" = ?1 AND v."Type" = 2
+               ORDER BY bi."Id", v."Value""#,
+        )
+        .bind(crate::projection::PROGRAM_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// Marks an item favourite for a user, the way the playstate path stores it.
     pub async fn seed_favorite(
         db: &Database,
@@ -561,6 +619,25 @@ pub mod test_support {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// The item holding `user_id`'s favourite row keyed `key`, if any: the
+    /// channel itself, or the deletion placeholder a removed channel's rows
+    /// are parked on.
+    pub async fn favorite_holder(
+        db: &Database,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        sqlx::query_scalar(
+            r#"SELECT "ItemId" FROM "UserData"
+               WHERE "UserId" = ?1 AND "CustomDataKey" = ?2 AND "IsFavorite" = 1"#,
+        )
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
     }
 
     /// Pins every channel's `DateCreated` to a sentinel value.

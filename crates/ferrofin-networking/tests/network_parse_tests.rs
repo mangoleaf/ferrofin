@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use common::CapturingLogger;
 use ferrofin_networking::net_utils;
@@ -18,6 +18,14 @@ fn split(s: &str, sep: char) -> Vec<String> {
 }
 
 const MOCK_INTERFACES: &str = "192.168.1.208/24,-16,eth16|200.200.200.200/24,11,eth11";
+
+/// Stands in for DNS, as [`MOCK_INTERFACES`] stands in for the host's
+/// interfaces: `jellyfin.org` is a public address (from `TEST-NET-3`), and
+/// every other name, `invalid.domain.test` included, resolves to nothing.
+/// Upstream resolves `jellyfin.org` live, so its cases need working DNS.
+fn fake_dns(host: &str) -> Option<Vec<IpAddr>> {
+    (host == "jellyfin.org").then(|| vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))])
+}
 
 /// `IgnoreVirtualInterfaces`.
 #[rstest]
@@ -250,10 +258,11 @@ fn test_bind_interfaces(
         enable_ipv4: true,
         ..Default::default()
     };
-    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
+    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES).with_resolver(fake_dns);
 
-    // Check to see if DNS resolution is working. If not, skip test.
-    if net_utils::try_parse_host(source, true, ipv6enabled).is_none() {
+    // Upstream skips a source DNS cannot resolve (`invalid.domain.test`); with
+    // `fake_dns` that is every name but `jellyfin.org`.
+    if net_utils::try_parse_host_with(source, true, ipv6enabled, fake_dns).is_none() {
         return;
     }
 
@@ -340,7 +349,7 @@ fn test_bind_interface_overrides(
         published_server_uri_by_subnet: vec![published_servers.to_owned()],
         ..Default::default()
     };
-    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
+    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES).with_resolver(fake_dns);
 
     let mut result = result.to_owned();
     if let Some(result_obj) = nm.try_parse_interface(&result) {
@@ -349,6 +358,69 @@ fn test_bind_interface_overrides(
 
     let (intf, _) = nm.get_bind_address(source);
     assert_eq!(result, intf);
+}
+
+/// `GetBindAddress_PublishedServerOverride_ParsesHostAndPort` (v12.2): a
+/// published-server override's host and explicit port, an IPv6 literal kept
+/// whole, a full URL left as it is.
+#[rstest]
+// Internal override with an explicit port.
+#[case(
+    "192.168.1.1",
+    "192.168.1.0/24=internal.jellyfin:8097",
+    "internal.jellyfin",
+    Some(8097)
+)]
+// External/all override with an explicit port.
+#[case(
+    "8.8.8.8",
+    "all=external.jellyfin:8097",
+    "external.jellyfin",
+    Some(8097)
+)]
+// Bracketed IPv6 override with an explicit port.
+#[case("8.8.8.8", "all=[fd00:1234::1]:8097", "fd00:1234::1", Some(8097))]
+// Bare IPv6 override without a port - must remain whole, not mangled by the extra colons.
+#[case("8.8.8.8", "all=fd00:1234::1", "fd00:1234::1", None)]
+// Full HTTPS URL override with an explicit port - the URL stays whole, port stays embedded.
+#[case(
+    "8.8.8.8",
+    "all=https://secure.jellyfin.org:8920",
+    "https://secure.jellyfin.org:8920",
+    None
+)]
+// Hostname beginning with "http" is a hostname, not a URL scheme.
+#[case("8.8.8.8", "all=http-proxy.lan:8097", "http-proxy.lan", Some(8097))]
+// Literal "internal" keyword override (applies to every LAN subnet) with an explicit port.
+#[case(
+    "192.168.1.1",
+    "internal=myhost.internal:8097",
+    "myhost.internal",
+    Some(8097)
+)]
+// Literal "external" keyword override with an explicit port.
+#[case(
+    "8.8.8.8",
+    "external=myhost.external:9090",
+    "myhost.external",
+    Some(9090)
+)]
+fn get_bind_address_published_server_override_parses_host_and_port(
+    #[case] source: &str,
+    #[case] published_servers: &str,
+    #[case] expected_host: &str,
+    #[case] expected_port: Option<u16>,
+) {
+    let conf = NetworkConfiguration {
+        local_network_subnets: vec!["192.168.1.0/24".to_owned()],
+        local_network_addresses: vec!["eth16".to_owned(), "eth11".to_owned()],
+        enable_ipv4: true,
+        published_server_uri_by_subnet: vec![published_servers.to_owned()],
+        ..Default::default()
+    };
+    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES).with_resolver(fake_dns);
+    let (host, port) = nm.get_bind_address(source);
+    assert_eq!((host.as_str(), port), (expected_host, expected_port));
 }
 
 /// `HasRemoteAccess_GivenWhitelist_AllowsOnlyIPsInWhitelist`.
@@ -559,4 +631,61 @@ fn startup_published_server_url_override_wins() {
     );
     let (intf, _) = nm.get_bind_address("192.168.1.1");
     assert_eq!(intf, "http://startup.example");
+}
+
+/// `InitializeOverrides_FullUrlPublicPathDiffersFromBaseUrl_LogsWarning`: the
+/// overrides `WarnIfPublishedUrlBasePathDiffers` warns about. Ferrofin's app
+/// host does the logging, against the mounted base URL.
+#[rstest]
+// Full-URL override with a different public path: warn about the Live TV fallback.
+#[case("all=https://media.example.com", "/jellyfin", true)]
+// Full-URL override that ends with the base URL (with and without a trailing slash): no warning.
+#[case("all=https://media.example.com/jellyfin", "/jellyfin", false)]
+#[case("all=https://media.example.com/jellyfin/", "/jellyfin", false)]
+#[case("all=https://media.example.com/media/jellyfin", "/jellyfin", false)]
+#[case("all=https://media.example.com/cool%20server", "/cool server", false)]
+// A similar segment or a path following the base URL is a different public API base.
+#[case("all=https://media.example.com/jellyfinx", "/jellyfin", true)]
+#[case("all=https://media.example.com/jellyfin/media", "/jellyfin", true)]
+// No base URL configured: there is no path to compare.
+#[case("all=https://media.example.com", "", false)]
+// Bare host overrides get the base URL appended when the API URL is built: no warning.
+#[case("all=media.example.com", "/jellyfin", false)]
+#[case("internal=http-proxy.lan:8097", "/jellyfin", false)]
+// Keyword overrides go through the same check as "all".
+#[case("internal=http://10.0.0.5:8096", "/jellyfin", true)]
+fn initialize_overrides_full_url_public_path_differs_from_base_url_logs_warning(
+    #[case] published_servers: &str,
+    #[case] base_url: &str,
+    #[case] expect_warning: bool,
+) {
+    let conf = NetworkConfiguration {
+        local_network_subnets: vec!["192.168.1.0/24".to_owned()],
+        local_network_addresses: vec!["eth16".to_owned()],
+        enable_ipv4: true,
+        published_server_uri_by_subnet: vec![published_servers.to_owned()],
+        ..Default::default()
+    };
+    let nm = NetworkManager::with_defaults(conf, "192.168.1.208/24,-16,eth16");
+    let overrides: Vec<&str> = nm
+        .published_server_urls()
+        .iter()
+        .map(|entry| entry.override_uri.as_str())
+        .collect();
+    assert!(!overrides.is_empty(), "the override was parsed");
+    let warned = ferrofin_networking::published_urls_missing_base_url(overrides, base_url);
+    assert_eq!(!warned.is_empty(), expect_warning, "{warned:?}");
+}
+
+/// `InitializeOverrides_StartupPublishedServerUrlPathDiffersFromBaseUrl_LogsWarningWithoutCredentials`:
+/// only the host and port of the override are reported.
+#[test]
+fn a_published_url_warning_names_only_its_host_and_port() {
+    assert_eq!(
+        ferrofin_networking::published_urls_missing_base_url(
+            ["https://user:password@media.example.com?access_token=secret#fragment"],
+            "/jellyfin",
+        ),
+        vec!["media.example.com:443".to_owned()]
+    );
 }

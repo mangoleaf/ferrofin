@@ -9,7 +9,8 @@
 //! - `GET  /Users` — list users (optionally filtered by hidden/disabled).
 //! - `GET  /Users/Public` — the login-screen-visible subset.
 //! - `GET  /Users/{userId}` — a single user by id.
-//! - `DELETE /Users/{userId}` — delete a user (revoking its tokens first).
+//! - `DELETE /Users/{userId}` — delete a user (revoking its tokens first),
+//!   then hand over or delete the playlists it owned.
 //! - `POST /Users/New` — create a user (optionally with a password).
 //! - `POST /Users` — update a user's name/configuration.
 //! - `POST /Users/{userId}/Policy` — update a user's policy.
@@ -31,12 +32,11 @@
 //!   [`is_administrator`].
 //! - `ServerId` (a client-cosmetic display field) is left unset: sourcing it
 //!   needs `IApplicationHost.SystemId`, which is not exposed at this layer.
-//! - The `PlaylistManager.RemovePlaylistsAsync` cleanup on delete is deferred
-//!   (no playlist manager at this layer); token revocation + user deletion run.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_db::entities::users::UserEntity;
@@ -55,7 +55,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{JsonBody, ProblemDetails, Query};
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
@@ -78,9 +78,11 @@ struct AuthenticateByNameRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct QuickConnectDto {
-    /// The Quick Connect secret returned by the initiate endpoint.
+    /// The Quick Connect secret returned by the initiate endpoint. Upstream
+    /// marks it `[Required]`, so the handler refuses a missing, `null` or
+    /// blank one.
     #[serde(default)]
-    secret: Secret,
+    secret: Option<Secret>,
 }
 
 /// The `POST /Users/New` request body.
@@ -306,7 +308,7 @@ pub(crate) async fn user_policy(
 
 /// Ports C# `RequestHelpers.AssertCanUpdateUser`: the caller may update `target`
 /// when the caller is an administrator, or when the caller *is* the target.
-async fn assert_can_update_user(
+pub(crate) async fn assert_can_update_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     target: &UserEntity,
@@ -451,7 +453,9 @@ async fn authenticate(
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
 ///
 /// Port of `UserController.AuthenticateWithQuickConnect`: exchanges an authorized
-/// Quick Connect secret for a session.
+/// Quick Connect secret for the session and token opened when its code was
+/// authorized. It never authenticates again: a second login would count the
+/// authorize-time session against `MaxActiveSessions` and orphan its token.
 #[utoipa::path(
     post,
     path = "/Users/AuthenticateWithQuickConnect",
@@ -460,39 +464,28 @@ async fn authenticate(
 )]
 async fn authenticate_with_quick_connect(
     State(state): State<AppState>,
-    parts: Parts,
     JsonBody(body): JsonBody<QuickConnectDto>,
-) -> Result<Json<AuthenticationResult>, ApiError> {
-    // Validate the secret (it has already been authorized on another device),
-    // then open a session for that user *directly* — no password — so the client
-    // receives a real `AccessToken` instead of thinking it logged in with none.
-    let session = state
-        .quick_connect
-        .get_authorized_request(body.secret.expose())
-        .await?;
-    let auth = auth_info(&parts);
-    let request = AuthenticationRequest {
-        username: None,
-        user_id: Some(session.user_id),
-        password: None,
-        app: auth.client,
-        app_version: auth.version,
-        device_id: auth.device_id,
-        device_name: auth.device,
-        // As on the password path: C# fills this from
-        // `HttpContext.GetNormalizedRemoteIP()`.
-        remote_endpoint: Some(state.client_address(&parts).to_string()),
+) -> Result<Response, ApiError> {
+    // `[Required]` model validation runs before the action and refuses a
+    // blank string (`IsNullOrWhiteSpace`) as well as a missing one.
+    let Some(secret) = body.secret.filter(|s| !s.expose().trim().is_empty()) else {
+        return Ok(
+            ProblemDetails::member_validation("Secret", "The Secret field is required.")
+                .into_response(),
+        );
     };
-    let result = state.sessions.authenticate_direct(&request).await?;
-    Ok(Json(authentication_result(&state, result).await))
+    let result = state
+        .quick_connect
+        .get_authorized_request(secret.expose())
+        .await?;
+    Ok(Json(authentication_result(&state, result).await).into_response())
 }
 
 /// Assembles the [`AuthenticationResult`] wire body from an authenticated
 /// session and its minted access token.
 ///
 /// The token is echoed back to the client as `AccessToken` so subsequent
-/// requests can authenticate; a genuinely empty token (e.g. the Quick Connect
-/// seam that does not carry one) collapses to `None`.
+/// requests can authenticate.
 async fn authentication_result(
     state: &AppState,
     result: AuthenticationResultData,
@@ -520,7 +513,7 @@ async fn authentication_result(
     AuthenticationResult {
         user: Some(user),
         session_info: Some(session),
-        access_token: (!access_token.expose().is_empty()).then_some(access_token),
+        access_token: Some(access_token),
         server_id,
     }
 }
@@ -646,8 +639,17 @@ async fn get_user_by_id(
 
 /// `DELETE /Users/{userId}` — delete a user.
 ///
-/// Port of `UserController.DeleteUser`: revokes the user's tokens, then deletes
-/// the user. (The playlist cleanup is deferred — see the module note.)
+/// Port of `UserController.DeleteUser`: revokes the user's tokens, deletes the
+/// user, then hands over or deletes the playlists they owned
+/// ([`PlaylistManager::remove_playlists`](ferrofin_traits::collections::PlaylistManager::remove_playlists)).
+///
+/// Upstream does the playlists between the two, before `DeleteUserAsync`,
+/// whose last-user / last-admin refusal then leaves the user in place with
+/// their playlists already given away or deleted. Here a refused delete
+/// touches no playlist (a Jellyfin bug not ported). The deletion's activity
+/// entry and `UserDeleted` message go out before the playlists, as upstream
+/// raises them inside `DeleteUserAsync`, so a failed hand-over (an error
+/// response, the user already deleted) cannot skip them.
 #[utoipa::path(
     delete,
     path = "/Users/{userId}",
@@ -694,6 +696,7 @@ async fn delete_user(
             )
             .await;
     }
+    state.playlists.remove_playlists(user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

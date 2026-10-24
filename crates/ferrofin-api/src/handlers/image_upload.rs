@@ -14,9 +14,15 @@ use ferrofin_model::net::mime_types;
 /// Decodes a standard (RFC 4648) base64 string into bytes, returning `None` on
 /// any invalid character.
 ///
-/// Port of the `GetFromBase64Stream` decode the image/user/splashscreen upload
-/// handlers apply to the request body (the workspace has no base64 dependency).
-/// Whitespace is ignored and `=` padding is accepted.
+/// Port of the `FromBase64Transform` decode the image/user/splashscreen and
+/// subtitle upload handlers apply to the request body (the workspace has no
+/// base64 dependency). Whitespace is ignored. `=` is accepted only as trailing
+/// padding, at most two followed by nothing but whitespace, and refused inside
+/// the data, as `Base64.DecodeFromUtf8` refuses it. `FromBase64Transform` also
+/// silently drops a trailing partial group (fewer than four characters): an
+/// unpadded or short padded final group (`aGk`, `aG=`), a third `=`, or a partial
+/// group after the padding. This decodes the final group in full and refuses the
+/// other two (Jellyfin bugs not ported).
 #[must_use]
 pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     fn val(b: u8) -> Option<u8> {
@@ -32,9 +38,20 @@ pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
+    let mut padding = 0u8;
     for &b in input.as_bytes() {
-        if b == b'=' || b.is_ascii_whitespace() {
+        if b.is_ascii_whitespace() {
             continue;
+        }
+        if b == b'=' {
+            padding += 1;
+            if padding > 2 {
+                return None;
+            }
+            continue;
+        }
+        if padding > 0 {
+            return None;
         }
         let v = val(b)?;
         acc = (acc << 6) | u32::from(v);
@@ -48,34 +65,43 @@ pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Extracts the bare image MIME type from a request `Content-Type` header.
-///
-/// Port of `ImageController.TryGetImageExtensionFromContentType`'s validation
-/// half: strips any `;charset=…`/parameters, and returns the media type only when
-/// it is a known image type. `None` for a missing, non-image, or unknown type
-/// (the C# `BadRequest("Incorrect ContentType.")` outcome).
-#[must_use]
-pub(crate) fn image_mime_from_content_type(content_type: Option<&str>) -> Option<String> {
-    let raw = content_type?.split(';').next()?.trim().to_ascii_lowercase();
-    if raw.is_empty() || !mime_types::is_image(&raw) {
-        return None;
-    }
-    Some(raw)
+/// An image upload's validated `Content-Type`: the media type the bytes are
+/// saved as, and the file extension that type is stored under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageContentType {
+    /// The bare media type, lowercased and without parameters (`image/png`).
+    pub(crate) mime_type: String,
+    /// The file extension, with its leading dot (`.png`).
+    pub(crate) extension: &'static str,
 }
 
-/// The filename extension for an image `Content-Type`, e.g. `image/png` → `.png`.
+/// Validates an upload's `Content-Type` and resolves its file extension.
 ///
-/// Port of the extension half of `TryGetImageExtensionFromContentType`
-/// (`MimeTypes.ToExtension`). `None` when the type is not a known image type.
+/// Port of `ImageController.TryGetImageExtensionFromContentType`: strips any
+/// `;charset=…`/parameters, and succeeds only for an `image/…` type that
+/// `MimeTypes.ToExtension` maps to an extension. `None` for a missing, empty,
+/// non-image or unknown image type, which every upload route (`PostUserImage`,
+/// `SetItemImage`, `SetItemImageByIndex`, `UploadCustomSplashscreen`) answers
+/// with `400 Incorrect ContentType.`.
 #[must_use]
-pub(crate) fn image_extension_from_content_type(content_type: Option<&str>) -> Option<String> {
-    let mime = image_mime_from_content_type(content_type)?;
-    mime_types::to_extension(&mime).map(ToOwned::to_owned)
+pub(crate) fn try_get_image_extension_from_content_type(
+    content_type: Option<&str>,
+) -> Option<ImageContentType> {
+    let mime_type = content_type?.split(';').next()?.trim().to_ascii_lowercase();
+    if !mime_types::is_image(&mime_type) {
+        return None;
+    }
+    let extension = mime_types::to_extension(&mime_type)?;
+    Some(ImageContentType {
+        mime_type,
+        extension,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_base64, image_extension_from_content_type, image_mime_from_content_type};
+    use super::{ImageContentType, decode_base64, try_get_image_extension_from_content_type};
+    use rstest::rstest;
 
     #[test]
     fn decodes_padded_base64_with_whitespace() {
@@ -84,31 +110,78 @@ mod tests {
         assert_eq!(decode_base64("aG k=\n").as_deref(), Some(&b"hi"[..]));
     }
 
+    /// `FromBase64Transform` (`Base64.DecodeFromUtf8`) takes `=` only as the
+    /// final padding; inside the data it is invalid (gl-689). The trailing
+    /// partial group upstream silently drops is decoded in full when it is data
+    /// and refused when it is a third `=` or data after the padding.
+    #[rstest::rstest]
+    #[case::empty("", Some(&b""[..]))]
+    #[case::one_padding_char("aGk=", Some(&b"hi"[..]))]
+    #[case::two_padding_chars("aA==", Some(&b"h"[..]))]
+    #[case::longer_padded("aGVsbG8=", Some(&b"hello"[..]))]
+    #[case::unpadded("aGk", Some(&b"hi"[..]))]
+    #[case::whitespace_after_padding("aGk= \r\n", Some(&b"hi"[..]))]
+    #[case::whitespace_between_padding_chars("aA= =", Some(&b"h"[..]))]
+    #[case::padding_inside_a_group("aG=k", None)]
+    #[case::padding_between_groups("aGk=aGk=", None)]
+    #[case::data_after_the_padding("aGk=x", None)]
+    #[case::three_padding_chars("aG===", None)]
+    fn padding_is_accepted_only_at_the_end(#[case] input: &str, #[case] expected: Option<&[u8]>) {
+        assert_eq!(decode_base64(input).as_deref(), expected);
+    }
+
     #[test]
     fn rejects_non_base64() {
         assert!(decode_base64("not*base64").is_none());
     }
 
-    #[test]
-    fn image_mime_strips_parameters_and_validates() {
+    /// Upstream `ImageControllerTests.TryGetImageExtensionFromContentType_Valid_True`,
+    /// plus `image/jpg` (Jellyfin 12's `MimeTypes._extensionLookup` entry).
+    #[rstest]
+    #[case("image/apng", ".apng")]
+    #[case("image/avif", ".avif")]
+    #[case("image/bmp", ".bmp")]
+    #[case("image/gif", ".gif")]
+    #[case("image/x-icon", ".ico")]
+    #[case("image/jpeg", ".jpg")]
+    #[case("image/png", ".png")]
+    #[case("image/png; charset=utf-8", ".png")]
+    #[case("image/svg+xml", ".svg")]
+    #[case("image/tiff", ".tiff")]
+    #[case("image/webp", ".webp")]
+    #[case("image/jpg", ".jpg")]
+    fn try_get_image_extension_from_content_type_valid_true(
+        #[case] content_type: &str,
+        #[case] extension: &str,
+    ) {
+        let parsed = try_get_image_extension_from_content_type(Some(content_type))
+            .expect("a known image type");
+        assert_eq!(parsed.extension, extension);
+    }
+
+    /// Upstream `ImageControllerTests.TryGetImageExtensionFromContentType_InValid_False`,
+    /// plus image types `ToExtension` knows no extension for.
+    #[rstest]
+    #[case(None)]
+    #[case(Some(""))]
+    #[case(Some("text/html"))]
+    #[case(Some("image/x-unknown"))]
+    #[case(Some("image/"))]
+    fn try_get_image_extension_from_content_type_invalid_false(#[case] content_type: Option<&str>) {
         assert_eq!(
-            image_mime_from_content_type(Some("image/png; charset=binary")).as_deref(),
-            Some("image/png")
+            try_get_image_extension_from_content_type(content_type),
+            None
         );
-        assert_eq!(
-            image_mime_from_content_type(Some("IMAGE/JPEG")).as_deref(),
-            Some("image/jpeg")
-        );
-        assert!(image_mime_from_content_type(Some("application/json")).is_none());
-        assert!(image_mime_from_content_type(None).is_none());
     }
 
     #[test]
-    fn extension_maps_image_type() {
+    fn image_content_type_is_the_bare_lowercased_media_type() {
         assert_eq!(
-            image_extension_from_content_type(Some("image/png")).as_deref(),
-            Some(".png")
+            try_get_image_extension_from_content_type(Some(" IMAGE/JPEG ; charset=binary")),
+            Some(ImageContentType {
+                mime_type: "image/jpeg".to_owned(),
+                extension: ".jpg",
+            })
         );
-        assert!(image_extension_from_content_type(Some("text/plain")).is_none());
     }
 }

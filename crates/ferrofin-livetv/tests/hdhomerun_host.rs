@@ -297,3 +297,98 @@ async fn validate_clears_the_model_cache_before_re_reading() {
     host.validate(&mut info).await.expect("validate");
     assert_eq!(info.device_id.as_deref(), Some("10xxxxx5"));
 }
+
+// ---------------------------------------------------------------- streamed JSON
+
+/// Long enough for every request below to finish, short enough that one which
+/// buffers an endless body fails here instead of hanging the run.
+const GUARD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A device whose `endless` document (`discover.json` or `lineup.json`) is an
+/// MPEG-TS stream that never ends, as a tuner URL pointing at a channel
+/// stream serves; its `discover.json` is otherwise valid and points the lineup
+/// back at this peer. The stream is paced, so a client that buffers it
+/// instead of parsing it grows slowly rather than exhausting the host.
+async fn serve_endless(endless: &'static str) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listen");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let discover = format!(r#"{{"ModelNumber":"HDHR5-4US","TunerCount":4,"BaseURL":"{base}"}}"#);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let discover = discover.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 1024];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                if !path.ends_with(endless) {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discover}",
+                        discover.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+                if socket.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                // TS packets: a 0x47 sync byte, then 187 bytes of payload.
+                let mut packets = vec![0_u8; 188 * 64];
+                for packet in packets.chunks_mut(188) {
+                    packet[0] = 0x47;
+                }
+                while socket.write_all(&packets).await.is_ok() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            });
+        }
+    });
+    base
+}
+
+/// `GetModelInfo` reads `discover.json` with `ReadFromJsonAsync`, which parses
+/// the body as it arrives (v12.2 HdHomerunHost.cs:125-128): a URL serving a
+/// channel stream fails at its first byte instead of being buffered forever.
+#[tokio::test]
+async fn an_endless_non_json_discover_fails_at_once() {
+    let base = serve_endless("discover.json").await;
+    let host = HdHomerunHost::new(Arc::new(ReqwestFetcher::new()));
+    let outcome = tokio::time::timeout(GUARD, host.get_model_info(&tuner(&base), true))
+        .await
+        .expect("the endless discover.json was buffered instead of parsed");
+    let err = outcome.expect_err("an MPEG-TS stream is not a discover.json");
+    assert!(err.to_string().contains("discover.json"), "{err}");
+}
+
+/// `GetLineup` reads `lineup.json` the same way (v12.2 HdHomerunHost.cs:77-78).
+#[tokio::test]
+async fn an_endless_non_json_lineup_fails_at_once() {
+    let base = serve_endless("lineup.json").await;
+    let host = HdHomerunHost::new(Arc::new(ReqwestFetcher::new()));
+    let outcome = tokio::time::timeout(GUARD, host.get_lineup(&tuner(&base)))
+        .await
+        .expect("the endless lineup.json was buffered instead of parsed");
+    let err = outcome.expect_err("an MPEG-TS stream is not a lineup");
+    assert!(err.to_string().contains("lineup.json"), "{err}");
+}
+
+/// `ReadFromJsonAsync` skips a UTF-8 byte-order mark before the document.
+#[tokio::test]
+async fn a_utf8_bom_before_discover_json_is_skipped() {
+    let url = serve_once(
+        "200 OK",
+        "\u{FEFF}{\"ModelNumber\":\"HDHR5-4US\",\"TunerCount\":4}",
+    )
+    .await;
+    let host = HdHomerunHost::new(Arc::new(ReqwestFetcher::new()));
+    let model = host
+        .get_model_info(&tuner(&url), true)
+        .await
+        .expect("a BOM is not part of the JSON");
+    assert_eq!(model.model_number.as_deref(), Some("HDHR5-4US"));
+    assert_eq!(model.tuner_count, 4);
+}

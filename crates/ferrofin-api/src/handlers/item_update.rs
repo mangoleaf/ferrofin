@@ -18,10 +18,12 @@
 //! ids, then cascaded as the C# `UpdateItem` does: a series' name, rating and
 //! tag edits onto its seasons and their episodes, a season's onto its
 //! episodes, an album's onto its tracks (each child's own `LockedFields`
-//! honoured), and a change of `LockData` onto every descendant of a folder.
+//! honoured, and a changed rating only onto the children that followed the
+//! old one), and a change of `LockData` onto every descendant of a folder.
 //!
-//! TODO(parity, open work item): one part of `UpdateItem` is not ported yet —
-//! the `request.People` write (`_libraryManager.UpdatePeople`).
+//! The item's people (`request.People`) are written first, through
+//! [`LibraryManager::update_people`](ferrofin_traits::library::LibraryManager::update_people),
+//! so the metadata savers that follow read them.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -29,13 +31,14 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::dto::{MetadataEditorInfo, NameGuidPair, NameValuePair};
-use ferrofin_model::entities::MetadataField;
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_model::data::{BaseItemKind, CollectionType, PersonKind};
+use ferrofin_model::dto::{DayOfWeek, MetadataEditorInfo, NameGuidPair, NameValuePair};
+use ferrofin_model::entities::{MetadataField, SeriesStatus, Video3DFormat};
 use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
 use crate::handlers::refresh_scan_path;
 use serde::Deserialize;
@@ -77,11 +80,27 @@ pub(crate) async fn update_item(
     let current_tags = split_list(item.tags.as_deref());
     // `displayOrderChanged`: only a series, compared case-insensitively with
     // null as empty (`ItemUpdateController.cs:83-86`).
-    let series_display_order_changed = BaseItemKind::from_stored_type_name(&item.type_)
-        == Some(BaseItemKind::Series)
+    let is_series = BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::Series);
+    let series_display_order_changed = is_series
         && !stored_display_order(&item)
             .unwrap_or_default()
             .eq_ignore_ascii_case(request.display_order.as_deref().unwrap_or_default());
+    // `previousOfficialRating` / `previousCustomRating` (v12.2
+    // `ItemUpdateController.cs:295-296`): the cascade moves only the children
+    // that followed the item's rating before the edit.
+    let previous_ratings = Ratings::of(&item);
+    // A series' `Status` must parse (`GetSeriesStatus`, only in the series
+    // branch), checked before anything is written. Upstream's throw comes
+    // after `UpdatePeople`, leaving the people written; here nothing is.
+    if is_series {
+        parse_series_status(request.status.as_deref()).map_err(ApiError::BadRequest)?;
+    }
+    // "Do this first so that metadata savers can pull the updates from the
+    // database" (`ItemUpdateController.cs:93-103`).
+    if let Some(people) = &request.people {
+        let people: Vec<PeopleEntity> = people.iter().filter_map(PersonRequest::entity).collect();
+        state.library.update_people(&item, &people).await?;
+    }
     // `item.IsLocked = request.LockData ?? false` (`ItemUpdateController.cs:
     // 418`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
@@ -117,7 +136,7 @@ pub(crate) async fn update_item(
             .update_item_locked_fields(item_id, fields)
             .await?;
     }
-    cascade_to_children(&state, &item, &request, &current_tags).await?;
+    cascade_to_children(&state, &item, &previous_ratings, &request, &current_tags).await?;
     // `if (displayOrderChanged) QueueRefresh(series, FullRefresh/FullRefresh,
     // ReplaceAllMetadata, High)` (`:120-132`): the episodes are renumbered under
     // the new order.
@@ -243,6 +262,104 @@ pub(crate) struct UpdateItemRequest {
     /// set's member ordering — assigned as sent, a null clearing it.
     #[serde(default)]
     display_order: Option<String>,
+    /// `IHasAspectRatio.AspectRatio` — a video's display aspect ratio (the
+    /// editor's "Original aspect ratio") — assigned as sent, a null clearing it.
+    #[serde(default)]
+    aspect_ratio: Option<String>,
+    /// The item's cast and crew, replacing its credits when present.
+    #[serde(default)]
+    people: Option<Vec<PersonRequest>>,
+    /// `Series.Status` as sent; read by [`parse_series_status`] on a series
+    /// only, as upstream reads it.
+    #[serde(default)]
+    status: Option<String>,
+    /// `Series.AirDays`: with [`Self::air_time`], written only when present.
+    #[serde(default)]
+    air_days: Option<Vec<DayOfWeek>>,
+    /// `Series.AirTime`, written with the air days.
+    #[serde(default)]
+    air_time: Option<String>,
+    /// `Episode.AirsBeforeSeasonNumber` — a special's placement.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    airs_before_season_number: Option<i32>,
+    /// `Episode.AirsAfterSeasonNumber`.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    airs_after_season_number: Option<i32>,
+    /// `Episode.AirsBeforeEpisodeNumber`.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    airs_before_episode_number: Option<i32>,
+    /// `Video.Video3DFormat`, a null clearing it.
+    #[serde(default, rename = "Video3DFormat")]
+    video3d_format: Option<Video3DFormat>,
+    /// A Live TV channel's `Height`, written only when present.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    height: Option<i32>,
+    /// A series' `RunTimeTicks` (a file's comes from its probe).
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
+    run_time_ticks: Option<i64>,
+}
+
+/// One `BaseItemPerson` of the request: what `UpdateItem` keeps of it
+/// (`new PersonInfo { Name, Role, Type }`). An absent `Type` is
+/// `PersonKind.Unknown`, the C# default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct PersonRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default, rename = "Type")]
+    kind: Option<PersonKind>,
+}
+
+impl PersonRequest {
+    /// The credit to write; a person with no name is none. (Upstream's
+    /// `UpdatePeople` trims the name and fails the request on a null one;
+    /// dropping the entry keeps the rest of the edit.)
+    fn entity(&self) -> Option<PeopleEntity> {
+        let name = self
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())?;
+        Some(PeopleEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            name: name.to_owned(),
+            person_type: Some(
+                self.kind
+                    .unwrap_or(PersonKind::Unknown)
+                    .json_name()
+                    .into_owned(),
+            ),
+            role: self.role.clone(),
+            primary_image_url: None,
+            provider_id: None,
+            sort_order: None,
+        })
+    }
+}
+
+/// `GetSeriesStatus`: null or empty is no status, else a member name
+/// ignoring case or its number, 0–2 only (`Enum.Parse<SeriesStatus>(…,
+/// true)` also takes any integer and comma lists, meaningless here).
+///
+/// # Errors
+///
+/// Any other value. Upstream's `Enum.Parse` throws there and the request
+/// ends in a 500; the handler answers 400 instead.
+fn parse_series_status(value: Option<&str>) -> Result<Option<SeriesStatus>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    [
+        ("Continuing", "0", SeriesStatus::Continuing),
+        ("Ended", "1", SeriesStatus::Ended),
+        ("Unreleased", "2", SeriesStatus::Unreleased),
+    ]
+    .into_iter()
+    .find(|(name, number, _)| value.eq_ignore_ascii_case(name) || value == *number)
+    .map(|(_, _, status)| Some(status))
+    .ok_or_else(|| format!("'{value}' is no SeriesStatus"))
 }
 
 /// Deserializes `LockedFields` the way `JsonStringEnumConverter` reads an
@@ -337,8 +454,9 @@ fn apply_update(
         BaseItemKind::from_stored_type_name(&item.type_),
         Some(BaseItemKind::Series | BaseItemKind::BoxSet)
     ) {
-        set_stored_display_order(item, request.display_order.as_deref());
+        set_data_string(item, "DisplayOrder", request.display_order.as_deref());
     }
+    apply_kind_fields(item, request);
 
     if let Some(album) = &request.album {
         item.album = Some(album.clone());
@@ -359,6 +477,69 @@ fn apply_update(
     }
 }
 
+/// The fields `UpdateItem` writes only on some kinds: a video's aspect ratio
+/// and 3D format, an episode's special placement, a series' runtime, status
+/// and air schedule, a Live TV channel's height.
+fn apply_kind_fields(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
+    // `if (item is IHasAspectRatio hasAspectRatio) hasAspectRatio.AspectRatio =
+    // request.AspectRatio` (`ItemUpdateController.cs:417-420`): `Video` and its
+    // subclasses, kept in `Data` beside the disc format.
+    if super::videos::is_video(item) {
+        set_data_string(item, "AspectRatio", request.aspect_ratio.as_deref());
+        // `video.Video3DFormat = request.Video3DFormat` (`:434-437`).
+        set_data_value(
+            item,
+            "Video3DFormat",
+            request
+                .video3d_format
+                .and_then(|format| serde_json::to_value(format).ok()),
+        );
+    }
+    let kind = BaseItemKind::from_stored_type_name(&item.type_);
+    match kind {
+        // `episode.AirsAfterSeasonNumber = …` (`:259-264`), kept in `Data`
+        // compactly, where the `AiredDuringSeason` filter matches them.
+        Some(BaseItemKind::Episode) => {
+            for (key, value) in [
+                ("AirsAfterSeasonNumber", request.airs_after_season_number),
+                (
+                    "AirsBeforeEpisodeNumber",
+                    request.airs_before_episode_number,
+                ),
+                ("AirsBeforeSeasonNumber", request.airs_before_season_number),
+            ] {
+                set_data_value(item, key, value.map(serde_json::Value::from));
+            }
+        }
+        // "Only allow this for series. Runtimes for media comes from
+        // ffprobe" (`:423-427`); then `series.Status`, and the air days and
+        // time when the days are sent (`:465-473`).
+        Some(BaseItemKind::Series) => {
+            item.run_time_ticks = request.run_time_ticks;
+            set_data_value(
+                item,
+                "Status",
+                // Validated in `update_item` before anything was written.
+                parse_series_status(request.status.as_deref())
+                    .ok()
+                    .flatten()
+                    .and_then(|status| serde_json::to_value(status).ok()),
+            );
+            if let Some(days) = &request.air_days {
+                set_data_value(item, "AirDays", serde_json::to_value(days).ok());
+                set_data_string(item, "AirTime", request.air_time.as_deref());
+            }
+        }
+        // `if (request.Height is not null && item is LiveTvChannel channel)`.
+        Some(BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel) => {
+            if let Some(height) = request.height {
+                item.height = Some(i64::from(height));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The `DisplayOrder` kept in the row's `Data`, if any.
 fn stored_display_order(item: &BaseItemEntity) -> Option<String> {
     item.data
@@ -371,19 +552,25 @@ fn stored_display_order(item: &BaseItemEntity) -> Option<String> {
         })
 }
 
-/// Stores `order` as the row's `DisplayOrder` in its `Data`; `None` removes it.
-fn set_stored_display_order(item: &mut BaseItemEntity, order: Option<&str>) {
+/// Stores `value` under `key` in the row's `Data`; `None` removes it.
+fn set_data_string(item: &mut BaseItemEntity, key: &str, value: Option<&str>) {
+    set_data_value(item, key, value.map(serde_json::Value::from));
+}
+
+/// Stores `value` under `key` in the row's `Data`, serialized compactly
+/// (`"Key":value`); `None` removes it.
+fn set_data_value(item: &mut BaseItemEntity, key: &str, value: Option<serde_json::Value>) {
     let mut data: serde_json::Map<String, serde_json::Value> = item
         .data
         .as_deref()
         .and_then(|data| serde_json::from_str(data).ok())
         .unwrap_or_default();
-    match order {
-        Some(order) => {
-            data.insert("DisplayOrder".to_owned(), order.into());
+    match value {
+        Some(value) => {
+            data.insert(key.to_owned(), value);
         }
         None => {
-            data.remove("DisplayOrder");
+            data.remove(key);
         }
     }
     item.data = (!data.is_empty()).then(|| serde_json::Value::Object(data).to_string());
@@ -502,35 +689,104 @@ async fn children_of(
         .await?)
 }
 
-/// The rating and tag half of the cascade on one child, skipping a field in
-/// the child's own `LockedFields` (`ItemUpdateController.cs:321-381`):
+/// A season's episodes for the cascade. Upstream walks `season.Children`,
+/// its `ParentId` children, which misses the episodes of a virtual season:
+/// they are stored under the series (`CreateSeasonsAsync` links them by
+/// `SeasonId` only). ACCEPTED DIVERGENCE (don't-port-bugs): they are reached
+/// here by ancestry, so a season's rating and tag edits reach every episode
+/// it lists.
+async fn season_episodes_of(
+    state: &AppState,
+    season: Uuid,
+) -> Result<Vec<BaseItemEntity>, ApiError> {
+    Ok(state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            ancestor_ids: vec![season],
+            include_item_types: vec![BaseItemKind::Episode],
+            recursive: true,
+            ..InternalItemsQuery::default()
+        })
+        .await?)
+}
+
+/// An item's `OfficialRating` and `CustomRating`, the pair the cascade
+/// passes down.
+struct Ratings {
+    official: Option<String>,
+    custom: Option<String>,
+}
+
+impl Ratings {
+    fn of(item: &BaseItemEntity) -> Self {
+        Self {
+            official: item.official_rating.clone(),
+            custom: item.custom_rating.clone(),
+        }
+    }
+}
+
+/// `GetPropagatedRating` (v12.2 `ItemUpdateController.cs:489`): when the
+/// parent's rating moved from `previous` to `new` (ordinal-ignore-case, null
+/// as empty), a child with no rating or with `previous` follows it to `new`;
+/// a child with a rating of its own, or any child when the parent's rating
+/// did not change, keeps its rating.
+fn propagate_rating(child: &mut Option<String>, previous: Option<&str>, new: Option<&str>) {
+    let previous = previous.unwrap_or_default();
+    if equals_ordinal_ignore_case(previous, new.unwrap_or_default()) {
+        return;
+    }
+    if child
+        .as_deref()
+        .is_none_or(|rating| rating.is_empty() || equals_ordinal_ignore_case(rating, previous))
+    {
+        *child = new.map(ToOwned::to_owned);
+    }
+}
+
+/// The rating and tag half of the cascade on one child, as its parent's
+/// ratings moved from `previous` to `new`, skipping a field in the child's
+/// own `LockedFields` (v12.2 `ItemUpdateController.cs:317-402`):
 /// `OfficialRating` unless locked, `CustomRating` always, the tag edit
 /// unless `Tags` is locked.
 fn cascade_onto(
     child: &mut BaseItemEntity,
     locked: &[MetadataField],
-    official_rating: Option<&String>,
-    custom_rating: Option<&String>,
+    previous: &Ratings,
+    new: &Ratings,
     tags: &TagEdit,
 ) {
     if !locked.contains(&MetadataField::OfficialRating) {
-        child.official_rating = official_rating.cloned();
+        propagate_rating(
+            &mut child.official_rating,
+            previous.official.as_deref(),
+            new.official.as_deref(),
+        );
     }
-    child.custom_rating = custom_rating.cloned();
+    propagate_rating(
+        &mut child.custom_rating,
+        previous.custom.as_deref(),
+        new.custom.as_deref(),
+    );
     if !locked.contains(&MetadataField::Tags) {
         tags.apply(child);
     }
 }
 
-/// Port of the child walks in `ItemUpdateController.UpdateItem`
-/// (`ItemUpdateController.cs:315-381`): a `Series` passes its name, rating
-/// and tag edits to its seasons and their episodes, a `Season` its rating
-/// and tags to its episodes, a `MusicAlbum` its rating and tags to its
-/// children. Each child's `LockedFields` shields its `OfficialRating` and
-/// `Tags`; `SeriesName` and `CustomRating` are always written.
+/// Port of the child walks in `ItemUpdateController.UpdateItem` (v12.2
+/// `ItemUpdateController.cs:317-402`, but for the season walk's `SeasonName`
+/// — see the module TODO): a `Series` passes its name, rating and tag edits
+/// to its seasons, and its name and tag edits to their episodes, which take
+/// their season's own rating change; a `Season` its rating and tags to its
+/// episodes, a `MusicAlbum` its rating and tags to its children.
+/// A rating reaches only the children that followed the item's `previous`
+/// one ([`propagate_rating`]). Each child's `LockedFields` shields its
+/// `OfficialRating` and `Tags`; `SeriesName` and `CustomRating` are never
+/// lock-checked.
 async fn cascade_to_children(
     state: &AppState,
     item: &BaseItemEntity,
+    previous: &Ratings,
     request: &UpdateItemRequest,
     current_tags: &[String],
 ) -> Result<(), ApiError> {
@@ -546,48 +802,76 @@ async fn cascade_to_children(
     };
     let tags = TagEdit::of(current_tags, request);
     // `request.OfficialRating = string.IsNullOrWhiteSpace(...) ? null : ...`
-    // — the same value the item itself took.
-    let official_rating = item.official_rating.as_ref();
-    let custom_rating = request.custom_rating.as_ref();
-    // The direct children the walk visits, then (for a series) the seasons'
-    // episodes.
-    let mut children = match kind {
-        Some(BaseItemKind::Series) => {
-            children_of(state, item_id, Some(BaseItemKind::Season)).await?
+    // — the same values the item itself took.
+    let new = Ratings::of(item);
+    // A series' seasons, each with its episodes; a season's or album's
+    // children sit directly under the item.
+    let (mut seasons, mut groups) = if kind == Some(BaseItemKind::Series) {
+        let seasons = children_of(state, item_id, Some(BaseItemKind::Season)).await?;
+        let mut episodes = Vec::with_capacity(seasons.len());
+        for season in &seasons {
+            episodes.push(match Uuid::parse_str(&season.id) {
+                Ok(season_id) => season_episodes_of(state, season_id).await?,
+                Err(_) => Vec::new(),
+            });
         }
-        Some(BaseItemKind::Season) => {
-            children_of(state, item_id, Some(BaseItemKind::Episode)).await?
-        }
-        _ => children_of(state, item_id, None).await?,
+        (seasons, episodes)
+    } else if kind == Some(BaseItemKind::Season) {
+        (Vec::new(), vec![season_episodes_of(state, item_id).await?])
+    } else {
+        (Vec::new(), vec![children_of(state, item_id, None).await?])
     };
-    if kind == Some(BaseItemKind::Series) {
-        let mut episodes = Vec::new();
-        for season in &children {
-            if let Ok(season_id) = Uuid::parse_str(&season.id) {
-                episodes.extend(children_of(state, season_id, Some(BaseItemKind::Episode)).await?);
-            }
-        }
-        children.extend(episodes);
-    }
-    if children.is_empty() {
-        return Ok(());
-    }
-    let ids: Vec<Uuid> = children
+    let ids: Vec<Uuid> = seasons
         .iter()
+        .chain(groups.iter().flatten())
         .filter_map(|c| Uuid::parse_str(&c.id).ok())
         .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
     let locks = state.library.get_locked_fields_batch(&ids).await?;
-    for child in &mut children {
-        if kind == Some(BaseItemKind::Series) {
-            // `season.SeriesName = rseries.Name` / `ep.SeriesName = ...`.
-            child.series_name.clone_from(&item.name);
-        }
-        let locked = Uuid::parse_str(&child.id)
+    let locked = |child: &BaseItemEntity| {
+        Uuid::parse_str(&child.id)
             .ok()
             .and_then(|id| locks.get(&id))
-            .map_or(&[][..], Vec::as_slice);
-        cascade_onto(child, locked, official_rating, custom_rating, &tags);
+            .map_or(&[][..], Vec::as_slice)
+    };
+    if kind == Some(BaseItemKind::Series) {
+        for (season, episodes) in seasons.iter_mut().zip(&mut groups) {
+            // `season.SeriesName = rseries.Name`.
+            season.series_name.clone_from(&item.name);
+            let season_previous = Ratings::of(season);
+            let season_locked = locked(season);
+            cascade_onto(season, season_locked, previous, &new, &tags);
+            // Episodes follow the season's own change, so a season whose
+            // rating stayed (its own, or locked) leaves theirs alone.
+            let season_new = Ratings::of(season);
+            for episode in episodes {
+                episode.series_name.clone_from(&item.name);
+                let episode_locked = locked(episode);
+                cascade_onto(
+                    episode,
+                    episode_locked,
+                    &season_previous,
+                    &season_new,
+                    &tags,
+                );
+            }
+        }
+    } else {
+        for child in groups.iter_mut().flatten() {
+            // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`).
+            if kind == Some(BaseItemKind::Season) {
+                child.season_name.clone_from(&item.name);
+            }
+            let child_locked = locked(child);
+            cascade_onto(child, child_locked, previous, &new, &tags);
+        }
     }
+    let children: Vec<BaseItemEntity> = seasons
+        .into_iter()
+        .chain(groups.into_iter().flatten())
+        .collect();
     state.library.update_items(&children, None).await?;
     for id in ids {
         state
@@ -636,9 +920,10 @@ struct ContentTypeQuery {
 /// `POST /Items/{itemId}/ContentType` — sets the folder content-type override.
 ///
 /// Port of `ItemUpdateController.UpdateItemContentType`. A missing item is a
-/// `404`; on success the server configuration's `ContentTypes` list is rewritten
-/// (dropping any prior entry for this folder, adding the new one when non-blank)
-/// and persisted, returning `204`.
+/// `404`. Otherwise the server configuration's `ContentTypes` list is saved
+/// without the entry for the item's `ContainingFolderPath` (its own folder for
+/// a folder, its file's directory for a file), with the new type added under
+/// that folder unless it is blank, and the answer is `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/ContentType",
@@ -660,40 +945,17 @@ async fn update_item_content_type(
         .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    let folder = containing_folder_path(item.path.as_deref());
+    let folder = state.library.containing_folder_path(&item).await;
 
     let mut configuration = (*state.config.configuration().await?).clone();
-    configuration.content_types.retain(|pair| {
-        pair.name
-            .as_deref()
-            .is_some_and(|name| !name.is_empty() && !name.eq_ignore_ascii_case(&folder))
-    });
-    if let Some(content_type) = query
-        .content_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        configuration.content_types.push(NameValuePair {
-            name: Some(folder),
-            value: Some(content_type.to_owned()),
-        });
-    }
+    configuration.content_types =
+        ferrofin_model::content_type_overrides::with_content_type_override(
+            &configuration.content_types,
+            folder.as_deref(),
+            query.content_type.as_deref(),
+        );
     state.config.update_configuration(&configuration).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// The containing-folder path of a file path (its parent directory), or an empty
-/// string when unknown. Mirrors C# `BaseItem.ContainingFolderPath`.
-fn containing_folder_path(path: Option<&str>) -> String {
-    let Some(path) = path else {
-        return String::new();
-    };
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    match trimmed.rfind(['/', '\\']) {
-        Some(idx) => trimmed[..idx].to_owned(),
-        None => String::new(),
-    }
 }
 
 /// Query parameters for `POST /Items/{itemId}/Refresh`.
@@ -1022,14 +1284,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// when absent), then assembles the reference data — parental ratings, countries,
 /// cultures (deduped by display name, name-ordered case-insensitively via the
 /// shared [`crate::handlers::localization::distinct_ordered_cultures`]), the item's external-id
-/// descriptors, and the per-item content-type options.
-///
-/// Port note — content type: C# refines `ContentType`/`ContentTypeOptions` from
-/// the folder's inherited vs configured collection type
-/// (`GetInheritedContentType`/`GetConfiguredContentType`), which need the
-/// un-ported collection-folder tree. The portable seam always offers the full
-/// per-item option set with an unset `ContentType`; the descriptor shape and the
-/// reference lists are already the final ones.
+/// descriptors, and the item's content type ([`content_type_editor`]).
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/MetadataEditor",
@@ -1045,14 +1300,11 @@ async fn get_metadata_editor(
     RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
-    if state
+    let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound(format!("item {item_id}")));
-    }
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
     let external_id_infos = state.providers.get_external_id_infos(item_id).await?;
 
@@ -1062,19 +1314,130 @@ async fn get_metadata_editor(
     let cultures =
         crate::handlers::localization::distinct_ordered_cultures(state.localization.get_cultures());
 
+    let (content_type, content_type_options) = content_type_editor(&state, &item).await?;
     let info = MetadataEditorInfo {
         parental_rating_options: state.localization.get_parental_ratings(),
         countries: state.localization.get_countries(),
         cultures,
         external_id_infos,
-        content_type: None,
-        // Jellyfin's GetMetadataEditorInfo only populates ContentTypeOptions for a collection-folder
-        // whose content type is configurable; a plain library item (e.g. a Movie) gets an empty list.
-        // Ferrofin doesn't model the configurable-content-type folder tree here, so a plain item — the
-        // common case this endpoint serves — matches Jellyfin's empty array.
-        content_type_options: Vec::new(),
+        content_type,
+        content_type_options,
     };
     Ok(Json(info))
+}
+
+/// The editor's `ContentType` and `ContentTypeOptions` for `item`
+/// (`GetMetadataEditorInfo`, v12.2 `ItemUpdateController.cs:167-193`).
+///
+/// Only a library's own item offers the selector: not a virtual item, a library
+/// (`ICollectionFolder`), a user view, the aggregate folder, a Live TV channel
+/// or program, a channel or one of its items, a by-name item, or a recording
+/// still being written. It is offered where the inherited type is unknown (a
+/// mixed library), or where the item already has an override, which it then
+/// shows. Where the inherited type is unknown, movies or shows, only Inherit,
+/// Movies and Shows are offered.
+async fn content_type_editor(
+    state: &AppState,
+    item: &BaseItemEntity,
+) -> Result<(Option<CollectionType>, Vec<NameValuePair>), ApiError> {
+    if !offers_content_type(state, item).await? {
+        return Ok((None, Vec::new()));
+    }
+    let inherited = state.library.get_inherited_content_type(item).await?;
+    let configured = state.library.get_configured_content_type(item).await?;
+    if inherited.is_some() && configured.is_none() {
+        return Ok((None, Vec::new()));
+    }
+    let mut options = content_type_options(state);
+    if matches!(
+        inherited,
+        None | Some(CollectionType::tvshows | CollectionType::movies)
+    ) {
+        options.retain(|option| {
+            option.value.as_deref().is_none_or(|value| {
+                value.trim().is_empty()
+                    || equals_ordinal_ignore_case(value, "TvShows")
+                    || equals_ordinal_ignore_case(value, "Movies")
+            })
+        });
+    }
+    Ok((configured, options))
+}
+
+/// Whether `item` may carry a folder content-type override: the guard of
+/// `GetMetadataEditorInfo` (`ItemUpdateController.cs:167-173`).
+async fn offers_content_type(state: &AppState, item: &BaseItemEntity) -> Result<bool, ApiError> {
+    if item.is_virtual_item || item.channel_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        return Ok(false);
+    }
+    // `BaseItemKind::from_stored_type_name` names every kind the guard
+    // excludes; a type it cannot name is none of them.
+    if BaseItemKind::from_stored_type_name(&item.type_).is_some_and(|kind| {
+        matches!(
+            kind,
+            BaseItemKind::CollectionFolder
+                | BaseItemKind::BasePluginFolder
+                | BaseItemKind::PlaylistsFolder
+                | BaseItemKind::ManualPlaylistsFolder
+                | BaseItemKind::UserView
+                | BaseItemKind::AggregateFolder
+                | BaseItemKind::TvChannel
+                | BaseItemKind::LiveTvChannel
+                | BaseItemKind::TvProgram
+                | BaseItemKind::LiveTvProgram
+                | BaseItemKind::Channel
+                | BaseItemKind::Genre
+                | BaseItemKind::MusicGenre
+                | BaseItemKind::Studio
+                | BaseItemKind::Year
+                | BaseItemKind::Person
+                | BaseItemKind::MusicArtist
+        )
+    }) {
+        return Ok(false);
+    }
+    // `Video.SourceType` is `LiveTV` while a recording still writes the file.
+    let video = BaseItemKind::from_stored_type_name(&item.type_).is_some_and(|kind| {
+        matches!(
+            kind,
+            BaseItemKind::Movie
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Trailer
+                | BaseItemKind::Video
+        )
+    });
+    if video
+        && let (Some(live_tv), Some(path)) = (&state.live_tv, item.path.as_deref())
+        && live_tv
+            .active_recording_paths()
+            .await?
+            .iter()
+            .any(|recording| recording == path)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// `ItemUpdateController.GetContentTypeOptions(isForItem: true)`: Inherit,
+/// then the item content types, each name localized.
+fn content_type_options(state: &AppState) -> Vec<NameValuePair> {
+    [
+        ("Inherit", ""),
+        ("Movies", "movies"),
+        ("Music", "music"),
+        ("Shows", "tvshows"),
+        ("HomeVideos", "homevideos"),
+        ("MusicVideos", "musicvideos"),
+        ("Photos", "photos"),
+    ]
+    .into_iter()
+    .map(|(name, value)| NameValuePair {
+        name: Some(state.localization.get_localized_string(name)),
+        value: Some(value.to_owned()),
+    })
+    .collect()
 }
 
 crate::query::query_parameters! {
@@ -1084,7 +1447,55 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod tests {
-    use super::{UpdateItemRequest, containing_folder_path, join_distinct, non_empty};
+    use super::{UpdateItemRequest, join_distinct, non_empty, propagate_rating};
+    use rstest::rstest;
+
+    /// `ItemUpdateController.UpdateItem` (v12.2 :417-420): a video
+    /// (`IHasAspectRatio`) takes the request's `AspectRatio`, a null clearing
+    /// it, and keeps the rest of its `Data`; any other kind ignores it.
+    #[test]
+    fn a_video_stores_the_requested_aspect_ratio() {
+        let update = |item: &mut ferrofin_db::entities::base_items::BaseItemEntity, json: &str| {
+            let request: UpdateItemRequest =
+                crate::extract::deserialize_mvc(json).expect("request");
+            super::apply_update(item, &request, &crate::test_support::FakeLocalization);
+        };
+        // Rows carry the stored type name, which the kind gate reads.
+        let stored = |kind: ferrofin_model::data::BaseItemKind| {
+            kind.stored_type_name().expect("stored name")
+        };
+        let mut movie = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Wide",
+            stored(ferrofin_model::data::BaseItemKind::Movie),
+        );
+        movie.data = Some(r#"{"VideoType":"Dvd"}"#.to_owned());
+        update(&mut movie, r#"{"Name":"Wide","AspectRatio":"2.35:1"}"#);
+        let data: serde_json::Value =
+            serde_json::from_str(movie.data.as_deref().expect("data")).expect("json");
+        assert_eq!(data["AspectRatio"], "2.35:1");
+        assert_eq!(data["VideoType"], "Dvd", "the rest of Data stays");
+        update(&mut movie, r#"{"Name":"Wide","AspectRatio":null}"#);
+        let data: serde_json::Value =
+            serde_json::from_str(movie.data.as_deref().expect("data")).expect("json");
+        assert!(data.get("AspectRatio").is_none(), "{data}");
+
+        let mut album = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Album",
+            stored(ferrofin_model::data::BaseItemKind::MusicAlbum),
+        );
+        update(&mut album, r#"{"Name":"Album","AspectRatio":"16:9"}"#);
+        assert!(
+            !album
+                .data
+                .as_deref()
+                .unwrap_or_default()
+                .contains("AspectRatio"),
+            "{:?}",
+            album.data
+        );
+    }
 
     /// A string the number cannot be read from is a REFUSAL, not a silent
     /// `None`.
@@ -1194,6 +1605,35 @@ mod tests {
         assert_eq!(req.community_rating, Some(7.0));
     }
 
+    /// `GetPropagatedRating(childRating, previousRating, newRating)`.
+    #[rstest]
+    // The parent's rating did not change: every child keeps its own.
+    #[case(Some("TV-14"), Some("TV-PG"), Some("TV-PG"), Some("TV-14"))]
+    #[case(None, Some("TV-PG"), Some("tv-pg"), None)]
+    #[case(Some("TV-14"), None, Some(""), Some("TV-14"))]
+    // It changed: a child with none, or with the old one, follows it.
+    #[case(None, Some("TV-PG"), Some("TV-MA"), Some("TV-MA"))]
+    #[case(Some(""), Some("TV-PG"), Some("TV-MA"), Some("TV-MA"))]
+    #[case(Some("TV-PG"), Some("TV-PG"), Some("TV-MA"), Some("TV-MA"))]
+    #[case(Some("pg-13"), Some("PG-13"), Some("R"), Some("R"))]
+    #[case(Some("TV-PG"), Some("TV-PG"), None, None)]
+    #[case(None, None, Some("TV-MA"), Some("TV-MA"))]
+    // A child with a rating of its own keeps it.
+    #[case(Some("TV-14"), Some("TV-PG"), Some("TV-MA"), Some("TV-14"))]
+    #[case(Some("TV-14"), None, Some("TV-MA"), Some("TV-14"))]
+    // An empty new rating is taken as sent, not as null.
+    #[case(Some("XXX"), Some("XXX"), Some(""), Some(""))]
+    fn a_rating_reaches_only_children_following_the_parent(
+        #[case] child: Option<&str>,
+        #[case] previous: Option<&str>,
+        #[case] new: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut rating = child.map(ToOwned::to_owned);
+        propagate_rating(&mut rating, previous, new);
+        assert_eq!(rating.as_deref(), expected);
+    }
+
     #[test]
     fn join_distinct_dedups_case_insensitively() {
         let values = vec![
@@ -1210,15 +1650,5 @@ mod tests {
         assert_eq!(non_empty(Some("  x ")), Some("x".to_owned()));
         assert_eq!(non_empty(Some("   ")), None);
         assert_eq!(non_empty(None), None);
-    }
-
-    #[test]
-    fn containing_folder_is_parent_dir() {
-        assert_eq!(
-            containing_folder_path(Some("/media/movies/Blade/Blade.mkv")),
-            "/media/movies/Blade"
-        );
-        assert_eq!(containing_folder_path(Some("Blade.mkv")), "");
-        assert_eq!(containing_folder_path(None), "");
     }
 }

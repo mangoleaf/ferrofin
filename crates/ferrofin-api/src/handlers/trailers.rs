@@ -162,6 +162,8 @@ fn trailers_query_options(
     // `GetItems` applies its media-stream rules before `ApplyFilters`
     // (v12 ItemsController.cs:462-489).
     apply_media_stream_filter_rules(&mut internal);
+    // …and orders a search by score, then `SortName`.
+    crate::handlers::items::order_search_by_sort_name(&mut internal);
     if let Some(parent) = query.parent_id {
         internal.parent_id = parent;
     }
@@ -199,7 +201,9 @@ async fn get_trailers(
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let internal = trailers_query_options(&query, user)?;
 
-    let result = state.library.query_items(&internal).await?;
+    let mut result = state.library.query_items(&internal).await?;
+    // `GetItems` answers explicit ids through `Folder.GetItems`.
+    crate::handlers::items::sort_items_by_request(&internal, &mut result.items);
     let options = DtoOptions::with_all_fields(false);
     let dtos = state
         .dto
@@ -262,5 +266,34 @@ mod tests {
         assert!(internal.audio_languages.is_empty());
         assert!(internal.subtitle_languages.is_empty());
         assert!(!internal.include_owned_items);
+    }
+
+    /// `GetTrailers` hands its arguments to `ItemsController.GetItems`, so a
+    /// search is ordered as there: `SortName` leads the caller's keys (see
+    /// `items::order_search_by_sort_name`).
+    #[test]
+    fn trailers_order_a_search_by_sort_name_before_the_callers_keys() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        let order_by = |q: &str| {
+            let Query(query) = Query::<TrailersQuery>::try_from_uri(
+                &format!("/Trailers?{q}").parse().expect("uri"),
+            )
+            .expect(q);
+            trailers_query_options(&query, crate::test_support::sample_user())
+                .expect("maps")
+                .order_by
+        };
+        assert_eq!(
+            order_by("searchTerm=blade&sortBy=PremiereDate"),
+            [
+                (ItemSortBy::SortName, SortOrder::Ascending),
+                (ItemSortBy::PremiereDate, SortOrder::Ascending)
+            ]
+        );
+        assert_eq!(
+            order_by("sortBy=PremiereDate"),
+            [(ItemSortBy::PremiereDate, SortOrder::Ascending)]
+        );
     }
 }

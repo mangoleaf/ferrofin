@@ -1,12 +1,23 @@
-//! Request authentication — Jellyfin's `MediaBrowser`/`X-Emby-Token` scheme.
+//! Request authentication — Jellyfin's `MediaBrowser` authorization scheme.
 //!
 //! Jellyfin clients present their access token in one of several places:
 //!
 //! - `Authorization: MediaBrowser Token="…", Client="…", Device="…",
 //!   DeviceId="…", Version="…"`
+//! - the `ApiKey` query parameter
+//!
+//! The Emby-era forms are honoured only while the server configuration's
+//! `EnableLegacyAuthorization` is on (gated in `AuthorizationContext.cs`),
+//! which Jellyfin 12 leaves off by default (`ServerConfiguration.cs`):
+//!
 //! - `X-Emby-Authorization` (same grammar as `Authorization`)
 //! - `X-Emby-Token` / `X-MediaBrowser-Token` (bare token)
-//! - the `api_key` / `ApiKey` query parameter
+//! - the `api_key` query parameter
+//! - the `Emby` scheme name in place of `MediaBrowser`
+//!
+//! Parsing lives in `ferrofin-core`'s `FerrofinAuthorizationContext`, behind
+//! the `ferrofin_traits` `AuthorizationContext` seam. The session WebSocket
+//! (`handlers::websocket`) authenticates through the same path.
 //!
 //! Two pieces mirror the C# `MediaBrowser.Controller.Net` layer:
 //!
@@ -36,6 +47,10 @@ use crate::state::AppState;
 /// Copies every header as a `(name, value)` pair (dropping non-UTF-8 values,
 /// which Jellyfin's ASCII header grammar never uses) and carries the raw query
 /// string so the authorization logic can read the `api_key`/`ApiKey` parameter.
+///
+/// The scheme is left unresolved (`None`, read as `http`): authorization does
+/// not need it. A context that builds addresses comes from
+/// `handlers::system::context_from_parts`, which resolves it.
 pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -54,6 +69,7 @@ pub(crate) fn request_context(
         headers: copied,
         query_string: query.map(ToOwned::to_owned),
         remote_endpoint: remote,
+        scheme: None,
     }
 }
 
@@ -529,30 +545,15 @@ fn day_of_week_contains(
 ///    root installs `with_connect_info`. Failing closed there costs a real
 ///    caller nothing and keeps the unknown case from being the permissive one.
 ///
-/// The local-network test is [`crate::handlers::system::is_in_local_network`],
-/// shared with `GET /System/Endpoint` so the endpoint that *reports* whether a
-/// client is in-network and the policy that *acts* on it can never disagree.
-///
-/// Two limits of that test, both of which make this arm **wider** than
-/// upstream's. Neither is a regression — before this gate the route took plain
-/// [`RequireAuth`], so any account could restart from anywhere, and both cases
-/// below still land on "authenticated caller only". But do not read the gate as
-/// stronger than it is:
-///
-/// - **Reverse proxies.** The peer address is the transport peer, and nothing
-///   here consumes `X-Forwarded-For`. Behind a proxy or ingress — including
-///   this repo's own `charts/ferrofin/templates/ingress.yaml` — every request
-///   presents the proxy's address, which is private, so the local arm is
-///   satisfied for all callers and the gate degrades to "any authenticated
-///   account". Upstream needs `KnownProxies` configured to do better;
-///   `NetworkConfiguration::known_proxies` exists here but nothing reads it
-///   yet.
-/// - **Configured subnets.** This now asks
-///   [`AppState::is_in_local_network`], which is
-///   `NetworkManager.IsInLocalNetwork` — `LocalNetworkSubnets` intersected and
-///   the `!`-prefixed exclusions subtracted — whenever the composition root has
-///   wired the policy. Without it (unit tests) the private-range fallback still
-///   applies.
+/// The local-network test is [`AppState::is_in_local_network`] over
+/// [`AppState::client_address`], as `GET /System/Endpoint`'s `IsInNetwork` is,
+/// so the endpoint that *reports* whether a client is in-network and the policy
+/// that *acts* on it can never disagree. With the composition root's network
+/// policy wired, that is `NetworkManager.IsInLocalNetwork` (the
+/// `LocalNetworkSubnets` intersected and the `!`-prefixed exclusions
+/// subtracted) over the client behind any `KnownProxies`, as upstream reads
+/// `GetNormalizedRemoteIP()`. Without it (unit tests) the private-range
+/// fallback in `handlers::system` applies.
 #[derive(Debug, Clone)]
 pub struct RequireLocalAccessOrAdmin(pub AuthorizationInfo);
 

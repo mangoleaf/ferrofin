@@ -37,9 +37,15 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00A1_0000);
+/// Another user an administrator may name in `userId`.
+const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00A1_00FF);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
 /// A non-audio item id: it EXISTS, but the lyric routes must still refuse it.
 const MOVIE_ID: Uuid = Uuid::from_u128(0x00A1_0002);
+/// A library track whose awaited refresh [`StreamLibrary`] reports stopped.
+const STOPPED_ID: Uuid = Uuid::from_u128(0x00A1_0003);
+/// [`STOPPED_ID`]'s file.
+const STOPPED_TRACK: &str = "/music/Artist/Album/Stopped.flac";
 
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
@@ -124,7 +130,16 @@ struct OkUsers {
 #[async_trait]
 impl UserManager for OkUsers {
     async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
-        Ok((id == USER_ID).then(user))
+        Ok(match id {
+            USER_ID => Some(user()),
+            OTHER_USER_ID => Some(UserEntity {
+                id: OTHER_USER_ID.to_string(),
+                username: "bob".to_owned(),
+                normalized_username: "BOB".to_owned(),
+                ..user()
+            }),
+            _ => None,
+        })
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
@@ -284,6 +299,10 @@ impl MediaSourceManager for StreamSources {
 /// A [`LibraryManager`] that resolves [`ITEM_ID`] and 404s everything else.
 struct StreamLibrary;
 
+/// The refreshes [`StreamLibrary`] ran to completion for a caller that
+/// awaited them (`run_refresh_scan`), as debug-printed targets.
+static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 #[async_trait]
 impl LibraryManager for StreamLibrary {
     async fn is_item_visible_standalone(
@@ -307,7 +326,38 @@ impl LibraryManager for StreamLibrary {
             // it, the way C# `GetItemById<Audio>` does.
             return Ok(Some(minimal_base_item(MOVIE_ID, "A Movie", "Movie")));
         }
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Song", "Audio")))
+        if id == STOPPED_ID {
+            return Ok(Some(BaseItemEntity {
+                path: Some(STOPPED_TRACK.to_owned()),
+                top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
+                ..minimal_base_item(STOPPED_ID, "Stopped", "Audio")
+            }));
+        }
+        // A library track: the refresh a lyric write queues is its path's scan.
+        Ok((id == ITEM_ID).then(|| BaseItemEntity {
+            path: Some("/music/Artist/Album/A Song.flac".to_owned()),
+            top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
+            ..minimal_base_item(ITEM_ID, "A Song", "Audio")
+        }))
+    }
+
+    async fn queue_refresh_scan(
+        &self,
+        _target: ferrofin_traits::library::ScanTarget,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn run_refresh_scan(
+        &self,
+        target: ferrofin_traits::library::ScanTarget,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let target = format!("{target:?}");
+        // The shutdown stopping a refresh before it finished.
+        let finished = !target.contains(STOPPED_TRACK);
+        AWAITED_REFRESHES.lock().unwrap().push(target);
+        Ok(finished)
     }
     async fn query_items(
         &self,
@@ -423,7 +473,12 @@ struct CannedLyrics {
     /// The remote lyric served for the namespaced id `remote.0`.
     remote: Option<(String, LyricDto)>,
     deleted: Arc<Mutex<bool>>,
+    /// The last upload: its format and the body's bytes.
+    saved: Arc<Mutex<Option<SavedUpload>>>,
 }
+
+/// An upload [`CannedLyrics`] received: its format and the body's bytes.
+type SavedUpload = (String, Vec<u8>);
 
 #[async_trait]
 impl LyricManager for CannedLyrics {
@@ -450,10 +505,11 @@ impl LyricManager for CannedLyrics {
     async fn save_lyric(
         &self,
         _item_id: Uuid,
-        _format: &str,
-        _lyrics: &str,
+        format: &str,
+        lyrics: &[u8],
     ) -> Result<Option<LyricDto>, ServiceError> {
-        Ok(None)
+        *self.saved.lock().unwrap() = Some((format.to_owned(), lyrics.to_vec()));
+        Ok(self.stored.clone())
     }
     async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         *self.deleted.lock().unwrap() = true;
@@ -617,6 +673,7 @@ async fn lyrics_get_returns_stored_or_404() {
             stored: Some(dto),
             remote: None,
             deleted: Arc::new(Mutex::new(false)),
+            saved: Arc::default(),
         }),
     );
     let (ok, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
@@ -632,6 +689,7 @@ async fn lyrics_get_returns_stored_or_404() {
             stored: None,
             remote: None,
             deleted: Arc::new(Mutex::new(false)),
+            saved: Arc::default(),
         }),
     );
     let (missing, _) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
@@ -648,6 +706,7 @@ async fn lyrics_routes_404_on_a_non_audio_item() {
         stored: Some(LyricDto::default()),
         remote: Some(("abc_1".to_owned(), LyricDto::default())),
         deleted: deleted.clone(),
+        saved: Arc::default(),
     };
     for (method, path) in [
         ("GET", format!("/Audio/{MOVIE_ID}/Lyrics")),
@@ -673,7 +732,7 @@ async fn lyric_writes_need_the_lyric_management_permission() {
     // Port of `[Authorize(Policy = Policies.LyricManagement)]` — the
     // `UserPermissionRequirement(PermissionKind.EnableLyricManagement)` five of
     // the six `LyricsController` actions carry. The permission defaults to
-    // FALSE for a new user and is not implied by IsAdministrator, so without
+    // FALSE for a new user (an administrator passes anyway, below), so without
     // this gate any authenticated account could overwrite or delete another
     // user's lyrics. A parity run cannot see it: the bench user holds it.
     let deleted = Arc::new(Mutex::new(false));
@@ -681,6 +740,7 @@ async fn lyric_writes_need_the_lyric_management_permission() {
         stored: Some(LyricDto::default()),
         remote: Some(("abc_1".to_owned(), LyricDto::default())),
         deleted: deleted.clone(),
+        saved: Arc::default(),
     };
     let gated = [
         ("POST", format!("/Audio/{ITEM_ID}/Lyrics?fileName=x.lrc")),
@@ -738,11 +798,136 @@ async fn lyrics_delete_is_204_and_calls_manager() {
             stored: None,
             remote: None,
             deleted: deleted.clone(),
+            saved: Arc::default(),
         }),
     );
     let (status, _) = call(app, "DELETE", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(*deleted.lock().unwrap());
+}
+
+/// `DeleteLyricsAsync` ends with an awaited `audio.RefreshMetadata`, so the
+/// track's lyric stream is gone by the `204`, not some time after it.
+#[tokio::test]
+async fn lyrics_delete_awaits_the_tracks_refresh() {
+    let (_dir, path) = temp_media();
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::default(),
+        }),
+    );
+    let (status, _) = call(app, "DELETE", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        AWAITED_REFRESHES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|target| target.contains("/music/Artist/Album/A Song.flac")),
+        "{:?}",
+        AWAITED_REFRESHES.lock().unwrap()
+    );
+}
+
+/// A refresh the shutdown stops is no `204`: the files are gone, but the
+/// track's streams were not re-read (upstream's awaited `RefreshMetadata`
+/// throws then).
+#[tokio::test]
+async fn lyrics_delete_with_a_stopped_refresh_is_503() {
+    let (_dir, path) = temp_media();
+    let deleted = Arc::new(Mutex::new(false));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: None,
+            deleted: Arc::clone(&deleted),
+            saved: Arc::default(),
+        }),
+    );
+    let (status, _) = call(app, "DELETE", &format!("/Audio/{STOPPED_ID}/Lyrics")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(*deleted.lock().unwrap());
+}
+
+/// Sends an authenticated `POST` whose body is `body`.
+async fn post_body(app: AppState, uri: &str, body: Vec<u8>) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Authorization", "Bearer token")
+        .header("Content-Type", "text/plain")
+        .body(Body::from(body))
+        .expect("request");
+    create_router(app).oneshot(request).await.unwrap().status()
+}
+
+/// `UploadLyrics` takes the format from `Path.GetExtension(fileName)`, which
+/// counts a leading dot, and hands the body's bytes to `SaveLyricAsync`
+/// whatever their encoding: a UTF-16 body is no `400`.
+#[rstest::rstest]
+#[case::plain("s.lrc", b"[00:01.00]hi".to_vec(), "lrc")]
+#[case::dot_only_name(".lrc", b"[00:01.00]hi".to_vec(), "lrc")]
+#[case::folder_in_name("a.b/song.TXT", b"hi".to_vec(), "TXT")]
+#[case::utf16(
+    "s.lrc",
+    [&[0xFF, 0xFE][..], &[b'h', 0, b'i', 0]].concat(),
+    "lrc"
+)]
+#[tokio::test]
+async fn lyrics_upload_passes_format_and_raw_body(
+    #[case] file_name: &str,
+    #[case] body: Vec<u8>,
+    #[case] format: &str,
+) {
+    let (_dir, path) = temp_media();
+    let saved = Arc::new(Mutex::new(None));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: Some(LyricDto::default()),
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::clone(&saved),
+        }),
+    );
+    let uri = format!("/Audio/{ITEM_ID}/Lyrics?fileName={file_name}");
+    assert_eq!(post_body(app, &uri, body.clone()).await, StatusCode::OK);
+    assert_eq!(
+        saved.lock().unwrap().clone(),
+        Some((format.to_owned(), body))
+    );
+}
+
+/// No extension (`Path.GetExtension` is empty, a trailing dot included) is
+/// the controller's `400`, and nothing is saved.
+#[rstest::rstest]
+#[case::bare("song")]
+#[case::trailing_dot("song.")]
+#[case::dot_in_folder("a.b/song")]
+#[tokio::test]
+async fn lyrics_upload_without_an_extension_is_400(#[case] file_name: &str) {
+    let (_dir, path) = temp_media();
+    let saved = Arc::new(Mutex::new(None));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: Some(LyricDto::default()),
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::clone(&saved),
+        }),
+    );
+    let uri = format!("/Audio/{ITEM_ID}/Lyrics?fileName={file_name}");
+    assert_eq!(
+        post_body(app, &uri, b"hi".to_vec()).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(saved.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -754,6 +939,7 @@ async fn lyrics_remote_search_is_empty_list() {
             stored: None,
             remote: None,
             deleted: Arc::new(Mutex::new(false)),
+            saved: Arc::default(),
         }),
     );
     let (status, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/RemoteSearch/Lyrics")).await;
@@ -782,6 +968,7 @@ async fn providers_lyrics_by_id_returns_remote_lyric_without_item() {
             stored: None,
             remote: Some((lyric_id.to_owned(), dto)),
             deleted: Arc::new(Mutex::new(false)),
+            saved: Arc::default(),
         }),
     );
     let (status, body) = call(app, "GET", &format!("/Providers/Lyrics/{lyric_id}")).await;
@@ -799,6 +986,7 @@ async fn providers_lyrics_by_id_returns_remote_lyric_without_item() {
             stored: None,
             remote: None,
             deleted: Arc::new(Mutex::new(false)),
+            saved: Arc::default(),
         }),
     );
     let (missing, _) = call(app, "GET", "/Providers/Lyrics/deadbeef_1").await;
@@ -812,7 +1000,7 @@ async fn providers_lyrics_by_id_returns_remote_lyric_without_item() {
 #[tokio::test]
 async fn universal_audio_cross_user_as_non_admin_is_forbidden() {
     let (_dir, path) = temp_media();
-    let other = Uuid::from_u128(0x00A1_00FF);
+    let other = OTHER_USER_ID;
     let (status, _) = call(
         state(&path, no_lyrics()),
         "GET",
@@ -826,7 +1014,7 @@ async fn universal_audio_cross_user_as_non_admin_is_forbidden() {
 #[tokio::test]
 async fn universal_audio_cross_user_as_admin_is_allowed() {
     let (_dir, path) = temp_media();
-    let other = Uuid::from_u128(0x00A1_00FF);
+    let other = OTHER_USER_ID;
     let (status, _) = call(
         state_as(&path, no_lyrics(), true, true),
         "GET",

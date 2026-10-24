@@ -124,27 +124,36 @@ fn unused_backdrop_stem(directory: &Path) -> String {
     }
 }
 
-/// Once at least one new backdrop exists, remove old internal backdrops that
-/// the caller did not retain. This never deletes a media sidecar.
-pub(super) fn prune_old_backdrops(directory: &Path, current: &[ItemImageInfo]) {
+/// Once at least one new backdrop exists in an item's art `directories`,
+/// removes the old internal backdrops in any of them that the caller did not
+/// retain. This never deletes a media sidecar. The directories are judged
+/// together: a refresh writes its backdrops to the item's own folder, so the
+/// ones it replaced may sit in the legacy folder older scans wrote to.
+pub(super) fn prune_old_backdrops_in(directories: &[PathBuf], current: &[ItemImageInfo]) {
     let kept: Vec<PathBuf> = current
         .iter()
         .filter(|image| image.image_type == ImageType::Backdrop)
         .map(|image| PathBuf::from(&image.path))
         .collect();
-    if !kept.iter().any(|path| path.starts_with(directory)) {
+    if !kept.iter().any(|path| {
+        directories
+            .iter()
+            .any(|directory| path.starts_with(directory))
+    }) {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if super::parse_art_file_stem(&path) == Some(ImageType::Backdrop)
-            && !kept.contains(&path)
-            && let Err(err) = std::fs::remove_file(&path)
-        {
-            tracing::warn!(%err, path = %path.display(), "failed to prune replaced backdrop");
+    for directory in directories {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if super::parse_art_file_stem(&path) == Some(ImageType::Backdrop)
+                && !kept.contains(&path)
+                && let Err(err) = std::fs::remove_file(&path)
+            {
+                tracing::warn!(%err, path = %path.display(), "failed to prune replaced backdrop");
+            }
         }
     }
 }
@@ -315,6 +324,9 @@ mod tests {
 
     #[tokio::test]
     async fn bad_urls_skip_but_other_failures_stop_that_providers_type_pass() {
+        // Every retry of `/error` is still sent; the limiter's own suite
+        // tests the backoff between them.
+        ferrofin_providers::rate_limit::test_support::skip_backoff();
         let (base, requests) = server();
         let tmp = tempfile::tempdir().unwrap();
         let policy = ImageAcquisitionPolicy::new(None, "Person");
@@ -373,7 +385,7 @@ mod tests {
             true,
         )
         .await;
-        prune_old_backdrops(&dir, &failed);
+        prune_old_backdrops_in(std::slice::from_ref(&dir), &failed);
         assert_eq!(std::fs::read(&old).unwrap(), b"old");
         let local = tmp.path().join("sidecar.png");
         std::fs::write(&local, b"sidecar").unwrap();
@@ -394,9 +406,38 @@ mod tests {
         );
         assert_eq!(current.len(), 2);
         assert!(old.exists(), "old files remain until acquisition succeeds");
-        prune_old_backdrops(&dir, &current);
+        prune_old_backdrops_in(std::slice::from_ref(&dir), &current);
         assert!(!old.exists());
         assert_eq!(std::fs::read(local).unwrap(), b"sidecar");
         assert_eq!(std::fs::read(&current[1].path).unwrap(), b"/new");
+    }
+
+    /// An item's folders are pruned together: once the own folder keeps a new
+    /// backdrop, an old one in the legacy folder goes; with no kept backdrop
+    /// in any of them, nothing is pruned.
+    #[test]
+    fn backdrops_are_pruned_across_the_items_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("OWN");
+        let legacy = tmp.path().join("own");
+        for dir in [&own, &legacy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let new = own.join("backdrop.jpg");
+        let old = legacy.join("backdrop.jpg");
+        std::fs::write(&new, b"new").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        let folders = [own.clone(), legacy.clone()];
+        prune_old_backdrops_in(&folders, &[]);
+        assert!(
+            old.exists() && new.exists(),
+            "no kept backdrop: nothing pruned"
+        );
+        prune_old_backdrops_in(&folders, &[stored(&new, ImageType::Backdrop)]);
+        assert!(new.exists());
+        assert!(
+            !old.exists(),
+            "the replaced backdrop in the legacy folder goes"
+        );
     }
 }

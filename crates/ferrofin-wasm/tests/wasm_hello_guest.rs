@@ -119,7 +119,10 @@ async fn real_guest_loads_runs_and_reports_rss() {
     let events = ferrofin_core::FerrofinEventManager::new();
     host.subscribe_events(&events, &manager);
     events.publish("PlaybackStart", "{}").await.unwrap();
-    events.publish("LibraryChanged", "{}").await.unwrap();
+    events
+        .publish(ferrofin_core::library_changed_notifier::ITEMS_CHANGED, "{}")
+        .await
+        .unwrap();
 
     let tasks = host.scheduled_tasks(&manager);
     let progress = ferrofin_core::TaskProgress::default();

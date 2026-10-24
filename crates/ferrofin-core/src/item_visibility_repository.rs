@@ -62,6 +62,23 @@ pub(crate) async fn linked_children(
     Ok(pairs)
 }
 
+/// The official ratings of a container's linked children that exist, in link
+/// order (`SortOrder`) — only the column `UpdateRatingToItems` reads.
+pub(crate) async fn member_ratings(
+    db: &Database,
+    parent_id: Uuid,
+) -> Result<Vec<Option<String>>, ServiceError> {
+    sqlx::query_scalar(
+        r#"SELECT bi."OfficialRating" FROM "LinkedChildren" lc
+           JOIN "BaseItems" bi ON bi."Id" = lc."ChildId"
+           WHERE lc."ParentId" = ?1 ORDER BY lc."SortOrder""#,
+    )
+    .bind(guid_to_db(parent_id))
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
 pub(crate) async fn playlist_access(
     db: &Database,
     user_id: &str,

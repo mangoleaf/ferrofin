@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
-use ferrofin_hls::{DynamicHlsPlaylistGenerator, HlsStreamManagerImpl};
+use ferrofin_hls::{DynamicHlsPlaylistGenerator, EncodingOptionsProvider, HlsStreamManagerImpl};
 use ferrofin_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
 use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
@@ -39,10 +39,12 @@ use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, HlsStreamManager, MediaEncoder, MediaInfoRequest,
 };
+use ferrofin_traits::persistence::KeyframeRepository;
 use ferrofin_traits::system::PathManager;
 use uuid::Uuid;
 
 use crate::bootstrap::FfmpegPaths;
+use crate::encoding_options::EncodingOptionsReader;
 use crate::planner::FerrofinStreamStatePlanner;
 
 /// How often the transcode idle reaper sweeps for consumerless jobs.
@@ -62,13 +64,55 @@ pub struct MediaEncodingExtras {
     pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
     /// Releases the live stream a killed job was reading.
     pub sessions: Option<Arc<dyn ferrofin_traits::session::SessionManager>>,
+    /// Stores the keyframes remux playlists are cut on. Without it the
+    /// playlist generator has no keyframe extractor, and every playlist uses
+    /// equal-length segments.
+    pub keyframes: Option<Arc<dyn KeyframeRepository>>,
+}
+
+/// The playlist generator's encoding options: the live configuration, as
+/// upstream reads `GetEncodingOptions()` on every playlist request.
+struct GeneratorEncodingOptions {
+    config: Arc<dyn ServerConfigurationManager>,
+    reader: EncodingOptionsReader,
+}
+
+#[async_trait]
+impl EncodingOptionsProvider for GeneratorEncodingOptions {
+    async fn get_encoding_options(&self) -> EncodingOptions {
+        self.reader.read(self.config.as_ref()).await
+    }
+}
+
+/// Port of `AddHlsPlaylistGenerator`: the HLS playlist generator over the live
+/// encoding options and the cached ffprobe and Matroska keyframe extractors,
+/// of which it keeps the metadata-based (Matroska) one. Without a keyframe
+/// repository it has no extractor.
+fn playlist_generator(
+    config: &Arc<dyn ServerConfigurationManager>,
+    encoder: &Arc<dyn MediaEncoder>,
+    keyframes: Option<Arc<dyn KeyframeRepository>>,
+) -> Arc<DynamicHlsPlaylistGenerator<GeneratorEncodingOptions>> {
+    let extractors = keyframes
+        .map(|repository| {
+            ferrofin_core::keyframe_extractors::keyframe_extractors(repository, Arc::clone(encoder))
+        })
+        .unwrap_or_default();
+    Arc::new(DynamicHlsPlaylistGenerator::new(
+        GeneratorEncodingOptions {
+            config: Arc::clone(config),
+            reader: EncodingOptionsReader::new("playlist generator"),
+        },
+        extractors,
+    ))
 }
 
 /// The one thing job teardown needs from the session layer: release a live
 /// stream no session still wants (`ISessionManager.CloseLiveStreamIfNeededAsync`).
 #[async_trait]
 trait LiveStreamReleaser: Send + Sync {
-    /// Closes `live_stream_id` unless another session is still using it.
+    /// Releases `session_id`'s hold on `live_stream_id`, closing the stream
+    /// once no session holds it, or at once when no session registered it.
     async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError>;
 
     /// Publishes a starting job's details against `device_id`.
@@ -170,6 +214,35 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
     }
 }
 
+/// Starts the pause-key probe in the background, publishing into `slot`.
+///
+/// The probe is a real-time ffmpeg job, so it must not delay boot; a transcode
+/// that starts before it finishes picks the keys up on a later throttle tick.
+/// Nothing runs for the placeholder a failed discovery leaves (its capabilities
+/// are not [`validated`](ferrofin_mediaencoding::FfmpegCapabilities::validated)):
+/// that is a binary the server just declared unavailable.
+fn spawn_pause_key_probe(
+    handle: &tokio::runtime::Handle,
+    ffmpeg: &FfmpegPaths,
+    slot: ferrofin_mediaencoding::transcoding::throttler::PauseKeySlot,
+) {
+    if !ffmpeg.capabilities.validated() {
+        return;
+    }
+    handle.spawn(tracing::Instrument::instrument(
+        crate::bootstrap::probe_pause_keys(
+            ffmpeg.ffmpeg.clone(),
+            ffmpeg.capabilities.ffmpeg_version(),
+            slot,
+        ),
+        tracing::info_span!(
+            "ffmpeg_pause_probe",
+            task = "ffmpeg_pause_probe",
+            trigger = "startup"
+        ),
+    ));
+}
+
 /// Builds the concrete media-encoding pair injected via
 /// [`AppState::with_media_encoding`](ferrofin_api::AppState::with_media_encoding).
 ///
@@ -209,6 +282,7 @@ pub fn build_media_encoding(
     Arc<dyn SubtitleEncoder>,
 ) {
     let library = extras.library;
+    let generator = playlist_generator(&config, &encoder, extras.keyframes);
     // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
     // Built first: the planner also consumes it, resolving a burned text
     // subtitle to its cached extracted file so the `subtitles` filter doesn't
@@ -220,6 +294,7 @@ pub fn build_media_encoding(
         path_manager: Arc::clone(&path_manager),
         ffmpeg_path: encoder.encoder_path(),
         config: Arc::clone(&config),
+        encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
     };
     let pure_encoder = Arc::new(PureSubtitleEncoder::new(SubtitleEditParser::new(), sub_io));
     let subtitles: Arc<dyn SubtitleEncoder> =
@@ -249,22 +324,20 @@ pub fn build_media_encoding(
         Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
         None => Arc::new(NoopSessionReporter),
     };
-    let manager = Arc::new(
-        TranscodeManagerImpl::new(reporter)
-            .with_encoding_configuration(config)
-            .with_pause_keys(
-                ferrofin_mediaencoding::transcoding::throttler::PauseKeys::select(
-                    ffmpeg.capabilities.pkey_pause_supported(),
-                    ffmpeg.capabilities.ffmpeg_version(),
-                ),
-            ),
-    );
+    // `TranscodeManager`'s constructor clears the transcode cache before any
+    // job can start (`DeleteEncodedMediaCache`, `TranscodeManager.cs:94`).
+    let cleared = ferrofin_core::scheduled_tasks::maintenance::delete_encoded_media_cache(&*paths);
+    if cleared > 0 {
+        tracing::info!(deleted = cleared, "cleared the transcode cache");
+    }
+    let manager = Arc::new(TranscodeManagerImpl::new(reporter).with_encoding_configuration(config));
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
     // → the job dies and its partial files are cleaned up. Spawned only when a
     // runtime exists so the sync composition unit test can still call this.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        spawn_pause_key_probe(&handle, ffmpeg, manager.pause_key_slot());
         handle.spawn(TranscodeManagerImpl::run_transcode_controls(
             Arc::downgrade(&manager),
         ));
@@ -273,15 +346,6 @@ pub fn build_media_encoding(
                 .run_idle_reaper(std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS)),
         );
     }
-    // The generator reads live encoding options per request; First-Light returns
-    // the defaults (the persisted named-config accessor is not yet threaded
-    // through `ServerConfigurationManager`).
-    let generator_config: Box<dyn Fn() -> EncodingOptions + Send + Sync> =
-        Box::new(EncodingOptions::default);
-    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(
-        generator_config,
-        Vec::new(),
-    ));
     let mut hls_impl = HlsStreamManagerImpl::new(
         planner,
         transcoder,
@@ -321,6 +385,8 @@ struct FfmpegSubtitleIo {
     path_manager: Arc<dyn PathManager>,
     ffmpeg_path: String,
     config: Arc<dyn ServerConfigurationManager>,
+    /// Reads `encoding.json` on each extraction and reports a broken file once.
+    encoding_reader: EncodingOptionsReader,
 }
 
 #[async_trait]
@@ -376,10 +442,9 @@ impl SubtitleIo for FfmpegSubtitleIo {
         }
         // `RunSubtitleExtractionProcess` reads the timeout on every run.
         let minutes = self
-            .config
-            .get_encoding_options()
+            .encoding_reader
+            .read(self.config.as_ref())
             .await
-            .unwrap_or_default()
             .subtitle_extraction_timeout_minutes;
         let Some(timeout) = subtitle_extraction_timeout(minutes) else {
             return Err(format!(
@@ -387,7 +452,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
                  the longest supported wait"
             ));
         };
-        let parts = split_ffmpeg_args(args);
+        let parts = ferrofin_mediaencoding::encoder::split_args(args)?;
         let child = tokio::process::Command::new(&self.ffmpeg_path)
             .args(&parts)
             .stdin(std::process::Stdio::null())
@@ -575,10 +640,10 @@ impl AttachmentIo for FfmpegAttachmentIo {
     }
 
     fn attachment_path(&self, media_source_id: &str, file_name: &str) -> String {
-        // The path manager refuses a file name that is not a plain leaf
-        // (`..`, separators). Such a name came from the file's own `filename`
-        // tag, so it must never reach the command line as-is: fall back to a
-        // sanitized leaf inside the cache folder rather than the raw name.
+        // The path manager keeps a name's leaf and refuses a name with none
+        // (`..`, a trailing separator). Such a name came from the file's own
+        // `filename` tag, so it must never reach the command line as-is: fall
+        // back to a sanitized leaf inside the cache folder rather than the raw name.
         self.path_manager
             .attachment_path(media_source_id, file_name)
             .or_else(|| {
@@ -621,9 +686,9 @@ impl AttachmentIo for FfmpegAttachmentIo {
         working_dir: Option<&str>,
     ) -> Result<i32, String> {
         // `args` is a pre-built ffmpeg command line (a single space-joined
-        // string, matching the C# `arguments` string); split it into parts while
-        // honouring the double-quoted attachment-output path.
-        let parts = split_ffmpeg_args(args);
+        // string, matching the C# `arguments` string), split with the same
+        // splitter every other string-built ffmpeg run uses.
+        let parts = ferrofin_mediaencoding::encoder::split_args(args)?;
         let mut command = tokio::process::Command::new(ffmpeg_path);
         if let Some(dir) = working_dir {
             command.current_dir(dir);
@@ -638,38 +703,6 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .map_err(|e| format!("spawn ffmpeg {ffmpeg_path}: {e}"))?;
         Ok(status.code().unwrap_or(-1))
     }
-}
-
-/// Splits a space-joined ffmpeg argument string into parts, keeping
-/// double-quoted spans (e.g. the `-dump_attachment` output path) as one token
-/// with the surrounding quotes stripped.
-fn split_ffmpeg_args(args: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut has_token = false;
-    for ch in args.chars() {
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                has_token = true;
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if has_token {
-                    out.push(std::mem::take(&mut current));
-                    has_token = false;
-                }
-            }
-            c => {
-                current.push(c);
-                has_token = true;
-            }
-        }
-    }
-    if has_token {
-        out.push(current);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -851,6 +884,26 @@ mod tests {
         (config, paths)
     }
 
+    /// [`config_and_paths`] rooted at `root`. The composition clears the
+    /// transcode directory, so a test that builds it must own its paths.
+    fn config_and_paths_in(
+        root: &std::path::Path,
+    ) -> (
+        Arc<dyn ServerConfigurationManager>,
+        Arc<FerrofinServerApplicationPaths>,
+    ) {
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            root.join("data"),
+            root.join("log"),
+            root.join("config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        let config: Arc<dyn ServerConfigurationManager> =
+            Arc::new(FakeConfig(Arc::clone(&paths), EncodingOptions::default()));
+        (config, paths)
+    }
+
     /// A fake [`ServerConfigurationManager`] exposing the paths and fixed
     /// encoding options.
     struct FakeConfig(Arc<FerrofinServerApplicationPaths>, EncodingOptions);
@@ -912,9 +965,10 @@ mod tests {
             attachments: Vec::new(),
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
-        let (config, paths) = config_and_paths();
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, paths) = config_and_paths_in(tmp.path());
         let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
-            root: "/cache/att".to_owned(),
+            root: tmp.path().join("att").to_string_lossy().into_owned(),
         });
         // The trio builds without panicking; every slot is a real trait object.
         let ffmpeg = FfmpegPaths {
@@ -936,8 +990,57 @@ mod tests {
                 virtual_folders: None,
                 trickplay: None,
                 sessions: None,
+                keyframes: None,
             },
         );
+    }
+
+    /// The composition runs upstream's `DeleteEncodedMediaCache`
+    /// (`TranscodeManager.cs:94,718`): every file a crash left under the
+    /// transcode directory is gone before any job starts, whatever its age;
+    /// the directories stay.
+    #[test]
+    fn build_media_encoding_clears_the_transcode_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, paths) = config_and_paths_in(tmp.path());
+        let job = tmp.path().join("cache/transcodes/0123abcd");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(job.join("0123abcd0.mp4"), b"segment").unwrap();
+        std::fs::write(
+            tmp.path().join("cache/transcodes/0123abcd.m3u8"),
+            b"#EXTM3U",
+        )
+        .unwrap();
+        let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: "ffmpeg".into(),
+            ffprobe: "ffprobe".into(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+            chromaprint_muxer: false,
+        };
+        let _ = build_media_encoding(
+            Arc::new(FakeSources {
+                sources: Vec::new(),
+                attachments: Vec::new(),
+            }),
+            Arc::new(RecordingEncoder),
+            config,
+            paths,
+            Arc::new(FakePathManager {
+                root: tmp.path().join("att").to_string_lossy().into_owned(),
+            }),
+            &ffmpeg,
+            MediaEncodingExtras {
+                library: None,
+                virtual_folders: None,
+                trickplay: None,
+                sessions: None,
+                keyframes: None,
+            },
+        );
+        assert!(!job.join("0123abcd0.mp4").exists());
+        assert!(!tmp.path().join("cache/transcodes/0123abcd.m3u8").exists());
+        assert!(job.is_dir(), "directories stay");
     }
 
     /// Records what job teardown asked the session layer to release.
@@ -1239,6 +1342,7 @@ mod tests {
                 virtual_folders: None,
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
+                keyframes: None,
             },
         );
 
@@ -1262,23 +1366,150 @@ mod tests {
         );
     }
 
+    /// A keyframe repository holding rows in memory.
+    #[derive(Default)]
+    struct StoredKeyframes(
+        std::sync::Mutex<
+            std::collections::HashMap<Uuid, ferrofin_db::entities::base_items::KeyframeDataEntity>,
+        >,
+    );
+
+    #[async_trait]
+    impl KeyframeRepository for StoredKeyframes {
+        async fn get_keyframe_data(
+            &self,
+            item_id: Uuid,
+        ) -> Result<Vec<ferrofin_db::entities::base_items::KeyframeDataEntity>, ServiceError>
+        {
+            Ok(self
+                .0
+                .lock()
+                .expect("rows")
+                .get(&item_id)
+                .cloned()
+                .into_iter()
+                .collect())
+        }
+        async fn save_keyframe_data(
+            &self,
+            item_id: Uuid,
+            data: &ferrofin_db::entities::base_items::KeyframeDataEntity,
+        ) -> Result<(), ServiceError> {
+            self.0.lock().expect("rows").insert(item_id, data.clone());
+            Ok(())
+        }
+        async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
+            self.0.lock().expect("rows").remove(&item_id);
+            Ok(())
+        }
+    }
+
+    /// The `#EXTINF` lengths of a playlist.
+    fn segment_lengths(playlist: &str) -> Vec<&str> {
+        playlist
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXTINF:"))
+            .filter_map(|rest| rest.strip_suffix(", nodesc"))
+            .collect()
+    }
+
+    /// The playlist for a 12 s `file` whose stored keyframes are at 0, 4.2,
+    /// 6.5 and 11 s, cut into 6 s segments.
+    async fn playlist_for(file: &str, remux: bool, options: EncodingOptions) -> String {
+        let item = Uuid::from_u128(0x4B);
+        let repository = Arc::new(StoredKeyframes::default());
+        repository
+            .save_keyframe_data(
+                item,
+                &ferrofin_db::entities::base_items::KeyframeDataEntity {
+                    item_id: ferrofin_db::store::guid_to_db(item),
+                    keyframe_ticks: Some("[0,42000000,65000000,110000000]".to_owned()),
+                    total_duration: 120_000_000,
+                },
+            )
+            .await
+            .expect("seed");
+        let (_, paths) = config_and_paths();
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(paths, options));
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
+        let generator = playlist_generator(
+            &config,
+            &encoder,
+            Some(repository as Arc<dyn KeyframeRepository>),
+        );
+        let request = ferrofin_hls::CreateMainPlaylistRequest::new(
+            Some(item),
+            file,
+            6000,
+            120_000_000,
+            "ts",
+            "hls1/main/",
+            "?static=true",
+            remux,
+        );
+        generator
+            .create_main_playlist(&request)
+            .await
+            .expect("playlist")
+    }
+
+    #[tokio::test]
+    async fn a_remuxed_mkv_is_cut_on_its_keyframes() {
+        let playlist = playlist_for("/media/movie.mkv", true, EncodingOptions::default()).await;
+
+        // The first keyframe at or after 6 s is at 6.5 s; the rest runs to 12 s.
+        assert_eq!(
+            segment_lengths(&playlist),
+            ["6.500000", "5.500000"],
+            "{playlist}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::a_transcode_makes_its_own_keyframes("/media/movie.mkv", true, false)]
+    #[case::the_extension_is_not_allowed("/media/movie.mp4", true, true)]
+    #[case::extraction_is_switched_off("/media/movie.mkv", false, true)]
+    #[tokio::test]
+    async fn other_playlists_use_equal_length_segments(
+        #[case] file: &str,
+        #[case] allow_mkv: bool,
+        #[case] remux: bool,
+    ) {
+        let options = EncodingOptions {
+            allow_on_demand_metadata_based_keyframe_extraction_for_extensions: if allow_mkv {
+                vec!["mkv".to_owned()]
+            } else {
+                Vec::new()
+            },
+            ..EncodingOptions::default()
+        };
+
+        let playlist = playlist_for(file, remux, options).await;
+
+        assert_eq!(
+            segment_lengths(&playlist),
+            ["6.000000", "6.000000"],
+            "{playlist}"
+        );
+    }
+
     #[test]
     fn attachment_path_never_lets_a_traversal_file_name_leave_the_cache_folder() {
         // The name comes from the file's own `filename` tag; the path manager
-        // refuses anything but a plain leaf, and the fallback must stay inside
-        // the cache folder rather than hand the raw name to ffmpeg.
+        // keeps only its leaf, and the fallback for a name with no leaf must
+        // stay inside the cache folder rather than hand the raw name to ffmpeg.
         let (_, paths) = config_and_paths();
         let io = FfmpegAttachmentIo {
             path_manager: Arc::new(ferrofin_core::path_manager::FerrofinPathManager::new(paths)),
         };
         let id = "d37ecb9d75b0c0a8e9ecb0a864ec670e";
         let folder = io.attachment_folder_path(id).expect("guid folder");
-        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf"] {
+        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf", "a/..", "a/"] {
             let path = io.attachment_path(id, evil);
             assert!(path.starts_with(&folder), "{evil} -> {path}");
             // A plain leaf: no separator after the folder, so `..` is inert.
             assert!(
-                !path[folder.len() + 1..].contains(['/', '\\']),
+                !path[folder.len() + 1..].contains(std::path::is_separator),
                 "{evil} -> {path}"
             );
         }
@@ -1378,10 +1609,8 @@ mod tests {
     /// A stand-in ffmpeg: an executable shell script running `body`.
     #[cfg(unix)]
     fn fake_ffmpeg(dir: &std::path::Path, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("ffmpeg");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::stub_script(&path, body);
         path.to_string_lossy().into_owned()
     }
 
@@ -1406,6 +1635,7 @@ mod tests {
             }),
             ffmpeg_path,
             config: Arc::new(FakeConfig(paths, options)),
+            encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
         }
     }
 
@@ -1431,6 +1661,55 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("timed out after 0 minute(s)"), "{error}");
         assert!(!std::path::Path::new(&output).exists());
+    }
+
+    /// A broken `encoding.json` extracts with the default timeout, and says so
+    /// once with the file's path rather than once per extraction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subtitle_extraction_warns_once_about_a_broken_encoding_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            "for arg; do out=\"$arg\"; done; printf 1 > \"$out\"",
+        );
+        let mut io = subtitle_io(tmp.path(), ffmpeg, 1);
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            tmp.path().join("data"),
+            tmp.path().join("log"),
+            tmp.path().join("config"),
+            tmp.path().join("cache"),
+            tmp.path().join("web"),
+        ));
+        io.config = Arc::new(
+            ferrofin_core::FerrofinServerConfigurationManager::load(paths)
+                .await
+                .unwrap(),
+        );
+        let file = tmp.path().join("config/users/named/encoding.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{ \"SubtitleExtractionTimeoutMinutes\": 1, }").unwrap();
+
+        let logs = crate::test_logs::CapturedLogs::default();
+        let guard = logs.install();
+        for name in ["0.srt", "1.srt"] {
+            let output = tmp.path().join(name).to_string_lossy().into_owned();
+            io.extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap();
+            assert!(std::path::Path::new(&output).is_file());
+        }
+        drop(guard);
+
+        let warnings = logs.lines_at("WARN");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains(&file.display().to_string()),
+            "{warnings:#?}"
+        );
     }
 
     /// Within the configured timeout the extraction completes normally.
@@ -1587,26 +1866,89 @@ mod tests {
         assert!(io.read_file("/no/such/file").await.is_err());
     }
 
-    #[test]
-    fn split_ffmpeg_args_keeps_quoted_path_as_one_token() {
-        let args =
-            r#"-dump_attachment:3 "/cache/att/font.ttf" -i file:/media/x.mkv -t 0 -f null null"#;
-        let parts = split_ffmpeg_args(args);
-        assert_eq!(parts[0], "-dump_attachment:3");
-        assert_eq!(parts[1], "/cache/att/font.ttf");
-        assert_eq!(parts[2], "-i");
-        assert_eq!(parts[3], "file:/media/x.mkv");
-        assert_eq!(parts.last().unwrap(), "null");
+    /// The attachment dump spawns ffmpeg with exactly the argv the builder
+    /// quoted. The old hand-rolled splitter here toggled on every `"` and kept
+    /// the `\` escapes, so a media path containing a quote reached ffmpeg
+    /// mangled and fonts were never extracted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_dump_gets_a_quoted_path_back_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp.path().join("argv");
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            &format!("printf '%s\\n' \"$@\" > \"{}\"", record.display()),
+        );
+        let io = FfmpegAttachmentIo {
+            path_manager: Arc::new(FakePathManager {
+                root: tmp.path().to_string_lossy().into_owned(),
+            }),
+        };
+        let media = r#"/media/The "Best" \ Movie.mkv"#;
+        let args = format!(
+            "-dump_attachment:3 {} -i {} -t 0 -f null null",
+            ferrofin_mediaencoding::encoder::quote("/cache/att/font.ttf"),
+            ferrofin_mediaencoding::encoder::get_input_argument("file", media, MediaProtocol::File),
+        );
+        assert_eq!(io.run_ffmpeg(&ffmpeg, &args, None).await.unwrap(), 0);
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            [
+                "-dump_attachment:3",
+                "/cache/att/font.ttf",
+                "-i",
+                &format!("file:{media}"),
+                "-t",
+                "0",
+                "-f",
+                "null",
+                "null",
+            ]
+        );
+        // Unbalanced quoting is refused rather than guessed at.
+        assert!(
+            io.run_ffmpeg(&ffmpeg, r#"-i "unterminated"#, None)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn split_ffmpeg_args_handles_plain_tokens() {
-        let parts = split_ffmpeg_args("-i input.mkv -c copy");
-        assert_eq!(parts, vec!["-i", "input.mkv", "-c", "copy"]);
-    }
-
-    #[test]
-    fn split_ffmpeg_args_empty_is_empty() {
-        assert!(split_ffmpeg_args("   ").is_empty());
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pause_key_probe_runs_only_for_a_validated_ffmpeg() {
+        use ferrofin_mediaencoding::transcoding::throttler::{PauseKeySlot, PauseKeys};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("ffmpeg");
+        // Prints Jellyfin-ffmpeg's pause-key help once it has read `?q` on stdin.
+        crate::test_exec::stub_script(
+            &script,
+            "keys=$(dd bs=1 count=2 2>/dev/null)\n\
+             if [ \"$keys\" = '?q' ]; then echo 'p      pause transcoding' >&2; fi\n",
+        );
+        let paths = |validated| FfmpegPaths {
+            encoder_app_path_display: None,
+            ffmpeg: script.clone(),
+            ffprobe: "ffprobe".into(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::builder()
+                .ffmpeg_version(ferrofin_mediaencoding::FfmpegVersion::new(8, 0))
+                .validated(validated)
+                .build(),
+            chromaprint_muxer: false,
+        };
+        let (skipped, probed) = (PauseKeySlot::default(), PauseKeySlot::default());
+        let handle = tokio::runtime::Handle::current();
+        spawn_pause_key_probe(&handle, &paths(false), skipped.clone());
+        spawn_pause_key_probe(&handle, &paths(true), probed.clone());
+        for _ in 0..500 {
+            if probed.get().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(probed.get(), Some(PauseKeys::Patched));
+        // Give a wrongly spawned probe time to land too.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(skipped.get(), None, "a placeholder ffmpeg is never run");
     }
 }

@@ -26,16 +26,18 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 
 ## Why Ferrofin
 
-- **Faster, and a fraction of the memory.** On the same machine and library, Ferrofin
-  renders the home screen **3.4× faster** than Jellyfin 12.0-rc7, cold-starts **15.8×
-  faster**, and sits at **61 MiB idle against 409 MiB** (6.7× lighter), with peak memory
-  under load 3.8× lower. Numbers, method and caveats are in [Benchmarks](#benchmarks).
+- **Faster movie browsing, lower memory.** Across three runs on the same machine and
+  fixture, Ferrofin's movie-screen HTTP workload had **16 ms median latency against
+  36 ms** for Jellyfin 12.2.0, and steady idle memory was **168 MiB against 422 MiB**.
+  Playback is also faster; home, detail, series and search remain withheld where response
+  validation differs.
+  Results, ranges and limitations are in [Benchmarks](#benchmarks).
 - **One binary, no runtime.** A single `ferrofin-server` executable plus ffmpeg. No .NET
   runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
   client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
   Jellyfin 12.0), same password hashes. Adopt an existing Jellyfin 10.11.8–10.11.11,
-  12.0.0, 12.1.0 or 12.2.0 library with no re-scan; see [supported and tested versions](adoption/README.md#supported-and-tested-versions).
+  12.0.0, 12.1.0 or 12.2.0 library with no re-scan; see [supported and tested versions](gates/adoption/README.md#supported-and-tested-versions).
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
@@ -68,35 +70,44 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 ## Benchmarks
 
 <!-- BEGIN GENERATED BENCHMARKS — do not edit by hand. Regenerate with:
-     python3 bench/report.py --readme README.md bench/runs/v1.0.0 bench/runs/v1.0.0-run2 bench/runs/v1.0.0-run3 -->
-Ferrofin `v1.0.0` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit and no swap, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every figure is the **median of 3 full runs**. No request failed on any server at any load level.
+     python3 gates/bench/report.py --readme README.md gates/bench/runs/v1.3.2-603-d2bb9306 gates/bench/runs/v1.3.2-603-d2bb9306-run2 gates/bench/runs/v1.3.2-603-d2bb9306-run3 -->
+Ferrofin `v1.3.2-603-d2bb9306` against **Jellyfin 12.2.0**, measured 2026-10-20 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 logical CPUs with an 8 GiB limit, over a fixture of 3001 movies, 250 series and 7490 episodes. Published figures are medians across 3 selected runs; incomplete or non-comparable cells are withheld.
+No measured request failed in the recorded load windows (unloaded, loaded, stress).
 
-The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that screen, replayed at 5 screens per second (the "loaded" level). Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.0-rc7.
+The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, replayed at 5 screens per second (the "loaded" level). They include API and poster requests, not browser rendering. Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.2.0.
 
-| | Jellyfin 12.0-rc7 | Jellyfin 10.11.8 | **Ferrofin** | Ferrofin vs 12.0-rc7 |
-|---|---|---|---|---|
-| **home** screen | 44 / 51 / 57 | 64 / 73 / 77 | **13 / 16 / 19** | **3.4× faster** |
-| **movies** screen | 38 / 43 / 47 | 24 / 28 / 31 | **25 / 30 / 32** | **1.5× faster** |
-| **detail** screen | 98 / 161 / 165 | 20 / 29 / 33 | **9 / 12 / 13** | **10.9× faster** ⚠[1] |
-| **series** screen | 97 / 101 / 224 | 18 / 21 / 27 | **8 / 10 / 11** | **12.1× faster** |
-| **search** screen | 70 / 234 / 255 | 98 / 121 / 184 | **26 / 36 / 42** | **2.7× faster** |
-| **playback** screen | 31 / 37 / 55 | 5 / 20 / 33 | **10 / 13 / 45** | **3.1× faster** ⚠[2] |
-| cold start (restart → home screen) | 2746 ms | 2162 ms | **174 ms** | **15.8× faster** |
-| direct-play TTFB (1 MiB range) | 4.61 ms | 1.01 ms | **0.48 ms** | **9.6× faster** |
-| peak under load memory | 588 MiB | 548 MiB | **155 MiB** | **3.8× lighter** |
-| steady idle memory | 409 MiB | 356 MiB | **61.4 MiB** | **6.7× lighter** |
+| | Jellyfin 12.2.0 | **Ferrofin** | Ferrofin vs 12.2.0 |
+|---|---|---|---|
+| **home** screen | 46 / 51 / 60 | **— ⚠[1]** | **—** |
+| **movies** screen | 36 / 41 / 47 | **16 / 18 / 20** | **2.2× faster** |
+| **detail** screen | 32 / 37 / 41 | **— ⚠[2]** | **—** |
+| **series** screen | 24 / 27 / 28 | **— ⚠[3]** | **—** |
+| **search** screen | 59 / 68 / 81 | **— ⚠[4]** | **—** |
+| **playback** screen | 29 / 33 / 57 | **11 / 13 / 33** | **2.6× faster** |
+| cold start (restart → authenticated views; host caches retained) | 3301 ms | **1088 ms** | **3.0× faster** |
+| direct-play TTFB (1 MiB range) | 3.93 ms | **0.52 ms** | **7.6× faster** |
+| peak under load memory | 590 MiB | **214 MiB** | **2.8× lighter** |
+| steady idle memory | 422 MiB | **168 MiB** | **2.5× lighter** |
 
-Per endpoint, same level and runs, Ferrofin is faster than Jellyfin 12.0-rc7 on all 28 compared requests, from 1.1× (`movies:items`) to 20.7× (`home:resume-book`); the full three-server table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+Among 23 comparable endpoint measurements at this level, Ferrofin is faster on 19, about the same on 0, and slower on 4 against Jellyfin 12.2.0. Flagged or missing endpoints are excluded from these counts. The full tables are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather than a like-for-like result:
+⚠ marks a withheld cell: its evidence is incomplete or the servers did different work. Raw diagnostic numbers remain in the full report.
 
-1. detail: detail:item: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal, MediaStreams[].IsOriginal (+1 more)
-2. playback: playback:playbackinfo: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal
+1. Ferrofin: home: home:latest-shows: ids differs for a request pick
+2. Ferrofin: detail: detail:image: request picks differ
+3. Ferrofin: series: series:similar: ids differs for a request pick
+4. Ferrofin: search: search:artists: ids differs for a request pick
 
-Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.
-
-How steady are these numbers? Across the 3 runs, 3 of the 102 medians in the loaded-level tables moved by more than 15 % of their value, against 68 of the 204 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). It is a deliberate, local instrument, not a CI job.
+How steady are these numbers? Across the 3 runs, 36 of the 78 medians in the loaded-level tables moved by more than 15 % of their value, against 144 of the 156 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`gates/bench/README.md`](gates/bench/README.md). It is a deliberate, local instrument, not a CI job.
 <!-- END GENERATED BENCHMARKS -->
+
+The measured server source is commit `d2bb9306`; the run name above identifies the
+local result set, not a release. CPU observations and the retained cold-start range
+(739–1092 ms across Ferrofin's run medians) are in [the full results](docs/BENCHMARKS.md).
+Whole-workload CPU savings claims remain withheld while response/work differences are
+unresolved. Every run passed the start-of-run idle check, but the first saw 42–49 % p95
+interference on the server cores during measurement; the ranges include it.
+
 
 ## Quickstart
 
@@ -163,7 +174,7 @@ All six 10.11–12.1 releases passed the live adoption suite on 2026-09-16; the 
 passed the synthetic suite on 2026-10-13. Nine fixture paths total, including both
 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0 and both 12.2 routes. Checks cover API
 summaries against Jellyfin 12.2, database integrity, and stable responses without repeated
-repairs after restart. See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+repairs after restart. See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
 Support is determined by the exact migration history; these version numbers do not imply
 support for every 10.11.x or 12.x release.
 
@@ -254,7 +265,7 @@ All 412 operations in the vendored Jellyfin 10.11.8 contract are implemented. Wo
 end-to-end: authentication, users and QuickConnect; library scan with live filesystem
 watching; browse and query; images; sessions, playstate and remote control; WebSocket push;
 playlists and collections; direct play and live HLS transcoding (NVENC, VAAPI and QSV
-hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; all 20 scheduled tasks;
+hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; 20 scheduled tasks;
 metrics and tracing; trickplay, chapters, lyrics and media segments; photo and book
 libraries; backup and restore.
 
@@ -311,7 +322,8 @@ Crate map, the C#-to-Rust mapping, and the porting rules: [`docs/ARCHITECTURE.md
 ## Contributing
 
 Every change is gated behind `cargo fmt`, `clippy -D warnings`, the full test suite, and
-an 80 % per-crate line-coverage floor. Perf-touching changes need a measured before/after.
+an 80 % per-crate line-coverage floor. Performance and memory are benchmarked before each
+release.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE.md`](CLAUDE.md).
 
 Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).

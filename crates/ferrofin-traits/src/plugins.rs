@@ -328,7 +328,9 @@ pub trait PluginRequestHandler: Send + Sync {
     /// plugin (or it is disabled)" — the transport turns that into `404`.
     ///
     /// # Errors
-    /// Backend failures (the plugin trapping, the runtime being gone).
+    /// [`ServiceError::Unavailable`] when the plugin has no room for the
+    /// request right now (the transport answers `503`); backend failures (the
+    /// plugin trapping, the runtime being gone).
     async fn handle(
         &self,
         plugin_id: uuid::Uuid,

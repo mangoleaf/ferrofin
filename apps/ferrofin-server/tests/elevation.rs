@@ -434,6 +434,116 @@ async fn an_anonymous_caller_is_unauthorized_not_forbidden() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// A client side of the session WebSocket.
+type ClientSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Reads text frames until one of type `until` arrives, returning the types of
+/// every frame read on the way, `until` included.
+async fn read_until(socket: &mut ClientSocket, until: &str) -> Vec<String> {
+    use futures_util::StreamExt as _;
+    let mut seen = Vec::new();
+    while seen.last().is_none_or(|t| t != until) {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("no {until} frame in time; saw {seen:?}"))
+            .expect("socket open")
+            .expect("readable frame");
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                let v: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+                seen.push(v["MessageType"].as_str().unwrap_or_default().to_owned());
+            }
+            tokio_tungstenite::tungstenite::Message::Close(_) => {
+                panic!("the server closed the socket; saw {seen:?}")
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Opens `token`'s session socket and sends `ActivityLogEntryStart`. Frames are
+/// handled in order, so the `KeepAlive` ack proves the subscription was
+/// processed before anything the caller does next.
+async fn subscribe_to_activity(addr: std::net::SocketAddr, token: &str) -> ClientSocket {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/socket?ApiKey={token}"))
+            .await
+            .expect("upgrade");
+    for message in [
+        r#"{"MessageType":"ActivityLogEntryStart","Data":"0,50"}"#,
+        r#"{"MessageType":"KeepAlive"}"#,
+    ] {
+        socket.send(Message::text(message)).await.expect("send");
+    }
+    read_until(&mut socket, "KeepAlive").await;
+    socket
+}
+
+/// `ActivityLogEntryStart` streams the activity log over the session socket, so
+/// it must apply the same gate as `GET /System/ActivityLog/Entries` (C#
+/// `ActivityLogWebSocketListener.Start`): the administrator's subscription is
+/// served, the ordinary account's is refused, and its socket stays open. The
+/// entry used is a failed sign-in, which carries the caller's IP address.
+#[tokio::test]
+async fn an_ordinary_account_cannot_stream_the_activity_log() {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let admin_token = login(&router, ADMIN_USER, ADMIN_PASSWORD, "elev-admin").await;
+    let (status, _) = call_as(
+        &router,
+        "POST",
+        "/Users/New",
+        Some(&admin_token),
+        "elev-admin",
+        Some(serde_json::json!({ "Name": USER_NAME, "Password": USER_PASSWORD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin may create a user");
+    let user_token = login(&router, USER_NAME, USER_PASSWORD, "elev-user").await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let served = router.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, served).await;
+    });
+    let mut admin = subscribe_to_activity(addr, &admin_token).await;
+    let mut user = subscribe_to_activity(addr, &user_token).await;
+
+    let (status, _) = call_as(
+        &router,
+        "POST",
+        "/Users/AuthenticateByName",
+        None,
+        "elev-stranger",
+        Some(serde_json::json!({ "Username": USER_NAME, "Pw": "wrong" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the sign-in fails");
+
+    read_until(&mut admin, "ActivityLogEntry").await;
+    // Give an armed stream several periods to fire before the probe, whose
+    // answer also proves the refused socket stayed open.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    user.send(Message::text(r#"{"MessageType":"KeepAlive"}"#))
+        .await
+        .expect("send the probe");
+    let seen = read_until(&mut user, "KeepAlive").await;
+    assert!(
+        !seen.iter().any(|t| t == "ActivityLogEntry"),
+        "the ordinary account received the activity log: {seen:?}"
+    );
+}
+
 // The other half of the restart gate, against the real `UserManager`: an
 // ordinary account calling from off-network. `call_as` inserts no
 // `ConnectInfo`, which the policy treats as remote, so this resolves the

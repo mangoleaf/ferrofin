@@ -1,0 +1,29 @@
+WEBVTT - cues
+
+STYLE
+::cue(.yellow) { color: yellow; }
+::cue(.big) { font-size: 30px; font-weight: bold; }
+
+REGION
+id:top width:40% lines:3 regionanchor:0%,100% viewportanchor:10%,90%
+
+NOTE a block before the first cue joins the header
+
+00:00:11.000 --> 00:00:12.500 region:top position:20% line:20%
+Top left &amp; early
+
+00:00:13.000 --> 00:00:14.000 position:80%
+<i>Bottom</i> <b>right</b> <u>under</u>
+
+00:00:15.000 --> 00:00:16.000
+<c.yellow>Yellow class</c>
+
+00:00:17.000 --> 00:00:18.000 line:20%
+<v Bob>Top by line number
+second &lt;line&gt;
+
+00:00:19.000 --> 00:00:20.000
+<c.big.yellow>Big</c> and <c.red>red</c>
+
+00:00:21.000 --> 00:00:22.000 line:50%
+Middle

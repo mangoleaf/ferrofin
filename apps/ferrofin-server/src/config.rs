@@ -28,7 +28,8 @@ use serde::Deserialize;
 /// candidate setting is already exposed as [`Config::port`].
 pub const DEFAULT_HTTP_PORT: u16 = 8096;
 
-/// Default TCP port for the HTTPS endpoint (TLS termination is deferred).
+/// Default TCP port for the HTTPS endpoint, served when the network
+/// configuration enables HTTPS and its certificate loads.
 ///
 /// `8920` is the Jellyfin parity value (`ServerConfiguration.HttpsServerPortNumber`).
 /// FLAGGED as a magic number, same rationale as [`DEFAULT_HTTP_PORT`].
@@ -54,6 +55,15 @@ const DATABASE_FILE_NAME: &str = "ferrofin.db";
 
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
+
+/// Minimum period, in milliseconds, between pushes of a dashboard WebSocket
+/// stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). The client names
+/// the period in its `*Start` subscription; Ferrofin floors it because it drives
+/// these streams on a timer — each tick recomputes and resends the full snapshot
+/// — unlike upstream's event-driven `BasePeriodicWebSocketListener`, where the
+/// period is only a debounce ceiling. 100 ms allows far faster updates than
+/// jellyfin-web's 1500 ms while bounding the worst case for a hostile client.
+const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
 
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
@@ -117,6 +127,9 @@ struct FileConfig {
     /// 2) and fail the whole file on a string, so every value goes through
     /// [`Config::tvdb_cache_duration`]'s check and warning instead.
     tvdb_cache_hours: Option<String>,
+    /// Read as text for the same reason as `tvdb_cache_hours`; checked by
+    /// [`Config::tvdb_token_max_age`].
+    tvdb_token_days: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
     ffmpeg_path: Option<PathBuf>,
@@ -132,8 +145,12 @@ struct FileConfig {
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
+    websocket_min_stream_period_ms: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
+    scan_directory_cache_records: Option<u32>,
+    scan_directory_cache_idle_secs: Option<u32>,
+    trickplay_concurrency: Option<CountOrAuto>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
@@ -146,6 +163,7 @@ struct FileConfig {
     wasm_write_content_mb: Option<u32>,
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
+    quick_connect_pending_per_ip: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -158,6 +176,18 @@ enum DbPoolFileValue {
     /// An explicit connection count (`db_pool = 16`).
     Count(u32),
     /// A sizing mode by name — only `"auto"` is valid (`db_pool = "auto"`).
+    Mode(String),
+}
+
+/// A `config.toml` value that is an integer or the literal string `"auto"`.
+/// Unlike [`DbPoolFileValue`] the integer is signed: zero and negative values
+/// are accepted and mean `auto`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CountOrAuto {
+    /// An explicit count (`trickplay_concurrency = 2`).
+    Count(i64),
+    /// A mode by name — only `"auto"` is valid (`trickplay_concurrency = "auto"`).
     Mode(String),
 }
 
@@ -192,6 +222,34 @@ pub struct ProviderEndpoints {
     pub audiodb: Option<String>,
     /// Replaces `https://lrclib.net` for scheduled-lyrics integration tests.
     pub lrclib: Option<String>,
+}
+
+/// The base URL [`Config::test_stub`] gives the remote providers a scan or a
+/// refresh reaches: a loopback port nothing serves (TCP 9, the discard port),
+/// so a test server's provider requests are refused at once instead of
+/// reaching the public internet.
+#[doc(hidden)]
+pub const OFFLINE_PROVIDER_URL: &str = "http://127.0.0.1:9";
+
+impl ProviderEndpoints {
+    /// Every provider here pointed at [`OFFLINE_PROVIDER_URL`]: what
+    /// [`Config::test_stub`] uses. A test that mocks one provider overrides
+    /// that field and keeps the rest offline with
+    /// `..ProviderEndpoints::offline()`.
+    #[must_use]
+    pub fn offline() -> Self {
+        let nowhere = Some(OFFLINE_PROVIDER_URL.to_owned());
+        Self {
+            tmdb: nowhere.clone(),
+            tmdb_images: nowhere.clone(),
+            omdb: nowhere.clone(),
+            opensubtitles: nowhere.clone(),
+            tvdb: nowhere.clone(),
+            fanart: nowhere.clone(),
+            audiodb: nowhere.clone(),
+            lrclib: nowhere,
+        }
+    }
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -246,7 +304,9 @@ pub struct Config {
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
 
-    /// HTTPS port (TLS deferred). Default [`DEFAULT_HTTPS_PORT`].
+    /// HTTPS port, listened on beside the HTTP port when the network
+    /// configuration's `EnableHttps` is on and its certificate loads. Default
+    /// [`DEFAULT_HTTPS_PORT`].
     pub https_port: u16,
 
     /// Publicly reachable server URL advertised to clients
@@ -284,6 +344,15 @@ pub struct Config {
     /// where the client is built, so a bad value warns (tracing is up by
     /// then) and the default applies — it never stops the server.
     pub tvdb_cache_hours: Option<String>,
+
+    /// How old TheTVDB's bearer token may get before Ferrofin logs in again,
+    /// in whole days, as written: the TVDB plugin's 25 (`LoginAsync`), inside
+    /// the month a TVDB v4 token is valid for. Resolved
+    /// `FERROFIN_TVDB_TOKEN_DAYS` env > `tvdb_token_days` in `config.toml` >
+    /// unset; validated by [`tvdb_token_max_age`](Self::tvdb_token_max_age)
+    /// where the client is built, so a bad value warns and the default
+    /// applies.
+    pub tvdb_token_days: Option<String>,
 
     /// fanart.tv personal API key (`client_key`), raising rate limits and
     /// unlocking fresher artwork. Empty = the built-in key only. From
@@ -382,6 +451,13 @@ pub struct Config {
     /// `config.toml` > 30.
     pub shutdown_timeout_secs: u32,
 
+    /// Minimum period (milliseconds) between pushes of a dashboard WebSocket
+    /// stream; the client-chosen Sessions / ScheduledTasksInfo /
+    /// ActivityLogEntry period is clamped up to it. Resolved
+    /// `FERROFIN_WS_MIN_STREAM_PERIOD_MS` env > `websocket_min_stream_period_ms`
+    /// in `config.toml` > 100. See [`DEFAULT_WS_MIN_STREAM_PERIOD_MS`].
+    pub websocket_min_stream_period_ms: u32,
+
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
     /// order: `FERROFIN_SCAN_PROGRESS_EVERY` env, then `scan_progress_every` in
@@ -400,6 +476,35 @@ pub struct Config {
     /// `config.toml` > default.
     pub scan_probe_concurrency: Option<u32>,
 
+    /// The directory listings one library scan keeps: dropped whole once
+    /// they hold this many records (a folder counts each entry plus one).
+    /// A scan lists each folder once and its items read that listing, so
+    /// this bounds the memory a huge library's scan spends on them; past it,
+    /// a folder is listed again. `None` = upstream's
+    /// `DirectoryService.MaxCachedRecords` (100 000). Resolved
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` env >
+    /// `scan_directory_cache_records` in `config.toml` > default; `0` is an
+    /// error.
+    pub scan_directory_cache_records: Option<u32>,
+
+    /// How long, in seconds, a library scan's directory listings survive
+    /// unread before they are dropped whole. `None` = upstream's
+    /// `DirectoryService.IdleTimeoutMs` (300 s). Resolved
+    /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` env >
+    /// `scan_directory_cache_idle_secs` in `config.toml` > default; `0` is an
+    /// error.
+    pub scan_directory_cache_idle_secs: Option<u32>,
+
+    /// How many trickplay generations (one item width each, an ffmpeg frame
+    /// extraction plus tile packing) run at once. A library scan runs several;
+    /// the scheduled task runs one but shares the cap. `None` = `auto`: as many as the shared image-encoding
+    /// pool allows (`ParallelImageEncodingLimit`, else the usable cores).
+    /// Jellyfin runs one at a time; `1` restores that. Zero, negative, and
+    /// values above the auto value also mean auto (applied in `state.rs`).
+    /// Resolved `FERROFIN_TRICKPLAY_CONCURRENCY` env (integer or `auto`) >
+    /// `trickplay_concurrency` in `config.toml` (integer or `"auto"`) > auto.
+    pub trickplay_concurrency: Option<u32>,
+
     /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
     /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
     /// `FERROFIN_WASM_CALL_TIMEOUT_SECS` env > `wasm_call_timeout_secs` in
@@ -414,7 +519,8 @@ pub struct Config {
 
     /// Per-plugin event queue depth for WASM plugins. `None` = the 256
     /// default. A full queue drops events for that plugin only (events are
-    /// hints; the DB is the truth). Resolved
+    /// hints; the DB is the truth), and web requests may hold at most half
+    /// of it. Resolved
     /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
     /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
     /// treated as unset.
@@ -467,6 +573,13 @@ pub struct Config {
     /// Resolved `FERROFIN_PLAYBACK_METRICS_QUEUE` env >
     /// `playback_metrics_queue` in `config.toml` > default.
     pub playback_metrics_queue: Option<u32>,
+
+    /// Unauthorized Quick Connect requests one remote IP may hold at once;
+    /// the next `POST /QuickConnect/Initiate` from that IP drops its oldest.
+    /// `None`/zero = `ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP` (10). Jellyfin has no
+    /// cap. Resolved `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` env >
+    /// `quick_connect_pending_per_ip` in `config.toml` > default.
+    pub quick_connect_pending_per_ip: Option<u32>,
 
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
@@ -590,6 +703,11 @@ impl Config {
             .filter(|raw| !raw.trim().is_empty())
             .or(file.tvdb_cache_hours);
 
+        let tvdb_token_days = env
+            .var("FERROFIN_TVDB_TOKEN_DAYS")
+            .filter(|raw| !raw.trim().is_empty())
+            .or(file.tvdb_token_days);
+
         let fanart_personal_api_key = env
             .var("FERROFIN_FANART_KEY")
             .or(file.fanart_personal_api_key)
@@ -656,6 +774,7 @@ impl Config {
             tvdb_api_key,
             tvdb_subscriber_pin,
             tvdb_cache_hours,
+            tvdb_token_days,
             fanart_personal_api_key,
             musicbrainz_base_url,
             ffmpeg_path,
@@ -679,10 +798,26 @@ impl Config {
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+            websocket_min_stream_period_ms: parse_var(env, "FERROFIN_WS_MIN_STREAM_PERIOD_MS")
+                .or(file.websocket_min_stream_period_ms)
+                .unwrap_or(DEFAULT_WS_MIN_STREAM_PERIOD_MS),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
                 .or(file.scan_probe_concurrency),
+            scan_directory_cache_records: resolve_positive(
+                env,
+                "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
+                "scan_directory_cache_records",
+                file.scan_directory_cache_records,
+            )?,
+            scan_directory_cache_idle_secs: resolve_positive(
+                env,
+                "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
+                "scan_directory_cache_idle_secs",
+                file.scan_directory_cache_idle_secs,
+            )?,
+            trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
             wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
@@ -709,6 +844,8 @@ impl Config {
                 .or(file.wasm_subtitle_extract_mb),
             playback_metrics_queue: parse_var(env, "FERROFIN_PLAYBACK_METRICS_QUEUE")
                 .or(file.playback_metrics_queue),
+            quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
+                .or(file.quick_connect_pending_per_ip),
         })
     }
 
@@ -769,6 +906,30 @@ impl Config {
         }
     }
 
+    /// TheTVDB's token max age ([`tvdb_token_days`](Self::tvdb_token_days)):
+    /// the configured whole days, or the plugin's 25
+    /// ([`ferrofin_providers::tvdb::DEFAULT_TOKEN_MAX_AGE`]) when unset. A
+    /// value outside 1–29 days is refused with a warning and the default is
+    /// used: TheTVDB expires a token after a month, so 30 or more would let
+    /// every lookup fail before the renewal. Call it once tracing is
+    /// installed.
+    #[must_use]
+    pub fn tvdb_token_max_age(&self) -> std::time::Duration {
+        let default = ferrofin_providers::tvdb::DEFAULT_TOKEN_MAX_AGE;
+        let Some(raw) = self.tvdb_token_days.as_deref() else {
+            return default;
+        };
+        if let Ok(days @ 1..=29) = raw.trim().parse::<u32>() {
+            return std::time::Duration::from_hours(u64::from(days) * 24);
+        }
+        tracing::warn!(
+            value = raw,
+            default_days = default.as_secs() / 86_400,
+            "FERROFIN_TVDB_TOKEN_DAYS / tvdb_token_days is not a whole number of days from 1 to 29; using the default"
+        );
+        default
+    }
+
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for
     /// `ferrofin_db::Database::connect`.
     #[must_use]
@@ -777,9 +938,19 @@ impl Config {
     }
 
     /// A minimal [`Config`] for tests: all directories under `root`, empty
-    /// credentials/keys, ephemeral ports. Callers override the one or two fields
-    /// they exercise via struct-update syntax (`..Config::test_stub(root)`), so
-    /// adding a new field only needs a default here — not an edit at every site.
+    /// credentials/keys, ephemeral ports, and the remote providers a scan or a
+    /// refresh reaches (the [`ProviderEndpoints`], MusicBrainz and the studio
+    /// artwork repository) offline at [`OFFLINE_PROVIDER_URL`], so a scan in a
+    /// test never waits on the public internet. ListenBrainz, asked only for
+    /// similar artists on request, keeps its public host. As with any
+    /// MusicBrainz mirror, the music items' MusicBrainz links point at the
+    /// configured base URL, here the offline one. The two URLs are operator
+    /// settings, which win over the dashboard's MusicBrainz `Server` and Studio
+    /// Images `RepositoryUrl`: a test of those dashboard settings sets them
+    /// back to `String::new()`. Callers override the one or two fields they
+    /// exercise via struct-update syntax (`..Config::test_stub(root)`), so
+    /// adding a new field only needs a default here — not an edit at every
+    /// site.
     ///
     /// `#[doc(hidden)] pub` (not `#[cfg(test)]`) so the integration tests in
     /// `tests/`, which link the crate compiled normally, can reach it too.
@@ -796,18 +967,19 @@ impl Config {
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
             bind_addr_explicit: true,
             discovery_bind_addr: None,
-            provider_endpoints: ProviderEndpoints::default(),
+            provider_endpoints: ProviderEndpoints::offline(),
             port: 0,
             https_port: 0,
             published_url: None,
             base_url: String::new(),
             omdb_api_key: String::new(),
-            studios_repo_url: String::new(),
+            studios_repo_url: OFFLINE_PROVIDER_URL.to_owned(),
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
             tvdb_cache_hours: None,
+            tvdb_token_days: None,
             fanart_personal_api_key: String::new(),
-            musicbrainz_base_url: String::new(),
+            musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
             ffmpeg_path: None,
             ffprobe_path: None,
             library_roots: Vec::new(),
@@ -821,8 +993,12 @@ impl Config {
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            websocket_min_stream_period_ms: DEFAULT_WS_MIN_STREAM_PERIOD_MS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
+            scan_directory_cache_records: None,
+            scan_directory_cache_idle_secs: None,
+            trickplay_concurrency: None,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
@@ -835,6 +1011,7 @@ impl Config {
             wasm_write_content_mb: None,
             wasm_subtitle_extract_mb: None,
             playback_metrics_queue: None,
+            quick_connect_pending_per_ip: None,
         }
     }
 }
@@ -889,6 +1066,65 @@ fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Resu
         Some(DbPoolFileValue::Mode(s)) if s.eq_ignore_ascii_case("auto") => Ok(None),
         Some(DbPoolFileValue::Mode(s)) => Err(anyhow::anyhow!(
             "invalid db_pool `{s}` in config.toml: expected an integer or \"auto\""
+        )),
+    }
+}
+
+/// Resolves a count that must be positive: the `env_key` env var > `file_key`
+/// in `config.toml` > `None` (the default). Zero and anything that is not a
+/// non-negative integer are errors, so a typo or a `0` meant as "off" is
+/// noticed instead of silently disabling a cache. An empty env value is
+/// unset.
+fn resolve_positive(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+) -> anyhow::Result<Option<u32>> {
+    if let Some(raw) = env.var(env_key).filter(|s| !s.trim().is_empty()) {
+        let n: u32 = raw.trim().parse().map_err(|_| {
+            anyhow::anyhow!("invalid {env_key} `{raw}`: expected a positive integer")
+        })?;
+        anyhow::ensure!(n > 0, "invalid {env_key} `0`: expected a positive integer");
+        return Ok(Some(n));
+    }
+    anyhow::ensure!(
+        file != Some(0),
+        "invalid {file_key} `0` in config.toml: expected a positive integer"
+    );
+    Ok(file)
+}
+
+/// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
+/// (integer or `auto`) > `trickplay_concurrency` in `config.toml` (integer or
+/// `"auto"`) > `None` (auto). Zero and negative integers are `auto`; anything
+/// that is neither an integer nor `auto` is an error, so a typo is noticed.
+fn resolve_trickplay_concurrency(
+    env: &dyn Env,
+    file: Option<CountOrAuto>,
+) -> anyhow::Result<Option<u32>> {
+    // Huge values saturate; state.rs caps every value at the auto value anyway.
+    let positive = |n: i64| (n > 0).then(|| u32::try_from(n).unwrap_or(u32::MAX));
+    if let Some(raw) = env
+        .var("FERROFIN_TRICKPLAY_CONCURRENCY")
+        .filter(|s| !s.is_empty())
+    {
+        if raw.eq_ignore_ascii_case("auto") {
+            return Ok(None);
+        }
+        let n: i64 = raw.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid FERROFIN_TRICKPLAY_CONCURRENCY `{raw}`: expected an integer or `auto`"
+            )
+        })?;
+        return Ok(positive(n));
+    }
+    match file {
+        None => Ok(None),
+        Some(CountOrAuto::Count(n)) => Ok(positive(n)),
+        Some(CountOrAuto::Mode(s)) if s.eq_ignore_ascii_case("auto") => Ok(None),
+        Some(CountOrAuto::Mode(s)) => Err(anyhow::anyhow!(
+            "invalid trickplay_concurrency `{s}` in config.toml: expected an integer or \"auto\""
         )),
     }
 }
@@ -1032,6 +1268,23 @@ mod tests {
         assert!(cfg.ffmpeg_path.is_none());
         // With no XDG/HOME the system location is used.
         assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
+        assert_eq!(
+            cfg.websocket_min_stream_period_ms,
+            DEFAULT_WS_MIN_STREAM_PERIOD_MS
+        );
+    }
+
+    #[test]
+    fn websocket_min_stream_period_resolves_env_over_default() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            cfg.websocket_min_stream_period_ms,
+            DEFAULT_WS_MIN_STREAM_PERIOD_MS
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_WS_MIN_STREAM_PERIOD_MS", "250");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.websocket_min_stream_period_ms, 250);
     }
 
     #[test]
@@ -1329,6 +1582,37 @@ mod tests {
         }
     }
 
+    /// `FERROFIN_TVDB_TOKEN_DAYS` beats `tvdb_token_days` in `config.toml`,
+    /// unset is the plugin's 25 days, and a value that is not a whole number
+    /// of days from 1 to 29 warns and falls back to it.
+    #[test]
+    fn tvdb_token_days_env_beats_file_and_bad_values_fall_back() {
+        let days = |config: &Config| config.tvdb_token_max_age().as_secs() / 86_400;
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(days(&unset), 25, "the plugin's LoginAsync");
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "tvdb_token_days = 7\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(days(&Config::load_from(cli(), &FakeEnv::new()).unwrap()), 7);
+        let env = FakeEnv::new().with("FERROFIN_TVDB_TOKEN_DAYS", " 29 ");
+        assert_eq!(days(&Config::load_from(cli(), &env).unwrap()), 29);
+        let blank = FakeEnv::new().with("FERROFIN_TVDB_TOKEN_DAYS", "  ");
+        assert_eq!(days(&Config::load_from(cli(), &blank).unwrap()), 7);
+        for bad in ["0", "30", "-1", "1.5", "25d"] {
+            let env = FakeEnv::new().with("FERROFIN_TVDB_TOKEN_DAYS", bad);
+            assert_eq!(days(&Config::load_from(cli(), &env).unwrap()), 25, "{bad}");
+        }
+        for bad in ["30", "1.5", "\"25d\"", "true"] {
+            std::fs::write(&toml, format!("tvdb_token_days = {bad}\n")).unwrap();
+            let config = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+            assert_eq!(days(&config), 25, "file {bad}");
+        }
+    }
+
     #[test]
     fn scan_duration_buckets_env_beats_file_and_defers_when_unset() {
         assert_eq!(
@@ -1431,6 +1715,51 @@ mod tests {
     }
 
     #[test]
+    fn trickplay_concurrency_resolves_integers_auto_and_garbage() {
+        let resolve =
+            |env: FakeEnv| Config::load_from(Cli::default(), &env).map(|c| c.trickplay_concurrency);
+        let env = |v: &str| FakeEnv::new().with("FERROFIN_TRICKPLAY_CONCURRENCY", v);
+        assert_eq!(resolve(FakeEnv::new()).unwrap(), None, "unset is auto");
+        assert_eq!(resolve(env("auto")).unwrap(), None);
+        assert_eq!(resolve(env("AUTO")).unwrap(), None);
+        assert_eq!(resolve(env("")).unwrap(), None, "empty is unset");
+        assert_eq!(resolve(env("0")).unwrap(), None, "zero is auto");
+        assert_eq!(resolve(env("-3")).unwrap(), None, "negative is auto");
+        assert_eq!(resolve(env("2")).unwrap(), Some(2));
+        let err = resolve(env("lots")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid FERROFIN_TRICKPLAY_CONCURRENCY")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let file = |body: &str| {
+            std::fs::write(&toml, body).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            Config::load_from(cli, &FakeEnv::new()).map(|c| c.trickplay_concurrency)
+        };
+        assert_eq!(file("trickplay_concurrency = 3\n").unwrap(), Some(3));
+        assert_eq!(file("trickplay_concurrency = \"auto\"\n").unwrap(), None);
+        assert_eq!(file("trickplay_concurrency = 0\n").unwrap(), None);
+        assert_eq!(file("trickplay_concurrency = -1\n").unwrap(), None);
+        let err = file("trickplay_concurrency = \"many\"\n").unwrap_err();
+        assert!(err.to_string().contains("invalid trickplay_concurrency"));
+
+        // Env beats the file.
+        std::fs::write(&toml, "trickplay_concurrency = 3\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env("auto")).unwrap();
+        assert_eq!(cfg.trickplay_concurrency, None);
+    }
+
+    #[test]
     fn db_pool_env_rejects_garbage() {
         let env = FakeEnv::new().with("FERROFIN_DB_POOL", "many");
         let err = Config::load_from(Cli::default(), &env).unwrap_err();
@@ -1446,6 +1775,24 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn quick_connect_pending_per_ip_env_beats_file() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.quick_connect_pending_per_ip, None);
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "quick_connect_pending_per_ip = 4\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let from_file = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(from_file.quick_connect_pending_per_ip, Some(4));
+        let env = FakeEnv::new().with("FERROFIN_QUICK_CONNECT_PENDING_PER_IP", "20");
+        let from_env = Config::load_from(cli(), &env).unwrap();
+        assert_eq!(from_env.quick_connect_pending_per_ip, Some(20));
     }
 
     #[test]
@@ -1531,6 +1878,62 @@ mod tests {
     }
 
     #[test]
+    fn scan_directory_cache_limits_resolve_and_reject_zero() {
+        // Unset → None (the scanner keeps upstream's values).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, None);
+        assert_eq!(cfg.scan_directory_cache_idle_secs, None);
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "5000")
+            .with("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "60");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(5000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(60));
+
+        for (key, value) in [
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "0"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "0"),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5"),
+        ] {
+            let err = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{key}={value}: {err}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let load = |body: &str| {
+            std::fs::write(&toml, body).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            Config::load_from(cli, &FakeEnv::new())
+        };
+        let cfg =
+            load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 9\n").unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(7));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(9));
+        let err = load("scan_directory_cache_idle_secs = 0\n").unwrap_err();
+        assert!(
+            err.to_string().contains("scan_directory_cache_idle_secs"),
+            "{err}"
+        );
+        // Env wins over the file.
+        std::fs::write(&toml, "scan_directory_cache_records = 7\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.scan_directory_cache_records, Some(11));
+    }
+
+    #[test]
     fn scan_progress_every_resolves_from_env_and_preserves_zero() {
         // Env value is used verbatim.
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "250");
@@ -1545,5 +1948,48 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "0");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.scan_progress_every, Some(0));
+    }
+
+    /// A test server's scan never reaches a public metadata provider:
+    /// `test_stub` points each one a scan reaches at [`OFFLINE_PROVIDER_URL`],
+    /// where nothing answers, so its requests fail at once instead of waiting
+    /// on the network (a three-library scan once spent a minute on 181
+    /// requests to the live providers).
+    #[test]
+    fn test_stub_keeps_every_remote_provider_offline() {
+        let cfg = Config::test_stub(Path::new("/tmp/ferrofin"));
+        // Exhaustive: a new provider field fails to compile here until it is
+        // listed, and the assertion below then requires it offline.
+        let ProviderEndpoints {
+            tmdb,
+            tmdb_images,
+            omdb,
+            opensubtitles,
+            tvdb,
+            fanart,
+            audiodb,
+            lrclib,
+        } = cfg.provider_endpoints;
+        for endpoint in [
+            tmdb,
+            tmdb_images,
+            omdb,
+            opensubtitles,
+            tvdb,
+            fanart,
+            audiodb,
+            lrclib,
+        ] {
+            assert_eq!(endpoint.as_deref(), Some(OFFLINE_PROVIDER_URL));
+        }
+        assert_eq!(cfg.musicbrainz_base_url, OFFLINE_PROVIDER_URL);
+        assert_eq!(cfg.studios_repo_url, OFFLINE_PROVIDER_URL);
+        let addr = OFFLINE_PROVIDER_URL
+            .strip_prefix("http://")
+            .expect("a plain http URL");
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "something answers on {OFFLINE_PROVIDER_URL}, so test servers would reach it"
+        );
     }
 }
