@@ -353,6 +353,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - An `encoding.json` the server cannot read (after an ownership change, say) is logged once as
   a warning while transcodes run, as the transcode planner already did, instead of an error
   every five seconds for each running transcode
+- `GET /System/Configuration/{key}` reads through the configuration manager like the rest of
+  the server. A saved document that does not parse is logged once per change of the file
+  instead of on every request. One that exists but cannot be read answers 500 instead of
+  reading as the defaults, and so does saving the encoding settings over it, so a save cannot
+  replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
 
 ## [1.0.0] - 2026-09-05
 

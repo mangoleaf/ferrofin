@@ -134,75 +134,16 @@ async fn update_branding_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Reads the persisted named configuration at `path`, or `None` when nothing
-/// usable is stored there.
-///
-/// Port of `BaseConfigurationManager.LoadConfiguration`, which wraps its
-/// deserialize in `catch { Logger.LogError(ex, "Error loading configuration
-/// file: {Path}", path) }` and then falls back to `Activator.CreateInstance` —
-/// the response shape stays the typed default, but the failure is **logged**.
-/// A missing file is the ordinary "never saved" case (upstream's `File.Exists`
-/// guard) and stays silent; a read error or invalid JSON is a broken store that
-/// would otherwise be indistinguishable from it, making an admin's saved
-/// settings look reset to defaults with nothing to look at.
-async fn read_named_config(path: &std::path::Path) -> Option<Value> {
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "reading named configuration failed; falling back to defaults"
-            );
-            return None;
-        }
-    };
-    match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => Some(value),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "named configuration is not valid JSON; falling back to defaults"
-            );
-            None
-        }
-    }
-}
-
-/// Loads a core section through its configuration DTO. Older
-/// documents may omit members; deserialization supplies their defaults. Like
-/// `BaseConfigurationManager.LoadConfiguration`, an invalid stored document
-/// yields defaults and a diagnostic, without overwriting the damaged file.
-fn load_named_configuration<T: serde::de::DeserializeOwned + Default>(
-    key: &str,
-    saved: Option<Value>,
-) -> T {
-    let Some(saved) = saved else {
-        return T::default();
-    };
-    match serde_json::from_value(saved) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(
-                configuration_key = key,
-                error = %error,
-                "saved named configuration could not be read; falling back to defaults"
-            );
-            T::default()
-        }
-    }
-}
-
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
-/// Port of `ConfigurationController.GetNamedConfiguration`. `branding` keeps its
-/// dedicated typed store; other core keys load their DTO from the per-key
-/// store (`{config}/users/named/{key}.json`). Omitted members receive defaults,
-/// and invalid documents fall back with a warning. `database` is the SQLite
-/// document Jellyfin writes on its first start. A key no store is registered
+/// Port of `ConfigurationController.GetNamedConfiguration`: the configuration
+/// manager's `GetConfiguration(key)`
+/// ([`ServerConfigurationManager::get_named_configuration`]), which binds the
+/// stored document to its type, reads one that does not parse as its
+/// defaults, and fails on one it cannot read. A key no store is registered
 /// under is `404`, as `GetConfiguration`'s `ResourceNotFoundException` is.
+///
+/// [`ServerConfigurationManager::get_named_configuration`]: ferrofin_traits::configuration::ServerConfigurationManager::get_named_configuration
 #[utoipa::path(
     get,
     path = "/System/Configuration/{key}",
@@ -215,96 +156,63 @@ async fn get_named_configuration(
     _auth: RequireAuth,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    use ferrofin_model::configuration::{
-        EncodingOptions, MetadataConfiguration, XbmcMetadataOptions,
-    };
-    use ferrofin_model::live_tv::LiveTvOptions;
-    let to_value = |r: Result<Value, serde_json::Error>| {
-        r.map_err(|e| {
-            ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
-                "serialize configuration `{key}`: {e}"
-            )))
-        })
-    };
-    if key.eq_ignore_ascii_case("branding") {
-        return Ok(Json(to_value(serde_json::to_value(
-            state.config.get_branding().await?,
-        ))?));
-    }
-    // Load once: retrying through a manager after a failed file read would
-    // turn the logged fallback into another parse error on the same file.
-    let saved = match named_config_file(&state, &key) {
-        Some(path) => read_named_config(&path).await,
-        None => None,
-    };
+    // Typed here, not through the document: the numbers JsonDefaults cannot
+    // write must answer 400, not come back as `null`.
     if key.eq_ignore_ascii_case("encoding") {
-        let options = load_named_configuration::<EncodingOptions>(&key, saved);
-        return encoding_response(&options).map(Json);
+        return encoding_response(&state.config.get_encoding_options().await?).map(Json);
     }
+    let Some(mut value) = state.config.get_named_configuration(&key).await? else {
+        return Err(ApiError::NotFound(format!(
+            "Configuration with key {key} not found."
+        )));
+    };
     // `livetv` merges the persisted scalars (recording paths, padding) with the
     // canonical tuner/provider rows the Live TV manager keeps in SQLite — the
     // dashboard's Live TV page renders its tuner and guide-provider lists from
     // this config object, so they must reflect the manager's state.
-    if key.eq_ignore_ascii_case("livetv") {
-        let options = load_named_configuration::<LiveTvOptions>(&key, saved);
-        let mut value = to_value(serde_json::to_value(options))?;
-        if let (Some(live_tv), Value::Object(map)) = (state.live_tv.as_ref(), &mut value) {
-            // A backend failure must not read as "no tuners configured": the
-            // rows still render empty (Jellyfin's corrupt-store fallback also
-            // yields an empty `LiveTvOptions`), but the failure is logged
-            // instead of vanishing.
-            let tuners = match live_tv.get_tuner_hosts().await {
-                Ok(tuners) => tuners,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "listing Live TV tuner hosts failed; reporting none configured"
-                    );
-                    Vec::new()
-                }
-            };
-            let providers = match live_tv.get_listing_providers().await {
-                Ok(providers) => providers,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "listing Live TV listing providers failed; reporting none configured"
-                    );
-                    Vec::new()
-                }
-            };
-            map.insert(
-                "TunerHosts".to_owned(),
-                to_value(serde_json::to_value(tuners))?,
-            );
-            map.insert(
-                "ListingProviders".to_owned(),
-                to_value(serde_json::to_value(providers))?,
-            );
-        }
-        return Ok(Json(value));
+    if key.eq_ignore_ascii_case("livetv")
+        && let (Some(live_tv), Value::Object(map)) = (state.live_tv.as_ref(), &mut value)
+    {
+        let to_value = |r: Result<Value, serde_json::Error>| {
+            r.map_err(|e| {
+                ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
+                    "serialize configuration `{key}`: {e}"
+                )))
+            })
+        };
+        // A backend failure must not read as "no tuners configured": the
+        // rows still render empty (Jellyfin's corrupt-store fallback also
+        // yields an empty `LiveTvOptions`), but the failure is logged
+        // instead of vanishing.
+        let tuners = match live_tv.get_tuner_hosts().await {
+            Ok(tuners) => tuners,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "listing Live TV tuner hosts failed; reporting none configured"
+                );
+                Vec::new()
+            }
+        };
+        let providers = match live_tv.get_listing_providers().await {
+            Ok(providers) => providers,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "listing Live TV listing providers failed; reporting none configured"
+                );
+                Vec::new()
+            }
+        };
+        map.insert(
+            "TunerHosts".to_owned(),
+            to_value(serde_json::to_value(tuners))?,
+        );
+        map.insert(
+            "ListingProviders".to_owned(),
+            to_value(serde_json::to_value(providers))?,
+        );
     }
-    let value = match key.to_ascii_lowercase().as_str() {
-        // The DTO's aliases also read the old EnableIpv4/RemoteIpFilter names;
-        // serialization always returns the names understood by jellyfin-web.
-        "network" => to_value(serde_json::to_value(load_named_configuration::<
-            ferrofin_networking::NetworkConfiguration,
-        >(&key, saved)))?,
-        "metadata" => to_value(serde_json::to_value(load_named_configuration::<
-            MetadataConfiguration,
-        >(&key, saved)))?,
-        "xbmcmetadata" => to_value(serde_json::to_value(load_named_configuration::<
-            XbmcMetadataOptions,
-        >(&key, saved)))?,
-        "database" => to_value(serde_json::to_value(
-            ferrofin_model::configuration::DatabaseConfigurationOptions::default(),
-        ))?,
-        _ => {
-            return Err(ApiError::NotFound(format!(
-                "Configuration with key {key} not found."
-            )));
-        }
-    };
     Ok(Json(value))
 }
 
@@ -441,17 +349,15 @@ pub(crate) async fn save_named_configuration(
         .configuration_validators
         .get(&key.to_ascii_lowercase())
     {
-        let saved = read_named_config(&path).await;
-        // Validate against the same typed/default value exposed by GET. In
-        // particular, a malformed old encoding file must remain repairable.
-        let old = if key.eq_ignore_ascii_case("encoding") {
-            serde_json::to_string(&load_named_configuration::<
-                ferrofin_model::configuration::EncodingOptions,
-            >(&key, saved))
-        } else {
-            serde_json::to_string(&saved.unwrap_or_else(|| serde_json::json!({})))
-        }
-        .map_err(|error| configuration_error(&error))?;
+        // Validate against the document GET serves, as `SaveConfiguration`
+        // passes `GetConfiguration(key)`: a malformed old document reads as its
+        // defaults, so it stays repairable.
+        let old = state
+            .config
+            .get_named_configuration(&key)
+            .await?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let old = serde_json::to_string(&old).map_err(|error| configuration_error(&error))?;
         validator.validate(&old, &json).map_err(validation_error)?;
     }
     let committed: std::sync::Arc<str> = json.clone().into();
