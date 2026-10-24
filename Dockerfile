@@ -92,5 +92,5 @@ RUN useradd --uid 1000 --user-group --home-dir /data --no-create-home \
  && mkdir -p /data && chown ferrofin:ferrofin /data
 USER ferrofin
 VOLUME /data
-EXPOSE 8096 7359/udp
+EXPOSE 8096 8920 7359/udp
 ENTRYPOINT ["ferrofin-server"]

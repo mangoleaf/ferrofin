@@ -356,6 +356,8 @@ const TV_LIBRARY_ID: Uuid = Uuid::from_u128(0xC1F);
 const BOXSETS_LIBRARY_ID: Uuid = Uuid::from_u128(0xC2F);
 /// A default-builder view that delegates to [`TV_LIBRARY_ID`].
 const TV_VIEW_ID: Uuid = Uuid::from_u128(0xC3F);
+/// A box set, whose own listing is its linked children.
+const BOX_SET_ID: Uuid = Uuid::from_u128(0xB05);
 /// The physical folder's on-disk path (= one of the library's locations).
 const PHYSICAL_PATH: &str = "/media/movies-real";
 
@@ -450,6 +452,13 @@ impl LibraryManager for OkLibrary {
                 PLAYLIST_ID,
                 "Playlist",
                 BaseItemKind::Playlist,
+            )));
+        }
+        if id == BOX_SET_ID {
+            return Ok(Some(item_entity(
+                BOX_SET_ID,
+                "Box set",
+                BaseItemKind::BoxSet,
             )));
         }
         if id == PLAYLISTS_VIEW_ID || id == STALE_PLAYLISTS_VIEW_ID {
@@ -3377,5 +3386,108 @@ async fn items_get_result_local_dates_match_dotnet_child_process() {
                 assert!(query.is_none(), "{zone}: {uri} must fail before querying");
             }
         }
+    }
+}
+
+/// [`OkDto`], with the DTOs [`DtoService::get_linked_children_dtos`] built
+/// marked in `Overview`, so a test can see which projection a listing used.
+struct LinkedChildrenDto;
+
+#[async_trait]
+impl DtoService for LinkedChildrenDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items.iter().map(entity_to_dto).collect())
+    }
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items
+            .iter()
+            .map(|item| BaseItemDto {
+                overview: Some("linked children".to_owned()),
+                ..entity_to_dto(item)
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+}
+
+/// A playlist's or box set's own listing is its linked children
+/// (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`,
+/// v12.2 Folder.cs), which upstream resolves with every field loaded, so the
+/// members take the linked-children projection; a recursive listing is the
+/// repository query and stays a plain page.
+#[tokio::test]
+async fn a_playlist_or_box_set_listing_projects_its_linked_children() {
+    for (params, linked) in [
+        (format!("parentId={PLAYLIST_ID}"), true),
+        (format!("parentId={BOX_SET_ID}"), true),
+        (format!("parentId={BOX_SET_ID}&recursive=true"), false),
+        // Named ids clear the parent: a plain lookup, not a listing.
+        (format!("parentId={BOX_SET_ID}&ids={ITEM_ID}"), false),
+        (format!("parentId={TV_LIBRARY_ID}"), false),
+    ] {
+        let state = ok_state_full(
+            OkLibrary {
+                item_id: ITEM_ID,
+                ..Default::default()
+            },
+            Arc::new(OkUsers),
+            Arc::new(LinkedChildrenDto),
+            (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        );
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?userId={USER_ID}&{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            page["Items"][0]["Overview"].as_str() == Some("linked children"),
+            linked,
+            "{params}: {page}"
+        );
     }
 }

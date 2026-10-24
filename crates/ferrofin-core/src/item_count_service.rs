@@ -202,6 +202,9 @@ pub struct FerrofinItemCountService {
     /// The `UserRootFolder`/`AggregateFolder` ids, injected once by the
     /// composition root (see [`FerrofinItemCountService::with_root_ids`]).
     roots: Option<RootFolderIds>,
+    /// The `IsVisible` evaluator the count's library scope asks about
+    /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
+    visibility: crate::item_repository::VisibilitySlot,
 }
 
 impl std::fmt::Debug for FerrofinItemCountService {
@@ -215,7 +218,22 @@ impl FerrofinItemCountService {
     /// Creates the service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db, roots: None }
+        Self {
+            db,
+            roots: None,
+            visibility: crate::item_repository::VisibilitySlot::default(),
+        }
+    }
+
+    /// Installs the slot the composition root fills with the server's
+    /// `ItemVisibility`, the same one the item repository holds, so a count's
+    /// library scope admits the playlists folder and a box-set library exactly
+    /// when a query's does (`UserViewManager.GetUserViews`). Left empty, both
+    /// are admitted.
+    #[must_use]
+    pub fn with_visibility(mut self, slot: crate::item_repository::VisibilitySlot) -> Self {
+        self.visibility = slot;
+        self
     }
 
     /// Injects the two root-folder ids resolved once at startup, so the user
@@ -489,7 +507,13 @@ impl ItemCountService for FerrofinItemCountService {
         // see one library must be counted over that library, not the server.
         // Without it `/Items/Counts` handed a restricted account the whole
         // catalogue's totals — numbers it could not then browse to.
-        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        let scoped = crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            visibility.as_deref(),
+            filter,
+        )
+        .await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -511,7 +535,13 @@ impl ItemCountService for FerrofinItemCountService {
         // (type, count) rows — instead of materializing every matching full row
         // (all ~60 columns) and counting them in Rust, which dominated this
         // endpoint's CPU on a large library.
-        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        let scoped = crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            visibility.as_deref(),
+            filter,
+        )
+        .await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
