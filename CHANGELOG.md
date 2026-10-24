@@ -124,6 +124,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   for a folder's `playlist.xml` (#56)
 - Create the internal playlists folder at startup, as `CreateRootFolder` does: a server
   whose only playlists come from the library scan now lists the Playlists view
+- Check the server directories at startup, as Jellyfin does. Before a scheduled restore is
+  applied or the database is opened, Ferrofin creates its configuration, log, plugins,
+  data, cache, `<data>/data` and `<data>/root` directories, and leaves Jellyfin's
+  `.jellyfin-<kind>` marker in each (the cache also gets `CACHEDIR.TAG`). A layout that
+  used to start now stops the boot with a clear error when a directory holds another
+  kind's marker (two of its paths point at one directory) or cannot be created or written
+  to. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - The Playlists view lists every playlist the user may open, wherever it is, as Jellyfin
   12.2 does — not only the ones made in the app
 - Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in

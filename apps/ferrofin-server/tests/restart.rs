@@ -389,6 +389,45 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         .expect("run exits cleanly");
 }
 
+/// `Program.StartApp` checks the server's directories first (Ferrofin, once
+/// logging has started): a layout that points two of them at one directory stops the
+/// boot before a scheduled restore is applied or a database is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clashing_layout_stops_the_boot_before_the_restore_and_the_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = Config {
+        port: free_port(),
+        ..Config::test_stub(tmp.path())
+    };
+    config.cache_dir = config.data_dir.clone();
+    // `POST /Backup/Restore`'s marker, naming an archive the boot never reaches.
+    let pending = config.data_dir.join("data/backups/restore-pending");
+    std::fs::create_dir_all(pending.parent().expect("backups dir")).expect("mkdir");
+    std::fs::write(&pending, "never-applied.zip").expect("schedule a restore");
+    let database = config.database_path();
+
+    let refused = tokio::time::timeout(
+        REFUSAL_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Runtime::new()
+                .expect("server runtime")
+                .block_on(ferrofin_server::run(config))
+        }),
+    )
+    .await
+    .expect("a clashing layout must stop the boot, not serve")
+    .expect("server thread did not panic")
+    .expect_err("a clashing layout must not start");
+
+    let message = format!("{refused:#}");
+    assert!(
+        message.contains("Expected to find only .jellyfin-cache but found marker for"),
+        "{message}"
+    );
+    assert!(!database.exists(), "the refused start opened a database");
+    assert!(pending.is_file(), "the refused start applied the restore");
+}
+
 /// Jellyfin 12.2's start-over guard: a server that has been set up refuses to
 /// start once its database is gone — instead of creating an empty one and
 /// seeding a new administrator — and creates nothing; a scheduled restore that
