@@ -1978,7 +1978,9 @@ pub async fn build_app_state(
         .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users))
         // The refresh an entry change queues (collage, rating).
         .with_providers(Arc::clone(&providers))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
+        .with_item_persistence(Arc::clone(&item_persistence_service)),
     );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),

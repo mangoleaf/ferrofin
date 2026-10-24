@@ -59,7 +59,7 @@ use ferrofin_traits::collections::{
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, UserManager};
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
+use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, LinkedChildrenService};
 use ferrofin_traits::providers::{
     MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
@@ -935,6 +935,9 @@ pub struct FerrofinPlaylistManager {
     /// Brackets the folder a new playlist is made in, as `PlaylistManager.CreatePlaylist` does
     /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
     self_writes: Option<Arc<dyn SelfWriteGuard>>,
+    /// Announces each committed change of a playlist ([`Self::announce_added`],
+    /// [`Self::announce_updated`]). `None` in unit tests: nothing is announced.
+    persistence: Option<Arc<dyn ItemPersistenceService>>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -962,6 +965,41 @@ impl FerrofinPlaylistManager {
             entry_edits: Arc::default(),
             providers: None,
             self_writes: None,
+            persistence: None,
+        }
+    }
+
+    /// Announces each committed playlist change to the library-changed
+    /// notifier through `persistence`, as upstream's `UpdatePlaylistInternal`
+    /// and `Folder.AddChild` do. Called once by the composition root.
+    #[must_use]
+    pub fn with_item_persistence(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// `Folder.AddChild` → `LibraryManager.CreateItem`'s `ItemAdded` for a new
+    /// playlist. The create is committed by now, so a failure is logged, not
+    /// returned.
+    async fn announce_added(&self, playlist_id: Uuid) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        if let Err(err) = persistence.report_item_added(playlist_id).await {
+            tracing::warn!(item_id = %playlist_id, %err, "could not announce a new playlist");
+        }
+    }
+
+    /// `UpdatePlaylistInternal` → `UpdateToRepositoryAsync(MetadataEdit)`:
+    /// stamps the playlist's `DateLastSaved` (its Etag moves) and announces
+    /// `ItemUpdated`. The change is committed by now, so a failure is logged,
+    /// not returned.
+    async fn announce_updated(&self, playlist_id: Uuid) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        if let Err(err) = persistence.touch_item_updated(playlist_id).await {
+            tracing::warn!(item_id = %playlist_id, %err, "could not announce a playlist change");
         }
     }
 
@@ -1384,6 +1422,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             }
             return Err(err);
         }
+        self.announce_added(id).await;
         // `await playlist.RefreshMetadata(new MetadataRefreshOptions(..) {
         // ForceSave = true })`: the first refresh runs before the create
         // returns, and a failure fails it, as upstream's exception does.
@@ -1482,6 +1521,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         }
         item_data::sync_container_data_in(&mut tx, request.id).await?;
         tx.commit().await.map_err(db_err)?;
+        self.announce_updated(request.id).await;
         if entries.as_ref().is_some_and(|entries| !entries.is_empty()) {
             self.update_rating_to_items(request.id).await?;
             // `AddToPlaylistInternal`'s refresh, reached from `UpdatePlaylist`,
@@ -1585,7 +1625,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         )
         .await?;
         item_data::sync_container_data_in(&mut tx, request.id).await?;
-        tx.commit().await.map_err(db_err)
+        tx.commit().await.map_err(db_err)?;
+        self.announce_updated(request.id).await;
+        Ok(())
     }
 
     async fn remove_user_from_shares(
@@ -1605,7 +1647,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         .await
         .map_err(db_err)?;
         item_data::sync_container_data_in(&mut tx, playlist_id).await?;
-        tx.commit().await.map_err(db_err)
+        tx.commit().await.map_err(db_err)?;
+        self.announce_updated(playlist_id).await;
+        Ok(())
     }
 
     async fn get_playlist_shares(
@@ -1763,7 +1807,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
             n => shown.get(n - 1).map_or(entries.len(), |prior| prior + 1),
         };
         entries.insert(target, entry);
-        write_entries(self.db.writer(), &pid, &entries).await
+        write_entries(self.db.writer(), &pid, &entries).await?;
+        self.announce_updated(playlist).await;
+        Ok(())
     }
 
     async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError> {
@@ -1806,6 +1852,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
                     item_data::hand_playlist_to_in(&mut tx, playlist, heir).await?;
                 }
                 tx.commit().await.map_err(db_err)?;
+                if heir.is_some() {
+                    self.announce_updated(playlist).await;
+                }
                 if heir.is_none() && !permissions.open_access {
                     // `DeleteItem` with `DeleteFileLocation = false`.
                     let options = ferrofin_traits::options::DeleteOptions {
@@ -1832,6 +1881,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
     }
 }
 
+#[cfg(test)]
+mod playlist_announcements_tests;
 #[cfg(test)]
 mod remove_playlists_tests;
 

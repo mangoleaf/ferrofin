@@ -3764,6 +3764,16 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written)
     }
 
+    async fn report_item_added(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let Some(item) = container_row(&self.db, item_id).await? else {
+            return Ok(false);
+        };
+        if let Some(changed) = self.changed.get() {
+            changed.record_added(&[item]);
+        }
+        Ok(true)
+    }
+
     async fn never_refreshed_ids(
         &self,
         kind: BaseItemKind,

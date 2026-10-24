@@ -376,8 +376,25 @@ async fn another_users_private_playlist_is_never_announced_to_a_viewer() {
     .await;
     assert_eq!(status, StatusCode::OK, "{created}");
     let playlist = created["Id"].as_str().expect("playlist id").to_owned();
-    // Its owner hears of it.
-    pushes_until(&mut f.admin_socket, &playlist).await;
+    // Its owner hears of it, first as an addition (gl-578: `Folder.AddChild`
+    // → `CreateItem`'s `ItemAdded`; the create's own refresh, which saves
+    // it, is no addition).
+    let pushes = pushes_until(&mut f.admin_socket, &playlist).await;
+    let first = pushes.last().expect("a push naming the playlist");
+    assert!(
+        first["ItemsAdded"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(playlist.as_str()))),
+        "the new playlist was not announced as added: {first}"
+    );
+    // The create's refresh and member re-rate save it too; that update folds
+    // into the addition, or follows it in a later push.
+    assert!(
+        first["ItemsUpdated"]
+            .as_array()
+            .is_none_or(|ids| ids.iter().all(|id| id.as_str() != Some(playlist.as_str()))),
+        "the new playlist was announced as updated with its addition: {first}"
+    );
 
     f.touch_sentinel().await;
     let pushes = pushes_until(&mut f.viewer_socket, &f.allowed).await;

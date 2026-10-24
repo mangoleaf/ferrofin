@@ -426,6 +426,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   nothing
 - A request whose handler panics is answered `500` "Error processing request." and logged,
   as in Jellyfin. Before, its connection was dropped, over HTTP/2 with every other request on it
+- A new playlist is announced to the sessions that may see it as added, and renaming it,
+  making it public or private, changing who it is shared with, moving an entry or handing it
+  to a share when its owner is deleted announces it as changed and moves its `Etag`, as in
+  Jellyfin. Before, a new playlist was announced as changed, so another open jellyfin-web
+  session showed it only after a reload, and the other edits were not announced at all
 
 ## [1.0.0] - 2026-09-05
 
