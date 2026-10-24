@@ -1570,6 +1570,21 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// Announces `ItemAdded` for a row created outside
+    /// [`crate::library::LibraryManager::create_items`] (which announces its
+    /// own), as `LibraryManager.CreateItem` raises it for every new item.
+    /// Returns whether the row exists.
+    ///
+    /// The default announces nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn report_item_added(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
     /// Writes an existing row's `DateLastMediaAdded`, when it differs, with
     /// its `DateLastSaved` stamp and nothing else — the targeted write of
     /// [`folder_last_media_added`](Self::folder_last_media_added)'s answer,

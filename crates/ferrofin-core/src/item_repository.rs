@@ -498,10 +498,11 @@ impl FerrofinItemRepository {
         rows: Vec<BaseItemEntity>,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        use crate::tv_series_manager::{aired_order, stable_sort_by};
+        use crate::tv_series_manager::aired_order;
         use ferrofin_model::dto::SortOrder;
         use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
+        use ferrofin_util::stable_sort::stable_sort_by;
         type Keyed = (Option<AiredEpisodeOrder>, BaseItemEntity);
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);

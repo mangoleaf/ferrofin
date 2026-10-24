@@ -1500,9 +1500,11 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs create_playlist (CreatePlaylistQuery, effective_user_id) \
                → ferrofin-model playlists.rs CreatePlaylistDto → ferrofin-core \
                collection_manager.rs FerrofinPlaylistManager::create_playlist \
-               (PlaylistManager.CreatePlaylist: infer_media_type, require_user, \
-               playlists_folder, new_playlist_folder_and_id; playlist_items for \
-               AddToPlaylistInternal and Playlist.GetPlaylistItems)",
+               (PlaylistManager.CreatePlaylist: playlists_folder, a lookup like \
+               GetPlaylistsFolder; infer_media_type, require_user, \
+               new_playlist_folder_and_id, then report_item_added for AddChild's \
+               ItemAdded; playlist_items for AddToPlaylistInternal and \
+               Playlist.GetPlaylistItems)",
         date: "2026-10-24",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
@@ -1516,9 +1518,11 @@ pub const VERIFIED: &[Verified] = &[
          to the next `1`-suffixed folder; upstream's GetTargetPath checks only \
          Directory.Exists, so a file makes CreateDirectory throw (500) and a row whose \
          folder went missing is saved over. Jellyfin bug not ported.",
-            "The create announces nothing: upstream's Folder.AddChild → CreateItem sends the \
-         playlist in ItemsAdded, and here a create with items is announced only as \
-         ItemsUpdated, by the members' re-rate. Fix path: gl-578.",
+            "The playlists folder is found by its path (any row there, whatever its type or \
+         parent), then by the id derived from data\\playlists, not as GetPlaylistsFolder \
+         finds it (the first PlaylistsFolder child of the root, then of the user root, by \
+         type); and the lookup re-parents parentless playlists (adopt_orphans), where \
+         upstream's writes nothing. Fix path: gl-921.",
             "The first ForceSave refresh writes no playlist.xml into the new folder, where \
          upstream's PlaylistXmlSaver saves one. Fix path: gl-341.",
             "With no media type named and a mixed folder as the first deciding id, the type \
@@ -1536,9 +1540,10 @@ pub const VERIFIED: &[Verified] = &[
             "A user named twice in Users keeps one share, with the last entry's CanEdit; \
          upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
          gl-886.",
-            "The 400 (no name, an unknown id while the media type is inferred, an API key \
-         that names no user) and 403 (another user's id without the administrator role) \
-         bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (no name, no playlists folder, an unknown id while the media type is \
+         inferred, an API key that names no user) and 403 (another user's id without the \
+         administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
         ],
         refs: &[],
     },

@@ -331,6 +331,49 @@ async fn events_published_on_the_manager_reach_the_guest() {
     assert!(seen.contains('2'), "guest never saw both events");
 }
 
+/// A plugin's `LibraryChanged` is each batch of library changes the notifier
+/// publishes in process (`ItemsChanged`). The client push never crosses the
+/// bus, so a `LibraryChanged` published there reaches no plugin.
+#[tokio::test]
+async fn library_changes_reach_the_guest_from_the_notifiers_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "hello", FIXTURE_WAT);
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let events = ferrofin_core::FerrofinEventManager::new();
+    host.subscribe_events(&events, &manager());
+    events.publish("LibraryChanged", "{}").await.unwrap();
+    events
+        .publish(ferrofin_core::library_changed_notifier::ITEMS_CHANGED, "{}")
+        .await
+        .unwrap();
+    events.publish("PlaybackStart", "{}").await.unwrap();
+
+    let task = &host.scheduled_tasks(&manager())[0];
+    let progress = ferrofin_core::TaskProgress::default();
+    let count = || async { task.execute(&progress).await.unwrap_err().to_string() };
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let seen = count().await;
+        if seen.contains('2') || seen.contains('3') {
+            break;
+        }
+    }
+    // Long enough for a third delivery to land, were there one.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let seen = count().await;
+    assert!(
+        seen.contains('2') && !seen.contains('3'),
+        "the guest should see the batch and the playback event only: {seen}"
+    );
+}
+
 #[tokio::test]
 async fn memory_limiter_denies_growth_beyond_the_cap() {
     let dir = tempfile::tempdir().unwrap();

@@ -530,6 +530,11 @@ pub(crate) async fn container_at(db: &Database, path: &str) -> Result<Option<Uui
 /// playlist it created was an orphan — reachable only by a query that names no
 /// scope, and invisible the moment one does.
 ///
+/// Only the Collections library is provisioned here. The playlists folder is
+/// startup's to make and to keep at the data directory
+/// ([`crate::AggregateFolderStore::ensure`], `CreateRootFolder`), and a create
+/// only looks it up, as `PlaylistManager.GetPlaylistsFolder` does.
+///
 /// Matched by exact path — see [`container_at`] for why by path and never by
 /// type, and which two spellings are accepted.
 pub(crate) async fn ensure_container(
@@ -829,6 +834,60 @@ pub(crate) async fn reparent_virtual_child(
     Ok(())
 }
 
+/// Saves a plug-in folder at `path`, under `parent` (the `AggregateFolder`)
+/// and as its own top parent, created and modified as `dates` says (its
+/// directory's times) and saved `saved`: the row
+/// `LibraryManager.CreateRootFolder` writes when the one stored under the
+/// folder's id is at another path, as it is once the data directory moved
+/// (v12.2 LibraryManager.cs:1132-1144).
+///
+/// Those columns only, where upstream saves a new folder object over the row:
+/// the row keeps its name, its images and whatever else was set on it, and
+/// its playlists stay where they are.
+pub(crate) async fn repath_virtual_child(
+    db: &Database,
+    id: Uuid,
+    path: &str,
+    parent: Uuid,
+    dates: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    saved: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ServiceError> {
+    let (created, modified) = dates;
+    sqlx::query(
+        r#"UPDATE "BaseItems"
+           SET "Path" = ?2, "ParentId" = ?3, "TopParentId" = ?1,
+               "DateCreated" = ?4, "DateModified" = ?5, "DateLastSaved" = ?6
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(path)
+    .bind(guid_to_db(parent))
+    .bind(ferrofin_db::store::datetime_to_db(created))
+    .bind(ferrofin_db::store::datetime_to_db(modified))
+    .bind(ferrofin_db::store::datetime_to_db(saved))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Stores `path` as root folder `id`'s `Path`: `CreateRootFolder`'s
+/// "Resetting root folder path" for a program data directory that moved
+/// (v12.2 LibraryManager.cs:1109-1113).
+pub(crate) async fn repath_root_folder(
+    db: &Database,
+    id: Uuid,
+    path: &str,
+) -> Result<(), ServiceError> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(path)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
 /// The literal Jellyfin writes into `BaseItems.Path` in place of the data
 /// directory (`%AppDataPath%/collections`), which Ferrofin stores resolved.
 const JELLYFIN_DATA_PATH_TOKEN: &str = "%AppDataPath%";
@@ -926,10 +985,10 @@ impl FerrofinItemPersistenceService {
     }
 
     /// Attaches the `LibraryChanged` notifier so every item save announces
-    /// itself. Scans are deliberately NOT announced through here — they use
-    /// [`save_scanned_items`](ItemPersistenceService::save_scanned_items) and
-    /// publish one folded event at scan end instead, so a full scan cannot
-    /// accumulate a row per item for the length of the debounce.
+    /// itself. Scans are not announced through here — they save with
+    /// [`save_scanned_items`](ItemPersistenceService::save_scanned_items)
+    /// and report what they added, saved and removed to the same notifier
+    /// at scan end, once their user data is reattached.
     /// Later calls are ignored — which notifier a save announces on is a
     /// wiring decision, not a runtime one.
     pub fn set_change_notifier(
@@ -3703,6 +3762,16 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
         }
         Ok(written)
+    }
+
+    async fn report_item_added(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let Some(item) = container_row(&self.db, item_id).await? else {
+            return Ok(false);
+        };
+        if let Some(changed) = self.changed.get() {
+            changed.record_added(&[item]);
+        }
+        Ok(true)
     }
 
     async fn never_refreshed_ids(

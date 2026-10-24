@@ -44,6 +44,9 @@ async fn create(
     public: bool,
     items: Vec<Uuid>,
 ) -> Uuid {
+    // The playlists folder a create goes into is startup's to make, and
+    // making it again is a no-op.
+    super::tests::provision_root_folder(&mgr.db, &mgr.paths).await;
     let created = mgr
         .create_playlist(&PlaylistCreationRequest {
             name: Some("Playlist".to_owned()),
