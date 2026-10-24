@@ -282,6 +282,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- A library scan's `LibraryChanged` push reaches each signed-in user through the per-user
+  filter, as in Jellyfin, instead of one payload sent to every session: a user no longer
+  receives the ids of items added to or changed in libraries they cannot open, nor of those
+  libraries' folders. Removed ids still reach every user, as Jellyfin sends them, so a deleted
+  item leaves every screen. The push now also names the items a rescan saved (`ItemsUpdated`), the
+  by-name artists a scan retires (`ItemsRemoved`), and, from the TMDb missing-episodes pass, the
+  virtual seasons it adds but not its pathless episodes, as Jellyfin's `FilterItem` does. It
+  goes out `LibraryUpdateDuration` after the scan announces it, like every other library
+  change. WASM plugins receive every batch of library changes as `LibraryChanged`
 - Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes

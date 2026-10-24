@@ -1460,20 +1460,15 @@ pub async fn build_app_state(
         }
         scanner = scanner.with_directory_cache_limits(limits);
     }
-    // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
-    // registered below (once the session manager exists) forward them to
-    // clients over the WebSocket so open views refresh after a scan.
+    // Scans publish `RefreshProgress` events, which the consumers registered
+    // below (once the session manager exists) forward to clients over the
+    // WebSocket; the items a scan changes go to the `LibraryChanged`
+    // notifier, which tells each user what they may see.
     // The plugins' metadata sources: every loaded WASM plugin is a remote
     // metadata provider the scan folds with the built-in ones at its rank in
     // the library's fetcher order (inert until the collaborators are armed
     // below and while a plugin is disabled).
     scanner = scanner.with_dynamic_providers(wasm_host.metadata_providers());
-    scanner = scanner
-        .with_events(Arc::clone(&event_manager))
-        .with_scan_progress(scan_progress.clone());
-    let library_scanner = Arc::new(scanner);
-    // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
-    // (the `dyn LibraryManager` object does not carry that narrow impl).
     // `ServerConfiguration.LibraryUpdateDuration` — how long a batch of changes
     // waits, from its first change, before the notifier pushes it. Read live as
     // each batch opens; Jellyfin's default covers a failed read.
@@ -1486,6 +1481,13 @@ pub async fn build_app_state(
         )
         .with_config(Arc::clone(&config_trait)),
     );
+    scanner = scanner
+        .with_events(Arc::clone(&event_manager))
+        .with_change_notifier(Arc::clone(&change_notifier))
+        .with_scan_progress(scan_progress.clone());
+    let library_scanner = Arc::new(scanner);
+    // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
+    // (the `dyn LibraryManager` object does not carry that narrow impl).
     // `IsVisible`/`IsVisibleStandalone`: one evaluator, shared by the library's
     // user-scoped lookups and the media sources' per-user version filter.
     let item_visibility = Arc::new(
@@ -1510,9 +1512,9 @@ pub async fn build_app_state(
         .with_scanner(Arc::clone(&library_scanner))
         .with_scan_progress(&scan_progress)
         // `LibraryChangedNotifier`: item writes through the API (a metadata
-        // edit, a delete) announce themselves after `LibraryUpdateDuration`
-        // seconds of quiet. Without this only scans pushed `LibraryChanged`,
-        // so a client sitting on a library view never saw an edit land.
+        // edit, a delete) announce themselves, as the scanner's changes do,
+        // `LibraryUpdateDuration` seconds after a batch's first change, so a
+        // client sitting on a library view sees an edit land.
         .with_change_notifier(Arc::clone(&change_notifier))
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
@@ -2233,19 +2235,14 @@ pub async fn build_app_state(
                         }
                     });
                     // A client push is best-effort and must never hold up the
-                    // publisher (a scan publishes LibraryChanged/RefreshProgress
-                    // repeatedly), so this one stays spawned.
+                    // publisher (a scan publishes RefreshProgress repeatedly),
+                    // so this one stays spawned.
                     ferrofin_core::event_manager::consumer_done()
                 }),
             );
         };
-        // Library adds/removes → every signed-in client refreshes its views.
-        forward(
-            &event_bus,
-            "LibraryChanged",
-            SessionMessageType::LibraryChanged,
-            false,
-        );
+        // `LibraryChanged` is never forwarded from the bus: the notifier
+        // delivers it to each user's sessions, filtered to what they may see.
         // Scan % + task completion → the admin dashboard's live displays.
         // The scan reporter already runs independently of item processing.
         // Await its delivery here to preserve start/tick/end ordering; spawning

@@ -178,8 +178,8 @@ fn names(info: &Value, id: &str) -> bool {
 
 /// A booted, served server with two libraries and two signed-in users.
 struct Fixture {
-    _wired: WiredApp,
-    _temp: tempfile::TempDir,
+    wired: WiredApp,
+    temp: tempfile::TempDir,
     router: axum::Router,
     admin: String,
     admin_id: String,
@@ -190,6 +190,44 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Writes an empty media file under the temp dir.
+    fn add_file(&self, relative: &str) {
+        touch(&self.temp.path().join(relative), "");
+    }
+
+    /// Runs a full library scan to its end.
+    async fn scan(&self) {
+        assert!(
+            self.wired
+                .state
+                .library
+                .run_library_scan(ScanTrigger::Api, None)
+                .await
+                .expect("scan")
+        );
+    }
+
+    /// The id (`N` format) of the movie whose file ends with `file`.
+    async fn movie_id(&self, file: &str) -> String {
+        let (_, items) = call(
+            &self.router,
+            "GET",
+            "/Items?recursive=true&includeItemTypes=Movie&fields=Path",
+            &self.admin,
+            None,
+        )
+        .await;
+        items["Items"]
+            .as_array()
+            .expect("Items")
+            .iter()
+            .find(|i| i["Path"].as_str().is_some_and(|p| p.ends_with(file)))
+            .unwrap_or_else(|| panic!("{file} in {items}"))["Id"]
+            .as_str()
+            .expect("id")
+            .to_owned()
+    }
+
     /// Renames the shared movie, a change both users are told about.
     async fn touch_sentinel(&self) {
         let uri = format!("/Items/{}", self.allowed);
@@ -344,8 +382,8 @@ async fn fixture() -> Fixture {
     let admin_socket = open_socket(addr, &admin).await;
     let viewer_socket = open_socket(addr, &viewer).await;
     Fixture {
-        _wired: wired,
-        _temp: temp,
+        wired,
+        temp,
         router,
         admin,
         admin_id,
@@ -402,4 +440,60 @@ async fn another_users_private_playlist_is_never_announced_to_a_viewer() {
         pushes.iter().all(|info| !names(info, &playlist)),
         "the viewer was told about the admin's private playlist: {pushes:?}"
     );
+}
+
+/// Whether `info`'s `list` names `id` (`N` format).
+fn lists(info: &Value, list: &str, id: &str) -> bool {
+    info[list]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(id)))
+}
+
+/// gl-98: a scan's changes reach each user through the per-user notifier,
+/// never as one payload to every session: a viewer who may open only
+/// "Allowed" is told about the movie added there, never about the one added
+/// to "Hidden", which the administrator hears of.
+#[tokio::test]
+async fn a_scan_tells_each_user_only_about_the_libraries_they_can_open() {
+    let mut f = fixture().await;
+    f.add_file("movies/Beta (2000)/Beta (2000).mkv");
+    f.add_file("more/Delta (2002)/Delta (2002).mkv");
+    f.scan().await;
+    let beta = f.movie_id("Beta (2000).mkv").await;
+    let delta = f.movie_id("Delta (2002).mkv").await;
+
+    let admin = pushes_until(&mut f.admin_socket, &delta).await;
+    assert!(
+        admin.iter().any(|info| lists(info, "ItemsAdded", &delta)),
+        "{admin:?}"
+    );
+    f.touch_sentinel().await;
+    let viewer = pushes_until(&mut f.viewer_socket, &f.allowed).await;
+    assert!(
+        viewer.iter().any(|info| lists(info, "ItemsAdded", &beta)),
+        "the viewer is told about the movie added to their library: {viewer:?}"
+    );
+    assert!(
+        viewer.iter().all(|info| !names(info, &delta)),
+        "the viewer was told about a movie in a library they cannot open: {viewer:?}"
+    );
+}
+
+/// gl-98: a rescan that saves an item announces it as updated, as Jellyfin's
+/// `ItemUpdated` does for every saved item.
+#[tokio::test]
+async fn a_rescan_that_saves_an_item_announces_it_as_updated() {
+    let mut f = fixture().await;
+    let gamma = f.movie_id("Gamma (2001).mkv").await;
+    std::fs::File::options()
+        .write(true)
+        .open(f.temp.path().join("more/Gamma (2001)/Gamma (2001).mkv"))
+        .expect("open")
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(24))
+        .expect("set mtime");
+    f.scan().await;
+    let admin = pushes_until(&mut f.admin_socket, &gamma).await;
+    let last = admin.last().expect("a push naming the movie");
+    assert!(lists(last, "ItemsUpdated", &gamma), "{admin:?}");
+    assert!(!lists(last, "ItemsAdded", &gamma), "{admin:?}");
 }

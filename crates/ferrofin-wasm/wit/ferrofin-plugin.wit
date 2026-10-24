@@ -610,6 +610,9 @@ world plugin {
     /// type name (`LibraryChanged`, `PlaybackStart`, …); `event-json` is its
     /// serialized payload. Called only while the plugin is enabled; a slow
     /// consumer loses oldest events rather than slowing the server.
+    /// `LibraryChanged` is each batch of library changes the server
+    /// announces, unfiltered by user, `LibraryUpdateDuration` seconds after
+    /// the batch's first change.
     export on-event: func(event-name: string, event-json: string);
 
     /// Offers metadata for one library item when the library scanner

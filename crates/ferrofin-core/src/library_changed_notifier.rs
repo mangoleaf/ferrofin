@@ -152,7 +152,7 @@ pub struct LibraryChangedNotifier {
     /// The per-user fan-out. Set by the composition root after the library
     /// manager it reads from exists. `None` — unit tests, and any moment
     /// before wiring completes — falls back to publishing one payload on the
-    /// event bus, which is what the scan-end push has always done.
+    /// event bus, which nothing forwards to clients.
     audience: std::sync::OnceLock<Arc<dyn LibraryChangeAudience>>,
 }
 
@@ -350,8 +350,8 @@ impl LibraryChangedNotifier {
             let _ = self.events.publish(ITEMS_CHANGED, payload).await;
         }
         let Some(audience) = self.audience.get() else {
-            // No fan-out wired: one payload to everyone, the pre-existing
-            // scan-end behaviour.
+            // No fan-out wired (unit tests): one unfiltered payload on the
+            // bus, which nothing forwards to clients.
             if let Some(payload) = &payload {
                 let _ = self.events.publish("LibraryChanged", payload).await;
             }
@@ -584,6 +584,26 @@ fn fold(pending: &Pending) -> Folded {
 }
 
 impl LibraryChangedNotifier {
+    /// Records items deleted from `library` that are known only by id: a
+    /// library scan's prune and the old ids of the items it moved, whose rows
+    /// are gone by the time the scan announces them. Each is filed under the
+    /// library, as its top parent and as the folder it was removed from
+    /// (upstream names each item's own parent). With no row to read,
+    /// `FilterItem` is not applied: the prune removes library items, which it
+    /// admits.
+    pub fn record_removed_from_library(self: &Arc<Self>, library: Uuid, ids: &[Uuid]) {
+        let library = library.simple().to_string();
+        let changed = ids
+            .iter()
+            .map(|id| Changed {
+                id: id.simple().to_string(),
+                top_parent: Some(library.clone()),
+                parent: Some(library.clone()),
+            })
+            .collect();
+        self.add(changed, Kind::Removed);
+    }
+
     /// Records a folder deletion that cascaded to its children.
     ///
     /// `delete_item` loads the folder row and then resolves its children as

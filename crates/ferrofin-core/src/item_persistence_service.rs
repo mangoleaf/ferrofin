@@ -985,10 +985,10 @@ impl FerrofinItemPersistenceService {
     }
 
     /// Attaches the `LibraryChanged` notifier so every item save announces
-    /// itself. Scans are deliberately NOT announced through here — they use
-    /// [`save_scanned_items`](ItemPersistenceService::save_scanned_items) and
-    /// publish one folded event at scan end instead, so a full scan cannot
-    /// accumulate a row per item for the length of the debounce.
+    /// itself. Scans are not announced through here — they save with
+    /// [`save_scanned_items`](ItemPersistenceService::save_scanned_items)
+    /// and report what they added, saved and removed to the same notifier
+    /// at scan end, once their user data is reattached.
     /// Later calls are ignored — which notifier a save announces on is a
     /// wiring decision, not a runtime one.
     pub fn set_change_notifier(

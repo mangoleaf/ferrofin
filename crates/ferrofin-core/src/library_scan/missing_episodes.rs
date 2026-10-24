@@ -300,7 +300,8 @@ impl LibraryScanner {
                 "refreshed TMDb missing and unaired episodes"
             );
         }
-        self.publish_missing_episode_changes(series, &changes).await;
+        self.announce_missing_episode_changes(items.as_ref(), &changes)
+            .await;
         Ok(())
     }
 
@@ -882,7 +883,7 @@ impl LibraryScanner {
         if ids.is_empty() {
             return Ok(());
         }
-        let removed = self.persistence.delete_items(ids).await?;
+        let removed = self.delete_announced(ids).await?;
         self.remove_item_art(&removed).await;
         changes.removed.extend(removed);
         Ok(())
@@ -958,44 +959,33 @@ impl LibraryScanner {
         self.remove_episodes(&empty, changes).await
     }
 
-    /// `LibraryChanged` for what the provider added and removed, under each
-    /// series' library — the `ItemAdded`/`ItemRemoved` events upstream's
-    /// `CreateItem`/`DeleteItem` raise.
-    async fn publish_missing_episode_changes(
+    /// Reports the episodes and seasons the provider created and the ones
+    /// it updated to the per-user `LibraryChanged` push, as upstream's
+    /// `CreateItem` and `UpdateToRepositoryAsync` raise `ItemAdded` and
+    /// `ItemUpdated` (its removals were reported as they were deleted). The
+    /// notifier passes on what `FilterItem` admits: the seasons, not the
+    /// pathless episodes.
+    async fn announce_missing_episode_changes(
         &self,
-        series: &[MissingEpisodeSeries],
+        items: &dyn ItemRepository,
         changes: &Changes,
     ) {
-        let Some(events) = &self.events else {
+        let Some(notifier) = &self.change_notifier else {
             return;
         };
-        if changes.added.is_empty() && changes.removed.is_empty() {
-            return;
-        }
-        let n = |id: &Uuid| id.simple().to_string();
-        let mut libraries: Vec<Uuid> = series.iter().filter_map(|s| s.library).collect();
-        libraries.sort_unstable();
-        libraries.dedup();
-        let mut update = ferrofin_model::entities_media::LibraryUpdateInfo {
-            folders_added_to: if changes.added.is_empty() {
-                Vec::new()
-            } else {
-                libraries.iter().map(n).collect()
-            },
-            folders_removed_from: if changes.removed.is_empty() {
-                Vec::new()
-            } else {
-                libraries.iter().map(n).collect()
-            },
-            items_added: changes.added.iter().map(n).collect(),
-            items_removed: changes.removed.iter().map(n).collect(),
-            items_updated: changes.updated.iter().map(n).collect(),
-            collection_folders: libraries.iter().map(n).collect(),
-            ..ferrofin_model::entities_media::LibraryUpdateInfo::default()
-        };
-        update.is_empty = update.compute_is_empty();
-        if let Ok(payload) = serde_json::to_string(&update) {
-            let _ = events.publish("LibraryChanged", &payload).await;
+        for (ids, added) in [(&changes.added, true), (&changes.updated, false)] {
+            if ids.is_empty() {
+                continue;
+            }
+            match items.retrieve_items(ids).await {
+                Ok(rows) if added => notifier.record_added(&rows),
+                Ok(rows) => notifier.record_updated(&rows),
+                Err(err) => tracing::warn!(
+                    %err,
+                    count = ids.len(),
+                    "could not read the missing and unaired episodes to announce them"
+                ),
+            }
         }
     }
 }
