@@ -16,8 +16,9 @@
 //!   candidates), ordered by name;
 //! - `parent_id`, `person_types`/`exclude_person_types` (alphanumeric only),
 //!   `max_list_order`, and the name range/substring predicates are applied as in
-//!   C#. The `is_favorite` user-data path is honored via a `UserData` join, and
-//!   the `access_filter` keeps only people credited on an item the user can see.
+//!   C#. `is_favorite` keeps the names of the Person items the user has a
+//!   `UserData` row for with that flag, and the `access_filter` keeps only
+//!   people credited on an item the user can see.
 
 use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
 
@@ -66,7 +67,7 @@ struct PeopleWithCount {
 }
 
 /// The stored `Type` name of a `Person` item, used by the `is_favorite`
-/// user-data join (C# `itemTypeLookup.BaseItemKindNames[Person]`).
+/// user-data set (C# `itemTypeLookup.BaseItemKindNames[Person]`).
 const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 
 /// The concrete people repository.
@@ -694,20 +695,25 @@ fn is_valid_person_type(value: &str) -> bool {
 /// (`p`).
 #[allow(clippy::too_many_lines)] // one arm per C# `TranslateQuery` predicate
 fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, alias: &str) {
+    // C# `IsFavorite` (v12.2 `PeopleRepository.cs:402-416`): the names of the
+    // `Person` items the user has a row for with that flag, as one
+    // uncorrelated set (`favoriteNames.Contains(e.Name)`). SQLite builds it
+    // once per statement and probes it per row. As a correlated `EXISTS` it
+    // seeded every probe from the user's whole favourite (or non-favourite)
+    // set and joined back by name, for every `Peoples` row and again for every
+    // dedup candidate: 1.4 s for an empty page on the gl-637 corpus, past 10 s
+    // for `false`.
     if let (Some(user_id), Some(is_favorite)) = (filter.user_id, filter.is_favorite) {
-        qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "UserData" ud
-                JOIN "BaseItems" bi ON bi."Id" = ud."ItemId"
-                WHERE bi."Type" = "#,
-        );
-        qb.push_bind(PERSON_TYPE_NAME);
         qb.push(format!(
-            r#" AND bi."Name" = {alias}."Name" AND ud."UserId" = "#
+            r#" AND {alias}."Name" IN (SELECT bi."Name" FROM "BaseItems" bi
+                WHERE bi."Type" = "#
         ));
+        qb.push_bind(PERSON_TYPE_NAME);
+        qb.push(r#" AND bi."Id" IN (SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#);
         qb.push_bind(guid_to_db(user_id));
         qb.push(r#" AND ud."IsFavorite" = "#);
         qb.push_bind(i64::from(is_favorite));
-        qb.push(")");
+        qb.push("))");
     }
     if !filter.item_id.is_nil() {
         qb.push(format!(
@@ -3505,6 +3511,118 @@ mod tests {
             !details.iter().any(|d| d.contains("TEMP B-TREE")),
             "the page still comes off the name index in order: {details:?}"
         );
+    }
+
+    /// C# `IsFavorite` (v12.2 `PeopleRepository.cs:402-416`): the people
+    /// named like a `Person` item the user has a `UserData` row for with that
+    /// flag. A person with no row is in neither answer — the set is built from
+    /// the rows — and a person whose item is a favourite of another user only
+    /// is not this user's.
+    #[tokio::test]
+    async fn favorite_filter_follows_the_users_person_rows() {
+        use crate::test_support::{seed_named_item, seed_named_user, seed_user_data};
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x8660);
+        let other = Uuid::from_u128(0x8661);
+        seed_named_user(&db, user, "user").await;
+        seed_named_user(&db, other, "other").await;
+        let set_favorite = |owner: Uuid, item: Uuid, favorite: bool| {
+            let db = db.clone();
+            async move {
+                seed_user_data(&db, owner, item, false, None).await;
+                sqlx::query(
+                    r#"UPDATE "UserData" SET "IsFavorite" = ?1 WHERE "ItemId" = ?2 AND "UserId" = ?3"#,
+                )
+                .bind(favorite)
+                .bind(guid_to_db(item))
+                .bind(guid_to_db(owner))
+                .execute(db.writer())
+                .await
+                .unwrap();
+            }
+        };
+        for (n, name) in [
+            (1, "Ann Favorite"),
+            (2, "Ben Seen"),
+            (3, "Cat Unseen"),
+            (4, "Dan Elsewhere"),
+        ] {
+            let item = Uuid::from_u128(0x8670 + n);
+            seed_named_item(&db, item, BaseItemKind::Person, name).await;
+            super::seed_people_row(&db, Uuid::from_u128(0x8680 + n), name, "Actor").await;
+            match n {
+                1 => set_favorite(user, item, true).await,
+                2 => set_favorite(user, item, false).await,
+                4 => set_favorite(other, item, true).await,
+                _ => {}
+            }
+        }
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        for (favorite, expected) in [(true, "Ann Favorite"), (false, "Ben Seen")] {
+            let page = repo
+                .get_people_by_name(&InternalPeopleQuery {
+                    user_id: Some(user),
+                    is_favorite: Some(favorite),
+                    must_have_item: true,
+                    limit: 20,
+                    ..Default::default()
+                })
+                .await
+                .expect("page");
+            let names: Vec<&str> = page.items.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, [expected], "isFavorite={favorite}");
+            assert_eq!(page.total_record_count, 1, "isFavorite={favorite}");
+        }
+    }
+
+    /// The favourite set is read once per statement, never per person: every
+    /// `UserData` probe hangs off a `LIST SUBQUERY`, not a correlated one.
+    /// Correlated, SQLite seeds each probe from the user's whole favourite (or
+    /// non-favourite) set and joins back by name, once for every `Peoples` row
+    /// and again for every dedup candidate — 1.4 s for an empty page on the
+    /// gl-637 corpus, and past 10 s for `isFavorite=false`.
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn favorite_filter_reads_the_favourite_set_once(#[case] favorite: bool) {
+        let db = test_db().await;
+        let query = InternalPeopleQuery {
+            user_id: Some(Uuid::from_u128(0x8690)),
+            is_favorite: Some(favorite),
+            must_have_item: true,
+            limit: 20,
+            ..Default::default()
+        };
+        let sql = super::by_name_page_query(&query)
+            .into_sql()
+            .as_str()
+            .to_owned();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let detail_of: std::collections::HashMap<i64, (i64, &str)> = plan
+            .iter()
+            .map(|(id, parent, _, detail)| (*id, (*parent, detail.as_str())))
+            .collect();
+        let user_data: Vec<i64> = plan
+            .iter()
+            .filter(|(_, _, _, d)| d.starts_with("SEARCH ud "))
+            .map(|(id, ..)| *id)
+            .collect();
+        assert!(!user_data.is_empty(), "{plan:?}");
+        for id in user_data {
+            let (parent, _) = detail_of[&id];
+            let (_, opened_by) = detail_of
+                .get(&parent)
+                .unwrap_or_else(|| panic!("UserData read at the plan root: {plan:?}"));
+            assert!(
+                opened_by.starts_with("LIST SUBQUERY"),
+                "UserData read under `{opened_by}`: {plan:?}"
+            );
+        }
     }
 
     /// Issue #58: upstream (v12.2 `PeopleRepository.GetPeople`) filters first
