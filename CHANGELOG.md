@@ -256,6 +256,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   key is a 404, as in Jellyfin (it was a 501, or a file a save had left behind), and saving one
   fails as Jellyfin's does instead of writing a file. `database` reads as the SQLite provider
   Ferrofin runs on, and saving it is refused (400), since no other provider can be used
+- `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
+  every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
