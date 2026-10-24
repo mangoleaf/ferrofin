@@ -860,13 +860,12 @@ impl FerrofinVirtualFolderManager {
 
     /// Sanitizes a proposed library name to a safe single path segment.
     ///
-    /// Port of `IFileSystem.GetValidFilename(name.Trim())`: trims surrounding
-    /// whitespace and strips the characters that are illegal in a path segment
-    /// (path separators and the Windows-reserved set), so the name maps to one
-    /// directory under the root.
+    /// Port of `AddVirtualFolder`'s `GetValidFilename(name.Trim())`: trims
+    /// surrounding whitespace, then replaces every invalid path character
+    /// (separators, the Windows-reserved set and control characters) with a
+    /// space, so the name maps to one directory under the root.
     fn valid_filename(name: &str) -> String {
-        const INVALID: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'];
-        name.trim().replace(INVALID, "")
+        ferrofin_util::path_helper::get_valid_filename(name.trim())
     }
 
     /// The lowercase enum name Jellyfin writes as the `<type>.collection` marker
@@ -3601,11 +3600,17 @@ mod tests {
         }
     }
 
+    /// `AddVirtualFolder`'s `GetValidFilename(name.Trim())`: each invalid
+    /// character, control characters included, becomes a space.
     #[test]
-    fn valid_filename_strips_separators_and_trims() {
+    fn valid_filename_replaces_invalid_characters_with_spaces() {
         assert_eq!(
             FerrofinVirtualFolderManager::valid_filename("  a/b:c  "),
-            "abc"
+            "a b c"
+        );
+        assert_eq!(
+            FerrofinVirtualFolderManager::valid_filename("Kids:\tMovies"),
+            "Kids  Movies"
         );
         assert_eq!(
             FerrofinVirtualFolderManager::valid_filename("Movies"),
