@@ -410,6 +410,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   run again, as in Jellyfin. Before, it stayed "Running" until someone pressed Stop, the
   server restarted or a trigger's time limit ran out, and its triggers and the Run button did
   nothing
+- A request whose handler panics is answered `500` "Error processing request." and logged,
+  as in Jellyfin. Before, its connection was dropped, over HTTP/2 with every other request on it
 
 ## [1.0.0] - 2026-09-05
 
