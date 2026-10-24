@@ -428,7 +428,13 @@ impl PlaylistManager for RecordingPlaylists {
         _playlist_id: Uuid,
         _user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![item_entity(ITEM_A), item_entity(ITEM_B)])
+        // Dashed upper case, as a Jellyfin-scanned database stores `Id`.
+        Ok([ITEM_A, ITEM_B]
+            .map(|id| BaseItemEntity {
+                id: id.to_string().to_uppercase(),
+                ..item_entity(id)
+            })
+            .into())
     }
     async fn add_user_to_shares(
         &self,
@@ -738,6 +744,8 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result.total_record_count, 2);
     assert_eq!(result.items.len(), 1);
+    // `ItemId?.ToString("N")` (v12.2 PlaylistsController.cs:559): 32 lower-case
+    // hex digits, whatever case the row's stored id has.
     assert_eq!(
         result.items[0].playlist_item_id.as_deref(),
         Some(ITEM_A.simple().to_string().as_str())
