@@ -849,6 +849,48 @@ async fn artists_list_album_artists_and_by_name() {
     assert_eq!(json_body(response).await["Name"], "Miles Davis");
 }
 
+/// The kind lists reach the repository as the client sent them: a Live TV kind
+/// with no stored type name (`Program`) survives the lenient parse, so the
+/// repository can answer it with nothing as `TranslateQuery` does, and a kind
+/// both included and excluded arrives in both lists, for the repository to
+/// apply the include alone (v12.2 `TranslateQuery.cs:282-313`).
+#[tokio::test]
+async fn by_name_lists_pass_the_kind_lists_through() {
+    let library = ByNameLibrary::default();
+    let state = by_name_state_with_library(library.clone());
+    for route in [
+        "/Genres",
+        "/MusicGenres",
+        "/Studios",
+        "/Artists",
+        "/Artists/AlbumArtists",
+    ] {
+        for (params, include, exclude) in [
+            (
+                "includeItemTypes=Program",
+                vec![BaseItemKind::Program],
+                vec![],
+            ),
+            (
+                "includeItemTypes=Movie&excludeItemTypes=Movie",
+                vec![BaseItemKind::Movie],
+                vec![BaseItemKind::Movie],
+            ),
+        ] {
+            let uri = format!("{route}?{params}");
+            let response = create_router(state.clone())
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let seen = library.seen.lock().expect("lock");
+            let query = seen.last().expect("a by-name query ran");
+            assert_eq!(query.include_item_types, include, "{uri}");
+            assert_eq!(query.exclude_item_types, exclude, "{uri}");
+        }
+    }
+}
+
 /// `studios` on the artist routes (v12.2 `ArtistsController.cs:182-195`,
 /// `:336-349`): non-empty, the names' studio ids REPLACE `studioIds`. Upstream's
 /// `GetStudio` mints a row for an unknown name, whose id nothing references;

@@ -239,10 +239,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
   file converted to ASS does not get Jellyfin's style conversion yet
 - `GET /Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists` and the
-  genre facet of `GET /Items/Filters2` filter their content by kind as Jellyfin's query does. An `includeItemTypes` of only Live TV
-  kinds with no stored rows (`Program`, `Recording`, `ChannelFolderItem`) lists nothing; it
-  listed every value. `excludeItemTypes` counts only when no kind is included, so naming
-  one kind in both lists answers that kind instead of nothing
+  genre facet of `GET /Items/Filters2` filter their content by kind as Jellyfin's query
+  does. An `includeItemTypes` of only Live TV kinds with no stored rows (`Program`,
+  `Recording`, `ChannelFolderItem`) lists nothing; it listed every value.
+  `excludeItemTypes` counts only when no kind is included, so naming one kind in both lists
+  answers that kind instead of nothing
 - `GET /Artists` and `/Artists/AlbumArtists` honour `studios` (pipe-delimited studio names):
   the named studios replace `studioIds`, and since an artist carries no studios the list is
   empty, as in Jellyfin. The parameter was dropped and every artist listed. Unlike Jellyfin,

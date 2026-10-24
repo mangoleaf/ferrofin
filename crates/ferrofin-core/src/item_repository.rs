@@ -1939,6 +1939,9 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
     // row — `/Artists?includeItemTypes=MusicAlbum` walks 800 albums per
     // artist: 45 ms; pinned, it walks the artist's own map rows: 4 ms.
     match content_type_names {
+        // Page only: the Counts scope falls through to the excludes on purpose,
+        // since `BuildItemCountsByCleanName`'s `scopeQuery` copies
+        // `ExcludeItemTypes` and not `IncludeItemTypes`.
         Some(names) if inner == InnerScope::Page => {
             qb.push(" AND ");
             push_in_list(qb, r#"+ci."Type""#, names);
