@@ -331,20 +331,7 @@ impl FerrofinServerConfigurationManager {
         let metadata_file = named_dir.join(Self::METADATA_FILE_NAME);
 
         // Before `system.json` is written below: see `seed_named_configurations`.
-        if let Err(e) = seed_named_configurations(&config_dir, &named_dir).await {
-            // Never fatal, on any boot. The line between refusing to start and
-            // carrying on is not "is this the adoption boot" — it is whether
-            // the next boot gets another chance. Seeding is skipped only once
-            // its JSON exists, so a failure here leaves the JSON absent and is
-            // retried forever; the cost of carrying on is hardware transcoding
-            // or a splash screen until the operator fixes the file. Refusing to
-            // start over that would be worse than the problem.
-            tracing::warn!(
-                error = %e,
-                "could not seed a named configuration from jellyfin's xml; the server is \
-                 starting on ferrofin's defaults for it, and will try again on the next boot"
-            );
-        }
+        seed_named_configurations(&config_dir, &named_dir).await;
 
         // No `system.json` means this data directory has never been served by
         // Ferrofin, so it may be a Jellyfin one we are adopting. Jellyfin kept
@@ -906,77 +893,110 @@ where
 /// runs it BEFORE writing `system.json`, since that file is the sentinel for
 /// the adoption branch and crashing between the two would lose these for good.
 ///
-/// # Errors
-///
-/// Returns the first [`ServiceError`] a seed hits; the seeds after it are
-/// retried on the next boot.
-async fn seed_named_configurations(
-    config_dir: &std::path::Path,
-    named_dir: &std::path::Path,
-) -> Result<(), ServiceError> {
-    seed_named(
-        &config_dir.join("encoding.xml"),
-        &named_dir.join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME),
-        EncodingOptions::default(),
-        "EncodingOptions",
-        config_import::ENCODING_XML_DENY,
-    )
-    .await?;
-    seed_named(
-        &config_dir.join("branding.xml"),
-        &named_dir.join(FerrofinServerConfigurationManager::BRANDING_FILE_NAME),
-        BrandingOptions::default(),
-        "BrandingOptions",
-        config_import::BRANDING_XML_DENY,
-    )
-    .await?;
-    // The network policy is enforced from this file (see
-    // `ferrofin_api::ip_access`), so dropping it on adoption would
-    // quietly take down an operator's remote-IP filter and widen their
-    // `LocalNetworkSubnets` back to every private range — the server
-    // would come up more permissive than the one it replaced, and
-    // nothing would say so.
-    seed_named(
-        &config_dir.join("network.xml"),
-        &named_dir.join(FerrofinServerConfigurationManager::NETWORK_FILE_NAME),
-        ferrofin_networking::NetworkConfiguration::default(),
-        "NetworkConfiguration",
-        config_import::NETWORK_XML_DENY,
-    )
-    .await?;
-    // "Date added behavior for new content": the library scan dates
-    // every new item by it, so an operator who chose "Use date
-    // scanned into the library" keeps that choice.
-    seed_named(
-        &config_dir.join("metadata.xml"),
-        &named_dir.join(FerrofinServerConfigurationManager::METADATA_FILE_NAME),
-        MetadataConfiguration::default(),
-        "MetadataConfiguration",
-        &[],
-    )
-    .await?;
-    // NFO settings: the user whose watched state NFO sidecars carry,
-    // the release date format and path substitution.
-    seed_named(
-        &config_dir.join("xbmcmetadata.xml"),
-        &named_dir.join(FerrofinServerConfigurationManager::XBMC_METADATA_FILE_NAME),
-        ferrofin_model::configuration::XbmcMetadataOptions::default(),
-        "XbmcMetadataOptions",
-        &[],
-    )
-    .await?;
-    // Live TV's scalar options: guide days, recording padding,
-    // subfolders, the post-processor and NFO/image saving. Seeded here
-    // rather than by the once-only `live_tv_import`, so installs adopted
-    // before this seed existed get them on their next boot.
-    seed_named(
-        &config_dir.join("livetv.xml"),
-        &named_dir.join(FerrofinServerConfigurationManager::LIVE_TV_FILE_NAME),
-        ferrofin_model::live_tv::LiveTvOptions::default(),
-        "LiveTvOptions",
-        config_import::LIVETV_OPTIONS_XML_DENY,
-    )
-    .await
+/// Each document is seeded on its own, so one that cannot be imported costs
+/// only itself: a corrupt `encoding.xml` must not keep `network.xml`, whose
+/// policy the request path enforces, from being imported. A failure is logged
+/// with the file it came from, and is never fatal, on any boot. The line
+/// between refusing to start and carrying on is not "is this the adoption
+/// boot" — it is whether the next boot gets another chance. Seeding is skipped
+/// only once its JSON exists, so a failure leaves the JSON absent and is
+/// retried on every boot; the cost of carrying on is that document's settings
+/// until the operator fixes the file. Refusing to start over that would be
+/// worse than the problem.
+async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std::path::Path) {
+    let seeds = [
+        (
+            "encoding",
+            seed_named(
+                &config_dir.join("encoding.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME),
+                EncodingOptions::default(),
+                "EncodingOptions",
+                config_import::ENCODING_XML_DENY,
+            )
+            .await,
+        ),
+        (
+            "branding",
+            seed_named(
+                &config_dir.join("branding.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::BRANDING_FILE_NAME),
+                BrandingOptions::default(),
+                "BrandingOptions",
+                config_import::BRANDING_XML_DENY,
+            )
+            .await,
+        ),
+        // The network policy is enforced from this file (see
+        // `ferrofin_api::ip_access`), so dropping it on adoption would
+        // quietly take down an operator's remote-IP filter and widen their
+        // `LocalNetworkSubnets` back to every private range — the server
+        // would come up more permissive than the one it replaced, and
+        // nothing would say so.
+        (
+            "network",
+            seed_named(
+                &config_dir.join("network.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::NETWORK_FILE_NAME),
+                ferrofin_networking::NetworkConfiguration::default(),
+                "NetworkConfiguration",
+                config_import::NETWORK_XML_DENY,
+            )
+            .await,
+        ),
+        // "Date added behavior for new content": the library scan dates
+        // every new item by it, so an operator who chose "Use date
+        // scanned into the library" keeps that choice.
+        (
+            "metadata",
+            seed_named(
+                &config_dir.join("metadata.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::METADATA_FILE_NAME),
+                MetadataConfiguration::default(),
+                "MetadataConfiguration",
+                &[],
+            )
+            .await,
+        ),
+        // NFO settings: the user whose watched state NFO sidecars carry,
+        // the release date format and path substitution.
+        (
+            "xbmcmetadata",
+            seed_named(
+                &config_dir.join("xbmcmetadata.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::XBMC_METADATA_FILE_NAME),
+                ferrofin_model::configuration::XbmcMetadataOptions::default(),
+                "XbmcMetadataOptions",
+                &[],
+            )
+            .await,
+        ),
+        // Live TV's scalar options: guide days, recording padding,
+        // subfolders, the post-processor and NFO/image saving. Seeded here
+        // rather than by the once-only `live_tv_import`, so installs adopted
+        // before this seed existed get them on their next boot.
+        (
+            "livetv",
+            seed_named(
+                &config_dir.join("livetv.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::LIVE_TV_FILE_NAME),
+                ferrofin_model::live_tv::LiveTvOptions::default(),
+                "LiveTvOptions",
+                config_import::LIVETV_OPTIONS_XML_DENY,
+            )
+            .await,
+        ),
+    ];
+    for (key, seeded) in seeds {
+        if let Err(e) = seeded {
+            tracing::warn!(
+                configuration_key = key,
+                error = %e,
+                "could not seed a named configuration from jellyfin's xml; the server is \
+                 starting on ferrofin's defaults for it, and will try again on the next boot"
+            );
+        }
+    }
 }
 
 /// Writes `json_path` from the Jellyfin XML at `xml_path`, if that XML exists.
@@ -2260,6 +2280,64 @@ mod tests {
             ferrofin_model::entities::HardwareAccelerationType::none,
             "the operator turned it off; adoption must not turn it back on"
         );
+    }
+
+    /// One broken document costs only itself: a corrupt `encoding.xml` must not
+    /// keep `network.xml`, whose policy the request path enforces, from being
+    /// imported, and each failure is logged with the file it came from.
+    #[tokio::test]
+    async fn a_corrupt_named_xml_does_not_stop_the_documents_after_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let dir = tmp.path().join("config");
+        let encoding_xml = dir.join("encoding.xml");
+        let livetv_xml = dir.join("livetv.xml");
+        std::fs::write(&encoding_xml, "<EncodingOptions><A></B>").expect("encoding.xml");
+        std::fs::write(&livetv_xml, "<WrongRoot />").expect("livetv.xml");
+        std::fs::write(
+            dir.join("metadata.xml"),
+            "<MetadataConfiguration><UseFileCreationTimeForDateAdded>false\
+             </UseFileCreationTimeForDateAdded></MetadataConfiguration>",
+        )
+        .expect("metadata.xml");
+
+        let logs = CapturedLogs::default();
+        let mgr = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .expect("must still boot")
+        };
+
+        let network: ferrofin_networking::NetworkConfiguration =
+            seeded_named(tmp.path(), "network");
+        assert_eq!(network.remote_ip_filter, ["203.0.113.0/24"]);
+        let branding: BrandingOptions = seeded_named(tmp.path(), "branding");
+        assert!(branding.splashscreen_enabled);
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+        assert!(!mgr.encoding_file.exists(), "retried on the next boot");
+        let named = mgr.encoding_file.parent().expect("named dir");
+        assert!(
+            !named.join("livetv.json").exists(),
+            "retried on the next boot"
+        );
+
+        let text = logs.text();
+        for xml in [&encoding_xml, &livetv_xml] {
+            let warnings = text
+                .lines()
+                .filter(|line| line.contains(" WARN ") && line.contains(&xml.display().to_string()))
+                .count();
+            assert_eq!(warnings, 1, "one warning naming {}:\n{text}", xml.display());
+        }
     }
 
     /// The boot writes go through the same atomic, private write as every

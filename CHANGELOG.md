@@ -340,6 +340,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   seeded from Jellyfin's XML) are replaced atomically and readable by the server's user only
   (`0600`), like every other configuration save. A server stopped mid-write could leave a
   truncated `system.json` that kept the next start from booting
+- A Jellyfin configuration file that cannot be imported no longer stops the ones after it. A
+  corrupt `encoding.xml` or `branding.xml` kept `network.xml` (the remote-IP filter, local
+  subnets and known proxies), `metadata.xml`, `xbmcmetadata.xml` and `livetv.xml` from being
+  imported on every start, and only the broken file was named. Each file is now imported on its
+  own, and each one that fails is logged with its path
 
 ## [1.0.0] - 2026-09-05
 
