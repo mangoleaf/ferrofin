@@ -25,9 +25,10 @@ reaches into an object), `query` (object), `body` (a write's JSON body, an objec
 templates in its strings are filled too), `source` (where jellyfin-web issues it), `oracle_trap` (why
 the oracle is known to stall or fail on it), `expect_status` (the status the oracle answers, default
 200: two servers that agree on an error are not a pass unless the request says an error is expected),
-and on a write `readbacks`: the GETs (`id`, `path`, `query`, `source`, `oracle_trap`, `expect_status`)
-sent after it and compared like any read, reported as `<write id>/<read-back id>`, and `setup`: writes
-(fields as a request's) sent on the fresh copy before it, to build the state it acts on (a favourite
+and on a write `readbacks`: the GETs (`id`, `path`, `query`, `source`, `oracle_trap`, `expect_status`,
+and `settle`, a field a background refresh fills, asked again until it is there) sent after it and
+compared like any read, reported as `<write id>/<read-back id>`, and `setup`: writes (fields as a
+request's) sent on the fresh copy before it, to build the state it acts on (a favourite
 for an unfavourite to clear), compared too and reported as `<write id>/<step id>`. A read-back's
 `{write.Id}` is read from what each server answered to the write, so each server is asked about
 the thing it created.
@@ -107,6 +108,7 @@ class Request:
     of: str = ""             # a read-back's or setup step's write
     setup: tuple = ()        # requests sent on the fresh copy before this write (ids `<write>/<step>`)
     file: str = ""           # the request file it came from (the report's time by request file)
+    settle: str = ""         # a read-back's field a background refresh fills: asked again until it is there
 
     @property
     def is_write(self):
@@ -145,6 +147,15 @@ def walk(value, field):
         else:
             raise KeyError(part)
     return value
+
+
+def has_field(value, field):
+    """Whether `field` (as `walk` reads it) is in a JSON value, not null and not an empty list."""
+    try:
+        found = walk(value, field)
+    except KeyError:
+        return False
+    return found is not None and found != []
 
 
 def lookup(ids, name, capture=NO_CAPTURE):
@@ -191,7 +202,7 @@ def fill(text, ids, capture=NO_CAPTURE):
 
 SETUP_FIELDS = {"id", "method", "path", "query", "body", "source", "oracle_trap", "expect_status"}
 REQUEST_FIELDS = SETUP_FIELDS | {"readbacks", "setup"}
-READBACK_FIELDS = {"id", "path", "query", "source", "oracle_trap", "expect_status"}
+READBACK_FIELDS = {"id", "path", "query", "source", "oracle_trap", "expect_status", "settle"}
 
 
 def parse_request(row, where, of=None, kind=""):
@@ -222,6 +233,9 @@ def parse_request(row, where, of=None, kind=""):
         raise ParityError(f"{where}: a GET carries no body")
     if body is not None and not isinstance(body, (dict, list)):
         raise ParityError(f"{where}: `body` is a JSON object, an array or null")
+    settle = row.get("settle", "")
+    if not isinstance(settle, str):
+        raise ParityError(f"{where}: `settle` is the field path a background refresh fills")
     expect = row.get("expect_status", 200)
     if isinstance(expect, bool) or not isinstance(expect, int) or not 100 <= expect <= 599:
         raise ParityError(f"{where}: `expect_status` is an HTTP status code")
@@ -241,7 +255,7 @@ def parse_request(row, where, of=None, kind=""):
             children[field].append(child)
     return Request(f"{of}/{row['id']}" if of else row["id"], method, row["path"], query, body,
                    row.get("source", ""), row.get("oracle_trap", ""), expect, tuple(children["readbacks"]), of or "",
-                   tuple(children["setup"]))
+                   tuple(children["setup"]), settle=settle)
 
 
 def request_lines(paths):
@@ -492,6 +506,8 @@ def load_rules(path):
         scope = row.get("requests", None)
         if scope is not None and (not isinstance(scope, list) or not scope or not all(isinstance(g, str) and g for g in scope)):
             raise ParityError(f"{where}: `requests` lists request ids or globs the rule is limited to")
+        if "$" in paths and not scope:
+            raise ParityError(f"{where}: `$` (the whole body) is normalised only for the requests the rule names")
         for p in paths:
             # A path belongs to one rule for every request, or to rules each limited to some requests
             # (check_rule_scopes makes sure no request has two of those).
@@ -558,11 +574,16 @@ class Difference:
         return {"path": self.path, "at": self.at, "kind": self.kind, "oracle": self.oracle, "ferrofin": self.ferrofin}
 
 
+def root(path):
+    """A rule's path as the comparison walks it: `$`, the whole body, is the empty path of its root."""
+    return "" if path == "$" else path
+
+
 class Comparison:
     """Compares two bodies, applying the rules; `used` collects the rules that matched a field."""
 
     def __init__(self, rules):
-        self.by_path = {p: rule for rule in rules for p in rule.paths}
+        self.by_path = {root(p): rule for rule in rules for p in rule.paths}
         self.used = set()
         self.differences = []
 
@@ -618,7 +639,25 @@ class Comparison:
         if len(a) != len(b):
             self.add(path, at, "length", a, b)
         for index, (x, y) in enumerate(zip(a, b)):
-            self.walk(x, y, f"{path}[]", f"{at}[{index}]")
+            child, where = f"{path}[]", f"{at}[{index}]"
+            if self.other_items(x, y, child):
+                # two different items in the same place: the order or the selection differs, and that is
+                # the difference; comparing one item's fields with another's would only repeat it
+                self.add(f"{child}.Id", f"{where}.Id", "value", x["Id"], y["Id"])
+            else:
+                self.walk(x, y, child, where)
+
+    def other_items(self, x, y, path):
+        """Whether two array elements are different items: objects whose ids differ, also once dashes and
+        case are set aside (a format difference is reported at the id, the fields still compared), where no
+        rule applies to the element or makes its id opaque."""
+        if not (isinstance(x, dict) and isinstance(y, dict) and "Id" in x and "Id" in y) or path in self.by_path:
+            return False
+        same = lambda v: str(v).replace("-", "").lower()
+        if same(x["Id"]) == same(y["Id"]):
+            return False
+        rule = self.by_path.get(f"{path}.Id")
+        return not (rule and rule.kind == "opaque")
 
 
 def compare_bodies(oracle_body, ferrofin_body, rules, used):
@@ -708,6 +747,15 @@ def load_ledger(path, source=None):
     return entries
 
 
+#: A 32-hex path segment: an image tag used as a key. `findings` groups them as one.
+HEX_KEY = re.compile(r"(?<=\.)[0-9a-f]{32}(?=\.|$)")
+
+
+def tag_path(path):
+    """A field path with its image-tag keys as `<tag>`, as filed.toml, the ledger and `findings` write them."""
+    return HEX_KEY.sub("<tag>", path)
+
+
 # ── filed differences (filed.toml) ──────────────────────────────────────────
 @dataclass(frozen=True)
 class FiledEntry:
@@ -747,9 +795,9 @@ def load_filed(path):
 def filed_issue(entries, request_id, difference):
     """The issue a difference was filed as, or None. Paths are matched with their image-tag keys as
     `<tag>` (how `findings` prints them), so one entry covers a blurhash map's every tag."""
-    path = HEX_KEY.sub("<tag>", difference.path)
+    path = tag_path(difference.path)
     for entry in entries:
-        if fnmatch.fnmatchcase(request_id, entry.request) and HEX_KEY.sub("<tag>", entry.path) == path and difference.kind in entry.kinds:
+        if fnmatch.fnmatchcase(request_id, entry.request) and tag_path(entry.path) == path and difference.kind in entry.kinds:
             return entry.issue
     return None
 
@@ -768,23 +816,23 @@ def normalised(body, rules):
     """`(body as the comparison saw it, the paths of the rules that changed it)`: an opaque value is
     `<opaque>`, an opaque-keys object's keys are `<key N>` in the order of their values, an unordered
     array is sorted by its key. The bodies new-differences.json carries for filing."""
-    by_path = {p: rule for rule in rules for p in rule.paths}
+    by_path = {root(p): rule for rule in rules for p in rule.paths}
     applied = set()
 
     def walk(value, path):
         rule = by_path.get(path)
         if rule and rule.kind == "opaque":
-            applied.add(path)
+            applied.add(path or "$")
             return value if value is None else "<opaque>"
         if isinstance(value, dict):
             if rule and rule.kind == "opaque-keys":
-                applied.add(path)
+                applied.add(path or "$")
                 ordered = sorted(value.values(), key=lambda item: json.dumps(item, sort_keys=True))
                 return {f"<key {n}>": walk(item, f"{path}.{{key}}") for n, item in enumerate(ordered, 1)}
             return {key: walk(item, f"{path}.{key}" if path else key) for key, item in value.items()}
         if isinstance(value, list):
             if rule and rule.kind == "unordered" and all(isinstance(x, dict) and rule.by in x for x in value):
-                applied.add(path)
+                applied.add(path or "$")
                 value = sorted(value, key=lambda x: str(x[rule.by]))
             return [walk(item, f"{path}[]") for item in value]
         return value
@@ -794,14 +842,28 @@ def normalised(body, rules):
 
 
 def matching_entry(entries, request_id, difference):
+    """The ledger entry that accepts a difference, or None. Image-tag keys match as `<tag>`, as in filed.toml."""
+    path = tag_path(difference.path)
     for entry in entries:
-        if (fnmatch.fnmatchcase(request_id, entry.request) and entry.path == difference.path
+        if (fnmatch.fnmatchcase(request_id, entry.request) and tag_path(entry.path) == path
                 and difference.kind in entry.kinds):
             return entry
     return None
 
 
 # ── one request, both servers ───────────────────────────────────────────────
+#: What a server's own harness token is replaced by in its answers (a playlist's `ApiKey=`).
+TOKEN_MARK = b"<token>"
+
+
+def masked(response, token):
+    """The response with the harness's own token for that server replaced by TOKEN_MARK: each server
+    puts the token its session holds into the URLs it writes, which can never agree and must not be stored."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token or "") or token.encode() not in response.body:   # both servers' tokens are GUIDs ("N")
+        return response
+    return dataclasses.replace(response, body=response.body.replace(token.encode(), TOKEN_MARK))
+
+
 def examine(request, oracle, ferrofin, rules, used):
     """`(state, differences)` for one request. State is `match`, `differences` or `oracle failed`."""
     unexpected = oracle.status != request.expect_status
@@ -815,8 +877,11 @@ def examine(request, oracle, ferrofin, rules, used):
         differences.append(Difference("$status", "$status", "status", oracle.error, ferrofin.error))
     else:
         (a, why_a), (b, why_b) = decode(oracle), decode(ferrofin)
+        whole = next((rule for rule in rules if "$" in rule.paths and rule.kind == "opaque"), None)
         if why_a or why_b:
-            if (why_a, oracle.body) != (why_b, ferrofin.body):
+            if whole and why_a == why_b == "not JSON":
+                used.add(whole)   # bytes that can never agree (an encoder's output): both answered a body
+            elif (why_a, oracle.body) != (why_b, ferrofin.body):
                 differences.append(Difference("$", "$", "value", why_a or "body", why_b or "body"))
         else:
             differences += compare_bodies(a, b, rules, used)
@@ -839,10 +904,12 @@ ROLES = ("oracle", "ferrofin")
 #: Reads in flight per server at once (PARITY_CONCURRENCY): default 4, 1 to 8 (run.sh holds the same range).
 CONCURRENCY_DEFAULT = 4
 CONCURRENCY_RANGE = (1, 8)
+#: Between the polls of a read-back that waits for a background refresh (lib.sh's POLL_S, 1 s).
+SETTLE_POLL_S = 1
 
 
 def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries, request_timeout, deadline,
-                 now=time.monotonic, wall=time.time, send=fetch, reset=None, concurrency=1, filed=()):
+                 now=time.monotonic, wall=time.time, send=fetch, reset=None, concurrency=1, filed=(), sleep=time.sleep):
     """Send every read to both servers, `concurrency` pairs at a time (so each server has at most that many
     in flight), then each write one at a time, each on a fresh database copy (`reset(timeout)` gives both
     servers one and returns new tokens), after its setup steps and followed by its read-backs, until
@@ -886,8 +953,29 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
             replies.append(reply)
         return replies
 
+    def settled(request, paths, replies):
+        """The read-back's answers once each server's has its `settle` field: a server that answered
+        without it (its refresh still queued) is asked again every SETTLE_POLL_S, within the request
+        timeout; the last answer stands when the field never comes. None when the cap cut it short."""
+        replies = list(replies)
+        for index, role in enumerate(ROLES):
+            give_up = now() + request_timeout   # each server settles in a window of its own
+            while replies[index].status == 200 and not has_field(decode(replies[index])[0], request.settle) and now() < give_up:
+                sleep(SETTLE_POLL_S)
+                timeout, spent = budget()
+                if spent:
+                    return None
+                reply = send(urls[role], request.method, paths[role], auth_header(tokens[role]), timeout, now)
+                if timeout < request_timeout and reply.error == "timeout":
+                    return None   # cut short by the cap, as in exchange()
+                replies[index] = reply
+        return replies
+
     def record(request, paths, a, b, state=None, keep=True, **extra):
         differences = []
+        # Each server's own token only: a field that carries it is still compared (both sides read <token>),
+        # and a field only one server answers is still a missing or extra difference.
+        a, b = masked(a, tokens["oracle"]), masked(b, tokens["ferrofin"])
         if state is None:
             state, differences = examine(request, a, b, rules_for(rules, request.id), used)
         rows = []
@@ -985,6 +1073,8 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
                     paths[role], bodies[role] = request.path, None
                     unsent[role] = Response(None, b"", 0.0, f"not sent: {err}")
             replies = exchange(request, paths, bodies, unsent=unsent)
+            if replies is not None and request.settle:
+                replies = settled(request, paths, replies)
             if replies is None:
                 return finish(cap_exceeded=True)
             # A trap excuses an oracle that stalled or failed, never a server that was not asked at all.
@@ -1212,8 +1302,6 @@ def new_differences(results, rules):
 
 #: How much of each body a `findings` section shows (an issue's text stays readable).
 FINDINGS_BODY_CHARS = 4000
-#: A 32-hex path segment: an image tag used as a key. `findings` groups them as one.
-HEX_KEY = re.compile(r"(?<=\.)[0-9a-f]{32}(?=\.|$)")
 
 
 def findings(new):
@@ -1225,7 +1313,7 @@ def findings(new):
         for d in entry["differences"]:
             if not d.get("filed"):
                 # an image tag as a key (a blurhash map): one group for every tag, not one per image
-                path = HEX_KEY.sub("<tag>", d["path"])
+                path = tag_path(d["path"])
                 groups.setdefault((path, d["kind"]), []).append((entry, d))
     requests_of = lambda rows: len({entry["request"] for entry, _ in rows})
     out = [f"# New parity differences: {len(groups)} not filed yet\n"]
