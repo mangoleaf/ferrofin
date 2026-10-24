@@ -1354,6 +1354,9 @@ pub const VERIFIED: &[Verified] = &[
             "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
          the database rather than in the document; when they cannot be read the lists are \
          empty and the failure is logged.",
+            "For a caller who is not an administrator, livetv's TunerHosts[].Url and \
+         ListingProviders[].Password are blanked; upstream's plain [Authorize] serves those \
+         credentials to every signed-in user (owner decision 2026-10-23).",
         ],
         refs: &[],
     },

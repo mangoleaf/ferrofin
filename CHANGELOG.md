@@ -253,6 +253,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   wrong data directory or a deleted file was enough). The refusal names three ways out: restore
   the database, set `IsStartupWizardCompleted` to false in `system.json` to start over, or
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- `GET /System/Configuration/livetv` no longer hands Live TV credentials to users who are not
+  administrators: each tuner's URL (an IPTV playlist's usually carries the account's user name
+  and password) and each guide provider's password (the Schedules Direct password hash) come
+  back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
+  pages read them, so jellyfin-web is unaffected
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

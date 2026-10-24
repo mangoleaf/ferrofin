@@ -27,7 +27,7 @@ use ferrofin_model::branding::{BrandingOptions, BrandingOptionsDto};
 use ferrofin_model::configuration::{MetadataOptions, ServerConfiguration};
 use serde_json::Value;
 
-use crate::auth::{RequireAdminWithDefault, RequireAuth};
+use crate::auth::{RequireAdminWithDefault, RequireAuth, is_administrator_identity};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, JsonValueBody};
 use crate::state::AppState;
@@ -153,7 +153,7 @@ async fn update_branding_configuration(
 )]
 async fn get_named_configuration(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     // Typed here, not through the document: the numbers JsonDefaults cannot
@@ -213,7 +213,30 @@ async fn get_named_configuration(
             to_value(serde_json::to_value(providers))?,
         );
     }
+    // Divergence (owner decision 2026-10-23): upstream's plain [Authorize]
+    // hands these credentials to every signed-in user, and only the
+    // dashboard's admin pages read them. Blanked on the document itself, so
+    // the lists a dashboard save left in `livetv.json` are covered too.
+    if key.eq_ignore_ascii_case("livetv") && !is_administrator_identity(&state, &auth.0).await? {
+        blank_live_tv_credentials(&mut value);
+    }
     Ok(Json(value))
+}
+
+/// Blanks the credentials in a `livetv` document: each tuner's `Url` (an IPTV
+/// playlist's usually carries the account's user name and password) and each
+/// listing provider's `Password` (Schedules Direct accepts the stored hash as
+/// the credential). A member the document does not have stays absent.
+fn blank_live_tv_credentials(document: &mut Value) {
+    for (list, member) in [("TunerHosts", "Url"), ("ListingProviders", "Password")] {
+        if let Some(Value::Array(rows)) = document.get_mut(list) {
+            for row in rows {
+                if let Some(credential @ Value::String(_)) = row.get_mut(member) {
+                    *credential = Value::String(String::new());
+                }
+            }
+        }
+    }
 }
 
 /// A JsonException thrown inside UpdateNamedConfiguration reaches Jellyfin's

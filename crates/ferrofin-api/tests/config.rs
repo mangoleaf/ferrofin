@@ -839,11 +839,17 @@ async fn the_database_configuration_cannot_be_changed() {
     assert!(!dir.path().join("named/database.json").exists());
 }
 
-/// A Live TV manager whose two configuration reads fail (backend down).
-struct FailingLiveTv;
+/// A Live TV manager whose two configuration reads answer the given rows, or
+/// fail (backend down) when it has none.
+struct ScriptedLiveTv(
+    Option<(
+        Vec<ferrofin_model::live_tv::TunerHostInfo>,
+        Vec<ferrofin_model::live_tv::ListingsProviderInfo>,
+    )>,
+);
 
 #[async_trait]
-impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
+impl ferrofin_traits::stubs::LiveTvManager for ScriptedLiveTv {
     async fn get_guide_info(&self) -> Result<ferrofin_model::live_tv::GuideInfo, ServiceError> {
         unimplemented!("this fake is never asked for the guide window")
     }
@@ -858,12 +864,18 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn get_tuner_hosts(
         &self,
     ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
-        Err(ServiceError::backend("tuner store unavailable"))
+        self.0
+            .as_ref()
+            .map(|(tuners, _)| tuners.clone())
+            .ok_or_else(|| ServiceError::backend("tuner store unavailable"))
     }
     async fn get_listing_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::live_tv::ListingsProviderInfo>, ServiceError> {
-        Err(ServiceError::backend("listings store unavailable"))
+        self.0
+            .as_ref()
+            .map(|(_, providers)| providers.clone())
+            .ok_or_else(|| ServiceError::backend("listings store unavailable"))
     }
     async fn get_live_tv_info(&self) -> Result<ferrofin_model::live_tv::LiveTvInfo, ServiceError> {
         unreachable!()
@@ -1035,9 +1047,89 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     }
 }
 
+/// Tuner URLs (an IPTV playlist's usually carries the account's user name and
+/// password) and listing-provider passwords (Schedules Direct accepts the
+/// stored hash as the credential) are blanked for a caller who is not an
+/// administrator; only the dashboard's admin pages read them. Upstream serves
+/// them to every signed-in user (owner decision 2026-10-23).
+#[tokio::test]
+async fn live_tv_credentials_are_blanked_for_a_caller_who_is_not_an_administrator() {
+    use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
+    let rows = || {
+        Some((
+            vec![TunerHostInfo {
+                id: Some("tuner".to_owned()),
+                url: Some("http://iptv.example/get.php?username=u&password=p".to_owned()),
+                ..TunerHostInfo::default()
+            }],
+            vec![ListingsProviderInfo {
+                id: Some("provider".to_owned()),
+                username: Some("sd-user".to_owned()),
+                password: Some("5f4dcc3b5aa765d61d8327deb882cf99".into()),
+                ..ListingsProviderInfo::default()
+            }],
+        ))
+    };
+
+    let (status, body) = get(
+        full_state().with_live_tv(Arc::new(ScriptedLiveTv(rows()))),
+        "/System/Configuration/livetv",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["TunerHosts"][0]["Id"], "tuner");
+    assert_eq!(value["TunerHosts"][0]["Url"], "");
+    assert_eq!(value["ListingProviders"][0]["Username"], "sd-user");
+    assert_eq!(value["ListingProviders"][0]["Password"], "");
+
+    let (status, body) = get(
+        state_with(StubPaths::default(), Arc::new(FakeAdminUsers))
+            .with_live_tv(Arc::new(ScriptedLiveTv(rows()))),
+        "/System/Configuration/livetv",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(
+        value["TunerHosts"][0]["Url"],
+        "http://iptv.example/get.php?username=u&password=p"
+    );
+    assert_eq!(
+        value["ListingProviders"][0]["Password"],
+        "5f4dcc3b5aa765d61d8327deb882cf99"
+    );
+
+    // The lists a dashboard save left in the stored document are blanked too,
+    // when no Live TV manager supplies its own.
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(
+        dir.path(),
+        "livetv",
+        br#"{"TunerHosts":[{"Id":"tuner","Url":"http://iptv.example/u/p"},{"Id":"bare"}],
+            "ListingProviders":[{"Id":"provider","Password":"hash"}]}"#,
+    );
+    let (status, body) = get(
+        state_with_paths(StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        }),
+        "/System/Configuration/livetv",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["TunerHosts"][0]["Url"], "");
+    assert!(
+        value["TunerHosts"][1].get("Url").is_none(),
+        "absent stays absent"
+    );
+    assert_eq!(value["ListingProviders"][0]["Password"], "");
+}
+
 #[tokio::test]
 async fn live_tv_config_backend_failure_warns_instead_of_reading_as_unconfigured() {
-    let state = full_state().with_live_tv(Arc::new(FailingLiveTv));
+    let state = full_state().with_live_tv(Arc::new(ScriptedLiveTv(None)));
 
     let ((status, body), logs) =
         with_captured_logs(get(state, "/System/Configuration/livetv")).await;
