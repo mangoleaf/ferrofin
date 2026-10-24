@@ -238,6 +238,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
   Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
   file converted to ASS does not get Jellyfin's style conversion yet
+- `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
+  every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
