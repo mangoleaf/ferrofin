@@ -2950,6 +2950,13 @@ fn push_order_expression(
     }
     // `OrderMapper`'s `ItemValues`-correlated keys: the first value of the type
     // by its clean (ordinal) text — `Studio`, `Artist`, `AlbumArtist`.
+    //
+    // `CROSS JOIN` is the join-order pin: the row's own map rows
+    // (`IX_ItemValuesMap_ItemId`), then each value by its primary key, and the
+    // handful sorted per row. Left to choose, SQLite drove the sub-select from
+    // `IX_ItemValues_Type_CleanValue (Type=?)`, which hands it the `ORDER BY`
+    // for free, and probed the map for every value of the type, per row: a
+    // recursive `/Items` page sorted by artist cost 1.1 s on the gl-637 corpus.
     if let Some(value_type) = match by {
         ItemSortBy::Artist => Some(0),
         ItemSortBy::AlbumArtist => Some(1),
@@ -2958,7 +2965,7 @@ fn push_order_expression(
     } {
         qb.push(format!(
             r#"(SELECT iv."CleanValue" FROM "ItemValuesMap" ivm
-                JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
+                CROSS JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
                 WHERE ivm."ItemId" = bi."Id" AND iv."Type" = {value_type}
                 ORDER BY iv."CleanValue" LIMIT 1)"#
         ));
@@ -3115,6 +3122,48 @@ mod tests {
             );
             assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
         }
+    }
+
+    /// The `ItemValues` sort keys (`OrderMapper`'s `Artist`, `AlbumArtist`,
+    /// `Studio`) read each row's own values: the map by the row's item, then
+    /// each value by its id. Left to choose, SQLite drove the per-row
+    /// sub-select from `IX_ItemValues_Type_CleanValue (Type=?)` — the index
+    /// that hands it the inner `ORDER BY` for free — and probed the map for
+    /// every value of the type, per row: a recursive `/Items` page sorted by
+    /// artist cost 1.1 s on the gl-637 corpus.
+    #[rstest::rstest]
+    #[case(ItemSortBy::Artist)]
+    #[case(ItemSortBy::AlbumArtist)]
+    #[case(ItemSortBy::Studio)]
+    #[tokio::test]
+    async fn item_value_sort_keys_read_each_rows_own_values(#[case] by: ItemSortBy) {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let filter = InternalItemsQuery {
+            order_by: vec![(by, SortOrder::Ascending)],
+            limit: Some(20),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        let at = |prefix: &str| {
+            plan.iter()
+                .position(|d| d.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix}: {plan:#?}"))
+        };
+        let (ivm, iv) = (at("SEARCH ivm "), at("SEARCH iv "));
+        assert!(ivm < iv, "the map drives: {plan:#?}");
+        assert!(plan[ivm].ends_with("(ItemId=?)"), "{plan:#?}");
+        assert!(plan[iv].ends_with("(ItemValueId=?)"), "{plan:#?}");
     }
 
     /// The candidate read behind the Playlists/Collections views
