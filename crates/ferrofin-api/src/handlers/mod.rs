@@ -1360,6 +1360,33 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Users/{userId}/Policy",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "UpdateUserPolicy",
+        ferrofin: "handlers/users.rs update_user_policy → ferrofin-core user_manager.rs \
+               update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync behind \
+               ferrofin-traits policy_update_refusal) → session_manager.rs revoke_user_tokens",
+        date: "2026-10-24",
+        divergences: &[
+            "The three guards (the last administrator, an administrator disabled, the last \
+         enabled user) are read inside the transaction that saves, and a newly disabled \
+         user's tokens are revoked once it committed. Upstream counts from its user cache \
+         before saving and revokes first, so two concurrent saves could both pass a guard and \
+         leave the server without an administrator or an enabled user. Jellyfin bug not \
+         ported.",
+            "The 403 (a guard refused) and 404 (unknown user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+            "A body without AuthenticationProviderId or PasswordResetProviderId, or with either \
+         empty, is saved with the empty string, where upstream's [Required(AllowEmptyStrings \
+         = false)] model validation answers 400. Fix path: gl-863.",
+            "DeviceAccessHost (registered since Jellyfin 12.1) is not run after the save, so a \
+         device the new policy no longer allows keeps its token until it signs in again. Fix \
+         path: gl-442.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

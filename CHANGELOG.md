@@ -391,6 +391,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   instead of on every request. One that exists but cannot be read answers 500 instead of
   reading as the defaults, and so does saving the encoding settings over it, so a save cannot
   replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
+- Two administrators demoting or disabling each other at the same moment can no longer leave
+  the server without an administrator, or without any enabled user. The checks that
+  `POST /Users/{userId}/Policy` makes now run inside the save itself, as deleting a user's
+  already did, so the second save sees the first. Jellyfin has the same race. A user's tokens
+  are revoked once the save that disables them has gone through, so a refused save signs
+  nobody out
 
 ## [1.0.0] - 2026-09-05
 

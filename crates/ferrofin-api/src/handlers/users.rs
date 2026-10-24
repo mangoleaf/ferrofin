@@ -835,8 +835,12 @@ async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(),
 ///
 /// Port of `UserController.UpdateUserPolicy`, including the guards: the last
 /// administrator may not be demoted, an administrator may not be disabled, and
-/// the last enabled user may not be disabled. On a successful disable, the
-/// user's tokens are revoked.
+/// the last enabled user may not be disabled. The guards are read inside the
+/// save's transaction ([`UserManager::update_policy_guarded`]), so concurrent
+/// saves cannot both pass one. On a successful disable, the user's tokens are
+/// revoked.
+///
+/// [`UserManager::update_policy_guarded`]: ferrofin_traits::library::UserManager::update_policy_guarded
 #[utoipa::path(
     post,
     path = "/Users/{userId}/Policy",
@@ -854,44 +858,18 @@ async fn update_user_policy(
     Path(user_id): Path<Uuid>,
     JsonBody(new_policy): JsonBody<UserPolicy>,
 ) -> Result<StatusCode, ApiError> {
-    let user = load_user(&state, user_id).await?;
-    let was_admin = is_administrator(&state, &user).await?;
-
-    // If removing admin access, there must remain at least one administrator.
-    if !new_policy.is_administrator && was_admin && admin_count(&state).await? == 1 {
-        return Err(ApiError::Forbidden(
-            "there must be at least one user in the system with administrative access".to_owned(),
-        ));
-    }
-
-    // Administrators cannot be disabled.
-    if new_policy.is_disabled && was_admin {
-        return Err(ApiError::Forbidden(
-            "administrators cannot be disabled".to_owned(),
-        ));
-    }
-
-    // Disabling a currently-enabled user: at least one enabled user must remain.
-    let currently_disabled = state
+    load_user(&state, user_id).await?;
+    // The guards run inside the save's transaction (`update_policy_guarded`),
+    // so the tokens of a user it disabled go once it committed. Upstream
+    // revokes first, which is the same once its guards have passed; here a
+    // refused or failed save logs nobody out.
+    let saved = state
         .users
-        .get_user_dto(&user, None)
-        .await?
-        .policy
-        .is_some_and(|p| p.is_disabled);
-    let mut revoke_on_disable = false;
-    if new_policy.is_disabled && !currently_disabled {
-        if enabled_count(&state).await? == 1 {
-            return Err(ApiError::Forbidden(
-                "there must be at least one enabled user in the system".to_owned(),
-            ));
-        }
-        revoke_on_disable = true;
-    }
-
-    if revoke_on_disable {
+        .update_policy_guarded(user_id, &new_policy)
+        .await?;
+    if saved.newly_disabled {
         state.sessions.revoke_user_tokens(user_id, "").await?;
     }
-    state.users.update_policy(user_id, &new_policy).await?;
     notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1120,36 +1098,6 @@ async fn load_user(state: &AppState, user_id: Uuid) -> Result<UserEntity, ApiErr
         .get_user_by_id(user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".to_owned()))
-}
-
-/// Counts the administrators in the system (for the policy guards).
-async fn admin_count(state: &AppState) -> Result<usize, ApiError> {
-    let users = state.users.get_users().await?;
-    let mut count = 0;
-    for user in &users {
-        if is_administrator(state, user).await? {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-/// Counts the enabled (non-disabled) users in the system (for the policy guards).
-async fn enabled_count(state: &AppState) -> Result<usize, ApiError> {
-    let users = state.users.get_users().await?;
-    let mut count = 0;
-    for user in &users {
-        let disabled = state
-            .users
-            .get_user_dto(user, None)
-            .await?
-            .policy
-            .is_some_and(|p| p.is_disabled);
-        if !disabled {
-            count += 1;
-        }
-    }
-    Ok(count)
 }
 
 /// `POST /Users/{userId}` — path-scoped form of `POST /Users` (update user).
