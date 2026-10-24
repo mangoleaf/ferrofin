@@ -95,6 +95,11 @@ fn default_segment_length_secs(copied_video: bool, user_agent: Option<&str>, liv
 /// `_minFFmpegHlsSegmentOptions` (an option rename, not a tuning value).
 const MIN_FFMPEG_HLS_SEGMENT_OPTIONS: FfmpegVersion = FfmpegVersion::new(5, 0);
 
+/// The first ffmpeg whose libx265 B-frames play in fMP4 HLS on iOS; older
+/// ones encode HLS libx265 with `-bf 0`. Port of `DynamicHlsController`'s
+/// `_minFFmpegX265BframeInFmp4` (an ffmpeg fix, not a tuning value).
+const MIN_FFMPEG_X265_BFRAME_IN_FMP4: FfmpegVersion = FfmpegVersion::with_build(7, 0, 1);
+
 /// The default HLS segment container when the request declares none.
 ///
 /// Port of the `DynamicHlsController` fallback: MPEG-TS (`ts`) segments.
@@ -1926,6 +1931,15 @@ impl FerrofinStreamStatePlanner {
                         frame_rate,
                     ),
                 );
+                // "Currently b-frames in libx265 breaks the FMP4-HLS playback
+                // on iOS": every HLS libx265 job on an older ffmpeg, whatever
+                // its segment container. An unknown version counts as older,
+                // as C#'s `null < version` does.
+                if video_encoder.eq_ignore_ascii_case("libx265")
+                    && !caps.ffmpeg_at_least(MIN_FFMPEG_X265_BFRAME_IN_FMP4)
+                {
+                    push_split(&mut args, "-bf 0");
+                }
             }
             // The plain software filter chain (downscale/tonemap/8-bit); the
             // burn-in branches below fold `sw_filters` into their own graphs
@@ -4921,6 +4935,105 @@ mod tests {
             !after.contains("igndts") && !after.contains("stream_loop"),
             "{after}"
         );
+    }
+
+    /// `DynamicHlsController.GetVideoArguments`: before ffmpeg 7.0.1,
+    /// libx265's B-frames break fMP4 HLS on iOS, so an HLS libx265 encode
+    /// turns them off right after its keyframe arguments. The gate reads the
+    /// encoder and the version only (an unknown version is older, as C#'s
+    /// `null < version` is), and the progressive path has no such arm.
+    #[rstest::rstest]
+    #[case::before_7_0_1(Some(FfmpegVersion::new(7, 0)), PlaylistKind::Vod, "mp4", true)]
+    #[case::mpegts_segments(Some(FfmpegVersion::new(6, 1)), PlaylistKind::Vod, "ts", true)]
+    #[case::event_playlist(Some(FfmpegVersion::new(6, 1)), PlaylistKind::Event, "mp4", true)]
+    #[case::from_7_0_1(
+        Some(FfmpegVersion::with_build(7, 0, 1)),
+        PlaylistKind::Vod,
+        "mp4",
+        false
+    )]
+    #[case::unknown_version(None, PlaylistKind::Vod, "mp4", true)]
+    #[case::progressive(
+        Some(FfmpegVersion::new(6, 1)),
+        PlaylistKind::Progressive,
+        "mp4",
+        false
+    )]
+    #[tokio::test]
+    async fn libx265_hls_drops_b_frames_before_ffmpeg_7_0_1(
+        #[case] version: Option<FfmpegVersion>,
+        #[case] kind: PlaylistKind,
+        #[case] segment_container: &str,
+        #[case] no_b_frames: bool,
+    ) {
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some(version) = version {
+            capabilities = capabilities.ffmpeg_version(version);
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("mpeg4"), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("hevc".to_owned());
+        req.segment_container = Some(segment_container.to_owned());
+        req.output_container = Some("mkv".to_owned());
+        let segment = (kind != PlaylistKind::Progressive).then_some(0);
+
+        let plan = p.plan(&req, false, segment, kind).await.unwrap();
+
+        let args = &plan.arguments;
+        assert!(
+            args.windows(2).any(|w| w == ["-c:v", "libx265"]),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.windows(2).any(|w| w == ["-bf", "0"]),
+            no_b_frames,
+            "{args:?}"
+        );
+        if no_b_frames {
+            // Right after the keyframe arguments, as upstream appends it.
+            let bf = args.iter().position(|a| a == "-bf").unwrap();
+            assert_eq!(args[bf - 2], "-force_key_frames:0", "{args:?}");
+        }
+    }
+
+    /// The same encoder through a libx264 job never loses its B-frames.
+    #[tokio::test]
+    async fn libx264_hls_keeps_its_b_frames_on_old_ffmpeg() {
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("mpeg4"), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .ffmpeg_version(FfmpegVersion::new(6, 1))
+                .build(),
+            EncodingOptions::default(),
+        );
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "libx264"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(!plan.arguments.iter().any(|a| a == "-bf"));
     }
 
     #[tokio::test]
