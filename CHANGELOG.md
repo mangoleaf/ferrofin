@@ -401,6 +401,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   times, and logged, instead of the recording being missed with no trace. A stored timer or
   series timer that no longer parses is logged when it is first read and when it misses its
   recording, instead of vanishing silently
+- An M3U playlist, HDHomeRun or Schedules Direct request, a File Transformation callback or
+  the relay of a remote static stream gives up after 100 seconds, as Jellyfin's do, when the
+  other end accepts the connection and never answers. Before, it waited for ever, stalling
+  the guide refresh, tuner discovery or the client's request. The M3U, HDHomeRun and relay
+  limits stop at the response headers, so a long body or stream is never cut off
 
 ## [1.0.0] - 2026-09-05
 
