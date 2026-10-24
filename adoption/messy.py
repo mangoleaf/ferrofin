@@ -697,7 +697,9 @@ def compare(state, entry, oracle, lineage):
     return failures
 
 
-def check(db, fixture):
+def shape_results(db, fixture):
+    """One dict per shape of an adopted database: its end state, what it must be, where that comes from
+    and the verdict. `compare` holds the same judgement as the failures `check` prints."""
     entry = json.loads((fixture / "messy.json").read_text())
     oracle = json.loads((fixture / "messy-oracle.json").read_text())
     if set(entry["shapes"]) != set(SHAPES):
@@ -705,7 +707,17 @@ def check(db, fixture):
         # (The manifest is saved with sorted keys, so only the set of shapes is comparable.)
         raise CheckError(f"the fixture was built with shapes {', '.join(sorted(entry['shapes']))}, not "
                          f"{', '.join(SHAPES)}; build the messy fixtures again")
-    return compare(read_state(db, entry), entry, oracle, entry["lineage"])
+    state = read_state(db, entry)
+    results = []
+    for shape in entry["shapes"]:
+        want, source = expected(shape, entry["lineage"], oracle)
+        results.append({"shape": shape, "got": state[shape], "want": want, "source": source,
+                        "verdict": "PASS" if want is not None and state[shape] == want else "FAIL"})
+    return results, compare(state, entry, oracle, entry["lineage"])
+
+
+def check(db, fixture):
+    return shape_results(db, fixture)[1]
 
 
 # ── the oracle: Jellyfin 12.2 on a clean copy carrying one shape ────────────
@@ -850,11 +862,17 @@ def main(argv=None):
     checker = sub.add_parser("check")
     checker.add_argument("db", type=Path)
     checker.add_argument("fixture", type=Path)
+    shaper = sub.add_parser("shapes", help="print each shape's end state, expectation and verdict as JSON")
+    shaper.add_argument("db", type=Path)
+    shaper.add_argument("fixture", type=Path)
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
         if args.mode == "build":
             build(args.fixtures.resolve(), args.port)
+            return 0
+        if args.mode == "shapes":
+            print(json.dumps(shape_results(args.db, args.fixture)[0], sort_keys=True))
             return 0
         failures = check(args.db, args.fixture)
         for line in failures:

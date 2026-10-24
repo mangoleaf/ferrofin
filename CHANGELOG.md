@@ -35,6 +35,21 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Keep the playlists folder out of a user's library-wide queries until they can see a
+  playlist, and a box-set library until they can see a box set, as Jellyfin's
+  `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
+  no playlist no longer lists the folder, which put its counts one above Jellyfin's
+- Take a comic's cover from `.cb7` (7z) and `.cbt` (tar) archives as well as `.cbz`, and open
+  every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
+  really a ZIP gets its cover too. The fallback page is the first in .NET's key order
+  (case ignored first), not byte order. A real RAR `.cbr` still gets no cover
+- Give extras their owner's title metadata and dates, as Jellyfin's `RefreshExtras`
+  does. Trailers, featurettes and other extras take the movie's or series' genres,
+  studios, production locations, overview, ratings, year and premiere date when a
+  scan finds them new, renamed or gone, or on a full refresh, and the year and
+  premiere date on every scan. A video extra also takes the year in its file name until
+  its owner has one. Existing extras need one "Search for missing metadata" refresh to
+  get the rest; see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
   Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
   the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
@@ -66,6 +81,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   content" and "Uncoded languages". External subtitle files named with these codes
   (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
   `GET /Items/Filters` is unchanged
+- `GET /Items/Filters2?isAiring=false` lists the filters of the programmes not on now
+  (starting later or already ended), as Jellyfin 12 does. It returned an empty filter set,
+  because the predicate required a programme to start after now and also end before now
 - Serve Jellyfin 12's `MediaStream.IsOriginal` (ffprobe's `original` disposition, always
   written), `LocalizedLanguage` and `LocalizedOriginal` (on every audio stream). An
   original audio track's `DisplayTitle` ends in " - Original" (localized). As upstream, a
@@ -93,6 +111,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
   the user-view consolidation's reference moves, and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Adopting a Jellyfin database re-attaches each extra whose owner is gone the way Jellyfin
+  does: to the lowest-Id video in the extra's folder, matched literally and ignoring case in
+  any script. An `_` or `%` in a folder name no longer matches other folders, and an extra
+  with no folder is left without an owner instead of joining an arbitrary video
 - Port Jellyfin's `PlaylistResolver`: a library scan makes a playlist of each `.m3u`,
   `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library (named after the
   file, under the album, artist or folder item it sits in, `.pls` no longer a song) and of
@@ -106,6 +128,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   for a folder's `playlist.xml` (#56)
 - Create the internal playlists folder at startup, as `CreateRootFolder` does: a server
   whose only playlists come from the library scan now lists the Playlists view
+- Check the server directories at startup, as Jellyfin does. Before a scheduled restore is
+  applied or the database is opened, Ferrofin creates its configuration, log, plugins,
+  data, cache, `<data>/data` and `<data>/root` directories, and leaves Jellyfin's
+  `.jellyfin-<kind>` marker in each (the cache also gets `CACHEDIR.TAG`). A layout that
+  used to start now stops the boot with a clear error when a directory holds another
+  kind's marker (two of its paths point at one directory) or cannot be created or written
+  to. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - The Playlists view lists every playlist the user may open, wherever it is, as Jellyfin
   12.2 does — not only the ones made in the app
 - Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in
@@ -136,6 +166,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   downloader, as in Jellyfin 12.2. See [docs/UPGRADING.md](docs/UPGRADING.md)
 - TheAudioDB descriptions return for music artists and albums, in the item's metadata
   language when TheAudioDB has it, else in English
+- OpenSubtitles downloads share one login, as the plugin does. The token is kept until it
+  expires or the account changes (it was renewed for every subtitle). A rejected token is
+  renewed and the download retried once. The account's daily quota is tracked: once it is
+  spent, downloads are refused ("OpenSubtitles download limit reached") without asking
+  OpenSubtitles until its reset time, and the remaining count is logged with each
+  download. A download without an account is refused before any request, and the error for
+  a download OpenSubtitles rejects carries its reply (a web page as `[html]`), as the
+  plugin's does
 - Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
   "Use date scanned into the library" dates a new item by the moment Ferrofin first
   detects it, by a library scan or the disk watcher/webhook alike, and its series'
@@ -150,6 +188,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
   forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
   some clients produce on partial-GOP audio. As upstream, the default is off
+- Cut remuxed MKV HLS playlists on the file's own keyframes, as Jellyfin does. They are read
+  from its Matroska cues on the first request and stored. The Keyframe Extractor task fills
+  the same store, trying the Matroska cues before ffprobe, and
+  `AllowOnDemandMetadataBasedKeyframeExtractionForExtensions` takes effect. A seek restarts
+  the transcode at the segment's playlist time, half a second later for a copied video so
+  ffmpeg lands on the keyframe itself
 - Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
@@ -162,6 +206,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `MediaEncoder`: extraction failures are logged at WARN with the ffmpeg output and do not
   abort the transcode; ASS subtitles with missing `[Fonts]` or `[Graphics]` sections get
   the headers appended on write so libass renders them correctly
+- Trickplay frames and tiles are made in the server's temp directory (`{cache}/temp`), as
+  Jellyfin makes them in its own, instead of the system's `/tmp`. "Clean Cache Directory"
+  sweeps what a killed generation leaves there, and a small or read-only `/tmp` no longer
+  stops trickplay
 - Port `DownMixStereoAlgorithm` filter table: the 15-entry `(algorithm, channel_layout) →
   pan=stereo|…` lookup for Dave750, NightmodeDialogue, Rfc7845 and Ac4 algorithms, with
   7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
@@ -172,6 +220,54 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- The startup wizard's "Allow remote connections" choice applies at once, as in Jellyfin:
+  `POST /Startup/RemoteAccess` now saves the network configuration the way the dashboard
+  does, so the live remote-access policy takes it without a restart
+- Serve HTTPS from the dashboard's Networking settings, as Jellyfin does: with **Enable
+  HTTPS** and a PKCS#12 certificate that loads, the server also listens on
+  `FERROFIN_HTTPS_PORT` (8920) and publishes `https://` addresses; **Require HTTPS**
+  redirects plain HTTP there with a `307`; a new certificate path flags a restart, and a
+  missing one is answered `404`. `X-Forwarded-Proto` now counts only from known proxies,
+  also for addresses published from each request; see [docs/UPGRADING.md](docs/UPGRADING.md)
+- Music libraries keep their folder tree: a folder that is neither artist nor album (a
+  grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
+  is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
+  instead of being lifted to the level above. The next scan moves existing items under
+  their folders; their ids, play state and playlist entries stay
+- A series refresh removes its missing episodes once you have them, as Jellyfin 12.2 does:
+  a missing episode whose number a file covers, one with no number, and one carrying the
+  provider id of an episode you have under another number are removed, so an adopted
+  library no longer lists those episodes twice (see `docs/UPGRADING.md`)
+- Missing and unaired episodes from TheMovieDb, as Jellyfin 12 offers them: the TMDb
+  settings page's "Create unaired episodes", "Create missing episodes" and "Include
+  specials" options, its library list, refresh interval and grace period, and the "Refresh
+  upcoming and missing episodes (TheMovieDb)" scheduled task. Off by default
+- Convert subtitles with Jellyfin 12's writers (SubtitleEdit's libse 4.0.12), byte for byte:
+  converted WebVTT, SubRip, SSA and ASS lose the byte-order mark, and WebVTT loses the fixed
+  region block and `line:90%` on every cue. An `{\anN}` sign is placed where it asks to be
+  (`{\an8}` at the top), other SSA/ASS override tags are removed instead of shown as text,
+  and `<font color>` becomes a WebVTT colour class. An ASS script converted to SSA keeps its
+  styles and comments. `Stream.ttml` now serves TTML (`application/ttml+xml`; it was a 500).
+  An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
+  Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
+  file converted to ASS does not get Jellyfin's style conversion yet
+- `/System/Configuration/{key}` knows Jellyfin's named configurations only: `branding`,
+  `encoding`, `network`, `metadata`, `xbmcmetadata`, `livetv` and `database`. Reading any other
+  key is a 404, as in Jellyfin (it was a 501, or a file a save had left behind), and saving one
+  fails as Jellyfin's does instead of writing a file. `database` reads as the SQLite provider
+  Ferrofin runs on, and saving it is refused (400), since no other provider can be used
+- `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
+  every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
+- `GET /Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists` and the
+  genre facet of `GET /Items/Filters2` filter their content by kind as Jellyfin's query
+  does. An `includeItemTypes` of only Live TV kinds with no stored rows (`Program`,
+  `Recording`, `ChannelFolderItem`) lists nothing; it listed every value.
+  `excludeItemTypes` counts only when no kind is included, so naming one kind in both lists
+  answers that kind instead of nothing
+- `GET /Artists` and `/Artists/AlbumArtists` honour `studios` (pipe-delimited studio names):
+  the named studios replace `studioIds`, and since an artist carries no studios the list is
+  empty, as in Jellyfin. The parameter was dropped and every artist listed. Unlike Jellyfin,
+  an unknown name does not create a studio
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -181,8 +277,30 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   wrong data directory or a deleted file was enough). The refusal names three ways out: restore
   the database, set `IsStartupWizardCompleted` to false in `system.json` to start over, or
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- `GET /System/Configuration/livetv` no longer hands Live TV credentials to users who are not
+  administrators: each tuner's URL (an IPTV playlist's usually carries the account's user name
+  and password) and each guide provider's password (the Schedules Direct password hash) come
+  back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
+  pages read them, so jellyfin-web is unaffected
+- Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
+  carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
+  had already run, and cleared it, so a user with a maximum parental rating saw those episodes
+  in lists, counts, Latest, Resume and Next Up until the next full library scan
 
 ### Bug Fixes
+- "Optimize database" no longer runs while a database backup is copying, and a backup asked for
+  while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
+  database write for up to 30 seconds when the two overlapped
+- A Live TV channel that drops out of the tuner lineup and comes back keeps its users'
+  favourites, likes and play state, as in Jellyfin. The guide refresh that recreates the
+  channel gives back the data its removal had set aside
+- Book metadata from an EPUB's or a sidecar's OPF follows Jellyfin's reader:
+  - the first description, publisher, language, date and identifier of each kind count;
+  - the first Calibre series, series index, rating and sort title count;
+  - Calibre's series index and rating round half to even (a `2.5` series index is book 2);
+  - a cover named by `<meta name="cover">` is also found under `Images/`.
+
+  Affected books change on their next metadata refresh
 - A genre whose movies and series have no poster no longer gets an image drawn from music
   art of the same genre name, as in Jellyfin, where only movie and series posters are
   sampled. An image already drawn that way stays until deleted. See
@@ -229,6 +347,57 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Persons` sorts people by name case-insensitively, as Jellyfin 12.2 does, so a
   lowercase name such as `de Niro` lists among the D names instead of after every
   capitalised one (#60)
+- An episode, season or music track stored without a sort name, which the startup repair
+  fills, now sorts by its numbers, as Jellyfin's own sort names do. Before, the repair gave
+  it an alphabetical key, which put episodes out of order and could break "next episode"
+- Collections and playlists take their genres and studios from their members, as in
+  Jellyfin. A collection also takes its earliest member's date and year, and a playlist's
+  runtime is the sum of its members'. Before, they took only a rating, so they had no
+  genres, studios, year or runtime and never matched a genre or studio filter. Locked
+  items and locked fields keep their values. A collection also keeps a current list of
+  the libraries its members are in, which decides who can see it
+- Adding, removing or renaming a library, or adding or removing one of its folders, can
+  fail part-way, for example on a full disk. When it does, the request still fails, but
+  the server now also refreshes its folder watch and runs the scan the request asked for,
+  as Jellyfin does. Before, both were skipped until the next scan
+- A library's folder shortcuts are written as Jellyfin writes them. They are named after
+  the folder without its extension (`Films.HD` gives `Films.mblink`), and a folder inside
+  the server's data directory is stored as `%AppDataPath%/…`, so it keeps working if the
+  data directory moves
+- During a transcode, PGS and VobSub subtitles a client can draw itself are delivered as
+  separate subtitle files, as in Jellyfin 12, instead of being burned into the video. The
+  "Allow subtitle extraction on the fly" setting now applies: with it off, other embedded
+  subtitles are burned in during a transcode. Playback negotiation also asks the installed
+  ffmpeg which audio encoders it has, instead of assuming a fixed list
+- The Playlists folder is created with Jellyfin's dates: created and modified from its
+  directory, and saved now. Before, it had no modified or saved date. A one-off startup
+  repair fills the dates missing from the Playlists folder and the Collections library
+  that earlier versions created, and leaves every other library alone
+- The configuration files written at startup (`system.json` on a first or adopting start,
+  when the port is authorized and by the setup-completed repair, and the named documents
+  seeded from Jellyfin's XML) are replaced atomically and readable by the server's user only
+  (`0600`), like every other configuration save. A server stopped mid-write could leave a
+  truncated `system.json` that kept the next start from booting
+- A Jellyfin configuration file that cannot be imported no longer stops the ones after it. A
+  corrupt `encoding.xml` or `branding.xml` kept `network.xml` (the remote-IP filter, local
+  subnets and known proxies), `metadata.xml`, `xbmcmetadata.xml` and `livetv.xml` from being
+  imported on every start, and only the broken file was named. Each file is now imported on its
+  own, and each one that fails is logged with its path
+- An `encoding.json` the server cannot read (after an ownership change, say) is logged once as
+  a warning while transcodes run, as the transcode planner already did, instead of an error
+  every five seconds for each running transcode
+- `GET /System/Configuration/{key}` reads through the configuration manager like the rest of
+  the server. A saved document that does not parse is logged once per change of the file
+  instead of on every request. One that exists but cannot be read answers 500 instead of
+  reading as the defaults, and so does saving the encoding settings over it, so a save cannot
+  replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
+- The server opens its HTTP port as soon as it starts, before it adopts or migrates the
+  database (after a scheduled backup restore), and answers while it does, as Jellyfin's
+  startup server does:
+  `/health/live` 200, `/health/ready` 503, `/health` `Degraded`, every other request 503 with
+  `Retry-After` and a "starting" page. Before, the port stayed closed until boot finished,
+  so a long adoption could outlast the chart's startup probe and be restarted in a loop.
+  Boot stages are now logged at `info`
 
 ## [1.0.0] - 2026-09-05
 

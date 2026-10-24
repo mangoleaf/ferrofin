@@ -86,6 +86,8 @@ tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compressio
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
+tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
+sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.0.0"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
@@ -130,6 +132,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
+# The HTTPS listener (server only): rustls with the aws-lc-rs provider reqwest
+# already builds, and Jellyfin's PKCS#12 (`.pfx`) certificates, read with both
+# the modern (PBES2) and the legacy (PBES1, `pbes1`) encryptions.
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
+p12-keystore = "0.4.1"
+# Self-signed certificates for the HTTPS tests (dev-dependency only).
+rcgen = "0.14.10"
 
 # ── openapi ────────────────────────────────────────────────────────
 utoipa = "6.0.0"
@@ -156,6 +166,7 @@ wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no 
 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
+url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
@@ -169,7 +180,7 @@ argon2 = "0.6.0"
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
 kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0

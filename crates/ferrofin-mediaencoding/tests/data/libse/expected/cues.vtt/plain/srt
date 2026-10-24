@@ -1,0 +1,25 @@
+1
+00:00:11,000 --> 00:00:12,500
+{\an7}Top left & early
+
+2
+00:00:13,000 --> 00:00:14,000
+{\an3}<i>Bottom</i> <b>right</b> <u>under</u>
+
+3
+00:00:15,000 --> 00:00:16,000
+<c.yellow>Yellow class</c>
+
+4
+00:00:17,000 --> 00:00:18,000
+{\an8}<v Bob>Top by line number
+second <line>
+
+5
+00:00:19,000 --> 00:00:20,000
+<c.big.yellow>Big</c> and <c.red>red</c>
+
+6
+00:00:21,000 --> 00:00:22,000
+{\an5}Middle
+

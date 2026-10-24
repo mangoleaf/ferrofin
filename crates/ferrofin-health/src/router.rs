@@ -58,6 +58,59 @@ pub fn health_router(checkers: Vec<Arc<dyn HealthChecker>>) -> Router {
         .with_state(checkers)
 }
 
+/// The name [`startup_router`]'s readiness reports as failing.
+pub const STARTUP_CHECK: &str = "startup";
+
+/// The probe endpoints while the server is still starting (port of the
+/// setup server's `UseHealthChecks("/health")` over `SetupHealthcheck`):
+///
+/// - `/health` (and `/health/`) answers plain-text `Degraded` with `200 OK`,
+///   as ASP.NET Core maps a `Degraded` result ("Server is still starting
+///   up.");
+/// - `GET /health/live` is the same process-only `200 OK` as
+///   [`health_router`]'s, so a long boot is never restarted;
+/// - `GET /health/ready` is `503 Service Unavailable`, failing
+///   [`STARTUP_CHECK`], so no traffic is routed before the server is ready.
+pub fn startup_router() -> Router {
+    Router::new()
+        .route("/health", any(starting))
+        .route("/health/", any(starting))
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(not_ready_while_starting))
+}
+
+/// `/health` while starting: `Degraded`, which ASP.NET Core answers with 200.
+async fn starting() -> impl IntoResponse {
+    plaintext(StatusCode::OK, "Degraded")
+}
+
+/// `GET /health/ready` while starting.
+async fn not_ready_while_starting() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ReadyResponse {
+            status: "not_ready",
+            failing: vec![STARTUP_CHECK.to_owned()],
+        }),
+    )
+}
+
+/// `HealthCheckMiddleware`'s `WriteMinimalPlaintext` answer: the status name
+/// as `text/plain`, with the headers it sets when `AllowCachingResponses` is
+/// off.
+fn plaintext(status: StatusCode, text: &'static str) -> impl IntoResponse {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/plain"),
+            (header::CACHE_CONTROL, "no-store, no-cache"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "Thu, 01 Jan 1970 00:00:00 GMT"),
+        ],
+        text,
+    )
+}
+
 /// Handles `GET /health/live`: reports the process is up without probing
 /// dependencies, plus the compile-time build identity of the running binary.
 async fn liveness() -> impl IntoResponse {
@@ -101,21 +154,11 @@ async fn failing_checks(checkers: &Checkers) -> Vec<String> {
 /// `text/plain`), `Unhealthy` mapped to 503, and the headers it sets when
 /// `AllowCachingResponses` is off.
 async fn health(State(checkers): State<Checkers>) -> impl IntoResponse {
-    let (status, text) = if failing_checks(&checkers).await.is_empty() {
-        (StatusCode::OK, "Healthy")
+    if failing_checks(&checkers).await.is_empty() {
+        plaintext(StatusCode::OK, "Healthy")
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "Unhealthy")
-    };
-    (
-        status,
-        [
-            (header::CONTENT_TYPE, "text/plain"),
-            (header::CACHE_CONTROL, "no-store, no-cache"),
-            (header::PRAGMA, "no-cache"),
-            (header::EXPIRES, "Thu, 01 Jan 1970 00:00:00 GMT"),
-        ],
-        text,
-    )
+        plaintext(StatusCode::SERVICE_UNAVAILABLE, "Unhealthy")
+    }
 }
 
 /// Handles `GET /health/ready`: runs every checker and aggregates the outcome.
@@ -159,6 +202,32 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    /// While starting: `/health` is `Degraded` (200), liveness holds, and
+    /// readiness fails the startup check.
+    #[tokio::test]
+    async fn the_startup_router_is_live_degraded_and_not_ready() {
+        let response = startup_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&text[..], b"Degraded");
+        let (status, body) = request(startup_router(), "/health/live").await;
+        assert_eq!(
+            (status, body["status"].clone()),
+            (StatusCode::OK, "ok".into())
+        );
+        let (status, body) = request(startup_router(), "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["failing"], serde_json::json!([STARTUP_CHECK]));
     }
 
     #[tokio::test]

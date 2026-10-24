@@ -2005,9 +2005,10 @@ impl FerrofinLibraryManager {
 
     /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
     /// before the item's files: each row's internal metadata folder
-    /// (`{metadata}/library/{id2}/{id}`, and Ferrofin's own
-    /// `{metadata}/library/{GUID}`). A folder that cannot be removed is
-    /// logged and passed over, as upstream.
+    /// (`{metadata}/library/{id2}/{id}`), Ferrofin's own
+    /// `{metadata}/library/{GUID}`, and the lower-cased one older scans also
+    /// wrote art to ([`crate::item_folders::item_art_folders`]). A folder that
+    /// cannot be removed is logged and passed over, as upstream.
     ///
     /// Upstream's list also names a video's internal extracted data
     /// (trickplay tiles, chapter images, subtitle and attachment caches);
@@ -2017,8 +2018,9 @@ impl FerrofinLibraryManager {
     async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
         if let Some(paths) = &self.app_paths {
             use ferrofin_traits::system::ServerApplicationPaths as _;
-            // Both layouts: Ferrofin's `{metadata}/library/{GUID}` and
-            // Jellyfin's `{metadata}/library/{xx}/{idN}` an adopted item has.
+            // Every layout: Ferrofin's `{metadata}/library/{GUID}` (and its
+            // older lower-cased spelling) and Jellyfin's
+            // `{metadata}/library/{xx}/{idN}` an adopted item has.
             let art_root = std::path::Path::new(&paths.internal_metadata_path()).join("library");
             let folders: Vec<std::path::PathBuf> = rows
                 .iter()
@@ -2429,6 +2431,139 @@ impl crate::library_monitor::LibraryScanTrigger for FerrofinLibraryManager {
     }
 }
 
+/// `BaseItem.ContainingFolderPath` with its overrides:
+/// - the item's own path for a by-name item and a Live TV program (`Genre.cs`,
+///   `MusicGenre.cs`, `MusicArtist.cs`, `Person.cs`, `Studio.cs`, `Year.cs`,
+///   `LiveTvProgram.cs`);
+/// - for a playlist, the directory of a playlist file, else its own path
+///   (`Playlist.cs`: `IsPlaylistFile` is a path with an extension where no
+///   directory is);
+/// - else a folder's own path, and for a video `Video.ContainingFolderPath`'s
+///   rules ([`crate::video_versions::containing_folder_path_at`]: a disc rip's
+///   own folder, a stack's first part's directory), else the file's directory.
+///
+/// `path` is the item's path with Jellyfin's `%MetadataPath%`/`%AppDataPath%`
+/// tokens expanded, as upstream's `BaseItem.Path` is. `None` where the path
+/// has no parent directory: `/`, where .NET's `GetDirectoryName` is `null`,
+/// or a bare file name, where it is empty (a name upstream's next save drops
+/// as blank anyway).
+async fn containing_folder_path(item: &BaseItemEntity, path: &str) -> Option<String> {
+    let parent = || {
+        std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .filter(|folder| !folder.is_empty())
+            .map(str::to_owned)
+    };
+    match BaseItemKind::from_stored_type_name(&item.type_) {
+        Some(
+            BaseItemKind::Genre
+            | BaseItemKind::MusicGenre
+            | BaseItemKind::MusicArtist
+            | BaseItemKind::Person
+            | BaseItemKind::Studio
+            | BaseItemKind::Year
+            | BaseItemKind::TvProgram
+            | BaseItemKind::LiveTvProgram,
+        ) => return Some(path.to_owned()),
+        Some(BaseItemKind::Playlist) => {
+            // `Path.HasExtension`: a dot in the file name with something after it.
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let has_extension = name.rfind('.').is_some_and(|dot| dot + 1 < name.len());
+            let is_file = has_extension
+                && !tokio::fs::metadata(path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir());
+            return if is_file {
+                parent()
+            } else {
+                Some(path.to_owned())
+            };
+        }
+        _ => {}
+    }
+    Some(crate::video_versions::containing_folder_path_at(item, path))
+        .filter(|folder| !folder.is_empty())
+}
+
+impl FerrofinLibraryManager {
+    /// [`containing_folder_path`] of `item`, its stored path expanded; `None`
+    /// for an item without a path.
+    async fn item_containing_folder(&self, item: &BaseItemEntity) -> Option<String> {
+        let path = self.expand_path(item.path.as_deref()?);
+        containing_folder_path(item, &path).await
+    }
+
+    /// `LibraryManager.GetConfiguredContentType(item, inheritConfiguredPath: false)`:
+    /// a `CollectionFolder`'s own collection type, else the override `overrides`
+    /// sets for `item`'s containing folder exactly.
+    async fn configured_content_type(
+        &self,
+        item: &BaseItemEntity,
+        overrides: &[ferrofin_model::dto::NameValuePair],
+        libraries: &[ferrofin_model::entities_media::VirtualFolderInfo],
+    ) -> Option<CollectionType> {
+        // Of upstream's `ICollectionFolder`s only a library's `CollectionFolder`
+        // can be a library item or one of its parents; the playlists folder
+        // never is.
+        if BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::CollectionFolder)
+        {
+            return libraries
+                .iter()
+                .find(|library| library.is_collection_folder(&item.id))
+                .and_then(|library| library.collection_type)
+                .and_then(crate::kinds::collection_type_of);
+        }
+        ferrofin_model::content_type_overrides::content_type_override(
+            overrides,
+            &self.item_containing_folder(item).await?,
+            false,
+        )
+    }
+
+    /// `ServerConfiguration.ContentTypes`: none without a configuration.
+    async fn content_type_overrides(
+        &self,
+    ) -> Result<Vec<ferrofin_model::dto::NameValuePair>, ServiceError> {
+        match &self.dashboard_configuration {
+            Some(config) => Ok(config.configuration().await?.content_types.clone()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The configured libraries: none without a virtual-folder manager.
+    async fn configured_libraries(
+        &self,
+    ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError> {
+        match &self.virtual_folders {
+            Some(folders) => folders.library_folders().await,
+            None => Ok(Arc::from([])),
+        }
+    }
+
+    /// `BaseItem.GetParents()`: the rows up `item`'s `ParentId` chain, its
+    /// parent first, ending where a parent is missing, or where the chain
+    /// comes back to a row already on it (a cycle in stored rows).
+    async fn parents_of(&self, item: &BaseItemEntity) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut parents: Vec<BaseItemEntity> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.extend(Uuid::parse_str(&item.id));
+        let mut next = item.parent_id.clone();
+        while let Some(id) = next
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .filter(|id| !id.is_nil() && seen.insert(*id))
+        {
+            let Some(parent) = self.items.retrieve_item(id).await? else {
+                break;
+            };
+            next.clone_from(&parent.parent_id);
+            parents.push(parent);
+        }
+        Ok(parents)
+    }
+}
+
 #[async_trait]
 impl LibraryManager for FerrofinLibraryManager {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -2436,6 +2571,73 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(None);
         }
         self.items.retrieve_item(id).await
+    }
+
+    async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
+        self.item_containing_folder(item).await
+    }
+
+    async fn get_inherited_content_type(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        let libraries = self.configured_libraries().await?;
+        let parents = self.parents_of(item).await?;
+        // `GetTopFolderContentType`: the library holding the top folder, the
+        // item's last parent below the `AggregateFolder` (or the item itself).
+        let top = parents
+            .iter()
+            .take_while(|parent| {
+                BaseItemKind::from_stored_type_name(&parent.type_)
+                    != Some(BaseItemKind::AggregateFolder)
+            })
+            .last()
+            .unwrap_or(item);
+        // A location matches ignoring one trailing separator: Ferrofin
+        // stores a location folder's path trimmed, where upstream's row and
+        // `PhysicalLocations` share one spelling.
+        let top_type = libraries
+            .iter()
+            .filter(|library| {
+                library.is_collection_folder(&top.id)
+                    || top.path.as_deref().is_some_and(|path| {
+                        library.locations.iter().any(|location| {
+                            ferrofin_model::content_type_overrides::paths_equal(location, path)
+                        })
+                    })
+            })
+            .find_map(|library| {
+                library
+                    .collection_type
+                    .and_then(crate::kinds::collection_type_of)
+            });
+        if top_type.is_some() {
+            return Ok(top_type);
+        }
+        // `item.GetParents().Select(GetConfiguredContentType).LastOrDefault(…)`:
+        // the parent farthest from the item that has a configured type.
+        let overrides = self.content_type_overrides().await?;
+        let mut farthest = None;
+        for parent in &parents {
+            if let Some(configured) = self
+                .configured_content_type(parent, &overrides, &libraries)
+                .await
+            {
+                farthest = Some(configured);
+            }
+        }
+        Ok(farthest)
+    }
+
+    async fn get_configured_content_type(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        let libraries = self.configured_libraries().await?;
+        let overrides = self.content_type_overrides().await?;
+        Ok(self
+            .configured_content_type(item, &overrides, &libraries)
+            .await)
     }
 
     async fn build_access_filter(
@@ -2517,6 +2719,37 @@ impl LibraryManager for FerrofinLibraryManager {
             .collect())
     }
 
+    async fn get_parentally_allowed_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &ferrofin_db::entities::users::UserEntity,
+        skip_allowed_tags: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let rows = self.items.retrieve_items(ids).await?;
+        let allowed: std::collections::HashSet<Uuid> = rows
+            .iter()
+            .zip(
+                service
+                    .parentally_allowed(&rows, user, skip_allowed_tags)
+                    .await?,
+            )
+            .filter(|(_, allowed)| *allowed)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .collect();
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| allowed.contains(id))
+            .collect())
+    }
+
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
         // Exactly `get_item_by_id(id).is_some()`, minus the row decode:
         // `get_item_by_id` rejects the nil id and `retrieve_item`'s predicate
@@ -2544,6 +2777,16 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(Vec::new());
         }
         self.items.get_image_infos(item_id).await
+    }
+
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ferrofin_traits::options::ItemImageInfo>, bool), ServiceError> {
+        if item_id.is_nil() {
+            return Ok((Vec::new(), false));
+        }
+        self.items.get_image_infos_with_auto_orient(item_id).await
     }
 
     async fn get_chapter_image(
@@ -2976,10 +3219,8 @@ impl LibraryManager for FerrofinLibraryManager {
         // in id order, that already has several sources and is itself no
         // version (`MediaSourceCount > 1 && !PrimaryVersionId.HasValue`) —
         // a video with versions, local or merged, which here is a row that
-        // points at it — else the widest default video stream, the first of
-        // equals (`ThenByDescending(...).First()`). The item's own `Width`
-        // column stands in for the default video stream width; the
-        // `Video3DFormat`/`VideoType` demotion before it is not modeled.
+        // points at it — else plain files before 3D and disc videos, then the
+        // widest ([`crate::video_versions::preferred_primary_version`]).
         let ids: Vec<Uuid> = items
             .iter()
             .filter_map(|item| Uuid::parse_str(&item.id).ok())
@@ -2991,15 +3232,7 @@ impl LibraryManager for FerrofinLibraryManager {
         let primary_index = items
             .iter()
             .position(|item| item.primary_version_id.is_none() && has_versions(item))
-            .unwrap_or_else(|| {
-                let mut best = 0;
-                for (index, item) in items.iter().enumerate().skip(1) {
-                    if item.width.unwrap_or(0) > items[best].width.unwrap_or(0) {
-                        best = index;
-                    }
-                }
-                best
-            });
+            .unwrap_or_else(|| crate::video_versions::preferred_primary_version(&items));
         let primary_id = items[primary_index].id.clone();
 
         // Link every non-primary item to the primary by pointer, and ensure the
@@ -3136,6 +3369,23 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        // `if (!item.SupportsPeople) return;`
+        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+            .is_some_and(crate::kinds::supports_people)
+        {
+            return Ok(());
+        }
+        let Ok(item_id) = Uuid::parse_str(&item.id) else {
+            return Ok(());
+        };
+        self.people.update_people(item_id, people).await.map(|_| ())
+    }
+
     async fn get_people(
         &self,
         query: &InternalPeopleQuery,
@@ -3222,6 +3472,10 @@ impl LibraryManager for FerrofinLibraryManager {
         query: &InternalItemsQuery,
     ) -> Result<Vec<i32>, ServiceError> {
         self.items.get_distinct_years(query).await
+    }
+
+    async fn get_tag_names(&self, query: &InternalItemsQuery) -> Result<Vec<String>, ServiceError> {
+        self.items.get_tag_names(query).await
     }
 
     async fn get_media_stream_languages(
@@ -5541,6 +5795,59 @@ mod tests {
         assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
     }
 
+    /// The parental check over ids keeps the input order and drops what it
+    /// rejects or cannot find: a person carrying a blocked tag, an unknown id.
+    /// Without a visibility service it refuses rather than allow every id.
+    #[tokio::test]
+    async fn parentally_allowed_ids_keep_the_order_and_drop_a_blocked_person() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7301)).await;
+        let [shown, hidden, missing] = [0x7302, 0x7303, 0x7304].map(Uuid::from_u128);
+        seed_named_item(&db, shown, BaseItemKind::Person, "Shown").await;
+        seed_named_item(&db, hidden, BaseItemKind::Person, "Hidden").await;
+        let mut row = crate::test_support::fetch_item(&db, hidden).await;
+        row.tags = Some("Private".into());
+        crate::test_support::save_item(&db, &row).await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockedTags,
+            &["private".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            base.get_parentally_allowed_item_ids(&[shown], &user, true)
+                .await
+                .is_err(),
+            "no visibility service"
+        );
+
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base.with_visibility(visibility);
+        assert_eq!(
+            library
+                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user, true)
+                .await
+                .unwrap(),
+            [shown]
+        );
+        assert!(
+            library
+                .get_parentally_allowed_item_ids(&[], &user, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn item_exists_agrees_with_get_item_by_id() {
         // The image routes gate their 404 on `item_exists`, so it must answer
@@ -6294,6 +6601,53 @@ mod tests {
                 .and_then(|s| Uuid::parse_str(s).ok()),
             Some(wide)
         );
+    }
+
+    /// `VideosController.MergeVersions` puts 3D and disc (non-`VideoFile`)
+    /// videos after plain files before it compares widths.
+    #[tokio::test]
+    async fn merge_versions_demotes_3d_and_disc_copies_below_a_plain_file() {
+        let db = test_db().await;
+        let three_d = Uuid::from_u128(0x311);
+        let disc = Uuid::from_u128(0x312);
+        let plain = Uuid::from_u128(0x313);
+        let blob = |id| {
+            if id == three_d {
+                r#"{"Video3DFormat":"HalfSideBySide"}"#
+            } else if id == disc {
+                r#"{"VideoType":"BluRay"}"#
+            } else {
+                "{}"
+            }
+        };
+        for (id, width) in [(three_d, 3840), (disc, 1920), (plain, 1280)] {
+            crate::test_support::seed_item_with_data(&db, id, BaseItemKind::Movie, "", blob(id))
+                .await;
+            set_width(&db, id, width).await;
+        }
+        let mgr = manager(&db);
+
+        mgr.merge_versions(&[three_d, disc, plain])
+            .await
+            .expect("merge");
+
+        let pointer = |row: Option<BaseItemEntity>| {
+            row.expect("some")
+                .primary_version_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        assert_eq!(
+            pointer(mgr.get_item_by_id(plain).await.expect("read")),
+            None
+        );
+        for id in [three_d, disc] {
+            assert_eq!(
+                pointer(mgr.get_item_by_id(id).await.expect("read")),
+                Some(plain),
+                "the wider 3D or disc copy is an alternate of the plain file"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7634,5 +7988,278 @@ mod tests {
             ["Alpha movie", "Bravo series", "Charlie video"],
             "plain explicit true does not override both disabled settings"
         );
+    }
+
+    /// A row of `kind` at `path` (if any) hanging off `parent`.
+    fn content_row(
+        kind: BaseItemKind,
+        path: Option<&str>,
+        parent: Option<&BaseItemEntity>,
+    ) -> BaseItemEntity {
+        BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: kind.stored_type_name().expect("a stored kind").to_owned(),
+            path: path.map(str::to_owned),
+            parent_id: parent.map(|parent| parent.id.clone()),
+            is_folder: crate::kinds::is_folder(kind),
+            ..Default::default()
+        }
+    }
+
+    /// `BaseItem.ContainingFolderPath` and its overrides (`Video`, `Playlist`,
+    /// the by-name items, `LiveTvProgram`).
+    #[tokio::test]
+    async fn the_containing_folder_follows_upstreams_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let list_dir = tmp.path().join("playlists").join("Road.Trip");
+        std::fs::create_dir_all(&list_dir).expect("playlist folder");
+        let list_dir = list_dir.to_string_lossy().into_owned();
+        let disc = {
+            let mut row = content_row(BaseItemKind::Movie, Some("/m/Rip (2001)"), None);
+            row.data = Some(r#"{"VideoType":"Dvd"}"#.to_owned());
+            row
+        };
+        let cases = [
+            (
+                content_row(BaseItemKind::Folder, Some("/m/Sets"), None),
+                Some("/m/Sets"),
+            ),
+            (
+                content_row(BaseItemKind::Movie, Some("/m/Heat (1995)/Heat.mkv"), None),
+                Some("/m/Heat (1995)"),
+            ),
+            (disc, Some("/m/Rip (2001)")),
+            (
+                content_row(BaseItemKind::Genre, Some("/meta/Genre/Rock"), None),
+                Some("/meta/Genre/Rock"),
+            ),
+            (
+                content_row(BaseItemKind::Person, Some("/meta/People/A/Ada"), None),
+                Some("/meta/People/A/Ada"),
+            ),
+            (
+                content_row(BaseItemKind::Year, Some("/meta/Year/1998"), None),
+                Some("/meta/Year/1998"),
+            ),
+            (
+                content_row(BaseItemKind::Playlist, Some("/m/lists/road.m3u"), None),
+                Some("/m/lists"),
+            ),
+            (
+                content_row(BaseItemKind::Playlist, Some(&list_dir), None),
+                Some(list_dir.as_str()),
+            ),
+            (
+                content_row(BaseItemKind::Movie, Some("/x.mkv"), None),
+                Some("/"),
+            ),
+            (content_row(BaseItemKind::Movie, None, None), None),
+        ];
+        for (row, expected) in cases {
+            let folder = match row.path.as_deref() {
+                Some(path) => containing_folder_path(&row, path).await,
+                None => None,
+            };
+            assert_eq!(
+                folder.as_deref(),
+                expected,
+                "{} at {:?}",
+                row.type_,
+                row.path
+            );
+        }
+    }
+
+    /// `GetConfiguredContentType(item)`: the override naming the item's
+    /// containing folder exactly, and a library's own type for its
+    /// `CollectionFolder`.
+    #[tokio::test]
+    async fn the_configured_content_type_is_the_override_on_the_items_folder() {
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::dto::NameValuePair;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).expect("media");
+        let db = test_db().await;
+        let vf = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        let cf = vf
+            .add_virtual_folder(
+                "Movies",
+                Some(ferrofin_model::entities::CollectionTypeOptions::movies),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: media.to_string_lossy().into_owned(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("library")
+            .expect("its collection folder");
+        let config = Arc::new(CollapsingConfiguration::default());
+        config.0.lock().unwrap().content_types = vec![NameValuePair {
+            name: Some("/m/mixed/Blade (1998)".to_owned()),
+            value: Some("movies".to_owned()),
+        }];
+        let mgr = manager(&db)
+            .with_virtual_folders(vf)
+            .with_dashboard_configuration(config);
+        let folder = content_row(BaseItemKind::Series, Some("/m/mixed/Blade (1998)"), None);
+        let file = content_row(
+            BaseItemKind::Movie,
+            Some("/m/mixed/Blade (1998)/b.mkv"),
+            None,
+        );
+        let above = content_row(BaseItemKind::Folder, Some("/m/mixed"), None);
+        let below = content_row(BaseItemKind::Folder, Some("/m/mixed/Blade (1998)/x"), None);
+        let library = BaseItemEntity {
+            id: guid_to_db(cf),
+            ..content_row(BaseItemKind::CollectionFolder, Some("/views/Movies"), None)
+        };
+        for (row, expected) in [
+            (&folder, Some(CollectionType::movies)),
+            (&file, Some(CollectionType::movies)),
+            (&above, None),
+            (&below, None),
+            (&library, Some(CollectionType::movies)),
+        ] {
+            assert_eq!(
+                mgr.get_configured_content_type(row).await.unwrap(),
+                expected,
+                "{:?}",
+                row.path
+            );
+        }
+    }
+
+    /// `GetInheritedContentType(item)`: the type of the library holding the
+    /// item's top folder; in a mixed library, the configured type of the
+    /// parent farthest from the item, whatever the nearer ones say.
+    #[tokio::test]
+    async fn the_inherited_content_type_is_the_librarys_else_the_farthest_override() {
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::dto::NameValuePair;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        let mixed = tmp.path().join("mixed");
+        std::fs::create_dir_all(&movies).expect("movies");
+        std::fs::create_dir_all(&mixed).expect("mixed");
+        let (movies, mixed) = (
+            movies.to_string_lossy().into_owned(),
+            mixed.to_string_lossy().into_owned(),
+        );
+        let db = test_db().await;
+        let vf = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        for (name, kind, location) in [
+            (
+                "Movies",
+                ferrofin_model::entities::CollectionTypeOptions::movies,
+                &movies,
+            ),
+            (
+                "Mixed",
+                ferrofin_model::entities::CollectionTypeOptions::mixed,
+                &mixed,
+            ),
+        ] {
+            vf.add_virtual_folder(
+                name,
+                Some(kind),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: location.clone(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("library");
+        }
+        let config = Arc::new(CollapsingConfiguration::default());
+        let a = format!("{mixed}/A");
+        let b = format!("{a}/B");
+        config.0.lock().unwrap().content_types = [(&b, "tvshows"), (&a, "movies")]
+            .into_iter()
+            .map(|(name, value)| NameValuePair {
+                name: Some(name.clone()),
+                value: Some(value.to_owned()),
+            })
+            .collect();
+        let root = content_row(BaseItemKind::AggregateFolder, Some("/config/root"), None);
+        let movies_location = content_row(BaseItemKind::Folder, Some(&movies), Some(&root));
+        let movie = content_row(
+            BaseItemKind::Movie,
+            Some(&format!("{movies}/Heat/Heat.mkv")),
+            Some(&movies_location),
+        );
+        let mixed_location = content_row(BaseItemKind::Folder, Some(&mixed), Some(&root));
+        let folder_a = content_row(BaseItemKind::Folder, Some(&a), Some(&mixed_location));
+        let folder_b = content_row(BaseItemKind::Folder, Some(&b), Some(&folder_a));
+        let video = content_row(
+            BaseItemKind::Video,
+            Some(&format!("{b}/x.mkv")),
+            Some(&folder_b),
+        );
+        let loose = content_row(
+            BaseItemKind::Video,
+            Some(&format!("{mixed}/y.mkv")),
+            Some(&mixed_location),
+        );
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[
+                root,
+                movies_location,
+                movie.clone(),
+                mixed_location,
+                folder_a,
+                folder_b,
+                video.clone(),
+                loose.clone(),
+            ])
+            .await
+            .expect("rows");
+        let mgr = manager(&db)
+            .with_virtual_folders(vf)
+            .with_dashboard_configuration(config);
+        assert_eq!(
+            mgr.get_inherited_content_type(&movie).await.unwrap(),
+            Some(CollectionType::movies)
+        );
+        assert_eq!(
+            mgr.get_inherited_content_type(&video).await.unwrap(),
+            Some(CollectionType::movies),
+            "A, the farther overridden parent, not B"
+        );
+        assert_eq!(mgr.get_inherited_content_type(&loose).await.unwrap(), None);
+    }
+
+    /// A cycle in stored `ParentId`s ends the walk instead of looping.
+    #[tokio::test]
+    async fn a_parent_cycle_ends_the_walk() {
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let first = content_row(BaseItemKind::Folder, Some("/m/a"), None);
+        let second = content_row(BaseItemKind::Folder, Some("/m/a/b"), Some(&first));
+        store
+            .save_items(&[first.clone(), second.clone()])
+            .await
+            .expect("rows");
+        // Re-saved once its parent row exists, so the parent key holds.
+        let first = BaseItemEntity {
+            parent_id: Some(second.id.clone()),
+            ..first
+        };
+        store
+            .save_items(std::slice::from_ref(&first))
+            .await
+            .expect("the cycle");
+        let parents = manager(&db).parents_of(&first).await.unwrap();
+        assert_eq!(parents.len(), 1, "the second row, then back to the first");
     }
 }

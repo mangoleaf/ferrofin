@@ -8,6 +8,130 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the dashboard's HTTPS settings take effect
+
+Ferrofin now serves HTTPS itself, as Jellyfin does. Until now it ignored the HTTPS settings
+on **Dashboard → Networking**. They now apply at startup:
+- With **Enable HTTPS** on and a PKCS#12 certificate that loads, the server also listens on
+  `FERROFIN_HTTPS_PORT` (8920 unless set) and publishes `https://` addresses.
+- With **Require HTTPS** on as well, every plain HTTP request is redirected there with a
+  `307`, `/metrics` included. Only `/health/live` and `/health/ready` are not redirected.
+
+The ports are still `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`. The port fields on the
+Networking page are not read yet (gl-554). If both name the same port, HTTPS is not served
+and the log says so. If another program holds the HTTPS port, the server does not start, as
+it does not when the HTTP port is taken.
+
+An adopted Jellyfin configuration keeps **Enable HTTPS** and **Require HTTPS**. It does not
+keep the certificate path and password, which pointed into Jellyfin's own filesystem. So
+adopted settings take effect only once you set a certificate path here.
+
+If HTTPS is on, make sure clients can reach the HTTPS port:
+- **Container:** publish it, for example `-p 8920:8920`.
+- **Helm chart:** the chart's service carries only the HTTP port. Terminate TLS at the
+  ingress instead and leave both settings off.
+- **Otherwise:** turn **Require HTTPS** off, or **Enable HTTPS** off. Without a reachable
+  HTTPS port, clients on plain HTTP are redirected to a port they cannot reach.
+
+A reverse proxy that terminates TLS needs neither setting. List it under **Known proxies**;
+its `X-Forwarded-Proto: https` then counts as HTTPS. That header now counts only from known
+proxies, as in Jellyfin, also for the addresses published from each request (**Enable
+published server URI by request**). A proxy that is not listed gets `http://` addresses. A listed
+proxy's `X-Forwarded-Host` is not used yet (gl-813): those addresses still take their host
+from the request's `Host`.
+See [CONFIG.md](CONFIG.md#https).
+
+## Unreleased — the server checks its directories at startup, as Jellyfin does
+
+Ferrofin now runs Jellyfin's startup check on its directories before a scheduled restore and the database open (an adopted Jellyfin database included). Only logging starts before it, and it creates the log directory itself. It creates each of these directories and leaves a small marker file in it, as Jellyfin does:
+
+| Directory | Marker |
+|---|---|
+| configuration (`FERROFIN_CONFIG_DIR`, default `<data>/config`) | `.jellyfin-config` |
+| logs (`<data>/log`) | `.jellyfin-log` |
+| plugins (`<data>/plugins`) | `.jellyfin-plugin` |
+| data (`--data-dir` / `FERROFIN_DATA_DIR`), and `<data>/data` | `.jellyfin-data` |
+| cache (`FERROFIN_CACHE_DIR`, default `<data>/cache`), which also gets `CACHEDIR.TAG` | `.jellyfin-cache` |
+| root folder (`<data>/root`, Jellyfin's `RootFolderPath`) | `.jellyfin-root` |
+
+**Two layouts that used to start now refuse to.**
+- **Two of these paths point at one directory**, for example the configuration or cache directory set to the data directory. The second marker's check finds the first, and Ferrofin exits with:
+
+  ```
+  the server's directories failed their startup check: Expected to find only .jellyfin-cache but found marker for <data>/.jellyfin-data.
+  ```
+
+  Give each its own directory. Then delete the marker the message names if it sits in a directory it does not belong to: the refused start may have left one, such as `.jellyfin-config` in the data directory when the configuration directory pointed there. Jellyfin refuses the same layouts.
+- **One of these directories cannot be created or written**, for example a read-only plugins volume. Ferrofin exits naming it: `creating <path>: …`. Make it writable.
+
+Ferrofin's default layout, the container image and an adopted Jellyfin directory are unaffected: each directory is a different one, and an adopted install already carries the same markers in the same places.
+
+## Unreleased — Schedules Direct guides, and listings providers are checked on save
+
+**Schedules Direct works.** In **Dashboard → Live TV → Add TV guide data provider →
+Schedules Direct**, the account and the lineup save and the guide fills on the next
+refresh. A Schedules Direct provider carried over from a Jellyfin `livetv.xml` now gets
+its guide too.
+
+When Schedules Direct refuses requests, the guide refresh keeps the stored guide instead of
+emptying it. That covers an account error (fixed by saving the provider again), the
+30-minute pause after a failed login, and its daily request limit (lifted at 00:00 UTC).
+
+Saving a listings provider is now checked the way Jellyfin checks it:
+- **A provider without a `Type` is refused (404).** Earlier versions saved it as XMLTV.
+  The dashboard always sends the type, so only scripts calling
+  `POST /LiveTv/ListingProviders` directly need to add `"Type": "xmltv"`.
+- **An XMLTV provider whose path is a local file that does not exist is refused (404).**
+  An `http`/`https` URL is still accepted unchecked.
+
+Providers already saved are not touched.
+
+## Unreleased — extras take their owner's metadata; refresh once to fill existing ones
+
+Trailers, featurettes and other extras now take their movie's or series' genres,
+studios, overview, ratings, year and premiere date, as in Jellyfin. A scan gives them
+the year and premiere date every time. It gives them the rest when it finds an extra
+new, renamed or gone, or when the refresh is a full one. Extras already in your
+libraries get only the dates from an ordinary scan.
+
+To fill the rest for existing extras, refresh each movie or TV library once with
+**Search for missing metadata** (Dashboard → Libraries → the library's menu → Refresh
+metadata), or refresh single items the same way. That is a full refresh, which is all
+the copy needs; **Replace all metadata** also works but re-fetches everything. New
+extras get everything on the scan that finds them.
+
+## Unreleased — missing episodes you now have are removed
+
+A database adopted from Jellyfin can hold **missing episodes**: placeholder rows with no
+file, which Jellyfin's TMDb option or the TheTVDB plugin added. They show to users with
+**Display missing episodes** on. Earlier versions kept every one forever, so when the
+file for one of them arrived, the episode was listed twice.
+
+Each library scan now does what Jellyfin does at the end of every series refresh. It
+removes a series' missing episode when:
+- a file in the same season covers its number;
+- it has no episode number;
+- it carries the TheTVDB, TMDb or other id of exactly one episode you have, under another
+  number. Aired, DVD and absolute orders number the same episode differently.
+
+The first scan after the upgrade does this for every series. Only placeholder rows go;
+no file is touched. A missing episode you still lack stays. A library monitor's event for
+a single file does not refresh its series, as in Jellyfin, so the next library scan
+removes its placeholder.
+
+## Unreleased — the server needs 2 GiB free to start, as Jellyfin does
+
+Ferrofin now checks free space at startup. It refuses to start when `{data_dir}/data`, the
+cache directory (`FERROFIN_CACHE_DIR`, default `{data_dir}/cache`) or `{data_dir}` itself
+has less than 2 GiB free, as Jellyfin does. A scheduled backup restore is checked the same
+way before it is applied. The log names the path and the shortfall: ``The path `…` has
+insufficient free space. Available: …, Required: 2GiB.``
+
+An install that started on a nearly full disk before will stop at boot after this
+upgrade. Free up space on that filesystem, or move the cache to another filesystem with
+`FERROFIN_CACHE_DIR`. A build that cannot read free space (non-Unix, such as Windows) logs
+a warning and starts.
+
 ## Unreleased — TheAudioDB descriptions return, in the library's language
 
 TheAudioDB stopped filling its English-suffixed description fields, and earlier versions

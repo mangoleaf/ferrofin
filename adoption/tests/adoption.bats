@@ -3,6 +3,8 @@
 # Nothing here needs docker, a Jellyfin database or external services: tests use canned
 # logs and smoke outputs, throwaway SQLite files and a local HTTP server.
 
+bats_require_minimum_version 1.5.0   # run --separate-stderr
+
 setup() {
   ADOPTION="$BATS_TEST_DIRNAME/.."
   # shellcheck source=adoption/lib.sh
@@ -509,6 +511,47 @@ EOS
   # the copy lands in work/run/, clear of synthetic.py run's work/<fixture>
   [ -d fixtures/work/run/jellyfin-12.0 ]
   [ ! -e fixtures/work/jellyfin-12.0 ]
+  # it is a failed row in the report too: the fixture began, and its row says why it never started
+  [ "$(jq -r 'select(.event == "row") | [.fixture, .verdict] | join(" ")' fixtures/work/run/results.jsonl)" = "jellyfin-12.0 FAIL" ]
+  jq -r 'select(.event == "row") | .detail' fixtures/work/run/results.jsonl | grep -q "metadata baseline"
+  grep -q "metadata baseline" fixtures/work/run/report.html
+}
+
+@test "run.sh: a broken or missing report module changes neither the verdict, the exit status nor the output" {
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  run --separate-stderr "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  normal_status=$status; normal_output=$output
+  [ "$normal_status" -eq 1 ]
+  [ -f fixtures/work/run/report.html ]
+  # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
+  [[ "$stderr" != *"report"* ]]   # a run that wrote its page says nothing about it
+  # the same run from a copy of the harness whose report module crashes, then from one that has none
+  cp -r "$ADOPTION" copy
+  printf 'raise SystemExit(7)\n' > copy/adoption_report.py
+  rm -rf fixtures/work
+  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq "$normal_status" ]
+  [ "$output" = "$normal_output" ]            # stdout is the same
+  [[ "$stderr" == *"report: not written"* ]]   # and the missing page is said, on stderr
+  [ ! -e fixtures/work/run/report.html ]
+  rm copy/adoption_report.py; rm -rf fixtures/work
+  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq "$normal_status" ]
+  [ "$output" = "$normal_output" ]
+  [[ "$stderr" == *"report: not written"* ]]
 }
 
 @test "synthetic adoption checks detect missing scenarios, changed membership and redundant writes" {
@@ -538,7 +581,8 @@ EOS
   grep -qF 'table_digests.py" check' "$ADOPTION/run.sh"
   # metadata_check runs after adoption, after restart and after scan
   [ "$(grep -c '^  metadata_check "after' "$ADOPTION/run.sh")" -eq 3 ]
-  grep -qF 'changed += table_digests.compare(' "$ADOPTION/preservation.py"
+  grep -qF 'table_changed = table_digests.compare(' "$ADOPTION/preservation.py"
+  grep -qF 'changed += record("table digests", table_changed)' "$ADOPTION/preservation.py"
   grep -qF 'tables_before, table_digests.snapshot(db, tables_before, reauthenticated=reauth))' "$ADOPTION/preservation.py"
 }
 
@@ -648,6 +692,54 @@ EOS
   [[ "$output" == *"messy: "* ]]   # the shape checker ran and said why it could not pass
   [ $((SECONDS - start)) -lt 60 ]
   [[ "$output" != *"unexpected docker"* ]]
+  # the report: every check's verdict was recorded, and the page says what failed and why
+  work=fixtures/work/run
+  [ "$(jq -s '[.[] | select(.event == "row")] | .[0] | [.fixture, .kind, .expected, .verdict] | join(" ")' -r "$work/results.jsonl")" = "jellyfin-12.2-messy messy 12.2.0 FAIL" ]
+  [ "$(jq -s '[.[] | select(.event == "check" and .verdict == "FAIL")] | length' "$work/results.jsonl")" -ge 2 ]
+  grep -q "jellyfin-12.2-messy" "$work/report.html"
+  grep -q "never became ready" "$work/report.html"
+  grep -q "messy shapes end as Jellyfin 12.2 left them" "$work/report.html"
+  grep -q ">FAIL<" "$work/report.html"
+}
+
+@test "run.sh: a skipped fixture is a SKIP row in the report, which is written even when nothing ran" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.event == "row") | [.fixture, .verdict, .detail] | join("|")' fixtures/work/run/results.jsonl)" = "jellyfin-12.0|SKIP|fixture missing" ]
+  grep -q "NOTHING RAN" fixtures/work/run/report.html
+}
+
+@test "run.sh: a run that is terminated still leaves a report, listing the fixture it was on as unfinished" {
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  # every container "is running" and never answers: the row waits for it
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo true; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  setsid "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy &
+  leader=$!
+  for _ in $(seq 1 40); do grep -q '"begin"' fixtures/work/run/results.jsonl 2>/dev/null && break; sleep 0.25; done
+  grep -q '"begin"' fixtures/work/run/results.jsonl
+  kill -TERM -- "-$leader"
+  status=0; wait "$leader" || status=$?
+  [ "$status" -eq 143 ]
+  grep -q "INCOMPLETE" fixtures/work/run/report.html
+  grep -q "jellyfin-12.2-messy" fixtures/work/run/report.html
+}
+
+@test "adoption report: recording, verdicts, the page and the viewer's listing" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_adoption_report.py
+  [ "$status" -eq 0 ]
 }
 
 # A messy 12.x row for run.sh with a docker that logs its `run` arguments to $DOCKER_LOG and

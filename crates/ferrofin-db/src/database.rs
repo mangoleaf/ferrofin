@@ -1,6 +1,7 @@
 //! The [`Database`] connection handle — a [`sqlx::SqlitePool`] wrapper.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -80,6 +81,9 @@ pub struct Database {
     /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
     /// [`Database::close`] still waits for it.
     snapshotter: SqlitePool,
+    /// One snapshot or one vacuum-and-checkpoint pass at a time
+    /// ([`Database::try_maintenance_turn`]), shared by every clone.
+    maintenance: Arc<tokio::sync::Mutex<()>>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -195,6 +199,7 @@ impl Database {
             pool,
             writer,
             snapshotter,
+            maintenance: Arc::default(),
             file_path: None,
         })
     }
@@ -237,6 +242,7 @@ impl Database {
             pool,
             writer,
             snapshotter,
+            maintenance: Arc::default(),
             file_path,
         })
     }
@@ -833,6 +839,31 @@ impl Database {
         }))
     }
 
+    /// Whether Jellyfin's `__EFMigrationsHistory` records `migration_id`, i.e.
+    /// Jellyfin already ran that routine here before Ferrofin adopted the
+    /// database. Always `false` on a Ferrofin-native database, which has no
+    /// such table (adoption keeps it untouched).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn jellyfin_migration_applied(&self, migration_id: &str) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        let applied: Option<i64> = sqlx::query_scalar(
+            r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
+        )
+        .bind(migration_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(applied.is_some())
+    }
+
     /// Plants an adoption record as the gate would — for tests of the boot
     /// repairs that key on it (an in-memory database never goes through the
     /// gate).
@@ -925,17 +956,40 @@ impl Database {
     /// whole copy would queue every write behind it (the writer pool has one
     /// connection) or, on a one-connection reader pool, every read. The cost
     /// is a WAL that cannot be checkpointed back to empty until the snapshot's
-    /// read transaction ends.
+    /// read transaction ends, so the copy waits for, and then holds, the
+    /// maintenance turn ([`Database::try_maintenance_turn`]).
     ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the statement fails
     /// (including when `dest` already exists).
     pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
+        let _turn = if let Ok(turn) = Arc::clone(&self.maintenance).try_lock_owned() {
+            turn
+        } else {
+            // A vacuum of a large database can take minutes: say why the
+            // backup is not copying yet.
+            tracing::info!("database snapshot waiting for database maintenance to finish");
+            Arc::clone(&self.maintenance).lock_owned().await
+        };
         let dest = dest.to_string_lossy().replace('\'', "''");
         sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
             .execute(&self.snapshotter)
             .await?;
         Ok(())
+    }
+
+    /// The database's maintenance turn when it is free, `None` while a
+    /// snapshot or another maintenance pass holds it. A vacuum and a truncating checkpoint
+    /// (`OptimizeDatabaseTask`) take it for their whole pass, and
+    /// [`Database::snapshot_to`] waits for it. A snapshot holds a read
+    /// transaction for the whole copy. A truncating checkpoint would wait
+    /// for that read through the busy timeout while holding the one writer,
+    /// and every write would queue behind it. A vacuum would grow the WAL
+    /// by the database's size, which no checkpoint can reclaim until the
+    /// snapshot ends.
+    #[must_use]
+    pub fn try_maintenance_turn(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.maintenance).try_lock_owned().ok()
     }
 
     /// Snapshots a file-backed database once, before a boot repair rewrites
@@ -2686,6 +2740,42 @@ mod tests {
         for r in readers {
             r.await.expect("reader task");
         }
+    }
+
+    /// `jellyfin_migration_applied` reads Jellyfin's own history: false with no
+    /// `__EFMigrationsHistory` (a Ferrofin-native database) or for an id the
+    /// table does not hold, true for one it does.
+    #[rstest::rstest]
+    #[case::no_history_table(None, false)]
+    #[case::another_id(Some("20260910120000_MigrateRatingLevels"), false)]
+    #[case::recorded(Some("20260915120000_MigrateRatingLevels"), true)]
+    #[tokio::test]
+    async fn jellyfin_migration_applied_reads_the_ef_history(
+        #[case] recorded: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        if let Some(id) = recorded {
+            sqlx::query(
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+            )
+            .execute(db.writer())
+            .await
+            .expect("history table");
+            sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.0.0')"#)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .expect("history row");
+        }
+        assert_eq!(
+            db.jellyfin_migration_applied("20260915120000_MigrateRatingLevels")
+                .await
+                .expect("history read"),
+            expected
+        );
     }
 
     #[tokio::test]

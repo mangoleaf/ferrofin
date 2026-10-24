@@ -989,7 +989,6 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
-            VERSION_RESUME_DATA_DIVERGENCE,
         ],
         refs: &[],
     },
@@ -998,10 +997,11 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Artists",
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetArtists",
-        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery, \
-               project_query_result) → ferrofin-core item_repository.rs get_artists \
-               (item_values_with_counts, item_counts_by_clean_name)",
-        date: "2026-10-19",
+        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery \
+               artists_query, resolve_by_name_ids, project_query_result) → ferrofin-core \
+               item_repository.rs get_artists (item_values_with_counts, \
+               item_counts_by_clean_name)",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1010,9 +1010,10 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Artists/AlbumArtists",
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetAlbumArtists",
-        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs → ferrofin-core \
-               item_repository.rs get_album_artists (item_values_with_counts)",
-        date: "2026-10-19",
+        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs (artists_query, \
+               resolve_by_name_ids) → ferrofin-core item_repository.rs get_album_artists \
+               (item_values_with_counts)",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1024,7 +1025,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
                get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1035,7 +1036,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetMusicGenres",
         ferrofin: "handlers/music_genres.rs get_music_genres → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1046,7 +1047,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetStudios",
         ferrofin: "handlers/studios.rs get_studios → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_studios (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1267,15 +1268,128 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/LiveTv/ListingProviders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "AddListingProvider",
+        ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
+               save_listing_provider (ListingsBackend::of, validate_xmltv, \
+               store_listing_provider) → schedules_direct/mod.rs SchedulesDirect::validate \
+               (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
+               SchedulesDirect.Validate)",
+        date: "2026-10-21",
+        divergences: &[
+            "An XMLTV provider without a Path is a 400; upstream's Validate dereferences \
+         the null path and answers a NullReferenceException 500. Jellyfin bug not ported.",
+            "Schedules Direct's /token body is serialized, so a username with a quote or a \
+         backslash stays valid JSON; upstream concatenates it into the body raw. Jellyfin \
+         bug not ported.",
+            "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
+         logs the password, its hash or the token. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/ListingProviders/Lineups",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLineups",
+        ferrofin: "handlers/live_tv.rs get_lineups → ferrofin-livetv manager.rs get_lineups \
+               (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
+               SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
+               XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
+        date: "2026-10-21",
+        divergences: &[
+            "A blank id is a 404 whatever the type; upstream calls \
+         GetProvider(type).GetLineups(null, …), which is a 404 for an unknown type but \
+         dereferences the null provider (500) for xmltv and SchedulesDirect. Jellyfin bug \
+         not ported.",
+            "The country and postal code are percent-encoded into Schedules Direct's \
+         headends query; upstream concatenates them raw, so a value holding `&` or `#` \
+         changes the query. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/{itemId}/ContentType",
+        upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
+        upstream_method: "UpdateItemContentType",
+        ferrofin: "handlers/item_update.rs update_item_content_type → ferrofin-core \
+               library_manager.rs containing_folder_path (BaseItem/Video/Playlist and the \
+               by-name ContainingFolderPath overrides) → ferrofin-model \
+               content_type_overrides.rs with_content_type_override",
+        date: "2026-10-21",
+        divergences: &[
+            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Configuration/{key}",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "GetNamedConfiguration",
+        ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
+               configuration_manager.rs get_named_configuration and get_encoding_options \
+               (read_named; BaseConfigurationManager.GetConfiguration and \
+               LoadConfiguration, the seven ConfigurationStore registrations) → \
+               encoding_response for encoding, the Live TV manager's tuner and provider rows \
+               for livetv",
+        date: "2026-10-23",
+        divergences: &[
+            "The stored document is reread on every call instead of cached from the first load \
+         until a save, so a hand-edited file applies without a restart, and a document that \
+         does not parse is logged at warn once per change of the file where upstream logs it \
+         at error once.",
+            "A stored document that exists but cannot be read is a 500, and so is a save of \
+         encoding (the one store with a validator) over it. LoadConfiguration catches every \
+         exception but IOException, so upstream serves the defaults for a permission-denied \
+         read (UnauthorizedAccessException, logged at error) and for a directory in the \
+         file's place (File.Exists is false), and only other I/O errors fail. Jellyfin quirk \
+         not ported: serving the defaults lets the next save replace a document nobody saw.",
+            "database always reads as Jellyfin-SQLite without locking, the document Jellyfin \
+         writes on its first start: Ferrofin has no other database provider and refuses to \
+         save another (owner decision 2026-10-23).",
+            "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
+         the database rather than in the document; when they cannot be read the lists are \
+         empty and the failure is logged.",
+            "For a caller who is not an administrator, livetv's TunerHosts[].Url and \
+         ListingProviders[].Password are blanked; upstream's plain [Authorize] serves those \
+         credentials to every signed-in user (owner decision 2026-10-23).",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/Counts",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetItemCounts",
+        ferrofin: "handlers/items.rs get_item_counts (resolve_user_opt, the \
+               RequestHelpers.GetUserId port) → ferrofin-core library_manager.rs \
+               get_item_counts → item_count_service.rs get_item_counts \
+               (scope_to_user_libraries, the LibraryManager.AddUserToQuery port; \
+               ItemCountService.GetItemCounts as QueryShape::TypeCounts and \
+               counts_from_type_map)",
+        date: "2026-10-24",
+        divergences: &[
+            "isFavorite with no user (an API key without userId, or a userId naming no \
+         account) is ignored and the totals are unfiltered (200); upstream's TranslateQuery \
+         dereferences the null User for the favourites subquery and fails (500). Jellyfin bug \
+         not ported.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
 /// `ArtistsController` + `BaseItemRepository.GetItemValues`.
 const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
-    "`studios` (pipe-delimited names) is not honored: v12 resolves each name through \
-     LibraryManager.GetStudio — which CREATES the studio row on a GET — into StudioIds. \
-     `studioIds` is honored. Un-defer path: a non-creating name → id lookup in the \
-     handler (find_named_item), never the creating one.",
+    "`studios` names resolve without writing: v12's LibraryManager.GetStudio CREATES a row \
+     for an unknown name on this GET; Ferrofin's lookup creates none and gives the name a \
+     no-match id (by_name::resolve_by_name_ids), the same empty answer.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
@@ -1331,7 +1445,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
-    VERSION_RESUME_DATA_DIVERGENCE,
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
      count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
@@ -1340,13 +1453,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",
 ];
-
-/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
-const VERSION_RESUME_DATA_DIVERGENCE: &str = "VersionResumeData.ApplyTo is not ported \
-     (DtoService via UserDataManager.GetResumeUserDataBatch): a returned video's UserData \
-     is its own row, where v12 takes Played, LastPlayedDate and the resume position from \
-     the most recently played version of its group. The write-side propagate_played_state \
-     covers finishing a version through playback. Fix path: gl-47.";
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

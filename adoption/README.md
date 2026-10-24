@@ -205,6 +205,24 @@ metadata path (the duplicate-path repair then stood in for the merge), people co
 Ferrofin re-keys them, and a table-digest baseline that read a legitimate merge as a lost row. The
 eleven clean rows and `synthetic.py run` were not re-run: nothing they use changed.
 
+### 2026-10-21 the report (gl-633)
+
+`report.html` written by both entry points, on synthetic fixtures with Ferrofin image
+`ferrofin:adopt-gl630` (built from `release/v1.4.0`, migration 0045; the release run needs its own
+candidate image). `run.sh` ran against existing synthetic fixtures (it does not compare them to the
+recipe): `--only 12.2.0` adopted the five 12.2.0 rows (`from-10`, `from-12`, `from-121`, `fresh`
+and the `messy` copy with its three original shapes), all **PASS**, 78 checks recorded, the page
+written in 99 s with the messy shapes table and every stage's checks; `--only
+jellyfin-10.11.11-scale` **PASSED** and its page carries the same measurements as the PASS line
+(migration 4.7 s, peak memory 950.1 MiB, anonymous 234.1 MiB, disk high-water 1.4 GiB, WAL 161.8
+MiB, `foreign_key_check` 0.3 s). The pages open from disk and the viewer's Adoption tab lists them
+(`bench/report.py --serve --adoption-dir DIR/work`). `preservation.py` is part of the synthetic
+recipe, so the report change needs the fixtures built again for `synthetic.py run`: the five
+fixtures it needs (`jellyfin-10.11.8`, `12.0`, `12.1-from-12`, `12.2-from-121`, `12.2-from-10`) were
+built into a new directory and `synthetic.py run --only jellyfin-12.2-from-10` **PASSED** all four
+stages, its page listing 35 checks under the same stage names as `run.sh`'s. The other paths of the
+matrix, and the messy shapes added to the messy fixtures later, were not run again for this change.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -320,6 +338,51 @@ about two minutes for the boot probes, plus a library scan of the small syntheti
 library. Run it before
 any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 `database.rs`, or the boot repairs in `adoption_repairs.rs`, and before a release.
+
+## The report
+
+`adoption/run.sh` and `python3 adoption/synthetic.py run` each write a self-contained
+`report.html` in their work directory (`DIR/work/run/` for `run.sh`, `DIR/work/` for the
+preservation matrix; `ADOPTION_WORK_DIR` moves the first). It opens from disk, has no external
+asset, and shows:
+
+- the run: image, Jellyfin oracle, duration, how many fixtures passed, failed or were skipped;
+- per fixture, per stage (**after adoption**, **after restart**, **after scan**), **every check's
+  verdict** and, for a failed one, why: boot log, answers against Jellyfin, `integrity_check` and
+  `foreign_key_check`, second-boot repairs, metadata, watch history, table digests (and, for the
+  matrix, user accounts, seeded states and artwork);
+- the **table-digest differences** of a stage that lost or changed a row;
+- for a messy fixture, **each shape's end state next to the one it must reach** and where that
+  expectation comes from (Jellyfin 12.2's record, or the divergence written for it);
+- for the scale fixture, the **measurements** (migration time, peak and anonymous memory, disk
+  high-water, WAL peak, the `foreign_key_check` time) and which of them could not be taken.
+
+Failed fixtures are open and passing ones collapsed. The checks are recorded one JSON line each in
+`work/results.jsonl` as the run goes (`adoption/adoption_report.py` is the recorder and the renderer), and the
+page is built from that when the run ends, **however it ends**: a run that is terminated, or stops
+on an error, still leaves its page, with the fixture it was on listed as unfinished (`INCOMPLETE`,
+which fails the run) and, for the matrix, the error that stopped it as a failed check. A run
+refused before it starts (a missing fixture directory, no docker) leaves nothing, and a matrix
+refused before its first fixture starts (no oracle, a recipe change, a previous run's copy still in
+`work/`) leaves the last report alone. The matrix has no messy or scale sections: those fixtures
+are `run.sh`'s. A page embeds the first 500 table-digest differences of a stage and counts the rest
+(the matrix also caps the reasons of a check and of a row at 500 each); `run.sh` keeps every difference in
+`<fixture>.tables-*.log` beside the page, and `synthetic.py run` prints them in the error that ends
+the run. Recording never changes a run's verdict or its exit status: an I/O or rendering problem
+leaves the run going without a page, and `run.sh` says on stderr that none was written (the
+recorder's own messages go to `/dev/null` there, so they never change what a run prints). When
+stdout is a terminal, `run.sh` also prints the page's path at the end: the one line of stdout
+recording adds, and only on a terminal.
+
+The shared viewer lists it in its Adoption tab and compares two runs side by side:
+
+```bash
+python3 bench/report.py --serve --adoption-dir DIR/work      # `run`, and the matrix as `work`
+```
+
+The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
+`adoption-matrix-report` artifacts on every run, pass or fail (the whole work directory is still
+uploaded as `adoption-work` on a failure).
 
 ## Messy rows
 
@@ -566,7 +629,13 @@ written divergence names a seeded shape, a derived lineage and a whole state.
 density, determinism, an unknown foreign key refused, a failed build cleaned up), the survival
 check, the disk requirement, the sampler's high-water marks and the cgroup lookup with
 substituted files, the boot-log timing and the record that names what it could not measure.
-CI runs the Bats tests with `bats adoption/tests`
+`tests/test_adoption_report.py` checks the recorder (a new run forgets the last, bad verdicts refused, a
+line cut off by a killed run ignored), the verdict rules (a row that passed with a failed check is
+failed; a fixture that began and never finished is `INCOMPLETE`; a run that ran nothing says so),
+every section of the page, that run text cannot inject markup, that the page is self-contained,
+the command line, and that the viewer's Adoption tab lists it. `adoption.bats` runs `run.sh` with a
+fake docker to see the checks recorded in the page of a failing row, of a skipped one and of a
+terminated run. CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.
 

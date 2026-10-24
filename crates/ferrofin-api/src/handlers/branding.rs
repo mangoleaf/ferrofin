@@ -172,6 +172,7 @@ async fn get_splashscreen(
         uuid::Uuid::nil(),
         &image,
         0,
+        false,
         &ImageQuery::tagged(query.tag, query.format),
         request,
     )
@@ -227,6 +228,7 @@ async fn upload_splashscreen(
     let mut branding = state.config.get_branding().await?;
     branding.splashscreen_location = Some(file_path.to_string_lossy().into_owned());
     state.config.update_branding(&branding).await?;
+    crate::handlers::config::run_committed_checks(&state, "branding")?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -257,6 +259,7 @@ async fn delete_splashscreen(
         })?;
         branding.splashscreen_location = None;
         state.config.update_branding(&branding).await?;
+        crate::handlers::config::run_committed_checks(&state, "branding")?;
     }
     Ok(StatusCode::NO_CONTENT)
 }

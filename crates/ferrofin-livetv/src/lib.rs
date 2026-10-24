@@ -1,4 +1,5 @@
-//! Live TV for Ferrofin — M3U tuner + XMLTV guide.
+//! Live TV for Ferrofin — M3U and HDHomeRun tuners, XMLTV and Schedules Direct
+//! guides.
 //!
 //! [`FerrofinLiveTvManager`] stores tuner-host/listing-provider configuration and
 //! caches the channel lineup and EPG in SQLite. A refresh fetches each source
@@ -17,8 +18,10 @@
 //! guide refresh's per-tuner dispatch and the media-source/stream paths all
 //! read from one collection.
 //!
-//! [`SchedulesDirect`] serves the account-less Schedules Direct country list
-//! behind Jellyfin's memory + on-disk cache.
+//! A listings provider is XMLTV (a guide document, [`xmltv`]) or
+//! [`SchedulesDirect`], the port of Jellyfin's SD JSON API client: account
+//! login and lineups, the station map, schedules and program details, and the
+//! country list behind Jellyfin's memory + on-disk cache.
 
 pub mod dvr;
 pub mod dvr_repository;
@@ -30,6 +33,7 @@ pub mod m3u;
 pub mod manager;
 pub mod mapping;
 pub mod projection;
+pub mod recording_metadata;
 pub mod schedules_direct;
 pub mod stream;
 pub mod tuner_host;

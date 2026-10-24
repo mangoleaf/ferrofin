@@ -50,6 +50,7 @@ import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+import endpoints
 import ramp
 import soak
 
@@ -665,7 +666,7 @@ CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
               "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
               "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
-              "testdata_counts", "user_isolation", "actors", "background_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
+              "testdata_counts", "user_isolation", "actors", "background_policy", "scan_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
               "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
               "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s",
               "coldstart_attempt_timeout_ms")
@@ -1118,6 +1119,75 @@ def soak_table(m, as_html=False):
     return "\n".join(out)
 
 
+def endpoint_ratio(mine, theirs):
+    """`X.Y× faster` of a p50 against the oracle's, from the printed numbers (as `speedup`)."""
+    if mine is None or theirs is None:
+        return ""
+    mine, theirs = float(sig3(mine)), float(sig3(theirs))
+    if not mine or not theirs:
+        return ""
+    ratio = theirs / mine
+    if f"{ratio:.1f}" == "1.0":
+        return "about the same"
+    return f"{ratio:.1f}× faster" if ratio > 1 else f"{1 / ratio:.1f}× slower"
+
+
+def endpoints_table(m, as_html=False):
+    """The per-endpoint latency pass of the runs that have one (`run.sh --only endpoints`): per
+    endpoint of the parity catalogue, each server's p50 / p95 / p99 (the median across runs),
+    the gated ones first. An endpoint a server answered with another status than the oracle, or
+    did not measure, says so instead of a ratio."""
+    docs = {k: [d for run in m["runs"] if (d := load(os.path.join(run, k, "endpoints.json")))] for k, _ in m["servers"]}
+    if not any(docs.values()):
+        return ""
+    order = list(dict.fromkeys(e["id"] for ds in docs.values() for d in ds for e in d["endpoints"]))
+    gates = {}
+    for e in (e for ds in docs.values() for d in ds for e in d["endpoints"]):
+        gates[e["id"]] = gates.get(e["id"], False) or bool(e.get("gates"))
+    per = {k: [endpoints.by_id(d) for d in ds] for k, ds in docs.items()}
+
+    def cell(k, eid):
+        entries = [r[eid] for r in per[k] if eid in r]
+        measured = [e for e in entries if e.get("p50") is not None]
+        if not measured:
+            return None, (entries[0].get("skipped") if entries else "not run") or "not measured"
+        vals = {q: statistics.median(e[f"p{q}"] for e in measured) for q in endpoints.PERCENTILES}
+        status = sorted({s for e in measured for s in e.get("statuses", {})})
+        return vals, status
+
+    head = ["Endpoint", "Gates"] + [f"{label} p50 / p95 / p99 ms (status)" for _, label in m["servers"]] + [f"vs {ORACLE_LABEL}"]
+    rows, gated_n = [], 0
+    for gated in (True, False):
+        for eid in order:
+            if gates[eid] != gated:
+                continue
+            gated_n += gated
+            row, vals = [eid, "yes" if gated else "reported"], {}
+            for k, _ in m["servers"]:
+                v, status = cell(k, eid)
+                vals[k] = (v, status)
+                row.append(f"skipped: {status}" if v is None else
+                           " / ".join(sig3(v[q]) for q in endpoints.PERCENTILES) + f" ({', '.join(status)})")
+            mine, theirs = vals.get("ferrofin", (None, None)), vals.get(ORACLE, (None, None))
+            if mine[0] and theirs[0] and mine[1] != theirs[1]:
+                row.append(f"not comparable: Ferrofin answered {', '.join(mine[1])}, {ORACLE_LABEL} {', '.join(theirs[1])}")
+            else:
+                row.append(endpoint_ratio(mine[0] and mine[0][50], theirs[0] and theirs[0][50]) or "—")
+            rows.append(row)
+    params = next(d for ds in docs.values() for d in ds)["params"]
+    skipped = sum(1 for eid in order if all(cell(k, eid)[0] is None for k, _ in m["servers"]))
+    title = f"Per-endpoint latency — {len(order)} GETs of the parity catalogue, {gated_n} gated, {skipped} not measured"
+    why = (f"Each endpoint alone after one shared warm-up: {params['count']} sequential requests or {params['max_s']:g} s, "
+           f"whichever came first, one keep-alive connection; ms to the whole body. Only {', '.join(params['gated_files'])} gate "
+           "(`gate.py endpoints`); the rest are reported. Sets: " + ", ".join(params["sets"]) + ".")
+    if as_html:
+        body = "".join("<tr>" + "".join(f"<td class='num'>{html.escape(str(v))}</td>" for v in row) + "</tr>" for row in rows)
+        return (f"<h2>{html.escape(title)}</h2><p class='lede'>{html.escape(why)}</p><details><summary>Show every endpoint</summary>"
+                "<div class='scroll'><table><thead><tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in head)
+                + f"</tr></thead><tbody>{body}</tbody></table></div></details>")
+    return diagnostic_table(title, head, rows) + f"\n{why}\n"
+
+
 # ── markdown (the README tables) ────────────────────────────────────────────
 def render_md(m):
     oracle_label = m["oracle_label"]
@@ -1165,6 +1235,8 @@ def render_md(m):
     if table := ramp_table(m):
         p(table)
     if table := soak_table(m):
+        p(table)
+    if table := endpoints_table(m):
         p(table)
     p(phase_table(m))
     p("### Time to first screen\n")
@@ -1776,6 +1848,8 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
         parts.append(table)
     if table := soak_table(m, True):
         parts.append(table)
+    if table := endpoints_table(m, True):
+        parts.append(table)
     parts.append(phase_table(m, True))
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen", gate))
     mem_note = "" if comparable_levels(m, base) else (
@@ -1810,11 +1884,18 @@ PICKER_CSS = """
 def list_runs(runs_dir):
     """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date.
     A `gate.py` session (a directory holding `gate.json`) is searched one level down, and the
-    runs found there are named `<session>/<run>`; a scan session's runs have no run.json."""
+    runs found there are named `<session>/<run>`; a scan session's runs have no run.json.
+    A session `gate.py render` wrote a report.html for is listed too, as `<session>`: the
+    gate's own page, which is the only one a scan session has."""
     out = []
     for session in os.listdir(runs_dir):
         top = os.path.join(runs_dir, session)
         nested = os.path.isfile(os.path.join(top, "gate.json"))
+        if nested and os.path.isfile(os.path.join(top, "report.html")):
+            plan = load(os.path.join(top, "gate.json"))
+            plan = plan if isinstance(plan, dict) else {}
+            date = str(plan.get("date", ""))
+            out.append((date, session, f"{session}  ·  {date[:16].replace('T', ' ')}  ·  gate {plan.get('mode', '?')}"))
         for name in ([f"{session}/{sub}" for sub in os.listdir(top)] if nested else [session]):
             d = os.path.join(runs_dir, name)
             meta = load(os.path.join(d, "run.json"))

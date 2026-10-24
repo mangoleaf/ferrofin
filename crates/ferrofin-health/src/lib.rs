@@ -36,7 +36,7 @@ mod router;
 
 pub use checker::{FnChecker, HealthChecker};
 pub use response::{LiveResponse, ReadyResponse};
-pub use router::health_router;
+pub use router::{STARTUP_CHECK, health_router, startup_router};
 
 /// The build identity baked in at compile time by this crate's `build.rs`:
 /// `FERROFIN_GIT_DESCRIBE` when supplied (Docker builds without `.git`), else

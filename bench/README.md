@@ -37,7 +37,7 @@ The benchmark reference is the Jellyfin release named by the C# source-parity pi
 (`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
 in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
 Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab|scan|ramp|soak`) refuses to start and `run.sh` warns and
+fails, a release-gate session (`gate.py aa|ab|scan|ramp|soak|endpoints`) refuses to start and `run.sh` warns and
 continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
 and digest. A run that boots Jellyfin also stops unless the pinned image reports the
 `UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
@@ -135,11 +135,16 @@ tmdb/imdb ids), locally drawn posters/fanart/logos, and five ffmpeg-generated te
 clips cloned under every name (real streams, no disk cost). It includes 40 multi-version
 movies, 50 HDR10 4K files, 300 multi-track files and one 3-minute 8 Mbps movie for the
 streaming numbers. **Jellyfin 10.11.8 itself scans it** with every remote fetcher off and
-is seeded over its own API (two users; 30 % of movies and 60 % of forty series played,
-5 % favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
+is seeded over its own API (two users; 30 % of movies and 60 % of forty series played, 5 %
+favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
 config directory is what Ferrofin boots a fresh copy of. Jellyfin boots a copy of the
-separately prepared config described below. Ferrofin adoption stays inside the run;
-media is mounted read-only for every server.
+separately prepared config described below. Ferrofin adoption stays inside the run: after
+its isolation restart, each run asks Ferrofin for one full library scan, waits for it to
+complete (`scan.json`) and restarts the server, outside every measured phase. That is the
+equivalent of the scan the Jellyfin preparation gave its config, so album-artist people
+and library view images exist on both sides, and no scan heap is left in the memory
+numbers. `scan_policy: 1` in `run.json` keeps these runs from pooling with earlier ones.
+Media is mounted read-only for every server.
 
 ## Shared picks and bounded validation
 
@@ -218,7 +223,8 @@ it is not all-endpoint coverage or a deep-parity score.
 - Before each drain, the runner verifies that triggers remain empty, library monitoring/
   fetchers remain off, and plugin states still satisfy the policy. Tasks drain to idle
   plus a 30 s settle before measurements. Fixture creation and the explicit Jellyfin 12
-  preparation scan remain enabled outside benchmark runs.
+  preparation scan remain enabled outside benchmark runs, and Ferrofin's one explicit
+  library scan runs during provisioning, followed by a restart, before every measured phase.
 - Ferrofin runs as **core Ferrofin**, with every plugin/compiled-in extension disabled;
   WASM files in the disposable config are rejected. Installed Jellyfin plugins are also
   disabled. Jellyfin's non-uninstallable bundled providers (AudioDB, MusicBrainz, OMDb,
@@ -269,7 +275,8 @@ These settings are recorded and checked before aggregation. Client process group
 TERM, then KILL if needed; container cleanup uses the ID created by this run. k6 retains
 its bounded default HTTP request timeout, with the outer client limit above. A drain can
 finish its last bounded HTTP call before reporting timeout. Fixture task drain/export
-uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes occur.
+uses `PREPARE_TIMEOUT_S` (1800 by default), and so does Ferrofin's in-run library
+scan. No global cleanup or host changes occur.
 
 The sampler saves `cpu_usec` beside its interval utilization fields. Sample timestamps
 retain sub-millisecond precision so catch-up observations do not collide through rounding.
@@ -367,6 +374,68 @@ after the first two soaks. Memory is compared only between runs in one window: t
 huge pages shift anon memory by about 50 MiB between time windows, which is why the pair runs
 back to back.
 
+## Per-endpoint latency
+
+The screens time 28 endpoints, all inside six jellyfin-web screens. `run.sh --only endpoints`
+(opt-in: no default run includes it; either server, or both) times **every GET of the parity
+request catalogue** on its own ([`parity/README.md`](../parity/README.md#requests)): the sweep of
+the vendored contract in `parity/requests/sweep/`, which holds the `bench/screens.js` request
+shapes (`screens.jsonl`), and the edge cases in `parity/requests/edge/`. `endpoints.py` reads them
+with the parity harness's own parser, so the two catalogues cannot drift apart. HEAD requests,
+writes and a write's read-backs are left out. Templates are filled from the run's `ids.json`, and
+the `{found.*}` names (`parity/discover.toml`) are read from the server under test; a name it does
+not give skips only the endpoints that use it, with the reason. `python3 bench/endpoints.py plan`
+prints the schedule without a server.
+
+After discovery comes **one shared warm-up**, every endpoint once in catalogue order, discarded.
+Then each endpoint runs alone: `ENDPOINT_COUNT` sequential requests (200) or `ENDPOINT_MAX_S`
+seconds (10), whichever comes first. The request that crosses the time limit still counts, and
+nothing is ever topped up (the scrapped v2 suite's per-endpoint top-ups took longer than its
+measurements). The pass uses one keep-alive connection, as the browse role of `screens.js` (its
+token and device). A latency is the time from sending the request to having read the whole body;
+each endpoint records its p50, p95 and p99, every status it was answered with, how many
+answers were not the expected one, and how often the server had closed the keep-alive connection.
+`HTTP_TIMEOUT_S` bounds each socket operation of a request (not the whole request), and a request
+that runs past it counts as an answer with no status. The phase drains, checks isolation before and after like the
+other phases, and writes `endpoints.json`; the run's `report.html` gets a "Per-endpoint latency"
+section with each server's p50 / p95 / p99 and `X.Y× faster` against Jellyfin. An endpoint the
+two servers answered with different statuses says so instead. `ENDPOINT_SETS` (comma-separated
+paths, relative to the repository) narrows the request sets: for example
+`parity/requests/sweep/screens.jsonl,parity/requests/edge` is the gated set alone.
+
+Not measured, each with its reason in `SKIP` (`endpoints.py`; `plan` and the report list them):
+- media streams and downloads (`/Videos/{id}/stream`, `/Audio/{id}/universal`, `/Items/{id}/Download`,
+  …): they send the file, so 200 reads time the disk, and starting playback is the
+  time-to-first-screen phase's number;
+- the HLS routes (playlists and segments): each prepares or runs an ffmpeg transcode that outlives
+  the request and would load the cores the next endpoints are timed on;
+- the remote lookups (remote images, subtitles and lyrics searches): their time is the internet
+  provider's, and 200 requests in a row would hammer it.
+
+The release gate runs it interleaved, Ferrofin only, three pairs:
+
+```bash
+python3 bench/gate.py endpoints ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+```
+
+Each endpoint is the cell `endpoints/<id>`, judged on each run's p50 by the `[endpoints]` row of
+[`gate.toml`](gate.toml) (more than 15 % **and** more than 0.5 ms, D2) and the D4 rule: the
+candidate slower in at least 2 of the 3 pairs. Only the `bench/screens.js` shapes and the edge-case
+GETs gate (decision DE); every other endpoint is reported, and a regression there is filed as an
+issue rather than blocking. An endpoint whose answers differ between runs (another status, a status
+that changed within a run, or a request filled differently) cannot be judged, and a gated one then
+blocks like a regression. The session's `report.html` lists every endpoint, the gated ones first,
+with both sides' p50, p95 and p99 (each the median across that side's runs).
+
+**Wall time.** One run of the whole catalogue, measured on the shared host (2026-10-24): Ferrofin
+took 77 minutes (50 s warm-up, 4,551 s measuring) and Jellyfin 115 minutes (75 s, 6,840 s). The
+1,836 parameter combinations of `combos.jsonl` are nearly all of it (Ferrofin 4,302 s, Jellyfin
+6,377 s): at 200 requests an endpoint, a 20 ms answer already costs 4 s, and 309 Jellyfin and 77
+Ferrofin endpoints ran into the 10 s limit. The other 241 endpoints took about 4 minutes on Ferrofin
+and 8 on Jellyfin. A three-pair gate session of the whole catalogue therefore takes about eight
+hours; `ENDPOINT_SETS` without `parity/requests/sweep/combos.jsonl` brings it to about an hour,
+nearly half of it the library scan every Ferrofin boot does.
+
 ## Running it
 
 The reporter has a fast correctness check, also run in CI:
@@ -375,6 +444,7 @@ The reporter has a fast correctness check, also run in CI:
 python3 -m unittest discover -s bench -p test_report.py
 python3 -m unittest discover -s bench -p test_ramp.py
 python3 -m unittest discover -s bench -p test_soak.py
+python3 -m unittest discover -s bench -p test_endpoints.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.
@@ -434,7 +504,7 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab` or `ramp` session (a directory with a `gate.json`), listed as `<session>/<run>`; a `gate.py scan` session's runs hold `scan.json` and are not listed |
+| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -449,9 +519,11 @@ runs of different harnesses are never compared. If a benchmark run directory hol
 `improved`, and `reason` saying why a cell was not comparable), its
 `report.html` gets an "A/B gate" section after the headline numbers, listing those cells,
 the blocking ones first; a malformed file is an error, not an omitted section. When several runs are rendered together the
-file of the first run that has one is used. `gate.py ab` (and `gate.py render`) writes the
-session's gated cells into every candidate run and rewrites that run's `report.html`, since a
-`report.html` written before the file existed does not show it.
+file of the first run that has one is used. `gate.py ab`, `ramp`, `soak` and `endpoints` (and `gate.py
+render` of such a session) write the session's gated cells into every candidate run and
+rewrite that run's `report.html`, since a `report.html` written before the file existed does
+not show it. A soak cell's rule is a slope limit rather than a percentage, so its Change
+column shows `—`.
 
 On the Benchmark tab the form below the list is the earlier median compare: tick the runs to render (several =
 median + ranges) and optionally one or more baseline runs. Cells stay numeric in both renderers: the
@@ -471,7 +543,7 @@ stdlib only, no JavaScript.
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
 `--only loaded` for a before/after on two builds, or a comma list such as
 `--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
-The default still selects all phases (except the opt-in `ramp`) and both servers. A shared host must be quiet: stop
+The default still selects all phases (except the opt-in `ramp`, `soak` and `endpoints`) and both servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.
 
 For repeated comparisons, rotate order explicitly, for example

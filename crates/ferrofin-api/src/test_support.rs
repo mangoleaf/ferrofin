@@ -576,9 +576,6 @@ macro_rules! fake_library_manager {
             ) -> Result<Vec<String>, ServiceError> {
                 unimplemented!("fake")
             }
-            async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-                unimplemented!("fake")
-            }
         }
     };
 }
@@ -587,6 +584,9 @@ macro_rules! fake_library_manager {
 pub struct FakeLibrary;
 
 fake_library_manager!(FakeLibrary {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -609,10 +609,48 @@ fake_library_manager!(FakeLibrary {
 pub struct ScanningLibrary;
 
 fake_library_manager!(ScanningLibrary {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
     fn is_scan_running(&self) -> bool {
         true
     }
 });
+
+/// [`FakeLibrary`] that counts the library scans queued through it, scoped
+/// or not, for the routes whose requested refresh is under test.
+#[derive(Default)]
+pub struct CountingScans(pub std::sync::atomic::AtomicUsize);
+
+fake_library_manager!(CountingScans {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+});
+
+/// An ffmpeg build with the common audio encoders (`SupportsEncoder`), for
+/// the routes whose negotiation transcodes audio; a state built by
+/// [`AppState::new`] has none.
+pub struct CommonEncoders;
+
+impl ferrofin_traits::media_encoding::EncoderSupport for CommonEncoders {
+    fn supports_encoder(&self, encoder: &str) -> bool {
+        [
+            "aac",
+            "ac3",
+            "eac3",
+            "flac",
+            "alac",
+            "libopus",
+            "libmp3lame",
+            "libvorbis",
+            "pcm_s16le",
+        ]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(encoder))
+    }
+}
 
 /// A plain, non-administrator [`UserEntity`] for tests that need the
 /// authenticated caller to *be* somebody — every permission extractor resolves
@@ -1212,6 +1250,11 @@ impl SessionManager for FakeSessions {
     async fn report_session_ended(&self, _session_id: &str) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    /// A socket's last close ends quietly here, so a socket test can close its
+    /// last socket. A logout (`report_session_ended`) stays unimplemented.
+    async fn close_if_needed(&self, _session_id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn send_general_command(
         &self,
         _controlling_session_id: &str,
@@ -1257,8 +1300,8 @@ impl SessionManager for FakeSessions {
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        // The played/favorite/rating/user-data handlers push `UserDataChanged`
-        // here best-effort; delivery is covered by ferrofin-core's tests.
+        // The user-data manager's batched `UserDataChanged` goes out here;
+        // delivery is covered by ferrofin-core's tests.
         Ok(())
     }
     async fn send_message_to_user_device_sessions(
@@ -2743,7 +2786,8 @@ pub fn setup_complete_state(auth: Arc<dyn AuthService>) -> AppState {
 }
 
 /// [`fake_state`] with the given auth service and configuration manager.
-fn fake_state_with(
+#[must_use]
+pub fn fake_state_with(
     auth: Arc<dyn AuthService>,
     config: Arc<dyn ServerConfigurationManager>,
 ) -> AppState {

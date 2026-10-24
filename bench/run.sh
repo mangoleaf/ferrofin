@@ -6,7 +6,7 @@
 # is reported and the next one runs; report.py renders whatever exists.
 #
 #   run.sh [--testdata DIR] [--servers jellyfin,ferrofin]
-#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs,ramp,soak] [--rate N] [--out DIR]
+#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs,ramp,soak,endpoints] [--rate N] [--out DIR]
 #
 # `ramp` is opt-in (never part of a default run) and Ferrofin only: it steps the loaded mix
 # upward until a step fails and reports the last passing rate as the throughput ceiling
@@ -15,6 +15,10 @@
 # `soak` is opt-in (never part of a default run) and Ferrofin only: it holds the loaded mix
 # for an hour and reports the slope of anon memory (bench/soak.py). `gate.py soak PREVIOUS
 # CANDIDATE` runs it A/B.
+#
+# `endpoints` is opt-in (never part of a default run), on either server: every GET of the parity
+# request catalogue alone, one endpoint at a time, p50/p95/p99 each (bench/endpoints.py). `gate.py
+# endpoints PREVIOUS CANDIDATE` runs it A/B.
 #
 # Requires: docker, k6, python3, jq; the pinned Jellyfin image
 # and ferrofin:bench (docker build -t ferrofin:bench .).
@@ -81,6 +85,13 @@ RAMP_BOUND_MS=${RAMP_BOUND_MS:-100}
 SOAK_S=${SOAK_S:-3600}
 RATE_SOAK=${RATE_SOAK:-5}
 SOAK_SKIP_S=${SOAK_SKIP_S:-600}
+#: The per-endpoint pass (`--only endpoints`, B13 and DE of the "Benchmark coverage" milestone):
+#: after one shared warm-up, each endpoint gets ENDPOINT_COUNT sequential requests or
+#: ENDPOINT_MAX_S seconds, whichever comes first, and no top-up. ENDPOINT_SETS (comma-separated,
+#: relative to the repository) are the parity request sets it reads.
+ENDPOINT_COUNT=${ENDPOINT_COUNT:-200}
+ENDPOINT_MAX_S=${ENDPOINT_MAX_S:-10}
+ENDPOINT_SETS=${ENDPOINT_SETS:-parity/requests/sweep,parity/requests/edge}
 export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
@@ -95,7 +106,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
-for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S COLDSTART_ATTEMPT_TIMEOUT_MS MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS SOAK_S RATE_SOAK SOAK_SKIP_S; do
+for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S COLDSTART_ATTEMPT_TIMEOUT_MS MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS SOAK_S RATE_SOAK SOAK_SKIP_S ENDPOINT_COUNT ENDPOINT_MAX_S; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
 # Reject bad selections before any fixture access or Docker command.
@@ -105,7 +116,7 @@ for selection in "$ONLY" "$SERVERS"; do
 done
 [ -n "$SERVERS" ] || { echo "--servers cannot be empty" >&2; exit 2; }
 for phase in ${ONLY//,/ }; do
-  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs|ramp|soak) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
+  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs|ramp|soak|endpoints) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
 done
 for server in ${SERVERS//,/ }; do
   case "$server" in jellyfin|ferrofin) ;; *) echo "unknown server $server" >&2; exit 2;; esac
@@ -202,7 +213,7 @@ jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(base
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" --argjson oracle "$ORACLE" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
-  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, coldstart_attempt_timeout_ms:$coldstart_attempt, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, scan_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, coldstart_attempt_timeout_ms:$coldstart_attempt, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, oracle:$oracle, date: (now|todate)}' > "$OUT/run.json"
 
@@ -466,6 +477,17 @@ phase_ramp() {
   esac
 }
 
+phase_endpoints() {
+  local sets=() entry bound
+  for entry in ${ENDPOINT_SETS//,/ }; do sets+=(--set "$entry"); done
+  bound=$(python3 bench/endpoints.py plan --bound --count "$ENDPOINT_COUNT" --max-s "$ENDPOINT_MAX_S" --timeout "$HTTP_TIMEOUT_S" "${sets[@]}") ||
+    { FAIL_REASON="endpoints.py cannot read the request sets"; return 1; }
+  drain || return 1
+  # The client must outlive the slowest possible pass (every request at its timeout), not PHASE_TIMEOUT_S.
+  PHASE_TIMEOUT_S=$((bound + PHASE_TIMEOUT_S)) client taskset -c "$CLIENT_CPUS" python3 bench/endpoints.py run "$URL" "$IDS" "$D" \
+    --count "$ENDPOINT_COUNT" --max-s "$ENDPOINT_MAX_S" --timeout "$HTTP_TIMEOUT_S" "${sets[@]}"
+}
+
 phase_ttfs() {
   drain || return 1
   client taskset -c "$CLIENT_CPUS" python3 bench/ttfs.py "$URL" "$IDS" "$D/ttfs.json" "$TTFS_REPS" || return 1
@@ -483,6 +505,7 @@ run_server() {
   state startup pending; state startup-drain pending; state cleanup pending; state isolation-setup pending
   for selected in counts shape coldstart ttfs; do ! want "$selected" || state "$selected" pending; done
   ! explicit ramp || state ramp pending
+  ! explicit endpoints || state endpoints pending
   for selected in unloaded loaded stress soak; do
     if { [ "$selected" != soak ] && want "$selected"; } || { [ "$selected" = soak ] && explicit soak; }; then
       state "$selected" pending; state "warmup-$selected" pending; state "drain-$selected" pending
@@ -535,6 +558,17 @@ PY_ISOLATION
   docker_cmd start "$CONTAINER" >/dev/null
   wait_ready || die "$NAME: isolation restart failed"
   verify_isolation || die "$NAME: $FAIL_REASON"
+  # Jellyfin boots the config its preparation scanned under 12.x; give Ferrofin the
+  # equivalent one full scan of its adopted copy, then a fresh process, as Jellyfin's scan
+  # ran in its preparation: no scan heap is left in the memory numbers.
+  if [ "$1" = ferrofin ]; then
+    PHASE_TIMEOUT_S=${PREPARE_TIMEOUT_S:-1800} client python3 bench/testdata/seed.py --scan "$URL" "$TESTDATA/ids.json" "$D/scan.json" \
+      || die "$NAME: library scan failed: ${FAIL_REASON:-see the traceback above, or $D/server.log}"
+    docker_cmd stop --time "$CLEANUP_TIMEOUT_S" "$CONTAINER" >/dev/null
+    docker_cmd start "$CONTAINER" >/dev/null
+    wait_ready || die "$NAME: post-scan restart failed"
+    verify_isolation || die "$NAME: $FAIL_REASON"
+  fi
   state startup completed; CURRENT_PHASE=""
   phase startup-drain drain || exit 1
   docker_cmd inspect -f '{{.Config.Image}} {{.Image}}' "$CONTAINER" > "$D/image.txt"
@@ -545,6 +579,7 @@ PY_ISOLATION
   { ! want unloaded && ! want loaded && ! want stress && ! explicit soak; } || phase_load
   ! want ttfs || isolated_phase ttfs phase_ttfs || true
   ! explicit ramp || isolated_phase ramp phase_ramp || true
+  ! explicit endpoints || isolated_phase endpoints phase_endpoints || true
   exit "$FAILED"
 }
 

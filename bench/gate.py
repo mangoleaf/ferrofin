@@ -15,6 +15,11 @@
     gate.py scan PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the same interleaved pairs, each run `scan.py` (library-scan and adoption-migration
         wall time and peak anon memory, B7/B8) instead of run.sh; every cell gates (D6)
+    gate.py endpoints PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
+        the per-endpoint latency pass (`run.sh --only endpoints`, Ferrofin only here) interleaved the
+        same way: every GET of the parity catalogue, p50/p95/p99 per run, regressed / within noise /
+        improved per endpoint on the p50 by the `[endpoints]` row; only the `bench/screens.js` shapes
+        and the parity edge-case GETs gate (endpoints.py has the catalogue)
     gate.py soak PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the one-hour memory soak (`run.sh --only soak`, Ferrofin only) back to back, default one
         pair: the anon-memory slope in MiB/h per run, regressed when the candidate's exceeds the
@@ -53,6 +58,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+import endpoints
 import oracle
 import ramp
 import report
@@ -60,7 +66,8 @@ import soak
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 TAG = "ferrofin:bench"
-PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": "ramp", "soak": "soak"}
+PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": "ramp", "soak": "soak",
+          "endpoints": "endpoints"}
 #: The levels whose cells can block a release; `stress` is reported, never gated (B5).
 GATED_LEVELS = ("unloaded", "loaded")
 #: An endpoint cell whose medians are both under this many ms is reported, never gated (B5).
@@ -209,6 +216,39 @@ def verdicts(model_a, model_b, gate):
     return out
 
 
+def endpoint_verdicts(docs_a, docs_b, gate):
+    """Per endpoint of either side's `endpoints.json`: the D4 verdict over each run's p50 in
+    schedule order (`docs_a[i]` ran just before `docs_b[i]`), judged by the endpoint's own band
+    (`endpoints/<id>`) or the `[endpoints]` row (D2), with the medians of p50, p95 and p99 per
+    side. Only an endpoint of `endpoints.GATED_FILES` gates, whichever run lacks or skipped it; one
+    whose answers differ between runs cannot be judged (`endpoints.problem`). A session without a
+    single gated endpoint judged nothing, and that blocks as `endpoints/*`."""
+    a_runs, b_runs = [endpoints.by_id(d) for d in docs_a], [endpoints.by_id(d) for d in docs_b]
+    ids = list(dict.fromkeys(eid for run in a_runs + b_runs for eid in run))
+    out = {}
+    for eid in ids:
+        key = f"endpoints/{eid}"
+        a, b = [r.get(eid) for r in a_runs], [r.get(eid) for r in b_runs]
+        band = (gate.get("cells") or {}).get(key) or gate.get("endpoints")
+        row = {"kind": "endpoints", "unit": "ms", "band": band, "gated": any(e and e.get("gates") for e in a + b)}
+        why = endpoints.problem(a + b) if a and len(a) == len(b) else "missing runs"
+        if why:
+            row.update(verdict="not comparable", reason=why)
+        else:
+            row["a"], row["b"] = [e["p50"] for e in a], [e["p50"] for e in b]
+            v, diff, pct, slower = verdict(row["a"], row["b"], band)
+            row.update(verdict=v, diff=diff, pct=pct, slower=slower, a_median=statistics.median(row["a"]),
+                       b_median=statistics.median(row["b"]))
+            for side, entries in (("a", a), ("b", b)):
+                for q in (95, 99):
+                    row[f"{side}_p{q}"] = statistics.median(e[f"p{q}"] for e in entries)
+        out[key] = row
+    if not any(r["gated"] for r in out.values()):
+        out["endpoints/*"] = {"kind": "endpoints", "unit": "ms", "band": gate.get("endpoints"), "gated": True,
+                              "verdict": "not comparable", "reason": "no run holds a gated endpoint (no endpoints.json?)"}
+    return out
+
+
 def scan_verdicts(results, gate):
     """Per SCAN_CELLS cell: the D4 verdict over each role's scan.json values in schedule
     order (`results[role]`), judged by the cell's own band or its gate.toml row."""
@@ -342,11 +382,22 @@ def soak_session(session, plan, gate):
     return {"verdicts": rows, "soaks": soaks, "blocking": soak.blocking(rows)}
 
 
+def judge_candidate_runs(session, plan, rows):
+    """Give every candidate run of the session the gated verdicts as `ab-verdicts.json` and
+    rewrite its report.html: how a verdict of a gate whose runs are `run.sh` runs (A/B,
+    ramp, soak) reaches the run in the viewer (`report.py --serve`)."""
+    cells = {"cells": viewer_cells(rows)}
+    for run in run_dirs(session, plan)["b"]:
+        with open(os.path.join(run, "ab-verdicts.json"), "w") as f:
+            json.dump(cells, f, indent=2)
+        report.write_html(run)
+
+
 def render(session):
     """Compute the session's tables, write report.md, report.html and the machine-readable
-    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B also gives
-    every candidate run the gated verdicts as `ab-verdicts.json` and rewrites its
-    report.html, which is how they reach the viewer (`report.py --serve`)."""
+    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B, ramp or soak
+    gate also gives its candidate runs the gated verdicts ([`judge_candidate_runs`]); the
+    session's own report.html is listed in the viewer too (`report.list_runs`)."""
     plan = report.load(os.path.join(session, "gate.json"))
     if not plan:
         raise ValueError(f"{session} has no gate.json")
@@ -360,8 +411,14 @@ def render(session):
             f.write(md)
         with open(os.path.join(session, "report.html"), "w") as f:
             f.write(soak.render_html(header(plan), result, report.CSS))
+        judge_candidate_runs(session, plan, result["verdicts"])
         return md, result["blocking"]
-    if plan["mode"] == "ramp":
+    if plan["mode"] == "endpoints":
+        docs = {role: [report.load(os.path.join(d, "ferrofin", "endpoints.json")) for d in dirs]
+                for role, dirs in run_dirs(session, plan).items()}
+        result = {"verdicts": endpoint_verdicts(docs["a"], docs["b"], gate)}
+        name, block = "verdict.json", blocking(result["verdicts"])
+    elif plan["mode"] == "ramp":
         docs = {role: [report.load(os.path.join(d, "ferrofin", "ramp.json")) for d in dirs]
                 for role, dirs in run_dirs(session, plan).items()}
         result = {"verdicts": ramp_verdicts(docs["a"], docs["b"], gate), "ramps": docs}
@@ -386,7 +443,7 @@ def render(session):
         result["kinds"] = kind_summary(result["noise"], gate)
         name, block = "noise.json", []
     else:
-        built, by_role = models(session, plan)
+        built, _ = models(session, plan)
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
@@ -397,12 +454,8 @@ def render(session):
         f.write(md)
     with open(os.path.join(session, "report.html"), "w") as f:
         f.write(render_html(plan, result))
-    if plan["mode"] == "ab":
-        cells = {"cells": viewer_cells(result["verdicts"])}
-        for run in by_role["b"]:
-            with open(os.path.join(run, "ab-verdicts.json"), "w") as f:
-                json.dump(cells, f, indent=2)
-            report.write_html(run)
+    if plan["mode"] in ("ab", "ramp", "endpoints"):
+        judge_candidate_runs(session, plan, result["verdicts"])
     return md, block
 
 
@@ -448,6 +501,28 @@ NOISE_HEAD = ("cell", "min", "median", "max", "range", "CV", "p95 range", "band"
 VERDICT_HEAD = ("cell", "previous", "candidate", "change", "slower pairs", "band", "gates", "verdict")
 RAMP_HEAD = ("cell", "previous", "candidate", "change", "worse pairs", "band", "gates", "verdict")
 RAMP_RUN_HEAD = ("run", "ceiling", "limit", "stopped at", "why")
+ENDPOINT_HEAD = ("cell", "previous p50 / p95 / p99", "candidate p50 / p95 / p99", "p50 change", "slower pairs", "band",
+                 "gates", "verdict")
+
+
+def endpoint_rows(rows):
+    """The endpoint session's rows: the gated endpoints first, then the reported ones."""
+    def pcts(r, side):
+        if f"{side}_median" not in r:
+            return "—"
+        return " / ".join(fmt(r[k], r["unit"]) for k in (f"{side}_median", f"{side}_p95", f"{side}_p99"))
+    for gated in (True, False):
+        for key, r in rows.items():
+            if r["gated"] != gated:
+                continue
+            b = r["band"]
+            band = f"{b['relative_pct']}% / {b['absolute']} {r['unit']}" if b else "—"
+            if "diff" in r:
+                yield (key, pcts(r, "a"), pcts(r, "b"),
+                       ("—" if r["pct"] is None else f"{r['pct']:+.0f}%") + f" ({r['diff']:+.2f} {r['unit']})",
+                       f"{r['slower']}/{len(r['a'])}", band, "yes" if gated else "reported", r["verdict"])
+            else:
+                yield (key, "—", "—", "—", "—", band, "yes" if gated else "reported", f"not comparable: {r['reason']}")
 
 
 def ramp_run_rows(ramps):
@@ -484,6 +559,11 @@ def render_md(plan, result):
             parts.append("\n## Proposed per-cell bands for gate.toml (owner decision, D8)\n\n```toml\n" + "".join(
                 f'[cells."{k}"]\nrelative_pct = {v["relative_pct"]}\nabsolute = {v["absolute"]}\n\n'
                 for k, v in result["proposed_cells"].items()).rstrip() + "\n```\n")
+    elif plan["mode"] == "endpoints":
+        gated = sum(r["gated"] for r in result["verdicts"].values())
+        parts += [f"\n## Per-endpoint latency ({gated} gated endpoints first, then {len(result['verdicts']) - gated} reported)\n\n",
+                  md_table(ENDPOINT_HEAD, endpoint_rows(result["verdicts"])),
+                  "\n" + (f"**BLOCKED**: {', '.join(result['blocking'])}\n" if result["blocking"] else "**PASS**: no gated endpoint regressed.\n")]
     elif plan["mode"] == "ramp":
         parts += ["\n## Throughput ceiling\n\n", md_table(RAMP_HEAD, verdict_rows(result["verdicts"])),
                   "\n## Per run\n\n", md_table(RAMP_RUN_HEAD, ramp_run_rows(result["ramps"])),
@@ -529,6 +609,13 @@ def render_html(plan, result):
                   "<h2>Interleaved halves</h2><p class='lede'>The A/A runs compared as an A/B would compare them; any "
                   "verdict but within noise is a false alarm.</p>",
                   html_table(VERDICT_HEAD, verdict_rows(result["false_alarms"]), verdict_col=7)]
+    elif plan["mode"] == "endpoints":
+        verdict_text = (f"<b>Blocked</b> by {e(', '.join(result['blocking']))}" if result["blocking"]
+                        else "<b>Pass</b>: no gated endpoint regressed.")
+        parts += [f"<h2>Per-endpoint latency</h2><p class='lede'>{verdict_text} Every GET of the parity catalogue, alone: "
+                  "the median across each side's runs of p50, p95 and p99 (ms). The verdict is on the p50; only the "
+                  "<code>bench/screens.js</code> shapes and the edge-case GETs gate, and they are listed first.</p>",
+                  "<div class='scroll'>" + html_table(ENDPOINT_HEAD, endpoint_rows(result["verdicts"]), verdict_col=7) + "</div>"]
     elif plan["mode"] == "ramp":
         verdict_text = (f"<b>Blocked</b> by {e(', '.join(result['blocking']))}" if result["blocking"]
                         else "<b>Pass</b>: the ceiling did not regress.")
@@ -545,7 +632,7 @@ def render_html(plan, result):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "scan", "soak", "render"):
+    if len(argv) < 2 or argv[0] not in ("aa", "ab", "ramp", "scan", "soak", "endpoints", "render"):
         sys.exit(__doc__)
     mode, args = argv[0], argv[1:]
     if mode == "render":

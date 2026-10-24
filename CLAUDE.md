@@ -58,7 +58,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-util` | leaf string/path/collection helpers |
 | `ferrofin-model` | all DTOs + enums (serde + utoipa) — the shared data universe; also the DLNA profile/StreamBuilder logic |
 | `ferrofin-naming` | filename → media parsing |
-| `ferrofin-keyframes` | keyframe extraction structures |
+| `ferrofin-keyframes` | keyframe extraction: the ffprobe output parser and the Matroska cue reader |
 | `ferrofin-chromaprint` | audio fingerprinting (chromaprint) for the intro-skipper extension |
 | `ferrofin-common` | config, app-paths, **password hashing** (real PBKDF2-HMAC-SHA512/SHA1, byte-compatible with Jellyfin) |
 | `ferrofin-networking` | bind / published-URL resolution |
@@ -70,7 +70,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
 | `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb uses a built-in key) |
-| `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
+| `ferrofin-livetv` | Live TV — M3U/HDHomeRun tuners + XMLTV/Schedules Direct guides, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
 | `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
 | `ferrofin-core` | the concrete manager implementations — the workhorse |
@@ -382,8 +382,8 @@ response-shape pass is one of those supporting probes, not the parity number.)
 Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
-burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 19 registered
-scheduled tasks (17 shown in a stock install — the two guide/channel refreshers hide
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 20 registered
+scheduled tasks (18 shown in a stock install — the two guide/channel refreshers hide
 themselves until a tuner exists),
 metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
 (EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered
@@ -412,10 +412,12 @@ The real remaining gaps are **by design**, not un-ported routes:
 - **No artwork is written into a media library without the library's opt-in** — an owner
   decision (2026-10-17). Upstream's `IsSaveLocalMetadataEnabled()` overrides (Genre,
   MusicGenre, Playlist, Person, Studio, Year, BoxSet, …) save artwork "beside the item"
-  whatever the library says. Ferrofin ports them (Genre, MusicGenre and Playlist so far)
-  only while the item's own path is in its data or metadata directory (a genre's
-  `{metadata}/Genre/<name>`, a playlist in `{data}/playlists`). An item inside a media
-  library (an `.m3u` playlist file, a playlist folder) follows the library's "Save artwork
+  whatever the library says. Ferrofin ports them (Genre, MusicGenre, Playlist, Person,
+  Studio, Year, BoxSet, a by-name MusicArtist and a library's CollectionFolder; not yet
+  UserView) only while the item's own path is in its data or metadata directory or the
+  libraries' root folder (a genre's `{metadata}/Genre/<name>`, a playlist in
+  `{data}/playlists`, a library's `root/default/<name>`). An item inside a media library
+  (an `.m3u` playlist file, a playlist or box-set folder) follows the library's "Save artwork
   into media folders" (`SaveLocalMetadata`), so with it off the media folders stay
   untouched and need no write permission.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
