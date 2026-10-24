@@ -35,6 +35,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Keep the playlists folder out of a user's library-wide queries until they can see a
+  playlist, and a box-set library until they can see a box set, as Jellyfin's
+  `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
+  no playlist no longer lists the folder, which put its counts one above Jellyfin's
 - Take a comic's cover from `.cb7` (7z) and `.cbt` (tar) archives as well as `.cbz`, and open
   every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
   really a ZIP gets its cover too. The fallback page is the first in .NET's key order

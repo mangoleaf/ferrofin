@@ -358,14 +358,22 @@ pub async fn build_app_state(
     // Live TV is built after the repository and must not be owned by it, so the
     // repository asks it for the files being recorded through this late slot.
     let active_recordings = ferrofin_core::ActiveRecordingSlot::default();
+    // The `IsVisible` evaluator is built over the repository, so the query
+    // scope (`AddUserToQuery`'s playlists and box-set gate) reaches it through
+    // this late slot, filled once the evaluator exists.
+    let scope_visibility = ferrofin_core::VisibilitySlot::default();
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
             .with_virtual_paths(virtual_paths.clone())
-            .with_active_recordings(Arc::clone(&active_recordings)),
+            .with_active_recordings(Arc::clone(&active_recordings))
+            .with_visibility(Arc::clone(&scope_visibility)),
     );
-    let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
-        Arc::new(FerrofinItemCountService::new(db.clone()).with_root_ids(root_folder_ids));
+    let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> = Arc::new(
+        FerrofinItemCountService::new(db.clone())
+            .with_root_ids(root_folder_ids)
+            .with_visibility(Arc::clone(&scope_visibility)),
+    );
     let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
@@ -1182,6 +1190,9 @@ pub async fn build_app_state(
         )
         .with_virtual_paths(virtual_paths.clone()),
     );
+    // Held weakly by the repository and the count service: the evaluator owns
+    // the repository. `set` fails only if already set, which nothing else does.
+    let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
