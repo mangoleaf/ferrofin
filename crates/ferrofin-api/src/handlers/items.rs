@@ -598,10 +598,27 @@ async fn get_items(
             options.fields.push(ItemFields::Tags);
         }
     }
-    let dtos = state
-        .dto
-        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
-        .await?;
+    // A playlist's or box set's own listing is its linked children
+    // (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`),
+    // which upstream resolves with every field loaded; a recursive listing is
+    // the repository query, loaded with the client's fields.
+    let linked_children = !internal.recursive
+        && internal.item_ids.is_empty()
+        && matches!(
+            internal.parent_type,
+            Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+        );
+    let dtos = if linked_children {
+        state
+            .dto
+            .get_linked_children_dtos(&result.items, &options, internal.user.as_ref())
+            .await?
+    } else {
+        state
+            .dto
+            .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
+            .await?
+    };
     Ok(Json(QueryResult::new(
         Some(result.start_index),
         Some(result.total_record_count),

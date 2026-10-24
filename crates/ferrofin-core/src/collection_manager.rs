@@ -1384,7 +1384,10 @@ impl PlaylistManager for FerrofinPlaylistManager {
             // `AddToPlaylistInternal`'s refresh, reached from `CreatePlaylist`.
             queue_refresh(self.providers.as_deref(), id, force_save_refresh()).await?;
         }
-        Ok(PlaylistCreationResult { id: id.to_string() })
+        // `playlist.Id.ToString("N", CultureInfo.InvariantCulture)`.
+        Ok(PlaylistCreationResult {
+            id: id.simple().to_string(),
+        })
     }
 
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError> {
@@ -1671,9 +1674,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         entry_ids: &[String],
     ) -> Result<(), ServiceError> {
         // Entry ids are approximated by the child item id (see module docs). The
-        // wire form is a dashless `Guid('N')` (`GetPlaylistItems` emits
-        // `item.id.replace('-', "")`), but `ChildId` is stored in the canonical
-        // dashed uppercase form. Parse and re-format via `guid_to_db` to
+        // wire form is a lower-case `Guid('N')` (`GetPlaylistItems`' `ItemId?
+        // .ToString("N")`), but `ChildId` is stored in the canonical dashed
+        // uppercase form. Parse and re-format via `guid_to_db` to
         // normalise back to the stored form; skip any entry id that isn't a
         // valid GUID.
         // C# `RemoveItemFromPlaylistAsync` (12.0): every entry whose item id
@@ -3014,14 +3017,16 @@ mod tests {
             .expect("create");
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
-        // Read the entry id exactly as the wire DTO exposes it: dashless.
+        // Read the entry id exactly as the wire DTO exposes it: `Guid('N')`.
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items");
         assert_eq!(items.len(), 1);
-        let dashless = items[0].id.replace('-', "");
-        assert!(!dashless.contains('-'));
+        let dashless = Uuid::parse_str(&items[0].id)
+            .expect("uuid")
+            .simple()
+            .to_string();
 
         mgr.remove_item_from_playlist(&created.id, &[dashless])
             .await
@@ -3199,10 +3204,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_playlist_items_pins_entry_id_derivation() {
-        // `PlaylistItemId` on the wire is `item.id.replace('-', "")` over the row
-        // this returns, so the row's `Id` must stay the canonical stored guid
-        // (dashed uppercase) — the joined read must project the CHILD's `Id`,
-        // never the playlist's.
+        // `PlaylistItemId` on the wire is the member's id in `Guid('N')` form,
+        // so the row's `Id` must stay the canonical stored guid (dashed
+        // uppercase) — the joined read must project the CHILD's `Id`, never the
+        // playlist's.
         let db = test_db().await;
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
@@ -3228,11 +3233,6 @@ mod tests {
             items[0].id,
             ferrofin_db::store::guid_to_db(track),
             "row id must be the child's canonical stored guid"
-        );
-        assert_eq!(
-            items[0].id.replace('-', ""),
-            track.simple().to_string().to_uppercase(),
-            "PlaylistItemId derivation must be unchanged"
         );
         // And the member's own fields came back (not the playlist's).
         assert_eq!(
@@ -3890,6 +3890,8 @@ mod tests {
             .await
             .expect("create");
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+        // `playlist.Id.ToString("N")` (v12.2 PlaylistManager.cs:163).
+        assert_eq!(created.id, playlist_id.simple().to_string());
 
         let alice_access = mgr.get_playlist_access(playlist_id, alice).await.unwrap();
         assert_eq!(alice_access.level, PlaylistAccessLevel::Owner);
