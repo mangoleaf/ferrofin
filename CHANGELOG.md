@@ -258,6 +258,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Ferrofin runs on, and saving it is refused (400), since no other provider can be used
 - `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
   every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
+- `GET /Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists` and the
+  genre facet of `GET /Items/Filters2` filter their content by kind as Jellyfin's query
+  does. An `includeItemTypes` of only Live TV kinds with no stored rows (`Program`,
+  `Recording`, `ChannelFolderItem`) lists nothing; it listed every value.
+  `excludeItemTypes` counts only when no kind is included, so naming one kind in both lists
+  answers that kind instead of nothing
+- `GET /Artists` and `/Artists/AlbumArtists` honour `studios` (pipe-delimited studio names):
+  the named studios replace `studioIds`, and since an artist carries no studios the list is
+  empty, as in Jellyfin. The parameter was dropped and every artist listed. Unlike Jellyfin,
+  an unknown name does not create a studio
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

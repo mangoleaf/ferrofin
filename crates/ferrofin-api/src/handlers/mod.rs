@@ -997,10 +997,11 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Artists",
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetArtists",
-        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery, \
-               project_query_result) → ferrofin-core item_repository.rs get_artists \
-               (item_values_with_counts, item_counts_by_clean_name)",
-        date: "2026-10-19",
+        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery \
+               artists_query, resolve_by_name_ids, project_query_result) → ferrofin-core \
+               item_repository.rs get_artists (item_values_with_counts, \
+               item_counts_by_clean_name)",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1009,9 +1010,10 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Artists/AlbumArtists",
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetAlbumArtists",
-        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs → ferrofin-core \
-               item_repository.rs get_album_artists (item_values_with_counts)",
-        date: "2026-10-19",
+        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs (artists_query, \
+               resolve_by_name_ids) → ferrofin-core item_repository.rs get_album_artists \
+               (item_values_with_counts)",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1023,7 +1025,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
                get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1034,7 +1036,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetMusicGenres",
         ferrofin: "handlers/music_genres.rs get_music_genres → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1045,7 +1047,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetStudios",
         ferrofin: "handlers/studios.rs get_studios → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_studios (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1385,10 +1387,9 @@ pub const VERIFIED: &[Verified] = &[
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
 /// `ArtistsController` + `BaseItemRepository.GetItemValues`.
 const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
-    "`studios` (pipe-delimited names) is not honored: v12 resolves each name through \
-     LibraryManager.GetStudio — which CREATES the studio row on a GET — into StudioIds. \
-     `studioIds` is honored. Un-defer path: a non-creating name → id lookup in the \
-     handler (find_named_item), never the creating one.",
+    "`studios` names resolve without writing: v12's LibraryManager.GetStudio CREATES a row \
+     for an unknown name on this GET; Ferrofin's lookup creates none and gives the name a \
+     no-match id (by_name::resolve_by_name_ids), the same empty answer.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",

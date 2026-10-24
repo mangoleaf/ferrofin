@@ -1540,62 +1540,6 @@ issue = 80
 reason = "Ferrofin ignores this /Items filter (an unbound parameter), so the count and the page differ."
 
 [[entry]]
-request = "Get*.includeItemTypes.program"
-path = "TotalRecordCount"
-kind = "value"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.program"
-path = "Items"
-kind = "length"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.recording"
-path = "TotalRecordCount"
-kind = "value"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.recording"
-path = "Items"
-kind = "length"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.channelfolderitem"
-path = "TotalRecordCount"
-kind = "value"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*.includeItemTypes.channelfolderitem"
-path = "Items"
-kind = "length"
-issue = 823
-reason = "By-name lists ignore an includeItemTypes of only Live TV kinds and list everything."
-
-[[entry]]
-request = "Get*Artists.studios.*"
-path = "TotalRecordCount"
-kind = "value"
-issue = 824
-reason = "/Artists and /Artists/AlbumArtists drop the studios name filter."
-
-[[entry]]
-request = "Get*Artists.studios.*"
-path = "Items"
-kind = "length"
-issue = 824
-reason = "/Artists and /Artists/AlbumArtists drop the studios name filter."
-
-[[entry]]
 request = "edge-parental-rating/counts"
 path = "EpisodeCount"
 kind = "value"

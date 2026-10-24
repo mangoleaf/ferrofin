@@ -1674,6 +1674,7 @@ impl FerrofinItemRepository {
     /// library, each with an in-scope item count — matching Jellyfin, which scopes
     /// its by-name aggregates to the query. Only values with an in-scope item (and
     /// a materialized by-name row) appear.
+    #[allow(clippy::too_many_lines)] // the C# `GetItemValues` query and its paging, in its order
     async fn item_values_with_counts(
         &self,
         value_types: &[ItemValueType],
@@ -1699,11 +1700,18 @@ impl FerrofinItemRepository {
         // returnType)` selects. The owner-type split lives solely on the
         // *Names* variants (`GetItemValueNames`, ByName.cs:120-141), which
         // `get_genre_names`/`get_music_genre_names` still carry.
-        let content_type_names: Vec<String> = filter
-            .include_item_types
-            .iter()
-            .filter_map(|k| stored_type_name(*k).map(str::to_owned))
-            .collect();
+        //
+        // `None` only when the caller named no kind: a list of kinds none of
+        // which has a stored name (`Program`, `Recording`, …) is `Some(empty)`
+        // and matches nothing, as `TranslateQuery` does (see `push_content_scope`).
+        let content_type_names: Option<Vec<String>> =
+            (!filter.include_item_types.is_empty()).then(|| {
+                filter
+                    .include_item_types
+                    .iter()
+                    .filter_map(|k| stored_type_name(*k).map(str::to_owned))
+                    .collect()
+            });
         let exclude_type_names: Vec<String> = filter
             .exclude_item_types
             .iter()
@@ -1747,7 +1755,7 @@ impl FerrofinItemRepository {
         let scope = ByNameScope {
             filter,
             type_ints: &type_ints,
-            content_type_names: &content_type_names,
+            content_type_names: content_type_names.as_deref(),
             exclude_type_names: &exclude_type_names,
             media_types: &media_types,
             ancestors: &ancestors,
@@ -1963,22 +1971,35 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
         top_parents,
         ..
     } = scope;
+    // The kinds, as `TranslateQuery` filters them (v12.2
+    // `TranslateQuery.cs:282-313`): with kinds included, `WhereOneOrMany` over
+    // their stored names, which matches nothing when none has one
+    // (`push_in_list` writes `1 = 0`), and the excludes are ignored; with none
+    // included, the excludes. The counts' `scopeQuery` carries no included
+    // kinds (`ByName.cs:336-346`), so it always takes the excludes.
+    //
     // `+`: a plan pin, like the one on `TopParentId` below. Unpinned, the
     // planner drives the semijoin from every content row of the kind
     // (`IX_BaseItems_Type_…`, `Type=?`) and probes the value per
     // row — `/Artists?includeItemTypes=MusicAlbum` walks 800 albums per
     // artist: 45 ms; pinned, it walks the artist's own map rows: 4 ms.
-    if inner == InnerScope::Page && !content_type_names.is_empty() {
-        qb.push(" AND ");
-        push_in_list(qb, r#"+ci."Type""#, content_type_names);
-    }
-    if !exclude_type_names.is_empty() {
-        qb.push(r#" AND ci."Type" NOT IN ("#);
-        let mut sep = qb.separated(", ");
-        for name in *exclude_type_names {
-            sep.push_bind(name.clone());
+    match content_type_names {
+        // Page only: the Counts scope falls through to the excludes on purpose,
+        // since `BuildItemCountsByCleanName`'s `scopeQuery` copies
+        // `ExcludeItemTypes` and not `IncludeItemTypes`.
+        Some(names) if inner == InnerScope::Page => {
+            qb.push(" AND ");
+            push_in_list(qb, r#"+ci."Type""#, names);
         }
-        qb.push(")");
+        _ if !exclude_type_names.is_empty() => {
+            qb.push(r#" AND ci."Type" NOT IN ("#);
+            let mut sep = qb.separated(", ");
+            for name in *exclude_type_names {
+                sep.push_bind(name.clone());
+            }
+            qb.push(")");
+        }
+        _ => {}
     }
     if !media_types.is_empty() {
         qb.push(" AND ");
@@ -2108,9 +2129,12 @@ struct ByNameScope<'a> {
     type_ints: &'a [i64],
     /// Stored type names of the content items that may contribute — the
     /// caller's `IncludeItemTypes` and nothing else, exactly as C# builds its
-    /// `innerQueryFilter`.
-    content_type_names: &'a [String],
-    /// Stored type names the content items must not be (`ExcludeItemTypes`).
+    /// `innerQueryFilter`. `None` when the caller named no kind; `Some(&[])`
+    /// when it named only kinds without a stored name, which matches nothing.
+    content_type_names: Option<&'a [String]>,
+    /// Stored type names the content items must not be (`ExcludeItemTypes`):
+    /// the page applies them only while `content_type_names` is `None`, the
+    /// per-kind counts always.
     exclude_type_names: &'a [String],
     /// Stored `MediaType` names the content items are restricted to.
     media_types: &'a [String],
@@ -7800,6 +7824,149 @@ mod tests {
         );
     }
 
+    /// The by-name inner query's type filter is `TranslateQuery`'s (v12.2
+    /// `TranslateQuery.cs:282-313`): named kinds that have no stored type name
+    /// (the Live TV `Program`, `Recording`, `ChannelFolderItem`) still leave a
+    /// `Type IN ()` that matches nothing, and the excluded kinds count only
+    /// while no kind is included. The per-kind counts keep the excludes either
+    /// way: their `scopeQuery` carries `ExcludeItemTypes` and no includes
+    /// (`ByName.cs:336-346`).
+    #[rstest::rstest]
+    #[case::program(BaseItemKind::Program)]
+    #[case::recording(BaseItemKind::Recording)]
+    #[case::channel_folder_item(BaseItemKind::ChannelFolderItem)]
+    #[tokio::test]
+    async fn by_name_type_filter_follows_translate_query(#[case] unmapped: BaseItemKind) {
+        assert_eq!(
+            stored_type_name(unmapped),
+            None,
+            "{unmapped:?} has a stored name"
+        );
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0D1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        let album = Uuid::from_u128(0xA0D2);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_item_value(&db, album, ItemValueType::Artist, "Band").await;
+        seed_item_value(&db, album, ItemValueType::AlbumArtist, "Band").await;
+
+        let names = |result: QueryResult<ItemWithCounts>| -> (Vec<String>, i32) {
+            let total = result.total_record_count;
+            let names = result
+                .items
+                .into_iter()
+                .filter_map(|i| i.item.name)
+                .collect();
+            (names, total)
+        };
+        let unmapped_only = InternalItemsQuery {
+            include_item_types: vec![unmapped],
+            enable_total_record_count: true,
+            ..Default::default()
+        };
+        // `limit=0` takes the separate total statement (`count_by_name_total`).
+        let probe = InternalItemsQuery {
+            limit: Some(0),
+            ..unmapped_only.clone()
+        };
+        for (route, result) in [
+            ("genres", repository.get_genres(&unmapped_only).await),
+            ("studios", repository.get_studios(&unmapped_only).await),
+            ("artists", repository.get_artists(&unmapped_only).await),
+            (
+                "album artists",
+                repository.get_album_artists(&unmapped_only).await,
+            ),
+            ("genres limit=0", repository.get_genres(&probe).await),
+        ] {
+            assert_eq!(names(result.expect(route)), (vec![], 0), "{route}");
+        }
+        // An unmapped kind beside a mapped one: the mapped one still counts.
+        let mixed = InternalItemsQuery {
+            include_item_types: vec![unmapped, BaseItemKind::Movie],
+            ..unmapped_only.clone()
+        };
+        let mixed = repository.get_genres(&mixed).await.expect("mixed");
+        assert_eq!(names(mixed), (vec!["Drama".to_owned()], 1));
+
+        // Included and excluded at once: the include wins on the page, so the
+        // value is listed, and the counts still drop the excluded kind.
+        let both = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            exclude_item_types: vec![BaseItemKind::Movie],
+            enable_total_record_count: true,
+            ..Default::default()
+        };
+        let genres = repository.get_genres(&both).await.expect("both");
+        assert_eq!(genres.total_record_count, 1);
+        assert_eq!(genres.items.len(), 1);
+        assert_eq!(genres.items[0].item.name.as_deref(), Some("Drama"));
+        assert_eq!(genres.items[0].counts.movie_count, 0);
+        let studios = repository.get_studios(&both).await.expect("studios both");
+        assert_eq!(names(studios), (vec!["Acme".to_owned()], 1));
+        // Excluded alone, the kind is gone from the page too.
+        let excluded = InternalItemsQuery {
+            exclude_item_types: vec![BaseItemKind::Movie],
+            enable_total_record_count: true,
+            ..Default::default()
+        };
+        let excluded = repository.get_genres(&excluded).await.expect("excluded");
+        assert_eq!(names(excluded), (vec![], 0));
+    }
+
+    /// `studioIds` matches through the referenced row's `CleanName` (v12.2
+    /// `WhereReferencedItem`), so an id that names no row, the API's stand-in
+    /// for a `studios` name with no studio, matches nothing, on an item browse
+    /// as on a by-name list. On `/Artists` the filter lands on the artist row
+    /// itself (`ByName.cs:221`), which carries no studios: even a real studio
+    /// empties the list.
+    #[tokio::test]
+    async fn studio_ids_naming_no_row_match_nothing() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0E1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        let album = Uuid::from_u128(0xA0E2);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_item_value(&db, album, ItemValueType::Artist, "Band").await;
+        let studios = repository
+            .get_studios(&InternalItemsQuery::default())
+            .await
+            .expect("studios");
+        let acme = Uuid::parse_str(&studios.items[0].item.id).expect("studio id");
+
+        let with_studios = |ids: Vec<Uuid>| InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            studio_ids: ids,
+            ..Default::default()
+        };
+        let movies = |result: QueryResult<BaseItemEntity>| -> Vec<String> {
+            result.items.into_iter().filter_map(|i| i.name).collect()
+        };
+        let real = repository.get_items(&with_studios(vec![acme])).await;
+        assert_eq!(movies(real.expect("real studio")), ["One"]);
+        let unknown = repository.get_items(&with_studios(vec![Uuid::nil()])).await;
+        assert!(movies(unknown.expect("unknown studio")).is_empty());
+
+        let all = repository
+            .get_artists(&InternalItemsQuery::default())
+            .await
+            .expect("artists");
+        assert_eq!(all.items.len(), 1);
+        for ids in [vec![acme], vec![Uuid::nil()], vec![acme, Uuid::nil()]] {
+            let query = InternalItemsQuery {
+                studio_ids: ids.clone(),
+                ..Default::default()
+            };
+            let artists = repository.get_artists(&query).await.expect("artists");
+            assert!(artists.items.is_empty(), "{ids:?}");
+        }
+    }
+
     #[tokio::test]
     async fn by_name_paging_and_filters_push_into_sql() {
         let db = test_db().await;
@@ -8767,7 +8934,7 @@ mod tests {
         let movie = [stored_type_name(BaseItemKind::Movie)
             .expect("stored")
             .to_owned()];
-        for content_type_names in [&movie[..], &[]] {
+        for content_type_names in [Some(&movie[..]), None] {
             let scope = ByNameScope {
                 filter: &filter,
                 type_ints: &type_ints,
