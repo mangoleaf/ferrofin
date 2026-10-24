@@ -1396,6 +1396,51 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Library/VirtualFolders",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "GetVirtualFolders",
+        ferrofin: "handlers/library_structure.rs get_virtual_folders → ferrofin-core \
+               virtual_folder_manager.rs get_virtual_folders and list_libraries \
+               (LibraryManager.GetVirtualFolders(true) and GetVirtualFolderInfo: \
+               resolve_locations, read_collection_type, load_options for \
+               CollectionFolder.GetLibraryOptions, scan_progress for RefreshProgress and \
+               RefreshStatus) → ferrofin-model entities_media.rs VirtualFolderInfo, \
+               configuration.rs LibraryOptions, TypeOptions, ImageOption, MediaPathInfo",
+        date: "2026-10-24",
+        divergences: &[
+            "Libraries are listed sorted by name; upstream lists them in the order the file \
+         system enumerates root/default. Fix path: gl-858.",
+            "A library's Locations are sorted ordinally; upstream's .Order() compares them in \
+         the request's culture, so /media/Movies and /media/kids list kids first upstream \
+         and Movies first here. Fix path: gl-887.",
+            "A symbolic link to a directory under root/default is skipped; upstream's \
+         Directory.EnumerateDirectories lists it as a library. Fix path: gl-888.",
+            "A library adopted from Jellyfin whose options.xml stores a media path as \
+         %AppDataPath% or %MetadataPath% serves that token unexpanded in \
+         LibraryOptions.PathInfos; CollectionFolder.LoadLibraryOptions expands it. Fix \
+         path: gl-889.",
+            "A shortcut that cannot be read is dropped without upstream's error log, and a \
+         BOM or non-UTF-8 shortcut resolves differently from File.ReadAllText. Fix path: \
+         gl-890.",
+            "A library directory without a CollectionFolder row gets one written by the \
+         listing, so ItemId, LibraryOptions and RefreshStatus are always sent; upstream \
+         leaves the folder members out until its in-memory root folder's children are \
+         revalidated. Ferrofin has no in-memory tree, and the row keeps the library's id \
+         resolvable and a scan clear of the foreign key (owner decision 2026-10-24).",
+            "A failed write of that CollectionFolder row fails the whole listing (500). Fix \
+         path: gl-891.",
+            "An empty .mblink is dropped; upstream filters only nulls, so it lists an empty \
+         location, which names no folder. Jellyfin bug not ported.",
+            "An options.json that does not parse serves the defaults without a log entry; \
+         upstream also serves the defaults for a bad options.xml but logs it at error. Fix \
+         path: gl-271.",
+            "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

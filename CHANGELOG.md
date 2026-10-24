@@ -35,6 +35,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Send every library type's `SimilarItemProviders` and `SimilarItemProviderOrder` in
+  `GET /Library/VirtualFolders` even when empty (`[]`), as Jellyfin does, instead of leaving
+  them out
 - Write a backup manifest's `DateCreated` as Jellyfin writes its `DateTimeOffset`, with a
   `+00:00` offset instead of `Z` (`POST /Backup/Create`, `GET /Backup`,
   `GET /Backup/Manifest` and the archive's `manifest.json`). Archives written with the `Z`
