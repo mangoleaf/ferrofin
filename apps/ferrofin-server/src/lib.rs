@@ -255,8 +255,9 @@ async fn announce_shutdown(
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
 ///
-/// This is the whole composition root, in order: initialise logging, open +
-/// migrate the database, discover ffmpeg (non-fatal — the API still boots without
+/// This is the whole composition root, in order: initialise logging, check the
+/// server directories (Jellyfin's `MakeSanityCheckOrThrow`), open + migrate the
+/// database, discover ffmpeg (non-fatal — the API still boots without
 /// it, playback just 500s until configured), wire every concrete manager into the
 /// shared `AppState`, seed a default administrator when the install is fresh, mount
 /// the `ferrofin-api` router, and `axum::serve` on the configured bind address with
@@ -274,7 +275,8 @@ async fn announce_shutdown(
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened/migrated, manager wiring
+/// Returns an error if a server directory cannot be created or marked, or holds
+/// another kind's marker, if the database cannot be opened/migrated, manager wiring
 /// fails, seeding fails, the listener cannot bind the configured address, or the
 /// server loop errors.
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -373,8 +375,10 @@ struct ProcessMetrics {
 
 /// `StorageHelper.TestCommonPathsForStorageCapacity`: Jellyfin will not start,
 /// nor apply a restore, without 2 GiB free on the data, cache and
-/// program-data paths. A failure stops the boot before the database is opened
-/// or a restore is applied; only the three directories may have been created.
+/// program-data paths. It runs after the directory check
+/// (`bootstrap::check_application_paths`, upstream's order), so all three
+/// already exist. A failure stops the boot before the database is opened or a
+/// restore is applied.
 fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
     ferrofin_core::system_manager::test_common_paths_for_storage_capacity(
         &ferrofin_core::system_manager::FsStorageProbe,
@@ -454,6 +458,10 @@ async fn record_restore_failure(
 /// One server lifetime: boot, serve until drained, tear the host down, and
 /// report whether an API restart was requested (`true` → the caller runs it
 /// again). A signal-initiated drain always reports `false`.
+// The boot is one ordered sequence (directories, restore, database, wiring,
+// serve, drain), each step depending on the one before; split into helpers it
+// would only re-thread the same state, as `build_app_state` notes.
+#[allow(clippy::too_many_lines)]
 async fn serve_once(
     config: &Config,
     started: std::time::Instant,
@@ -463,6 +471,8 @@ async fn serve_once(
     // Process-wide SQLite setup must precede every open, the restore and the
     // existing-database check below included.
     ferrofin_db::init_sqlite();
+    // Directories first (`Program.StartApp`), before a restore or an adopted database.
+    bootstrap::check_application_paths(config)?;
     // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
     // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
     // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.

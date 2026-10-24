@@ -41,6 +41,31 @@ proxy's `X-Forwarded-Host` is not used yet (gl-813): those addresses still take 
 from the request's `Host`.
 See [CONFIG.md](CONFIG.md#https).
 
+## Unreleased — the server checks its directories at startup, as Jellyfin does
+
+Ferrofin now runs Jellyfin's startup check on its directories before a scheduled restore and the database open (an adopted Jellyfin database included). Only logging starts before it, and it creates the log directory itself. It creates each of these directories and leaves a small marker file in it, as Jellyfin does:
+
+| Directory | Marker |
+|---|---|
+| configuration (`FERROFIN_CONFIG_DIR`, default `<data>/config`) | `.jellyfin-config` |
+| logs (`<data>/log`) | `.jellyfin-log` |
+| plugins (`<data>/plugins`) | `.jellyfin-plugin` |
+| data (`--data-dir` / `FERROFIN_DATA_DIR`), and `<data>/data` | `.jellyfin-data` |
+| cache (`FERROFIN_CACHE_DIR`, default `<data>/cache`), which also gets `CACHEDIR.TAG` | `.jellyfin-cache` |
+| root folder (`<data>/root`, Jellyfin's `RootFolderPath`) | `.jellyfin-root` |
+
+**Two layouts that used to start now refuse to.**
+- **Two of these paths point at one directory**, for example the configuration or cache directory set to the data directory. The second marker's check finds the first, and Ferrofin exits with:
+
+  ```
+  the server's directories failed their startup check: Expected to find only .jellyfin-cache but found marker for <data>/.jellyfin-data.
+  ```
+
+  Give each its own directory. Then delete the marker the message names if it sits in a directory it does not belong to: the refused start may have left one, such as `.jellyfin-config` in the data directory when the configuration directory pointed there. Jellyfin refuses the same layouts.
+- **One of these directories cannot be created or written**, for example a read-only plugins volume. Ferrofin exits naming it: `creating <path>: …`. Make it writable.
+
+Ferrofin's default layout, the container image and an adopted Jellyfin directory are unaffected: each directory is a different one, and an adopted install already carries the same markers in the same places.
+
 ## Unreleased — Schedules Direct guides, and listings providers are checked on save
 
 **Schedules Direct works.** In **Dashboard → Live TV → Add TV guide data provider →
