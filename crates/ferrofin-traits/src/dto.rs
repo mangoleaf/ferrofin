@@ -72,6 +72,25 @@ pub trait DtoService: Send + Sync {
         skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError>;
 
+    /// Projects a playlist's or box set's members as a page, like
+    /// [`Self::get_base_item_dtos`].
+    ///
+    /// Upstream resolves these linked children with every field loaded
+    /// (`Folder.ResolveLinkedChildren` with a parameterless `DtoOptions`, or a
+    /// box set's per-member `GetLinkedChild` by id), so their provider ids are
+    /// always present, whatever fields the client asked for. That decides a
+    /// never-written member's `UserData.Key`: its provider key, as on its own
+    /// page. The default projects them as a plain list.
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.get_base_item_dtos(items, options, user, None, true)
+            .await
+    }
+
     /// Projects an item-by-name row (a genre/studio/person/…) into a
     /// [`BaseItemDto`], counting the items tagged with it.
     ///

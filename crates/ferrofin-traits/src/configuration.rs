@@ -120,6 +120,30 @@ pub trait ServerConfigurationManager: Send + Sync {
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
         Ok(EncodingOptions::default())
     }
+
+    /// The named configuration `key` (C# `GetConfiguration(key)`), as its
+    /// configuration type serializes, or `None` when no store is registered
+    /// under `key` (upstream's `ResourceNotFoundException`). The key is
+    /// case-insensitive.
+    ///
+    /// Read as upstream's `LoadConfiguration` reads it: a document never saved
+    /// is the type's defaults, and so is one that does not parse, which is
+    /// logged with its path. The default implementation registers no store, so
+    /// the lightweight managers that keep no named configurations keep
+    /// compiling; `FerrofinServerConfigurationManager` overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the stored document exists but cannot be
+    /// read. Upstream fails only on an `IOException` and serves the defaults
+    /// for a permission-denied read; Ferrofin fails on both, so a save cannot
+    /// replace a document nobody could see.
+    async fn get_named_configuration(
+        &self,
+        _key: &str,
+    ) -> Result<Option<serde_json::Value>, ServiceError> {
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_server_configuration_manager(_: &dyn ServerConfigurationManager) {}

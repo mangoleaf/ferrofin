@@ -43,6 +43,7 @@ use ferrofin_traits::persistence::{
 use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
+use crate::item_visibility::ItemVisibility;
 use crate::kinds::is_video;
 use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_music_albums_query, build_query,
@@ -78,6 +79,10 @@ pub struct FerrofinItemRepository {
     /// The files Live TV is writing right now, bound late by the composition
     /// root (see [`FerrofinItemRepository::with_active_recordings`]).
     active_recordings: ActiveRecordingSlot,
+    /// The `IsVisible` evaluator the query scope asks about playlists and box
+    /// sets, bound late by the composition root (see
+    /// [`FerrofinItemRepository::with_visibility`]).
+    visibility: VisibilitySlot,
 }
 
 /// What the files Live TV is recording right now are, asked when needed.
@@ -91,6 +96,27 @@ pub type ActiveRecordingSource = Arc<
 /// A late-bound [`ActiveRecordingSource`]: the Live TV manager is built after
 /// the repository it must not own, so the composition root fills this once.
 pub type ActiveRecordingSlot = Arc<std::sync::OnceLock<ActiveRecordingSource>>;
+
+/// A late-bound [`ItemVisibility`]: the evaluator is built over the repository,
+/// so the repository holds it weakly (an `Arc` would be a cycle) and the
+/// composition root fills the slot once. The query scope needs it for
+/// `GetUserViews`' playlists and box-set gate (see [`scope_to_user_libraries`]).
+pub type VisibilitySlot = Arc<std::sync::OnceLock<std::sync::Weak<ItemVisibility>>>;
+
+/// The evaluator in `slot`, while the server holds it. An empty slot (a
+/// repository built without one) is silent; a bound evaluator that is gone
+/// says so at `debug`, because the scope then admits the playlists folder and
+/// every box-set library ungated.
+pub(crate) fn bound_visibility(slot: &VisibilitySlot) -> Option<Arc<ItemVisibility>> {
+    let weak = slot.get()?;
+    let visibility = weak.upgrade();
+    if visibility.is_none() {
+        tracing::debug!(
+            "the item visibility evaluator is gone; the library scope skips the playlists and box-set gate"
+        );
+    }
+    visibility
+}
 
 impl std::fmt::Debug for FerrofinItemRepository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -211,6 +237,7 @@ impl FerrofinItemRepository {
             item_type_lookup,
             virtual_paths: VirtualPathExpander::identity(),
             active_recordings: ActiveRecordingSlot::default(),
+            visibility: VisibilitySlot::default(),
             roots: None,
         }
     }
@@ -246,6 +273,22 @@ impl FerrofinItemRepository {
     pub fn with_active_recordings(mut self, slot: ActiveRecordingSlot) -> Self {
         self.active_recordings = slot;
         self
+    }
+
+    /// Installs the slot the composition root fills with the server's
+    /// [`ItemVisibility`] once it is built over this repository. The query
+    /// scope asks it whether the user can see a playlist or a box set before
+    /// it admits the playlists folder or a box-set library
+    /// (`UserViewManager.GetUserViews`); left empty, the scope admits both.
+    #[must_use]
+    pub fn with_visibility(mut self, slot: VisibilitySlot) -> Self {
+        self.visibility = slot;
+        self
+    }
+
+    /// The bound `IsVisible` evaluator, if the composition root installed one.
+    fn visibility(&self) -> Option<Arc<ItemVisibility>> {
+        bound_visibility(&self.visibility)
     }
 
     /// The paths Live TV is recording to, empty until the source is bound.
@@ -805,7 +848,7 @@ impl FerrofinItemRepository {
             // AddUserToQuery still grants the user's libraries after Parent is
             // cleared; DescendantOfId is not one of its confinement guards.
             return Ok(Some(
-                scope_to_user_libraries_prepared(&self.db, prepared)
+                scope_to_user_libraries_prepared(&self.db, self.visibility().as_deref(), prepared)
                     .await?
                     .unwrap_or_else(|| prepared.clone()),
             ));
@@ -876,7 +919,7 @@ impl FerrofinItemRepository {
             let mut resolved = filter.clone();
             resolved.parent_id = Uuid::nil();
             return Ok(Some(
-                scope_to_user_libraries(&self.db, &resolved)
+                scope_to_user_libraries(&self.db, self.visibility().as_deref(), &resolved)
                     .await?
                     .unwrap_or(resolved),
             ));
@@ -922,7 +965,7 @@ impl FerrofinItemRepository {
             return Ok(Some(resolved));
         }
         if !wants_parent && filter.top_parent_ids.is_empty() {
-            return scope_to_user_libraries(&self.db, filter).await;
+            return scope_to_user_libraries(&self.db, self.visibility().as_deref(), filter).await;
         }
 
         let mut resolved = None;
@@ -1687,7 +1730,8 @@ impl FerrofinItemRepository {
             .collect();
         // `AddUserToQuery` for the by-name tabs. A no-op for a query that is
         // already scoped (a browse under one library passes `ancestor_ids`).
-        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        let scoped =
+            scope_to_user_libraries(&self.db, self.visibility().as_deref(), filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let top_parents = to_guid_strings(&filter.top_parent_ids);
 
@@ -2562,23 +2606,31 @@ pub(crate) async fn query_user(
 /// The eight fields checked are exactly the eight the C# checks; any one of
 /// them already narrows the query, and Jellyfin leaves it alone then.
 ///
+/// The scope is the top parents of `GetUserViews(user)`, so the playlists
+/// folder and a box-set library are in it only while `visibility` finds a
+/// playlist or box set the user can see ([`without_itemless_linked_libraries`]).
+/// Without an evaluator (a repository built without
+/// [`FerrofinItemRepository::with_visibility`]) both stay in.
+///
 /// An empty scope means the user can see nothing, and C# guards it with a
 /// fresh guid so the query matches nothing rather than everything. This
 /// uses the placeholder id for the same purpose — deterministic, and a row
 /// every query already excludes.
 pub(crate) async fn scope_to_user_libraries(
     db: &Database,
+    visibility: Option<&ItemVisibility>,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let preferences = crate::query_restrictions::resolve(db, filter).await?;
     let prepared = preferences.as_ref().unwrap_or(filter);
-    Ok(scope_to_user_libraries_prepared(db, prepared)
+    Ok(scope_to_user_libraries_prepared(db, visibility, prepared)
         .await?
         .or(preferences))
 }
 
 async fn scope_to_user_libraries_prepared(
     db: &Database,
+    visibility: Option<&ItemVisibility>,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let Some(user) = filter.user.as_ref() else {
@@ -2596,25 +2648,108 @@ async fn scope_to_user_libraries_prepared(
         return Ok(None);
     }
 
-    let views = visible_views(db, user).await?;
-    let by_view = library_top_parents_by_view(db, &views).await?;
+    let views = visible_view_rows(db, user).await?;
+    let ids: Vec<Uuid> = views.iter().map(|view| view.id).collect();
+    let by_view = library_top_parents_by_view(db, &ids).await?;
+    let views = without_itemless_linked_libraries(views, &by_view, visibility, user).await?;
     // `GetTopParentIdsForQuery` per view: a collection folder becomes its
     // physical folders plus itself (what the rows a Ferrofin scan saved
     // carry, [`library_top_parents_by_view`]), and anything else — a Live TV
     // view, or any view on a Ferrofin-written database — stands for itself.
-    let mut scope: Vec<Uuid> = views
-        .iter()
-        .flat_map(|v| match by_view.get(v) {
-            Some(folders) => folders.clone(),
-            None => vec![*v],
-        })
-        .collect();
+    let mut scope = top_parents_of(views.iter().map(|view| view.id), &by_view);
     if scope.is_empty() {
         scope.push(Uuid::parse_str(PLACEHOLDER_ID).unwrap_or_else(|_| Uuid::nil()));
     }
     let mut resolved = filter.clone();
     resolved.top_parent_ids = scope;
     Ok(Some(resolved))
+}
+
+/// The top parents `views` stand for, in order: each library's entry in
+/// `by_view` ([`library_top_parents_by_view`]), and any other view itself.
+fn top_parents_of(
+    views: impl IntoIterator<Item = Uuid>,
+    by_view: &HashMap<Uuid, Vec<Uuid>>,
+) -> Vec<Uuid> {
+    views
+        .into_iter()
+        .flat_map(|view| match by_view.get(&view) {
+            Some(folders) => folders.clone(),
+            None => vec![view],
+        })
+        .collect()
+}
+
+/// 12.2 `UserViewManager.GetUserViews` (`UserViewManager.cs:62-73`) for the
+/// query scope: a playlists or boxsets library "only references linked
+/// items", so it is one of the user's views only while
+/// [`ItemVisibility::has_visible_item`] finds a `Playlist` (`BoxSet`) the user
+/// can see. Without that, a user with no playlist got the playlists folder
+/// itself (its `TopParentId` is its own id) in every unscoped recursive
+/// `/Items` answer, one row more than Jellyfin.
+///
+/// The probe names its own top parents, those of every root folder the user
+/// can see, playlists folder included (`folders.SelectMany(GetTopParentIds)`,
+/// `UserViewManager.cs:161-185`). It must: a probe naming no scope would be
+/// scoped by this very function. Each kind is asked at most once.
+async fn without_itemless_linked_libraries(
+    views: Vec<VisibleView>,
+    by_view: &HashMap<Uuid, Vec<Uuid>>,
+    visibility: Option<&ItemVisibility>,
+    user: &UserEntity,
+) -> Result<Vec<VisibleView>, ServiceError> {
+    let Some(visibility) = visibility else {
+        return Ok(views);
+    };
+    if views.iter().all(|view| view.linked_kind.is_none()) {
+        return Ok(views);
+    }
+    let root_folders = top_parents_of(
+        views
+            .iter()
+            .filter(|view| !view.user_view)
+            .map(|view| view.id),
+        by_view,
+    );
+    let mut known: HashMap<BaseItemKind, bool> = HashMap::new();
+    let mut kept = Vec::with_capacity(views.len());
+    for view in views {
+        if let Some(kind) = view.linked_kind {
+            let visible = if let Some(visible) = known.get(&kind) {
+                *visible
+            } else {
+                // Boxed: the evaluator's batch load would otherwise sit inline
+                // in every query future that scopes to the user's libraries.
+                let visible =
+                    Box::pin(visibility.has_visible_item(kind, user, &root_folders)).await?;
+                known.insert(kind, visible);
+                visible
+            };
+            if !visible {
+                continue;
+            }
+        }
+        kept.push(view);
+    }
+    Ok(kept)
+}
+
+/// The top parents of the root folders `user` can see — the libraries and
+/// the playlists folder, never a `UserView` — which is the scope
+/// `UserViewManager.HasVisibleItem` probes (`folders.SelectMany(
+/// GetTopParentIds)`, `UserViewManager.cs:161-185`).
+pub(crate) async fn root_folder_top_parents(
+    db: &Database,
+    user: &UserEntity,
+) -> Result<Vec<Uuid>, ServiceError> {
+    let roots: Vec<Uuid> = visible_view_rows(db, user)
+        .await?
+        .into_iter()
+        .filter(|view| !view.user_view)
+        .map(|view| view.id)
+        .collect();
+    let by_view = library_top_parents_by_view(db, &roots).await?;
+    Ok(top_parents_of(roots, &by_view))
 }
 
 /// The libraries `user` grouped into a `view_type` view: of the views the
@@ -2654,7 +2789,31 @@ pub(crate) async fn grouped_libraries(
     Ok(libraries)
 }
 
-/// The library views `user` may see, as item ids.
+/// The library views `user` may see, as item ids — the user root's children
+/// (`GetUserRootFolder().GetChildren(user, true)`) and the `UserView` rows,
+/// before `GetUserViews`' playlists and box-set gate (see
+/// [`visible_view_rows`]).
+async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+    Ok(visible_view_rows(db, user)
+        .await?
+        .into_iter()
+        .map(|view| view.id)
+        .collect())
+}
+
+/// One of the views [`visible_view_rows`] keeps.
+struct VisibleView {
+    id: Uuid,
+    /// A `UserView` row (Live TV, a playlists or a grouped view) — a derived
+    /// view, not a child of the user root.
+    user_view: bool,
+    /// What a playlists or boxsets library links to (`Playlist`, `BoxSet`):
+    /// the kind `GetUserViews` needs the user to see one of
+    /// ([`without_itemless_linked_libraries`]).
+    linked_kind: Option<BaseItemKind>,
+}
+
+/// The library views `user` may see.
 ///
 /// The `Folder.IsVisible` half of `AddUserToQuery`: a non-empty
 /// `BlockedMediaFolders` preference hides exactly those; otherwise a user
@@ -2664,16 +2823,23 @@ pub(crate) async fn grouped_libraries(
 /// so the Live TV view is in scope exactly when that call yields it — which
 /// is only while Live TV is available (see
 /// [`user_entity_ext::live_tv_enabled_for`]).
-async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+async fn visible_view_rows(
+    db: &Database,
+    user: &UserEntity,
+) -> Result<Vec<VisibleView>, ServiceError> {
     let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
         return Ok(Vec::new());
     };
     let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
         return Ok(Vec::new());
     };
-    // What `GET /Library/MediaFolders` lists, which is Jellyfin's
-    // `GetUserRootFolder().Children` — the libraries, the views, and the
-    // playlists folder created playlists hang off.
+    // The user root's children (`GetUserRootFolder().Children`, what
+    // `GET /Library/MediaFolders` lists): the libraries and the playlists
+    // folder created playlists hang off. Plus the `UserView` rows, which
+    // stand for themselves in the scope. `GetUserViews` then drops the
+    // playlists folder and a boxsets library the user sees nothing in
+    // ([`without_itemless_linked_libraries`]), which is why each row carries
+    // what it links to.
     //
     // BOTH playlists-folder kinds. An adopted database stores
     // `PlaylistsFolder` (10.11.8 has no `ManualPlaylistsFolder` class —
@@ -2684,8 +2850,11 @@ async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, Se
     let playlists_folder = stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default();
     let manual_playlists_folder =
         stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default();
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Type", "Path" FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#,
+    // A library's `CollectionType` lives in its `Data` blob; only those
+    // rows' blobs are read.
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Type", "Path", CASE WHEN "Type" = ?1 THEN "Data" END
+           FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#,
     )
     .bind(collection_folder)
     .bind(user_view)
@@ -2725,7 +2894,7 @@ async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, Se
 
     Ok(active
         .iter()
-        .filter_map(|(id, type_, _)| {
+        .filter_map(|(id, type_, _, data)| {
             let id = Uuid::parse_str(id).ok()?;
             // Neither a `UserView` (Live TV, Playlists) nor the playlists
             // folder is a media folder, so neither carries a visibility
@@ -2733,15 +2902,33 @@ async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, Se
             if live_tv_view == Some(id) {
                 return None;
             }
-            if type_ == user_view || type_ == playlists_folder || type_ == manual_playlists_folder {
-                return Some(id);
+            if type_ == user_view {
+                return Some(VisibleView {
+                    id,
+                    user_view: true,
+                    linked_kind: None,
+                });
+            }
+            if type_ == playlists_folder || type_ == manual_playlists_folder {
+                // `PlaylistsFolder.CollectionType` is the constant `playlists`.
+                return Some(VisibleView {
+                    id,
+                    user_view: false,
+                    linked_kind: Some(BaseItemKind::Playlist),
+                });
             }
             if blocked.contains(&id) {
                 return None;
             }
             match &enabled {
                 Some(allowed) if !allowed.contains(&id) => None,
-                _ => Some(id),
+                _ => Some(VisibleView {
+                    id,
+                    user_view: false,
+                    linked_kind: crate::item_visibility::linked_kind(
+                        crate::item_data::stored_collection_type(data.as_deref()).as_deref(),
+                    ),
+                }),
             }
         })
         .collect())
@@ -3071,7 +3258,7 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(None);
         }
         Ok(Some(
-            scope_to_user_libraries(&self.db, &filter)
+            scope_to_user_libraries(&self.db, self.visibility().as_deref(), &filter)
                 .await?
                 .unwrap_or(filter),
         ))
@@ -14048,3 +14235,7 @@ mod played_state_tests;
 #[cfg(test)]
 #[path = "item_repository/is_airing_tests.rs"]
 mod is_airing_tests;
+
+#[cfg(test)]
+#[path = "item_repository/linked_library_scope_tests.rs"]
+mod linked_library_scope_tests;

@@ -93,6 +93,8 @@ pub struct FerrofinServerApplicationHost {
     network_manager: Option<Arc<RwLock<NetworkManager>>>,
     http_bind: Option<IpAddr>,
     bound_http_port: AtomicU16,
+    /// The HTTPS port actually bound, recorded as the HTTP one is.
+    bound_https_port: AtomicU16,
     machine_name: String,
     /// The last-published server name (`Configuration.ServerName`), or `None`
     /// when empty — in which case the friendly name is the machine name.
@@ -129,6 +131,7 @@ impl FerrofinServerApplicationHost {
             paths,
             configuration_manager,
             bound_http_port: AtomicU16::new(network.http_port),
+            bound_https_port: AtomicU16::new(network.https_port),
             network,
             network_manager: None,
             http_bind: None,
@@ -155,6 +158,11 @@ impl FerrofinServerApplicationHost {
     /// Records the actual HTTP port after binding, including an ephemeral port.
     pub fn set_bound_http_port(&self, port: u16) {
         self.bound_http_port.store(port, Ordering::Relaxed);
+    }
+
+    /// Records the actual HTTPS port after binding, including an ephemeral port.
+    pub fn set_bound_https_port(&self, port: u16) {
+        self.bound_https_port.store(port, Ordering::Relaxed);
     }
 
     /// Marks core startup as complete (the composition root calls this once the
@@ -291,7 +299,7 @@ impl FerrofinServerApplicationHost {
         });
         let is_https = scheme.eq_ignore_ascii_case("https");
         let port = port.unwrap_or(if is_https {
-            self.network.https_port
+            self.https_port()
         } else {
             self.http_port()
         });
@@ -332,6 +340,8 @@ impl FerrofinServerApplicationHost {
     /// The port is `None` when absent or unparseable. IPv6 literals in
     /// brackets (`[::1]:8096`) are handled.
     fn parse_request_host(request: &RequestContext) -> Option<(String, Option<u16>)> {
+        // TODO(gl-813): behind a known proxy, upstream's `request.Host` (host
+        // and port) is the proxy's `X-Forwarded-Host` (ForwardedHeadersMiddleware).
         let host = request.header("host")?;
         if let Some(rest) = host.strip_prefix('[') {
             // IPv6 literal: [addr]:port
@@ -345,32 +355,21 @@ impl FerrofinServerApplicationHost {
         }
     }
 
-    /// Infers the request scheme from the forwarded-proto header, defaulting to
-    /// the host's listen mode.
-    fn request_scheme(&self, request: &RequestContext) -> String {
-        request.header("x-forwarded-proto").map_or_else(
-            || {
-                if self.network.listen_with_https {
-                    "https".to_owned()
-                } else {
-                    "http".to_owned()
-                }
-            },
-            str::to_owned,
-        )
+    /// The scheme the request arrived with (`request.Scheme`): the one the
+    /// API layer resolved from its listener and known proxies, else `http`.
+    fn request_scheme(request: &RequestContext) -> String {
+        request.scheme.clone().unwrap_or_else(|| "http".to_owned())
     }
-}
 
-#[async_trait]
-impl LocalApiAccess for FerrofinServerApplicationHost {
-    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+    /// `NetworkManager.GetBindAddress(null)` for the local access URL.
+    fn local_access_hostname(&self) -> String {
         // `NetworkManager.GetBindAddress(null)` (`ApplicationHost.cs:981`)
         // over its known interfaces: the first non-loopback one, local ones
         // first, else loopback. A specific address pinned at startup is the one
         // listener (`listen.rs`), so it is the address; a pinned `0.0.0.0`
         // serves IPv4 only, so the pick is the first local IPv4 interface,
         // else loopback. Without a network manager only loopback is known.
-        let hostname = match (self.http_bind, &self.network_manager) {
+        match (self.http_bind, &self.network_manager) {
             (Some(bind), _) if !bind.is_unspecified() => bind.to_string(),
             (bind, Some(manager)) => {
                 let manager = manager
@@ -389,8 +388,22 @@ impl LocalApiAccess for FerrofinServerApplicationHost {
                 }
             }
             (_, None) => Ipv4Addr::LOCALHOST.to_string(),
-        };
-        Ok(self.build_local_api_url(&hostname, None, None))
+        }
+    }
+}
+
+#[async_trait]
+impl LocalApiAccess for FerrofinServerApplicationHost {
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        Ok(self.build_local_api_url(&self.local_access_hostname(), None, None))
+    }
+
+    async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        Ok(self.build_local_api_url(
+            &self.local_access_hostname(),
+            Some("http"),
+            Some(self.http_port()),
+        ))
     }
 }
 
@@ -406,7 +419,7 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
     }
 
     fn https_port(&self) -> u16 {
-        self.network.https_port
+        self.bound_https_port.load(Ordering::Relaxed)
     }
 
     fn listen_with_https(&self) -> bool {
@@ -438,7 +451,7 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         if self.published_server_uri_by_request()
             && let Some((host, req_port)) = Self::parse_request_host(request)
         {
-            let scheme = self.request_scheme(request);
+            let scheme = Self::request_scheme(request);
             // C# passes -1 when Host omits the port, so UriBuilder omits it
             // rather than substituting the server's internal listen port.
             let port = Some(req_port.unwrap_or(if scheme.eq_ignore_ascii_case("https") {
@@ -628,16 +641,69 @@ mod tests {
         };
         let h = host(net).await;
         let req = RequestContext {
-            headers: vec![
-                ("Host".to_owned(), "media.lan:8096".to_owned()),
-                ("X-Forwarded-Proto".to_owned(), "http".to_owned()),
-            ],
+            headers: vec![("Host".to_owned(), "media.lan:8096".to_owned())],
+            scheme: Some("http".to_owned()),
             ..Default::default()
         };
         assert_eq!(
             h.get_smart_api_url(&req).await.unwrap(),
             "http://media.lan:8096"
         );
+    }
+
+    /// `GetSmartApiUrl(HttpRequest)` builds from `request.Scheme`, the scheme
+    /// the request came with, not from whether the server also listens with
+    /// HTTPS: a plain HTTP request is answered with an `http://` address.
+    #[tokio::test]
+    async fn the_request_scheme_wins_over_listening_with_https() {
+        let h = host(HostNetworkInfo {
+            enable_published_server_uri_by_request: true,
+            listen_with_https: true,
+            https_port: 8920,
+            ..Default::default()
+        })
+        .await;
+        for scheme in [None, Some("http")] {
+            let req = RequestContext {
+                headers: vec![("Host".to_owned(), "media.lan:8096".to_owned())],
+                scheme: scheme.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(
+                h.get_smart_api_url(&req).await.unwrap(),
+                "http://media.lan:8096"
+            );
+        }
+        let req = RequestContext {
+            headers: vec![("Host".to_owned(), "media.lan:8920".to_owned())],
+            scheme: Some("https".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            h.get_smart_api_url(&req).await.unwrap(),
+            "https://media.lan:8920"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_access_over_http_keeps_the_http_port_when_https_is_served() {
+        let h = host(HostNetworkInfo {
+            listen_with_https: true,
+            https_port: 8920,
+            ..Default::default()
+        })
+        .await;
+        h.set_bound_http_port(18096);
+        h.set_bound_https_port(18920);
+        assert_eq!(
+            h.get_api_url_for_local_access().await.expect("url"),
+            "https://127.0.0.1:18920"
+        );
+        assert_eq!(
+            h.get_http_api_url_for_local_access().await.expect("url"),
+            "http://127.0.0.1:18096"
+        );
+        assert_eq!(h.https_port(), 18920);
     }
 
     #[tokio::test]
@@ -650,10 +716,8 @@ mod tests {
         .await;
         for host in ["media.example.test", "media.example.test:443"] {
             let request = RequestContext {
-                headers: vec![
-                    ("Host".into(), host.into()),
-                    ("X-Forwarded-Proto".into(), "https".into()),
-                ],
+                headers: vec![("Host".into(), host.into())],
+                scheme: Some("https".into()),
                 ..Default::default()
             };
             assert_eq!(

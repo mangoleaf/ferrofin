@@ -278,6 +278,13 @@ impl NetworkManager {
         }
     }
 
+    /// The network configuration the manager was last given
+    /// (`GetNetworkConfiguration`).
+    #[must_use]
+    pub fn configuration(&self) -> &NetworkConfiguration {
+        &self.config
+    }
+
     /// Whether discovery should start for the next server lifetime.
     #[must_use]
     pub fn auto_discovery(&self) -> bool {
@@ -547,6 +554,9 @@ impl NetworkManager {
     ///
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
     /// whole chain is walkable.
+    ///
+    /// TODO(gl-184): the chain it gets has unparsable entries already dropped;
+    /// `ApplyForwarders` stops the walk at the first one instead.
     #[must_use]
     pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
         if self.known_proxies.is_empty() {

@@ -293,6 +293,8 @@ impl UserManager for OkUsers {
 #[derive(Default)]
 struct OkDto {
     seen_fields: std::sync::Mutex<Vec<Vec<ferrofin_model::querying::ItemFields>>>,
+    /// Whether the linked-children projection ran.
+    linked_children: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -332,6 +334,17 @@ impl DtoService for OkDto {
                 ..BaseItemDto::default()
             })
             .collect())
+    }
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.linked_children
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.get_base_item_dtos(items, options, user, None, true)
+            .await
     }
     async fn get_item_by_name_dto(
         &self,
@@ -411,7 +424,7 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<PlaylistCreationResult, ServiceError> {
         *self.created.lock().unwrap() = Some(request.clone());
         Ok(PlaylistCreationResult {
-            id: PLAYLIST_ID.to_string(),
+            id: PLAYLIST_ID.simple().to_string(),
         })
     }
     async fn update_playlist(
@@ -428,7 +441,13 @@ impl PlaylistManager for RecordingPlaylists {
         _playlist_id: Uuid,
         _user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![item_entity(ITEM_A), item_entity(ITEM_B)])
+        // Dashed upper case, as a Jellyfin-scanned database stores `Id`.
+        Ok([ITEM_A, ITEM_B]
+            .map(|id| BaseItemEntity {
+                id: id.to_string().to_uppercase(),
+                ..item_entity(id)
+            })
+            .into())
     }
     async fn add_user_to_shares(
         &self,
@@ -644,12 +663,54 @@ async fn create_playlist_from_body_returns_id() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: PlaylistCreationResult = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(result.id, PLAYLIST_ID.to_string());
+    // The manager's id passes through unchanged.
+    assert_eq!(result.id, PLAYLIST_ID.simple().to_string());
     let created = pl.created.lock().unwrap().clone().expect("recorded");
     assert_eq!(created.name.as_deref(), Some("Roadtrip"));
     assert_eq!(created.item_id_list, vec![ITEM_A]);
     // The caller's id is used when neither query nor body names one.
     assert_eq!(created.user_id, USER_ID);
+}
+
+/// `Public = createPlaylistRequest?.IsPublic` over C#'s `bool IsPublic = true`
+/// (v12.2 PlaylistsController.cs:99, CreatePlaylistDto.cs:44): a body without
+/// `IsPublic` creates an open playlist; only the bodiless query-string form
+/// leaves it to the manager's `Public ?? false`.
+#[tokio::test]
+async fn create_playlist_is_public_defaults_per_body() {
+    let cases: [(&str, Body, Option<bool>); 5] = [
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip"}"#),
+            Some(true),
+        ),
+        // Upstream's non-nullable `bool` rejects an explicit null (a 400);
+        // Ferrofin keeps reading it as unset, so the playlist is private.
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":null}"#),
+            None,
+        ),
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":false}"#),
+            Some(false),
+        ),
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":true}"#),
+            Some(true),
+        ),
+        ("/Playlists?name=Roadtrip", Body::empty(), None),
+    ];
+    for (uri, body, expected) in cases {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", uri, body).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let created = pl.created.lock().unwrap().clone().expect("recorded");
+        assert_eq!(created.public, expected, "{uri}: {expected:?}");
+    }
 }
 
 #[tokio::test]
@@ -719,6 +780,12 @@ async fn playlist_items_projects_the_fields_the_client_asked_for() {
         "asking for one field must not project everything — got {} fields: {fields:?}",
         fields.len()
     );
+    // `GetManageableItems()` → `ResolveLinkedChildren`: the members are
+    // projected as linked children, loaded with every field.
+    assert!(
+        dto.linked_children
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
 }
 
 #[tokio::test]
@@ -738,6 +805,8 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result.total_record_count, 2);
     assert_eq!(result.items.len(), 1);
+    // `ItemId?.ToString("N")` (v12.2 PlaylistsController.cs:559): 32 lower-case
+    // hex digits, whatever case the row's stored id has.
     assert_eq!(
         result.items[0].playlist_item_id.as_deref(),
         Some(ITEM_A.simple().to_string().as_str())
