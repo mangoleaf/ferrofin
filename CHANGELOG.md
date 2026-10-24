@@ -291,6 +291,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   virtual seasons it adds but not its pathless episodes, as Jellyfin's `FilterItem` does. It
   goes out `LibraryUpdateDuration` after the scan announces it, like every other library
   change. WASM plugins receive every batch of library changes as `LibraryChanged`
+- The `LibraryChanged` push tells each user about an added or changed item only when they may
+  see it on its own, as Jellyfin's `IsVisibleStandalone` check does: another user's private
+  playlist, or an item above the user's parental rating or behind a blocked tag, is no longer
+  named to them, nor a folder they cannot open
 - Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
@@ -435,6 +439,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   nothing
 - A request whose handler panics is answered `500` "Error processing request." and logged,
   as in Jellyfin. Before, its connection was dropped, over HTTP/2 with every other request on it
+- A season with more than 20 episodes that Jellyfin's aired-order rule cannot fully order (an
+  undated episode among dated ones without episode numbers, or an unnumbered one beside a
+  special placed before a later episode) is listed again: `GET /Shows/{id}/Episodes`, the
+  season's `GET /Items` and the scan's season premiere-date pass sort it the way Jellyfin's
+  stable sort does, instead of answering `500` or failing the scan
+- An M3U playlist is read line by line as it downloads and an HDHomeRun device's JSON is parsed
+  as it arrives, as Jellyfin does, instead of buffering the whole response: a large playlist is
+  no longer held whole in memory, a wrong playlist URL that serves a video stream keeps memory
+  flat (the guide refresh still waits on it, as Jellyfin's does), and a device answering with
+  something that is not JSON fails at once. A playlist whose first line follows a UTF-8
+  byte-order mark, or whose lines end with a lone carriage return, no longer loses channels
 - A new playlist is announced to the sessions that may see it as added, and renaming it,
   making it public or private, changing who it is shared with, moving an entry or handing it
   to a share when its owner is deleted announces it as changed and moves its `Etag`, as in
