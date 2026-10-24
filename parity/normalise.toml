@@ -164,13 +164,19 @@ reason = "A resized image is encoded by each server's own encoder, and ffmpeg's 
 # ── what upstream itself orders at random (gl-619) ──────────────────────────────────────────────────
 # Jellyfin answers these in a random order, so two answers never agree on which items a page holds: a
 # Random sort, every instant mix (MusicManager orders Random), the series, album and artist similar-items
-# providers, and the movie recommendations' baselines. The page's total and type, and the categories'
-# number and kinds, are still compared.
+# providers, and the movie recommendations' baselines. The page's total and type (but for a song's
+# mix, whose total depends on the draw), and the categories' number and kinds, are still compared.
 [[rule]]
 paths = ["Items"]
 kind = "opaque"
 requests = ["*.sortBy.random", "GetInstantMix*", "GetSimilarShows", "screen-series-similar", "GetSimilarAlbums", "GetSimilarArtists"]
 reason = "Upstream orders these at random: a Random sort, instant mixes and the series, album and artist similar-items providers."
+
+[[rule]]
+paths = ["TotalRecordCount"]
+kind = "opaque"
+requests = ["GetInstantMixFromSong"]
+reason = "A song's instant mix is the song, then 200 random songs of its genres without it: 201, or 200 when the draw held the song."
 
 [[rule]]
 paths = ["[].BaselineItemName", "[].CategoryId", "[].Items"]
@@ -187,3 +193,13 @@ kind = "opaque"
 requests = ["GetResumeItems.fields.providerids", "edge-sort-year-name-desc", "edge-sort-rating-desc", "edge-sort-premiere-asc",
             "edge-sort-mixed-orders", "edge-sort-series-name-desc", "edge-non-null-series"]
 reason = "Jellyfin's in-memory user data keeps the first key computed for an item, which depends on the order the concurrent reads reached it. This also hides Ferrofin's GUID key for a never-written item (gl-675, gl-830) on these requests; the user-data routes and the playlist and folder listings still compare it."
+
+# ── what a remote service answers (gl-619) ──────────────────────────────────────────────────────────
+# Each server asks the live service itself; the service, not the server, decides the order of results
+# it scores equally.
+[[rule]]
+paths = ["$"]
+kind = "unordered"
+by = "Name"
+requests = ["GetMusicAlbumRemoteSearchResults"]
+reason = "Each server asks the live MusicBrainz search, which returns equally scored releases in no fixed order."
