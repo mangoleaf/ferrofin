@@ -272,6 +272,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
+  carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
+  had already run, and cleared it, so a user with a maximum parental rating saw those episodes
+  in lists, counts, Latest, Resume and Next Up until the next full library scan
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

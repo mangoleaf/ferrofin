@@ -1357,7 +1357,9 @@ impl FerrofinItemPersistenceService {
     /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
     /// — Jellyfin's `MigrateRatingLevels` routine, as 12.2 re-dated it
     /// (`Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs`),
-    /// recorded in `FerrofinMeta` so later boots skip it.
+    /// recorded in `FerrofinMeta` so later boots skip it. Like upstream, it
+    /// does not run where `__EFMigrationsHistory` already records that routine
+    /// (an adopted 12.2 database); the key is recorded and no row is touched.
     ///
     /// In one transaction, for each DISTINCT `OfficialRating`: a null/empty
     /// rating clears both columns; any other resolves through the localization
@@ -1384,7 +1386,22 @@ impl FerrofinItemPersistenceService {
         // `rating_levels_v121` (12.1) and `rating_levels_all_countries` (the
         // first pass with every country's table loaded).
         const META_KEY: &str = "rating_levels_v122";
+        // The upstream routine this key ports. Jellyfin runs a routine only
+        // while its id is missing from `__EFMigrationsHistory`, and on an
+        // adopted 12.2 database it is there: the routine ran and Jellyfin's
+        // later scans re-derived the scores it cleared (an unrated episode's
+        // is its series'). Re-running it would clear them until our next scan.
+        const JELLYFIN_ROUTINE: &str = "20260915120000_MigrateRatingLevels";
         if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        if self
+            .db
+            .jellyfin_migration_applied(JELLYFIN_ROUTINE)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        {
+            self.mark_repair_done(META_KEY).await?;
             return Ok(0);
         }
         let ratings: Vec<Option<String>> =
@@ -11665,6 +11682,58 @@ mod tests {
                 "{rating}"
             );
         }
+    }
+
+    /// Jellyfin runs `MigrateRatingLevels` once, keyed by its id in
+    /// `__EFMigrationsHistory`, and its later scans give unrated episodes back
+    /// their series' score. An adopted 12.2 database already ran 12.2's
+    /// routine, so the repair must leave those scores alone; one that only ran
+    /// 12.1's still gets 12.2's pass, which clears them as upstream does.
+    #[rstest::rstest]
+    #[case::ran_on_jellyfin_12_2("20260915120000_MigrateRatingLevels", Some(13))]
+    #[case::ran_on_jellyfin_12_1("20260910120000_MigrateRatingLevels", None)]
+    #[tokio::test]
+    async fn repair_rating_levels_skips_a_routine_jellyfin_already_ran(
+        #[case] recorded_id: &str,
+        #[case] expected_score: Option<i64>,
+    ) {
+        use crate::test_support::{fetch_item, save_item, seed_named_item};
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        sqlx::query(
+            r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("history table");
+        sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.0.0')"#)
+            .bind(recorded_id)
+            .execute(db.writer())
+            .await
+            .expect("history row");
+        // An unrated episode carrying its PG-13 series' score, as a 12.2 scan
+        // leaves it.
+        let episode = Uuid::from_u128(0x7D01);
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
+        let mut row = fetch_item(&db, episode).await;
+        row.official_rating = None;
+        row.inherited_parental_rating_value = Some(13);
+        row.inherited_parental_rating_sub_value = None;
+        save_item(&db, &row).await;
+
+        service
+            .repair_rating_levels(&localization)
+            .await
+            .expect("repair");
+
+        let row = fetch_item(&db, episode).await;
+        assert_eq!(row.inherited_parental_rating_value, expected_score);
+        assert_eq!(
+            db.meta_get("rating_levels_v122").await.expect("meta"),
+            Some("1".to_owned()),
+            "either way the key is recorded"
+        );
     }
 
     /// `series_key_scope`: the language falls through row → library → server,
