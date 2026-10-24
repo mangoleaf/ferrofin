@@ -1677,11 +1677,13 @@ impl FerrofinStreamStatePlanner {
         }));
         // The rest of `GetInputArgument`: an external subtitle the job embeds
         // or overlays, then an external audio track, as the inputs the maps
-        // and the overlay pads below number 1 and 2.
+        // and the overlay pads below number 1 and 2, each on the media
+        // file's clock.
         args.extend(
             ferrofin_mediaencoding::encoding_helper::helper::external_stream_input_arguments(
                 state,
                 fast_seek.as_deref(),
+                caps.ffmpeg_version(),
             ),
         );
 
@@ -4441,22 +4443,20 @@ mod tests {
             .unwrap();
 
         let args = &plan.arguments;
-        assert_eq!(
-            inputs_after_the_media(args),
-            [
-                "-analyzeduration",
-                "200M",
-                "-probesize",
-                "1G",
-                "-ss",
-                "90000000",
-                "-canvas_size",
-                "1920x1080",
-                "-i",
-                "file:/media/movie.en.sup",
-            ],
-            "{args:?}"
-        );
+        // The NVENC probe reports ffmpeg 7.0.1, which takes `-isync`: the
+        // sidecar is then read from its start on the movie's clock. The plain
+        // probe reports no version, which keeps upstream's seeked input.
+        let timing: &[&str] = if hardware {
+            &["-canvas_size", "1920x1080", "-isync", "0"]
+        } else {
+            &["-ss", "90000000", "-canvas_size", "1920x1080"]
+        };
+        let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
+            .into_iter()
+            .chain(timing.iter().copied())
+            .chain(["-i", "file:/media/movie.en.sup"])
+            .collect();
+        assert_eq!(inputs_after_the_media(args), expected, "{args:?}");
         let joined = args.join(" ");
         assert!(joined.contains("[1:0]"), "{joined}");
         assert!(joined.contains("-map 1:0 -sn"), "{joined}");
