@@ -1980,9 +1980,14 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
         }
         qb.push(")");
     }
+    // `+`: a plan pin, like `Type` above. Unpinned, the planner drives the
+    // semijoin from every content row of the media type
+    // (`IX_BaseItems_MediaType_…`, `MediaType=?`) and probes the value per
+    // row — `/Artists?mediaTypes=Video` walked 10k videos per artist: 2.6 s for
+    // an empty page on the gl-637 corpus; pinned, the artist's own map rows.
     if !media_types.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"ci."MediaType""#, media_types);
+        push_in_list(qb, r#"+ci."MediaType""#, media_types);
     }
     if !ancestors.is_empty() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = ci."Id" AND "#);
@@ -8798,6 +8803,55 @@ mod tests {
             );
             assert!(
                 !plan.iter().any(|d| d.contains("IX_BaseItems_ParentId")),
+                "{plan:#?}"
+            );
+        }
+    }
+
+    /// Plan pin for the by-name semijoin under a media-type filter
+    /// (`/Artists?mediaTypes=Video`): each of the value's map rows reaches its
+    /// item by the item's primary key, with or without the user's libraries.
+    /// Driven from `IX_BaseItems_MediaType_…` instead, every artist walked every
+    /// item of that media type: 2.6 s for an empty page on the gl-637 corpus.
+    #[tokio::test]
+    async fn by_name_semijoin_under_a_media_type_probes_items_by_id() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery::default();
+        let type_ints = [i64::from(i32::from(ItemValueType::Artist))];
+        let media_types = ["Video".to_owned()];
+        let libraries = to_guid_strings(&[Uuid::from_u128(0x8671), Uuid::from_u128(0x8672)]);
+        for top_parents in [&libraries[..], &[]] {
+            let scope = ByNameScope {
+                filter: &filter,
+                type_ints: &type_ints,
+                content_type_names: &[],
+                exclude_type_names: &[],
+                media_types: &media_types,
+                ancestors: &[],
+                top_parents,
+            };
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Type" = "#);
+            qb.push_bind(stored_type_name(BaseItemKind::MusicArtist).expect("stored"));
+            push_value_exists(&mut qb, &scope, InnerScope::Page);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|d| d == "SEARCH ci USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.contains("IX_BaseItems_MediaType")),
                 "{plan:#?}"
             );
         }
