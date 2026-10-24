@@ -390,6 +390,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Boot stages are now logged at `info`
 - A recursive `/Items` request sorted by `AiredEpisodeOrder` orders by sort name, as Jellyfin
   does, and a folder's children sorted by it use the aired-episode comparer
+- `/Items?ids=` and `/Trailers?ids=` without a `sortBy` return the items in the order their
+  ids were requested, as Jellyfin does, instead of in sort-name order
 
 ## [1.0.0] - 2026-09-05
 

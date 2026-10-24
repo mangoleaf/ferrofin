@@ -1296,14 +1296,6 @@ kind = "value"
 issue = 862
 reason = "A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order."
 
-# Ferrofin returns explicitly requested ids in SortName order, not in request order.
-[[entry]]
-request = "edge-fields-all"
-path = "Items[].Id"
-kind = "value"
-issue = 852
-reason = "Ferrofin returns explicitly requested ids in SortName order, not in request order."
-
 # An unused API key's DateLastActivity is 1970-01-01, not 0001-01-01.
 [[entry]]
 request = "RevokeKey/key"
