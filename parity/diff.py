@@ -708,6 +708,91 @@ def load_ledger(path, source=None):
     return entries
 
 
+# ── filed differences (filed.toml) ──────────────────────────────────────────
+@dataclass(frozen=True)
+class FiledEntry:
+    request: str
+    path: str
+    kinds: tuple
+    issue: int
+
+
+def load_filed(path):
+    """The differences already filed as GitLab issues: still new (they gate until fixed or ledgered), but
+    the report and new-differences.json name the issue, and `findings` does not offer them again."""
+    data = tomllib.loads(Path(path).read_text())
+    unknown = set(data) - {"version", "filed"}
+    if unknown:
+        raise ParityError(f"{path}: unknown key(s) {', '.join(sorted(unknown))}")
+    entries = []
+    for number, row in enumerate(data.get("filed", []), 1):
+        where = f"{path}: filed {number}"
+        unknown = set(row) - {"request", "path", "kind", "issue"}
+        if unknown:
+            raise ParityError(f"{where}: unknown key(s) {', '.join(sorted(unknown))}")
+        for key in ("request", "path"):
+            if not isinstance(row.get(key), str) or not row[key].strip():
+                raise ParityError(f"{where}: `{key}` is required")
+        kinds = row.get("kind")
+        kinds = [kinds] if isinstance(kinds, str) else kinds
+        if not isinstance(kinds, list) or not kinds or set(kinds) - set(KINDS):
+            raise ParityError(f"{where}: `kind` is required: one or more of {', '.join(KINDS)}")
+        issue = row.get("issue")
+        if isinstance(issue, bool) or not isinstance(issue, int) or issue <= 0:
+            raise ParityError(f"{where}: `issue` is a GitLab issue number")
+        entries.append(FiledEntry(row["request"], row["path"], tuple(kinds), issue))
+    return entries
+
+
+def filed_issue(entries, request_id, difference):
+    """The issue a difference was filed as, or None. Paths are matched with their image-tag keys as
+    `<tag>` (how `findings` prints them), so one entry covers a blurhash map's every tag."""
+    path = HEX_KEY.sub("<tag>", difference.path)
+    for entry in entries:
+        if fnmatch.fnmatchcase(request_id, entry.request) and HEX_KEY.sub("<tag>", entry.path) == path and difference.kind in entry.kinds:
+            return entry.issue
+    return None
+
+
+def unused_filed(entries, results):
+    """The filed entries no difference of the run matched: fixed, or no longer sent."""
+    unused = []
+    for entry in entries:
+        if not any(filed_issue([entry], r["id"], Difference(d["path"], d["at"], d["kind"], d["oracle"], d["ferrofin"]))
+                   for r in results for d in r["differences"] if not d["ledger"]):
+            unused.append({"request": entry.request, "path": entry.path, "issue": entry.issue})
+    return unused
+
+
+def normalised(body, rules):
+    """`(body as the comparison saw it, the paths of the rules that changed it)`: an opaque value is
+    `<opaque>`, an opaque-keys object's keys are `<key N>` in the order of their values, an unordered
+    array is sorted by its key. The bodies new-differences.json carries for filing."""
+    by_path = {p: rule for rule in rules for p in rule.paths}
+    applied = set()
+
+    def walk(value, path):
+        rule = by_path.get(path)
+        if rule and rule.kind == "opaque":
+            applied.add(path)
+            return value if value is None else "<opaque>"
+        if isinstance(value, dict):
+            if rule and rule.kind == "opaque-keys":
+                applied.add(path)
+                ordered = sorted(value.values(), key=lambda item: json.dumps(item, sort_keys=True))
+                return {f"<key {n}>": walk(item, f"{path}.{{key}}") for n, item in enumerate(ordered, 1)}
+            return {key: walk(item, f"{path}.{key}" if path else key) for key, item in value.items()}
+        if isinstance(value, list):
+            if rule and rule.kind == "unordered" and all(isinstance(x, dict) and rule.by in x for x in value):
+                applied.add(path)
+                value = sorted(value, key=lambda x: str(x[rule.by]))
+            return [walk(item, f"{path}[]") for item in value]
+        return value
+
+    shown = walk(body, "")
+    return shown, sorted(applied)
+
+
 def matching_entry(entries, request_id, difference):
     for entry in entries:
         if (fnmatch.fnmatchcase(request_id, entry.request) and entry.path == difference.path
@@ -757,7 +842,7 @@ CONCURRENCY_RANGE = (1, 8)
 
 
 def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries, request_timeout, deadline,
-                 now=time.monotonic, wall=time.time, send=fetch, reset=None, concurrency=1):
+                 now=time.monotonic, wall=time.time, send=fetch, reset=None, concurrency=1, filed=()):
     """Send every read to both servers, `concurrency` pairs at a time (so each server has at most that many
     in flight), then each write one at a time, each on a fresh database copy (`reset(timeout)` gives both
     servers one and returns new tokens), after its setup steps and followed by its read-backs, until
@@ -810,7 +895,8 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
             entry = matching_entry(entries, request.id, difference)
             rows.append({**difference.as_dict(), "ledger": entry.link() if entry else None,
                          "ledger_reason": entry.reason if entry else None,
-                         "ledger_entry": entries.index(entry) if entry else None})
+                         "ledger_entry": entries.index(entry) if entry else None,
+                         "filed": None if entry else filed_issue(filed, request.id, difference)})
         if state == "differences" and all(row["ledger"] for row in rows):
             state = "ledgered"
         result = {"id": request.id, "method": request.method, "target": paths["oracle"], "source": request.source,
@@ -958,7 +1044,8 @@ def difference_rows(result, only_new):
     for d in result["differences"]:
         if bool(d["ledger"]) != only_new:
             yield [f"<code>{esc(result['id'])}</code>", f"<code>{esc(d['at'])}</code>", esc(d["kind"]),
-                   f"<code>{esc(d['oracle'])}</code>", f"<code>{esc(d['ferrofin'])}</code>"]
+                   f"<code>{esc(d['oracle'])}</code>", f"<code>{esc(d['ferrofin'])}</code>",
+                   esc(f"gl-{d['filed']}") if d.get("filed") else "<span class='mut'>not yet</span>"]
 
 
 def render(summary):
@@ -980,7 +1067,7 @@ def render(summary):
     new = [r for r in results if r["state"] == "differences"]
     out.append(f"<h2>New differences ({sum(1 for r in new for d in r['differences'] if not d['ledger'])})</h2>")
     if new:
-        out.append(table(["Request", "Where", "Kind", "Jellyfin", "Ferrofin"],
+        out.append(table(["Request", "Where", "Kind", "Jellyfin", "Ferrofin", "Filed as"],
                          [row for r in new for row in difference_rows(r, True)]))
         for r in new:
             out.append(f"<details open><summary><code>{esc(r['method'])} {esc(r['target'])}</code> "
@@ -1031,6 +1118,10 @@ def render(summary):
                          [[f"<code>{esc(w['method'])} {esc(w['id'])}</code>", f"{w['reset_s']:.1f} s", esc(w["state"]),
                            "<br>".join(f"<code>{esc(r['id'])}</code> {esc(r['state'])}" for r in results if r.get("of") == w["id"]) or "none"]
                           for w in writes]))
+    stale_filed = summary.get("unused_filed", [])
+    if stale_filed:   # fixed, or no longer sent: the entry can leave filed.toml
+        out.append("<h2>Filed differences that matched nothing</h2><ul>" + "".join(
+            f"<li><code>{esc(u['request'])} {esc(u['path'])}</code> <span class='mut'>gl-{esc(u['issue'])}</span></li>" for u in stale_filed) + "</ul>")
     clean = [r for r in results if r["state"] == "match"]
     out.append(f"<h2>Identical ({len(clean)})</h2>")
     out.append(table(["Request", "Jellyfin ms", "Ferrofin ms"],
@@ -1092,6 +1183,71 @@ def write_results(out, summary):
     (out / "report.html").write_text(render(summary))
 
 
+def new_differences(results, rules):
+    """new-differences.json: every request with a difference no ledger entry accepts, with the request,
+    the field paths, both bodies as the comparison saw them, the rules that changed them, and the issue a
+    difference was filed as (filed.toml), for filing them as issues (`diff.py findings`)."""
+    entries = []
+    for r in results:
+        new = [d for d in r["differences"] if not d["ledger"]]
+        if not new:
+            continue
+        applicable = rules_for(rules, r["id"])
+        bodies, applied = {}, set()
+        for side in ROLES:
+            text = (r.get("bodies") or {}).get(side, "")
+            try:
+                bodies[side], used = normalised(json.loads(text), applicable)
+                applied |= set(used)
+            except ValueError:
+                bodies[side] = text   # not JSON, or cut short (stored()): as kept
+        entries.append({"request": r["id"], "method": r["method"], "target": r["target"],
+                        **({"ferrofin_target": r["ferrofin_target"]} if "ferrofin_target" in r else {}),
+                        "source": r["source"], "file": r.get("file", ""),
+                        "status": {"oracle": r["oracle"]["status"] or r["oracle"]["error"], "ferrofin": r["ferrofin"]["status"] or r["ferrofin"]["error"]},
+                        "differences": [{**{key: d[key] for key in ("path", "at", "kind", "oracle", "ferrofin")}, "filed": d.get("filed")} for d in new],
+                        "bodies": bodies, "rules_applied": sorted(applied)})
+    return {"version": 1, "requests": entries}
+
+
+#: How much of each body a `findings` section shows (an issue's text stays readable).
+FINDINGS_BODY_CHARS = 4000
+#: A 32-hex path segment: an image tag used as a key. `findings` groups them as one.
+HEX_KEY = re.compile(r"(?<=\.)[0-9a-f]{32}(?=\.|$)")
+
+
+def findings(new):
+    """new-differences.json as Markdown for filing: one section per field path and kind not filed yet
+    (the dedupe key of the issue tracker, beside the request pattern), each with the requests that show it
+    and the first one's values and bodies."""
+    groups = {}
+    for entry in new["requests"]:
+        for d in entry["differences"]:
+            if not d.get("filed"):
+                # an image tag as a key (a blurhash map): one group for every tag, not one per image
+                path = HEX_KEY.sub("<tag>", d["path"])
+                groups.setdefault((path, d["kind"]), []).append((entry, d))
+    requests_of = lambda rows: len({entry["request"] for entry, _ in rows})
+    out = [f"# New parity differences: {len(groups)} not filed yet\n"]
+    for (path, kind), rows in sorted(groups.items(), key=lambda item: (-requests_of(item[1]), item[0])):
+        first, d = rows[0]
+        ids = sorted({entry["request"] for entry, _ in rows})
+        out.append(f"## `{path}` ({kind}) in {len(ids)} request(s)\n")
+        out.append(f"- requests: {', '.join(f'`{i}`' for i in ids[:20])}{' …' if len(ids) > 20 else ''}")
+        out.append(f"- first: `{first['method']} {first['target']}` ({first['source']})")
+        out.append(f"- at `{d['at']}`: Jellyfin `{d['oracle']}`, Ferrofin `{d['ferrofin']}`")
+        if first["rules_applied"]:
+            out.append(f"- normalisation rules applied: {', '.join(f'`{p}`' for p in first['rules_applied'])}")
+        for side, name in (("oracle", "Jellyfin"), ("ferrofin", "Ferrofin")):
+            body = first["bodies"][side]
+            text = body if isinstance(body, str) else json.dumps(body, indent=1, ensure_ascii=False)
+            cut = len(text) > FINDINGS_BODY_CHARS
+            note = f" (cut at {FINDINGS_BODY_CHARS} characters; the whole body is in new-differences.json)" if cut else ""
+            out.append(f"\n{name} (normalised){note}:\n````json\n{text[:FINDINGS_BODY_CHARS]}\n````")
+        out.append("")
+    return "\n".join(out)
+
+
 def read_run(out):
     """The run's own metadata (run.json), or {} when it is missing or unreadable: a report of a run that
     failed early is the one most likely to find it broken."""
@@ -1110,6 +1266,7 @@ def check_inputs(args, ids=None):
     rules = load_rules(args.normalise)
     check_rule_scopes(rules, every_id(requests))
     entries = load_ledger(args.ledger, args.source)
+    load_filed(args.filed)   # an invalid links file is refused before anything boots, like the ledger
     return requests, rules, entries
 
 
@@ -1166,6 +1323,7 @@ def command_run(args):
     found = discover(args.oracle_url, tokens["oracle"], {name: spec[name] for name in sorted(used_names(requests))}, ids, args.request_timeout)
     ids = {**ids, "found": found}
     resetter = ResetCommand(args.reset_command) if args.reset_command else None
+    filed = load_filed(args.filed)
 
     def reset(timeout):
         resetter(timeout)
@@ -1186,7 +1344,7 @@ def command_run(args):
     try:
         outcome = run_requests(requests, ids, args.oracle_url, args.ferrofin_url, tokens, rules, entries,
                                args.request_timeout, args.deadline, reset=reset if resetter else None,
-                               concurrency=args.concurrency)
+                               concurrency=args.concurrency, filed=filed)
     finally:
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
@@ -1203,8 +1361,10 @@ def command_run(args):
                "request_timeout_s": args.request_timeout, "cap_s": run.get("cap_s"),
                "unused_rules": [{"paths": list(r.paths), "reason": r.reason} for r in rules if r not in outcome.used],
                "unused_ledger": [{"request": e.request, "path": e.path, "link": e.link()} for index, e in enumerate(entries)
-                                 if index not in matched]}
+                                 if index not in matched],
+               "unused_filed": unused_filed(filed, results)}
     write_results(args.out, summary)
+    (Path(args.out) / "new-differences.json").write_text(json.dumps(new_differences(results, rules), indent=1, ensure_ascii=False))
     print(f"parity: {verdict}: {reason}; report: {Path(args.out) / 'report.html'}")
     return exit_code(verdict)
 
@@ -1215,6 +1375,7 @@ def command_failure(args):
                "requests": [], "resets": 0, "elapsed_s": time.time() - run["started"] if "started" in run else 0.0, "run": run, "request_timeout_s": None,
                "cap_s": run.get("cap_s"), "unused_rules": [], "unused_ledger": []}
     write_results(args.out, summary)
+    (Path(args.out) / "new-differences.json").write_text(json.dumps(new_differences([], []), indent=1))
     print(f"parity: run failed: {args.reason}; report: {Path(args.out) / 'report.html'}")
     return 1
 
@@ -1230,6 +1391,7 @@ def build_parser():
         p.add_argument("--ledger", default=str(HERE / "ledger.toml"))
         p.add_argument("--source", default=None, help="the Rust file holding handlers::VERIFIED (tests)")
         p.add_argument("--discover", default=str(HERE / "discover.toml"), help="names read from the oracle for {found.*}")
+        p.add_argument("--filed", default=str(HERE / "filed.toml"), help="the differences already filed as issues")
 
     run = sub.add_parser("run")
     inputs(run)
@@ -1249,6 +1411,8 @@ def build_parser():
     log.add_argument("--url", required=True)
     log.add_argument("--ids", required=True)
     log.add_argument("--timeout", type=int, default=REQUEST_TIMEOUT_DEFAULT_S)
+    find = sub.add_parser("findings", help="print a run's new differences not filed yet as Markdown, for filing")
+    find.add_argument("--out", required=True, help="the run directory")
     fail = sub.add_parser("failure")
     fail.add_argument("--out", required=True)
     fail.add_argument("--reason", required=True)
@@ -1266,6 +1430,9 @@ def main(argv):
         if args.command == "check":
             requests, rules, entries = check_inputs(args, json.loads(Path(args.ids).read_text()) if args.ids else None)
             print(f"parity: {len(requests)} request(s), {len(rules)} rule(s), {len(entries)} ledger entr{'y' if len(entries) == 1 else 'ies'}: valid")
+            return 0
+        if args.command == "findings":
+            print(findings(json.loads((Path(args.out) / "new-differences.json").read_text())))
             return 0
         if args.command == "login":
             print(login(args.url, json.loads(Path(args.ids).read_text()), args.timeout))
