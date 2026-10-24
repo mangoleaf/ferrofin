@@ -1,5 +1,6 @@
 //! Port of `AttachmentExtractor`.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::encoder::quote;
@@ -267,11 +268,12 @@ where
             if self.io.file_exists(&path) {
                 continue;
             }
-            dump.push_str(&format!(
+            let _ = write!(
+                dump,
                 "-dump_attachment:{} {} ",
                 attachment.index,
                 quote(&path)
-            ));
+            );
             missing.push(path);
         }
         if missing.is_empty() {
