@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use ferrofin_util::stream_extensions::LineReader;
 use regex::Regex;
 
 /// A single channel parsed from an M3U tuner playlist.
@@ -42,24 +43,84 @@ pub struct M3uChannel {
     pub url: String,
 }
 
-/// Parses the body of an M3U tuner playlist into its channel list.
+/// Parses the body of an M3U tuner playlist into its channel list: the
+/// playlist's bytes through [`M3uParser`].
+///
+/// The text is read as a .NET `StreamReader` reads the bytes, so a line ends
+/// at `\n`, `\r` or `\r\n` and a leading byte-order mark is dropped.
+#[must_use]
+pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
+    let mut parser = M3uParser::new();
+    parser.push(content.as_bytes());
+    parser.finish()
+}
+
+/// Reads an M3U tuner playlist into its channel list as its bytes arrive.
+///
+/// Port of `M3uParser.Parse`/`GetChannelsAsync` (v12.2 M3uParser.cs:39-46,72-114),
+/// which reads the playlist with `new StreamReader(stream)` and
+/// `ReadAllLinesAsync`: only the current line and the channels so far are
+/// held, never the whole playlist. The text is decoded as that reader decodes
+/// it (see [`LineReader`]).
 ///
 /// Lines that are not `#EXTINF`/URL pairs (including `#EXTM3U`, blank lines and
 /// unknown `#`-directives) are skipped, matching Jellyfin's lenient parsing. An
 /// `#EXTINF` with no following URL line is dropped, and so is an entry whose
 /// URL line fails [`is_valid_channel_url`].
-#[must_use]
-pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
-    let mut channels = Vec::new();
-    // The `#EXTINF` text awaiting its URL line: the number can come from the
-    // URL, so the entry is parsed once both are known.
-    let mut pending: Option<&str> = None;
-    let mut skipped = 0usize;
+#[derive(Debug, Default)]
+pub struct M3uParser {
+    /// Splits the bytes into lines.
+    lines: LineReader,
+    /// What has been read so far.
+    state: ParseState,
+}
 
-    for raw in content.lines() {
+/// The lines an [`M3uParser`] has read, folded.
+#[derive(Debug, Default)]
+struct ParseState {
+    /// The channels found so far.
+    channels: Vec<M3uChannel>,
+    /// The `#EXTINF` text awaiting its URL line: the number can come from the
+    /// URL, so the entry is parsed once both are known.
+    pending: Option<String>,
+    /// How many entries were dropped for an invalid stream URL.
+    skipped: usize,
+}
+
+impl M3uParser {
+    /// A parser at the start of a playlist.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads `chunk`, the playlist's next bytes.
+    pub fn push(&mut self, chunk: &[u8]) {
+        let state = &mut self.state;
+        self.lines.push(chunk, |line| state.push_line(line));
+    }
+
+    /// Ends the playlist and answers its channels.
+    #[must_use]
+    pub fn finish(self) -> Vec<M3uChannel> {
+        let mut state = self.state;
+        self.lines.finish(|line| state.push_line(line));
+        if state.skipped > 0 {
+            tracing::warn!(
+                skipped = state.skipped,
+                "live tv: skipped M3U channel entries with invalid stream URLs"
+            );
+        }
+        state.channels
+    }
+}
+
+impl ParseState {
+    /// Reads one line of the playlist (`GetChannelsAsync`'s loop body).
+    fn push_line(&mut self, raw: &str) {
         let line = raw.trim();
         if line.is_empty() {
-            continue;
+            return;
         }
         if let Some(rest) = line
             .get(..EXTINF.len())
@@ -67,33 +128,26 @@ pub fn parse_m3u(content: &str) -> Vec<M3uChannel> {
             .map(|_| line[EXTINF.len()..].trim())
         {
             // `string.IsNullOrWhiteSpace(extInf)`: an empty header waits for none.
-            pending = Some(rest).filter(|rest| !rest.is_empty());
+            self.pending = Some(rest.to_owned()).filter(|rest| !rest.is_empty());
         } else if line.starts_with('#') {
             // #EXTM3U / #EXTVLCOPT / #EXTGRP / other directives — ignored.
-        } else if let Some(extinf) = pending.take() {
+        } else if let Some(extinf) = self.pending.take() {
             // `M3uParser.GetChannelsAsync` drops the entry and clears the
             // pending `#EXTINF` (`take` already did). Upstream warns per entry;
-            // that volume scales with the playlist, so one count is warned below.
+            // that volume scales with the playlist, so one count is warned in
+            // `finish`.
             if !is_valid_channel_url(line) {
                 tracing::debug!(
                     path = line,
                     "live tv: skipping M3U channel entry with an invalid stream URL"
                 );
-                skipped += 1;
-                continue;
+                self.skipped += 1;
+                return;
             }
-            channels.push(parse_extinf(extinf, line));
+            self.channels.push(parse_extinf(&extinf, line));
         }
         // A bare URL with no preceding #EXTINF is ignored (no metadata).
     }
-
-    if skipped > 0 {
-        tracing::warn!(
-            skipped,
-            "live tv: skipped M3U channel entries with invalid stream URLs"
-        );
-    }
-    channels
 }
 
 /// `M3uParser.ExtInfPrefix`, matched case-insensitively.
@@ -483,5 +537,37 @@ mod tests {
     fn empty_input_yields_no_channels() {
         assert!(parse_m3u("").is_empty());
         assert!(parse_m3u("#EXTM3U\n").is_empty());
+    }
+
+    /// `ReadLineAsync` ends a line at a lone `\r` too, and `StreamReader`
+    /// drops a leading byte-order mark (v12.2 M3uParser.cs:42,77): neither
+    /// loses an entry.
+    #[rstest::rstest]
+    #[case::cr_only("#EXTM3U\r#EXTINF:-1,One\rhttp://tuner/1\r")]
+    #[case::bom("\u{FEFF}#EXTINF:-1,One\nhttp://tuner/1\n")]
+    #[case::no_final_terminator("#EXTINF:-1,One\r\nhttp://tuner/1")]
+    fn line_endings_and_a_bom_keep_every_entry(#[case] m3u: &str) {
+        let channels = parse_m3u(m3u);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "One");
+        assert_eq!(channels[0].url, "http://tuner/1");
+    }
+
+    /// Fed in pieces cut anywhere (inside a line, a character, or between
+    /// `\r` and `\n`), the parser reads what it reads whole.
+    #[test]
+    fn a_playlist_read_in_pieces_parses_as_one_read_whole() {
+        let m3u = "#EXTM3U\r\n#EXTINF:-1 tvg-id=\"a\" tvg-chno=\"1\",Café One\r\n\
+            http://tuner/1\r\n#EXTINF:-1,Two\rhttp://tuner/2";
+        let whole = parse_m3u(m3u);
+        assert_eq!(whole.len(), 2);
+        assert_eq!(whole[0].name, "Café One");
+        for size in 1..=7 {
+            let mut parser = M3uParser::new();
+            for piece in m3u.as_bytes().chunks(size) {
+                parser.push(piece);
+            }
+            assert_eq!(parser.finish(), whole, "pieces of {size}");
+        }
     }
 }

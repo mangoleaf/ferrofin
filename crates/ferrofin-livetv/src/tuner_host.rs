@@ -21,7 +21,7 @@ use ferrofin_model::live_tv::TunerHostInfo;
 use ferrofin_traits::error::ServiceError;
 
 use crate::fetch::SourceFetcher;
-use crate::m3u::{is_valid_channel_url, parse_m3u};
+use crate::m3u::{M3uParser, is_valid_channel_url};
 
 /// One channel as a tuner reported it, before anything is persisted.
 ///
@@ -274,12 +274,25 @@ impl TunerHost for M3uTunerHost {
 
     async fn get_channels(&self, tuner: &TunerHostInfo) -> Result<Vec<TunerChannel>, ServiceError> {
         let url = tuner.url.as_deref().unwrap_or_default();
-        // `M3uParser.GetListingsStream` presents the tuner's user agent.
-        let body = self
-            .fetcher
-            .fetch_as(url, tuner.user_agent.as_deref())
-            .await?;
-        Ok(parse_m3u(&body)
+        // `M3uParser.GetListingsStream` presents the tuner's user agent and
+        // fails on a non-success status (`EnsureSuccessStatusCode`); `Parse`
+        // then reads the playlist line by line as it arrives (v12.2
+        // M3uParser.cs:39-70), never holding it whole. Like upstream, an
+        // endless body is read for ever, and one that never ends a line
+        // grows that line.
+        let mut opened = self.fetcher.open(url, tuner.user_agent.as_deref()).await?;
+        if !opened.is_success() {
+            return Err(ServiceError::backend(format!(
+                "fetch {url} answered {}",
+                opened.status
+            )));
+        }
+        let mut parser = M3uParser::new();
+        while let Some(chunk) = opened.body.next_chunk().await? {
+            parser.push(&chunk);
+        }
+        Ok(parser
+            .finish()
             .into_iter()
             .map(|ch| TunerChannel {
                 external_id: m3u_external_channel_id(url, &ch.url),
@@ -397,7 +410,7 @@ mod tests {
         ChannelStreamKind, M3uTunerHost, StoredChannel, TunerHost, find_host,
         m3u_external_channel_id, tuner_host_types,
     };
-    use crate::fetch::SourceFetcher;
+    use crate::fetch::{SourceBody, SourceFetcher};
     use ferrofin_model::live_tv::TunerHostInfo;
     use ferrofin_traits::error::ServiceError;
 
@@ -425,13 +438,13 @@ mod tests {
             async fn fetch(&self, _url: &str) -> Result<String, ServiceError> {
                 Ok(String::new())
             }
-            async fn fetch_as(
+            async fn open(
                 &self,
                 _url: &str,
                 user_agent: Option<&str>,
-            ) -> Result<String, ServiceError> {
+            ) -> Result<SourceBody, ServiceError> {
                 self.0.lock().unwrap().push(user_agent.map(str::to_owned));
-                Ok(String::new())
+                Ok(SourceBody::from_bytes(200, Vec::new()))
             }
         }
         let fetcher = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
@@ -447,6 +460,135 @@ mod tests {
         assert_eq!(
             *fetcher.0.lock().unwrap(),
             [Some("VLC/3.0".to_owned()), None]
+        );
+    }
+
+    /// `EnsureSuccessStatusCode` (v12.2 M3uParser.cs:67): a playlist URL that
+    /// answers a failure status is an error, whatever its body says, not a
+    /// lineup.
+    #[tokio::test]
+    async fn a_failure_status_is_an_error_not_a_lineup() {
+        struct NotFound;
+
+        #[async_trait::async_trait]
+        impl SourceFetcher for NotFound {
+            async fn fetch(&self, _url: &str) -> Result<String, ServiceError> {
+                Ok(String::new())
+            }
+            async fn open(
+                &self,
+                _url: &str,
+                _user_agent: Option<&str>,
+            ) -> Result<SourceBody, ServiceError> {
+                Ok(SourceBody::from_bytes(
+                    404,
+                    b"#EXTINF:-1,Error page\nhttp://iptv.example/404\n".to_vec(),
+                ))
+            }
+        }
+        let tuner = TunerHostInfo {
+            url: Some("http://iptv.example/list.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let err = M3uTunerHost::new(Arc::new(NotFound))
+            .get_channels(&tuner)
+            .await
+            .expect_err("a 404 is no playlist");
+        assert!(
+            matches!(&err, ServiceError::Backend(why)
+                if why == "fetch http://iptv.example/list.m3u answered 404"),
+            "{err:?}"
+        );
+    }
+
+    /// Where a playlist test serves its bytes from.
+    #[derive(Debug, Clone, Copy)]
+    enum Source {
+        /// A local file (`AsyncFile.OpenRead`).
+        File,
+        /// A one-shot HTTP peer (`ReadAsStreamAsync`).
+        Http,
+    }
+
+    /// Serves `body` from `source` and answers the URL a tuner points at; the
+    /// directory keeps a file alive for the test.
+    fn serve_playlist(source: Source, body: Vec<u8>) -> (String, tempfile::TempDir) {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().expect("tmp");
+        match source {
+            Source::File => {
+                let path = dir.path().join("list.m3u");
+                std::fs::write(&path, body).expect("write");
+                (path.to_str().expect("utf-8 path").to_owned(), dir)
+            }
+            Source::Http => {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                let url = format!("http://{}/list.m3u", listener.local_addr().expect("addr"));
+                std::thread::spawn(move || {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        let mut buffer = [0_u8; 4096];
+                        let _ = stream.read(&mut buffer);
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                });
+                (url, dir)
+            }
+        }
+    }
+
+    /// `text` as UTF-16 in `unit`'s byte order behind its byte-order mark.
+    fn utf16(text: &str, bom: [u8; 2], unit: fn(u16) -> [u8; 2]) -> Vec<u8> {
+        let mut bytes = bom.to_vec();
+        bytes.extend(text.encode_utf16().flat_map(unit));
+        bytes
+    }
+
+    /// `M3uParser.Parse` reads the playlist through `new StreamReader(stream)`
+    /// and `ReadLineAsync` (v12.2 M3uParser.cs:42-45,77): UTF-8 unless a
+    /// byte-order mark names UTF-16 or UTF-32, the mark dropped, an invalid
+    /// byte read as U+FFFD, and a line ended by `\n`, `\r` or `\r\n` — from a
+    /// file and over HTTP alike.
+    #[rstest::rstest]
+    #[case::cr_only(
+        b"#EXTM3U\r#EXTINF:-1,One\rhttp://tuner/1\r#EXTINF:-1,Two\rhttp://tuner/2\r".to_vec(),
+        &["One", "Two"]
+    )]
+    #[case::mixed_endings(
+        b"#EXTM3U\r\n#EXTINF:-1,One\rhttp://tuner/1\n\n#EXTINF:-1,Two\r\nhttp://tuner/2".to_vec(),
+        &["One", "Two"]
+    )]
+    #[case::utf8_bom(b"\xEF\xBB\xBF#EXTINF:-1,One\nhttp://tuner/1\n".to_vec(), &["One"])]
+    #[case::latin1(b"#EXTINF:-1,Caf\xE9\nhttp://tuner/1\n".to_vec(), &["Caf\u{FFFD}"])]
+    #[case::utf16_le(
+        utf16("#EXTINF:-1,Café\r\nhttp://tuner/1\r\n", [0xFF, 0xFE], u16::to_le_bytes),
+        &["Café"]
+    )]
+    #[case::utf16_be(
+        utf16("#EXTINF:-1,Café\nhttp://tuner/1", [0xFE, 0xFF], u16::to_be_bytes),
+        &["Café"]
+    )]
+    #[tokio::test]
+    async fn the_playlist_is_read_like_a_dotnet_stream_reader(
+        #[case] body: Vec<u8>,
+        #[case] names: &[&str],
+        #[values(Source::File, Source::Http)] source: Source,
+    ) {
+        let (url, _dir) = serve_playlist(source, body);
+        let host = M3uTunerHost::new(Arc::new(crate::fetch::ReqwestFetcher::new()));
+        let tuner = TunerHostInfo {
+            url: Some(url),
+            ..TunerHostInfo::default()
+        };
+        let channels = host.get_channels(&tuner).await.expect("lineup");
+        assert_eq!(
+            channels.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            names,
+            "{source:?}"
         );
     }
 
