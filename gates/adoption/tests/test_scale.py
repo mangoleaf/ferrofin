@@ -1,4 +1,4 @@
-"""The scale fixture's cloning, its survival check and its measurements (adoption/scale.py)."""
+"""The scale fixture's cloning, its survival check and its measurements (gates/adoption/scale.py)."""
 
 from contextlib import closing
 import json

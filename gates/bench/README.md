@@ -154,9 +154,9 @@ covered by its hash; regenerating it changes the workload. The export also recor
 Existing fixtures can export these without regenerating media or reseeding users:
 
 ```bash
-bench/testdata/build.sh --export-pools
+gates/bench/testdata/build.sh --export-pools
 # Move an existing testdata/jellyfin preparation aside, then:
-bench/testdata/build.sh --prepare-jellyfin
+gates/bench/testdata/build.sh --prepare-jellyfin
 ```
 
 Export boots a disposable 10.11.8 source copy and atomically updates only `ids.json`.
@@ -323,7 +323,7 @@ The release gate compares the candidate with the previous release in one window,
 interleaved, exactly as the latency gate does:
 
 ```bash
-python3 bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:rc --pairs 3
+python3 gates/bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:rc --pairs 3
 ```
 
 The ceiling is a higher-is-better cell, `ramp/ceiling`, judged by the `[ramp]` row of
@@ -360,7 +360,7 @@ The release gate soaks the previous release and then the candidate back to back 
 by default; the cost is two hours of a quiet host):
 
 ```bash
-python3 bench/gate.py soak ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+python3 gates/bench/gate.py soak ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
 ```
 
 The cell is `soak/slope`, judged by the `[soak]` row of [`gate.toml`](gate.toml): the
@@ -378,13 +378,13 @@ back to back.
 
 The screens time 28 endpoints, all inside six jellyfin-web screens. `run.sh --only endpoints`
 (opt-in: no default run includes it; either server, or both) times **every GET of the parity
-request catalogue** on its own ([`parity/README.md`](../parity/README.md#requests)): the sweep of
-the vendored contract in `parity/requests/sweep/`, which holds the `bench/screens.js` request
-shapes (`screens.jsonl`), and the edge cases in `parity/requests/edge/`. `endpoints.py` reads them
+request catalogue** on its own ([`gates/parity/README.md`](../parity/README.md#requests)): the sweep of
+the vendored contract in `gates/parity/requests/sweep/`, which holds the `gates/bench/screens.js` request
+shapes (`screens.jsonl`), and the edge cases in `gates/parity/requests/edge/`. `endpoints.py` reads them
 with the parity harness's own parser, so the two catalogues cannot drift apart. HEAD requests,
 writes and a write's read-backs are left out. Templates are filled from the run's `ids.json`, and
-the `{found.*}` names (`parity/discover.toml`) are read from the server under test; a name it does
-not give skips only the endpoints that use it, with the reason. `python3 bench/endpoints.py plan`
+the `{found.*}` names (`gates/parity/discover.toml`) are read from the server under test; a name it does
+not give skips only the endpoints that use it, with the reason. `python3 gates/bench/endpoints.py plan`
 prints the schedule without a server.
 
 After discovery comes **one shared warm-up**, every endpoint once in catalogue order, discarded.
@@ -401,7 +401,7 @@ other phases, and writes `endpoints.json`; the run's `report.html` gets a "Per-e
 section with each server's p50 / p95 / p99 and `X.Y× faster` against Jellyfin. An endpoint the
 two servers answered with different statuses says so instead. `ENDPOINT_SETS` (comma-separated
 paths, relative to the repository) narrows the request sets: for example
-`parity/requests/sweep/screens.jsonl,parity/requests/edge` is the gated set alone.
+`gates/parity/requests/sweep/screens.jsonl,gates/parity/requests/edge` is the gated set alone.
 
 Not measured, each with its reason in `SKIP` (`endpoints.py`; `plan` and the report list them):
 - media streams and downloads (`/Videos/{id}/stream`, `/Audio/{id}/universal`, `/Items/{id}/Download`,
@@ -415,12 +415,12 @@ Not measured, each with its reason in `SKIP` (`endpoints.py`; `plan` and the rep
 The release gate runs it interleaved, Ferrofin only, three pairs:
 
 ```bash
-python3 bench/gate.py endpoints ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
+python3 gates/bench/gate.py endpoints ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
 ```
 
 Each endpoint is the cell `endpoints/<id>`, judged on each run's p50 by the `[endpoints]` row of
 [`gate.toml`](gate.toml) (more than 15 % **and** more than 0.5 ms, D2) and the D4 rule: the
-candidate slower in at least 2 of the 3 pairs. Only the `bench/screens.js` shapes and the edge-case
+candidate slower in at least 2 of the 3 pairs. Only the `gates/bench/screens.js` shapes and the edge-case
 GETs gate (decision DE); every other endpoint is reported, and a regression there is filed as an
 issue rather than blocking. An endpoint whose answers differ between runs (another status, a status
 that changed within a run, or a request filled differently) cannot be judged, and a gated one then
@@ -433,7 +433,7 @@ took 77 minutes (50 s warm-up, 4,551 s measuring) and Jellyfin 115 minutes (75 s
 6,377 s): at 200 requests an endpoint, a 20 ms answer already costs 4 s, and 309 Jellyfin and 77
 Ferrofin endpoints ran into the 10 s limit. The other 241 endpoints took about 4 minutes on Ferrofin
 and 8 on Jellyfin. A three-pair gate session of the whole catalogue therefore takes about eight
-hours; `ENDPOINT_SETS` without `parity/requests/sweep/combos.jsonl` brings it to about an hour,
+hours; `ENDPOINT_SETS` without `gates/parity/requests/sweep/combos.jsonl` brings it to about an hour,
 nearly half of it the library scan every Ferrofin boot does.
 
 ## Running it
@@ -441,10 +441,10 @@ nearly half of it the library scan every Ferrofin boot does.
 The reporter has a fast correctness check, also run in CI:
 
 ```sh
-python3 -m unittest discover -s bench -p test_report.py
-python3 -m unittest discover -s bench -p test_ramp.py
-python3 -m unittest discover -s bench -p test_soak.py
-python3 -m unittest discover -s bench -p test_endpoints.py
+python3 -m unittest discover -s gates/bench -p test_report.py
+python3 -m unittest discover -s gates/bench -p test_ramp.py
+python3 -m unittest discover -s gates/bench -p test_soak.py
+python3 -m unittest discover -s gates/bench -p test_endpoints.py
 ```
 
 It uses self-contained fixtures and does not start servers or measure performance.
@@ -462,14 +462,14 @@ and Python `Pillow`.
 ```bash
 docker build -t ferrofin:bench .                  # the commit under test
 docker pull jellyfin/jellyfin:10.11.8              # source fixture builder only
-docker pull "$(cat bench/testdata/jellyfin-image.txt)"   # the pinned Jellyfin reference
-bench/testdata/build.sh                           # source fixture, once, ~20 min
-bench/testdata/build.sh --prepare-jellyfin          # once per source fixture / pinned image
-bench/run.sh                                      # one full run, ~40 min → bench/runs/<version>/report.md
-python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the full tables: medians, markers, notes
-python3 bench/report.py --readme README.md bench/runs/A bench/runs/B bench/runs/C
+docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"   # the pinned Jellyfin reference
+gates/bench/testdata/build.sh                           # source fixture, once, ~20 min
+gates/bench/testdata/build.sh --prepare-jellyfin          # once per source fixture / pinned image
+gates/bench/run.sh                                      # one full run, ~40 min → gates/bench/runs/<version>/report.md
+python3 gates/bench/report.py gates/bench/runs/A gates/bench/runs/B gates/bench/runs/C   # the full tables: medians, markers, notes
+python3 gates/bench/report.py --readme README.md gates/bench/runs/A gates/bench/runs/B gates/bench/runs/C
                                                   # rewrites the README "Benchmarks" block (headline table + prose)
-python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
+python3 gates/bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
 
 Jellyfin preparation copies the stopped 10.11.8 config into `testdata/jellyfin/`,
@@ -499,12 +499,12 @@ With no tags, or outside git, the name falls back to `20260903-1412-7e80268`. Th
 resolved name and the dirty flag are also written into `run.json`, so they survive a
 renamed directory. `--out` overrides the whole thing.
 
-`python3 bench/report.py --serve [PORT] [RUNS_DIR]` is the one local viewer
+`python3 gates/bench/report.py --serve [PORT] [RUNS_DIR]` is the one local viewer
 (127.0.0.1:8097, loopback only) for every harness's runs, with three tabs:
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
+| Benchmark | `gates/bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
 | Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
 
@@ -553,7 +553,7 @@ Use the same phase selection and settings; affinity alone does not make a busy h
 ## Release gate
 
 What blocks a release is the interleaved A/B gate in [`gate.py`](gate.py), not the
-Jellyfin comparison above. [`RELEASE.md`](../RELEASE.md) has the gate's command, wall
+Jellyfin comparison above. [`RELEASE.md`](../../RELEASE.md) has the gate's command, wall
 time, threshold table and blocking rules. `gate.py ab PREVIOUS CANDIDATE` runs Ferrofin
 only: three adjacent pairs of `run.sh --servers ferrofin --only shape,unloaded,loaded`. It
 judges each cell regressed, within noise or improved against the thresholds in
@@ -572,7 +572,7 @@ unauthenticated probe such as `/System/Ping`.
 `gate.py scan PREVIOUS CANDIDATE` measures library-scan and adoption-migration cost, A/B
 against the previous release in the same window: PREVIOUS CANDIDATE … as interleaved pairs
 (`--pairs`, default 3), each run being `scan.py` on that image ID. It needs the same test data
-as `run.sh` (`--testdata`, default `bench/testdata`), and the server gets `run.sh`'s cores and
+as `run.sh` (`--testdata`, default `gates/bench/testdata`), and the server gets `run.sh`'s cores and
 memory limit after the same idle-core check.
 
 - **Scan wall time**: seconds from `POST /Library/Refresh` to the RefreshLibrary task
@@ -585,7 +585,7 @@ memory limit after the same idle-core check.
   (its libraries' realtime monitor turned off, as `run.sh` provisions every copy).
   That is the bench corpus's own Jellyfin 10.11.8 database (about 26,000 items), so the
   boot runs the whole adoption and migration chain. The synthetic fixtures under
-  `adoption/` hold a few dozen items each: they check correctness, not cost.
+  `gates/adoption/` hold a few dozen items each: they check correctness, not cost.
 - **Peak anon**: the largest cgroup `anon` sample (`mem_sample.py`, every 100 ms) inside
   each timed span. For migration, sampling starts once `docker start` returns, so the first
   moments of the boot can be missed.

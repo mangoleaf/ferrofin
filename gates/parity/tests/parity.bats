@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests of parity/run.sh: its refusals, the cap, the teardown and the failure reports.
+# Tests of gates/parity/run.sh: its refusals, the cap, the teardown and the failure reports.
 # A fake `docker` starts a fake server (fake_server.py) in place of each container, so no image,
 # corpus or network is needed. The comparison itself is tested in test_diff.py.
 
@@ -178,9 +178,9 @@ containers_gone() { # no container left in the fake docker, no server process le
 }
 
 @test "run.sh: a ledger entry without a link fails the run before anything boots" {
-  mkdir repo && cp -r "$PARITY" repo/parity && ln -s "$PARITY/../bench" repo/bench   # the layout run.sh finds its helpers in
-  printf 'version = 1\n[[entry]]\nrequest = "a"\npath = "X"\nreason = "no link"\n' > repo/parity/ledger.toml
-  run repo/parity/run.sh --testdata td --out out --oracle "$PIN" --ferrofin ferrofin:ok
+  mkdir -p repo/gates && cp -r "$PARITY" repo/gates/parity && ln -s "$PARITY/../bench" repo/gates/bench   # the layout run.sh finds its helpers in
+  printf 'version = 1\n[[entry]]\nrequest = "a"\npath = "X"\nreason = "no link"\n' > repo/gates/parity/ledger.toml
+  run repo/gates/parity/run.sh --testdata td --out out --oracle "$PIN" --ferrofin ferrofin:ok
   [ "$status" -eq 2 ]
   [[ "$output" == *"exactly one link"* ]]
   [ ! -e out ]

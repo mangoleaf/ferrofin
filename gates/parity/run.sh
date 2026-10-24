@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # The live parity replay: send jellyfin-web-shaped requests to a Jellyfin and a Ferrofin that serve
 # the same library, compare the answers, match the differences against the ledger, and write a
-# report. See parity/README.md.
+# report. See gates/parity/README.md.
 #
 #   run.sh --oracle IMAGE --ferrofin IMAGE [--testdata DIR] [--requests FILE] [--out DIR] [--gate]
 #
-#   --oracle     the Jellyfin image (the pinned release image in bench/testdata/jellyfin-image.txt)
+#   --oracle     the Jellyfin image (the pinned release image in gates/bench/testdata/jellyfin-image.txt)
 #   --ferrofin   the Ferrofin image under test
-#   --testdata   the benchmark corpus (config/, media/, ids.json, jellyfin/): default bench/testdata
+#   --testdata   the benchmark corpus (config/, media/, ids.json, jellyfin/): default gates/bench/testdata
 #   --requests   a request file, or a directory of them (every *.jsonl in it); repeat it to send several
-#                sets as one (the sweep and the edge cases: --requests parity/requests/sweep
-#                --requests parity/requests/edge): default
-#                parity/requests/tracer.jsonl; the full sweep is parity/requests/sweep. Its writes each run
-#                on a fresh database copy: parity/reset.sh restores both servers to the snapshot taken at boot
-#   --out        the run directory: default parity/runs/<name>; never reused
+#                sets as one (the sweep and the edge cases: --requests gates/parity/requests/sweep
+#                --requests gates/parity/requests/edge): default
+#                gates/parity/requests/tracer.jsonl; the full sweep is gates/parity/requests/sweep. Its writes each run
+#                on a fresh database copy: gates/parity/reset.sh restores both servers to the snapshot taken at boot
+#   --out        the run directory: default gates/parity/runs/<name>; never reused
 #   --gate       a release-gate run: a stale oracle pin, or an --oracle other than the pin, is refused
 #                (an ad-hoc run only warns)
 #
@@ -32,15 +32,15 @@
 # Requires: docker, python3, jq, curl, timeout; taskset when pinning.
 set -euo pipefail
 CALLER=$PWD
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 START_EPOCH=$(date +%s)
-# shellcheck source=parity/lib.sh
-source parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
+# shellcheck source=gates/parity/lib.sh
+source gates/parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
 
 PARITY_CAP_S=${PARITY_CAP_S:-7200}
 PARITY_REQUEST_TIMEOUT=${PARITY_REQUEST_TIMEOUT:-30}
 PARITY_CONCURRENCY=${PARITY_CONCURRENCY:-4}   # reads in flight per server; writes are serial (decision D4)
-DRAIN_TIMEOUT_S=${DRAIN_TIMEOUT_S:-300}   # this and the settings below are bench/run.sh's
+DRAIN_TIMEOUT_S=${DRAIN_TIMEOUT_S:-300}   # this and the settings below are gates/bench/run.sh's
 CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}   # the server and client cores must be this idle before a run starts
 SERVER_CPUS=${SERVER_CPUS:-8-15}       # the benchmark's server cpuset: each server gets half of it
 CLIENT_CPUS=${CLIENT_CPUS:-16-19}
@@ -50,7 +50,7 @@ ORACLE_PORT=${PARITY_ORACLE_PORT:-18111}    # beside the benchmark's 18101 and 1
 FERROFIN_PORT=${PARITY_FERROFIN_PORT:-18113}
 
 ORACLE_IMAGE=""; FERROFIN_IMAGE=""; GATE=false
-TESTDATA=$PWD/bench/testdata; REQUESTS=(); OUT=""
+TESTDATA=$PWD/gates/bench/testdata; REQUESTS=(); OUT=""
 die() { echo "parity: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in --oracle|--ferrofin|--testdata|--requests|--out) [ $# -ge 2 ] || die "$1 needs a value";; esac
@@ -76,14 +76,14 @@ done
 [[ "$PIN" =~ ^[01]$ ]] || die "PARITY_PIN is 0 or 1"
 ! $GATE || [ "$PIN" = 1 ] || die "a release-gate run is pinned: PARITY_PIN=0 is for ad-hoc runs and the harness's own tests"
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
-(( ${#REQUESTS[@]} )) || REQUESTS=("$PWD/parity/requests/tracer.jsonl")
+(( ${#REQUESTS[@]} )) || REQUESTS=("$PWD/gates/parity/requests/tracer.jsonl")
 request_args=()   # --requests once per set, in the order given: they are sent as one set
 for i in "${!REQUESTS[@]}"; do REQUESTS[i]=$(realpath -m "$(abs "${REQUESTS[i]}")"); request_args+=(--requests "${REQUESTS[i]}"); done
-export READY_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S   # parity/reset.sh waits as the boot does
+export READY_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S   # gates/parity/reset.sh waits as the boot does
 DEADLINE=$((START_EPOCH + PARITY_CAP_S))
 
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
-RUNS_DIR=$PWD/parity/runs
+RUNS_DIR=$PWD/gates/parity/runs
 run_name() {
   local base n=1 candidate
   base="$(date +%Y%m%d-%H%M)-$SHA"
@@ -94,7 +94,7 @@ run_name() {
 }
 OUT=$(realpath -m "$(abs "${OUT:-$RUNS_DIR/$(run_name)}")")
 # Every run copies and boots the corpus: that load belongs on a local disk, never a network share
-# (the same judgement as adoption/lib.sh adoption_require_local, by the nearest existing parent).
+# (the same judgement as gates/adoption/lib.sh adoption_require_local, by the nearest existing parent).
 require_local() {
   local dir=$1 types fs
   until [ -e "$dir" ]; do dir=$(dirname "$dir"); done
@@ -112,12 +112,12 @@ for t in docker python3 jq curl timeout; do command -v "$t" >/dev/null || die "$
 [ "$PIN" = 0 ] || command -v taskset >/dev/null || die "taskset not installed (PARITY_PIN=0 runs without it)"
 [ ! -e "$OUT" ] || die "$OUT exists: a run directory is never reused"
 IDS=$TESTDATA/ids.json
-[ -f "$IDS" ] || die "no $IDS: build the test data first (bench/testdata/build.sh)"
+[ -f "$IDS" ] || die "no $IDS: build the test data first (gates/bench/testdata/build.sh)"
 jq -e '.user and .user_name and .password' "$IDS" >/dev/null || die "$IDS lacks the browse user (user, user_name, password)"
-python3 parity/diff.py check "${request_args[@]}" --ids "$IDS" >/dev/null || exit 2   # its message is on stderr
-for d in config media jellyfin/config; do [ -d "$TESTDATA/$d" ] || die "no $TESTDATA/$d: build and prepare the test data (bench/testdata/build.sh --prepare-jellyfin)"; done
+python3 gates/parity/diff.py check "${request_args[@]}" --ids "$IDS" >/dev/null || exit 2   # its message is on stderr
+for d in config media jellyfin/config; do [ -d "$TESTDATA/$d" ] || die "no $TESTDATA/$d: build and prepare the test data (gates/bench/testdata/build.sh --prepare-jellyfin)"; done
 PREP=$TESTDATA/jellyfin/preparation.json
-[ -f "$PREP" ] || die "prepare Jellyfin first: bench/testdata/build.sh --prepare-jellyfin '$TESTDATA'"
+[ -f "$PREP" ] || die "prepare Jellyfin first: gates/bench/testdata/build.sh --prepare-jellyfin '$TESTDATA'"
 for image in "$ORACLE_IMAGE" "$FERROFIN_IMAGE"; do docker_cmd image inspect "$image" >/dev/null 2>&1 || die "image $image missing"; done
 expected_image=$(docker_cmd image inspect -f '{{.Id}}' "$ORACLE_IMAGE")
 expected_source=$(sha256sum "$TESTDATA/config/data/jellyfin.db" | cut -d' ' -f1)
@@ -125,10 +125,10 @@ expected_ids=$(sha256sum "$IDS" | cut -d' ' -f1)
 jq -e --arg image "$expected_image" --arg source "$expected_source" --arg ids "$expected_ids" \
   '.image_id == $image and .source_db_sha256 == $source and .ids_sha256 == $ids' "$PREP" >/dev/null \
   || die "the Jellyfin preparation does not match this oracle image and source fixture"
-# The oracle is the Jellyfin release named by UPSTREAM_TAG, pinned by digest (bench/oracle.py): a
+# The oracle is the Jellyfin release named by UPSTREAM_TAG, pinned by digest (gates/bench/oracle.py): a
 # release-gate run refuses a stale pin, an ad-hoc run warns.
 oracle_args=(check); ! $GATE || oracle_args+=(--gate)
-ORACLE_PIN=$(python3 bench/oracle.py "${oracle_args[@]}") || die "the oracle pin was refused (see above)"
+ORACLE_PIN=$(python3 gates/bench/oracle.py "${oracle_args[@]}") || die "the oracle pin was refused (see above)"
 if [ "$ORACLE_IMAGE" != "$(jq -r .image <<<"$ORACLE_PIN")" ]; then
   $GATE && die "--oracle $ORACLE_IMAGE is not the pinned oracle $(jq -r .image <<<"$ORACLE_PIN")"
   echo "parity: warning: --oracle $ORACLE_IMAGE is not the pinned oracle $(jq -r .image <<<"$ORACLE_PIN")" >&2
@@ -140,8 +140,8 @@ if [ "$PIN" = 1 ]; then
   (( (hi - lo + 1) % 2 == 0 && hi > lo )) || die "SERVER_CPUS needs an even number of cpus to give each server half"
   half=$(( (hi - lo + 1) / 2 ))
   ORACLE_CPUS=$lo-$((lo + half - 1)); FERROFIN_CPUS=$((lo + half))-$hi
-  topology=$(python3 bench/mem_sample.py --topology "$SERVER_CPUS" "$CLIENT_CPUS") || die "invalid CPU allocation"
-  idle=$(python3 bench/mem_sample.py --check "$(jq -r '.checked_cpus|map(tostring)|join(",")' <<<"$topology")")
+  topology=$(python3 gates/bench/mem_sample.py --topology "$SERVER_CPUS" "$CLIENT_CPUS") || die "invalid CPU allocation"
+  idle=$(python3 gates/bench/mem_sample.py --check "$(jq -r '.checked_cpus|map(tostring)|join(",")' <<<"$topology")")
   awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN { if (i < m) { printf "cores %s are only %.0f%% idle (need %.0f%%): something else is using them\n", c, i*100, m*100; exit 1 } }' || exit 2
 fi
 
@@ -162,7 +162,7 @@ cleanup() {   # the EXIT trap: stops what runs, removes the containers, and make
   give_up=$((SECONDS + CLEANUP_TIMEOUT_S))
   # A reset in flight leads a session of its own (diff.py stops it on a signal; this is the backstop for a
   # diff.py killed outright): stop its whole session, the docker calls it is waiting on included.
-  for pid in $(pgrep -f -- "parity/reset.sh $OUT\$"); do pkill -KILL -s "$pid" 2>/dev/null; done
+  for pid in $(pgrep -f -- "gates/parity/reset.sh $OUT\$"); do pkill -KILL -s "$pid" 2>/dev/null; done
   for name in oracle ferrofin; do
     pkill -TERM -f -- "--name parity-$name " 2>/dev/null
     while pgrep -f -- "--name parity-$name " >/dev/null 2>&1 && (( SECONDS < give_up )); do sleep 0.1; done   # a short poll, bounded by give_up
@@ -179,7 +179,7 @@ cleanup() {   # the EXIT trap: stops what runs, removes the containers, and make
   # A run that ends any way at all leaves a report.
   if [ ! -f "$OUT/report.html" ]; then
     flag=(); ! $CAP_EXCEEDED || flag=(--cap-exceeded)
-    python3 parity/diff.py failure --out "$OUT" --reason "${FAIL_REASON:-interrupted or aborted (exit $rc)}" "${flag[@]}" >/dev/null 2>&1
+    python3 gates/parity/diff.py failure --out "$OUT" --reason "${FAIL_REASON:-interrupted or aborted (exit $rc)}" "${flag[@]}" >/dev/null 2>&1
     (( rc )) || rc=1
   fi
   # The documented exits are 0, 1 and (signals) 129, 130 and 143; a set -e abort must not leak a command's own status.
@@ -225,7 +225,7 @@ drain() {   # every scheduled task idle
 }
 isolate() {   # no plugins, no automatic tasks: the answers come from the core servers, and nothing rewrites the copy
   # A plugin that cannot be uninstalled (an in-tree one: TMDb, OMDb, …) stays as it is on both servers: Jellyfin
-  # cannot disable it, and its state and settings pages are answers to compare. (bench/run.sh disables every
+  # cannot disable it, and its state and settings pages are answers to compare. (gates/bench/run.sh disables every
   # Ferrofin plugin, for load; parity treats both servers alike.)
   local id version
   api /Plugins > "$D/plugins-before.json" && jq -e 'type == "array"' "$D/plugins-before.json" >/dev/null || return 1
@@ -252,11 +252,11 @@ boot_server() {   # boot_server NAME IMAGE CONFIG_SOURCE PORT CPUS: runs in a ba
   D=$OUT/$NAME; URL=http://127.0.0.1:$port; TOKEN=""
   local cfg=$D/config cache=$D/cache env=() cpuset=()
   mkdir -p "$D" "$cache"
-  echo "$URL" > "$D/url"   # for parity/reset.sh
+  echo "$URL" > "$D/url"   # for gates/parity/reset.sh
   cp -r --reflink=auto "$source" "$cfg" || { reason "cannot copy the configuration"; return 1; }
-  # The parity answers are the core servers': no WASM plugin may ride along in the copy (as bench/run.sh).
+  # The parity answers are the core servers': no WASM plugin may ride along in the copy (as gates/bench/run.sh).
   if [ -n "$(find "$cfg" -name '*.wasm' -print -quit 2>/dev/null)" ]; then reason "a WASM plugin is present in the configuration copy"; return 1; fi
-  # Change only the disposable copy, before either server starts its filesystem watcher (as bench/run.sh,
+  # Change only the disposable copy, before either server starts its filesystem watcher (as gates/bench/run.sh,
   # whose isolate/verify_isolation/drain this section mirrors: change them together; gl-754 tracks sharing them).
   python3 - "$cfg" <<'PY_ISOLATION' || { reason "no library options in the configuration copy"; return 1; }
 import pathlib, sys, xml.etree.ElementTree as ET
@@ -282,12 +282,12 @@ PY_ISOLATION
   api_version=$(curl -sf --max-time "$HTTP_TIMEOUT_S" "$URL/System/Info/Public" | jq -r .Version) || { reason "cannot read its version"; return 1; }
   if [ "$NAME" = oracle ]; then
     [ "$api_version" = "$(jq -r '.validation.system_info.Version' "$PREP")" ] || { reason "expected Jellyfin $(jq -r '.validation.system_info.Version' "$PREP"), got $api_version"; return 1; }
-    python3 bench/oracle.py matches "$api_version" 2> "$D/oracle-matches.err" || { reason "$(cat "$D/oracle-matches.err")"; return 1; }
+    python3 gates/bench/oracle.py matches "$api_version" 2> "$D/oracle-matches.err" || { reason "$(cat "$D/oracle-matches.err")"; return 1; }
   fi
-  TOKEN=$(python3 parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in as the browse user"; return 1; }
+  TOKEN=$(python3 gates/parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in as the browse user"; return 1; }
   isolate || { reason "could not disable plugins and automatic tasks"; return 1; }
   # Jellyfin unloads disabled plugin assemblies only on restart. While the server is stopped, its isolated
-  # configuration is the snapshot every write starts from: parity/reset.sh restores it before each one.
+  # configuration is the snapshot every write starts from: gates/parity/reset.sh restores it before each one.
   stop_container "parity-$NAME" || { reason "isolation restart failed (stop)"; return 1; }
   mkdir -p "$D/pristine"
   if ! cp -r --reflink=auto "$cfg" "$D/pristine/config" || ! cp -r --reflink=auto "$cache" "$D/pristine/cache"; then
@@ -295,7 +295,7 @@ PY_ISOLATION
   fi
   docker_cmd start "parity-$NAME" >/dev/null || { reason "isolation restart failed (start)"; return 1; }
   wait_ready || { reason "did not come back after the isolation restart"; return 1; }
-  TOKEN=$(python3 parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in after the restart"; return 1; }
+  TOKEN=$(python3 gates/parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in after the restart"; return 1; }
   verify_isolation || return 1
   drain || { reason "scheduled tasks did not go idle within ${DRAIN_TIMEOUT_S}s"; return 1; }
   jq -n --argjson boot_s "$((SECONDS - started))" --arg version "$api_version" '{boot_s:$boot_s, version:$version}' > "$D/boot.json"
@@ -326,10 +326,10 @@ pin_prefix=(); [ "$PIN" = 0 ] || pin_prefix=(taskset -c "$CLIENT_CPUS")
 # as a job we wait on, so a signal to this script is handled at once (timeout leads its own process
 # group, which a signal to ours does not reach) and cleanup stops it.
 rc=0
-timeout --kill-after="${CLEANUP_TIMEOUT_S}s" "$((remaining + CLEANUP_TIMEOUT_S))s" "${pin_prefix[@]}" python3 parity/diff.py run \
+timeout --kill-after="${CLEANUP_TIMEOUT_S}s" "$((remaining + CLEANUP_TIMEOUT_S))s" "${pin_prefix[@]}" python3 gates/parity/diff.py run \
   --oracle-url "http://127.0.0.1:$ORACLE_PORT" --ferrofin-url "http://127.0.0.1:$FERROFIN_PORT" --ids "$IDS" "${request_args[@]}" \
   --out "$OUT" --request-timeout "$PARITY_REQUEST_TIMEOUT" --deadline "$DEADLINE" --concurrency "$PARITY_CONCURRENCY" \
-  --reset-command "$(printf '%q ' bash parity/reset.sh "$OUT")" 2> "$OUT/diff.err" &
+  --reset-command "$(printf '%q ' bash gates/parity/reset.sh "$OUT")" 2> "$OUT/diff.err" &
 wait "$!" || rc=$?
 cat "$OUT/diff.err" >&2
 # diff.py exits 0 (nothing new), 1 (new differences) or 2 (an input it could not use); anything else
@@ -343,5 +343,5 @@ if [ ! -f "$OUT/report.html" ]; then
   FAIL_REASON=${FAIL_REASON:-the comparison wrote no report: $(tail -n1 "$OUT/diff.err")}
   rc=1
 fi
-echo "parity: report $OUT/report.html  (compare runs: python3 bench/report.py --serve --parity-dir parity/runs)"
+echo "parity: report $OUT/report.html  (compare runs: python3 gates/bench/report.py --serve --parity-dir gates/parity/runs)"
 exit "$rc"

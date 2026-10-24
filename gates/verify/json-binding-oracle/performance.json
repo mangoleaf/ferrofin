@@ -3,7 +3,7 @@
   "rust_sources_sha256": "0b7ab4820c9a03ce9427e3520755fa6c2d33635f2515c78d3f2ef165e7bb2b5b",
   "baseline_commit": "1788efa7",
   "method": {
-    "workload": "bench/screens.js",
+    "workload": "gates/bench/screens.js",
     "execution": "native release binaries in bubblewrap with read-only media and disposable configuration copies",
     "reason": "Docker daemon socket was inaccessible in this tool environment",
     "cpu": "AMD Ryzen 9 9950X3D",
@@ -11,7 +11,7 @@
     "client_cpus": "7",
     "cpu_selection": "Default cores were below 90% idle; both builds use the same quieter assignments.",
     "memory_limit": null,
-    "fixture": "bench/testdata (Jellyfin-scanned generated media)",
+    "fixture": "gates/bench/testdata (Jellyfin-scanned generated media)",
     "screens_per_second": 5,
     "runs_per_build": 3,
     "warmup_seconds_per_run": 30,

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """The adoption report: what a run checked, stage by stage, as one self-contained report.html.
 
-adoption/run.sh and `synthetic.py run` record what they do as they go, one JSON line per event in
+gates/adoption/run.sh and `synthetic.py run` record what they do as they go, one JSON line per event in
 WORK/results.jsonl, and build WORK/report.html from it when they end (however they end: a killed
 run leaves its partial results). The page opens from disk, is uploaded as the CI artifact, and is
-listed in the Adoption tab of the shared viewer (`bench/report.py --serve --adoption-dir DIR`).
+listed in the Adoption tab of the shared viewer (`gates/bench/report.py --serve --adoption-dir DIR`).
 
     adoption_report.py start  WORK --title T [--image I] [--oracle O]    begin a run (forgets the previous one)
     adoption_report.py begin  WORK FIXTURE KIND EXPECTED                 a fixture has started (unfinished if no row follows)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Functions shared by verify/scan-behaviour.sh. Sourced, never executed: nothing here talks to a
-# server or touches media, which is what lets verify/tests/*.bats drive every piece of logic
+# Functions shared by gates/verify/scan-behaviour.sh. Sourced, never executed: nothing here talks to a
+# server or touches media, which is what lets gates/verify/tests/*.bats drive every piece of logic
 # with canned /metrics text and throwaway files.
 
 # The item names every scratch item carries (from its NFO), so the script finds its own items

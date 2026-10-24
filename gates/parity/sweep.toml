@@ -1,9 +1,9 @@
-# How parity/generate.py builds the sweep from the vendored contract (see its docstring).
+# How gates/parity/generate.py builds the sweep from the vendored contract (see its docstring).
 #
 # Templates: `{movie}` and the other ids of the corpus's ids.json; `{found.<name>}` read from the oracle
-# at run start (parity/discover.toml); `{setup.<name>.<field>}` read from a setup step's answer on the
+# at run start (gates/parity/discover.toml); `{setup.<name>.<field>}` read from a setup step's answer on the
 # same server, which puts that `[setups.<name>]` sequence in front of the write. Change this file, run
-# parity/generate.py, and commit both: the request set is checked in.
+# gates/parity/generate.py, and commit both: the request set is checked in.
 
 version = 1
 

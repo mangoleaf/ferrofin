@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Tests of adoption/adoption_report.py: recording a run, the verdicts, the page and the shared viewer's listing.
+"""Tests of gates/adoption/adoption_report.py: recording a run, the verdicts, the page and the shared viewer's listing.
 
-    python3 -m unittest discover -s adoption/tests -p test_adoption_report.py
+    python3 -m unittest discover -s gates/adoption/tests -p test_adoption_report.py
 """
 
 import contextlib
@@ -37,7 +37,7 @@ class Scratch(unittest.TestCase):
 
 class Recording(Scratch):
     def test_events_are_appended_as_json_lines_and_start_forgets_the_previous_run(self):
-        self.recorder.start("adoption/run.sh", image="ferrofin:x", oracle="12.2")
+        self.recorder.start("gates/adoption/run.sh", image="ferrofin:x", oracle="12.2")
         self.recorder.check("fx", "after adoption", "boot log", "PASS")
         self.recorder.row("fx", "path", "12.2.0", "PASS")
         events = [json.loads(line) for line in (self.work / report.RESULTS).read_text().splitlines()]
@@ -88,7 +88,7 @@ class Verdicts(Scratch):
 
 class Page(Scratch):
     def full_run(self):
-        self.recorder.start("adoption/run.sh", image="ferrofin:adoption-ci", oracle="12.2")
+        self.recorder.start("gates/adoption/run.sh", image="ferrofin:adoption-ci", oracle="12.2")
         self.recorder.check("jellyfin-12.2-fresh", "after adoption", "boot log (generation, migrations, no ERROR)", "PASS")
         self.recorder.check("jellyfin-12.2-fresh", "after restart", "second boot runs no repair", "FAIL", "second boot repaired again: merged 3")
         self.recorder.row("jellyfin-12.2-fresh", "path", "12.2.0", "FAIL", "second boot repaired again: merged 3")
@@ -103,7 +103,7 @@ class Page(Scratch):
 
     def test_the_page_names_the_run_the_verdict_and_every_fixture(self):
         page = self.full_run()
-        self.assertIn("adoption/run.sh", page)
+        self.assertIn("gates/adoption/run.sh", page)
         self.assertIn("ferrofin:adoption-ci", page)
         self.assertIn(">FAIL<", page)
         for fixture in ("jellyfin-12.2-fresh", "jellyfin-12.2-messy", "jellyfin-10.11.11-scale", "jellyfin-12.0"):
@@ -157,7 +157,7 @@ class Page(Scratch):
             self.assertNotIn(external, page)
 
     def test_an_empty_run_says_nothing_ran(self):
-        self.recorder.start("adoption/run.sh")
+        self.recorder.start("gates/adoption/run.sh")
         page = self.page()
         self.assertIn("NOTHING RAN", page)
         self.assertIn("No fixture was recorded.", page)
@@ -191,7 +191,7 @@ class CommandLine(Scratch):
         shapes.write_text(json.dumps(SHAPES))
         text = Path(self._dir.name) / "diff.txt"
         text.write_text("Peoples row abc lost")
-        steps = [("start", self.work, "--title", "adoption/run.sh", "--image", "img", "--oracle", "12.2"),
+        steps = [("start", self.work, "--title", "gates/adoption/run.sh", "--image", "img", "--oracle", "12.2"),
                  ("begin", self.work, "fx", "messy", "12.2.0"),
                  ("check", self.work, "fx", "after adoption", "ready", "PASS"),
                  ("check", self.work, "fx", "after adoption", "table digests", "FAIL", "--detail=tables: 1 difference(s)"),
@@ -335,7 +335,7 @@ class Robustness(Scratch):
 
 
 class SharedViewer(Scratch):
-    """The report is a self-contained page in a work directory: bench/report.py --serve lists it."""
+    """The report is a self-contained page in a work directory: gates/bench/report.py --serve lists it."""
 
     @staticmethod
     def viewer():
@@ -350,7 +350,7 @@ class SharedViewer(Scratch):
         return module
 
     def test_the_adoption_tab_lists_a_work_directory_holding_a_report_and_the_directory_above_it(self):
-        self.recorder.start("adoption/run.sh")
+        self.recorder.start("gates/adoption/run.sh")
         self.recorder.row("fx", "path", "12.2.0", "PASS")
         self.recorder.build()
         viewer = self.viewer()

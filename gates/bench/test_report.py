@@ -1,4 +1,4 @@
-"""Reporter correctness only: python3 -m unittest discover -s bench -p test_report.py."""
+"""Reporter correctness only: python3 -m unittest discover -s gates/bench -p test_report.py."""
 import copy
 import io
 import json

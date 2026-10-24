@@ -525,7 +525,7 @@ def _run_matrix(root, image, only, port, recorder):
         if only and only != name:
             continue
         if name in FRESH_INSTALL:
-            # A first-run install carries no seeds; adoption/run.sh validates it live.
+            # A first-run install carries no seeds; gates/adoption/run.sh validates it live.
             continue
         source = root / name
         ready = source / "synthetic-ready.json"

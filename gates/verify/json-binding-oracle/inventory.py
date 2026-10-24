@@ -2,14 +2,14 @@
 """List every schema reachable from JSON request bodies in both vendored contracts.
 
 Run from the repository root. Enum constants are independently recorded with:
-  dotnet run --project verify/json-binding-oracle -p:JellyfinDirectory=DIR -- \
+  dotnet run --project gates/verify/json-binding-oracle -p:JellyfinDirectory=DIR -- \
     --enum-inventory DIR
 The schema inventory includes nested/array members and avoids reference cycles.
 """
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def inventory():

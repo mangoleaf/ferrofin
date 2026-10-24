@@ -2,7 +2,7 @@
 # Each @test runs in its own subshell, so a test naming its own SCRATCH folder is meant to be
 # local to it.
 # shellcheck disable=SC2030,SC2031
-# Tests for the scan-behaviour check (verify/lib.sh, verify/scan-behaviour.sh). Nothing here
+# Tests for the scan-behaviour check (gates/verify/lib.sh, gates/verify/scan-behaviour.sh). Nothing here
 # needs a Ferrofin: lib.sh is driven with canned /metrics text and throwaway files; the script's
 # refusals run against a static file server (python3 -m http.server) standing in for the API,
 # every one before the script writes or asks anything; and whole runs go against
@@ -10,7 +10,7 @@
 
 setup() {
   VERIFY="$BATS_TEST_DIRNAME/.."
-  # shellcheck source=verify/lib.sh
+  # shellcheck source=gates/verify/lib.sh
   . "$VERIFY/lib.sh"
   TMP="$(realpath "$BATS_TEST_TMPDIR")/verify"
   mkdir -p "$TMP"

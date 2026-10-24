@@ -12,7 +12,7 @@ from PIL import Image
 
 # Credited on every movie and episode NFO, so Peoples and PeopleBaseItemMap hold rows.
 ACTORS = (("Synthetic Actor One", "Lead"), ("Synthetic Actor Two", "Support"))
-# The x265 HDR10 parameters of bench/testdata/gen.py's hevc_2160p_hdr10_51 template.
+# The x265 HDR10 parameters of gates/bench/testdata/gen.py's hevc_2160p_hdr10_51 template.
 HDR10 = ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
          "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
          "-x265-params", "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
@@ -63,7 +63,7 @@ def generate(root, image):
             image, "-hide_banner", "-loglevel", "error", "-nostdin", *args,
         ], check=True)
 
-    # Chapters every two minutes, the shape of bench/testdata/gen.py's chapters.txt, so every
+    # Chapters every two minutes, the shape of gates/bench/testdata/gen.py's chapters.txt, so every
     # video has Chapters rows (and chapter images once extraction runs).
     (root / "chapters.txt").write_text(";FFMETADATA1\n" + "".join(
         f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={i * 120000}\nEND={(i + 1) * 120000}\ntitle=Chapter {i + 1}\n"

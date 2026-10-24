@@ -383,7 +383,7 @@ def export_existing_pools(url, ids_path):
 
 def setup(api):
     """Startup wizard (admin bench/bench) and the three libraries, without a scan; returns
-    the admin's id and leaves `api` authenticated. bench/scan.py times the scan after it."""
+    the admin's id and leaves `api` authenticated. gates/bench/scan.py times the scan after it."""
     wait_ready(api)
     print("wizard", flush=True)
     api.post("/Startup/Configuration", {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})

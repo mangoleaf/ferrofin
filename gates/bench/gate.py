@@ -18,7 +18,7 @@
     gate.py endpoints PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the per-endpoint latency pass (`run.sh --only endpoints`, Ferrofin only here) interleaved the
         same way: every GET of the parity catalogue, p50/p95/p99 per run, regressed / within noise /
-        improved per endpoint on the p50 by the `[endpoints]` row; only the `bench/screens.js` shapes
+        improved per endpoint on the p50 by the `[endpoints]` row; only the `gates/bench/screens.js` shapes
         and the parity edge-case GETs gate (endpoints.py has the catalogue)
     gate.py soak PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the one-hour memory soak (`run.sh --only soak`, Ferrofin only) back to back, default one
@@ -614,7 +614,7 @@ def render_html(plan, result):
                         else "<b>Pass</b>: no gated endpoint regressed.")
         parts += [f"<h2>Per-endpoint latency</h2><p class='lede'>{verdict_text} Every GET of the parity catalogue, alone: "
                   "the median across each side's runs of p50, p95 and p99 (ms). The verdict is on the p50; only the "
-                  "<code>bench/screens.js</code> shapes and the edge-case GETs gate, and they are listed first.</p>",
+                  "<code>gates/bench/screens.js</code> shapes and the edge-case GETs gate, and they are listed first.</p>",
                   "<div class='scroll'>" + html_table(ENDPOINT_HEAD, endpoint_rows(result["verdicts"]), verdict_col=7) + "</div>"]
     elif plan["mode"] == "ramp":
         verdict_text = (f"<b>Blocked</b> by {e(', '.join(result['blocking']))}" if result["blocking"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
+# gates/adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
 #
 # Adopts every Jellyfin release Ferrofin claims to support, 11 paths: 10.11.8, 10.11.9, 10.11.10,
 # 10.11.11, 12.0, 12.1 via both upgrade routes, 12.2 via all three (from 10.11, 12.0, 12.1), and a
@@ -28,17 +28,17 @@
 # and the time of the every-boot foreign_key_check, on its PASS line and in
 # WORK/scale-measurements-<fixture>.json. Recorded, not gated. The boot may take
 # ADOPTION_SCALE_TIMEOUT seconds (default 1800) to answer. --only selects it like a messy fixture.
-# Every check's verdict is recorded as it runs, and WORK/report.html (adoption/adoption_report.py) is built from
+# Every check's verdict is recorded as it runs, and WORK/report.html (gates/adoption/adoption_report.py) is built from
 # those however the run ends: per fixture and stage, every check, the table-digest differences, the
 # messy shapes against Jellyfin 12.2 and the scale measurements. It opens from disk, and the shared
-# viewer lists it (python3 bench/report.py --serve --adoption-dir WORK/..).
+# viewer lists it (python3 gates/bench/report.py --serve --adoption-dir WORK/..).
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
 # includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
 # build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
-# adoption/README.md. DIR and the work directory must be on a local disk.
+# gates/adoption/README.md. DIR and the work directory must be on a local disk.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=adoption/lib.sh
+# shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}; IMAGE=${IMAGE:-ferrofin:bench}; ONLY=; USER_NAME=${ADOPTION_USER:-}
 ORACLE_VERSION=${ADOPTION_ORACLE:-12.2}
@@ -55,10 +55,10 @@ python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is 
 python3 -c 'import icu' 2>/dev/null || { echo "run: Python PyICU (python3-icu) is required for the CleanValue check" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
 ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
-[ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
+[ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
 # the probes must run as the account the oracle ran as; the builder records it
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
-[ -d "$FIXTURES/media" ] || { echo "run: $FIXTURES/media missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
+[ -d "$FIXTURES/media" ] || { echo "run: $FIXTURES/media missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
 adoption_require_local "$FIXTURES" && adoption_require_local "$WORK" || exit 2; mkdir -p "$WORK"
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 # The report: recorded as the run goes, built when it ends. Recording never changes the verdict.
@@ -78,7 +78,7 @@ trap finish EXIT
 trap 'exit 130' INT   # bash runs the EXIT trap only on an exit, not on a fatal signal: the report is built either way
 trap 'exit 143' TERM
 trap 'exit 129' HUP
-record start "$WORK" --title "adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION"
+record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION"
 # fixture_line <kind> <verdict> <expected> <fixture> <detail>: the PASS/FAIL line, and the fixture's row in the report.
 fixture_line() {
   printf '%-5s %-9s %-28s %s\n' "$2" "$3" "$4" "$5"

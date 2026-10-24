@@ -1,6 +1,6 @@
 // Measures Jellyfin's actual converters without changing server data.
 // .NET 10 SDK; JellyfinDirectory is a Jellyfin 12.2 portable installation:
-// dotnet run --project verify/json-binding-oracle -p:JellyfinDirectory=/path/to/jellyfin
+// dotnet run --project gates/verify/json-binding-oracle -p:JellyfinDirectory=/path/to/jellyfin
 // JSON-lines output is checked in at crates/ferrofin-api/tests/data/json-binding/.
 using System.ComponentModel;
 using System.Globalization;

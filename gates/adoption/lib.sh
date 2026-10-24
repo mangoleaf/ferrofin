@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Functions shared by adoption/run.sh and adoption/smoke.sh. Sourced, never executed: nothing
-# here touches docker or the network, which is what lets adoption/tests/*.bats drive every
+# Functions shared by gates/adoption/run.sh and gates/adoption/smoke.sh. Sourced, never executed: nothing
+# here touches docker or the network, which is what lets gates/adoption/tests/*.bats drive every
 # check with canned logs, smoke outputs and throwaway SQLite files.
 
 # Probe answers that legitimately differ between Ferrofin and Jellyfin, or between two boots.

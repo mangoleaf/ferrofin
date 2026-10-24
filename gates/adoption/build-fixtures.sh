@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# adoption/build-fixtures.sh --fixtures DIR
+# gates/adoption/build-fixtures.sh --fixtures DIR
 #
-# Builds every fixture adoption/run.sh needs from synthetic data only — no real library, no
+# Builds every fixture gates/adoption/run.sh needs from synthetic data only — no real library, no
 # media server, no network share. synthetic.py generates invented media under DIR/media and has
 # each Jellyfin release build its own fixture through its API (see VERSIONS there):
 #   jellyfin-10.11.8/                 Jellyfin 10.11.8 seeded from scratch
@@ -28,7 +28,7 @@
 # between runs. A failed messy or scale build removes its own derived copy, so only that step is repeated.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=adoption/lib.sh
+# shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
 while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,28p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done

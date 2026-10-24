@@ -10,21 +10,21 @@
 #
 # `ramp` is opt-in (never part of a default run) and Ferrofin only: it steps the loaded mix
 # upward until a step fails and reports the last passing rate as the throughput ceiling
-# (bench/ramp.py). `gate.py ramp PREVIOUS CANDIDATE` runs it A/B.
+# (gates/bench/ramp.py). `gate.py ramp PREVIOUS CANDIDATE` runs it A/B.
 #
 # `soak` is opt-in (never part of a default run) and Ferrofin only: it holds the loaded mix
-# for an hour and reports the slope of anon memory (bench/soak.py). `gate.py soak PREVIOUS
+# for an hour and reports the slope of anon memory (gates/bench/soak.py). `gate.py soak PREVIOUS
 # CANDIDATE` runs it A/B.
 #
 # `endpoints` is opt-in (never part of a default run), on either server: every GET of the parity
-# request catalogue alone, one endpoint at a time, p50/p95/p99 each (bench/endpoints.py). `gate.py
+# request catalogue alone, one endpoint at a time, p50/p95/p99 each (gates/bench/endpoints.py). `gate.py
 # endpoints PREVIOUS CANDIDATE` runs it A/B.
 #
 # Requires: docker, k6, python3, jq; the pinned Jellyfin image
 # and ferrofin:bench (docker build -t ferrofin:bench .).
 set -euo pipefail
 CALLER=$PWD
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # ── tunables (§2) ──────────────────────────────────────────────────────────
 WARMUP_S=${WARMUP_S:-30}        # discarded seconds at the same rate before each window
@@ -91,12 +91,12 @@ SOAK_SKIP_S=${SOAK_SKIP_S:-600}
 #: relative to the repository) are the parity request sets it reads.
 ENDPOINT_COUNT=${ENDPOINT_COUNT:-200}
 ENDPOINT_MAX_S=${ENDPOINT_MAX_S:-10}
-ENDPOINT_SETS=${ENDPOINT_SETS:-parity/requests/sweep,parity/requests/edge}
+ENDPOINT_SETS=${ENDPOINT_SETS:-gates/parity/requests/sweep,gates/parity/requests/edge}
 export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
 
-TESTDATA=$PWD/bench/testdata; SERVERS=jellyfin,ferrofin; ONLY=""; OUT=""
+TESTDATA=$PWD/gates/bench/testdata; SERVERS=jellyfin,ferrofin; ONLY=""; OUT=""
 while [ $# -gt 0 ]; do case "$1" in
   --testdata) TESTDATA=$2; shift 2;; --servers) SERVERS=$2; shift 2;;
   --only) ONLY=${2:-}; [ -n "$ONLY" ] || { echo "--only requires a phase or comma list" >&2; exit 2; }; shift 2;;
@@ -133,7 +133,7 @@ SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
 #                                               it; image.txt and run.json.sha record what
 #                                               actually ran
 #   no tags / no git    20260903-1412-7e80268   the date form, as before
-RUNS_DIR=$PWD/bench/runs
+RUNS_DIR=$PWD/gates/bench/runs
 run_name() {
   local base n
   if base=$(git describe --tags --exact-match 2>/dev/null); then
@@ -163,7 +163,7 @@ for p in "$TESTDATA" "$OUT"; do case "$p" in /mnt/mangonas*|/mnt/nvme0/k3s*) ech
 
 docker_cmd() { timeout --kill-after=2 "$HTTP_TIMEOUT_S" docker "$@"; }
 die() { echo "run: $*" >&2; exit 1; }
-image_of() { case "$1" in jellyfin) cat bench/testdata/jellyfin-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
+image_of() { case "$1" in jellyfin) cat gates/bench/testdata/jellyfin-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
 port_of() { case "$1" in jellyfin) echo 18101;; ferrofin) echo 18103;; esac; }
 want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by default
@@ -174,15 +174,15 @@ explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by defau
 ! explicit soak || [ "$SERVERS" = ferrofin ] || die "the soak is Ferrofin only: pass --servers ferrofin"
 ! explicit soak || (( SOAK_SKIP_S < SOAK_S )) || die "SOAK_SKIP_S must be shorter than SOAK_S"
 [ ! -e "$OUT" ] || die "$OUT exists — a run directory is never reused"
-[ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
+[ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (gates/bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum timeout setsid; do command -v $t >/dev/null || die "$t not installed"; done
 [ ! -z "$ONLY" ] && ! want ttfs || command -v ffprobe >/dev/null || die "ffprobe not installed"
-jq -e '.viewer_name and .viewer_password and .viewer and (.viewer != .user)' "$TESTDATA/ids.json" >/dev/null || die "playback role missing; run bench/testdata/build.sh --export-pools, then prepare Jellyfin again"
-jq -e '.pools | (.movies|length)>0 and (.series|length)>0 and (.terms|length)>0 and (.movieCount>0) and (.nextUpCutoff|type=="string")' "$TESTDATA/ids.json" >/dev/null || die "fixture pools missing; run bench/testdata/build.sh --export-pools"
+jq -e '.viewer_name and .viewer_password and .viewer and (.viewer != .user)' "$TESTDATA/ids.json" >/dev/null || die "playback role missing; run gates/bench/testdata/build.sh --export-pools, then prepare Jellyfin again"
+jq -e '.pools | (.movies|length)>0 and (.series|length)>0 and (.terms|length)>0 and (.movieCount>0) and (.nextUpCutoff|type=="string")' "$TESTDATA/ids.json" >/dev/null || die "fixture pools missing; run gates/bench/testdata/build.sh --export-pools"
 for s in ${SERVERS//,/ }; do docker_cmd image inspect "$(image_of "$s")" >/dev/null 2>&1 || die "image $(image_of "$s") missing"; done
 if [[ ",$SERVERS," == *,jellyfin,* ]]; then
   prep=$TESTDATA/jellyfin/preparation.json
-  [ -f "$prep" ] || die "prepare Jellyfin first: bench/testdata/build.sh --prepare-jellyfin '$TESTDATA'"
+  [ -f "$prep" ] || die "prepare Jellyfin first: gates/bench/testdata/build.sh --prepare-jellyfin '$TESTDATA'"
   expected_image=$(docker_cmd image inspect -f '{{.Id}}' "$(image_of jellyfin)")
   expected_source=$(sha256sum "$TESTDATA/config/data/jellyfin.db" | cut -d' ' -f1)
   expected_ids=$(sha256sum "$TESTDATA/ids.json" | cut -d' ' -f1)
@@ -192,15 +192,15 @@ if [[ ",$SERVERS," == *,jellyfin,* ]]; then
 fi
 echo "servers: $SERVERS; selected phases: ${ONLY:-all}; warm-up ${WARMUP_S}s; windows ${WINDOW_S}s"
 [ -z "$(docker_cmd ps -aq --filter name=^bench-)" ] || die "a bench-* container exists (docker rm -f it first)"
-topology=$(python3 bench/mem_sample.py --topology "$SERVER_CPUS" "$CLIENT_CPUS") || die "invalid CPU allocation"
+topology=$(python3 gates/bench/mem_sample.py --topology "$SERVER_CPUS" "$CLIENT_CPUS") || die "invalid CPU allocation"
 checked_cpus=$(jq -r '.checked_cpus|map(tostring)|join(",")' <<<"$topology")
-idle=$(python3 bench/mem_sample.py --check "$checked_cpus")
+idle=$(python3 gates/bench/mem_sample.py --check "$checked_cpus")
 awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN { if (i < m) { printf "cores %s are only %.0f%% idle (need %.0f%%) — something else is using them\n", c, i*100, m*100; exit 1 } }' || exit 1
 mkdir -p "$OUT"
 IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
 # The Jellyfin oracle pin; behind the latest Jellyfin release it only warns here (gate.py refuses).
-ORACLE=$(python3 bench/oracle.py check) || die "cannot read the Jellyfin oracle pin"
+ORACLE=$(python3 gates/bench/oracle.py check) || die "cannot read the Jellyfin oracle pin"
 # The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
 FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' ferrofin:bench)
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
@@ -211,7 +211,7 @@ jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(base
   --argjson ready "$READY_TIMEOUT_S" --argjson drain "$DRAIN_TIMEOUT_S" --argjson http "$HTTP_TIMEOUT_S" --argjson stream_http "$STREAM_HTTP_TIMEOUT_S" \
   --argjson phase "$PHASE_TIMEOUT_S" --argjson cleanup "$CLEANUP_TIMEOUT_S" --argjson coldstart_attempt "$COLDSTART_ATTEMPT_TIMEOUT_MS" --argjson restarts "$RESTARTS" --argjson ttfs_reps "$TTFS_REPS" \
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" --argjson oracle "$ORACLE" \
-  --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
+  --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum gates/bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
   '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, scan_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, coldstart_attempt_timeout_ms:$coldstart_attempt, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, ferrofin_image:$ferrofin_image, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
@@ -290,8 +290,8 @@ client() {
 k6run() {
   local arg output="" validation
   for arg in "$@"; do case "$arg" in OUT=*) output=${arg#OUT=};; esac; done
-  client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json -e SLOTS="$SLOTS" -e SHAPE_VUS="$SHAPE_VUS" -e URL="$URL" -e IDS="$IDS" "$@" bench/screens.js || return $?
-  validation=$(python3 bench/report.py --window-check "$output" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
+  client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json -e SLOTS="$SLOTS" -e SHAPE_VUS="$SHAPE_VUS" -e URL="$URL" -e IDS="$IDS" "$@" gates/bench/screens.js || return $?
+  validation=$(python3 gates/bench/report.py --window-check "$output" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
 }
 state() {
   local name=$1 status=$2 reason=${3:-}
@@ -366,14 +366,14 @@ phase_counts() {
   echo "  counts: $(jq -c . "$D/counts.json")"
 }
 setup_users() {
-  client python3 bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$D/ids-private.json" || return 1
+  client python3 gates/bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$D/ids-private.json" || return 1
   IDS=$D/ids-private.json
-  client python3 bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-baseline.json"
+  client python3 gates/bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-baseline.json"
 }
 state_check() {
   local name=$1
-  client python3 bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-$name.json" &&
-    client python3 bench/testdata/seed.py --state-compare "$D/state-baseline.json" "$D/state-$name.json" "$D/isolation-$name.json" || {
+  client python3 gates/bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-$name.json" &&
+    client python3 gates/bench/testdata/seed.py --state-compare "$D/state-baseline.json" "$D/state-$name.json" "$D/isolation-$name.json" || {
       FAIL_REASON="browse state/session isolation failed; see state-$name.json and isolation-$name.json"; return 1;
     }
 }
@@ -389,21 +389,21 @@ isolated_phase() {
 phase_shape() {
   local validation
   client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output "$D/shape.log" \
-    -e URL="$URL" -e IDS="$IDS" -e SHAPE=1 -e SHAPE_VUS="$SHAPE_VUS" -e SEED="$SEED" -e SLOTS="$SLOTS" -e OUT="$D/shape-summary.json" bench/screens.js >/dev/null || return 1
+    -e URL="$URL" -e IDS="$IDS" -e SHAPE=1 -e SHAPE_VUS="$SHAPE_VUS" -e SEED="$SEED" -e SLOTS="$SLOTS" -e OUT="$D/shape-summary.json" gates/bench/screens.js >/dev/null || return 1
   echo "  shape: $(jq -r '.iterations|tostring' "$D/shape-summary.json") slots; $(jq -r '.elapsed_ms/1000' "$D/shape-summary.json") seconds"
-  validation=$(python3 bench/report.py --shape-coverage "$D" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
+  validation=$(python3 gates/bench/report.py --shape-coverage "$D" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
   echo "$validation"
 }
 phase_coldstart() {
-  client taskset -c "$CLIENT_CPUS" python3 bench/coldstart.py "$CONTAINER" "$URL" "$IDS" "$D/coldstart.json" "$RESTARTS" "$POLL_MS" || return 1
+  client taskset -c "$CLIENT_CPUS" python3 gates/bench/coldstart.py "$CONTAINER" "$URL" "$IDS" "$D/coldstart.json" "$RESTARTS" "$POLL_MS" || return 1
   wait_ready && drain || return 1
   # Restarts clear live sessions. Reauthenticate the two roles outside restart timing.
-  client python3 bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$IDS"
+  client python3 gates/bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$IDS"
 }
 phase_load() {
   local level rate t0 t1 sampler_ok=1 deadline window_s client_timeout
   state sampler running
-  taskset -c "$CLIENT_CPUS" python3 bench/mem_sample.py "$CONTAINER" "$D/mem.csv" "$MEM_SAMPLE_MS" "$SERVER_CPUS" &
+  taskset -c "$CLIENT_CPUS" python3 gates/bench/mem_sample.py "$CONTAINER" "$D/mem.csv" "$MEM_SAMPLE_MS" "$SERVER_CPUS" &
   SAMPLER_PID=$!
   deadline=$((SECONDS + HTTP_TIMEOUT_S))
   while [ ! -s "$D/mem.csv" ] && kill -0 "$SAMPLER_PID" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
@@ -443,8 +443,8 @@ phase_load() {
   else state steady skipped "drain failed"; fi
   sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
   stop_sampler || sampler_ok=0
-  python3 bench/report.py --resource-check "$D" || sampler_ok=0
-  ! explicit soak || phase soak-slope python3 bench/soak.py finish "$D" || true
+  python3 gates/bench/report.py --resource-check "$D" || sampler_ok=0
+  ! explicit soak || phase soak-slope python3 gates/bench/soak.py finish "$D" || true
   if (( sampler_ok )); then state sampler completed; else state sampler failed "sampler exit or coverage failed"; FAILED=1; fi
 }
 
@@ -459,9 +459,9 @@ phase_ramp() {
     # The per-iteration selection log feeds the picks comparison, which the ramp does not make.
     client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output /dev/null \
       -e SLOTS="$SLOTS" -e SHAPE_VUS="$SHAPE_VUS" -e URL="$URL" -e IDS="$IDS" -e RATE="$rate" -e DURATION="${RAMP_STEP_S}s" -e SEED="$SEED" \
-      -e OUT="$D/k6-ramp-$rate.json" bench/screens.js || return 1
+      -e OUT="$D/k6-ramp-$rate.json" gates/bench/screens.js || return 1
     [ -s "$D/k6-ramp-$rate.json" ] || { FAIL_REASON="no k6 summary for $rate screens/s"; return 1; }
-    rc=0; reason=$(python3 bench/ramp.py check "$D/k6-ramp-$rate.json" "$RAMP_BOUND_MS") || rc=$?
+    rc=0; reason=$(python3 gates/bench/ramp.py check "$D/k6-ramp-$rate.json" "$RAMP_BOUND_MS") || rc=$?
     case "$rc" in
       0) echo "  ramp: $rate screens/s passed";;
       1) echo "  ramp: stopped at $rate screens/s: $reason"; break;;
@@ -469,7 +469,7 @@ phase_ramp() {
     esac
     rate=$((rate + RAMP_STEP_RATE))
   done
-  rc=0; python3 bench/ramp.py finish "$D" || rc=$?
+  rc=0; python3 gates/bench/ramp.py finish "$D" || rc=$?
   case "$rc" in
     0) ;;
     1) FAIL_REASON="the ramp has no passing step"; return 1;;
@@ -480,17 +480,17 @@ phase_ramp() {
 phase_endpoints() {
   local sets=() entry bound
   for entry in ${ENDPOINT_SETS//,/ }; do sets+=(--set "$entry"); done
-  bound=$(python3 bench/endpoints.py plan --bound --count "$ENDPOINT_COUNT" --max-s "$ENDPOINT_MAX_S" --timeout "$HTTP_TIMEOUT_S" "${sets[@]}") ||
+  bound=$(python3 gates/bench/endpoints.py plan --bound --count "$ENDPOINT_COUNT" --max-s "$ENDPOINT_MAX_S" --timeout "$HTTP_TIMEOUT_S" "${sets[@]}") ||
     { FAIL_REASON="endpoints.py cannot read the request sets"; return 1; }
   drain || return 1
   # The client must outlive the slowest possible pass (every request at its timeout), not PHASE_TIMEOUT_S.
-  PHASE_TIMEOUT_S=$((bound + PHASE_TIMEOUT_S)) client taskset -c "$CLIENT_CPUS" python3 bench/endpoints.py run "$URL" "$IDS" "$D" \
+  PHASE_TIMEOUT_S=$((bound + PHASE_TIMEOUT_S)) client taskset -c "$CLIENT_CPUS" python3 gates/bench/endpoints.py run "$URL" "$IDS" "$D" \
     --count "$ENDPOINT_COUNT" --max-s "$ENDPOINT_MAX_S" --timeout "$HTTP_TIMEOUT_S" "${sets[@]}"
 }
 
 phase_ttfs() {
   drain || return 1
-  client taskset -c "$CLIENT_CPUS" python3 bench/ttfs.py "$URL" "$IDS" "$D/ttfs.json" "$TTFS_REPS" || return 1
+  client taskset -c "$CLIENT_CPUS" python3 gates/bench/ttfs.py "$URL" "$IDS" "$D/ttfs.json" "$TTFS_REPS" || return 1
 }
 
 run_server() {
@@ -549,7 +549,7 @@ PY_ISOLATION
   if [ "$1" = jellyfin ]; then
     local expected_version; expected_version=$(jq -r '.validation.system_info.Version' "$TESTDATA/jellyfin/preparation.json")
     [ "$(jq -r .Version "$D/system-info.json")" = "$expected_version" ] || die "expected Jellyfin $expected_version"
-    python3 bench/oracle.py matches "$expected_version" || die "the Jellyfin image is not the oracle release"
+    python3 gates/bench/oracle.py matches "$expected_version" || die "the Jellyfin image is not the oracle release"
   fi
   disable_plugins "$cfg"
   disable_schedules || die "$NAME: could not disable automatic tasks"
@@ -562,7 +562,7 @@ PY_ISOLATION
   # equivalent one full scan of its adopted copy, then a fresh process, as Jellyfin's scan
   # ran in its preparation: no scan heap is left in the memory numbers.
   if [ "$1" = ferrofin ]; then
-    PHASE_TIMEOUT_S=${PREPARE_TIMEOUT_S:-1800} client python3 bench/testdata/seed.py --scan "$URL" "$TESTDATA/ids.json" "$D/scan.json" \
+    PHASE_TIMEOUT_S=${PREPARE_TIMEOUT_S:-1800} client python3 gates/bench/testdata/seed.py --scan "$URL" "$TESTDATA/ids.json" "$D/scan.json" \
       || die "$NAME: library scan failed: ${FAIL_REASON:-see the traceback above, or $D/server.log}"
     docker_cmd stop --time "$CLEANUP_TIMEOUT_S" "$CONTAINER" >/dev/null
     docker_cmd start "$CONTAINER" >/dev/null
@@ -600,7 +600,7 @@ for s in ${SERVERS//,/ }; do
   set -e
   (( status == 0 )) || rc=1
 done
-python3 bench/report.py "$OUT" > "$OUT/report.md" || rc=1
-python3 bench/report.py --html "$OUT" > /dev/null || rc=1
-echo "report: $OUT/report.md, $OUT/report.html  —  compare in the browser: python3 bench/report.py --serve"
+python3 gates/bench/report.py "$OUT" > "$OUT/report.md" || rc=1
+python3 gates/bench/report.py --html "$OUT" > /dev/null || rc=1
+echo "report: $OUT/report.md, $OUT/report.html  —  compare in the browser: python3 gates/bench/report.py --serve"
 exit "$rc"

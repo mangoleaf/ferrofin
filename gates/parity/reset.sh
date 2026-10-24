@@ -9,9 +9,9 @@
 # Exit 0 when both servers answer again; 1 with one line per server that did not, on stderr.
 # Settings (environment, exported by run.sh): READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S.
 set -euo pipefail
-cd "$(dirname "$0")/.."
-# shellcheck source=parity/lib.sh
-source parity/lib.sh
+cd "$(dirname "$0")/../.."
+# shellcheck source=gates/parity/lib.sh
+source gates/parity/lib.sh
 if [ $# -ne 1 ] || [ ! -d "$1" ]; then echo "usage: reset.sh RUN_DIR" >&2; exit 2; fi
 RUN=$1
 

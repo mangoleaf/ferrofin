@@ -45,7 +45,7 @@ VERSIONS = (
 NO_ORPHAN_CLEANUP = {"12.0"}
 # Fixtures that are a release's own first run (parent None, version 12.x), seeded only through
 # that release's API. A first-run install has none of the aged states seed_database injects, so
-# these carry no seeds: they are validated live by adoption/run.sh (its FIXTURE_TABLE), which
+# these carry no seeds: they are validated live by gates/adoption/run.sh (its FIXTURE_TABLE), which
 # proves the fresh-install EF id set and schema adopt, not by the seed-driven preservation
 # matrix (run_matrix), which has nothing to compare and skips them.
 FRESH_INSTALL = {"jellyfin-12.2-fresh"}
@@ -142,7 +142,7 @@ def build(root, only, port):
             validate(baseline, manifest)
             save(config / "preservation.json", baseline)
         # A first-run install (FRESH_INSTALL) has none of the aged states seed_database injects;
-        # it carries no seeds and is validated live by adoption/run.sh, not the preservation
+        # it carries no seeds and is validated live by gates/adoption/run.sh, not the preservation
         # matrix, so the whole seed step is skipped for it.
         if name not in FRESH_INSTALL:
             if not parent:

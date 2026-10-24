@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify/scan-behaviour.sh [options] BASE_URL LIBRARY_ID SCRATCH_DIR [SERVER_SCRATCH_DIR]
+# gates/verify/scan-behaviour.sh [options] BASE_URL LIBRARY_ID SCRATCH_DIR [SERVER_SCRATCH_DIR]
 #
 # Checks, against any running Ferrofin, that library scans reprocess only what changed: a
 # first scan creates the new items, an unchanged rescan probes, asks and writes nothing, a
@@ -42,7 +42,7 @@
 # or a row fails that did nothing wrong.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=verify/lib.sh
+# shellcheck source=gates/verify/lib.sh
 . "$HERE/lib.sh"
 
 # usage: the header above, without its comment markers.

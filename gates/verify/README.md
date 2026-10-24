@@ -1,6 +1,6 @@
 # Scan-behaviour check
 
-`verify/scan-behaviour.sh` checks, against any running Ferrofin, that a library scan
+`gates/verify/scan-behaviour.sh` checks, against any running Ferrofin, that a library scan
 reprocesses only what changed: a scan does not re-probe, re-fetch or re-save the whole
 library unless the dashboard asked for a full refresh ("Search for missing metadata",
 "Replace all metadata"). Point it at a local server, a copy of production data or a staging
@@ -21,7 +21,7 @@ It is one of three ways to see that scans behave:
 ## Running it
 
 ```bash
-FERROFIN_TOKEN=… verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DIR [SERVER_SCRATCH_DIR]
+FERROFIN_TOKEN=… gates/verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DIR [SERVER_SCRATCH_DIR]
 ```
 
 - `FERROFIN_TOKEN` is an administrator's access token. The script reads it from the
@@ -135,10 +135,10 @@ the cleanup). A failed row names each check that missed, with the value it wante
 
 ## Shell tests
 
-`verify/tests/verify.bats` runs in CI with the other shell tests. It drives the `/metrics`
+`gates/verify/tests/verify.bats` runs in CI with the other shell tests. It drives the `/metrics`
 arithmetic in `lib.sh` with canned exposition text, and the script's refusals against a
 `python3` static file server standing in for the API. Whole runs go against
-`verify/tests/fake_server.py`, which plays back a scenario of what a well-behaved server's
+`gates/verify/tests/fake_server.py`, which plays back a scenario of what a well-behaved server's
 scans do. They cover:
 
 - a passing run, and one with a failing row (exit 1);
@@ -162,9 +162,9 @@ and decides nothing. That behaviour is the server's; here the check is on the sc
 side, that its NFOs leave the enriched checks nothing to ask for.
 
 ```bash
-shellcheck -x verify/lib.sh verify/scan-behaviour.sh
-shellcheck -x -s bash verify/tests/verify.bats
-bats verify/tests
+shellcheck -x gates/verify/lib.sh gates/verify/scan-behaviour.sh
+shellcheck -x -s bash gates/verify/tests/verify.bats
+bats gates/verify/tests
 ```
 
 ## Test record
@@ -187,7 +187,7 @@ unchanged, 0 probes).
 
 ## Dashboard scan progress
 
-`node verify/scan-progress.mjs BINARY [LOG_EVERY]` boots a disposable server and
+`node gates/verify/scan-progress.mjs BINARY [LOG_EVERY]` boots a disposable server and
 checks progress over authenticated HTTP and WebSocket connections. It needs Node
 22 or newer and uses controlled ffprobe stubs; no media or existing server is
 modified. Logs and captured events remain in the printed temporary directory.
@@ -206,7 +206,7 @@ not production throughput estimates.
 
 ## Query binding
 
-`python3 verify/query-binding.py BINARY` boots a disposable server and checks
+`python3 gates/verify/query-binding.py BINARY` boots a disposable server and checks
 first-value binding for repeated scalar query parameters over authenticated HTTP.
 The 27 probes cover exact and mixed-case repetitions, encoded names and commas,
 integers, booleans, nullable UUIDs, collection requests, query-token authentication
@@ -229,9 +229,9 @@ Add `--baseline` to report the old binary's failures without stopping. Add
 with the same canonical scalar query and response on both versions. Run three
 alternating baseline/fixed pairs on a quiet machine and compare the medians and
 their range. These local HTTP timings include the Python client's overhead and
-are not a replacement for the loaded media-library benchmarks in `bench/`.
+are not a replacement for the loaded media-library benchmarks in `gates/bench/`.
 
 ```bash
-python3 verify/query-binding.py /path/to/before --baseline --samples 1000
-python3 verify/query-binding.py target/debug/ferrofin-server --samples 1000
+python3 gates/verify/query-binding.py /path/to/before --baseline --samples 1000
+python3 gates/verify/query-binding.py target/debug/ferrofin-server --samples 1000
 ```

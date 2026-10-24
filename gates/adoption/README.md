@@ -3,7 +3,7 @@
 Ferrofin supports in-place adoption of Jellyfin **10.11.8, 10.11.9, 10.11.10, 10.11.11,
 12.0.0, 12.1.0 and 12.2.0** databases. Adoption is one-way; returning to Jellyfin requires
 restoring a backup. Follow the
-[migration procedure](../docs/INSTALL.md#migrate-an-existing-jellyfin-installation) for a
+[migration procedure](../../docs/INSTALL.md#migrate-an-existing-jellyfin-installation) for a
 real installation.
 
 ## Supported and tested versions
@@ -122,8 +122,8 @@ A fresh-install Jellyfin 12.2 database (a first run, not upgraded from 10.11) wa
 eleventh live `run.sh` row (`jellyfin-12.2-fresh`), seeded from scratch through the 12.2 API and
 compared against its own Jellyfin 12.2 oracle (`smoke-jellyfin-12.2-fresh.txt`), since a clean
 install is a distinct library from the seeded upgrade routes. It carries the fresh-install EF id
-set (105) and schema and adopts as `12.2.0`. The offline gates all pass — `bats adoption/tests`,
-`python3 -m unittest discover -s adoption/tests` (170 tests) and ShellCheck — but the live
+set (105) and schema and adopts as `12.2.0`. The offline gates all pass — `bats gates/adoption/tests`,
+`python3 -m unittest discover -s gates/adoption/tests` (170 tests) and ShellCheck — but the live
 `run.sh`/`build-fixtures.sh` could not run on the author's host (its system `containerd` was
 down). The live result above is therefore recorded as **pending**: the `Adoption` workflow
 exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
@@ -216,7 +216,7 @@ written in 99 s with the messy shapes table and every stage's checks; `--only
 jellyfin-10.11.11-scale` **PASSED** and its page carries the same measurements as the PASS line
 (migration 4.7 s, peak memory 950.1 MiB, anonymous 234.1 MiB, disk high-water 1.4 GiB, WAL 161.8
 MiB, `foreign_key_check` 0.3 s). The pages open from disk and the viewer's Adoption tab lists them
-(`bench/report.py --serve --adoption-dir DIR/work`). `preservation.py` is part of the synthetic
+(`gates/bench/report.py --serve --adoption-dir DIR/work`). `preservation.py` is part of the synthetic
 recipe, so the report change needs the fixtures built again for `synthetic.py run`: the five
 fixtures it needs (`jellyfin-10.11.8`, `12.0`, `12.1-from-12`, `12.2-from-121`, `12.2-from-10`) were
 built into a new directory and `synthetic.py run --only jellyfin-12.2-from-10` **PASSED** all four
@@ -341,7 +341,7 @@ any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 
 ## The report
 
-`adoption/run.sh` and `python3 adoption/synthetic.py run` each write a self-contained
+`gates/adoption/run.sh` and `python3 gates/adoption/synthetic.py run` each write a self-contained
 `report.html` in their work directory (`DIR/work/run/` for `run.sh`, `DIR/work/` for the
 preservation matrix; `ADOPTION_WORK_DIR` moves the first). It opens from disk, has no external
 asset, and shows:
@@ -358,7 +358,7 @@ asset, and shows:
   high-water, WAL peak, the `foreign_key_check` time) and which of them could not be taken.
 
 Failed fixtures are open and passing ones collapsed. The checks are recorded one JSON line each in
-`work/results.jsonl` as the run goes (`adoption/adoption_report.py` is the recorder and the renderer), and the
+`work/results.jsonl` as the run goes (`gates/adoption/adoption_report.py` is the recorder and the renderer), and the
 page is built from that when the run ends, **however it ends**: a run that is terminated, or stops
 on an error, still leaves its page, with the fixture it was on listed as unfinished (`INCOMPLETE`,
 which fails the run) and, for the matrix, the error that stopped it as a failed check. A run
@@ -377,7 +377,7 @@ recording adds, and only on a terminal.
 The shared viewer lists it in its Adoption tab and compares two runs side by side:
 
 ```bash
-python3 bench/report.py --serve --adoption-dir DIR/work      # `run`, and the matrix as `work`
+python3 gates/bench/report.py --serve --adoption-dir DIR/work      # `run`, and the matrix as `work`
 ```
 
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
@@ -532,7 +532,7 @@ The fixture directory and the work directory must be on a **local disk**. Every 
 is copied, booted and scanned several times, so `run.sh`, `build-fixtures.sh` and
 `synthetic.py` refuse a directory on NFS, SMB/CIFS, 9p, Ceph, GlusterFS, AFS, WebDAV or
 a network FUSE mount (sshfs, rclone, s3fs), judged by `findmnt` before anything is created.
-Local FUSE disks such as ntfs-3g or mergerfs are accepted. Nothing under `adoption/` contains
+Local FUSE disks such as ntfs-3g or mergerfs are accepted. Nothing under `gates/adoption/` contains
 a database, and Git ignore rules
 exclude the fixture directories and generated reports.
 
@@ -565,11 +565,11 @@ Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3
 `curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
-adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
+gates/adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
 docker build -t ferrofin:bench .                            # the commit under test
-adoption/run.sh --fixtures /path/to/fixtures --image ferrofin:bench
-python3 adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
-adoption/run.sh --fixtures … --only jellyfin-12.1-from-10   # one generation
+gates/adoption/run.sh --fixtures /path/to/fixtures --image ferrofin:bench
+python3 gates/adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
+gates/adoption/run.sh --fixtures … --only jellyfin-12.1-from-10   # one generation
 ```
 
 A build that fails part-way, for example when Jellyfin resets a connection while seeding
@@ -577,7 +577,7 @@ A build that fails part-way, for example when Jellyfin resets a connection while
 retry could change the baseline. The half-built fixture is refused; build into a new
 directory.
 
-Full adoption validation requires **both** `adoption/run.sh` and the
+Full adoption validation requires **both** `gates/adoption/run.sh` and the
 [synthetic preservation matrix](#running-the-synthetic-matrix), run against the same
 fixture directory and the same Ferrofin image.
 
@@ -605,7 +605,7 @@ and `.watch-history-after-{adoption,restart,scan}.log` filenames.
 
 ## Tests
 
-`adoption/tests/adoption.bats` covers the harness itself without docker or fixtures: the
+`gates/adoption/tests/adoption.bats` covers the harness itself without docker or fixtures: the
 checks in `lib.sh` (log parsing, smoke normalisation and comparison, the SQLite checks, the
 second-boot repair detection, the credential picker) run against canned logs, smoke outputs
 and throwaway SQLite files, and the two entry points are exercised for their refusals and the
@@ -635,8 +635,8 @@ failed; a fixture that began and never finished is `INCOMPLETE`; a run that ran 
 every section of the page, that run text cannot inject markup, that the page is self-contained,
 the command line, and that the viewer's Adoption tab lists it. `adoption.bats` runs `run.sh` with a
 fake docker to see the checks recorded in the page of a failing row, of a skipped one and of a
-terminated run. CI runs the Bats tests with `bats adoption/tests`
-next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
+terminated run. CI runs the Bats tests with `bats gates/adoption/tests`
+next to `scripts/tests`; locally `mise exec bats@latest -- bats gates/adoption/tests` or
 a system `bats` works.
 
 The 2026-09-16 validation also passed all **23 adoption harness tests** and **13 script
@@ -825,9 +825,9 @@ Use a fresh fixture directory on a local disk, outside the checkout.
 `build-fixtures.sh` runs the build step below and adds the `run.sh` oracles:
 
 ```bash
-adoption/build-fixtures.sh --fixtures /path/to/fixtures   # or: python3 adoption/synthetic.py build --fixtures …
+gates/adoption/build-fixtures.sh --fixtures /path/to/fixtures   # or: python3 gates/adoption/synthetic.py build --fixtures …
 docker build -t ferrofin:bench .
-python3 adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
+python3 gates/adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
 ```
 
 The ten version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic.py`).
@@ -851,7 +851,7 @@ removed; the Jellyfin source remains available for another run. No fixture
 snapshots, media files, credentials, or per-item reports belong in Git.
 Adoption remains one-way: Jellyfin is never started against an adopted copy.
 
-The synthetic harness regression tests run through `bats adoption/tests`, along
+The synthetic harness regression tests run through `bats gates/adoption/tests`, along
 with the original metadata and watch-history tests. The PR CI does not encode or scan these
 fixtures. The live matrix runs in the `Adoption` workflow (`.github/workflows/adoption.yml`)
 on every push to a `release/**` branch, or by hand on any branch (one run per branch at a time:
@@ -875,8 +875,8 @@ pushed) blocks the GitHub Release and the chart, and uploads `work/` as the `upg
 artifact.
 
 ```bash
-python3 adoption/synthetic.py build --fixtures /path/to/fixtures --only jellyfin-10.11.8
-python3 adoption/synthetic.py upgrade --fixtures /path/to/fixtures --image ferrofin:bench \
+python3 gates/adoption/synthetic.py build --fixtures /path/to/fixtures --only jellyfin-10.11.8
+python3 gates/adoption/synthetic.py upgrade --fixtures /path/to/fixtures --image ferrofin:bench \
   --from ghcr.io/mangoleaf/ferrofin:v1.3.2 --from ghcr.io/mangoleaf/ferrofin:v1.0.0
 ```
 
@@ -969,7 +969,7 @@ to HTTP 403, and an administrator with downloading explicitly disabled returned
 HTTP 400. These are local debug-build measurements, not release benchmarks.
 
 The larger generated benchmark fixture was also measured with
-`bench/run.sh --servers ferrofin --only loaded`, comparing the earlier
+`gates/bench/run.sh --servers ferrofin --only loaded`, comparing the earlier
 `ferrofin:adoption-metadata-23` image with the correctness image above. Background
 load prevented the default CPU set from passing the 90% idle check. Both runs
 used server CPUs `6,22` and client CPUs `7,23`, which passed that same check.
@@ -1032,7 +1032,7 @@ line coverage was **94.10%**. Formatting, workspace Clippy, ShellCheck, and
 shell syntax checks passed.
 
 The preceding `ferrofin:adoption-preservation` image and this image were measured
-with `bench/run.sh --servers ferrofin --only loaded --rate 1` on the larger
+with `gates/bench/run.sh --servers ferrofin --only loaded --rate 1` on the larger
 generated library. Both used server CPUs `6,22`, client CPUs `7,23`, a 30-second
 warmup, and a 120-second window. Both passed the 90% idle preflight. The baseline
 completed 120 iterations and the updated build 121, with zero dropped iterations

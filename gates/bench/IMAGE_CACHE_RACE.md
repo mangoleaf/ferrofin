@@ -2,7 +2,7 @@
 
 Status: open server bug, recorded locally for review; not submitted upstream.
 
-In `bench/runs/noisy-preview`, the 600-slot shape scenario used ten VUs against fresh
+In `gates/bench/runs/noisy-preview`, the 600-slot shape scenario used ten VUs against fresh
 server caches. Jellyfin 12 returned three empty image bodies; Ferrofin returned four
 (including one transport failure). Slot 3 contains HTTP 200 `image/jpeg` responses with
 zero bytes on both servers. Later requests for those cache keys returned non-empty JPEGs.

@@ -3,7 +3,7 @@
 
     fake_server.py PORT BEHAVIOUR [CONFIG_DIR]
 
-It answers what parity/run.sh asks while booting (/System/Ping, /System/Info/Public, the sign-in,
+It answers what gates/parity/run.sh asks while booting (/System/Ping, /System/Info/Public, the sign-in,
 /Plugins, /ScheduledTasks, /Library/VirtualFolders), one item, /Users/u1/Items/m1, and one write:
 POST /UserFavoriteItems/<id> adds <id> to the favourites kept in CONFIG_DIR (the container's /config),
 which GET /favourites lists, so a write survives a restart unless the configuration is put back. Every

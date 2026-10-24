@@ -9,7 +9,7 @@
 # (the same account on every copy of one library); pass a username to pin it.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=adoption/lib.sh
+# shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 BASE=${1:?base url}; DB=${2:?data dir}/data/jellyfin.db; WANT_USER=${3:-${ADOPTION_USER:-}}
 q() { sqlite3 -readonly "file:$DB?mode=ro" "$1"; }

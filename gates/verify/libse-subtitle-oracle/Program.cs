@@ -1,6 +1,6 @@
 // Runs Jellyfin 12.2's subtitle conversion path over libse 4.0.12, the oracle for
 // Ferrofin's subtitle writers. .NET 10 SDK, with the Jellyfin image's locale:
-// LC_ALL=en_US.UTF-8 dotnet run --project verify/libse-subtitle-oracle -- \
+// LC_ALL=en_US.UTF-8 dotnet run --project gates/verify/libse-subtitle-oracle -- \
 //     <input> <srt|ass|ssa|vtt> <out-dir> [startTicks endTicks preserve(0|1)] [--debug]
 // writes one file per writer Jellyfin can reach from that source, named by format.
 // The outputs are checked in under crates/ferrofin-mediaencoding/tests/data/libse/

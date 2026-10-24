@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Self-tests of the curated edge-case set (parity/requests/edge/): every category of behaviour B7 has
+"""Self-tests of the curated edge-case set (gates/parity/requests/edge/): every category of behaviour B7 has
 requests, and they are a valid request set. Stdlib only.
 
-    python3 -m unittest discover -s parity/tests
+    python3 -m unittest discover -s gates/parity/tests
 """
 
 import json

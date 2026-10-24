@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Generate the parity sweep from the vendored contract: at least one request for every operation.
 
-    generate.py            write parity/requests/sweep/contract.jsonl and combos.jsonl
+    generate.py            write gates/parity/requests/sweep/contract.jsonl and combos.jsonl
     generate.py --check    exit 1 when the checked-in files are not what this would write
 
 Every operation of contracts/jellyfin-openapi-10.11.8.json gets a request (contract.jsonl). Its path
-parameters come from `[path]` in parity/sweep.toml (corpus ids from ids.json, names discovered from the
+parameters come from `[path]` in gates/parity/sweep.toml (corpus ids from ids.json, names discovered from the
 oracle, captures of a setup step), its required query parameters from `[query]`, and its expected status
 is the lowest success status the contract documents. `[op.<operationId>]` overrides any of that for one
 operation: a body, setup steps, an `oracle_trap`, the status an operation answers on this corpus with
@@ -26,7 +26,7 @@ import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parent.parent
 CONTRACT = ROOT / "contracts" / "jellyfin-openapi-10.11.8.json"
 CONFIG = HERE / "sweep.toml"
 OUT = HERE / "requests" / "sweep"
@@ -35,7 +35,7 @@ OVERRIDE_KEYS = {"path", "query", "body", "setup", "readbacks", "expect_status",
 
 
 class GenerateError(Exception):
-    """The contract or parity/sweep.toml cannot produce a request set."""
+    """The contract or gates/parity/sweep.toml cannot produce a request set."""
 
 
 def operations(contract):
@@ -256,7 +256,7 @@ def main(argv):
     stale = [name for name, text in files.items() if not (OUT / name).exists() or (OUT / name).read_text() != text]
     if args.check:
         for name in stale:
-            print(f"generate: {OUT / name} is stale: run parity/generate.py", file=sys.stderr)
+            print(f"generate: {OUT / name} is stale: run gates/parity/generate.py", file=sys.stderr)
         return 1 if stale else 0
     OUT.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():

@@ -8,7 +8,7 @@
                                              BEGIN/END GENERATED BENCHMARKS markers in place
     report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained; run.sh does this)
     report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR]
-                                             the viewer on http://127.0.0.1:PORT (default 8097, bench/runs):
+                                             the viewer on http://127.0.0.1:PORT (default 8097, gates/bench/runs):
                                              Benchmark, Adoption and Parity tabs, each listing that harness's
                                              runs (a report.html each) and comparing two side by side. The
                                              directories also come from FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS.
@@ -1317,7 +1317,7 @@ def render_readme(m, run_dirs):
     notes = Notes()
     out = []
     p = out.append
-    cmd = "python3 bench/report.py --readme README.md " + " ".join(f"bench/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
+    cmd = "python3 gates/bench/report.py --readme README.md " + " ".join(f"gates/bench/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
     p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
     cpus = str(meta.get("server_cpus", ""))
     try:
@@ -1406,7 +1406,7 @@ def render_readme(m, run_dirs):
           f"{README_LEVEL}-level tables moved by more than 15 % of their value, against {tail_moved} of the {tails} "
           f"p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, "
           f"and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); "
-          f"the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). "
+          f"the harness and the one-sentence definition of each number are in [`gates/bench/README.md`](gates/bench/README.md). "
           f"It is a deliberate, local instrument, not a CI job.")
     p(README_END)
     return "\n".join(out) + "\n"
@@ -1763,7 +1763,7 @@ def verdict_html(cells):
     return (f"<h2>A/B gate — {head or 'no cells'}</h2><p class='lede'>The verdict of each gated cell, the blocking ones first: "
             "a regressed or not comparable cell blocks the release. Baseline and candidate are medians over all of "
             "the gate session's runs of each image, so they can differ from the numbers above; "
-            "<code>bench/gate.toml</code> holds the thresholds the verdicts were judged by.</p>"
+            "<code>gates/bench/gate.toml</code> holds the thresholds the verdicts were judged by.</p>"
             "<div class='scroll'><table><thead><tr><th>Cell</th><th>Verdict</th><th>Baseline</th><th>Candidate</th><th>Change</th></tr></thead>"
             f"<tbody>{rows}</tbody></table></div>")
 
@@ -1800,7 +1800,7 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
              f"<b>X.Y× faster</b> compares the cell with {oracle_label} on the same row (memory says lighter); "
              "on an amber cell it is shown in amber italics, because the two servers did not do identical work. "
              "A % is the change against the baseline (the median of its runs), coloured only beyond the "
-             "noise thresholds in <code>bench/gate.toml</code>, and in amber italics when either side's own "
+             "noise thresholds in <code>gates/bench/gate.toml</code>, and in amber italics when either side's own "
              "evidence is flagged or the server answered differently than in the baseline. A missing or "
              f"different {oracle_label} never caveats it.</p>",
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
@@ -1869,7 +1869,7 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
     if m["missing"]:
         parts.append("<h2>Missing phases</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in sorted(set(m["missing"]))) + "</ul>")
     parts.append(notes_html(notes))
-    parts.append("<p class='meta'>Methodology: bench/README.md · the raw file behind every cell lives in the run dir.</p></main></body></html>")
+    parts.append("<p class='meta'>Methodology: gates/bench/README.md · the raw file behind every cell lives in the run dir.</p></main></body></html>")
     return "\n".join(parts)
 
 
@@ -1920,7 +1920,7 @@ nav.tabs a.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600
 
 #: The viewer's tabs, in order: the harness key, its tab label, the flag and the
 #: environment variable that name the directory holding its runs. The benchmark's runs
-#: are `bench/runs` (or the `--serve` argument); the other two harnesses decide where
+#: are `gates/bench/runs` (or the `--serve` argument); the other two harnesses decide where
 #: their runs go, so the viewer is told.
 HARNESSES = (("benchmark", "Benchmark", None, None),
              ("adoption", "Adoption", "--adoption-dir", "FERROFIN_ADOPTION_RUNS"),
@@ -1977,7 +1977,7 @@ def tab_html(harness, runs, a, b, picker=""):
     _, label, flag, env = next(h for h in HARNESSES if h[0] == harness)
     body = [f"<h1>{label} runs</h1>"]
     if not runs:
-        where = (f"Run the benchmark (<code>bench/run.sh</code>) to create one." if harness == "benchmark"
+        where = (f"Run the benchmark (<code>gates/bench/run.sh</code>) to create one." if harness == "benchmark"
                  else f"Point the viewer at the directory holding them with <code>{flag} DIR</code> or <code>{env}=DIR</code>.")
         body.append(f"<p class='lede runs-note'>No {e(label.lower())} runs yet. {where}</p>")
         return page_html(f"Ferrofin {label}", "".join(body) + picker, harness)

@@ -31,5 +31,5 @@
   },
   "performance": "performance.json",
   "live_http_probe": "http_probe.py",
-  "live_http_results": "../../crates/ferrofin-api/tests/data/json-binding/ferrofin-http.json"
+  "live_http_results": "../../../crates/ferrofin-api/tests/data/json-binding/ferrofin-http.json"
 }

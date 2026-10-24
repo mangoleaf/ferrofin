@@ -65,7 +65,7 @@ Completed checks:
 - `cargo nextest run -p ferrofin-providers`: 578 passed, 4 skipped.
 - `cargo test -p ferrofin-server --test scan_change_detection -- --nocapture`:
   the complete HTTP scan matrix passed, including the issue #23 outage cases.
-- `bats verify/tests/verify.bats`: 33 passed.
+- `bats gates/verify/tests/verify.bats`: 33 passed.
 - `cargo clippy -p ferrofin-providers -p ferrofin-server --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 

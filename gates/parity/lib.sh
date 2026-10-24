@@ -4,9 +4,9 @@
 
 READY_TIMEOUT_S=${READY_TIMEOUT_S:-300}
 HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S:-10}
-CLEANUP_TIMEOUT_S=${CLEANUP_TIMEOUT_S:-30}   # these three and the two below are bench/run.sh's
-KILL_GRACE_S=2   # between asking a process to stop and killing it (bench/run.sh's value)
-POLL_S=1         # between readiness and drain polls (bench/run.sh's value)
+CLEANUP_TIMEOUT_S=${CLEANUP_TIMEOUT_S:-30}   # these three and the two below are gates/bench/run.sh's
+KILL_GRACE_S=2   # between asking a process to stop and killing it (gates/bench/run.sh's value)
+POLL_S=1         # between readiness and drain polls (gates/bench/run.sh's value)
 
 docker_cmd() { timeout --kill-after="$KILL_GRACE_S" "$HTTP_TIMEOUT_S" docker "$@"; }
 

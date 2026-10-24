@@ -1,4 +1,4 @@
-# Benchmark gate thresholds, read by bench/report.py.
+# Benchmark gate thresholds, read by gates/bench/report.py.
 #
 # A change against the baseline (the median of the baseline runs) is coloured as a
 # regression or an improvement only when it crosses BOTH thresholds of its row:

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Self-tests of parity/diff.py: request loading, normalisation, comparison, the ledger, the cap and
+"""Self-tests of gates/parity/diff.py: request loading, normalisation, comparison, the ledger, the cap and
 the report, over fixture response pairs and two throwaway local HTTP servers. Stdlib only.
 
-    python3 -m unittest discover -s parity/tests
+    python3 -m unittest discover -s gates/parity/tests
 """
 
 import _thread

@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for the adoption harness (adoption/lib.sh, run.sh, smoke.sh, build-fixtures.sh).
+# Tests for the adoption harness (gates/adoption/lib.sh, run.sh, smoke.sh, build-fixtures.sh).
 # Nothing here needs docker, a Jellyfin database or external services: tests use canned
 # logs and smoke outputs, throwaway SQLite files and a local HTTP server.
 
@@ -7,7 +7,7 @@ bats_require_minimum_version 1.5.0   # run --separate-stderr
 
 setup() {
   ADOPTION="$BATS_TEST_DIRNAME/.."
-  # shellcheck source=adoption/lib.sh
+  # shellcheck source=gates/adoption/lib.sh
   . "$ADOPTION/lib.sh"
   TMP="$BATS_TEST_TMPDIR/fixtures"
   mkdir -p "$TMP"

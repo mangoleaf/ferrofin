@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Real HTTP/WebSocket regression check. Node >=22; no npm dependencies.
-// Only creates disposable data. Usage: node verify/scan-progress.mjs BINARY [LOG_EVERY]
+// Only creates disposable data. Usage: node gates/verify/scan-progress.mjs BINARY [LOG_EVERY]
 // Add --measure for before/after wall time and event counts without fix assertions.
 import { mkdtemp, mkdir, writeFile, chmod, open, rm, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

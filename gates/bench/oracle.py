@@ -20,9 +20,9 @@ import re
 import subprocess
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 UPSTREAM_SOURCE = "crates/ferrofin-api/src/handlers/mod.rs"
-PIN = "bench/testdata/jellyfin-image.txt"
+PIN = "gates/bench/testdata/jellyfin-image.txt"
 REPO = "https://github.com/jellyfin/jellyfin"
 #: A release tag; release candidates (`v12.0-rc7`) and anything else do not match.
 RELEASE = re.compile(r"v\d+(\.\d+)*")

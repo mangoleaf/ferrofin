@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Self-tests of parity/generate.py: the sweep covers every operation of the vendored contract, the
+"""Self-tests of gates/parity/generate.py: the sweep covers every operation of the vendored contract, the
 checked-in request set is what the generator writes, and the generator's rules. Stdlib only.
 
-    python3 -m unittest discover -s parity/tests
+    python3 -m unittest discover -s gates/parity/tests
 """
 
 import json
@@ -32,7 +32,7 @@ class Sweep(unittest.TestCase):
     def test_the_checked_in_request_files_are_what_the_generator_writes(self):
         for name, text in generate.generate().items():
             with self.subTest(name):
-                self.assertEqual((SWEEP / name).read_text(), text, "stale: run parity/generate.py")
+                self.assertEqual((SWEEP / name).read_text(), text, "stale: run gates/parity/generate.py")
 
     def test_the_sweep_is_a_valid_request_set_whose_templates_resolve(self):
         ids = {"user": "u", "user_name": "n", "password": "p", "viewer": "v", "movie": "m", "hdr_movie": "h", "series": "s",

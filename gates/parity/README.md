@@ -1,6 +1,6 @@
 # Live parity replay
 
-`parity/run.sh` answers one question on a running server: **does Ferrofin answer the way Jellyfin does?**
+`gates/parity/run.sh` answers one question on a running server: **does Ferrofin answer the way Jellyfin does?**
 It boots a Jellyfin (the release named by `UPSTREAM_TAG`) and the Ferrofin image under test on two
 copies of the same library, sends the same jellyfin-web-shaped requests to both, compares the
 answers on values, JSON types and nulls, matches each difference against a ledger of known ones,
@@ -13,7 +13,7 @@ The request sets:
 - `requests/sweep/`, **the sweep**: at least one request for every one of the 412 operations of the vendored
   10.11.8 contract (`contract.jsonl`); one request per documented value of each enumerated or boolean
   parameter of the query-heavy operations (`combos.jsonl`: `/Items`, the by-name lists, `/Shows/*`, Latest,
-  Resume); and jellyfin-web's request shapes from `bench/screens.js` (`screens.jsonl`).
+  Resume); and jellyfin-web's request shapes from `gates/bench/screens.js` (`screens.jsonl`).
 - `requests/edge/`, **the edge cases** (B7): two users with restrictions, each made on a fresh copy and asked
   about by id in its read-backs (a user allowed up to PG-13, a user with a blocked tag), each also asked for the
   one movie it must not see, which the oracle must refuse, so a restriction both servers ignored fails the run; paging at the first page,
@@ -24,26 +24,26 @@ The request sets:
   `{counts.movies-1}` is the last page's index on any corpus size.
 - `requests/writes.jsonl`: a starter set of writes with read-backs (played and unplayed, favourite and
   unfavourite, a resume position, a new playlist and a new collection).
-- `requests/tracer.jsonl`: the item-details call of `bench/screens.js` alone.
+- `requests/tracer.jsonl`: the item-details call of `gates/bench/screens.js` alone.
 
 A release run sends the sweep and the edge cases as one set; a new difference in either fails it. The seeded
 ledger and the filing of new differences as issues extend this same path in later steps.
 
 ```bash
 # needs docker, python3 (3.11+), jq, curl, timeout, taskset; the benchmark corpus, prepared for Jellyfin
-bench/testdata/build.sh                       # once: the corpus (see bench/README.md)
-bench/testdata/build.sh --prepare-jellyfin    # once: the corpus upgraded and scanned by the pinned Jellyfin
+gates/bench/testdata/build.sh                       # once: the corpus (see gates/bench/README.md)
+gates/bench/testdata/build.sh --prepare-jellyfin    # once: the corpus upgraded and scanned by the pinned Jellyfin
 docker build -t ferrofin:parity .             # the commit under test: REBUILD IT
-parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity
-parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity --requests parity/requests/writes.jsonl
-parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity \
-  --requests parity/requests/sweep --requests parity/requests/edge                                  # the release run
-python3 bench/report.py --serve --parity-dir parity/runs      # list and compare runs
+gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity
+gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity --requests gates/parity/requests/writes.jsonl
+gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity \
+  --requests gates/parity/requests/sweep --requests gates/parity/requests/edge                                  # the release run
+python3 gates/bench/report.py --serve --parity-dir gates/parity/runs      # list and compare runs
 ```
 
 `--gate` makes it a release-gate run: a stale oracle pin, or an `--oracle` that is not the pin, is refused
 instead of warned about. The oracle is the same pinned image and the same stale-pin check as the benchmark
-(`bench/oracle.py`).
+(`gates/bench/oracle.py`).
 
 ## What a run does
 
@@ -206,7 +206,7 @@ kind and both values, both bodies **as the comparison saw them** (`<opaque>` whe
 `<key N>` for opaque keys, unordered arrays sorted), the rules that changed them, and the issue a difference
 was filed as. The harness never talks to GitLab: filing is a step a person or an agent takes after the run.
 
-1. `python3 parity/diff.py findings --out parity/runs/<run>` prints the differences not filed yet as Markdown,
+1. `python3 gates/parity/diff.py findings --out gates/parity/runs/<run>` prints the differences not filed yet as Markdown,
    one section per field path and kind (with the requests that show it and the first one's bodies), largest
    group first.
 2. File them through the project's issue-filing workflow (agents: the issue-filing skill), which dedupes
@@ -236,10 +236,10 @@ A filed difference is still new: it fails the run until Ferrofin is fixed (or th
 
 ### The sweep (`generate.py`, `sweep.toml`)
 
-`python3 parity/generate.py` writes `requests/sweep/contract.jsonl` and `combos.jsonl` from
+`python3 gates/parity/generate.py` writes `requests/sweep/contract.jsonl` and `combos.jsonl` from
 `contracts/jellyfin-openapi-10.11.8.json` and `sweep.toml`; the files are checked in, so a change to the request
 set is a diff to review, and a self-test fails when they are stale or an operation has no request.
-`screens.jsonl` is written by hand from `bench/screens.js`: a change to a screen there is copied here by hand.
+`screens.jsonl` is written by hand from `gates/bench/screens.js`: a change to a screen there is copied here by hand.
 - A path parameter takes its value from `[path]` by name, or from `[path_by_prefix]` where the same name means
   something else (`name` is a genre under `/Genres/`, a person under `/Persons/`). A required query
   parameter takes its value from `[query]`. The expected status is the lowest success status the contract
@@ -281,9 +281,9 @@ resets (`results.json`: `timing.files`), so the edge cases read apart from the s
 ## Tests
 
 ```bash
-python3 -m unittest discover -s parity/tests     # the comparison, the ledger, the cap, the report, the sweep's coverage
-bats parity/tests                                # the runner: refusals, the cap and its backstop, teardown, failure reports
-shellcheck -x parity/lib.sh parity/run.sh parity/reset.sh && shellcheck -x -s bash parity/tests/parity.bats
+python3 -m unittest discover -s gates/parity/tests     # the comparison, the ledger, the cap, the report, the sweep's coverage
+bats gates/parity/tests                                # the runner: refusals, the cap and its backstop, teardown, failure reports
+shellcheck -x gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh && shellcheck -x -s bash gates/parity/tests/parity.bats
 ```
 
 CI runs all three. The runner's pinned-cpuset path needs the benchmark's core layout, so only a live run covers it.

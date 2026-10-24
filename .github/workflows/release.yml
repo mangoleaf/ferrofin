@@ -152,7 +152,7 @@ jobs:
       # this can. Each start release adopts a synthetic Jellyfin 10.11.8 fixture built here
       # (invented media and accounts), scans it and gets user state through its API; this
       # image then boots on the same data and must keep the accounts, watch history and
-      # metadata (adoption/README.md, "Populated Ferrofin upgrade"). Probed from the runner:
+      # metadata (gates/adoption/README.md, "Populated Ferrofin upgrade"). Probed from the runner:
       # release images have no curl.
       - name: upgrade a populated install from earlier releases
         env:
@@ -168,9 +168,9 @@ jobs:
           # The image build's cache is not needed again; the fixture and three images are.
           docker builder prune --all --force >/dev/null
           sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pil python3-icu
-          python3 adoption/synthetic.py build --fixtures "$RUNNER_TEMP/adoption" --only jellyfin-10.11.8
+          python3 gates/adoption/synthetic.py build --fixtures "$RUNNER_TEMP/adoption" --only jellyfin-10.11.8
           # shellcheck disable=SC2086 # starts is a list of --from arguments
-          python3 adoption/synthetic.py upgrade --fixtures "$RUNNER_TEMP/adoption" \
+          python3 gates/adoption/synthetic.py upgrade --fixtures "$RUNNER_TEMP/adoption" \
             --image "$img:$GITHUB_REF_NAME" $starts
           df -h /
       # The failed copy, its server logs and snapshots; all synthetic data.

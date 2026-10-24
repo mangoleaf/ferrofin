@@ -9,10 +9,10 @@
         server; with --bound, only the worst-case seconds of the pass (run.sh's client timeout)
 
 B13 and decision DE of the "Benchmark coverage" milestone. The catalogue is the parity harness's
-(`parity/README.md`): every GET of `parity/requests/sweep/` and `parity/requests/edge/`, read with
-`parity/diff.py`, so the two harnesses cannot drift apart. HEAD requests, writes and a write's
+(`gates/parity/README.md`): every GET of `gates/parity/requests/sweep/` and `gates/parity/requests/edge/`, read with
+`gates/parity/diff.py`, so the two harnesses cannot drift apart. HEAD requests, writes and a write's
 read-backs are not endpoints a browsing client times. The templates are filled from the run's
-ids file and the `{found.*}` names of `parity/discover.toml`, discovered on the server under test
+ids file and the `{found.*}` names of `gates/parity/discover.toml`, discovered on the server under test
 (each server serves the same library); a name the server does not give skips only the endpoints
 that use it, and says so.
 
@@ -23,7 +23,7 @@ One keep-alive connection, as the browse role of `screens.js` (its token and dev
 is the time from sending the request to having read the whole body, in ms.
 
 `SKIP` names the GETs that are not measured, each with its reason; the report lists them. Only the
-`bench/screens.js` shapes (`sweep/screens.jsonl`) and the edge cases (`edge/edge.jsonl`) gate
+`gates/bench/screens.js` shapes (`sweep/screens.jsonl`) and the edge cases (`edge/edge.jsonl`) gate
 (`GATED_FILES`); every other endpoint is reported.
 
 The A/B verdict per endpoint (`gate.endpoint_verdicts`) is the release gate's: each run's p50, the D4 rule of
@@ -42,12 +42,12 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "parity"))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "gates", "parity"))
 import diff  # noqa: E402  (the parity harness's request format, templates and discovery)
 
-SETS = ("parity/requests/sweep", "parity/requests/edge")
-DISCOVER = os.path.join(ROOT, "parity", "discover.toml")
+SETS = ("gates/parity/requests/sweep", "gates/parity/requests/edge")
+DISCOVER = os.path.join(ROOT, "gates", "parity", "discover.toml")
 #: The request files whose endpoints gate (DE, amended): jellyfin-web's screen shapes and the edge cases.
 GATED_FILES = ("sweep/screens.jsonl", "edge/edge.jsonl")
 #: The browse role of screens.js: its device, so the run's session checks see the session they expect.

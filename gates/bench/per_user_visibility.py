@@ -2,7 +2,7 @@
 
 Requires Python 3, ffmpeg/libx264, and a Ferrofin or Jellyfin executable.
 Only files created under its own temporary directory are eligible for deletion.
-Example: python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server
+Example: python3 gates/bench/per_user_visibility.py ferrofin target/debug/ferrofin-server
 Use --benchmark 100 --library-size 64 for warm-loopback latency samples.
 Use --reference /path/to/jellyfin/results.json to assert equivalent observations.
 """

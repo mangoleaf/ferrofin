@@ -5,7 +5,7 @@
                 [--normalise FILE] [--ledger FILE] [--request-timeout S] [--deadline EPOCH]
                 [--reset-command CMD]
         send every read to both servers, then each write on a fresh database copy (CMD resets both
-        servers; the runner passes parity/reset.sh) followed by its read-backs; compare the
+        servers; the runner passes gates/parity/reset.sh) followed by its read-backs; compare the
         normalised bodies on values, JSON types and nulls, classify each difference as ledgered or
         new, and write DIR/results.json and DIR/report.html. Exit 0 when nothing is new, 1 on a new
         difference or a run failure (the cap passed, a reset failed), 2 when an input is invalid.
@@ -33,7 +33,7 @@ for an unfavourite to clear), compared too and reported as `<write id>/<step id>
 `{write.Id}` is read from what each server answered to the write, so each server is asked about
 the thing it created.
 
-Normalisation file (normalise.toml) and ledger (ledger.toml) are described in parity/README.md.
+Normalisation file (normalise.toml) and ledger (ledger.toml) are described in gates/parity/README.md.
 """
 
 import argparse
@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parent.parent
 VERIFIED_SOURCE = "crates/ferrofin-api/src/handlers/mod.rs"
 #: The per-request timeout defaults to 30 s and may be set from 10 to 120 s (run.sh holds the same range).
 REQUEST_TIMEOUT_DEFAULT_S = 30
@@ -1359,7 +1359,7 @@ def check_inputs(args, ids=None):
 
 
 class ResetCommand:
-    """The runner's reset (parity/reset.sh RUN_DIR), run in a session of its own so that the cap, or a
+    """The runner's reset (gates/parity/reset.sh RUN_DIR), run in a session of its own so that the cap, or a
     signal to this process, stops it together with everything it started."""
 
     def __init__(self, command):
@@ -1491,7 +1491,7 @@ def build_parser():
     run.add_argument("--deadline", type=float, default=None, help="epoch seconds at which the run must stop")
     run.add_argument("--concurrency", type=int, default=CONCURRENCY_DEFAULT, help="reads in flight per server, 1 to 8")
     run.add_argument("--reset-command", default=None,
-                     help="resets both servers to a fresh database copy before each write (the runner passes parity/reset.sh RUN_DIR)")
+                     help="resets both servers to a fresh database copy before each write (the runner passes gates/parity/reset.sh RUN_DIR)")
     check = sub.add_parser("check")
     inputs(check)
     check.add_argument("--ids", default=None, help="also resolve every request template against this ids.json")

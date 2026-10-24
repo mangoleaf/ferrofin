@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A scripted stand-in for the endpoints verify/scan-behaviour.sh calls, for its bats tests.
+"""A scripted stand-in for the endpoints gates/verify/scan-behaviour.sh calls, for its bats tests.
 
 It does not scan anything. Each request that would start a scan (a library or item refresh,
 a webhook report) takes the next entry of a scenario file and applies it: the /metrics counters
