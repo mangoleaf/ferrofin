@@ -243,14 +243,6 @@ kind = "value"
 issue = 861
 reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
 
-# Ferrofin sorts AiredEpisodeOrder by season and episode; upstream's /Items maps it to SortName.
-[[entry]]
-request = "GetItems.sortBy.airedepisodeorder"
-path = "Items[].Id"
-kind = "value"
-issue = 859
-reason = "Ferrofin sorts AiredEpisodeOrder by season and episode; upstream's /Items maps it to SortName."
-
 # The page follows the difference gl-827 tracks.
 [[entry]]
 request = "GetItems.sortBy.officialrating"

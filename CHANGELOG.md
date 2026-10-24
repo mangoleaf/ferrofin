@@ -388,6 +388,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `Retry-After` and a "starting" page. Before, the port stayed closed until boot finished,
   so a long adoption could outlast the chart's startup probe and be restarted in a loop.
   Boot stages are now logged at `info`
+- A recursive `/Items` request sorted by `AiredEpisodeOrder` orders by sort name, as Jellyfin
+  does, and a folder's children sorted by it use the aired-episode comparer
 
 ## [1.0.0] - 2026-09-05
 
