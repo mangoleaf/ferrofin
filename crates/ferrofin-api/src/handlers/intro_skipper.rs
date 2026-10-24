@@ -774,7 +774,7 @@ async fn update_skip_duration(
 /// the fields the CSS routes don't touch.
 async fn save_branding(state: &AppState, branding: BrandingOptions) -> Result<(), ApiError> {
     state.config.update_branding(&branding).await?;
-    Ok(())
+    crate::handlers::config::run_committed_checks(state, "branding")
 }
 
 // ---------------------------------------------------------------------------

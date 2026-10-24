@@ -201,7 +201,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh parity/run.sh verify/lib.sh verify/scan-behaviour.sh
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh parity/lib.sh parity/run.sh parity/reset.sh verify/lib.sh verify/scan-behaviour.sh
       - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats parity/tests/parity.bats verify/tests/verify.bats
       - run: bats scripts/tests adoption/tests parity/tests verify/tests
       - run: python3 -m unittest discover -s parity/tests

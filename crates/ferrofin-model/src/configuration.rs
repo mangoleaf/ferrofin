@@ -444,6 +444,45 @@ impl Default for MetadataConfiguration {
     }
 }
 
+/// How Jellyfin locks database access for concurrent queries
+/// (`DatabaseLockingBehaviorTypes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
+pub enum DatabaseLockingBehaviorTypes {
+    /// No locking, Jellyfin's default.
+    #[default]
+    NoLock,
+    /// Pessimistic locking.
+    Pessimistic,
+    /// Optimistic locking.
+    Optimistic,
+}
+
+/// The database configuration (the named configuration `database`,
+/// Jellyfin's `DatabaseConfigurationOptions`).
+///
+/// Ferrofin runs on SQLite only, so it serves the document Jellyfin writes on
+/// its first start (`AddJellyfinDbContext`): the `Jellyfin-SQLite` provider
+/// without locking. It cannot be saved, because no other provider could be
+/// honoured. `CustomProviderOptions` names a .NET database plugin; it is always
+/// null, which Jellyfin's serializer omits, so it has no field here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct DatabaseConfigurationOptions {
+    /// The database provider (`DatabaseType`).
+    pub database_type: String,
+    /// The locking behaviour (`LockingBehavior`).
+    pub locking_behavior: DatabaseLockingBehaviorTypes,
+}
+
+impl Default for DatabaseConfigurationOptions {
+    fn default() -> Self {
+        Self {
+            database_type: "Jellyfin-SQLite".to_owned(),
+            locking_behavior: DatabaseLockingBehaviorTypes::NoLock,
+        }
+    }
+}
+
 /// A path substitution rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
