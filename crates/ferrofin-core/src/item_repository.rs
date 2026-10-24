@@ -1674,6 +1674,7 @@ impl FerrofinItemRepository {
     /// library, each with an in-scope item count — matching Jellyfin, which scopes
     /// its by-name aggregates to the query. Only values with an in-scope item (and
     /// a materialized by-name row) appear.
+    #[allow(clippy::too_many_lines)] // the C# `GetItemValues` query and its paging, in its order
     async fn item_values_with_counts(
         &self,
         value_types: &[ItemValueType],
