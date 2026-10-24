@@ -350,6 +350,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   subnets and known proxies), `metadata.xml`, `xbmcmetadata.xml` and `livetv.xml` from being
   imported on every start, and only the broken file was named. Each file is now imported on its
   own, and each one that fails is logged with its path
+- An `encoding.json` the server cannot read (after an ownership change, say) is logged once as
+  a warning while transcodes run, as the transcode planner already did, instead of an error
+  every five seconds for each running transcode
 
 ## [1.0.0] - 2026-09-05
 
