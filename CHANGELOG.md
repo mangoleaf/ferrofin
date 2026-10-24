@@ -281,6 +281,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   who could then remote-control that player without `EnableRemoteControlOfOtherUsers`. Session
   ids now match Jellyfin's byte for byte, so each one changes once on upgrade; they live only
   in memory and clients take whatever id the server reports
+- A user's details no longer say whether the account has a password. `HasPassword` and
+  `HasConfiguredPassword` are `true` for every user, as Jellyfin 12 reports them, so the
+  anonymous login-screen list (`GET /Users/Public`) no longer tells anyone which accounts have
+  no password. Signing in with an empty password still works for those accounts. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

@@ -1223,8 +1223,10 @@ impl UserManager for FerrofinUserManager {
             enable_auto_login: Some(user.enable_auto_login),
             last_login_date: user.last_login_date,
             last_activity_date: user.last_activity_date,
-            has_password: Some(user.password.is_some()),
-            has_configured_password: Some(user.password.is_some()),
+            // `HasPassword`/`HasConfiguredPassword` keep their defaults: Jellyfin
+            // 12 stopped reporting whether a user has a password (PR 14950), as
+            // it told anyone, the anonymous `/Users/Public` caller included,
+            // which accounts have none.
             configuration: Some(configuration),
             policy: Some(policy),
             ..UserDto::default()
@@ -2241,6 +2243,39 @@ mod tests {
         assert!(!dto_config.hide_played_in_latest);
         assert_eq!(dto_config.latest_items_excludes, vec![excluded]);
         assert_eq!(dto_config.subtitle_mode, SubtitlePlaybackMode::Always);
+    }
+
+    /// Jellyfin 12 no longer reports a user's password state (PR 14950):
+    /// `UserManager.GetUserDto` assigns neither `HasPassword` nor
+    /// `HasConfiguredPassword`, so every user reads their `[Obsolete]` defaults
+    /// (`true`, `true`, and `false` for the easy password). A passwordless user
+    /// is no longer told apart, not even on the anonymous `/Users/Public` list.
+    #[tokio::test]
+    async fn get_user_dto_does_not_reveal_whether_a_user_has_a_password() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let passwordless = mgr.create_user("nopass").await.expect("create");
+        assert!(
+            passwordless.password.is_none(),
+            "a new user has no password"
+        );
+        let with_password = mgr.create_user("haspass").await.expect("create");
+        let id = Uuid::parse_str(&with_password.id).expect("uuid");
+        mgr.change_password(id, "secret").await.expect("password");
+        let with_password = mgr.get_user_by_id(id).await.expect("reload").expect("some");
+        assert!(with_password.password.is_some());
+
+        for user in [&passwordless, &with_password] {
+            let dto = mgr.get_user_dto(user, None).await.expect("dto");
+            assert_eq!(dto.has_password, Some(true), "{}", user.username);
+            assert_eq!(dto.has_configured_password, Some(true), "{}", user.username);
+            assert_eq!(
+                dto.has_configured_easy_password,
+                Some(false),
+                "{}",
+                user.username
+            );
+        }
     }
 
     #[tokio::test]
