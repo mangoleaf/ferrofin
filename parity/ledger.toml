@@ -930,21 +930,6 @@ kind = "value"
 issue = 841
 reason = "The Screen Grabber image provider is not ported."
 
-# Empty similar-item provider lists are left out.
-[[entry]]
-request = "GetVirtualFolders"
-path = "[].LibraryOptions.TypeOptions[].SimilarItemProviderOrder"
-kind = "missing"
-issue = 839
-reason = "Empty similar-item provider lists are left out."
-
-[[entry]]
-request = "GetVirtualFolders"
-path = "[].LibraryOptions.TypeOptions[].SimilarItemProviders"
-kind = "missing"
-issue = 839
-reason = "Empty similar-item provider lists are left out."
-
 # Libraries are listed by name, not in directory-enumeration order.
 [[entry]]
 request = "GetSystemStorage"
@@ -1296,14 +1281,6 @@ kind = "value"
 issue = 862
 reason = "A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order."
 
-# An unused API key's DateLastActivity is 1970-01-01, not 0001-01-01.
-[[entry]]
-request = "RevokeKey/key"
-path = "Items[].DateLastActivity"
-kind = "value"
-issue = 834
-reason = "An unused API key's DateLastActivity is 1970-01-01, not 0001-01-01."
-
 # Owner decision 2026-10-24: a Ferrofin backup keeps its own engine version, server version and archive name.
 [[entry]]
 request = "CreateBackup"
@@ -1325,22 +1302,6 @@ path = "ServerVersion"
 kind = "value"
 issue = 235
 reason = "The backup manifest carries the stale crate version 0.4.1 (gl-235); once fixed it is Ferrofin's own version, an owner decision of 2026-10-24 (gl-862)."
-
-# The backup manifest's DateCreated is written with Z where upstream writes +00:00.
-[[entry]]
-request = "CreateBackup"
-path = "DateCreated"
-kind = "value"
-issue = 836
-reason = "The backup manifest's DateCreated is written with Z where upstream writes +00:00."
-
-# A display-preferences body without every member is refused with 400.
-[[entry]]
-request = "UpdateDisplayPreferences"
-path = "$status"
-kind = "status"
-issue = 845
-reason = "A display-preferences body without every member is refused with 400."
 
 # Cancelling a package installation always answers 404.
 [[entry]]
