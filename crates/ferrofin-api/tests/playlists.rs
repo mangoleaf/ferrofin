@@ -411,7 +411,7 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<PlaylistCreationResult, ServiceError> {
         *self.created.lock().unwrap() = Some(request.clone());
         Ok(PlaylistCreationResult {
-            id: PLAYLIST_ID.to_string(),
+            id: PLAYLIST_ID.simple().to_string(),
         })
     }
     async fn update_playlist(
@@ -650,12 +650,54 @@ async fn create_playlist_from_body_returns_id() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: PlaylistCreationResult = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(result.id, PLAYLIST_ID.to_string());
+    // The manager's id passes through unchanged.
+    assert_eq!(result.id, PLAYLIST_ID.simple().to_string());
     let created = pl.created.lock().unwrap().clone().expect("recorded");
     assert_eq!(created.name.as_deref(), Some("Roadtrip"));
     assert_eq!(created.item_id_list, vec![ITEM_A]);
     // The caller's id is used when neither query nor body names one.
     assert_eq!(created.user_id, USER_ID);
+}
+
+/// `Public = createPlaylistRequest?.IsPublic` over C#'s `bool IsPublic = true`
+/// (v12.2 PlaylistsController.cs:99, CreatePlaylistDto.cs:44): a body without
+/// `IsPublic` creates an open playlist; only the bodiless query-string form
+/// leaves it to the manager's `Public ?? false`.
+#[tokio::test]
+async fn create_playlist_is_public_defaults_per_body() {
+    let cases: [(&str, Body, Option<bool>); 5] = [
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip"}"#),
+            Some(true),
+        ),
+        // Upstream's non-nullable `bool` rejects an explicit null (a 400);
+        // Ferrofin keeps reading it as unset, so the playlist is private.
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":null}"#),
+            None,
+        ),
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":false}"#),
+            Some(false),
+        ),
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":true}"#),
+            Some(true),
+        ),
+        ("/Playlists?name=Roadtrip", Body::empty(), None),
+    ];
+    for (uri, body, expected) in cases {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", uri, body).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let created = pl.created.lock().unwrap().clone().expect("recorded");
+        assert_eq!(created.public, expected, "{uri}: {expected:?}");
+    }
 }
 
 #[tokio::test]
