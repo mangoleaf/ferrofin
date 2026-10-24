@@ -58,7 +58,7 @@ use crate::media_encoding::build_media_encoding;
 /// is sampled for each server lifetime; listener/base URL bootstrap settings are
 /// configured separately. Missing or unreadable files use defaults; malformed JSON
 /// also logs a warning that the remote-IP filter will not be enforced.
-async fn load_network_configuration(
+pub(crate) async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
 ) -> ferrofin_networking::NetworkConfiguration {
     let path = std::path::Path::new(&paths.user_configuration_directory_path())
