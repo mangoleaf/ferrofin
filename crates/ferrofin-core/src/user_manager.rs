@@ -542,26 +542,6 @@ impl FerrofinUserManager {
         .map_err(db_err)
     }
 
-    /// The count of users who are not disabled, from any executor (C#
-    /// `GetUsers().Count(i => !i.HasPermission(PermissionKind.IsDisabled))`,
-    /// the policy guard's).
-    async fn enabled_count_on<'e, E>(executor: E) -> Result<i64, ServiceError>
-    where
-        E: SqliteExecutor<'e>,
-    {
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM "Users" u
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM "Permissions" p
-                   WHERE p."UserId" = u."Id" AND p."Kind" = ?1 AND p."Value" = 1
-               )"#,
-        )
-        .bind(i32::from(PermissionKind::IsDisabled))
-        .fetch_one(executor)
-        .await
-        .map_err(db_err)
-    }
-
     /// Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
     /// permission flag, the access schedules (replaced wholesale) and the
     /// list-valued preferences the policy carries, in one transaction.
@@ -600,7 +580,9 @@ impl FerrofinUserManager {
                     .await?,
                 was_disabled,
                 administrators: Self::admin_count_on(&mut *tx).await?,
-                enabled_users: Self::enabled_count_on(&mut *tx).await?,
+                enabled_users: user_repository::enabled_count(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
             };
             if let Some(refusal) = policy_update_refusal(state, policy) {
                 return Err(ServiceError::Forbidden(refusal.to_owned()));

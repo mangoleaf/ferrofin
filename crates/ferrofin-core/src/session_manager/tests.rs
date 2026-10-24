@@ -811,6 +811,21 @@ async fn sign_in(mgr: &FerrofinSessionManager, user_id: Uuid, device_id: &str) -
         .to_owned()
 }
 
+/// Every stored device id, sorted, as the device manager lists them.
+async fn device_ids(db: &Database) -> Vec<String> {
+    use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
+    let mut ids: Vec<String> = FerrofinDeviceManager::new(db.clone())
+        .get_devices(&DeviceQuery::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|d| d.device_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// `SessionManager.RevokeUserTokens(userId, currentAccessToken)`: every device
 /// of the user except the one holding `currentAccessToken` (compared ignoring
 /// case) is logged out (`Logout(Device)`: the device row goes and its sessions
@@ -855,12 +870,7 @@ async fn revoking_a_users_tokens_keeps_only_the_current_device() {
         .await
         .unwrap();
 
-    let devices: Vec<String> =
-        sqlx::query_scalar(r#"SELECT "DeviceId" FROM "Devices" ORDER BY "DeviceId""#)
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(devices, ["alice-phone", "bob-laptop"]);
+    assert_eq!(device_ids(&db).await, ["alice-phone", "bob-laptop"]);
     for (token, device) in [(&current, "alice-phone"), (&bobs, "bob-laptop")] {
         mgr.get_session_by_authentication_token(token, device, "e")
             .await
@@ -880,12 +890,7 @@ async fn revoking_a_users_tokens_keeps_only_the_current_device() {
     // With no current token, every device of the user goes (user deletion,
     // and a disable through the policy).
     mgr.revoke_user_tokens(alice_id, "").await.unwrap();
-    let left: i64 =
-        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Devices" WHERE "DeviceId" LIKE 'alice-%'"#)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(left, 0);
+    assert_eq!(device_ids(&db).await, ["bob-laptop"]);
 }
 
 #[tokio::test]
