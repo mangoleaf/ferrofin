@@ -189,8 +189,9 @@ struct BackupManifest {
     /// it (and the listing can show it, as Jellyfin lists foreign archives).
     #[serde(default)]
     path: String,
-    /// When the backup was created.
-    #[serde(with = "ferrofin_model::json::datetime")]
+    /// When the backup was created: a `DateTimeOffset` upstream, so written
+    /// with an explicit offset ([`date_time_offset`]).
+    #[serde(with = "date_time_offset")]
     date_created: DateTime<Utc>,
     /// The server version that wrote it.
     server_version: String,
@@ -200,6 +201,32 @@ struct BackupManifest {
     backup_engine_version: String,
     /// The options the backup was created with (echoed back).
     options: BackupOptions,
+}
+
+/// System.Text.Json's own `DateTimeOffset` format (Jellyfin registers no
+/// converter for it) over a UTC value: the fraction loses its trailing zeros,
+/// and goes when it is zero, and the offset is `+00:00`, never `Z`. Reads any
+/// ISO-8601 form, so archives written with the `Z` form still list.
+mod date_time_offset {
+    use chrono::{DateTime, Utc};
+    use serde::Serializer;
+
+    pub(super) use ferrofin_model::json::datetime::deserialize;
+
+    /// Writes `value` as `Utf8JsonWriter.WriteStringValue(DateTimeOffset)` does.
+    pub(super) fn serialize<S: Serializer>(
+        value: &DateTime<Utc>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut text = value.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let ticks = value.timestamp_subsec_nanos() / 100;
+        if ticks != 0 {
+            text.push('.');
+            text.push_str(format!("{ticks:07}").trim_end_matches('0'));
+        }
+        text.push_str("+00:00");
+        serializer.serialize_str(&text)
+    }
 }
 
 /// The `POST /Backup/Create` body — which sections to include. Port of
@@ -914,6 +941,39 @@ mod tests {
     use super::{BackupManifest, BackupOptions, TreeRoots, add_dir_to_zip, read_manifest};
     use std::io::Write as _;
 
+    /// `BackupManifestDto.DateCreated` is a `DateTimeOffset`: written with
+    /// `+00:00` and System.Text.Json's trimmed fraction, read back from that
+    /// form and from the `Z` form older Ferrofin archives carry.
+    #[test]
+    fn manifest_date_created_is_written_as_a_date_time_offset() {
+        let manifest = |date: &str| BackupManifest {
+            path: String::new(),
+            date_created: date.parse().unwrap(),
+            server_version: String::new(),
+            backup_engine_version: String::new(),
+            options: BackupOptions::default(),
+        };
+        for (stored, written) in [
+            (
+                "2026-10-23T22:07:24.2746138Z",
+                "2026-10-23T22:07:24.2746138+00:00",
+            ),
+            ("2026-10-23T22:07:24.5Z", "2026-10-23T22:07:24.5+00:00"),
+            ("2024-01-02T03:04:05Z", "2024-01-02T03:04:05+00:00"),
+        ] {
+            let json = serde_json::to_value(manifest(stored)).unwrap();
+            assert_eq!(json["DateCreated"], written);
+            let back: BackupManifest = serde_json::from_value(json).unwrap();
+            assert_eq!(back.date_created, manifest(stored).date_created);
+        }
+        let old = r#"{"DateCreated":"2024-01-02T03:04:05.0000000Z","ServerVersion":"1.0.0","Options":{}}"#;
+        let read: BackupManifest = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            read.date_created,
+            manifest("2024-01-02T03:04:05Z").date_created
+        );
+    }
+
     #[test]
     fn zip_a_dir_and_read_back_its_manifest() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1532,6 +1592,11 @@ mod tests {
         // The manifest carries the contract's fields with the 10.11.8 defaults.
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["BackupEngineVersion"], super::BACKUP_ENGINE_VERSION);
+        assert!(
+            json["DateCreated"].as_str().unwrap().ends_with("+00:00"),
+            "{}",
+            json["DateCreated"]
+        );
         assert_eq!(json["Options"]["Database"], true);
         assert_eq!(json["Options"]["Metadata"], false);
         assert!(json["Options"].get("ManualListIds").is_none());

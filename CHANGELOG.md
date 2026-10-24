@@ -35,6 +35,23 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Refuse a `POST /Playlists` body without a `Name`, or with a null or blank one, and an
+  `"IsPublic": null`, with `400` as Jellyfin does, instead of creating the playlist; a
+  query-string `name` does not rescue such a body. A request with neither a body nor a
+  `name` is a `400` too (Jellyfin fails it with a `500`), where Ferrofin created a
+  nameless playlist
+- Accept a partial body on `POST /DisplayPreferences/{id}`, as Jellyfin does: each member
+  left out takes the default of Jellyfin's `DisplayPreferencesDto` (`ShowBackdrop` true,
+  250 px images, the rest off or empty) instead of failing with `400 missing field`
+- Send every library type's `SimilarItemProviders` and `SimilarItemProviderOrder` in
+  `GET /Library/VirtualFolders` even when empty (`[]`), as Jellyfin does, instead of leaving
+  them out
+- Write a backup manifest's `DateCreated` as Jellyfin writes its `DateTimeOffset`, with a
+  `+00:00` offset instead of `Z` (`POST /Backup/Create`, `GET /Backup`,
+  `GET /Backup/Manifest` and the archive's `manifest.json`). Archives written with the `Z`
+  form still list and restore
+- Report an API key's `DateLastActivity` as `0001-01-01T00:00:00.0000000Z` (.NET's unset
+  date) in `GET /Auth/Keys`, as Jellyfin does, instead of the Unix epoch
 - Keep the playlists folder out of a user's library-wide queries until they can see a
   playlist, and a box-set library until they can see a box set, as Jellyfin's
   `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
