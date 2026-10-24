@@ -392,6 +392,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   does, and a folder's children sorted by it use the aired-episode comparer
 - `/Items?ids=` and `/Trailers?ids=` without a `sortBy` return the items in the order their
   ids were requested, as Jellyfin does, instead of in sort-name order
+- A Live TV stream that a client's start and progress reports never named is closed by its stop
+  report or by the teardown of its abandoned transcode, as Jellyfin does, instead of holding the
+  tuner until a restart
 
 ## [1.0.0] - 2026-09-05
 
