@@ -1350,9 +1350,14 @@ fn append_date_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQ
         qb.push(r#" AND bi."DateCreated" >= "#)
             .push_bind(datetime_to_db(d));
     }
-    if let Some(d) = filter
-        .min_date_last_saved
-        .or(filter.min_date_last_saved_for_user)
+    // Two independent bounds, as upstream's two `Where` clauses: a request
+    // carrying both is held to each.
+    for d in [
+        filter.min_date_last_saved,
+        filter.min_date_last_saved_for_user,
+    ]
+    .into_iter()
+    .flatten()
     {
         qb.push(r#" AND (bi."DateLastSaved" IS NOT NULL AND bi."DateLastSaved" >= "#)
             .push_bind(datetime_to_db(d))
@@ -3128,9 +3133,11 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5501)).await;
         for kind in [BaseItemKind::Playlist, BaseItemKind::BoxSet] {
-            let mut filter = crate::user_view_manager::visible_item_query(kind, &user);
-            filter.top_parent_ids =
-                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)];
+            let filter = crate::user_view_manager::visible_item_query(
+                kind,
+                &user,
+                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)],
+            );
             let mut builder = build_query(&filter, QueryShape::IdsOnly);
             let mut query = builder.build();
             let args = query.take_arguments().expect("arguments").expect("binds");
@@ -3634,6 +3641,25 @@ mod tests {
             leading_name.matches(r#"bi."Name" ASC"#).count(),
             "no extra Name tiebreaker for a leading Name key: {leading_name}"
         );
+    }
+
+    /// `MinDateLastSaved` and `MinDateLastSavedForUser` are two independent
+    /// clauses (`TranslateQuery.cs:357-365`): a query with both meets each.
+    #[test]
+    fn both_min_date_last_saved_bounds_apply() {
+        let date = |s: &str| Some(s.parse::<chrono::DateTime<chrono::Utc>>().expect("date"));
+        let sql = build_query(
+            &InternalItemsQuery {
+                min_date_last_saved: date("2026-01-01T00:00:00Z"),
+                min_date_last_saved_for_user: date("2026-02-01T00:00:00Z"),
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql()
+        .as_str()
+        .to_owned();
+        assert_eq!(sql.matches(r#"bi."DateLastSaved" >= "#).count(), 2, "{sql}");
     }
 
     /// `ImageTypes` is an `EXISTS` over the item's image rows (C#

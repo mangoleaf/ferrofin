@@ -1,0 +1,607 @@
+# How parity/generate.py builds the sweep from the vendored contract (see its docstring).
+#
+# Templates: `{movie}` and the other ids of the corpus's ids.json; `{found.<name>}` read from the oracle
+# at run start (parity/discover.toml); `{setup.<name>.<field>}` read from a setup step's answer on the
+# same server, which puts that `[setups.<name>]` sequence in front of the write. Change this file, run
+# parity/generate.py, and commit both: the request set is checked in.
+
+version = 1
+
+# ── path parameters, by name ───────────────────────────────────────────────────────────────────────
+[path]
+itemId = "{movie}"
+userId = "{user}"
+videoId = "{movie}"
+mediaSourceId = "{movie}"
+routeItemId = "{movie}"
+routeMediaSourceId = "{movie}"
+seriesId = "{series}"
+SeriesId = "{series}"
+seasonId = "{season}"
+SeasonId = "{season}"
+id = "{episode}"
+Id = "{episode}"
+imageType = "Primary"
+imageIndex = "0"
+index = "0"
+routeIndex = "0"
+newIndex = "0"
+genreName = "{found.genre}"
+name = "{found.person}"
+year = "2003"
+playlistId = "{setup.playlist.Id}"
+collectionId = "{setup.collection.Id}"
+sessionId = "{setup.session.0.Id}"
+key = "{setup.key.Items.0.AccessToken}"
+taskId = "{found.task}"
+displayPreferencesId = "usersettings"
+language = "eng"
+container = "mkv"
+segmentContainer = "ts"
+segmentId = "0"
+routeFormat = "vtt"
+routeStartPositionTicks = "0"
+width = "320"
+maxWidth = "200"
+maxHeight = "300"
+percentPlayed = "0"
+unplayedCount = "0"
+tag = "parity"
+format = "jpg"
+command = "DisplayMessage"
+lyricId = "parity"
+subtitleId = "parity"
+# Live TV, plugins, packages and SyncPlay groups: the corpus has none, so these name nothing (the
+# operation's own answer to an unknown id is what is compared)
+recordingId = "00000000000000000000000000000001"
+timerId = "00000000000000000000000000000001"
+channelId = "00000000000000000000000000000001"
+programId = "00000000000000000000000000000001"
+groupId = "00000000000000000000000000000001"
+streamId = "00000000000000000000000000000001"
+tunerId = "00000000000000000000000000000001"
+packageId = "00000000000000000000000000000001"
+pluginId = "00000000000000000000000000000001"
+version = "1.0.0.0"
+
+# A path parameter that means something else under one prefix (most specific prefix first)
+[path_by_prefix."/Artists/"]
+name = "{found.artist}"
+itemId = "{found.artist_id}"
+[path_by_prefix."/Genres/"]
+name = "{found.genre}"
+[path_by_prefix."/MusicGenres/"]
+name = "{found.music_genre}"
+genreName = "{found.music_genre}"
+[path_by_prefix."/Studios/"]
+name = "{found.studio}"
+[path_by_prefix."/Persons/"]
+name = "{found.person}"
+[path_by_prefix."/Packages/"]
+name = "Intro Skipper"
+[path_by_prefix."/FallbackFont/"]
+name = "parity.ttf"
+[path_by_prefix."/Audio/"]
+itemId = "{found.track}"
+container = "mp3"
+playlistId = "main"
+[path_by_prefix."/Songs/"]
+itemId = "{found.track}"
+[path_by_prefix."/Albums/"]
+itemId = "{found.album}"
+[path_by_prefix."/Shows/"]
+itemId = "{series}"
+[path_by_prefix."/Videos/{itemId}/hls"]
+playlistId = "main"
+
+# ── required query parameters, by name ─────────────────────────────────────────────────────────────
+[query]
+app = "parity"
+ids = "{movie}"
+id = "{movie}"
+client = "emby"
+path = "/media"
+runtimeTicks = 0
+actualSegmentLengthTicks = 0
+mediaSourceId = "{movie}"
+deviceId = "parity"
+playSessionId = "parity"
+newIndex = 0
+liveStreamId = "parity"
+fileName = "parity.lrc"
+code = "000000"
+secret = "parity"
+type = "Primary"
+searchTerm = "{found.term}"
+providerId = "parity"
+itemId = "{movie}"
+playCommand = "PlayNow"
+itemIds = "{movie}"
+itemType = "Movie"
+itemName = "parity"
+segmentLength = 3
+name = "{found.log}"
+
+# ── setup sequences a write reads from with {setup.<name>.…} (the last step's id is the name) ──────
+[[setups.playlist]]
+id = "playlist"
+method = "POST"
+path = "/Playlists"
+body = { Name = "Parity sweep", Ids = ["{movie}", "{hdr_movie}"], UserId = "{user}", MediaType = "Video" }
+
+[[setups.collection]]
+id = "collection"
+method = "POST"
+path = "/Collections"
+query = { name = "Parity sweep", ids = "{movie}" }
+
+[[setups.session]]
+id = "session"
+method = "GET"
+path = "/Sessions"
+query = { deviceId = "parity" }
+
+[[setups.key]]
+id = "key-create"
+method = "POST"
+path = "/Auth/Keys"
+query = { app = "parity" }
+expect_status = 204
+[[setups.key]]
+id = "key"
+method = "GET"
+path = "/Auth/Keys"
+
+# ── per operation ───────────────────────────────────────────────────────────────────────────────────
+# Known oracle traps (B9): a stall or failure there is `oracle failed`, never a Ferrofin difference.
+[op.CreateBackup]
+oracle_trap = "Jellyfin's backup holds its exclusive database lock and can outlast the request timeout"
+[op.GetYears]
+oracle_trap = "Jellyfin's /Years fails or stalls on large libraries"
+[op.GetQueryFiltersLegacy]
+oracle_trap = "Jellyfin's /Items/Filters fails or stalls on large libraries"
+
+[op.CreatePlaylist]
+body = { Name = "Parity sweep", Ids = ["{movie}", "{hdr_movie}"], UserId = "{user}", MediaType = "Video" }
+[op.GetPlaylist]
+readback_of = "CreatePlaylist"
+path = "/Playlists/{write.Id}"
+[op.GetPlaylistItems]
+readback_of = "CreatePlaylist"
+path = "/Playlists/{write.Id}/Items"
+query = { userId = "{user}" }
+[op.GetPlaylistUsers]
+readback_of = "CreatePlaylist"
+path = "/Playlists/{write.Id}/Users"
+[op.GetPlaylistUser]
+readback_of = "CreatePlaylist"
+path = "/Playlists/{write.Id}/Users/{user}"
+[op.GetInstantMixFromPlaylist]
+readback_of = "CreatePlaylist"
+path = "/Playlists/{write.Id}/InstantMix"
+query = { userId = "{user}", limit = 20 }
+[op.AddItemToPlaylist]
+query = { ids = "{hdr_movie}", userId = "{user}" }
+[op.RemoveItemFromPlaylist]
+query = { entryIds = "{movie}" }
+[op.MoveItem]
+path = "/Playlists/{setup.playlist.Id}/Items/{movie}/Move/1"
+[op.UpdatePlaylist]
+body = { Name = "Parity sweep renamed" }
+[op.UpdatePlaylistUser]
+path = "/Playlists/{setup.playlist.Id}/Users/{viewer}"
+body = { CanEdit = true }
+[op.RemoveUserFromPlaylist]
+path = "/Playlists/{setup.playlist.Id}/Users/{viewer}"
+setup = [{ id = "share", method = "POST", path = "/Playlists/{setup.playlist.Id}/Users/{viewer}", body = { CanEdit = false }, expect_status = 204 }]
+
+[op.CreateCollection]
+query = { name = "Parity sweep", ids = "{movie}" }
+[op.AddToCollection]
+query = { ids = "{hdr_movie}" }
+
+[op.GetInstantMixFromArtists2]
+query = { id = "{found.artist_id}" }
+[op.GetInstantMixFromMusicGenreById]
+query = { id = "{found.music_genre_id}" }
+[op.GetDeviceInfo]
+query = { id = "parity" }
+[op.GetDeviceOptions]
+query = { id = "parity" }
+expect_status = 404   # the device has no options saved
+[op.UpdateDeviceOptions]
+query = { id = "parity" }
+body = { CustomName = "Parity device" }
+[op.DeleteDevice]
+query = { id = "parity" }
+
+[op.SendPlaystateCommand]
+path = "/Sessions/{setup.session.0.Id}/Playing/Pause"
+[op.SendSystemCommand]
+path = "/Sessions/{setup.session.0.Id}/System/GoHome"
+[op.SendGeneralCommand]
+path = "/Sessions/{setup.session.0.Id}/Command/DisplayMessage"
+[op.SendFullGeneralCommand]
+body = { Name = "DisplayMessage", Arguments = { Header = "Parity", Text = "sweep" } }
+[op.SendMessageCommand]
+body = { Header = "Parity", Text = "sweep", TimeoutMs = 1000 }
+[op.AddUserToSession]
+path = "/Sessions/{setup.session.0.Id}/User/{viewer}"
+[op.RemoveUserFromSession]
+path = "/Sessions/{setup.session.0.Id}/User/{viewer}"
+[op.DisplayContent]
+query = { itemType = "Movie", itemId = "{movie}", itemName = "parity" }
+
+[op.UpdateItemUserData]
+body = { PlaybackPositionTicks = 100000000, Played = false }
+[op.UpdateUserItemRating]
+query = { likes = true }
+[op.GetPostedPlaybackInfo]
+query = { userId = "{user}" }
+body = { UserId = "{user}", MaxStreamingBitrate = 120000000 }
+[op.ReportPlaybackStart]
+body = { ItemId = "{movie}", PlaySessionId = "parity", PositionTicks = 0, CanSeek = true, PlayMethod = "DirectPlay" }
+[op.ReportPlaybackProgress]
+body = { ItemId = "{movie}", PlaySessionId = "parity", PositionTicks = 100000000, CanSeek = true, PlayMethod = "DirectPlay" }
+[op.ReportPlaybackStopped]
+body = { ItemId = "{movie}", PlaySessionId = "parity", PositionTicks = 100000000 }
+[op.PostFullCapabilities]
+body = { PlayableMediaTypes = ["Video", "Audio"], SupportedCommands = ["DisplayMessage"], SupportsMediaControl = true }
+[op.UpdateDisplayPreferences]
+body = { Client = "emby", SortBy = "SortName", CustomPrefs = { homesection0 = "resume" } }
+[op.UpdateUserConfiguration]
+query = { userId = "{user}" }
+body = { PlayDefaultAudioTrack = true, SubtitleMode = "Default", OrderedViews = [], LatestItemsExcludes = [], MyMediaExcludes = [] }
+[op.UpdateUserPassword]
+query = { userId = "{viewer}" }
+body = { CurrentPw = "", NewPw = "parity" }
+[op.CreateUserByName]
+body = { Name = "parity-user", Password = "parity" }
+[op.AuthenticateUserByName]
+body = { Username = "{user_name}", Pw = "{password}" }
+[op.ForgotPassword]
+body = { EnteredUsername = "nobody" }
+[op.ForgotPasswordPin]
+body = { Pin = "0000" }
+expect_status = 404   # no reset pin was issued
+[op.ValidatePath]
+body = { ValidateWritable = false, Path = "/media", IsFile = false }
+[op.UpdateNamedConfiguration]
+path = "/System/Configuration/network"
+[op.GetNamedConfiguration]
+path = "/System/Configuration/network"
+[op.SetRepositories]
+body = []
+[op.UpdateTask]
+path = "/ScheduledTasks/{found.task}/Triggers"
+body = []
+[op.SetItemImage]
+expect_status = 400
+[op.SetItemImageByIndex]
+expect_status = 400
+[op.PostUserImage]
+expect_status = 400
+[op.UploadCustomSplashscreen]
+expect_status = 400
+
+# ── documented-parameter combinations for the query-heavy operations (combos.jsonl) ────────────────
+[combos]
+ops = ["GetItems", "GetGenres", "GetStudios", "GetPersons", "GetArtists", "GetAlbumArtists", "GetMusicGenres",
+       "GetEpisodes", "GetSeasons", "GetNextUp", "GetUpcomingEpisodes", "GetLatestMedia", "GetResumeItems"]
+# parameters a combination never varies on its own (identity, paging and the base query below)
+skip = ["userId", "limit", "startIndex", "enableTotalRecordCount"]
+base_query = { userId = "{user}", limit = 20 }
+
+[combos.base]
+GetItems = { userId = "{user}", recursive = true, limit = 20 }
+GetEpisodes = { userId = "{user}", limit = 20 }
+GetSeasons = { userId = "{user}" }
+
+# values for the documented parameters that are neither enumerated nor boolean
+[combos.values]
+parentId = ["{views.movies}", "{views.tvshows}", "{views.music}"]
+searchTerm = ["{found.term}"]
+nameStartsWith = ["A"]
+nameStartsWithOrGreater = ["M"]
+nameLessThan = ["M"]
+years = ["2003"]
+seasonId = ["{season}"]
+seriesId = ["{series}"]
+genres = ["{found.genre}"]
+studios = ["{found.studio}"]
+person = ["{found.person}"]
+ids = ["{movie},{hdr_movie}"]
+
+# ── calibrated against the oracle (first live sweep) ───────────────────────────────────────────────
+# Routes of plugins the vendored contract carries (Intro Skipper, Skip Button CSS, media segments API,
+# OpenSubtitles, File Transformation, Merge Versions): the oracle runs with its plugins disabled, so it
+# cannot answer them (404).
+[op.GetPluginMetadata]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetPluginMetadata_Introskipper]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetSupportBundle]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetSkippableSegments]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetTimestamps]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.UpdateTimestampsAsync]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetAnalyzerAction]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.UpdateAnalyzerActions]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetScanStatus]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.ScanSeason]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.GetSeasonEpisodes]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.EraseSeasonAsync]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.ResetIntroTimestamps]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.RebuildDatabase]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.InjectCss]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.UpdateSkipDuration]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.CreateSegmentAsync]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.DeleteSegmentAsync]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.ValidateLoginInfo]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.RegisterTransformation]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.MergeEpisodesRequestAsync]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.MergeMoviesRequest]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.SplitEpisodesRequestAsync]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+[op.SplitMoviesRequest]
+oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
+
+# Operations of the 10.11.8 contract Jellyfin 12 no longer serves (Ferrofin keeps them for the clients that
+# still call them): the oracle answers 404.
+[op.GetNetworkShares]
+oracle_trap = "Jellyfin 12 removed it; the 10.11.8 contract still has it"
+[op.GetCriticReviews]
+oracle_trap = "Jellyfin 12 removed it; the 10.11.8 contract still has it"
+[op.GetHlsAudioSegmentLegacyAac]
+oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+[op.GetHlsAudioSegmentLegacyMp3]
+oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+[op.GetHlsVideoSegmentLegacy]
+oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+[op.GetHlsPlaylistLegacy]
+oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+
+# Where the oracle itself fails on this corpus or without a network: its 5xx (or stall) is no difference.
+[op.HeadAudioStream]
+oracle_trap = "Jellyfin 12.2 answers HEAD on a static audio stream with 500"
+[op.GetUniversalAudioStream]
+oracle_trap = "Jellyfin 12.2 answers 500 to the universal audio stream without a device profile's parameters"
+[op.GetHlsAudioSegment]
+oracle_trap = "a segment of a transcode that was never started: Jellyfin 12.2 answers 500"
+[op.GetHlsVideoSegment]
+oracle_trap = "beside the concurrent reads' other transcodes of the same movie, Jellyfin 12.2 sometimes outlasts the request timeout starting this segment's job"
+[op.GetLiveHlsStream]
+oracle_trap = "beside the concurrent reads' other transcodes of the same movie, Jellyfin 12.2 sometimes outlasts the request timeout starting the live playlist's job"
+[op.GetItemImage2]
+oracle_trap = "beside the concurrent reads of the same image at the same size, Jellyfin 12.2 sometimes aborts the answer (Kestrel: Content-Length mismatch, 0 bytes written)"
+[op.GetTrailers]
+oracle_trap = "Jellyfin 12.2 answers /Trailers with 500 on this corpus, which has no trailers"
+[op.GetSuggestions]
+oracle_trap = "Jellyfin 12.2's /Items/Suggestions outlasts the request timeout on this corpus"
+[op.GetChannelMappingOptions]
+oracle_trap = "Jellyfin 12.2 answers 500 without a tuner or a listings provider"
+[op.GetSubtitle]
+oracle_trap = "the corpus movie's stream 0 is not a subtitle; Jellyfin 12.2 answers 500"
+[op.GetSubtitleWithTicks]
+oracle_trap = "the corpus movie's stream 0 is not a subtitle; Jellyfin 12.2 answers 500"
+[op.GetRemoteSubtitles]
+oracle_trap = "a remote subtitle provider: needs an OpenSubtitles account and the internet"
+[op.DeleteItem]
+oracle_trap = "the media is mounted read-only; Jellyfin 12.2's delete fails with 500"
+[op.GetBookRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetBoxSetRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetMovieRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetMusicAlbumRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetMusicArtistRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetMusicVideoRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetPersonRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetSeriesRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+[op.GetTrailerRemoteSearchResults]
+body = { SearchInfo = { Name = "Parity" }, IncludeDisabledProviders = false }
+oracle_trap = "a remote metadata search: needs the internet"
+
+# What the corpus does not have: both servers are asked about something absent, and the status says so.
+[op.GetBackup]
+expect_status = 404   # no backup exists
+[op.GetChannelFeatures]
+expect_status = 400   # the corpus has no channels
+[op.GetChannelItems]
+expect_status = 400   # the corpus has no channels
+[op.GetDashboardConfigurationPage]
+expect_status = 404   # no plugin configuration page is installed
+[op.GetArtistImage]
+expect_status = 404   # the corpus's artists, people and studios have no images
+[op.HeadArtistImage]
+expect_status = 404
+[op.GetPersonImage]
+expect_status = 404
+[op.HeadPersonImage]
+expect_status = 404
+[op.GetPersonImageByIndex]
+expect_status = 404
+[op.HeadPersonImageByIndex]
+expect_status = 404
+[op.GetStudioImage]
+expect_status = 404
+[op.HeadStudioImage]
+expect_status = 404
+[op.GetStudioImageByIndex]
+expect_status = 404
+[op.HeadStudioImageByIndex]
+expect_status = 404
+[op.GetUserImage]
+expect_status = 404   # the user has no image
+[op.HeadUserImage]
+expect_status = 404
+[op.GetChannel]
+expect_status = 404   # the corpus has no Live TV
+[op.GetLineups]
+expect_status = 404
+[op.GetLiveRecordingFile]
+expect_status = 404
+[op.GetLiveStreamFile]
+expect_status = 404
+[op.GetProgram]
+expect_status = 404
+[op.GetRecording]
+expect_status = 404
+[op.GetRecordingGroup]
+expect_status = 404
+[op.GetSeriesTimer]
+expect_status = 404
+[op.DeleteRecording]
+expect_status = 404
+[op.CancelSeriesTimer]
+expect_status = 404
+[op.CancelTimer]
+expect_status = 404
+[op.ResetTuner]
+expect_status = 400
+[op.OpenLiveStream]
+expect_status = 400   # nothing to open: the corpus has no live streams
+[op.GetLyrics]
+expect_status = 404   # the corpus's tracks have no lyrics
+[op.GetRemoteLyrics]
+expect_status = 404   # no lyrics provider
+[op.DownloadRemoteLyrics]
+expect_status = 404
+[op.UploadLyrics]
+expect_status = 400   # an empty upload
+[op.GetPackageInfo]
+expect_status = 404   # no plugin repository answers in the run
+[op.InstallPackage]
+expect_status = 404
+[op.GetPluginImage]
+expect_status = 404   # no plugin with that id
+[op.GetPluginConfiguration]
+expect_status = 404
+[op.UninstallPlugin]
+expect_status = 404
+[op.UninstallPluginByVersion]
+expect_status = 404
+[op.DisablePlugin]
+expect_status = 404
+[op.EnablePlugin]
+expect_status = 404
+[op.UpdatePluginConfiguration]
+expect_status = 404
+[op.GetPluginManifest]
+expect_status = 404
+[op.GetQuickConnectState]
+expect_status = 404   # an unknown QuickConnect secret
+[op.AuthorizeQuickConnect]
+expect_status = 404   # an unknown QuickConnect code
+[op.SyncPlayGetGroup]
+expect_status = 404   # no SyncPlay group
+[op.GetTrickplayTileImage]
+expect_status = 404   # trickplay is not generated in the corpus
+[op.GetTrickplayHlsPlaylist]
+expect_status = 404
+[op.GetAttachment]
+expect_status = 404   # the corpus movie has no attachments
+[op.DownloadRemoteImage]
+expect_status = 400   # no image URL
+[op.UpdateItemImageIndex]
+expect_status = 400   # the movie has one image of that type: there is no other index to move it to
+[op.StartRestoreBackup]
+body = { ArchiveFileName = "parity.zip" }
+expect_status = 404   # no such backup archive
+
+# Requests made valid
+[op.GetMasterHlsAudioPlaylist]
+query = { mediaSourceId = "{found.track}" }
+[op.HeadMasterHlsAudioPlaylist]
+query = { mediaSourceId = "{found.track}" }
+[op.MergeVersions]
+query = { ids = "{movie},{hdr_movie}" }
+[op.AddVirtualFolder]
+query = { name = "Parity", collectionType = "movies", refreshLibrary = false }
+body = { LibraryOptions = {} }
+[op.RemoveVirtualFolder]
+query = { name = "{found.library}", refreshLibrary = false }
+[op.RenameVirtualFolder]
+query = { name = "{found.library}", newName = "Parity renamed", refreshLibrary = false }
+[op.UpdateLibraryOptions]
+body = { Id = "{views.movies}", LibraryOptions = {} }
+[op.AddMediaPath]
+query = { refreshLibrary = false }
+body = { Name = "{found.library}", Path = "/media", PathInfo = { Path = "/media" } }
+[op.RemoveMediaPath]
+query = { name = "{found.library}", path = "{found.library_path}", refreshLibrary = false }
+[op.UpdateMediaPath]
+body = { Name = "{found.library}", PathInfo = { Path = "{found.library_path}" } }
+[op.StopTask]
+setup = [{ id = "start", method = "POST", path = "/ScheduledTasks/Running/{found.task}", expect_status = 204 }]
+oracle_trap = "Jellyfin 12.2 answers 500 when the task has already finished by the time it is stopped"
+[op.UploadSubtitle]
+body = { Language = "eng", Format = "srt", IsForced = false, IsHearingImpaired = false, Data = "MQ0KMDA6MDA6MDEsMDAwIC0tPiAwMDowMDowMiwwMDANClBhcml0eQ0K" }
+expect_status = 500   # the subtitle is saved beside the media, which is mounted read-only: both fail
+[op.UpdateUser]
+query = { userId = "{viewer}" }
+body = { Id = "{viewer}", Name = "viewer", Policy = { AuthenticationProviderId = "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider", PasswordResetProviderId = "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider" } }
+[op.DeleteUser]
+path = "/Users/{viewer}"
+[op.UpdateUserPolicy]
+path = "/Users/{viewer}/Policy"
+body = { AuthenticationProviderId = "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider", PasswordResetProviderId = "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider", IsAdministrator = false, EnableAllFolders = true }
+[op.AuthenticateWithQuickConnect]
+body = { Secret = "parity" }
+expect_status = 404   # an unknown QuickConnect secret
+
+# Live TV writes without a tuner or a listings provider: Jellyfin 12.2 fails with 500 on these.
+[op.SetChannelMapping]
+body = { ProviderId = "parity", TunerChannelId = "parity", ProviderChannelId = "parity" }
+oracle_trap = "no Live TV in the corpus: Jellyfin 12.2 answers 500"
+[op.CreateSeriesTimer]
+oracle_trap = "no Live TV in the corpus: Jellyfin 12.2 answers 500"
+[op.UpdateSeriesTimer]
+oracle_trap = "no Live TV in the corpus: Jellyfin 12.2 answers 500"
+[op.CreateTimer]
+oracle_trap = "no Live TV in the corpus: Jellyfin 12.2 answers 500"
+[op.UpdateTimer]
+oracle_trap = "no Live TV in the corpus: Jellyfin 12.2 answers 500"
+[op.AddListingProvider]
+expect_status = 404   # an empty provider names no listings provider type
+[op.AddTunerHost]
+expect_status = 404   # an empty tuner names no tuner type
+[op.DeleteItemImage]
+oracle_trap = "the image is in the read-only media folder: Jellyfin 12.2's delete fails with 500"
+[op.DeleteItemImageByIndex]
+oracle_trap = "the image is in the read-only media folder: Jellyfin 12.2's delete fails with 500"
+[op.UpdateStartupUser]
+expect_status = 403   # the startup wizard is complete

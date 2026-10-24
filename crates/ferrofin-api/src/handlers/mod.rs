@@ -1325,6 +1325,61 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/System/Configuration/{key}",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "GetNamedConfiguration",
+        ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
+               configuration_manager.rs get_named_configuration and get_encoding_options \
+               (read_named; BaseConfigurationManager.GetConfiguration and \
+               LoadConfiguration, the seven ConfigurationStore registrations) → \
+               encoding_response for encoding, the Live TV manager's tuner and provider rows \
+               for livetv",
+        date: "2026-10-23",
+        divergences: &[
+            "The stored document is reread on every call instead of cached from the first load \
+         until a save, so a hand-edited file applies without a restart, and a document that \
+         does not parse is logged at warn once per change of the file where upstream logs it \
+         at error once.",
+            "A stored document that exists but cannot be read is a 500, and so is a save of \
+         encoding (the one store with a validator) over it. LoadConfiguration catches every \
+         exception but IOException, so upstream serves the defaults for a permission-denied \
+         read (UnauthorizedAccessException, logged at error) and for a directory in the \
+         file's place (File.Exists is false), and only other I/O errors fail. Jellyfin quirk \
+         not ported: serving the defaults lets the next save replace a document nobody saw.",
+            "database always reads as Jellyfin-SQLite without locking, the document Jellyfin \
+         writes on its first start: Ferrofin has no other database provider and refuses to \
+         save another (owner decision 2026-10-23).",
+            "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
+         the database rather than in the document; when they cannot be read the lists are \
+         empty and the failure is logged.",
+            "For a caller who is not an administrator, livetv's TunerHosts[].Url and \
+         ListingProviders[].Password are blanked; upstream's plain [Authorize] serves those \
+         credentials to every signed-in user (owner decision 2026-10-23).",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/Counts",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetItemCounts",
+        ferrofin: "handlers/items.rs get_item_counts (resolve_user_opt, the \
+               RequestHelpers.GetUserId port) → ferrofin-core library_manager.rs \
+               get_item_counts → item_count_service.rs get_item_counts \
+               (scope_to_user_libraries, the LibraryManager.AddUserToQuery port; \
+               ItemCountService.GetItemCounts as QueryShape::TypeCounts and \
+               counts_from_type_map)",
+        date: "2026-10-24",
+        divergences: &[
+            "isFavorite with no user (an API key without userId, or a userId naming no \
+         account) is ignored and the totals are unfiltered (200); upstream's TranslateQuery \
+         dereferences the null User for the favourites subquery and fails (500). Jellyfin bug \
+         not ported.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

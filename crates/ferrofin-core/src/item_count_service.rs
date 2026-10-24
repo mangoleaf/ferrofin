@@ -202,6 +202,9 @@ pub struct FerrofinItemCountService {
     /// The `UserRootFolder`/`AggregateFolder` ids, injected once by the
     /// composition root (see [`FerrofinItemCountService::with_root_ids`]).
     roots: Option<RootFolderIds>,
+    /// The `IsVisible` evaluator the count's library scope asks about
+    /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
+    visibility: crate::item_repository::VisibilitySlot,
 }
 
 impl std::fmt::Debug for FerrofinItemCountService {
@@ -215,7 +218,22 @@ impl FerrofinItemCountService {
     /// Creates the service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db, roots: None }
+        Self {
+            db,
+            roots: None,
+            visibility: crate::item_repository::VisibilitySlot::default(),
+        }
+    }
+
+    /// Installs the slot the composition root fills with the server's
+    /// `ItemVisibility`, the same one the item repository holds, so a count's
+    /// library scope admits the playlists folder and a box-set library exactly
+    /// when a query's does (`UserViewManager.GetUserViews`). Left empty, both
+    /// are admitted.
+    #[must_use]
+    pub fn with_visibility(mut self, slot: crate::item_repository::VisibilitySlot) -> Self {
+        self.visibility = slot;
+        self
     }
 
     /// Injects the two root-folder ids resolved once at startup, so the user
@@ -489,7 +507,13 @@ impl ItemCountService for FerrofinItemCountService {
         // see one library must be counted over that library, not the server.
         // Without it `/Items/Counts` handed a restricted account the whole
         // catalogue's totals — numbers it could not then browse to.
-        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        let scoped = crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            visibility.as_deref(),
+            filter,
+        )
+        .await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -511,7 +535,13 @@ impl ItemCountService for FerrofinItemCountService {
         // (type, count) rows — instead of materializing every matching full row
         // (all ~60 columns) and counting them in Rust, which dominated this
         // endpoint's CPU on a large library.
-        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        let scoped = crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            visibility.as_deref(),
+            filter,
+        )
+        .await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -528,12 +558,9 @@ impl ItemCountService for FerrofinItemCountService {
             .map(|(t, c)| (t, i32::try_from(c).unwrap_or(i32::MAX)))
             .collect();
 
-        // Jellyfin's LibraryController.GetItemCounts never assigns ItemCount, so
-        // it serializes as 0 for the top-level endpoint. Match that: build the
-        // per-type counts, then zero the grand total.
-        let mut counts = counts_from_type_map(&by_type);
-        counts.item_count = 0;
-        Ok(counts)
+        // ItemCountService.GetItemCounts (v12.2, :73) sets ItemCount to the sum
+        // of every type group, types with no field of their own included.
+        Ok(counts_from_type_map(&by_type))
     }
 
     async fn get_item_counts_for_name_item(
@@ -3508,15 +3535,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_item_counts_zeroes_the_grand_total() {
+    async fn get_item_counts_totals_every_matched_type() {
         let db = test_db().await;
         let service = svc(&db);
 
-        // Two movies and one series → per-type counts populate, but the
-        // top-level ItemCount must serialize as 0 (Jellyfin never assigns it).
+        // ItemCountService.GetItemCounts (v12.2, :73): ItemCount is the sum of
+        // every type group, including types with no field of their own (Season).
         seed_item(&db, Uuid::from_u128(0xCC01), BaseItemKind::Movie).await;
         seed_item(&db, Uuid::from_u128(0xCC02), BaseItemKind::Movie).await;
         seed_item(&db, Uuid::from_u128(0xCC03), BaseItemKind::Series).await;
+        seed_item(&db, Uuid::from_u128(0xCC04), BaseItemKind::Season).await;
 
         let counts = service
             .get_item_counts(&InternalItemsQuery::default())
@@ -3525,7 +3553,7 @@ mod tests {
 
         assert_eq!(counts.movie_count, 2);
         assert_eq!(counts.series_count, 1);
-        assert_eq!(counts.item_count, 0);
+        assert_eq!(counts.item_count, 4);
     }
 
     #[tokio::test]

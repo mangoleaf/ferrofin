@@ -281,6 +281,31 @@ pub trait ProviderManager: Send + Sync {
         image_index: Option<i32>,
     ) -> Result<(), ServiceError>;
 
+    /// The local copy of a remote image row's `path`, downloaded into the
+    /// server's remote-image cache on first use.
+    ///
+    /// Port of the download half of `LibraryManager.ConvertImageToLocal`,
+    /// which `ImageController` calls for an image that is not a local file and
+    /// `GuideManager.PreCacheImages` calls ahead of time: `path` may hold
+    /// several `|`-separated URLs, tried in order. Upstream then rewrites the
+    /// row to the downloaded file. Ferrofin leaves the row at its URL and
+    /// keeps the file in a cache keyed by the URL, because the Live TV
+    /// refresh compares a row's path with the listing's URL to tell whether
+    /// its artwork changed: a rewritten row never matches again, so every
+    /// refresh would re-download every logo and guide image.
+    ///
+    /// The default has no cache.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when no URL could be downloaded as an image,
+    /// or no cache is wired. The error never names the URL: tuner and guide
+    /// image URLs can carry credentials, and the image routes repeat it.
+    async fn cached_remote_image(&self, path: &str) -> Result<String, ServiceError> {
+        let _ = path;
+        Err(ServiceError::backend("no remote image cache is wired"))
+    }
+
     /// Stores caller-supplied image bytes for an item.
     async fn save_image(
         &self,

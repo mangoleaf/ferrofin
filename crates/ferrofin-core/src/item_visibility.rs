@@ -21,6 +21,19 @@ use crate::item_type_lookup::kind_from_type_name;
 use crate::item_visibility_repository as repository;
 use crate::text_util::get_clean_value;
 
+/// The kind a playlists or boxsets library only links to, from its lower-cased
+/// collection type — the `itemKind` 12.2 `GetUserViews` asks
+/// [`ItemVisibility::has_visible_item`] about (`UserViewManager.cs:62-73`):
+/// `Playlist` for `playlists`, `BoxSet` for `boxsets`, and nothing for any
+/// other type.
+pub(crate) fn linked_kind(collection_type: Option<&str>) -> Option<BaseItemKind> {
+    match collection_type {
+        Some("playlists") => Some(BaseItemKind::Playlist),
+        Some("boxsets") => Some(BaseItemKind::BoxSet),
+        _ => None,
+    }
+}
+
 /// The collaborators needed to evaluate item access. Results are never cached
 /// across requests, so library, sharing and policy changes apply immediately.
 pub struct ItemVisibility {
@@ -220,6 +233,68 @@ impl ItemVisibility {
                 }
             })
             .collect()
+    }
+
+    /// 12.2 `UserViewManager.HasVisibleItem` (`UserViewManager.cs:161-176`):
+    /// whether `user` can see at least one `kind` item (`Playlist` or
+    /// `BoxSet`) whose `TopParentId` is one of `top_parent_ids`, wherever
+    /// under it the item sits — a playlist file inside a music album counts.
+    /// No top parents, no item, as upstream.
+    ///
+    /// The caller names the top parents: those of the user's root folders
+    /// (`folders.SelectMany(GetTopParentIds)`, see
+    /// [`Self::has_visible_root_item`]). A probe naming none would be scoped
+    /// to the user's views, which is the scope this answer decides.
+    ///
+    /// It reads ids only, seeking a `(Type, TopParentId)` index;
+    /// `items.Any(item => item.IsVisible(user))` then checks them in doubling
+    /// batches (1, 2, 4, …), so the common answer costs one row and a library
+    /// of hidden ones a handful of visibility loads rather than one per item.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy.
+    pub async fn has_visible_item(
+        &self,
+        kind: BaseItemKind,
+        user: &UserEntity,
+        top_parent_ids: &[Uuid],
+    ) -> Result<bool, ServiceError> {
+        if top_parent_ids.is_empty() {
+            return Ok(false);
+        }
+        let ids = self
+            .items
+            .get_item_ids(&crate::user_view_manager::visible_item_query(
+                kind,
+                user,
+                top_parent_ids.to_vec(),
+            ))
+            .await?;
+        let (mut start, mut size) = (0, 1);
+        while start < ids.len() {
+            let end = (start + size).min(ids.len());
+            let rows = self.items.retrieve_items(&ids[start..end]).await?;
+            if self.visible(&rows, user, false).await?.contains(&true) {
+                return Ok(true);
+            }
+            (start, size) = (end, size * 2);
+        }
+        Ok(false)
+    }
+
+    /// [`Self::has_visible_item`] over the top parents of the root folders
+    /// `user` can see, the libraries and the playlists folder — the question
+    /// `GetUserViews` asks before it lists a playlists or boxsets library.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy.
+    pub async fn has_visible_root_item(
+        &self,
+        kind: BaseItemKind,
+        user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let top_parents = crate::item_repository::root_folder_top_parents(&self.db, user).await?;
+        self.has_visible_item(kind, user, &top_parents).await
     }
 
     /// Recomputes persisted parental scores from effective custom/official ratings

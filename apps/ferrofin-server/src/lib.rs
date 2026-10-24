@@ -28,11 +28,13 @@ pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
 pub mod seed;
+mod startup;
 pub mod state;
 #[cfg(test)]
 mod test_exec;
 #[cfg(test)]
 mod test_logs;
+pub mod tls;
 pub mod vaapi_probe;
 
 use std::net::SocketAddr;
@@ -142,15 +144,16 @@ fn encoder_or_disabled(discovered: anyhow::Result<FfmpegPaths>) -> FfmpegPaths {
     }
 }
 
-/// Logs how far into the boot each stage of [`run`] finished, at `debug`.
+/// Logs how far into the boot each stage of [`run`] finished.
 ///
-/// Cold start is a sequence of a handful of coarse stages (database + encoder
-/// probe, manager wiring, seeding, router, bind), and without a per-stage
-/// timestamp the only observable is the total — which says nothing about which
-/// stage to attack. Emitted with `RUST_LOG=ferrofin_server=debug`; a disabled
-/// `debug!` costs a single atomic load, so this is free in production.
+/// Cold start is a sequence of a handful of coarse stages (bind, database +
+/// encoder probe, manager wiring, seeding, router, ready), and without a
+/// per-stage timestamp the only observable is the total — which says nothing
+/// about which stage to attack. At `info`: a handful of lines per boot, and
+/// while a long migration runs they are what tells an operator how far the
+/// server has got.
 fn boot_stage(started: std::time::Instant, stage: &'static str) {
-    tracing::debug!(
+    tracing::info!(
         stage,
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "boot stage"
@@ -254,8 +257,9 @@ async fn announce_shutdown(
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
 ///
-/// This is the whole composition root, in order: initialise logging, open +
-/// migrate the database, discover ffmpeg (non-fatal — the API still boots without
+/// This is the whole composition root, in order: initialise logging, check the
+/// server directories (Jellyfin's `MakeSanityCheckOrThrow`), open + migrate the
+/// database, discover ffmpeg (non-fatal — the API still boots without
 /// it, playback just 500s until configured), wire every concrete manager into the
 /// shared `AppState`, seed a default administrator when the install is fresh, mount
 /// the `ferrofin-api` router, and `axum::serve` on the configured bind address with
@@ -273,7 +277,8 @@ async fn announce_shutdown(
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened/migrated, manager wiring
+/// Returns an error if a server directory cannot be created or marked, or holds
+/// another kind's marker, if the database cannot be opened/migrated, manager wiring
 /// fails, seeding fails, the listener cannot bind the configured address, or the
 /// server loop errors.
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -372,8 +377,10 @@ struct ProcessMetrics {
 
 /// `StorageHelper.TestCommonPathsForStorageCapacity`: Jellyfin will not start,
 /// nor apply a restore, without 2 GiB free on the data, cache and
-/// program-data paths. A failure stops the boot before the database is opened
-/// or a restore is applied; only the three directories may have been created.
+/// program-data paths. It runs after the directory check
+/// (`bootstrap::check_application_paths`, upstream's order), so all three
+/// already exist. A failure stops the boot before the database is opened or a
+/// restore is applied.
 fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
     ferrofin_core::system_manager::test_common_paths_for_storage_capacity(
         &ferrofin_core::system_manager::FsStorageProbe,
@@ -382,6 +389,19 @@ fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
         &config.data_dir,
     )
     .context("the storage capacity check failed")
+}
+
+/// [`apply_scheduled_restore`] on a blocking-pool thread. Synchronous on
+/// purpose (nothing may touch the tree meanwhile, and the boot waits for it),
+/// but a restore copies whole trees, which on the runtime's workers would
+/// leave the startup server unable to answer.
+async fn apply_scheduled_restore_off_runtime(
+    config: &Config,
+) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || apply_scheduled_restore(&config))
+        .await
+        .context("the scheduled restore task failed")?
 }
 
 /// Applies a restore scheduled by `POST /Backup/Restore`, before the database
@@ -453,6 +473,10 @@ async fn record_restore_failure(
 /// One server lifetime: boot, serve until drained, tear the host down, and
 /// report whether an API restart was requested (`true` → the caller runs it
 /// again). A signal-initiated drain always reports `false`.
+// The boot is one ordered sequence (directories, restore, database, wiring,
+// serve, drain), each step depending on the one before; split into helpers it
+// would only re-thread the same state, as `build_app_state` notes.
+#[allow(clippy::too_many_lines)]
 async fn serve_once(
     config: &Config,
     started: std::time::Instant,
@@ -462,10 +486,38 @@ async fn serve_once(
     // Process-wide SQLite setup must precede every open, the restore and the
     // existing-database check below included.
     ferrofin_db::init_sqlite();
+    // Directories first (`Program.StartApp`), before a restore or an adopted database.
+    bootstrap::check_application_paths(config)?;
     // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
-    // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
-    // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.
-    let restore_failure = apply_scheduled_restore(config)?;
+    // before the database file is opened — Jellyfin's `RestoreBackupPath`
+    // sequence. It may bring back another `network.xml`, which decides the
+    // addresses below and stays bound for the whole lifetime, so a pending
+    // one runs before the bind; with nothing pending the storage check runs
+    // after it.
+    let restore_pending = ferrofin_api::handlers::backup::restore_pending(&boot_tree_roots(config));
+    let early_restore = if restore_pending {
+        Some(apply_scheduled_restore_off_runtime(config).await?)
+    } else {
+        None
+    };
+    // The startup server (`SetupServer`, which upstream starts before its
+    // migrations): bind the HTTP port now and answer while the database is
+    // adopted and migrated, so clients and probes get a 503 and a live
+    // process, not a closed port. Leaving this function early drops
+    // `serving`, which closes the port again. HTTPS waits for the wiring, as
+    // upstream's setup server binds the HTTP port only.
+    let (listeners, addresses, bound_port) = bind_http_listeners(config).await?;
+    let ready = startup::Ready::default();
+    let mut serving = Serving::start(
+        listeners.into_iter().map(listen::ServedListener::Plain),
+        &startup::dispatcher(Arc::clone(&ready)),
+    );
+    tracing::info!(addresses = ?addresses, "ferrofin-server listening, starting up");
+    boot_stage(started, "listener bound");
+    let restore_failure = match early_restore {
+        Some(failure) => failure,
+        None => apply_scheduled_restore_off_runtime(config).await?,
+    };
     // A server that has been set up must not come up on a missing or empty
     // database: opening it would create and migrate a new one, and the seeding
     // below would give it a passwordless administrator. Checked after the
@@ -485,8 +537,21 @@ async fn serve_once(
     // `MediaEncoder.SetFFmpegPath`'s middle rung: the encoding configuration's
     // saved `EncoderAppPath`, between the command line and `$PATH`.
     let saved_encoder_path = bootstrap::persisted_encoder_app_path(&config.config_dir);
+    // On a blocking-pool thread: adoption and the table-rebuilding migrations
+    // copy the database file with blocking I/O, which on the runtime's workers
+    // (one, on a one-CPU container) would leave the startup server unable to
+    // answer `/health/live` for as long as the copy takes.
+    let open = {
+        let config = config.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || runtime.block_on(open_database(&config)))
+    };
     let (db, ffmpeg, fpcalc) = tokio::join!(
-        open_database(config),
+        async {
+            open.await
+                .context("the database open task failed")
+                .and_then(|opened| opened)
+        },
         discover_ffmpeg(config, saved_encoder_path.as_deref()),
         ferrofin_extensions::fingerprint::discover_fpcalc_async(),
     );
@@ -587,28 +652,41 @@ async fn serve_once(
     // `Router::layer`, which runs per-matched-route, too late to re-route).
 
     boot_stage(started, "router mounted");
-    let (listeners, addresses, bound_port) = bind_http_listeners(config, &wired.state)?;
     wired.app_host.set_bound_http_port(bound_port);
+    let (https_listeners, https_addresses) = bind_https_listeners(config, &wired)?;
+    if let Some(listen::ServedListener::Tls(listener)) = https_listeners.first() {
+        wired
+            .app_host
+            .set_bound_https_port(listener.local_addr().port());
+    }
     let discovery = start_discovery(&wired, config.discovery_bind_addr).await;
     let discovery_abort = discovery
         .as_ref()
         .map(tokio::task::JoinHandle::abort_handle);
-    boot_stage(started, "listener bound");
-    tracing::info!(addresses = ?addresses, "ferrofin-server listening");
+    // The handover: the listeners serving the startup answers serve the
+    // lifetime's router from the next request on, and HTTPS starts with it.
+    let app = lifetime_app(router, &config.base_url, https_redirect(config, &wired));
+    serving.serve(https_listeners, &app);
+    // `ready` is this lifetime's own, so this is its only `set`.
+    let _ = ready.set(app);
+    boot_stage(started, "ready");
+    tracing::info!(
+        addresses = ?addresses,
+        https_addresses = ?https_addresses,
+        "ferrofin-server ready"
+    );
 
-    let serve_result = serve_until_drained(
-        listeners,
-        router,
-        announce_shutdown(
-            shutdown_rx,
-            Arc::clone(&wired.state.sessions),
-            signals.clone(),
-            discovery_abort,
-        ),
-        config.shutdown_timeout_secs,
-        &config.base_url,
-    )
-    .await;
+    let serve_result = serving
+        .drain(
+            announce_shutdown(
+                shutdown_rx,
+                Arc::clone(&wired.state.sessions),
+                signals.clone(),
+                discovery_abort,
+            ),
+            config.shutdown_timeout_secs,
+        )
+        .await;
 
     // Tear the host down (Jellyfin: `using CoreAppHost` per iteration): stop
     // every background task, then close the pools so nothing from this lifetime
@@ -677,87 +755,145 @@ async fn stop_background_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
     }
 }
 
-/// Serves until the shutdown trigger fires and the drain completes — or
-/// `timeout_secs` after the trigger, whichever comes first (Kestrel's
-/// `HostOptions.ShutdownTimeout`). Unbounded, a client mid-stream would keep
-/// the old host alive — listener already closed — for as long as it kept
-/// reading, so a restart during playback never came back. Dropping the serve
-/// future past the deadline aborts the remaining connections.
+/// Serves `router` on `listeners` until `shutdown` resolves, then drains for
+/// at most `timeout_secs`.
+#[cfg(test)]
 async fn serve_until_drained(
-    listeners: Vec<listen::Listener>,
+    listeners: Vec<listen::ServedListener>,
     router: axum::Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     timeout_secs: u32,
     base: &str,
+    https_redirect: Option<Arc<tls::HttpsRedirect>>,
 ) -> anyhow::Result<()> {
+    Serving::start(listeners, &lifetime_app(router, base, https_redirect))
+        .drain(shutdown, timeout_secs)
+        .await
+}
+
+/// The lifetime's router behind the path-case, HTTPS-redirect and base-URL
+/// rewrites, which run before routing.
+fn lifetime_app(
+    router: axum::Router,
+    base: &str,
+    https_redirect: Option<Arc<tls::HttpsRedirect>>,
+) -> axum::Router {
     let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
+    // Inside the base URL mount, as Jellyfin's `UseHttpsRedirection` is.
+    let app =
+        axum::middleware::from_fn_with_state(https_redirect, tls::redirect_to_https).layer(app);
     let app = axum::middleware::from_fn_with_state(base_url::normalize(base), base_url::rewrite)
         .layer(app);
-    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
-    // One serve loop per listening address, all stopped by the same trigger.
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut servers = tokio::task::JoinSet::new();
-    for listener in listeners {
-        let mut stop = stop_rx.clone();
-        let app = app.clone();
-        servers.spawn(async move {
-            // Each connection's peer (`ConnectInfo`, which handlers read, e.g.
-            // `GET /System/Endpoint`) and the address it was accepted on, which
-            // the IP gate compares with it (C# `IsLocal()`).
-            let make_service = tower::service_fn(
-                move |stream: axum::serve::IncomingStream<'_, listen::Listener>| {
-                    let peer = *stream.remote_addr();
-                    let local = stream.io().local_addr().ok();
-                    let app = app.clone();
-                    async move {
-                        let service = tower::ServiceBuilder::new()
-                            .map_request(move |mut request: axum::extract::Request| {
-                                let extensions = request.extensions_mut();
-                                extensions.insert(axum::extract::ConnectInfo(peer));
-                                if let Some(local) = local {
-                                    extensions.insert(
-                                        ferrofin_api::ip_access::ConnectionLocalAddr(local),
-                                    );
-                                }
-                                request
-                            })
-                            .service(app);
-                        Ok::<_, std::convert::Infallible>(service)
-                    }
-                },
-            );
-            axum::serve(listener, make_service)
-                .with_graceful_shutdown(async move {
-                    let _ = stop.wait_for(|stopped| *stopped).await;
-                })
-                .await
-        });
+    axum::Router::new().fallback_service(app)
+}
+
+/// A lifetime's serve loops, one per listening address, all stopped by the
+/// same trigger. Dropping it aborts them and closes the listeners.
+struct Serving {
+    servers: tokio::task::JoinSet<std::io::Result<()>>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl Serving {
+    /// Starts serving `app` on every listener.
+    fn start(
+        listeners: impl IntoIterator<Item = listen::ServedListener>,
+        app: &axum::Router,
+    ) -> Self {
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let mut serving = Self {
+            servers: tokio::task::JoinSet::new(),
+            stop,
+        };
+        serving.serve(listeners, app);
+        serving
     }
-    tokio::spawn(async move {
-        shutdown.await;
-        let _ = stop_tx.send(true);
-        let _ = drain_started_tx.send(());
-    });
-    let deadline = async move {
-        let _ = drain_started_rx.await;
-        tokio::time::sleep(std::time::Duration::from_secs(u64::from(timeout_secs))).await;
-    };
-    let serve = async {
-        while let Some(finished) = servers.join_next().await {
-            finished
-                .context("a listener task failed")?
-                .context("server error")?;
+
+    /// Serves `app` on more listeners, stopped by the same trigger.
+    fn serve(
+        &mut self,
+        listeners: impl IntoIterator<Item = listen::ServedListener>,
+        app: &axum::Router,
+    ) {
+        for listener in listeners {
+            let mut stop = self.stop.subscribe();
+            let app = app.clone();
+            self.servers.spawn(async move {
+                // Each connection's peer (`ConnectInfo`, which handlers read, e.g.
+                // `GET /System/Endpoint`) and the address it was accepted on, which
+                // the IP gate compares with it (C# `IsLocal()`).
+                let make_service = tower::service_fn(
+                    move |stream: axum::serve::IncomingStream<'_, listen::ServedListener>| {
+                        let peer = *stream.remote_addr();
+                        let local = stream.io().local_addr().ok();
+                        let transport = stream.io().transport();
+                        let app = app.clone();
+                        async move {
+                            let service = tower::ServiceBuilder::new()
+                                .map_request(move |mut request: axum::extract::Request| {
+                                    let extensions = request.extensions_mut();
+                                    extensions.insert(axum::extract::ConnectInfo(peer));
+                                    extensions.insert(transport);
+                                    if let Some(local) = local {
+                                        extensions.insert(
+                                            ferrofin_api::ip_access::ConnectionLocalAddr(local),
+                                        );
+                                    }
+                                    request
+                                })
+                                .service(app);
+                            Ok::<_, std::convert::Infallible>(service)
+                        }
+                    },
+                );
+                axum::serve(listener, make_service)
+                    .with_graceful_shutdown(async move {
+                        let _ = stop.wait_for(|stopped| *stopped).await;
+                    })
+                    .await
+            });
         }
-        Ok(())
-    };
-    tokio::select! {
-        result = serve => result,
-        () = deadline => {
-            tracing::warn!(
-                timeout_s = timeout_secs,
-                "shutdown timeout elapsed — aborting the remaining connections"
-            );
+    }
+
+    /// Serves until the shutdown trigger fires and the drain completes — or
+    /// `timeout_secs` after the trigger, whichever comes first (Kestrel's
+    /// `HostOptions.ShutdownTimeout`). Unbounded, a client mid-stream would keep
+    /// the old host alive — listener already closed — for as long as it kept
+    /// reading, so a restart during playback never came back. Dropping the serve
+    /// future past the deadline aborts the remaining connections.
+    async fn drain(
+        self,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+        timeout_secs: u32,
+    ) -> anyhow::Result<()> {
+        let Self { mut servers, stop } = self;
+        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = stop.send(true);
+            let _ = drain_started_tx.send(());
+        });
+        let deadline = async move {
+            let _ = drain_started_rx.await;
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(timeout_secs))).await;
+        };
+        let serve = async {
+            while let Some(finished) = servers.join_next().await {
+                finished
+                    .context("a listener task failed")?
+                    .context("server error")?;
+            }
             Ok(())
+        };
+        tokio::select! {
+            result = serve => result,
+            () = deadline => {
+                tracing::warn!(
+                    timeout_s = timeout_secs,
+                    "shutdown timeout elapsed — aborting the remaining connections"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -765,11 +901,15 @@ async fn serve_until_drained(
 /// Plans and binds this lifetime's HTTP listeners, returning them with the
 /// addresses they were planned on and the port clients are told about (the
 /// first listener's; every address shares it).
-fn bind_http_listeners(
+async fn bind_http_listeners(
     config: &Config,
-    state: &ferrofin_api::state::AppState,
 ) -> anyhow::Result<(Vec<listen::Listener>, Vec<SocketAddr>, u16)> {
-    let addresses = listen_addresses(config, state);
+    // The same saved network settings `build_app_state` gives the shared
+    // network manager, read before it exists.
+    let paths = bootstrap::application_paths(config);
+    let network =
+        ferrofin_networking::NetworkManager::live(state::load_network_configuration(&paths).await);
+    let addresses = listen_addresses(config, Some(&network), config.port);
     anyhow::ensure!(
         !addresses.is_empty(),
         "the network settings leave no address to listen on (IPv4 and IPv6 are both disabled)"
@@ -783,14 +923,60 @@ fn bind_http_listeners(
     Ok((listeners, addresses, port))
 }
 
-/// The addresses this lifetime listens on: the operator's startup bind when
-/// they pinned one, otherwise Jellyfin's `GetAllBindInterfaces` over the saved
-/// network settings (`LocalNetworkAddresses`, `EnableIPv4`/`EnableIPv6`).
-fn listen_addresses(config: &Config, state: &ferrofin_api::state::AppState) -> Vec<SocketAddr> {
-    let interfaces: Vec<listen::BindInterface> = state
+/// The HTTPS redirect this lifetime serves: Jellyfin adds
+/// `UseHttpsRedirection` when `RequireHttps` is set and it listens with HTTPS.
+/// It points at the bound HTTPS port, so it follows the listeners.
+fn https_redirect(config: &Config, wired: &WiredApp) -> Option<Arc<tls::HttpsRedirect>> {
+    use ferrofin_traits::system::ServerApplicationHost as _;
+    wired.https.as_ref().filter(|https| https.require).map(|_| {
+        Arc::new(tls::HttpsRedirect {
+            port: wired.app_host.https_port(),
+            base: base_url::normalize(&config.base_url),
+            network: wired.state.network.clone(),
+            config: Arc::clone(&wired.state.config),
+        })
+    })
+}
+
+/// Binds this lifetime's HTTPS listeners, when the server listens with HTTPS:
+/// Kestrel's `UseHttps` listener on the HTTPS port of every address the HTTP
+/// port is bound on (`SetupJellyfinWebServer`). Returns them with the
+/// addresses they were planned on.
+fn bind_https_listeners(
+    config: &Config,
+    wired: &WiredApp,
+) -> anyhow::Result<(Vec<listen::ServedListener>, Vec<SocketAddr>)> {
+    let Some(https) = wired.https.as_ref() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let network = wired
+        .state
         .network
         .as_ref()
-        .and_then(|network| network.read().ok())
+        .and_then(|network| network.read().ok());
+    let addresses = listen_addresses(config, network.as_deref(), config.https_port);
+    drop(network);
+    let listeners = listen::bind_all(&addresses)
+        .context("failed to bind the HTTPS listeners (FERROFIN_HTTPS_PORT)")?
+        .into_iter()
+        .map(|listener| {
+            tls::TlsListener::new(listener, Arc::clone(&https.config))
+                .map(listen::ServedListener::Tls)
+                .context("failed to start an HTTPS listener")
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok((listeners, addresses))
+}
+
+/// The addresses this lifetime listens on, on `port`: the operator's startup
+/// bind when they pinned one, otherwise Jellyfin's `GetAllBindInterfaces` over
+/// the saved network settings (`LocalNetworkAddresses`, `EnableIPv4`/`EnableIPv6`).
+fn listen_addresses(
+    config: &Config,
+    network: Option<&ferrofin_networking::NetworkManager>,
+    port: u16,
+) -> Vec<SocketAddr> {
+    let interfaces: Vec<listen::BindInterface> = network
         .map(|network| {
             network
                 .get_all_bind_interfaces(false)
@@ -804,7 +990,7 @@ fn listen_addresses(config: &Config, state: &ferrofin_api::state::AppState) -> V
         .unwrap_or_default();
     listen::plan_addresses(
         config.bind_addr_explicit.then_some(config.bind_addr),
-        config.port,
+        port,
         &interfaces,
     )
 }
@@ -1172,13 +1358,14 @@ mod tests {
         );
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(super::serve_until_drained(
-            vec![listener],
+            vec![crate::listen::ServedListener::Plain(listener)],
             router,
             async move {
                 let _ = stopped.await;
             },
             1,
             "",
+            None,
         ));
 
         let mut stream = tokio::net::TcpStream::connect(address)

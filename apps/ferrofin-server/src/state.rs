@@ -58,7 +58,7 @@ use crate::media_encoding::build_media_encoding;
 /// is sampled for each server lifetime; listener/base URL bootstrap settings are
 /// configured separately. Missing or unreadable files use defaults; malformed JSON
 /// also logs a warning that the remote-IP filter will not be enforced.
-async fn load_network_configuration(
+pub(crate) async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
 ) -> ferrofin_networking::NetworkConfiguration {
     let path = std::path::Path::new(&paths.user_configuration_directory_path())
@@ -130,6 +130,9 @@ pub struct WiredApp {
     /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
     /// `StartServer` iteration).
     pub background: Vec<tokio::task::JoinHandle<()>>,
+    /// HTTPS for this lifetime, when the server listens with it
+    /// (`ListenWithHttps`): the certificate the HTTPS listeners serve.
+    pub https: Option<crate::tls::HttpsServing>,
 }
 
 /// The concrete [`LifecycleController`] for the running server.
@@ -358,14 +361,22 @@ pub async fn build_app_state(
     // Live TV is built after the repository and must not be owned by it, so the
     // repository asks it for the files being recorded through this late slot.
     let active_recordings = ferrofin_core::ActiveRecordingSlot::default();
+    // The `IsVisible` evaluator is built over the repository, so the query
+    // scope (`AddUserToQuery`'s playlists and box-set gate) reaches it through
+    // this late slot, filled once the evaluator exists.
+    let scope_visibility = ferrofin_core::VisibilitySlot::default();
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
             .with_virtual_paths(virtual_paths.clone())
-            .with_active_recordings(Arc::clone(&active_recordings)),
+            .with_active_recordings(Arc::clone(&active_recordings))
+            .with_visibility(Arc::clone(&scope_visibility)),
     );
-    let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
-        Arc::new(FerrofinItemCountService::new(db.clone()).with_root_ids(root_folder_ids));
+    let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> = Arc::new(
+        FerrofinItemCountService::new(db.clone())
+            .with_root_ids(root_folder_ids)
+            .with_visibility(Arc::clone(&scope_visibility)),
+    );
     let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
@@ -791,6 +802,13 @@ pub async fn build_app_state(
     // Configuration saves update this same object through AppState.
     let network_config = load_network_configuration(paths.as_ref()).await;
     let discovery_enabled = network_config.auto_discovery;
+    // `ApplicationHost.Init`: the certificate is loaded once per lifetime.
+    let https = crate::tls::HttpsServing::from_network_configuration(
+        &network_config,
+        config.port,
+        config.https_port,
+    );
+    let loaded_certificate_path = network_config.certificate_path.clone();
     let network = Arc::new(std::sync::RwLock::new(
         ferrofin_networking::NetworkManager::live(network_config),
     ));
@@ -1101,6 +1119,7 @@ pub async fn build_app_state(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
             )
+            .with_remote_image_cache(cache_root.child("remote-images"))
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
@@ -1182,6 +1201,9 @@ pub async fn build_app_state(
         )
         .with_virtual_paths(virtual_paths.clone()),
     );
+    // Held weakly by the repository and the count service: the evaluator owns
+    // the repository. `set` fails only if already set, which nothing else does.
+    let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
@@ -1215,6 +1237,9 @@ pub async fn build_app_state(
         Arc::clone(&item_repository),
         Arc::clone(&user_views),
     );
+    // Channel logos and guide artwork are remote image rows: the refresh warms
+    // their cache and tags a channel's logo for programme DTOs.
+    live_tv_impl.set_images(Arc::clone(&providers), Arc::clone(&image_processor));
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
     // "Similarity providers" list, in the admin's configured order.
@@ -1766,6 +1791,14 @@ pub async fn build_app_state(
             }
         }));
     }
+    // A new HTTPS certificate path takes a restart, or is refused when the file
+    // is missing (`ApplicationHost.OnConfigurationUpdated`).
+    let certificate_check = Arc::new(crate::tls::CertificatePathCheck::new(
+        loaded_certificate_path,
+        Arc::clone(&network),
+        Arc::clone(&lifecycle),
+    ));
+    config_mgr.add_configuration_listener(certificate_check.configuration_listener());
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
@@ -2398,7 +2431,7 @@ pub async fn build_app_state(
             HostNetworkInfo {
                 http_port: config.port,
                 https_port: config.https_port,
-                listen_with_https: false,
+                listen_with_https: https.is_some(),
                 published_server_url: config.published_url.clone(),
                 base_url: config.base_url.clone(),
                 // Read live from the network manager attached below; this is
@@ -2580,12 +2613,15 @@ pub async fn build_app_state(
     }
 
     // The host and HTTP policy share one network manager, constructed above.
-    let state = state.with_network(network).with_configuration_validator(
-        "encoding",
-        Arc::new(
-            ferrofin_mediaencoding::configuration::store::EncodingConfigurationStore::default(),
-        ),
-    );
+    let state = state
+        .with_network(network)
+        .with_configuration_validator(
+            "encoding",
+            Arc::new(
+                ferrofin_mediaencoding::configuration::store::EncodingConfigurationStore::default(),
+            ),
+        )
+        .with_committed_configuration_check(certificate_check);
 
     // ---- virtual-folder (library-structure) store -------------------------
     // The `/Library/VirtualFolders*` + `/Library/PhysicalPaths` admin surface is
@@ -2718,6 +2754,7 @@ pub async fn build_app_state(
         file_transformations,
         lifecycle: lifecycle_concrete,
         background,
+        https,
     })
 }
 

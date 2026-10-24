@@ -1119,7 +1119,7 @@ struct GroupRow {
 ///   primary's `PresentationUniqueKey` (its N-format id), `ParentId`,
 ///   `TopParentId`, `IsInMixedFolder` and ancestors, and is linked under it
 ///   as a local version (`ChildType` 2). Its name stands: the scan never
-///   renames an owned version (`settle_extra_name`).
+///   renames an owned version (`library_scan::renamed_extra`).
 ///
 ///   Upstream's scan then finds the primary's version links short of its
 ///   `LocalAlternateVersions` — the deleted row took its link along — and

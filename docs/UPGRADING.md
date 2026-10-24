@@ -22,6 +22,64 @@ Ferrofin now runs Jellyfin's two playback checks:
   WebSocket, as in Jellyfin. It was ignored before, including when carried over from an
   adopted Jellyfin configuration. At `0`, the default, nothing is stopped.
 
+## Unreleased — the dashboard's HTTPS settings take effect
+
+Ferrofin now serves HTTPS itself, as Jellyfin does. Until now it ignored the HTTPS settings
+on **Dashboard → Networking**. They now apply at startup:
+- With **Enable HTTPS** on and a PKCS#12 certificate that loads, the server also listens on
+  `FERROFIN_HTTPS_PORT` (8920 unless set) and publishes `https://` addresses.
+- With **Require HTTPS** on as well, every plain HTTP request is redirected there with a
+  `307`, `/metrics` included. Only `/health/live` and `/health/ready` are not redirected.
+
+The ports are still `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`. The port fields on the
+Networking page are not read yet (gl-554). If both name the same port, HTTPS is not served
+and the log says so. If another program holds the HTTPS port, the server does not start, as
+it does not when the HTTP port is taken.
+
+An adopted Jellyfin configuration keeps **Enable HTTPS** and **Require HTTPS**. It does not
+keep the certificate path and password, which pointed into Jellyfin's own filesystem. So
+adopted settings take effect only once you set a certificate path here.
+
+If HTTPS is on, make sure clients can reach the HTTPS port:
+- **Container:** publish it, for example `-p 8920:8920`.
+- **Helm chart:** the chart's service carries only the HTTP port. Terminate TLS at the
+  ingress instead and leave both settings off.
+- **Otherwise:** turn **Require HTTPS** off, or **Enable HTTPS** off. Without a reachable
+  HTTPS port, clients on plain HTTP are redirected to a port they cannot reach.
+
+A reverse proxy that terminates TLS needs neither setting. List it under **Known proxies**;
+its `X-Forwarded-Proto: https` then counts as HTTPS. That header now counts only from known
+proxies, as in Jellyfin, also for the addresses published from each request (**Enable
+published server URI by request**). A proxy that is not listed gets `http://` addresses. A listed
+proxy's `X-Forwarded-Host` is not used yet (gl-813): those addresses still take their host
+from the request's `Host`.
+See [CONFIG.md](CONFIG.md#https).
+
+## Unreleased — the server checks its directories at startup, as Jellyfin does
+
+Ferrofin now runs Jellyfin's startup check on its directories before a scheduled restore and the database open (an adopted Jellyfin database included). Only logging starts before it, and it creates the log directory itself. It creates each of these directories and leaves a small marker file in it, as Jellyfin does:
+
+| Directory | Marker |
+|---|---|
+| configuration (`FERROFIN_CONFIG_DIR`, default `<data>/config`) | `.jellyfin-config` |
+| logs (`<data>/log`) | `.jellyfin-log` |
+| plugins (`<data>/plugins`) | `.jellyfin-plugin` |
+| data (`--data-dir` / `FERROFIN_DATA_DIR`), and `<data>/data` | `.jellyfin-data` |
+| cache (`FERROFIN_CACHE_DIR`, default `<data>/cache`), which also gets `CACHEDIR.TAG` | `.jellyfin-cache` |
+| root folder (`<data>/root`, Jellyfin's `RootFolderPath`) | `.jellyfin-root` |
+
+**Two layouts that used to start now refuse to.**
+- **Two of these paths point at one directory**, for example the configuration or cache directory set to the data directory. The second marker's check finds the first, and Ferrofin exits with:
+
+  ```
+  the server's directories failed their startup check: Expected to find only .jellyfin-cache but found marker for <data>/.jellyfin-data.
+  ```
+
+  Give each its own directory. Then delete the marker the message names if it sits in a directory it does not belong to: the refused start may have left one, such as `.jellyfin-config` in the data directory when the configuration directory pointed there. Jellyfin refuses the same layouts.
+- **One of these directories cannot be created or written**, for example a read-only plugins volume. Ferrofin exits naming it: `creating <path>: …`. Make it writable.
+
+Ferrofin's default layout, the container image and an adopted Jellyfin directory are unaffected: each directory is a different one, and an adopted install already carries the same markers in the same places.
+
 ## Unreleased — Schedules Direct guides, and listings providers are checked on save
 
 **Schedules Direct works.** In **Dashboard → Live TV → Add TV guide data provider →
