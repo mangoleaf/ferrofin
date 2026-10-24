@@ -1754,13 +1754,87 @@ pub fn scale_filter(
 }
 
 /// Whether an external subtitle must be muxed as a second FFmpeg input. Port of
-/// `NeedsExternalSubtitleMuxing`.
-fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
+/// `NeedsExternalSubtitleMuxing`: an embedded external track, or a burned-in
+/// graphical one (a burned-in text file is read by the `subtitles` filter).
+#[must_use]
+pub fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
     state.subtitle_stream.as_ref().is_some_and(|sub| {
         sub.is_external
             && (state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed
                 || (should_encode_subtitle(state) && !sub.is_text_subtitle_stream()))
     })
+}
+
+/// The inputs that follow the media file on the command line, as argv tokens:
+/// the external subtitle [`needs_external_subtitle_muxing`] names (input 1),
+/// then an external audio track (input 1, or 2 after a subtitle). Port of the
+/// tail of `GetInputArgument`, which [`EncodingHelper::map_args`] and the
+/// overlay pads count on.
+///
+/// `fast_seek` is the media file's own `-ss` value, if it seeks: every input
+/// is seeked alike, so the tracks stay in step with the video. A subtitle
+/// input reads with the media file's `-analyzeduration` and `-probesize`, and
+/// a burned-in graphical one with its canvas size. A VobSub `.sub` is read
+/// through its `.idx` when one lies beside it, since the `.idx` names the
+/// `.sub` and carries the palette and timing.
+#[must_use]
+pub fn external_stream_input_arguments(
+    state: &EncodingJobInfo,
+    fast_seek: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    let seek = |args: &mut Vec<String>| {
+        if let Some(time) = fast_seek {
+            args.extend(["-ss".to_owned(), time.to_owned()]);
+        }
+    };
+    if let Some(sub) = state
+        .subtitle_stream
+        .as_ref()
+        .filter(|_| needs_external_subtitle_muxing(state))
+    {
+        // An external stream always has a path. Were one missing, the input
+        // still has to be there: the maps and pads number the inputs after
+        // it, and ffmpeg then names the empty path in its error.
+        let mut path = sub.path.clone().unwrap_or_default();
+        let as_path = std::path::Path::new(&path);
+        if as_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sub"))
+        {
+            let idx = as_path.with_extension("idx");
+            if idx.is_file() {
+                path = idx.to_string_lossy().into_owned();
+            }
+        }
+        args.extend([
+            "-analyzeduration".to_owned(),
+            crate::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                crate::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+            "-probesize".to_owned(),
+            crate::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
+        ]);
+        seek(&mut args);
+        if should_encode_subtitle(state) && !sub.is_text_subtitle_stream() {
+            args.extend(
+                super::hw::input_args::graphical_sub_canvas_size(Some(sub), true)
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        args.extend(["-i".to_owned(), format!("file:{path}")]);
+    }
+    if let Some(audio) = state
+        .audio_stream
+        .as_ref()
+        .filter(|audio| audio.is_external)
+    {
+        seek(&mut args);
+        args.extend(["-i".to_owned(), audio.path.clone().unwrap_or_default()]);
+    }
+    args
 }
 
 /// The score (ascending-quality index) of a profile for a codec. Port of

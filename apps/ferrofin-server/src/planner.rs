@@ -1559,10 +1559,17 @@ impl FerrofinStreamStatePlanner {
         // (see `-output_ts_offset` below and `text_subtitle_filter`). A seek
         // clamped to the very start shifts nothing.
         let segment_seek_ticks = input_seek_ticks.filter(|ticks| !progressive && *ticks > 0);
-        if let Some(seek_ticks) = input_seek_ticks {
-            let ss = self.encoder.get_time_parameter(seek_ticks);
+        // The `-ss` value, which the external inputs take too.
+        let fast_seek = input_seek_ticks.map(|ticks| {
+            self.encoder
+                .get_time_parameter(ticks)
+                .trim_start_matches("-ss")
+                .trim()
+                .to_owned()
+        });
+        if let Some(ss) = fast_seek.as_deref() {
             push_split(&mut args, "-ss");
-            push_split(&mut args, ss.trim_start_matches("-ss").trim());
+            push_split(&mut args, ss);
             // A copied video stream restarts at the keyframe *before* the seek
             // target, but ffmpeg's default accurate seek still trims re-encoded
             // audio forward to the exact target — the muxed audio then leads the
@@ -1668,6 +1675,15 @@ impl FerrofinStreamStatePlanner {
             tracing::debug!(%error, "input argument does not split; passing it as one");
             vec![input]
         }));
+        // The rest of `GetInputArgument`: an external subtitle the job embeds
+        // or overlays, then an external audio track, as the inputs the maps
+        // and the overlay pads below number 1 and 2.
+        args.extend(
+            ferrofin_mediaencoding::encoding_helper::helper::external_stream_input_arguments(
+                state,
+                fast_seek.as_deref(),
+            ),
+        );
 
         // ---- hardware video filters ------------------------------------------
         // The ported vendor chain owns the whole graph on the hardware path —
@@ -4374,6 +4390,152 @@ mod tests {
         assert!(args.contains("overlay"), "burned in: {args}");
         assert!(args.contains("[0:3]"), "the ffmpeg index, 2 + 1: {args}");
         assert!(!args.contains("[0:2]"), "{args}");
+    }
+
+    /// An external subtitle sidecar: `path` beside the movie.
+    fn sidecar(codec: &str, index: i32, path: &str) -> MediaStream {
+        MediaStream {
+            is_external: true,
+            supports_external_stream: true,
+            path: Some(path.to_owned()),
+            ..subtitle_stream(codec, index)
+        }
+    }
+
+    /// The arguments between the first `-i` and the maps: the inputs that
+    /// follow the media file.
+    fn inputs_after_the_media(args: &[String]) -> &[String] {
+        let first = args.iter().position(|a| a == "-i").expect("-i") + 2;
+        let maps = args.iter().position(|a| a == "-map").expect("-map");
+        &args[first..maps]
+    }
+
+    /// `GetInputArgument` adds a burned-in external bitmap as ffmpeg input 1,
+    /// seeked like the media file and decoded onto its own canvas, and the
+    /// overlay reads its first stream there. Without the input, ffmpeg refused
+    /// the overlay's `[1:0]` and the playback never started.
+    #[rstest::rstest]
+    #[case::software(false)]
+    #[case::nvenc(true)]
+    #[tokio::test]
+    async fn a_burned_in_external_bitmap_is_input_1(#[case] hardware: bool) {
+        let mut sup = sidecar("PGSSUB", 2, "/media/movie.en.sup");
+        sup.width = Some(1920);
+        sup.height = Some(1080);
+        let (video, p): (_, fn(Vec<MediaSourceInfo>) -> FerrofinStreamStatePlanner) = if hardware {
+            (nvdec_decodable_video_stream(), nvenc_planner)
+        } else {
+            (video_stream("h264"), planner)
+        };
+        let p = p(vec![source("abc", vec![video, audio_stream("aac"), sup])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        req.current_runtime_ticks = 9 * TICKS_PER_SECOND;
+
+        let plan = p
+            .plan(&req, false, Some(3), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            inputs_after_the_media(args),
+            [
+                "-analyzeduration",
+                "200M",
+                "-probesize",
+                "1G",
+                "-ss",
+                "90000000",
+                "-canvas_size",
+                "1920x1080",
+                "-i",
+                "file:/media/movie.en.sup",
+            ],
+            "{args:?}"
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("[1:0]"), "{joined}");
+        assert!(joined.contains("-map 1:0 -sn"), "{joined}");
+    }
+
+    /// An external track embedded into a progressive MKV is input 1, mapped
+    /// as `1:0`, text or bitmap alike (upstream PR 16448's StreamBuilder and
+    /// map halves were ported; this is the input half).
+    #[rstest::rstest]
+    #[case::srt("srt", "/media/movie.en.srt")]
+    #[case::pgs("PGSSUB", "/media/movie.en.sup")]
+    #[tokio::test]
+    async fn an_embedded_external_track_is_input_1(#[case] codec: &str, #[case] path: &str) {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                sidecar(codec, 2, path),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            inputs_after_the_media(args),
+            [
+                "-analyzeduration",
+                "200M",
+                "-probesize",
+                "1G",
+                "-i",
+                &format!("file:{path}"),
+            ],
+            "{args:?}"
+        );
+        assert!(args.join(" ").contains("-map 1:0 "), "{args:?}");
+    }
+
+    /// An external audio track selected for a transcode is the next input.
+    #[tokio::test]
+    async fn a_selected_external_audio_track_is_input_1() {
+        let commentary = MediaStream {
+            index: 2,
+            is_external: true,
+            path: Some("/media/movie.commentary.mka".to_owned()),
+            ..audio_stream("aac")
+        };
+        let src = source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac"), commentary],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_stream_index = Some(2);
+
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            inputs_after_the_media(args),
+            ["-i", "/media/movie.commentary.mka"],
+            "{args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["-map", "1:0"]), "{args:?}");
     }
 
     /// Upstream appends the embed arguments to the progressive command only.
