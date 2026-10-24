@@ -333,9 +333,10 @@ pub(crate) async fn insert_named_item(
     name: &str,
     is_folder: bool,
     container: Option<Uuid>,
+    is_locked: bool,
 ) -> Result<BaseItemEntity, ServiceError> {
     let mut conn = db.writer().acquire().await.map_err(db_err)?;
-    insert_named_item_in(&mut conn, id, kind, name, is_folder, container).await?;
+    insert_named_item_in(&mut conn, id, kind, name, is_folder, container, is_locked).await?;
     drop(conn);
     sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
@@ -346,6 +347,9 @@ pub(crate) async fn insert_named_item(
 
 /// `insert_named_item`'s insert on a connection the caller holds, normally
 /// a writer transaction that commits the rest of the item with it.
+/// `is_locked` stamps the `IsLocked` column, the way `CreateCollectionAsync`
+/// sets `IsLocked = options.IsLocked`; callers that create an always-unlocked
+/// row (playlists, the auto-provisioned folders) pass `false`.
 pub(crate) async fn insert_named_item_in(
     conn: &mut sqlx::SqliteConnection,
     id: Uuid,
@@ -353,6 +357,7 @@ pub(crate) async fn insert_named_item_in(
     name: &str,
     is_folder: bool,
     container: Option<Uuid>,
+    is_locked: bool,
 ) -> Result<(), ServiceError> {
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
@@ -391,7 +396,7 @@ pub(crate) async fn insert_named_item_in(
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
             "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName",
             "DateCreated", "DateModified", "DateLastSaved")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9)"#,
+           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -409,6 +414,7 @@ pub(crate) async fn insert_named_item_in(
     ))
     .bind(crate::text_util::get_clean_value(name))
     .bind(datetime_to_db(chrono::Utc::now()))
+    .bind(i64::from(is_locked))
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -600,7 +606,7 @@ pub(crate) async fn ensure_container(
     // only, so a row committed without one would never be found again, and
     // every later provision would fail to insert the same id.
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    insert_named_item_in(&mut tx, id, kind, name, true, parent).await?;
+    insert_named_item_in(&mut tx, id, kind, name, true, parent, false).await?;
     set_container_path(&mut *tx, id, path).await?;
     if let Some(data) = data {
         backfill_container_data(&mut *tx, id, data).await?;
@@ -11014,7 +11020,8 @@ mod tests {
     async fn the_named_item_repair_fills_created_box_sets_and_playlists_once() {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
-        let named = |id, kind, name| super::insert_named_item(&db, id, kind, name, true, None);
+        let named =
+            |id, kind, name| super::insert_named_item(&db, id, kind, name, true, None, false);
         // Renamed by the old bare `UPDATE "Name"`: both keys hold the old name.
         let renamed = Uuid::from_u128(0xC0A1);
         named(renamed, BaseItemKind::Playlist, "New Name")
@@ -11102,9 +11109,17 @@ mod tests {
     async fn the_named_item_repair_leaves_adopted_rows_and_other_kinds_alone() {
         let db = test_db().await;
         let adopted = Uuid::from_u128(0xC0A4);
-        super::insert_named_item(&db, adopted, BaseItemKind::BoxSet, "Adopted", true, None)
-            .await
-            .expect("adopted");
+        super::insert_named_item(
+            &db,
+            adopted,
+            BaseItemKind::BoxSet,
+            "Adopted",
+            true,
+            None,
+            false,
+        )
+        .await
+        .expect("adopted");
         sqlx::query(
             r#"UPDATE "BaseItems" SET "CleanName" = 'kept',
                    "DateCreated" = '2025-05-05 00:00:00.0000000'
@@ -11196,7 +11211,7 @@ mod tests {
                 None,
             ),
         ] {
-            super::insert_named_item(&db, id, kind, name, true, None)
+            super::insert_named_item(&db, id, kind, name, true, None, false)
                 .await
                 .expect("row");
             sqlx::query(
