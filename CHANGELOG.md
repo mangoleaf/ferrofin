@@ -291,6 +291,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   in on is not among the allowed ones, its token is revoked at once. Before, it kept working
   until the device signed in again; only new sign-ins from it were refused. A rename runs the
   same check. If the check fails, the save still succeeds and the error is logged
+- Behind a proxy listed under **Known proxies**, a client can no longer choose its own address
+  through `X-Forwarded-For`. When the proxy writes a token that is not an address for its client
+  (Squid's `unknown`, for example), the client is now that proxy, as in Jellyfin. Before, the
+  token was skipped and the entry to its left, which the client wrote itself, became the
+  client's address: enough to get past a remote IP filter's allow or block list. Quoted entries
+  are read too, as Jellyfin reads them
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

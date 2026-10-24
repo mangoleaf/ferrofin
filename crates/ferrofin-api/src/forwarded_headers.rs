@@ -58,38 +58,19 @@ pub struct ForwardedRequest {
 /// becomes the next remote address and an unparsable one ends the walk, and a
 /// valid scheme or host replaces the one taken so far.
 ///
-/// Unlike [`forwarded_for`](crate::state::forwarded_for), which keeps only the
-/// entries that parse, this walk keeps the headers' entries aligned, as the
-/// scheme and host depend on which hop supplied them.
-///
-/// TODO(gl-184): the client-address walk should stop at an unparsable entry
-/// too, as `ApplyForwarders` does, so the two walks agree.
+/// The client address comes from [`forwarded_for`](crate::state::forwarded_for),
+/// which ends the `For` list at the same unparsable entry; this walk keeps the
+/// three headers' entries aligned, as the scheme and host depend on which hop
+/// supplied them.
 #[must_use]
 pub fn walk_forwarded_headers(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     is_known_proxy: impl Fn(std::net::IpAddr) -> bool,
 ) -> ForwardedRequest {
-    // `GetCommaSeparatedValues`: trimmed, unquoted, empty entries skipped.
-    let values = |name: &str| -> Vec<String> {
-        headers
-            .get_all(name)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .map(|v| {
-                let v = v.trim();
-                v.strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .unwrap_or(v)
-                    .to_owned()
-            })
-            .filter(|v| !v.is_empty())
-            .collect()
-    };
-    let for_entries = values("x-forwarded-for");
-    let proto_entries = values("x-forwarded-proto");
-    let host_entries = values("x-forwarded-host");
+    let for_entries = comma_separated_values(headers, "x-forwarded-for");
+    let proto_entries = comma_separated_values(headers, "x-forwarded-proto");
+    let host_entries = comma_separated_values(headers, "x-forwarded-host");
     let hops = for_entries
         .len()
         .max(proto_entries.len())
@@ -114,6 +95,25 @@ pub fn walk_forwarded_headers(
         }
     }
     forwarded
+}
+
+/// Every `name` header's comma-separated entries, in order
+/// (`GetCommaSeparatedValues`: trimmed, unquoted, empty entries skipped).
+pub(crate) fn comma_separated_values(headers: &axum::http::HeaderMap, name: &str) -> Vec<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|v| {
+            let v = v.trim();
+            v.strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(v)
+                .to_owned()
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 /// The entry `hop` places from the right of `entries`, the hop order.
@@ -417,6 +417,43 @@ mod tests {
             peer.parse().expect("peer"),
             &["203.0.113.9".parse().expect("client")],
         );
+        assert_eq!(client, expected.parse::<IpAddr>().expect("expected"));
+    }
+
+    /// `ApplyForwarders` stops at the first entry from the right that does not
+    /// parse and keeps the last address it trusted, so a known proxy that
+    /// writes an obfuscated token for its client stays the client, and the
+    /// entries left of the token (the client's own) are never taken. Entries
+    /// are unquoted and empty ones skipped, as `GetCommaSeparatedValues` does,
+    /// and split headers are one list.
+    #[rstest]
+    #[case::token_after_a_forged_entry(&["192.168.1.10, unknown"], "10.0.0.1")]
+    #[case::token_split_into_its_own_header(&["192.168.1.10", "unknown"], "10.0.0.1")]
+    #[case::token_before_the_client(&["unknown, 203.0.113.9"], "203.0.113.9")]
+    #[case::quoted_entry(&["\"203.0.113.9\""], "203.0.113.9")]
+    #[case::entry_with_a_port(&["198.51.100.7, 203.0.113.9:41234"], "203.0.113.9")]
+    #[case::empty_entries_are_skipped(&["198.51.100.7, , 203.0.113.9"], "203.0.113.9")]
+    #[case::unknown_hop_ends_the_walk(&["198.51.100.7, 203.0.113.9, 192.0.2.4"], "192.0.2.4")]
+    #[case::only_a_token(&["unknown"], "10.0.0.1")]
+    #[case::bracketed_ipv6_with_a_port(&["unknown, [2001:db8::7]:41234"], "2001:db8::7")]
+    fn the_client_walk_stops_at_an_unparsable_entry(
+        #[case] forwarded_for: &[&str],
+        #[case] expected: &str,
+    ) {
+        let network = std::sync::RwLock::new(ferrofin_networking::NetworkManager::with_interfaces(
+            ferrofin_networking::NetworkConfiguration {
+                known_proxies: vec!["10.0.0.1".to_owned()],
+                ..ferrofin_networking::NetworkConfiguration::default()
+            },
+            Vec::new(),
+        ));
+        let pairs: Vec<(&'static str, &str)> = forwarded_for
+            .iter()
+            .map(|value| ("x-forwarded-for", *value))
+            .collect();
+        let chain = crate::state::forwarded_for(&headers(&pairs));
+        let client =
+            client_address_through(Some(&network), "10.0.0.1".parse().expect("peer"), &chain);
         assert_eq!(client, expected.parse::<IpAddr>().expect("expected"));
     }
 

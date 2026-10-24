@@ -553,10 +553,9 @@ impl NetworkManager {
     ///   way past the proxy by prepending entries of its own.
     ///
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
-    /// whole chain is walkable.
-    ///
-    /// TODO(gl-184): the chain it gets has unparsable entries already dropped;
-    /// `ApplyForwarders` stops the walk at the first one instead.
+    /// whole chain is walkable. `ApplyForwarders` also stops at the first entry
+    /// from the right that does not parse; the caller passes the chain already
+    /// ended there (`ferrofin-api`'s `forwarded_for`).
     #[must_use]
     pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
         if self.known_proxies.is_empty() {
