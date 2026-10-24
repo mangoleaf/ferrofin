@@ -275,6 +275,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- A signed-in user can no longer take over another user's session by sending that user's
+  `Client` and `DeviceId` headers. Sessions are now keyed by client, device and user, as in
+  Jellyfin 12. Before, the other user's session, WebSocket included, was handed to the caller,
+  who could then remote-control that player without `EnableRemoteControlOfOtherUsers`. Session
+  ids now match Jellyfin's byte for byte, so each one changes once on upgrade; they live only
+  in memory and clients take whatever id the server reports
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

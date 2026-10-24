@@ -563,9 +563,16 @@ impl FerrofinSessionManager {
         }
     }
 
-    /// Computes the session key the pool is indexed by (C# `GetSessionKey`).
-    fn session_key(app_name: &str, device_id: &str) -> String {
-        format!("{app_name}{device_id}")
+    /// Computes the session key the pool is indexed by (C# `GetSessionKey`:
+    /// `appName + deviceId + userId.ToString("N")`, `Guid.Empty` for a session
+    /// with no user).
+    ///
+    /// The user is part of the key because the client name and the device id
+    /// come from the request headers, not from the access token: without it,
+    /// any signed-in user sending another user's pair took over that user's
+    /// session (upstream commit b1e3cf1341, in v12.0-rc7).
+    fn session_key(app_name: &str, device_id: &str, user_id: Uuid) -> String {
+        format!("{app_name}{device_id}{}", user_id.simple())
     }
 
     /// The stable session id derived from the session key (C#
@@ -600,13 +607,13 @@ impl FerrofinSessionManager {
             return Err(ServiceError::invalid_input("deviceId is required"));
         }
 
-        let key = Self::session_key(app_name, device_id);
         let now = Utc::now();
         let user_id = match user {
             // C# `SessionInfo.UserId` is `Guid.Empty` when no user is signed in.
             None => Uuid::nil(),
             Some(u) => parse_user_id(&u.id)?,
         };
+        let key = Self::session_key(app_name, device_id, user_id);
         let user_name = user.map(|u| u.username.clone());
 
         // The custom device name, if the device has one persisted.
