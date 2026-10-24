@@ -21,6 +21,19 @@ use crate::item_type_lookup::kind_from_type_name;
 use crate::item_visibility_repository as repository;
 use crate::text_util::get_clean_value;
 
+/// The kind a playlists or boxsets library only links to, from its lower-cased
+/// collection type — the `itemKind` 12.2 `GetUserViews` asks
+/// [`ItemVisibility::has_visible_item`] about (`UserViewManager.cs:62-73`):
+/// `Playlist` for `playlists`, `BoxSet` for `boxsets`, and nothing for any
+/// other type.
+pub(crate) fn linked_kind(collection_type: Option<&str>) -> Option<BaseItemKind> {
+    match collection_type {
+        Some("playlists") => Some(BaseItemKind::Playlist),
+        Some("boxsets") => Some(BaseItemKind::BoxSet),
+        _ => None,
+    }
+}
+
 /// The collaborators needed to evaluate item access. Results are never cached
 /// across requests, so library, sharing and policy changes apply immediately.
 pub struct ItemVisibility {

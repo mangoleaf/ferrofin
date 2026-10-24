@@ -247,10 +247,7 @@ pub(crate) fn grouped_view_id(
 /// the `CollectionType` its row's `Data` carries, lower-cased. A mixed library
 /// (`mixed.collection`) has none, as upstream parses it.
 fn library_collection_type(row: &BaseItemEntity) -> Option<String> {
-    crate::item_data::parse_data(row.data.as_deref())
-        .get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_ascii_lowercase)
+    crate::item_data::stored_collection_type(row.data.as_deref())
         .filter(|collection_type| collection_type != "mixed")
 }
 
@@ -693,17 +690,9 @@ impl FerrofinUserViewManager {
             let collection_type = if Some(row.type_.as_str()) == user_view {
                 crate::user_view_repository::view_type_of(row.data.as_deref())
             } else {
-                crate::item_data::parse_data(row.data.as_deref())
-                    .get("CollectionType")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_ascii_lowercase)
+                crate::item_data::stored_collection_type(row.data.as_deref())
             };
-            let linked_kind = match collection_type.as_deref() {
-                Some("playlists") => Some(BaseItemKind::Playlist),
-                Some("boxsets") => Some(BaseItemKind::BoxSet),
-                _ => None,
-            };
-            if let Some(kind) = linked_kind
+            if let Some(kind) = crate::item_visibility::linked_kind(collection_type.as_deref())
                 && !self.has_visible_item(kind, user, visible_items).await?
             {
                 continue;

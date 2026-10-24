@@ -100,6 +100,16 @@ pub fn parse_data(data: Option<&str>) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// The `CollectionType` a row's `Data` stores, lower-cased: how a library's
+/// type (`CollectionFolder.CollectionType`) is read case-insensitively.
+/// `mixed` comes back as stored; callers that read it as no type filter it.
+pub(crate) fn stored_collection_type(data: Option<&str>) -> Option<String> {
+    parse_data(data)
+        .get("CollectionType")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+}
+
 /// The `LinkedChildren` array from a parsed `Data` object, or empty.
 #[must_use]
 pub fn read_linked_children(data: &Map<String, Value>) -> Vec<LinkedChildJson> {

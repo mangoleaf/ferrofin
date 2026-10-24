@@ -103,9 +103,19 @@ pub type ActiveRecordingSlot = Arc<std::sync::OnceLock<ActiveRecordingSource>>;
 /// `GetUserViews`' playlists and box-set gate (see [`scope_to_user_libraries`]).
 pub type VisibilitySlot = Arc<std::sync::OnceLock<std::sync::Weak<ItemVisibility>>>;
 
-/// The evaluator in `slot`, while the server holds it.
+/// The evaluator in `slot`, while the server holds it. An empty slot (a
+/// repository built without one) is silent; a bound evaluator that is gone
+/// says so at `debug`, because the scope then admits the playlists folder and
+/// every box-set library ungated.
 pub(crate) fn bound_visibility(slot: &VisibilitySlot) -> Option<Arc<ItemVisibility>> {
-    slot.get().and_then(std::sync::Weak::upgrade)
+    let weak = slot.get()?;
+    let visibility = weak.upgrade();
+    if visibility.is_none() {
+        tracing::debug!(
+            "the item visibility evaluator is gone; the library scope skips the playlists and box-set gate"
+        );
+    }
+    visibility
 }
 
 impl std::fmt::Debug for FerrofinItemRepository {
@@ -2892,27 +2902,13 @@ async fn visible_view_rows(
                 _ => Some(VisibleView {
                     id,
                     user_view: false,
-                    linked_kind: linked_kind_of_library(data.as_deref()),
+                    linked_kind: crate::item_visibility::linked_kind(
+                        crate::item_data::stored_collection_type(data.as_deref()).as_deref(),
+                    ),
                 }),
             }
         })
         .collect())
-}
-
-/// What a library whose `Data` is `data` links to, read as
-/// `CollectionFolder.CollectionType` reads it (case-insensitively):
-/// `Playlist` for a `playlists` library, `BoxSet` for a `boxsets` one, and
-/// nothing for every other type.
-fn linked_kind_of_library(data: Option<&str>) -> Option<BaseItemKind> {
-    let collection_type = crate::item_data::parse_data(data)
-        .get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_ascii_lowercase)?;
-    match collection_type.as_str() {
-        "playlists" => Some(BaseItemKind::Playlist),
-        "boxsets" => Some(BaseItemKind::BoxSet),
-        _ => None,
-    }
 }
 
 /// The saved CollectionFolder option, including adopted XML and constructor
