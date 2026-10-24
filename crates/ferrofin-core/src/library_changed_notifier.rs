@@ -373,7 +373,36 @@ impl LibraryChangedNotifier {
             let n = |ids: &[Uuid]| -> HashSet<String> {
                 ids.iter().map(|id| id.simple().to_string()).collect()
             };
-            let info = folded.for_libraries(&n(&visible), &n(&tops));
+            let mut lists = folded.for_libraries(&n(&tops));
+            // Whether any folder gained or lost a child, which is what names
+            // the user's libraries in `CollectionFolders`. Upstream reads the
+            // folder lists before they are translated for the user; this keeps
+            // the cut by library (and, as before, the removed-from folders
+            // uncut) but not the item-visibility filter below.
+            let folders_moved =
+                !lists.folders_added_to.is_empty() || !folded.lists.folders_removed_from.is_empty();
+            // `TranslatePhysicalItemToUserLibrary`: within those libraries an
+            // item is announced only when the user may see it on its own
+            // (`IsVisibleStandalone`): another user's private playlist, or an
+            // item above the user's parental rating, is not. A folder deleted
+            // in the same batch has no row left and is not named either; its
+            // id is in the unfiltered removals.
+            let candidates = lists.announced_ids();
+            let seen = match audience.visible_item_ids(user_id, &candidates).await {
+                Ok(seen) => n(&seen),
+                Err(err) => {
+                    // Fail closed: the user is still told about removals.
+                    tracing::warn!(
+                        %err,
+                        %user_id,
+                        "failed to check which changed items a user can see; \
+                         announcing only removals"
+                    );
+                    HashSet::new()
+                }
+            };
+            lists.retain_visible(&seen);
+            let info = build(&lists, Some((&n(&visible), folders_moved)));
             // `if (info.IsEmpty) continue;` — a user who can see none of the
             // changed libraries is told nothing at all, rather than being
             // handed an empty envelope that makes their client re-fetch.
@@ -400,6 +429,34 @@ struct Lists {
     folders_removed_from: Vec<Changed>,
 }
 
+impl Lists {
+    /// The distinct ids a user is told about only when they may see them:
+    /// everything but the removals.
+    fn announced_ids(&self) -> Vec<Uuid> {
+        let mut seen = HashSet::new();
+        self.added
+            .iter()
+            .chain(&self.updated)
+            .chain(&self.folders_added_to)
+            .chain(&self.folders_removed_from)
+            .filter(|c| seen.insert(c.id.as_str()))
+            .filter_map(|c| Uuid::parse_str(&c.id).ok())
+            .collect()
+    }
+
+    /// Keeps, in every list but the removals, only the ids in `visible`.
+    fn retain_visible(&mut self, visible: &HashSet<String>) {
+        for list in [
+            &mut self.added,
+            &mut self.updated,
+            &mut self.folders_added_to,
+            &mut self.folders_removed_from,
+        ] {
+            list.retain(|c| visible.contains(&c.id));
+        }
+    }
+}
+
 /// The deduped change set, kept alongside the payload it folds into.
 ///
 /// The per-user filter needs each item's owning library, which the wire
@@ -413,42 +470,42 @@ struct Folded {
 }
 
 impl Folded {
-    /// One user's `GetLibraryUpdateInfo`, filtered to the libraries they can see.
+    /// One user's lists for `GetLibraryUpdateInfo`, cut to the libraries they
+    /// can see; [`Lists::retain_visible`] then applies the item's own
+    /// visibility.
     ///
     /// Removals are NOT filtered. C# passes `includeIfNotFound: true` for them
     /// alone, because the row is already gone and `IsVisibleStandalone` has
     /// nothing left to test — telling a client to drop an id it never had is
-    /// harmless, whereas withholding it leaves a deleted item on screen.
+    /// harmless, whereas withholding it leaves a deleted item on screen. The
+    /// folders an item was removed from still exist, and are filtered like the
+    /// rest (`TranslatePhysicalItemToUserLibrary(i, user)`).
     ///
-    /// `tops` are the `TopParentId`s those libraries' items carry (each
-    /// library and its locations' folders); `visible` the libraries.
-    fn for_libraries(
-        &self,
-        visible: &HashSet<String>,
-        tops: &HashSet<String>,
-    ) -> LibraryUpdateInfo {
+    /// `tops` are the `TopParentId`s the user's libraries' items carry (each
+    /// library and its locations' folders).
+    fn for_libraries(&self, tops: &HashSet<String>) -> Lists {
         let keep = |v: &[Changed]| -> Vec<Changed> {
             v.iter()
                 .filter(|c| c.top_parent.as_ref().is_some_and(|t| tops.contains(t)))
                 .cloned()
                 .collect()
         };
-        let lists = Lists {
+        Lists {
             added: keep(&self.lists.added),
             updated: keep(&self.lists.updated),
             removed: self.lists.removed.clone(),
             folders_added_to: keep(&self.lists.folders_added_to),
-            folders_removed_from: self.lists.folders_removed_from.clone(),
-        };
-        build(&lists, Some(visible))
+            folders_removed_from: keep(&self.lists.folders_removed_from),
+        }
     }
 }
 
 /// Builds the wire payload from one batch's deduped lists.
 ///
-/// `user_libraries` is the set of libraries the recipient can see, when there is
-/// a recipient. It is what `CollectionFolders` is derived from — see below.
-fn build(lists: &Lists, user_libraries: Option<&HashSet<String>>) -> LibraryUpdateInfo {
+/// `recipient` is, when there is one, the set of libraries they can see and
+/// whether any folder gained or lost a child among the changes they were
+/// considered for. It is what `CollectionFolders` is derived from — see below.
+fn build(lists: &Lists, recipient: Option<(&HashSet<String>, bool)>) -> LibraryUpdateInfo {
     let ids = |v: &[Changed]| -> Vec<String> { v.iter().map(|c| c.id.clone()).collect() };
     let folders_added_to = ids(&lists.folders_added_to);
     let folders_removed_from = ids(&lists.folders_removed_from);
@@ -465,13 +522,13 @@ fn build(lists: &Lists, user_libraries: Option<&HashSet<String>>) -> LibraryUpda
     // ponytail: order is the visible-id order, not C#'s name-sorted root
     // children. Only observable when folders actually change; sort by library
     // name here if a client is ever seen to care.
-    let collection_folders: Vec<String> = match user_libraries {
-        Some(libs) if !folders_added_to.is_empty() || !folders_removed_from.is_empty() => {
+    let collection_folders: Vec<String> = match recipient {
+        Some((libs, true)) => {
             let mut v: Vec<String> = libs.iter().cloned().collect();
             v.sort();
             v
         }
-        Some(_) => Vec::new(),
+        Some((_, false)) => Vec::new(),
         // No recipient to scope to (no audience wired): fall back to the
         // top parents of the changed items (their locations' folders, or on
         // older rows their libraries), which is the most a broadcast can
@@ -908,6 +965,10 @@ mod tests {
         visible: Vec<(Uuid, Uuid)>,
         /// library -> the folder of its one location
         locations: Vec<(Uuid, Uuid)>,
+        /// user id -> an item that user may not see on its own
+        hidden: Vec<(Uuid, Uuid)>,
+        /// Whether asking which items a user can see fails.
+        visibility_fails: bool,
         delivered: Mutex<Vec<(Uuid, LibraryUpdateInfo)>>,
     }
 
@@ -934,6 +995,20 @@ mod tests {
             );
             Ok(tops)
         }
+        async fn visible_item_ids(
+            &self,
+            user_id: Uuid,
+            ids: &[Uuid],
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            if self.visibility_fails {
+                return Err(ServiceError::Backend("visibility unavailable".to_owned()));
+            }
+            Ok(ids
+                .iter()
+                .copied()
+                .filter(|id| !self.hidden.contains(&(user_id, *id)))
+                .collect())
+        }
         async fn deliver(&self, user_id: Uuid, payload: &str) -> Result<(), ServiceError> {
             self.delivered.lock().expect("lock").push((
                 user_id,
@@ -952,6 +1027,8 @@ mod tests {
         let audience = Arc::new(SplitAudience {
             visible: vec![(alice, lib_a), (bob, lib_b)],
             locations: vec![(lib_a, location_a), (lib_b, Uuid::new_v4())],
+            hidden: Vec::new(),
+            visibility_fails: false,
             delivered: Mutex::new(Vec::new()),
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
@@ -984,6 +1061,111 @@ mod tests {
         );
     }
 
+    /// gl-580: within a library the user can see, an item is announced only
+    /// when they may see it on its own (`IsVisibleStandalone`) — another
+    /// user's private playlist, a folder they cannot open — while a removal
+    /// reaches everyone (`includeIfNotFound: true`).
+    #[tokio::test(start_paused = true)]
+    async fn an_item_a_user_may_not_see_is_left_out_but_its_removal_is_not() {
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (lib, alice, bob) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (playlist, folder) = (Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(SplitAudience {
+            visible: vec![(alice, lib), (bob, lib)],
+            locations: Vec::new(),
+            hidden: vec![(bob, playlist), (bob, folder)],
+            visibility_fails: false,
+            delivered: Mutex::new(Vec::new()),
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+
+        let added = movie(Uuid::new_v4(), Uuid::new_v4(), lib);
+        let mut private = movie(playlist, Uuid::new_v4(), lib);
+        private.parent_id = None;
+        let removed = movie(Uuid::new_v4(), folder, lib);
+        n.record_added(std::slice::from_ref(&added));
+        n.record_updated(std::slice::from_ref(&private));
+        n.record_removed(std::slice::from_ref(&removed));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let s = |id: &str| Uuid::parse_str(id).expect("uuid").simple().to_string();
+        let delivered = audience.delivered.lock().expect("lock");
+        let to = |user: Uuid| {
+            delivered
+                .iter()
+                .find(|(u, _)| *u == user)
+                .map(|(_, info)| info.clone())
+                .expect("delivered")
+        };
+        let (alice_info, bob_info) = (to(alice), to(bob));
+        assert_eq!(alice_info.items_updated, vec![s(&private.id)]);
+        assert_eq!(
+            alice_info.folders_removed_from,
+            vec![s(&folder.to_string())]
+        );
+        assert_eq!(bob_info.items_added, vec![s(&added.id)]);
+        assert!(bob_info.items_updated.is_empty(), "{bob_info:?}");
+        assert!(bob_info.folders_removed_from.is_empty(), "{bob_info:?}");
+        assert_eq!(bob_info.items_removed, vec![s(&removed.id)]);
+    }
+
+    /// `CollectionFolders` ("membership moved, re-read your libraries") comes
+    /// from the folder lists before the item-visibility filter: a folder the
+    /// user may not see still gained a child in one of their libraries.
+    #[tokio::test(start_paused = true)]
+    async fn a_hidden_folder_change_still_names_the_users_libraries() {
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (lib, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let (hidden, folder) = (Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(SplitAudience {
+            visible: vec![(bob, lib)],
+            locations: Vec::new(),
+            hidden: vec![(bob, hidden), (bob, folder)],
+            visibility_fails: false,
+            delivered: Mutex::new(Vec::new()),
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+
+        n.record_added(&[movie(hidden, folder, lib)]);
+        let mut edited = movie(Uuid::new_v4(), Uuid::new_v4(), lib);
+        edited.parent_id = None;
+        n.record_updated(std::slice::from_ref(&edited));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let delivered = audience.delivered.lock().expect("lock");
+        assert_eq!(delivered.len(), 1);
+        let info = &delivered[0].1;
+        assert!(info.items_added.is_empty() && info.folders_added_to.is_empty());
+        assert_eq!(info.items_updated.len(), 1);
+        assert_eq!(info.collection_folders, vec![lib.simple().to_string()]);
+    }
+
+    /// When the visibility check fails, the user is told only about removals.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_visibility_check_announces_only_removals() {
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (lib, alice) = (Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(SplitAudience {
+            visible: vec![(alice, lib)],
+            locations: Vec::new(),
+            hidden: Vec::new(),
+            visibility_fails: true,
+            delivered: Mutex::new(Vec::new()),
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+
+        n.record_added(&[movie(Uuid::new_v4(), Uuid::new_v4(), lib)]);
+        let removed = movie(Uuid::new_v4(), Uuid::new_v4(), lib);
+        n.record_removed(std::slice::from_ref(&removed));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let delivered = audience.delivered.lock().expect("lock");
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].1.items_added.is_empty());
+        assert!(delivered[0].1.folders_removed_from.is_empty());
+        assert_eq!(delivered[0].1.items_removed.len(), 1);
+    }
+
     /// In-process consumers get the whole change set, audience or not, as
     /// [`ITEMS_CHANGED`] — never as a client push.
     #[tokio::test(start_paused = true)]
@@ -992,6 +1174,8 @@ mod tests {
         n.set_audience(Arc::new(SplitAudience {
             visible: Vec::new(),
             locations: Vec::new(),
+            hidden: Vec::new(),
+            visibility_fails: false,
             delivered: Mutex::new(Vec::new()),
         }) as Arc<dyn LibraryChangeAudience>);
         let item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -1144,6 +1328,8 @@ mod tests {
         let audience = Arc::new(SplitAudience {
             visible: vec![(alice, lib)],
             locations: Vec::new(),
+            hidden: Vec::new(),
+            visibility_fails: false,
             delivered: Mutex::new(Vec::new()),
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
@@ -1172,6 +1358,8 @@ mod tests {
         let audience = Arc::new(SplitAudience {
             visible: vec![(alice, lib_a), (alice, lib_b)],
             locations: Vec::new(),
+            hidden: Vec::new(),
+            visibility_fails: false,
             delivered: Mutex::new(Vec::new()),
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);

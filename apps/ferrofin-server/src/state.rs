@@ -2191,12 +2191,13 @@ pub async fn build_app_state(
     // The notifier's per-user fan-out, attachable only now that the session
     // manager exists. Until this line the notifier falls back to publishing one
     // payload on the bus; after it, each user gets a payload filtered to the
-    // libraries they can actually see.
+    // libraries they can actually see and, within them, the items they may see.
     change_notifier.set_audience(Arc::new(SessionLibraryAudience {
         sessions: Arc::clone(&sessions),
         users: Arc::clone(&users),
         items: Arc::clone(&item_repository),
         persistence: Arc::clone(&item_persistence_service),
+        visibility: Arc::clone(&item_visibility),
     }));
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -2763,6 +2764,8 @@ struct SessionLibraryAudience {
     users: Arc<dyn ferrofin_traits::library::UserManager>,
     items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
     persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService>,
+    /// `IsVisibleStandalone`, for which changed items each user is told about.
+    visibility: Arc<ferrofin_core::item_visibility::ItemVisibility>,
 }
 
 #[async_trait::async_trait]
@@ -2806,6 +2809,28 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
             }
         }
         Ok(tops)
+    }
+
+    async fn visible_item_ids(
+        &self,
+        user_id: Uuid,
+        ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(user) = self.users.get_user_by_id(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        // An id whose row is gone has nothing to be visible through.
+        let rows = self.items.retrieve_items(ids).await?;
+        let verdicts = self.visibility.visible(&rows, &user, true).await?;
+        Ok(rows
+            .iter()
+            .zip(verdicts)
+            .filter(|(_, visible)| *visible)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .collect())
     }
 
     async fn deliver(
