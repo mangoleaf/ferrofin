@@ -35,6 +35,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Write a backup manifest's `DateCreated` as Jellyfin writes its `DateTimeOffset`, with a
+  `+00:00` offset instead of `Z` (`POST /Backup/Create`, `GET /Backup`,
+  `GET /Backup/Manifest` and the archive's `manifest.json`). Archives written with the `Z`
+  form still list and restore
 - Report an API key's `DateLastActivity` as `0001-01-01T00:00:00.0000000Z` (.NET's unset
   date) in `GET /Auth/Keys`, as Jellyfin does, instead of the Unix epoch
 - Keep the playlists folder out of a user's library-wide queries until they can see a
