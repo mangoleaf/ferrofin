@@ -1441,6 +1441,55 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/DisplayPreferences/{displayPreferencesId}",
+        upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
+        upstream_method: "UpdateDisplayPreferences",
+        ferrofin: "handlers/display_preferences.rs update_display_preferences (JsonBody \
+               DisplayPreferencesDto, take_pref/take_nullable_pref, enum_try_parse) → \
+               ferrofin-core display_preferences_manager.rs (get_display_preferences, \
+               get_item_display_preferences, set_custom_item_display_preferences, \
+               update_item_display_preferences, update_display_preferences, \
+               set_home_sections) → ferrofin-db database.rs replace_home_sections; \
+               ferrofin-model dto/display_preferences_dto.rs",
+        date: "2026-10-24",
+        divergences: &[
+            "SortBy, SortOrder, RememberSorting and RememberIndexing are written to one \
+         shared empty-GUID ItemDisplayPreferences row per user and client unless the item \
+         already has its own row; upstream stores them under the item \
+         (GetItemDisplayPreferences creates the row under itemId, and the controller sets \
+         itemPrefs.ItemId = itemId). Fix path: gl-447.",
+            "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
+         upstream's controller stores 15000 for both. Fix path: gl-410.",
+            "chromecastVersion and IndexBy are read by exact member name only: upstream's \
+         Enum.Parse/Enum.TryParse also take an integer, a comma list and surrounding white \
+         space, and an unknown chromecastVersion is a 400 there (ArgumentException) where \
+         it is stored as Stable here; int.Parse and bool.Parse also ignore surrounding \
+         white space in the skip lengths, the homesection order and \
+         enableNextVideoInfoOverlay. Fix path: gl-880.",
+            "displayPreferencesId is parsed with Uuid::parse_str, not Guid.TryParse, so a \
+         urn:uuid: id is taken as a GUID where upstream MD5-hashes it, and a (…), {0x…} or \
+         padded id is MD5-hashed where upstream parses it. Fix path: gl-881.",
+            "Values upstream fails on with a 500 take the defaults here: an \
+         enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
+         non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
+         key with a non-numeric suffix is dropped, a bare homesection key stays a custom \
+         pref, and a negative order falls back to None instead of indexing defaults[-1]. \
+         Jellyfin bug not ported.",
+            "Every save replaces the row's HomeSection children. Upstream clears the \
+         collection of an entity loaded in a disposed context and attaches it to a new \
+         one, so EF inserts the new sections but never deletes the old rows: they pile up, \
+         and a save without any homesection key leaves the previous layout visible to GET. \
+         Jellyfin bug not ported.",
+            "An invalid landing-* ViewType is logged at warn, as bad client input \
+         (docs/conventions/LOGGING.md), where upstream logs it at error.",
+            "The 400 for a missing or blank client or an unparsable userId, the 403 for \
+         another user's id without the administrator role, and the error text of a body \
+         that does not bind are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

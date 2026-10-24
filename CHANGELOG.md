@@ -35,6 +35,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Accept a partial body on `POST /DisplayPreferences/{id}`, as Jellyfin does: each member
+  left out takes the default of Jellyfin's `DisplayPreferencesDto` (`ShowBackdrop` true,
+  250 px images, the rest off or empty) instead of failing with `400 missing field`
 - Send every library type's `SimilarItemProviders` and `SimilarItemProviderOrder` in
   `GET /Library/VirtualFolders` even when empty (`[]`), as Jellyfin does, instead of leaving
   them out
