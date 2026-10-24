@@ -262,11 +262,16 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache" "$dst".*; else failed=1; fi
 done
 # The messy fixtures (messy.py): a clean fixture plus the rows of shapes long-lived databases
-# carry and no API can produce (rows of a deleted user, an extra whose owner is gone, two rows for
-# one path). The same image adopts a fresh copy of each, and every shape must end as Jellyfin 12.2
-# left it (DIR/<fixture>/messy-oracle.json) or as a divergence written down in messy.py. They
+# carry and no API can produce (nine shapes: rows of a deleted user, an extra whose owner is gone,
+# two rows for one path, odd id spellings, names differing in case, ...). The same image adopts a
+# fresh copy of each, and every shape must end as Jellyfin 12.2 left it (DIR/<fixture>/messy-oracle.json)
+# or as a divergence written down in messy.py. They
 # answer no smoke oracle: their library is the clean one plus rows no endpoint shows, so only the
 # boot, the file's integrity, a quiet second boot and the shapes are checked.
+# The messy rows mount media-messy (a hard-linked copy of the shared tree plus a link per file a
+# seeded item needs; messy.py), else the shared tree of a fixture directory built before it existed.
+MESSY_MEDIA=("${MEDIA[@]}")
+[ ! -d "$FIXTURES/media-messy" ] || MESSY_MEDIA=(-v "$FIXTURES/media-messy:/media:ro")
 # expected generation|fixture directory|host port
 MESSY_TABLE=(
   "10.11.11|jellyfin-10.11.11-messy|18081"
@@ -280,9 +285,17 @@ for spec in "${MESSY_TABLE[@]}"; do
   record begin "$WORK" "$src" messy "$expected"
   docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dst" "$dst-cache" "$dst".tables-*.log; mkdir -p "$WORK"
   cp -a "$FIXTURES/$src" "$dst"; mkdir -p "$dst-cache"
-  # The table digests (check 7) are taken before Ferrofin starts, so a row it loses beside the
-  # messy ones fails too; rows of the missing user are not in the baseline (0044 deletes them).
-  if ! baseline=$(python3 "$HERE/table_digests.py" snapshot "$dst/data/jellyfin.db" "$dst.tables.json" 2>&1); then
+  # The table digests (check 7) are taken before Ferrofin starts, from the clean fixture the messy
+  # copy was made from: a row it loses beside the messy ones fails, while the messy rows themselves
+  # (some of which an adoption rightly merges or removes, and the rows of the missing user, which
+  # 0044 deletes) are not in the baseline.
+  source=$(jq -r '.source // empty' "$FIXTURES/$src/messy.json" 2>/dev/null)
+  tables_from=$dst/data/jellyfin.db
+  if [ -n "$source" ] && [ -f "$FIXTURES/$source/data/jellyfin.db" ]; then
+    cp "$FIXTURES/$source/data/jellyfin.db" "$dst.source.db"   # a copy: reading the fixture in place can leave -wal/-shm files in it
+    tables_from=$dst.source.db
+  fi
+  if ! baseline=$(python3 "$HERE/table_digests.py" snapshot "$tables_from" "$dst.tables.json" 2>&1); then
     fixture_line messy FAIL "$expected" "$src" "table baseline: ${baseline:-check failed}"
     failed=1
     continue
@@ -291,7 +304,7 @@ for spec in "${MESSY_TABLE[@]}"; do
     -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
     -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 \
     -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost \
-    -v "$dst:/config" -v "$dst-cache:/cache" "${MEDIA[@]}" "$IMAGE" >/dev/null
+    -v "$dst:/config" -v "$dst-cache:/cache" "${MESSY_MEDIA[@]}" "$IMAGE" >/dev/null
   why=(); mark_from=0
   if wait_up "$name" "$port"; then
     settle "$port" "$(auth_for "$dst/data/jellyfin.db")"

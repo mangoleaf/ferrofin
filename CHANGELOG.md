@@ -35,6 +35,31 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Refuse a `POST /Playlists` body without a `Name`, or with a null or blank one, and an
+  `"IsPublic": null`, with `400` as Jellyfin does, instead of creating the playlist; a
+  query-string `name` does not rescue such a body. A request with neither a body nor a
+  `name` is a `400` too (Jellyfin fails it with a `500`), where Ferrofin created a
+  nameless playlist
+- Accept a partial body on `POST /DisplayPreferences/{id}`, as Jellyfin does: each member
+  left out takes the default of Jellyfin's `DisplayPreferencesDto` (`ShowBackdrop` true,
+  250 px images, the rest off or empty) instead of failing with `400 missing field`
+- Send every library type's `SimilarItemProviders` and `SimilarItemProviderOrder` in
+  `GET /Library/VirtualFolders` even when empty (`[]`), as Jellyfin does, instead of leaving
+  them out
+- Write a backup manifest's `DateCreated` as Jellyfin writes its `DateTimeOffset`, with a
+  `+00:00` offset instead of `Z` (`POST /Backup/Create`, `GET /Backup`,
+  `GET /Backup/Manifest` and the archive's `manifest.json`). Archives written with the `Z`
+  form still list and restore
+- Report an API key's `DateLastActivity` as `0001-01-01T00:00:00.0000000Z` (.NET's unset
+  date) in `GET /Auth/Keys`, as Jellyfin does, instead of the Unix epoch
+- Answer a grouped `/Items/Latest` whose first typed library is a movies library as
+  Jellyfin 12 does (`GetLatestMovieItems`): the newest `limit` items, one per presentation
+  key, then grouped into cards. The "Latest Movies" row is the same in nearly every case.
+  The unscoped home row on a server whose first typed library is Movies now reads `limit`
+  items instead of five times as many, so a batch of new tracks or episodes can fill it
+  with a few cards, and an unscoped request takes half the time (117 → 60 ms on the
+  benchmark corpus, one debug build before and after). See
+  [docs/UPGRADING.md](docs/UPGRADING.md).
 - Keep the playlists folder out of a user's library-wide queries until they can see a
   playlist, and a box-set library until they can see a box set, as Jellyfin's
   `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
@@ -268,6 +293,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the named studios replace `studioIds`, and since an artist carries no studios the list is
   empty, as in Jellyfin. The parameter was dropped and every artist listed. Unlike Jellyfin,
   an unknown name does not create a studio
+
+### Performance
+- `/Persons` with a favourite filter: build the user's favourite-person set once per
+  statement, as Jellyfin does, instead of probing it again for every person row. On the
+  benchmark corpus (one debug build, before and after; the figures below too) that is
+  6.1 s → 7 ms, and `isFavorite=false` (past a minute) → 9 ms
+- `/Artists` and `/Artists/AlbumArtists` with `mediaTypes`: keep the media-type filter
+  from driving the artist lookup (12.7 s → 32 ms for `mediaTypes=Video`). Skip the
+  played and total counts an artist page never shows, as Jellyfin does (plain `/Artists`
+  87 → 37 ms)
+- Recursive `/Items` sorted by `Artist`, `AlbumArtist` or `Studio`: read each item's own
+  values for the sort key (4.0 s → 0.26 s)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

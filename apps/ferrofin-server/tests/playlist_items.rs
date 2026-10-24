@@ -684,7 +684,9 @@ async fn a_created_playlist_takes_its_media_type_from_its_items() {
 }
 
 /// The obsolete query form names the media type too, in any case, and wins
-/// over the body and over inference (`mediaType ?? body.MediaType`).
+/// over the body and over inference (`mediaType ?? body.MediaType`), as its
+/// name wins over the body's. The body still carries the `Name` upstream's
+/// `required` member demands.
 #[tokio::test]
 async fn the_query_form_names_the_media_type() {
     let fx = fixture().await;
@@ -693,7 +695,7 @@ async fn the_query_form_names_the_media_type() {
         .call(
             "POST",
             &format!("/Playlists?name=Typed&mediaType=video&ids={}", music.album),
-            Some(json!({"MediaType": "Audio"})),
+            Some(json!({"Name": "From body", "MediaType": "Audio"})),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{created}");
@@ -701,6 +703,7 @@ async fn the_query_form_names_the_media_type() {
     let (status, item) = fx.call("GET", &format!("/Items/{id}"), None).await;
     assert_eq!(status, StatusCode::OK, "{item}");
     assert_eq!(item["MediaType"], "Video", "{item}");
+    assert_eq!(item["Name"], "Typed", "{item}");
 }
 
 /// A create keeps its media type and its shares side by side in `Data`,

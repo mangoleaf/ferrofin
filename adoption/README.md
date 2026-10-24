@@ -187,6 +187,24 @@ rows use, now takes a deadline whose default equals the old 300 polls of 2 s), a
 they share with this change is `preservation.py`'s snapshot, which pages through every item and is
 covered by its unit tests.
 
+### 2026-10-20 messy rows, second slice (gl-630)
+
+The messy copies were rebuilt with all nine shapes (`messy.py build`: Jellyfin 12.2 image id
+`sha256:357724bf0ae2…`, ten boots per lineage, each shape alone and all together, the two agreeing).
+They sit in the fixture directory built for gl-631, whose recipe is one edit ahead of this branch's
+(`run.sh` does not read the recipe; the clean fixtures are unchanged). Ferrofin image
+`ferrofin:adopt-gl630`, built from this change on top of `release/v1.4.0` (migrations through 0045).
+`run.sh --only jellyfin-12.2-messy`: **PASS**, with the divergences above written. `run.sh --only
+jellyfin-10.11.11-messy`: **FAIL, as expected**, on `gone_file_userdata` alone (the item is kept,
+Jellyfin 12.2 removes it: the open decision gl-521); every other shape, including both case-duplicate
+pairs, the GUID spellings, the virtual season and the non-ASCII names, ends exactly as Jellyfin 12.2
+left it. Getting there found five faults in the seeds themselves, each now a test: a clone with no
+file (removed by the upgrade before its shape showed anything), a shape that rewrote another's
+original (the combined run differed from the single runs), a person clone that shared its original's
+metadata path (the duplicate-path repair then stood in for the merge), people counted by id although
+Ferrofin re-keys them, and a table-digest baseline that read a legitimate merge as a lost row. The
+eleven clean rows and `synthetic.py run` were not re-run: nothing they use changed.
+
 ### 2026-10-21 the report (gl-633)
 
 `report.html` written by both entry points, on synthetic fixtures with Ferrofin image
@@ -369,50 +387,90 @@ uploaded as `adoption-work` on a failure).
 ## Messy rows
 
 Long-lived databases carry rows no API produces, and the clean fixtures never hold them.
-`messy.py` writes the shapes of this first slice by SQL into a stopped copy of a finished
-fixture, one function and one manifest entry (`messy.json`) per shape:
+`messy.py` writes the shapes below by SQL into a stopped copy of a finished fixture, one function and
+one manifest entry (`messy.json`) per shape:
 
 | Shape | What is written |
 |---|---|
 | `deleted_user` | UserData, Permissions, Preferences, Devices and DisplayPreferences rows of a user that does not exist |
-| `dangling_owner_extra` | a copy of an extra whose `OwnerId` names no item, at a path no file has |
+| `dangling_owner_extra` | a copy of an extra whose `OwnerId` names no item |
 | `duplicate_paths` | two `BaseItems` rows with one `Path`, the copy being the older |
+| `guid_casing` | two extras whose `OwnerId` and two videos whose `PrimaryVersionId` read as a lower-case dashed id and as 32 undashed characters, each naming an item that exists |
+| `case_duplicates` | four independent pairs whose names differ only by case: a Person item, a Peoples row linked to a movie, an accented pair of both, and a music artist |
+| `orphan_ancestor` | two `AncestorIds` rows with an end that names no item: one with a missing parent, one with a missing item |
+| `virtual_season` | a season no folder backs (`Path` NULL) one past the series' highest, with an episode in it |
+| `gone_file_userdata` | a movie whose file is not there and the play state two users recorded for it |
+| `non_ascii_names` | three users whose names case mappings disagree on (Turkish dotted capital I, a sharp s, an e with a combining diaeresis, each, on 12.x, with a stored normalised name that is no normalisation of it), a person with a decomposed name, and a movie whose path has an accent, a decomposed accent and a symbol |
 
 They go into `jellyfin-10.11.11-messy` and `jellyfin-12.2-messy`, copies of the latest 10.11.x and
 the latest 12.x fixture (`jellyfin-12.2-from-121`), one per lineage: the 10.11 lineage runs 0032
 and `FixIncorrectOwnerIdRelationships` on adoption, a 12.x database already has. The copies leave
 the eleven clean paths and their smoke oracle as the control; `build-fixtures.sh` builds them last.
 
+**An item needs its file.** Jellyfin 12.2 removes, when it upgrades a 10.11 database, every
+non-folder item whose file is missing under a library location (`MigrateLinkedChildren`, see
+[the stale-file sweep](#the-stale-file-sweep)). A seeded row with no file would be gone before its
+shape showed anything, so every non-folder, non-virtual item a shape creates with a library path has a file: a hard link to its template's, in
+`media-messy`, a hard-linked copy of the shared media tree that only the messy rows (and the oracle)
+mount as `/media`. The shared tree, which the clean rows scan, gains nothing. `gone_file_userdata`
+alone has no file, on purpose: that is its shape. The seeded rows are independent of each other: they
+never share a path with another shape's rows, name an original another shape rewrites, or copy another shape's rows, because the
+combined fixture is adopted and must end as each shape alone does (the build checks it).
+
 The expectation per shape is what **Jellyfin 12.2 itself did**, not an assumption:
 `messy.py build` pulls `jellyfin/jellyfin:12.2` (a stale local tag would record another release;
 the image id goes into the record), boots it on a clean copy of the source carrying only that
 shape, waits for its tasks to settle, and records the outcome and the end state read from the
-database (`messy-oracle.json`). It then boots it once on a copy carrying all three, because
-Ferrofin adopts the combined fixture, and fails the build if that differs from the single runs.
-A boot that neither answers nor exits within the deadline is an error, never a recorded
-refusal; a failed build removes its own derived copy, leaving the clean fixtures as they were.
-Each oracle boot's server log stays in `work/` as `messy-oracle-<fixture>-<shape>.server.log`,
+database (`messy-oracle.json`). It then boots it once on a copy carrying every shape, because
+Ferrofin adopts the combined fixture, and fails the build, naming both states, if that differs from
+the single runs. A boot that neither answers nor exits within the deadline is an error, never a
+recorded refusal; a failed build removes its own derived copy, leaving the clean fixtures as they
+were. Each oracle boot's server log stays in `work/` as `messy-oracle-<fixture>-<shape>.server.log`,
 the evidence behind a recorded outcome.
+
 `run.sh` then adopts a fresh copy of each messy fixture with the image under test and fails when
 a shape ends differently, when the boot log has an `ERROR`, when the file fails its integrity or
-foreign-key check, when a second boot repairs again, or when the table digests (check 7, baseline
-taken before Ferrofin starts) show a row lost beside the messy ones. A container that exits (a
-refused database) ends the wait at once. Where Ferrofin is meant to end differently,
-`DIVERGENCES` in `messy.py` names the state it must reach and why; a difference that is not
-written there fails, a shape Jellyfin refuses needs a written expectation, and a fixture built
-with a different list of shapes is refused rather than partly checked. What Jellyfin 12.2 did:
+foreign-key check, when a second boot repairs again, or when the table digests (check 7) show a row
+lost beside the messy ones. The digest baseline is taken, before Ferrofin starts, from the **clean
+fixture the copy was made from**, not from the copy: an adoption rightly merges or removes some of
+the messy rows (a merge drops a link, 0044 deletes a missing user's rows), and those must not read as
+losses, while every row of the clean library must survive. A container that exits (a refused
+database) ends the wait at once. Where Ferrofin is meant to end differently, `DIVERGENCES` in
+`messy.py` names the state it must reach and why; a difference that is not written there fails, a
+shape Jellyfin refuses needs a written expectation, and a fixture built with a different list of
+shapes is refused rather than partly checked. People and artists are counted by name, not by id,
+because Ferrofin deliberately re-keys a person (`unify_person_identities`). What Jellyfin 12.2 did:
 
 | Shape | 10.11 lineage (upgraded by 12.2) | 12.x lineage (booted as is) |
 |---|---|---|
 | `deleted_user` | deletes Permissions and Preferences; keeps UserData, Devices, DisplayPreferences | keeps every row |
 | `dangling_owner_extra` | deletes the extra | keeps it, dangling |
 | `duplicate_paths` | deletes the copy | keeps both |
+| `guid_casing` | upper-cases an owner id and a primary-version id; a 32-character owner becomes NULL, a 32-character primary version becomes a dashed upper-case id | keeps all four as written |
+| `case_duplicates` | merges each pair to one (items, Peoples rows, artists) | keeps every row |
+| `orphan_ancestor` | keeps both rows | keeps both rows |
+| `virtual_season` | keeps the season and its episode | keeps both |
+| `gone_file_userdata` | **removes the item** (the stale-file sweep) and keeps the play state, detached from it | keeps both |
+| `non_ascii_names` | recomputes each normalised name as .NET's `ToUpperInvariant` (`STRAßE`, `İSTANBUL`, a decomposed `ZOË`); path and person kept | keeps the stale normalised names; path and person kept |
 
-And what Ferrofin is expected to reach where it differs: every row of the missing user deleted
-on both lineages (migration 0044); on 12.x the dangling extra removed as on 10.11 (today
-Ferrofin refuses that database instead: gl-707) and the duplicate path collapsed by the ported
-routine. The next slice of shapes (GUID casing, case duplicates, orphaned ancestors, virtual
-seasons) goes into the same module.
+Where Ferrofin is written to differ (`DIVERGENCES`, each with its reason): every row of a missing user
+is deleted on both lineages (migration 0044); on 12.x it removes a dangling-owner extra as on 10.11,
+collapses a duplicate path with the ported routine, merges case-only duplicates (the routines Jellyfin
+ran when it upgraded that database), re-spells an owner id in another case and nulls a 32-character
+one (0045), and recomputes every user's normalised name; and on both lineages it deletes the
+`AncestorIds` rows that name a missing item (0044: what the key's cascade would have removed).
+`PrimaryVersionId` is left as written on 12.x, as Jellyfin leaves it; whether Ferrofin should re-spell it (its own lookups of it are byte-exact) is gl-752.
+
+### The stale-file sweep
+
+`gone_file_userdata` is the one shape whose difference from Jellyfin 12.2 is neither written down nor
+decided. Jellyfin's upgrade routine `MigrateLinkedChildren` deletes the non-folder, non-virtual items
+whose file no longer exists under a library location that is readable (with guards for an empty or
+missing location), and keeps their play state; Ferrofin's 10.11 adoption has no counterpart and keeps
+the item until a scan. The `jellyfin-10.11.11-messy` row therefore **fails** on this shape, naming both
+states, until the decision recorded in the open issue gl-521 is made: port the sweep (the row then
+passes unchanged), or record it as intentionally replaced by the first scan (a written divergence for
+`("gone_file_userdata", "10.11")`, and the row passes).
 
 ## Scale fixture
 
