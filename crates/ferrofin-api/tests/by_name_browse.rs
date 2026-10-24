@@ -155,10 +155,19 @@ fn named_entity(id: Uuid, name: &str) -> BaseItemEntity {
 /// filter reads return one seeded row so every Batch 1 route resolves.
 ///
 /// `created` records every `CreateItemByName` the handlers trigger, so a test
-/// can assert the slug branch resolves WITHOUT materializing anything.
+/// can assert the slug branch resolves WITHOUT materializing anything; `seen`
+/// records the query each by-name list ran with.
 #[derive(Default, Clone)]
 struct ByNameLibrary {
     created: Arc<std::sync::Mutex<Vec<(BaseItemKind, String)>>>,
+    seen: Arc<std::sync::Mutex<Vec<InternalItemsQuery>>>,
+}
+
+impl ByNameLibrary {
+    /// Records the query a by-name list ran with.
+    fn saw(&self, query: &InternalItemsQuery) {
+        self.seen.lock().expect("lock").push(query.clone());
+    }
 }
 
 const GENRE_ID: Uuid = Uuid::from_u128(0xAA01);
@@ -207,32 +216,37 @@ impl LibraryManager for ByNameLibrary {
 
     async fn get_genres(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(GENRE_ID, "Drama"))
     }
     async fn get_music_genres(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(MUSIC_GENRE_ID, "Jazz"))
     }
     async fn get_studios(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(STUDIO_ID, "A24"))
     }
     async fn get_artists(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(ARTIST_ID, "Miles Davis"))
     }
     async fn get_album_artists(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(ARTIST_ID, "Miles Davis"))
     }
     /// `CreateItemByName<T>`: resolve, and mint a row when nothing matches —
@@ -833,6 +847,54 @@ async fn artists_list_album_artists_and_by_name() {
     let response = get("/Artists/Miles%20Davis").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["Name"], "Miles Davis");
+}
+
+/// `studios` on the artist routes (v12.2 `ArtistsController.cs:182-195`,
+/// `:336-349`): non-empty, the names' studio ids REPLACE `studioIds`. Upstream's
+/// `GetStudio` mints a row for an unknown name, whose id nothing references;
+/// here the lookup writes nothing and an unknown name keeps a no-match id, so a
+/// list of unknown names never turns into no filter at all. The Genres and
+/// Studios controllers declare no `studios`, so it never reaches their query.
+#[tokio::test]
+async fn artist_lists_resolve_studio_names_without_creating_studios() {
+    const OTHER_STUDIO: &str = "0000000000000000000000000000ab09";
+    let other = Uuid::parse_str(OTHER_STUDIO).expect("uuid");
+    let library = ByNameLibrary::default();
+    let state = by_name_state_with_library(library.clone());
+    let studio_ids_for = async |uri: String| {
+        let response = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let seen = library.seen.lock().expect("lock");
+        seen.last().expect("a by-name query ran").studio_ids.clone()
+    };
+    for route in ["/Artists", "/Artists/AlbumArtists"] {
+        for (params, expected) in [
+            (
+                format!("studios=A24&studioIds={OTHER_STUDIO}"),
+                vec![STUDIO_ID],
+            ),
+            ("studios=Nope".to_owned(), vec![Uuid::nil()]),
+            (
+                "studios=A24%7CNope".to_owned(),
+                vec![STUDIO_ID, Uuid::nil()],
+            ),
+            (format!("studioIds={OTHER_STUDIO}&studios=%7C"), vec![other]),
+        ] {
+            let uri = format!("{route}?{params}");
+            assert_eq!(studio_ids_for(uri.clone()).await, expected, "{uri}");
+        }
+    }
+    for route in ["/Genres", "/MusicGenres", "/Studios"] {
+        let ids = studio_ids_for(format!("{route}?studios=A24")).await;
+        assert!(ids.is_empty(), "{route} took studios: {ids:?}");
+    }
+    assert!(
+        library.created.lock().expect("lock").is_empty(),
+        "a studios filter must not mint a studio row"
+    );
 }
 
 #[tokio::test]

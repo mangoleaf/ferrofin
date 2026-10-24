@@ -7726,6 +7726,56 @@ mod tests {
         assert_eq!(names(excluded), (vec![], 0));
     }
 
+    /// `studioIds` matches through the referenced row's `CleanName` (v12.2
+    /// `WhereReferencedItem`), so an id that names no row, the API's stand-in
+    /// for a `studios` name with no studio, matches nothing, on an item browse
+    /// as on a by-name list. On `/Artists` the filter lands on the artist row
+    /// itself (`ByName.cs:221`), which carries no studios: even a real studio
+    /// empties the list.
+    #[tokio::test]
+    async fn studio_ids_naming_no_row_match_nothing() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0E1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        let album = Uuid::from_u128(0xA0E2);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_item_value(&db, album, ItemValueType::Artist, "Band").await;
+        let studios = repository
+            .get_studios(&InternalItemsQuery::default())
+            .await
+            .expect("studios");
+        let acme = Uuid::parse_str(&studios.items[0].item.id).expect("studio id");
+
+        let with_studios = |ids: Vec<Uuid>| InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            studio_ids: ids,
+            ..Default::default()
+        };
+        let movies = |result: QueryResult<BaseItemEntity>| -> Vec<String> {
+            result.items.into_iter().filter_map(|i| i.name).collect()
+        };
+        let real = repository.get_items(&with_studios(vec![acme])).await;
+        assert_eq!(movies(real.expect("real studio")), ["One"]);
+        let unknown = repository.get_items(&with_studios(vec![Uuid::nil()])).await;
+        assert!(movies(unknown.expect("unknown studio")).is_empty());
+
+        let all = repository
+            .get_artists(&InternalItemsQuery::default())
+            .await
+            .expect("artists");
+        assert_eq!(all.items.len(), 1);
+        for ids in [vec![acme], vec![Uuid::nil()], vec![acme, Uuid::nil()]] {
+            let query = InternalItemsQuery {
+                studio_ids: ids.clone(),
+                ..Default::default()
+            };
+            let artists = repository.get_artists(&query).await.expect("artists");
+            assert!(artists.items.is_empty(), "{ids:?}");
+        }
+    }
+
     #[tokio::test]
     async fn by_name_paging_and_filters_push_into_sql() {
         let db = test_db().await;
