@@ -1360,6 +1360,26 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Items/Counts",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetItemCounts",
+        ferrofin: "handlers/items.rs get_item_counts (resolve_user_opt, the \
+               RequestHelpers.GetUserId port) → ferrofin-core library_manager.rs \
+               get_item_counts → item_count_service.rs get_item_counts \
+               (scope_to_user_libraries, the LibraryManager.AddUserToQuery port; \
+               ItemCountService.GetItemCounts as QueryShape::TypeCounts and \
+               counts_from_type_map)",
+        date: "2026-10-24",
+        divergences: &[
+            "isFavorite with no user (an API key without userId, or a userId naming no \
+         account) is ignored and the totals are unfiltered (200); upstream's TranslateQuery \
+         dereferences the null User for the favourites subquery and fails (500). Jellyfin bug \
+         not ported.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
