@@ -35,6 +35,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Report an API key's `DateLastActivity` as `0001-01-01T00:00:00.0000000Z` (.NET's unset
+  date) in `GET /Auth/Keys`, as Jellyfin does, instead of the Unix epoch
 - Keep the playlists folder out of a user's library-wide queries until they can see a
   playlist, and a box-set library until they can see a box set, as Jellyfin's
   `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with

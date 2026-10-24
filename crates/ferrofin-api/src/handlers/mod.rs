@@ -1380,6 +1380,22 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Auth/Keys",
+        upstream_file: "Jellyfin.Api/Controllers/ApiKeyController.cs",
+        upstream_method: "GetKeys",
+        ferrofin: "handlers/api_key.rs get_keys (RequireAdmin, Policies.RequiresElevation) → \
+               ferrofin-core api_key_manager.rs get_api_keys and to_authentication_info \
+               (AuthenticationManager.GetApiKeys) → ferrofin-model security.rs \
+               AuthenticationInfo, querying QueryResult::from_items",
+        date: "2026-10-24",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
