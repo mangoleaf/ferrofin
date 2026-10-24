@@ -370,6 +370,31 @@ class Comparison(Scratch):
         (found,) = differences
         self.assertEqual((found.at, found.path, found.kind), ("Items[1].Id", "Items[].Id", "value"))
 
+    def test_two_different_items_in_one_place_are_one_difference_at_the_id(self):
+        oracle = {"Items": [{"Id": "a", "Name": "x", "Year": 1}, {"Id": "b", "Name": "y", "Year": 2}]}
+        ferrofin = {"Items": [{"Id": "a", "Name": "x", "Year": 9}, {"Id": "c", "Name": "z", "Extra": 1}]}
+        differences, _ = pair(oracle, ferrofin)
+        self.assertEqual(sorted((d.at, d.path, d.kind, d.oracle, d.ferrofin) for d in differences),
+                         [("Items[0].Year", "Items[].Year", "value", "1", "9"),
+                          ("Items[1].Id", "Items[].Id", "value", '"b"', '"c"')])
+
+    def test_an_id_that_differs_only_in_its_format_is_the_same_item_and_its_fields_are_compared(self):
+        differences, _ = pair({"Items": [{"Id": "0123abcd", "N": 1}]}, {"Items": [{"Id": "0123-ABCD", "N": 2}]})
+        self.assertEqual(sorted(kinds(differences)), [("Items[0].Id", "value"), ("Items[0].N", "value")])
+
+    def test_a_rule_on_the_element_turns_the_collapse_off(self):
+        rules = self.rules('[[rule]]\npaths = ["Items[]"]\nkind = "opaque"\nreason = "per server"\n')
+        differences, used = pair({"Items": [{"Id": "a", "N": 1}]}, {"Items": [{"Id": "b", "M": 1}]}, rules)
+        self.assertEqual((differences, len(used)), ([], 1))
+
+    def test_elements_are_compared_field_by_field_when_the_id_is_opaque_or_absent(self):
+        rules = self.rules('[[rule]]\npaths = ["Items[].Id"]\nkind = "opaque"\nreason = "per server"\n')
+        differences, _ = pair({"Items": [{"Id": "a", "N": 1}]}, {"Items": [{"Id": "b", "N": 2}]}, rules)
+        self.assertEqual(kinds(differences), [("Items[0].N", "value")])
+        self.assertEqual(kinds(pair({"Items": [{"N": 1}]}, {"Items": [{"N": 2}]})[0]), [("Items[0].N", "value")])
+        self.assertEqual(sorted(kinds(pair({"Items": [{"Id": "a"}]}, {"Items": [{"Key": "a"}]})[0])),
+                         [("Items[0].Id", "missing"), ("Items[0].Key", "extra")])
+
     def test_numbers_that_are_equal_are_equal_whatever_their_spelling(self):
         self.assertEqual(pair({"N": 1}, {"N": 1.0})[0], [])
 
@@ -403,6 +428,13 @@ class Comparison(Scratch):
     def test_an_unordered_rule_over_elements_without_the_key_is_a_type_difference(self):
         rules = self.rules('[[rule]]\npaths = ["Tags"]\nkind = "unordered"\nby = "Id"\nreason = "r"\n')
         self.assertEqual(kinds(pair({"Tags": ["a"]}, {"Tags": ["a"]}, rules)[0]), [("Tags", "type")])
+
+    def test_a_rule_at_the_root_applies_to_the_whole_body(self):
+        rules = self.rules('[[rule]]\npaths = ["$"]\nkind = "unordered"\nby = "ItemId"\nrequests = ["r1"]\nreason = "no order"\n')
+        differences, used = pair([{"ItemId": "a"}, {"ItemId": "b"}], [{"ItemId": "b"}, {"ItemId": "a"}], rules)
+        self.assertEqual((differences, len(used)), ([], 1))
+        with self.assertRaisesRegex(diff.ParityError, "only for the requests the rule names"):
+            self.rules('[[rule]]\npaths = ["$"]\nkind = "opaque"\nreason = "r"\n')
 
     def test_a_rule_that_matches_nothing_is_not_used(self):
         rules = self.rules('[[rule]]\npaths = ["Gone"]\nkind = "opaque"\nreason = "r"\n')
@@ -570,6 +602,8 @@ class FakeServers:
         self.sent.append((base, path, timeout))
         self.events.append((base, method, path, headers["Authorization"].rsplit('Token="', 1)[-1].rstrip('"'), body))
         answer = self.answers[(base, path)]
+        if isinstance(answer, list):   # successive answers to the same path; the last one repeats
+            answer = answer.pop(0) if len(answer) > 1 else answer[0]
         return answer if isinstance(answer, diff.Response) else diff.Response(200, json.dumps(answer).encode(), 0.01)
 
 
@@ -596,6 +630,31 @@ class RunRequests(Scratch):
         (entry,) = self.ledger('[[entry]]\nrequest = "r1"\npath = "A"\nissue = 7\nkind = "value"\nreason = "known"\n')
         result, _ = self.run_one({"A": 1}, {"A": 2}, [entry])
         self.assertEqual((result["state"], result["differences"][0]["ledger"], result["bodies"]), ("ledgered", "issue gl-7", None))
+
+    def test_each_servers_own_token_in_its_answer_is_masked_before_comparing_and_storing(self):
+        mine, theirs = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
+        servers = FakeServers({("o", "/r1"): diff.Response(200, f"a.ts?ApiKey={mine}\n".encode(), 0.1),
+                               ("f", "/r1"): diff.Response(200, f"a.ts?ApiKey={theirs}\n".encode(), 0.1)})
+        results, *_ = diff.run_requests([request()], IDS, "o", "f", {"oracle": mine, "ferrofin": theirs}, [], [], 30, None, send=servers)
+        self.assertEqual(results[0]["state"], "match")
+        servers = FakeServers({("o", "/r1"): diff.Response(200, f"ApiKey={mine}".encode(), 0.1),
+                               ("f", "/r1"): diff.Response(200, b"ApiKey=other", 0.1)})
+        results, *_ = diff.run_requests([request()], IDS, "o", "f", {"oracle": mine, "ferrofin": theirs}, [], [], 30, None, send=servers)
+        self.assertEqual(results[0]["bodies"]["oracle"], "ApiKey=<token>")
+
+    def test_an_opaque_whole_body_rule_accepts_two_different_bodies_that_are_not_json(self):
+        rules = self.rules('[[rule]]\npaths = ["$"]\nkind = "opaque"\nrequests = ["r1"]\nreason = "encoder output"\n')
+        result, _ = self.run_one(diff.Response(200, b"\x00jpeg-a", 0.1), diff.Response(200, b"\x00jpeg-b", 0.1), rules=rules)
+        self.assertEqual(result["state"], "match")
+        result, _ = self.run_one(diff.Response(200, b"\x00jpeg-a", 0.1), diff.Response(200, b"", 0.1), rules=rules)
+        self.assertEqual(result["state"], "differences")
+
+    def test_a_ledger_path_matches_every_image_tag_key_as_tag(self):
+        (entry,) = self.ledger('[[entry]]\nrequest = "r1"\npath = "ImageBlurHashes.Primary.<tag>"\nissue = 7\n'
+                               'kind = ["missing", "extra"]\nreason = "keyed by the tag"\n')
+        result, _ = self.run_one({"ImageBlurHashes": {"Primary": {"0123456789abcdef0123456789abcdef": "h"}}},
+                                 {"ImageBlurHashes": {"Primary": {"fedcba9876543210fedcba9876543210": "h"}}}, [entry])
+        self.assertEqual((result["state"], {d["ledger"] for d in result["differences"]}), ("ledgered", {"issue gl-7"}))
 
     def test_one_new_difference_among_ledgered_ones_keeps_the_request_new(self):
         (entry,) = self.ledger('[[entry]]\nrequest = "r1"\npath = "A"\nissue = 7\nkind = "value"\nreason = "known"\n')
@@ -704,10 +763,46 @@ class WriteRuns(Scratch):
             return {"oracle": tokens[0], "ferrofin": tokens[1]}
         return reset, calls
 
-    def run_writes(self, requests, answers, reset, rules=(), deadline=None, wall=time.time, events=None):
+    def run_writes(self, requests, answers, reset, rules=(), deadline=None, wall=time.time, events=None, sleep=None):
         servers = FakeServers(answers, events)
         return diff.run_requests(requests, IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, list(rules), [], 30, deadline,
-                                 wall=wall, send=servers, reset=reset)
+                                 wall=wall, send=servers, reset=reset, sleep=sleep or (lambda s: None))
+
+    def test_a_settling_read_back_asks_a_server_again_until_its_refresh_filled_the_field(self):
+        (request,) = self.load('{"id": "bs", "method": "POST", "path": "/c", "readbacks": [{"id": "d", "path": "/d", "settle": "ProductionYear"}]}')
+        reset, _ = self.resetter([])
+        events, naps = [], []
+        answers = {("o", "/c"): {}, ("f", "/c"): {}, ("o", "/d"): {"Genres": [], "ProductionYear": 1953},
+                   ("f", "/d"): [{"Genres": []}, {"Genres": [], "ProductionYear": None}, {"Genres": [], "ProductionYear": 1953}]}
+        outcome = self.run_writes([request], answers, reset, events=events, sleep=naps.append)
+        self.assertEqual([(r["id"], r["state"]) for r in outcome.results], [("bs", "match"), ("bs/d", "match")])
+        self.assertEqual([e[:3] for e in events if e[2] == "/d"], [("o", "GET", "/d")] + [("f", "GET", "/d")] * 3)
+        self.assertEqual(naps, [diff.SETTLE_POLL_S] * 2)
+
+    def test_a_settling_poll_the_cap_cuts_short_ends_the_run_as_cap_exceeded(self):
+        (request,) = self.load('{"id": "bs", "method": "POST", "path": "/c", "readbacks": [{"id": "d", "path": "/d", "settle": "Year"}]}')
+        reset, _ = self.resetter([])
+
+        def send(base, method, path, headers, timeout, now=None, body=None):
+            if (base, path) == ("f", "/d") and timeout < 30:
+                return diff.Response(None, b"", timeout, "timeout")
+            return diff.Response(200, json.dumps({"Year": 1} if base == "o" or path != "/d" else {}).encode(), 0.01)
+
+        clock = iter([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 95.0, 95.0, 95.0, 95.0, 95.0, 95.0, 95.0, 95.0, 95.0, 95.0])
+        outcome = diff.run_requests([request], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, 100.0,
+                                    wall=lambda: next(clock, 95.0), send=send, reset=reset, sleep=lambda s: None)
+        self.assertTrue(outcome.cap_exceeded)
+        self.assertNotIn("bs/d", [r["id"] for r in outcome.results])
+
+    def test_a_read_back_whose_field_never_comes_compares_the_last_answer(self):
+        (request,) = self.load('{"id": "bs", "method": "POST", "path": "/c", "readbacks": [{"id": "d", "path": "/d", "settle": "Year"}]}')
+        reset, _ = self.resetter([])
+        clock = iter(range(0, 1000, 10))
+        servers = FakeServers({("o", "/c"): {}, ("f", "/c"): {}, ("o", "/d"): {"Year": 1}, ("f", "/d"): {"N": 1}})
+        outcome = diff.run_requests([request], IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, None,
+                                    now=lambda: float(next(clock)), send=servers, reset=reset, sleep=lambda s: None)
+        self.assertEqual(outcome.results[1]["state"], "differences")
+        self.assertLessEqual(sum(1 for base, path, _ in servers.sent if (base, path) == ("f", "/d")), 4)
 
     def test_reads_run_first_then_each_write_on_a_fresh_reset_followed_by_its_read_backs(self):
         requests = self.load('{"id": "w1", "method": "POST", "path": "/w1", "body": {"A": "{movie}"}, "readbacks": [{"id": "r", "path": "/r"}]}',

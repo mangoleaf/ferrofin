@@ -48,6 +48,7 @@ jobs:
       - run: python3 -m unittest discover -s bench -p test_report.py
       - run: python3 -m unittest discover -s bench -p test_ramp.py
       - run: python3 -m unittest discover -s bench -p test_soak.py
+      - run: python3 -m unittest discover -s bench -p test_endpoints.py
 
   # fmt and clippy. The workspace tests run beside it in lint-tests; the aggregate `lint`
   # job below is the status check main's branch protection requires.

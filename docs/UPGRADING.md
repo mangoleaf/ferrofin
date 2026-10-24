@@ -19,6 +19,20 @@ password instead. Upstream names jellyfin-web's login screen among those clients
 password empty: the account still signs in, because sign-in checks the stored password and
 not the flag.
 
+## Unreleased — abandoned playback is stopped, and paused sessions can be
+
+Ferrofin now runs Jellyfin's two playback checks:
+- **Idle playback:** a session that has been playing without reporting progress for more
+  than five minutes is stopped where its client last reported. Its device stops showing as
+  playing, its resume point is saved, and the usual rules may mark the item played. Before,
+  a client that vanished mid-playback over plain HTTP stayed "playing", and the "Clean
+  Transcode Directory" and "Optimize database" tasks skipped every run while it did.
+- **Inactive sessions:** the setting `InactiveSessionThreshold` (minutes, in
+  `config/system.json`, or through `POST /System/Configuration`) now applies. A session
+  paused longer than that is sent a stop command, which reaches clients connected over a
+  WebSocket, as in Jellyfin. It was ignored before, including when carried over from an
+  adopted Jellyfin configuration. At `0`, the default, nothing is stopped.
+
 ## Unreleased — the dashboard's HTTPS settings take effect
 
 Ferrofin now serves HTTPS itself, as Jellyfin does. Until now it ignored the HTTPS settings
@@ -76,20 +90,6 @@ Ferrofin now runs Jellyfin's startup check on its directories before a scheduled
 - **One of these directories cannot be created or written**, for example a read-only plugins volume. Ferrofin exits naming it: `creating <path>: …`. Make it writable.
 
 Ferrofin's default layout, the container image and an adopted Jellyfin directory are unaffected: each directory is a different one, and an adopted install already carries the same markers in the same places.
-
-## Unreleased — abandoned playback is stopped, and paused sessions can be
-
-Ferrofin now runs Jellyfin's two playback checks:
-- **Idle playback:** a session that has been playing without reporting progress for more
-  than five minutes is stopped where its client last reported. Its device stops showing as
-  playing, its resume point is saved, and the usual rules may mark the item played. Before,
-  a client that vanished mid-playback over plain HTTP stayed "playing", and the "Clean
-  Transcode Directory" and "Optimize database" tasks skipped every run while it did.
-- **Inactive sessions:** the setting `InactiveSessionThreshold` (minutes, in
-  `config/system.json`, or through `POST /System/Configuration`) now applies. A session
-  paused longer than that is sent a stop command, which reaches clients connected over a
-  WebSocket, as in Jellyfin. It was ignored before, including when carried over from an
-  adopted Jellyfin configuration. At `0`, the default, nothing is stopped.
 
 ## Unreleased — Schedules Direct guides, and listings providers are checked on save
 

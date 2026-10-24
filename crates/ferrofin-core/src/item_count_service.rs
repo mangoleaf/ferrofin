@@ -558,12 +558,9 @@ impl ItemCountService for FerrofinItemCountService {
             .map(|(t, c)| (t, i32::try_from(c).unwrap_or(i32::MAX)))
             .collect();
 
-        // Jellyfin's LibraryController.GetItemCounts never assigns ItemCount, so
-        // it serializes as 0 for the top-level endpoint. Match that: build the
-        // per-type counts, then zero the grand total.
-        let mut counts = counts_from_type_map(&by_type);
-        counts.item_count = 0;
-        Ok(counts)
+        // ItemCountService.GetItemCounts (v12.2, :73) sets ItemCount to the sum
+        // of every type group, types with no field of their own included.
+        Ok(counts_from_type_map(&by_type))
     }
 
     async fn get_item_counts_for_name_item(
@@ -3538,15 +3535,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_item_counts_zeroes_the_grand_total() {
+    async fn get_item_counts_totals_every_matched_type() {
         let db = test_db().await;
         let service = svc(&db);
 
-        // Two movies and one series → per-type counts populate, but the
-        // top-level ItemCount must serialize as 0 (Jellyfin never assigns it).
+        // ItemCountService.GetItemCounts (v12.2, :73): ItemCount is the sum of
+        // every type group, including types with no field of their own (Season).
         seed_item(&db, Uuid::from_u128(0xCC01), BaseItemKind::Movie).await;
         seed_item(&db, Uuid::from_u128(0xCC02), BaseItemKind::Movie).await;
         seed_item(&db, Uuid::from_u128(0xCC03), BaseItemKind::Series).await;
+        seed_item(&db, Uuid::from_u128(0xCC04), BaseItemKind::Season).await;
 
         let counts = service
             .get_item_counts(&InternalItemsQuery::default())
@@ -3555,7 +3553,7 @@ mod tests {
 
         assert_eq!(counts.movie_count, 2);
         assert_eq!(counts.series_count, 1);
-        assert_eq!(counts.item_count, 0);
+        assert_eq!(counts.item_count, 4);
     }
 
     #[tokio::test]

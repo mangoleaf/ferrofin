@@ -1100,6 +1100,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::save_item_images`] for many items, each with its own image
+    /// list. The real service writes a chunk of items per transaction, for a
+    /// caller that writes thousands at once (a guide refresh's programmes);
+    /// the default writes them one at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn save_items_images(
+        &self,
+        items: &[(Uuid, Vec<ItemImageInfo>)],
+    ) -> Result<(), ServiceError> {
+        for (item_id, images) in items {
+            self.save_item_images(*item_id, images).await?;
+        }
+        Ok(())
+    }
+
     /// The stored dimensions/blurhash of every image row attached to
     /// `item_ids`, read in one batch.
     ///

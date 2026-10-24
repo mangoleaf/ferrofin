@@ -380,19 +380,7 @@ pub(crate) fn valid_filename(name: &str) -> String {
 
 /// `ManagedFileSystem.GetValidFilename(name)`: every invalid path character
 /// replaced by a space, nothing trimmed.
-pub(crate) fn get_valid_filename(name: &str) -> String {
-    // `ManagedFileSystem._invalidPathCharacters`, verbatim.
-    const INVALID: &[char] = &['"', '<', '>', '|', ':', '*', '?', '\\', '/'];
-    name.chars()
-        .map(|c| {
-            if INVALID.contains(&c) || (c as u32) <= 31 {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
-}
+pub(crate) use ferrofin_util::path_helper::get_valid_filename;
 
 /// [`derive_item_id_with`] under [`IdDerivation::LegacyLowercase`] — kept for
 /// call sites that have not been handed a per-database mode.

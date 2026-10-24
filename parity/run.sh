@@ -224,10 +224,13 @@ drain() {   # every scheduled task idle
   return 1
 }
 isolate() {   # no plugins, no automatic tasks: the answers come from the core servers, and nothing rewrites the copy
+  # A plugin that cannot be uninstalled (an in-tree one: TMDb, OMDb, …) stays as it is on both servers: Jellyfin
+  # cannot disable it, and its state and settings pages are answers to compare. (bench/run.sh disables every
+  # Ferrofin plugin, for load; parity treats both servers alike.)
   local id version
   api /Plugins > "$D/plugins-before.json" && jq -e 'type == "array"' "$D/plugins-before.json" >/dev/null || return 1
   while read -r id version; do api_post "/Plugins/$id/$version/Disable" || return 1
-  done < <(jq -r --arg server "$NAME" '.[] | select($server == "ferrofin" or .CanUninstall != false) | "\(.Id) \(.Version)"' "$D/plugins-before.json")
+  done < <(jq -r '.[] | select(.CanUninstall != false) | "\(.Id) \(.Version)"' "$D/plugins-before.json")
   api /ScheduledTasks > "$D/tasks-before.json" && jq -e 'type == "array" and length > 0' "$D/tasks-before.json" >/dev/null || return 1
   while read -r id; do api_post "/ScheduledTasks/$id/Triggers" '[]' || return 1; done < <(jq -r '.[].Id' "$D/tasks-before.json")
 }
@@ -236,10 +239,9 @@ require() {   # require FILE PATH MESSAGE FILTER [jq args]: fetch PATH into FILE
   shift 4
   if ! api "$path" > "$file" || ! jq -e "$@" "$filter" "$file" >/dev/null; then reason "$message"; return 1; fi
 }
-# shellcheck disable=SC2016  # the jq programs use jq's $variables
 verify_isolation() {
   require "$D/plugins.json" /Plugins "plugins not disabled" \
-    'type == "array" and all(.[]; .Status == "Disabled" or ($server != "ferrofin" and .CanUninstall == false))' --arg server "$NAME" || return 1
+    'type == "array" and all(.[]; .Status == "Disabled" or .CanUninstall == false)' || return 1
   require "$D/tasks.json" /ScheduledTasks "automatic task triggers remain enabled" \
     'type == "array" and length > 0 and all(.[]; .Triggers == [])' || return 1
   require "$D/libraries.json" /Library/VirtualFolders "library monitoring, automatic refresh or fetchers not disabled" \
@@ -270,9 +272,10 @@ for path in files:
     node.text = "false"
     tree.write(path, encoding="utf-8", xml_declaration=True)
 PY_ISOLATION
-  [ "$NAME" != ferrofin ] || env=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache)
+  # Ferrofin's compiled-in extensions (Intro Skipper, Merge Versions, …) are plugins Jellyfin does not have: off.
+  [ "$NAME" != ferrofin ] || env=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache -e FERROFIN_DISABLE_EXTENSIONS=1)
   [ "$PIN" = 0 ] || cpuset=(--cpuset-cpus "$cpus")
-  timeout --kill-after="$KILL_GRACE_S" "$READY_TIMEOUT_S" docker run -d --cidfile "$D/container.cid" --name "parity-$NAME" --user "$(id -u):$(id -g)" "${cpuset[@]}" \
+  timeout --kill-after="$KILL_GRACE_S" "$READY_TIMEOUT_S" docker run -d --cidfile "$D/container.cid" --name "parity-$NAME" --hostname parity-server --user "$(id -u):$(id -g)" "${cpuset[@]}" \
     --memory "$MEMORY" --memory-swap "$MEMORY" -p "127.0.0.1:$port:8096" "${env[@]}" \
     -v "$cfg:/config" -v "$cache:/cache" -v "$TESTDATA/media:/media:ro" "$image" >/dev/null || { reason "docker could not start $image"; return 1; }
   wait_ready || { reason "did not answer /System/Ping within ${READY_TIMEOUT_S}s"; return 1; }

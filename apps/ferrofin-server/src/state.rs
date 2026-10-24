@@ -58,7 +58,7 @@ use crate::media_encoding::build_media_encoding;
 /// is sampled for each server lifetime; listener/base URL bootstrap settings are
 /// configured separately. Missing or unreadable files use defaults; malformed JSON
 /// also logs a warning that the remote-IP filter will not be enforced.
-async fn load_network_configuration(
+pub(crate) async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
 ) -> ferrofin_networking::NetworkConfiguration {
     let path = std::path::Path::new(&paths.user_configuration_directory_path())
@@ -1119,6 +1119,7 @@ pub async fn build_app_state(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
             )
+            .with_remote_image_cache(cache_root.child("remote-images"))
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
@@ -1236,6 +1237,9 @@ pub async fn build_app_state(
         Arc::clone(&item_repository),
         Arc::clone(&user_views),
     );
+    // Channel logos and guide artwork are remote image rows: the refresh warms
+    // their cache and tags a channel's logo for programme DTOs.
+    live_tv_impl.set_images(Arc::clone(&providers), Arc::clone(&image_processor));
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
     // "Similarity providers" list, in the admin's configured order.

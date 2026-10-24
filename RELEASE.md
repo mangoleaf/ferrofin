@@ -108,7 +108,7 @@ from.
    | Row | Measures | Relative | Absolute |
    |---|---|---:|---:|
    | `screens` | screen p50 | 15 % | 2 ms |
-   | `endpoints` | endpoint p50 | 15 % | 0.5 ms |
+   | `endpoints` | endpoint p50 (the screens' endpoints, and each endpoint of the per-endpoint pass) | 15 % | 0.5 ms |
    | `memory` | peak (under load) and steady idle anon memory; scan and migration peak anon | 25 % | 40 MiB |
    | `scan` | library-scan and adoption-migration wall time | 15 % | 1 s |
    | `ramp` | throughput ceiling (higher is better; *Throughput ceiling* below) | 15 % | 5 screens/s |
@@ -126,8 +126,10 @@ from.
    maintainer accepts it. Gated cells are the screen and endpoint p50s at the unloaded and
    loaded levels, plus peak and steady memory, all four cells of the scan session, the
    throughput ceiling of the ramp session below, which blocks whenever it is run, and the
-   soak's `soak/slope` when the soak was run. The stress level and endpoint cells whose
-   medians are both under 1 ms are reported but never block.
+   soak's `soak/slope` when the soak was run, and the per-endpoint pass's `bench/screens.js`
+   shapes and edge-case GETs (below). The stress level and the screens' endpoint cells whose
+   medians are both under 1 ms are reported but never block, and so is every other endpoint of
+   the per-endpoint pass.
 
    **Throughput ceiling.** Measure it in the same window as the gate. It is a separate
    session (output in `bench/runs/gate-ramp-<date>-<time>/`, with the same oracle-pin
@@ -157,6 +159,25 @@ from.
    and the settle and steady phases), so book it with the rest of the gate. The limit and the
    10 minutes are starting values, to be re-derived after two soaks.
 
+   **Per-endpoint latency.** Every GET of the parity request catalogue, one endpoint at a time
+   (`bench/README.md`, "Per-endpoint latency"), in the same window as the gate:
+   `python3 bench/gate.py endpoints ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`.
+   Three interleaved pairs of `bench/run.sh --servers ferrofin --only endpoints`; after one
+   shared warm-up each endpoint gets 200 sequential requests or 10 s, whichever comes first.
+   Each endpoint's p50 is judged by the `endpoints` row on the same rule as the other cells.
+   Only the `bench/screens.js` shapes and the parity edge-case GETs block: a regressed one, or
+   one that cannot be judged because its answers differ between runs. Every other endpoint is
+   reported; file a regression there as an issue. The oracle-pin refusal and the rule that a
+   failed run stops the session are the same as the A/B's. Output goes to
+   `bench/runs/gate-endpoints-<date>-<time>/`. **Wall time:** one
+   Ferrofin run measured on the shared host took 77 minutes (a 50 s warm-up, then 4,551 s
+   measuring, after the scan every Ferrofin boot does), so the six runs take about eight hours.
+   Nearly all of it is the 1,836 parameter combinations of `parity/requests/sweep/combos.jsonl`
+   (4,302 s); the other 241 endpoints, the gated ones among them, took about 4 minutes.
+   `ENDPOINT_SETS=parity/requests/sweep/contract.jsonl,parity/requests/sweep/screens.jsonl,parity/requests/edge`
+   leaves the combinations out. Whether the release session does that is still open: the
+   owner decides.
+
    **The Jellyfin comparison is publication only.** The three-server `bench/run.sh` runs
    (Ferrofin and both Jellyfins, three runs, median) produce the published tables in the root
    README and `docs/BENCHMARKS.md`. Run them when those numbers are refreshed. They never
@@ -182,7 +203,7 @@ from.
 4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
    Watch it finish, then verify (below).
 5. **Record the results** after the tag, so the record never moves the frozen head: attach
-   the benchmark gate's `report.md` files (A/B, scan and, when it was run, ramp) to the release
+   the benchmark gate's `report.md` files (A/B, scan, endpoints and, when it was run, ramp) to the release
    PR (release branch → `main`), or to the GitHub Release for a patch release from `main`, and
    update the adoption test record in `adoption/README.md` with the link to the green
    `Adoption` run from step 2.

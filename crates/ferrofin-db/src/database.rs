@@ -839,6 +839,31 @@ impl Database {
         }))
     }
 
+    /// Whether Jellyfin's `__EFMigrationsHistory` records `migration_id`, i.e.
+    /// Jellyfin already ran that routine here before Ferrofin adopted the
+    /// database. Always `false` on a Ferrofin-native database, which has no
+    /// such table (adoption keeps it untouched).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn jellyfin_migration_applied(&self, migration_id: &str) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        let applied: Option<i64> = sqlx::query_scalar(
+            r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
+        )
+        .bind(migration_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(applied.is_some())
+    }
+
     /// Plants an adoption record as the gate would — for tests of the boot
     /// repairs that key on it (an in-memory database never goes through the
     /// gate).
@@ -2715,6 +2740,42 @@ mod tests {
         for r in readers {
             r.await.expect("reader task");
         }
+    }
+
+    /// `jellyfin_migration_applied` reads Jellyfin's own history: false with no
+    /// `__EFMigrationsHistory` (a Ferrofin-native database) or for an id the
+    /// table does not hold, true for one it does.
+    #[rstest::rstest]
+    #[case::no_history_table(None, false)]
+    #[case::another_id(Some("20260910120000_MigrateRatingLevels"), false)]
+    #[case::recorded(Some("20260915120000_MigrateRatingLevels"), true)]
+    #[tokio::test]
+    async fn jellyfin_migration_applied_reads_the_ef_history(
+        #[case] recorded: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        if let Some(id) = recorded {
+            sqlx::query(
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+            )
+            .execute(db.writer())
+            .await
+            .expect("history table");
+            sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.0.0')"#)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .expect("history row");
+        }
+        assert_eq!(
+            db.jellyfin_migration_applied("20260915120000_MigrateRatingLevels")
+                .await
+                .expect("history read"),
+            expected
+        );
     }
 
     #[tokio::test]

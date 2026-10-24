@@ -261,6 +261,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   key is a 404, as in Jellyfin (it was a 501, or a file a save had left behind), and saving one
   fails as Jellyfin's does instead of writing a file. `database` reads as the SQLite provider
   Ferrofin runs on, and saving it is refused (400), since no other provider can be used
+- `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
+  every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -297,6 +299,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   token was skipped and the entry to its left, which the client wrote itself, became the
   client's address: enough to get past a remote IP filter's allow or block list. Quoted entries
   are read too, as Jellyfin reads them
+- Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
+  carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
+  had already run, and cleared it, so a user with a maximum parental rating saw those episodes
+  in lists, counts, Latest, Resume and Next Up until the next full library scan
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
@@ -408,6 +414,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   already did, so the second save sees the first. Jellyfin has the same race. A user's tokens
   are revoked once the save that disables them has gone through, so a refused save signs
   nobody out
+- The server opens its HTTP port as soon as it starts, before it adopts or migrates the
+  database (after a scheduled backup restore), and answers while it does, as Jellyfin's
+  startup server does:
+  `/health/live` 200, `/health/ready` 503, `/health` `Degraded`, every other request 503 with
+  `Retry-After` and a "starting" page. Before, the port stayed closed until boot finished,
+  so a long adoption could outlast the chart's startup probe and be restarted in a loop.
+  Boot stages are now logged at `info`
 
 ## [1.0.0] - 2026-09-05
 
