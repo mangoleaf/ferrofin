@@ -1361,6 +1361,55 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/Users/{userId}/Policy",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "UpdateUserPolicy",
+        ferrofin: "handlers/users.rs update_user_policy → ferrofin-core user_manager.rs \
+               update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync behind \
+               ferrofin-traits policy_update_refusal) → session_manager.rs revoke_user_tokens; \
+               handlers/users.rs refresh_device_access (DeviceAccessHost)",
+        date: "2026-10-24",
+        divergences: &[
+            "The three guards (the last administrator, an administrator disabled, the last \
+         enabled user) are read inside the transaction that saves, and a newly disabled \
+         user's tokens are revoked once it committed. Upstream counts from its user cache \
+         before saving and revokes first, so two concurrent saves could both pass a guard and \
+         leave the server without an administrator or an enabled user. Jellyfin bug not \
+         ported.",
+            "The 403 (a guard refused) and 404 (unknown user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+            "A body without AuthenticationProviderId or PasswordResetProviderId, or with either \
+         empty, is saved with the empty string, where upstream's [Required(AllowEmptyStrings \
+         = false)] model validation answers 400. Fix path: gl-863.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Users",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "UpdateUser",
+        ferrofin: "handlers/users.rs update_user (also behind the hidden POST /Users/{userId}) → \
+               ferrofin-core user_manager.rs rename_user, update_configuration; \
+               handlers/users.rs refresh_device_access (DeviceAccessHost after a rename)",
+        date: "2026-10-24",
+        divergences: &[
+            "A body without Name, or with a null one, keeps the name and answers 204, \
+         where upstream passes the null to RenameUser and ThrowIfInvalidUsername answers 400; \
+         a body without Configuration keeps the stored settings, where upstream's UserDto \
+         constructor supplies a default configuration that resets them. Fix path: gl-871.",
+            "\"Configuration\": null skips the configuration save, where upstream dereferences \
+         the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
+            "Every save pushes UserUpdated to the user's sessions once the configuration is \
+         saved, where upstream pushes it only from a rename (RenameUser raises \
+         UserUpdatedEventArgs; UpdateConfigurationAsync raises nothing). Fix path: gl-864.",
+            "The 400 (invalid or taken name), 403 (update not allowed) and 404 (unknown user) \
+         bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/Items/Counts",
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",

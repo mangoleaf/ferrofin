@@ -198,6 +198,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
   the default is 30 minutes
+- Stop playback a client abandoned, as Jellyfin does: a session playing without a progress
+  report for five minutes is stopped at the client's last position, and with
+  `InactiveSessionThreshold` set, a session paused past it is told to stop. A client that
+  vanished mid-playback no longer stays "playing" and no longer makes transcode cleanup and
+  database optimization skip every run
 - Port `TrimCopiedAudio` noise bitstream filter: when a video is being transcoded but the
   audio is direct-copied, ffmpeg 5.0+ trims the leading audio silence to match the
   requested seek point, eliminating the A/V desync on mid-file seeks into remuxed HLS. The
@@ -272,6 +277,28 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- A signed-in user can no longer take over another user's session by sending that user's
+  `Client` and `DeviceId` headers. Sessions are now keyed by client, device and user, as in
+  Jellyfin 12. Before, the other user's session, WebSocket included, was handed to the caller,
+  who could then remote-control that player without `EnableRemoteControlOfOtherUsers`. Session
+  ids now match Jellyfin's byte for byte, so each one changes once on upgrade; they live only
+  in memory and clients take whatever id the server reports
+- A user's details no longer say whether the account has a password. `HasPassword` and
+  `HasConfiguredPassword` are `true` for every user, as Jellyfin 12 reports them, so the
+  anonymous login-screen list (`GET /Users/Public`) no longer tells anyone which accounts have
+  no password. Signing in with an empty password still works for those accounts. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
+- Taking a device away from a user now signs that device out, as Jellyfin 12.1 does. When a
+  user's policy is saved without "Allow access from all devices" and a device the user is signed
+  in on is not among the allowed ones, its token is revoked at once. Before, it kept working
+  until the device signed in again; only new sign-ins from it were refused. A rename runs the
+  same check. If the check fails, the save still succeeds and the error is logged
+- Behind a proxy listed under **Known proxies**, a client can no longer choose its own address
+  through `X-Forwarded-For`. When the proxy writes a token that is not an address for its client
+  (Squid's `unknown`, for example), the client is now that proxy, as in Jellyfin. Before, the
+  token was skipped and the entry to its left, which the client wrote itself, became the
+  client's address: enough to get past a remote IP filter's allow or block list. Quoted entries
+  are read too, as Jellyfin reads them
 - Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
@@ -381,6 +408,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   instead of on every request. One that exists but cannot be read answers 500 instead of
   reading as the defaults, and so does saving the encoding settings over it, so a save cannot
   replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
+- Two administrators demoting or disabling each other at the same moment can no longer leave
+  the server without an administrator, or without any enabled user. The checks that
+  `POST /Users/{userId}/Policy` makes now run inside the save itself, as deleting a user's
+  already did, so the second save sees the first. Jellyfin has the same race. A user's tokens
+  are revoked once the save that disables them has gone through, so a refused save signs
+  nobody out
 - The server opens its HTTP port as soon as it starts, before it adopts or migrates the
   database (after a scheduled backup restore), and answers while it does, as Jellyfin's
   startup server does:

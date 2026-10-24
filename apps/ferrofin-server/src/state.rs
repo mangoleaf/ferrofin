@@ -2160,7 +2160,7 @@ pub async fn build_app_state(
     // delivery path for Play/Playstate/GeneralCommand pushes.
     let session_bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
         Arc::new(ferrofin_core::FerrofinSessionMessageBus::new());
-    let sessions: Arc<dyn ferrofin_traits::session::SessionManager> = Arc::new(
+    let sessions_impl = Arc::new(
         FerrofinSessionManager::new(
             Arc::clone(&users),
             Arc::clone(&devices),
@@ -2179,6 +2179,18 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
+    // The idle-playback and inactive-session checks (C# `StartCheckTimers`),
+    // for this host's lifetime.
+    background.push(tokio::spawn(tracing::Instrument::instrument(
+        Arc::clone(&sessions_impl).run_playback_checks(Arc::clone(&config_trait)),
+        tracing::info_span!(
+            parent: None,
+            "playback_checks",
+            task = "playback_checks",
+            trigger = "startup"
+        ),
+    )));
+    let sessions: Arc<dyn ferrofin_traits::session::SessionManager> = sessions_impl;
     // Every user-data save but a progress report reaches the user's sessions
     // as a batched `UserDataChanged` (upstream's `UserDataChangeNotifier`).
     user_data_impl.set_user_data_changed_sink(Arc::new(

@@ -1434,6 +1434,48 @@ impl PlaybackPermissions {
     }
 }
 
+/// What a [`UserManager::update_policy_guarded`] save changed that its caller
+/// acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicySaved {
+    /// The save disabled a user who was enabled, so their tokens are to be
+    /// revoked (`UserController.UpdateUserPolicy`'s `RevokeUserTokens`).
+    pub newly_disabled: bool,
+}
+
+/// The state of the server a policy save is checked against: the user's
+/// current policy flags and the counts `UserController.UpdateUserPolicy`
+/// takes over all users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyGuardState {
+    /// The user is an administrator now (`PermissionKind.IsAdministrator`).
+    pub was_administrator: bool,
+    /// The user is disabled now (`PermissionKind.IsDisabled`).
+    pub was_disabled: bool,
+    /// How many users are administrators.
+    pub administrators: i64,
+    /// How many users are not disabled.
+    pub enabled_users: i64,
+}
+
+/// `UserController.UpdateUserPolicy`'s three guards, in upstream's order: the
+/// refusal message when saving `policy` would demote the last administrator,
+/// disable an administrator, or disable the last enabled user; `None` when the
+/// save may go ahead.
+#[must_use]
+pub fn policy_update_refusal(state: PolicyGuardState, policy: &UserPolicy) -> Option<&'static str> {
+    if !policy.is_administrator && state.was_administrator && state.administrators == 1 {
+        return Some("there must be at least one user in the system with administrative access");
+    }
+    if policy.is_disabled && state.was_administrator {
+        return Some("administrators cannot be disabled");
+    }
+    if policy.is_disabled && !state.was_disabled && state.enabled_users == 1 {
+        return Some("there must be at least one enabled user in the system");
+    }
+    None
+}
+
 /// Manages user accounts, authentication, and per-user policy/configuration.
 ///
 /// Port of `IUserManager`. User rows are [`UserEntity`]; [`Self::get_user_dto`]
@@ -1540,6 +1582,59 @@ pub trait UserManager: Send + Sync {
 
     /// Updates a user's policy (stopgap; prefer [`Self::update_user`]).
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError>;
+
+    /// Saves a policy as `POST /Users/{userId}/Policy` does: the save
+    /// [`Self::update_policy`] makes, behind `UserController.UpdateUserPolicy`'s
+    /// guards ([`policy_update_refusal`]).
+    ///
+    /// The default checks the guards over this trait's own reads before it
+    /// saves, so impls without a store of their own compile unchanged. The
+    /// concrete manager overrides it to read them inside the transaction that
+    /// writes, so two concurrent saves cannot both pass a guard and leave the
+    /// server without an administrator or an enabled user.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] for an unknown user,
+    /// [`ServiceError::Forbidden`] with the guard's message when a guard
+    /// refuses, or whatever the save surfaces.
+    async fn update_policy_guarded(
+        &self,
+        user_id: Uuid,
+        policy: &UserPolicy,
+    ) -> Result<PolicySaved, ServiceError> {
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
+        let current = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        let mut state = PolicyGuardState {
+            was_administrator: current.is_administrator,
+            was_disabled: current.is_disabled,
+            administrators: 0,
+            enabled_users: 0,
+        };
+        for other in self.get_users().await? {
+            let other = self
+                .get_user_dto(&other, None)
+                .await?
+                .policy
+                .unwrap_or_default();
+            state.administrators += i64::from(other.is_administrator);
+            state.enabled_users += i64::from(!other.is_disabled);
+        }
+        if let Some(refusal) = policy_update_refusal(state, policy) {
+            return Err(ServiceError::Forbidden(refusal.to_owned()));
+        }
+        self.update_policy(user_id, policy).await?;
+        Ok(PolicySaved {
+            newly_disabled: policy.is_disabled && !state.was_disabled,
+        })
+    }
 
     /// Clears a user's profile image: deletes the stored file (a missing file is
     /// not an error) and the `ImageInfos` row, as `DELETE /UserImage` does.
@@ -3032,5 +3127,88 @@ mod tests {
         };
         assert_eq!(rec.baseline_item_name, "Because you watched");
         assert!(rec.items.is_empty());
+    }
+
+    /// The server a guard case runs against: `administrators` administrators
+    /// and `enabled_users` enabled users, the user being saved among them.
+    fn guard_state(
+        was_administrator: bool,
+        was_disabled: bool,
+        administrators: i64,
+        enabled_users: i64,
+    ) -> super::PolicyGuardState {
+        super::PolicyGuardState {
+            was_administrator,
+            was_disabled,
+            administrators,
+            enabled_users,
+        }
+    }
+
+    fn policy(is_administrator: bool, is_disabled: bool) -> super::UserPolicy {
+        super::UserPolicy {
+            is_administrator,
+            is_disabled,
+            ..super::UserPolicy::default()
+        }
+    }
+
+    #[test]
+    fn the_last_administrator_cannot_be_demoted() {
+        let refusal =
+            super::policy_update_refusal(guard_state(true, false, 1, 3), &policy(false, false));
+        assert_eq!(
+            refusal,
+            Some("there must be at least one user in the system with administrative access")
+        );
+        assert_eq!(
+            super::policy_update_refusal(guard_state(true, false, 2, 3), &policy(false, false)),
+            None,
+            "another administrator remains"
+        );
+        assert_eq!(
+            super::policy_update_refusal(guard_state(true, false, 1, 3), &policy(true, false)),
+            None,
+            "the administrator stays one"
+        );
+    }
+
+    /// Upstream checks the CURRENT administrator flag, so a save that demotes
+    /// and disables an administrator in one go is refused too.
+    #[test]
+    fn an_administrator_cannot_be_disabled() {
+        for new_admin in [true, false] {
+            assert_eq!(
+                super::policy_update_refusal(
+                    guard_state(true, false, 2, 3),
+                    &policy(new_admin, true)
+                ),
+                Some("administrators cannot be disabled"),
+                "new IsAdministrator {new_admin}"
+            );
+        }
+        assert_eq!(
+            super::policy_update_refusal(guard_state(false, false, 1, 3), &policy(true, true)),
+            None,
+            "only the current flag counts: a user promoted and disabled in one save is not refused"
+        );
+    }
+
+    #[test]
+    fn the_last_enabled_user_cannot_be_disabled() {
+        assert_eq!(
+            super::policy_update_refusal(guard_state(false, false, 1, 1), &policy(false, true)),
+            Some("there must be at least one enabled user in the system")
+        );
+        assert_eq!(
+            super::policy_update_refusal(guard_state(false, false, 1, 2), &policy(false, true)),
+            None,
+            "another enabled user remains"
+        );
+        assert_eq!(
+            super::policy_update_refusal(guard_state(false, true, 1, 1), &policy(false, true)),
+            None,
+            "an already disabled user is not being disabled"
+        );
     }
 }
