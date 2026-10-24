@@ -263,8 +263,9 @@ for spec in "${FIXTURE_TABLE[@]}"; do
 done
 # The messy fixtures (messy.py): a clean fixture plus the rows of shapes long-lived databases
 # carry and no API can produce (nine shapes: rows of a deleted user, an extra whose owner is gone,
-# two rows for one path, odd id spellings, names differing in case, ...). The same image adopts a fresh copy of each, and every shape must end as Jellyfin 12.2
-# left it (DIR/<fixture>/messy-oracle.json) or as a divergence written down in messy.py. They
+# two rows for one path, odd id spellings, names differing in case, ...). The same image adopts a
+# fresh copy of each, and every shape must end as Jellyfin 12.2 left it (DIR/<fixture>/messy-oracle.json)
+# or as a divergence written down in messy.py. They
 # answer no smoke oracle: their library is the clean one plus rows no endpoint shows, so only the
 # boot, the file's integrity, a quiet second boot and the shapes are checked.
 # The messy rows mount media-messy (a hard-linked copy of the shared tree plus a link per file a
