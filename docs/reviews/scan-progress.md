@@ -41,7 +41,7 @@ worktree paths and Rust standard-library paths.
 
 ## Live HTTP and WebSocket
 
-`node gates/verify/scan-progress.mjs /home/mango/dev/ferrofin/target/debug/ferrofin-server N`
+`node gates/verify/scan-progress.mjs target/debug/ferrofin-server N`
 passed for logging cadences N=0, 1, and 100. Each run created 12 items and held the
 first ffprobe process. Start events arrived in 3–27 ms; zero-percent samples followed
 at one-second intervals while held. After release, item ratios advanced and terminal
