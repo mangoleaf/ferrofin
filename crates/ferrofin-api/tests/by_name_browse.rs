@@ -897,6 +897,10 @@ async fn by_name_lists_pass_the_kind_lists_through() {
 /// here the lookup writes nothing and an unknown name keeps a no-match id, so a
 /// list of unknown names never turns into no filter at all. The Genres and
 /// Studios controllers declare no `studios`, so it never reaches their query.
+/// The assertions are on the query the library receives: this fake answers
+/// every list with one row, so the response's count says nothing here (the
+/// repository's `studio_ids_naming_no_row_match_nothing` covers the empty
+/// answer).
 #[tokio::test]
 async fn artist_lists_resolve_studio_names_without_creating_studios() {
     const OTHER_STUDIO: &str = "0000000000000000000000000000ab09";
@@ -923,7 +927,17 @@ async fn artist_lists_resolve_studio_names_without_creating_studios() {
                 "studios=A24%7CNope".to_owned(),
                 vec![STUDIO_ID, Uuid::nil()],
             ),
+            // `|` alone names nothing, so `studioIds` stands.
             (format!("studioIds={OTHER_STUDIO}&studios=%7C"), vec![other]),
+            // So does a whitespace-only value: the query layer binds it to null
+            // for every member (`ConvertEmptyStringToNull`). Upstream's pipe
+            // binder sees the raw value and keeps it as the name `""` instead
+            // (gl-855).
+            (format!("studioIds={OTHER_STUDIO}&studios=%20"), vec![other]),
+            // A blank entry beside a name is dropped. Upstream keeps it as the
+            // name `""`, an id that matches nothing, so it sends one more id
+            // than the `[A24]` here; the artist routes answer the same.
+            ("studios=A24%7C%20".to_owned(), vec![STUDIO_ID]),
         ] {
             let uri = format!("{route}?{params}");
             assert_eq!(studio_ids_for(uri.clone()).await, expected, "{uri}");

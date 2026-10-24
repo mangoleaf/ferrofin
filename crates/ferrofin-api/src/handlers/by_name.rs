@@ -467,7 +467,10 @@ const UNRESOLVED_NAME_ID: uuid::Uuid = uuid::Uuid::nil();
 /// `…Ids` counterpart: the controllers'
 /// `names.Select(n => _libraryManager.Get<Kind>(n)).Where(i => i is not null).Select(i => i!.Id)`
 /// (v12.2 `ArtistsController.cs:182-195` for `studios`; `ItemsController.cs`
-/// does the same for `studios` and `artists`).
+/// does the same for its `studios`). Upstream wraps each `GetStudio` /
+/// `GetArtist` in a `try`/`catch` and drops a name whose lookup throws; this
+/// resolver propagates a repository error (`?`) as an error response instead,
+/// so a caller must not assume lookup errors are swallowed.
 ///
 /// `None` when the parameter names nothing (`studios.Length == 0`): the
 /// caller's `…Ids` filter stands. Otherwise one id per name, and the caller
@@ -488,8 +491,12 @@ const UNRESOLVED_NAME_ID: uuid::Uuid = uuid::Uuid::nil();
 /// yet: upstream's minted row would match the items carrying it, a miss here
 /// matches none.
 ///
-/// Not for `albums`: `GetItems` resolves those with a plain `GetItemIds` that
-/// drops a miss, so a list of unknown albums is no filter there.
+/// For `Studio`-like kinds only. `GetArtist` (`artists` on `GET /Items`)
+/// special-cases `MusicArtist`: it takes an existing row by `Name`, ordered by
+/// `IsAccessedByName`, which a plain `CleanName` match does not reproduce, so
+/// that kind needs its own lookup. Not for `albums` either: `GetItems`
+/// resolves those with a plain `GetItemIds` that drops a miss, so a list of
+/// unknown albums is no filter there.
 pub(crate) async fn resolve_by_name_ids(
     state: &AppState,
     kind: ferrofin_model::data::BaseItemKind,
@@ -499,6 +506,9 @@ pub(crate) async fn resolve_by_name_ids(
     if names.is_empty() {
         return Ok(None);
     }
+    // One non-creating lookup per name, accepted as the cost: upstream runs one
+    // `GetStudio` per name, and on the artist routes any non-empty list empties
+    // the answer anyway. No cap on the count, and no skipping the lookup.
     let mut ids = Vec::with_capacity(names.len());
     for name in &names {
         let row = state.library.find_named_item(kind, name).await?;
