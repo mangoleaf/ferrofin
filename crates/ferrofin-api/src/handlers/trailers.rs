@@ -201,7 +201,9 @@ async fn get_trailers(
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let internal = trailers_query_options(&query, user)?;
 
-    let result = state.library.query_items(&internal).await?;
+    let mut result = state.library.query_items(&internal).await?;
+    // `GetItems` answers explicit ids through `Folder.GetItems`.
+    crate::handlers::items::sort_items_by_request(&internal, &mut result.items);
     let options = DtoOptions::with_all_fields(false);
     let dtos = state
         .dto

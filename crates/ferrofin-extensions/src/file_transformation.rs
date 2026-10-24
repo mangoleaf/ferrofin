@@ -25,6 +25,7 @@
 //! through the [`FileTransformationService`] trait instead).
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_core::{PluginConfigPage, ScheduledTask};
@@ -32,6 +33,7 @@ use ferrofin_traits::plugins::{
     FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
 };
 use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -224,6 +226,10 @@ pub struct WebFileTransformationService {
     /// for resolving relative HTTP-callback endpoints.
     local_api: Arc<dyn LocalApiAccess>,
     http: reqwest::Client,
+    /// How long an HTTP-callback exchange may take, body included: the
+    /// plugin's `new HttpClient()` keeps .NET's default `Timeout`
+    /// ([`HTTP_CLIENT_DEFAULT_TIMEOUT`]; a test shortens it).
+    endpoint_timeout: Duration,
 }
 
 impl WebFileTransformationService {
@@ -237,6 +243,7 @@ impl WebFileTransformationService {
             plugins,
             local_api,
             http: reqwest::Client::new(),
+            endpoint_timeout: HTTP_CLIENT_DEFAULT_TIMEOUT,
         }
     }
 
@@ -302,9 +309,12 @@ impl WebFileTransformationService {
                 }
             }
         };
+        // `PostAsync` reads the whole response before it returns, so the
+        // plugin's `HttpClient.Timeout` bounds the body read too.
         let response = self
             .http
             .post(&url)
+            .timeout(self.endpoint_timeout)
             .json(&serde_json::json!({ "contents": contents }))
             .send()
             .await;
@@ -909,6 +919,58 @@ mod tests {
             1,
             "the endpoint was called"
         );
+    }
+
+    /// A callback endpoint that accepts each connection and reads the request,
+    /// then sends `head` (nothing when it is empty) and holds the connection
+    /// open without another byte.
+    async fn spawn_stalled_callback(head: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The plugin's `new HttpClient()` keeps .NET's 100 s `Timeout` over the
+    /// whole `PostAsync` (the body is read before it returns), so a callback
+    /// that never answers, or stops part-way through its body, leaves the file
+    /// as it was instead of holding the request for ever.
+    #[tokio::test]
+    async fn a_callback_that_never_finishes_leaves_the_contents_unchanged() {
+        for head in [
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\npat",
+        ] {
+            let base = spawn_stalled_callback(head).await;
+            let mut svc = service_with("{}", true);
+            svc.endpoint_timeout = Duration::from_millis(200);
+            svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+                .await;
+
+            let out = tokio::time::timeout(
+                Duration::from_secs(5),
+                svc.run_transformation("main.js", "original".to_owned()),
+            )
+            .await;
+
+            assert_eq!(
+                out.as_deref().ok(),
+                Some("original"),
+                "the callback must give up ({head:?})"
+            );
+        }
     }
 
     /// A relative endpoint is a path on this server, called through its local

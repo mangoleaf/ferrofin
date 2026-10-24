@@ -147,7 +147,13 @@ pub(crate) async fn serve_static_source(
         }
         MediaProtocol::File => serve_static_file(&source.path, request).await,
         MediaProtocol::Http => {
-            serve_remote_static(&source.path, source.user_agent.as_deref(), request).await
+            serve_remote_static(
+                &source.path,
+                source.user_agent.as_deref(),
+                request,
+                ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT,
+            )
+            .await
         }
         other => Err(ApiError::BadRequest(format!(
             "Input protocol {other:?} cannot be streamed statically"
@@ -182,10 +188,16 @@ fn live_buffer_id(path: &str) -> Option<&str> {
 /// `Accept-Ranges` (`none` when the upstream does not offer ranges),
 /// `Content-Range`, `Content-Length` and `Content-Type`
 /// (`application/octet-stream` when it names none).
+///
+/// The request is `ResponseHeadersRead` through `NamedClient.Default`, so its
+/// `HttpClient.Timeout` (`headers_timeout`) bounds it only up to the response
+/// headers: an origin that never answers is a `500`, and a long body is
+/// relayed with no limit.
 async fn serve_remote_static(
     url: &str,
     user_agent: Option<&str>,
     request: Request,
+    headers_timeout: std::time::Duration,
 ) -> Result<Response, ApiError> {
     use axum::http::{HeaderValue, StatusCode, header};
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -213,11 +225,19 @@ async fn serve_remote_static(
     {
         upstream = upstream.header(header::RANGE, range.as_bytes());
     }
-    let response = upstream.send().await.map_err(|error| {
-        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-            "remote stream request failed: {error}"
-        )))
-    })?;
+    let response = tokio::time::timeout(headers_timeout, upstream.send())
+        .await
+        .map_err(|_| {
+            ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+                "remote stream request timed out: no response headers within {}s",
+                headers_timeout.as_secs_f64()
+            )))
+        })?
+        .map_err(|error| {
+            ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+                "remote stream request failed: {error}"
+            )))
+        })?;
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = response.headers();
@@ -407,6 +427,89 @@ pub(crate) async fn serve_growing_transcode(
         axum::http::HeaderValue::from_static("none"),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod remote_static_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// The headers deadline these tests use in place of the 100 s.
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
+
+    /// Long enough for every relay below to finish, short enough that one
+    /// with no deadline fails here instead of hanging the run.
+    const GUARD: Duration = Duration::from_secs(5);
+
+    /// An origin that accepts one connection, reads the request, then sends
+    /// `head` (nothing when it is empty) and each of `chunks` 100 ms apart,
+    /// holding the connection open afterwards.
+    async fn origin(head: &'static str, chunks: &'static [&'static str]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/media.mkv", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream.write_all(head.as_bytes()).await;
+            for chunk in chunks {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        url
+    }
+
+    /// `GetStaticRemoteStreamResult` sends through `NamedClient.Default`: an
+    /// origin that never answers runs out its `HttpClient.Timeout`, and the
+    /// `TaskCanceledException` is a `500`.
+    #[tokio::test]
+    async fn an_origin_that_never_answers_is_a_500() {
+        let url = origin("", &[]).await;
+        let relayed = tokio::time::timeout(
+            GUARD,
+            serve_remote_static(&url, None, Request::new(Body::empty()), SHORT_TIMEOUT),
+        )
+        .await
+        .expect("the relay gave up on the origin");
+        let error = relayed.expect_err("a silent origin is an error");
+        assert_eq!(
+            error.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// The timeout stops at the headers (`ResponseHeadersRead`): a body that
+    /// takes longer than it is relayed whole, never cut off.
+    #[tokio::test]
+    async fn a_body_slower_than_the_timeout_is_relayed_whole() {
+        let url = origin(
+            "HTTP/1.1 200 OK\r\nContent-Type: video/x-matroska\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+            &["abc", "def", "ghi", "jkl"],
+        )
+        .await;
+        let body = tokio::time::timeout(GUARD, async {
+            let response =
+                serve_remote_static(&url, None, Request::new(Body::empty()), SHORT_TIMEOUT)
+                    .await
+                    .expect("relayed");
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+        })
+        .await
+        .expect("the relay finished");
+        assert_eq!(body.as_ref(), b"abcdefghijkl");
+    }
 }
 
 #[cfg(test)]

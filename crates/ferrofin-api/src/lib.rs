@@ -27,6 +27,7 @@ pub mod forwarded_headers;
 pub mod handlers;
 pub mod ip_access;
 pub mod openapi;
+pub mod panic_boundary;
 mod query;
 mod request_culture;
 pub mod response_time;

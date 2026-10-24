@@ -368,8 +368,10 @@ fn determine_next_episode(
 
 /// A stable insertion sort that never panics, whatever the comparator does:
 /// LINQ's `OrderBy` semantics for a comparer that is not a total order. The
-/// inputs are a series' handful of positioned specials plus two rows.
-fn stable_sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
+/// inputs are a series' handful of positioned specials plus two rows, or a
+/// folder's children sorted by `AiredEpisodeOrder`; the cost is linear plus
+/// one swap per out-of-order pair.
+pub(crate) fn stable_sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
     for i in 1..items.len() {
         let mut j = i;
         while j > 0 && compare(&items[j - 1], &items[j]) == Ordering::Greater {
@@ -402,7 +404,7 @@ fn last_watched_date(result: &NextUpEpisodeBatchResult, rewatching: bool) -> Dat
 }
 
 /// Read source aired-order fields once per entity.
-fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
+pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
     let mut order = AiredOrder {
         season: episode.parent_index_number,
         episode: episode.index_number,

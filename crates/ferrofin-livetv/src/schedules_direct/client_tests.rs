@@ -466,6 +466,39 @@ async fn channels_without_credentials_are_unavailable() {
     assert!(fake.requests.lock().unwrap().is_empty());
 }
 
+/// `AddLineupToAccount` is sent `ResponseHeadersRead`, and is the only
+/// Schedules Direct request that is: every other one reads its whole response.
+#[tokio::test]
+async fn only_adding_a_lineup_ends_at_the_response_headers() {
+    let (fake, _dir, sd) = setup();
+    fake.login_ok();
+    fake.answer(
+        RequestMethod::Get,
+        "/lineups",
+        &[(200, &fixture("lineups_response.json"))],
+    );
+    fake.answer(RequestMethod::Put, "/lineups/USA-OTA-90210", &[(200, "")]);
+    let with_lineup = ListingsProviderInfo {
+        listings_id: Some("USA-OTA-90210".to_owned()),
+        ..info()
+    };
+    sd.validate(&with_lineup, false, true)
+        .await
+        .expect("validate");
+
+    let requests = fake.requests.lock().unwrap();
+    let (puts, others): (Vec<_>, Vec<_>) = requests
+        .iter()
+        .partition(|request| request.method == RequestMethod::Put);
+    assert_eq!(puts.len(), 1, "{requests:?}");
+    assert!(puts[0].headers_only, "{requests:?}");
+    assert!(!others.is_empty(), "{requests:?}");
+    assert!(
+        others.iter().all(|request| !request.headers_only),
+        "{requests:?}"
+    );
+}
+
 /// `Validate` with `validateListings`: the lineup is added to the account only
 /// when it is not already there; SD's `400` for an account with no lineups is
 /// "not there"; and a refusal to add it is logged, not raised.

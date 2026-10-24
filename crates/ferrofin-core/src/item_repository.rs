@@ -440,11 +440,14 @@ impl FerrofinItemRepository {
 
     async fn sort_folder_children_inner(
         &self,
-        mut rows: Vec<BaseItemEntity>,
+        rows: Vec<BaseItemEntity>,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use crate::tv_series_manager::{aired_order, stable_sort_by};
         use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
+        type Keyed = (Option<AiredEpisodeOrder>, BaseItemEntity);
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);
         }
@@ -453,11 +456,27 @@ impl FerrofinItemRepository {
                 by,
                 ItemSortBy::Name
                     | ItemSortBy::SortName
+                    | ItemSortBy::AiredEpisodeOrder
                     | ItemSortBy::Default
                     | ItemSortBy::Unrecognized(_)
             )
         }) {
-            rows.sort_by(|a, b| {
+            // `AiredEpisodeOrderComparer` positions episodes only, so the aired
+            // fields are read once per episode row; any other row has none.
+            let aired = filter
+                .order_by
+                .iter()
+                .any(|(by, _)| *by == ItemSortBy::AiredEpisodeOrder);
+            let episode = stored_type_name(BaseItemKind::Episode);
+            let mut keyed: Vec<Keyed> = rows
+                .into_iter()
+                .map(|row| {
+                    let key =
+                        (aired && Some(row.type_.as_str()) == episode).then(|| aired_order(&row));
+                    (key, row)
+                })
+                .collect();
+            let compare = |(a_aired, a): &Keyed, (b_aired, b): &Keyed| {
                 for (by, direction) in &filter.order_by {
                     let ordering = match by {
                         ItemSortBy::Name => {
@@ -467,6 +486,14 @@ impl FerrofinItemRepository {
                             Some(&folder_sort_name(a)),
                             Some(&folder_sort_name(b)),
                         ),
+                        // `AiredEpisodeOrderComparer.Compare`: a non-episode
+                        // sorts after every episode and equal to another one.
+                        ItemSortBy::AiredEpisodeOrder => match (a_aired, b_aired) {
+                            (Some(a), Some(b)) => a.compare(b),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        },
                         _ => continue,
                     };
                     let ordering = if *direction == SortOrder::Descending {
@@ -479,8 +506,16 @@ impl FerrofinItemRepository {
                     }
                 }
                 std::cmp::Ordering::Equal
-            });
-            return Ok(rows);
+            };
+            if aired {
+                // `LibraryManager.Sort`'s LINQ `OrderBy`/`ThenBy` is stable, and
+                // the comparer is not a total order, on which `sort_by` may
+                // panic: see `stable_sort_by`.
+                stable_sort_by(&mut keyed, compare);
+            } else {
+                keyed.sort_by(compare);
+            }
+            return Ok(keyed.into_iter().map(|(_, row)| row).collect());
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
@@ -13938,6 +13973,105 @@ mod folder_get_result_tests {
             .unwrap(),
             rows
         );
+    }
+    /// A folder listing sorted by `AiredEpisodeOrder` goes through
+    /// `LibraryManager.Sort` with `AiredEpisodeOrderComparer` upstream (LINQ
+    /// `OrderBy`, stable): episodes in aired order, a special placed by its
+    /// `AirsBeforeSeasonNumber`, and every non-episode after them, equal to
+    /// each other, so only a later key reorders them.
+    #[tokio::test]
+    async fn aired_episode_order_sorts_folder_children_with_the_comparer() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        async fn seed(
+            db: &Database,
+            kind: BaseItemKind,
+            name: &str,
+            sort_name: &str,
+            aired: Option<(i64, i64)>,
+            data: Option<&str>,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            seed_named_item(db, id, kind, name).await;
+            let mut row = crate::test_support::fetch_item(db, id).await;
+            row.sort_name = Some(sort_name.to_owned());
+            row.parent_index_number = aired.map(|(season, _)| season);
+            row.index_number = aired.map(|(_, episode)| episode);
+            row.data = data.map(str::to_owned);
+            crate::test_support::save_item(db, &row).await;
+            id
+        }
+        tokio::time::timeout(std::time::Duration::from_mins(1), async {
+            let db = test_db().await;
+            let repo = repository(&db);
+            let mut seeded = Vec::new();
+            for (kind, name, sort_name, aired, data) in [
+                (BaseItemKind::Movie, "M", "m", None, None),
+                (
+                    BaseItemKind::Episode,
+                    "S02E01",
+                    "002 - 0001 - b",
+                    Some((2, 1)),
+                    None,
+                ),
+                (
+                    BaseItemKind::Episode,
+                    "S00E01",
+                    "000 - 0001 - s",
+                    Some((0, 1)),
+                    Some(r#"{"AirsBeforeSeasonNumber":2}"#),
+                ),
+                (
+                    BaseItemKind::Episode,
+                    "S01E03",
+                    "001 - 0003 - c",
+                    Some((1, 3)),
+                    None,
+                ),
+                (BaseItemKind::Folder, "F", "f", None, None),
+            ] {
+                seeded.push(seed(&db, kind, name, sort_name, aired, data).await);
+            }
+            let rows = ordered_rows(&repo, &seeded).await;
+            assert_eq!(
+                rows[2].data.as_deref(),
+                Some(r#"{"AirsBeforeSeasonNumber":2}"#)
+            );
+            let sorted = |order_by: Vec<(ItemSortBy, SortOrder)>| {
+                let repo = &repo;
+                let rows = rows.clone();
+                async move {
+                    let query = InternalItemsQuery {
+                        order_by,
+                        ..Default::default()
+                    };
+                    let sorted = repo.sort_folder_children(rows, &query).await.unwrap();
+                    sorted
+                        .into_iter()
+                        .filter_map(|row| row.name)
+                        .collect::<Vec<_>>()
+                }
+            };
+            assert_eq!(
+                sorted(vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Ascending)]).await,
+                ["S01E03", "S00E01", "S02E01", "M", "F"]
+            );
+            // OrderByDescending keeps equal rows in input order too.
+            assert_eq!(
+                sorted(vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Descending)]).await,
+                ["M", "F", "S02E01", "S00E01", "S01E03"]
+            );
+            assert_eq!(
+                sorted(vec![
+                    (ItemSortBy::AiredEpisodeOrder, SortOrder::Ascending),
+                    (ItemSortBy::SortName, SortOrder::Ascending),
+                ])
+                .await,
+                ["S01E03", "S00E01", "S02E01", "F", "M"]
+            );
+        })
+        .await
+        .expect("test timed out");
     }
     #[tokio::test]
     async fn root_folder_preferences_apply_only_to_collection_folders_not_views_or_plugins() {
