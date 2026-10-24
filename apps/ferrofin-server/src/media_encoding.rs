@@ -639,32 +639,25 @@ impl AttachmentIo for FfmpegAttachmentIo {
         self.path_manager.attachment_folder_path(media_source_id)
     }
 
-    fn attachment_path(&self, media_source_id: &str, file_name: &str) -> String {
+    fn attachment_path(&self, media_source_id: &str, file_name: &str) -> Option<String> {
         // The path manager keeps a name's leaf and refuses a name with none
-        // (`..`, a trailing separator). Such a name came from the file's own
-        // `filename` tag, so it must never reach the command line as-is: fall
-        // back to a sanitized leaf inside the cache folder rather than the raw name.
+        // (`..`, a trailing separator); the extractor then falls back to the
+        // attachment's index, as upstream does.
         self.path_manager
             .attachment_path(media_source_id, file_name)
-            .or_else(|| {
-                let leaf: String = file_name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                self.path_manager
-                    .attachment_path(media_source_id, leaf.trim_matches('.'))
-            })
-            .unwrap_or_else(|| file_name.to_owned())
     }
 
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<(), String> {
+        match tokio::fs::remove_file(path).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("delete {path}: {error}"))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn create_directory(&self, path: &str) -> Result<(), String> {
@@ -1496,16 +1489,16 @@ mod tests {
     #[test]
     fn attachment_path_never_lets_a_traversal_file_name_leave_the_cache_folder() {
         // The name comes from the file's own `filename` tag; the path manager
-        // keeps only its leaf, and the fallback for a name with no leaf must
-        // stay inside the cache folder rather than hand the raw name to ffmpeg.
+        // keeps only its leaf, and a name with no leaf has no path at all (the
+        // extractor falls back to the attachment's index).
         let (_, paths) = config_and_paths();
         let io = FfmpegAttachmentIo {
             path_manager: Arc::new(ferrofin_core::path_manager::FerrofinPathManager::new(paths)),
         };
         let id = "d37ecb9d75b0c0a8e9ecb0a864ec670e";
         let folder = io.attachment_folder_path(id).expect("guid folder");
-        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf", "a/..", "a/"] {
-            let path = io.attachment_path(id, evil);
+        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf"] {
+            let path = io.attachment_path(id, evil).expect("a leaf");
             assert!(path.starts_with(&folder), "{evil} -> {path}");
             // A plain leaf: no separator after the folder, so `..` is inert.
             assert!(
@@ -1513,9 +1506,12 @@ mod tests {
                 "{evil} -> {path}"
             );
         }
+        for leafless in ["a/..", "a/", "..", ""] {
+            assert_eq!(io.attachment_path(id, leafless), None, "{leafless}");
+        }
         assert_eq!(
             io.attachment_path(id, "font.ttf"),
-            format!("{folder}/font.ttf")
+            Some(format!("{folder}/font.ttf"))
         );
     }
 
@@ -1851,10 +1847,10 @@ mod tests {
         );
         assert!(
             io.attachment_path("src", "font.ttf")
-                .ends_with("/src/font.ttf")
+                .is_some_and(|path| path.ends_with("/src/font.ttf"))
         );
 
-        // file_exists + read_file over a real temp file.
+        // file_exists + read_file + remove_file over a real temp file.
         let file = tmp.path().join("data.bin");
         assert!(!io.file_exists(&file.to_string_lossy()));
         std::fs::write(&file, b"hello").unwrap();
@@ -1864,6 +1860,11 @@ mod tests {
             b"hello"
         );
         assert!(io.read_file("/no/such/file").await.is_err());
+        io.remove_file(&file.to_string_lossy()).await.unwrap();
+        assert!(!io.file_exists(&file.to_string_lossy()));
+        // Already gone is not an error: the failed run may never have
+        // written it.
+        io.remove_file(&file.to_string_lossy()).await.unwrap();
     }
 
     /// The attachment dump spawns ffmpeg with exactly the argv the builder
