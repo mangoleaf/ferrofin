@@ -1549,27 +1549,12 @@ impl FerrofinStreamStatePlanner {
         // ---- input ------------------------------------------------------------
         // Seek to the segment start (`GetFastSeekCommandLineParameter`): the
         // playlist time its URL carries.
-        if let Some(seek_ticks) = state
-            .base_request
-            .start_time_ticks
-            .filter(|ticks| *ticks > 0)
-        {
-            // GetFastSeekCommandLineParameter clamps progressive seeks before
-            // EOF while JobLogger still uses the original requested offset.
-            let seek_ticks =
-                if progressive && state.run_time_ticks.is_some_and(|runtime| runtime > 0) {
-                    seek_ticks.clamp(
-                        0,
-                        state
-                            .run_time_ticks
-                            .unwrap_or_default()
-                            .saturating_sub(5 * TICKS_PER_SECOND)
-                            .max(0),
-                    )
-                } else {
-                    seek_ticks
-                };
-            let seek_ticks = seek_ticks.saturating_add(remux_seek_offset);
+        let input_seek_ticks = fast_seek_ticks(state, remux_seek_offset);
+        // A seek-restarted HLS segment's timestamps start at the input seek
+        // (see `-output_ts_offset` below and `text_subtitle_filter`). A seek
+        // clamped to the very start shifts nothing.
+        let segment_seek_ticks = input_seek_ticks.filter(|ticks| !progressive && *ticks > 0);
+        if let Some(seek_ticks) = input_seek_ticks {
             let ss = self.encoder.get_time_parameter(seek_ticks);
             push_split(&mut args, "-ss");
             push_split(&mut args, ss.trim_start_matches("-ss").trim());
@@ -1689,7 +1674,7 @@ impl FerrofinStreamStatePlanner {
         // (`negativeMapArgs + args + videoProcessParam`).
         let mut hw_graph: Option<(&'static str, String)> = None;
         if hw_filters {
-            let seek_offset = segment_seek_seconds(state, segment_id);
+            let seek_offset = segment_seek_ticks.map(round_to_whole_seconds);
             let sub_stream = state.subtitle_stream.as_ref().filter(|_| burn_sub);
             let (plain, alpha_sub2video) = sub_stream
                 .filter(|_| burn_text)
@@ -2086,7 +2071,7 @@ impl FerrofinStreamStatePlanner {
             // Downscale/tonemap ahead of the subtitle render, so the text is
             // drawn at output resolution in SDR.
             let mut chain = sw_filters.clone();
-            let offset_secs = segment_seek_seconds(state, segment_id);
+            let offset_secs = segment_seek_ticks.map(round_to_whole_seconds);
             chain.push(Self::text_subtitle_filter(
                 state,
                 sub,
@@ -2272,13 +2257,13 @@ impl FerrofinStreamStatePlanner {
         // time from the output PTS, so segment N would carry PTS ~0 instead of
         // its playlist time — the player then sees a discontinuity across the
         // seek boundary and stalls. Shift the output timestamps forward by that
-        // same seek time (a remux's half second included), so they keep the
-        // source's timeline and hls.js can splice the segment in. (Not
-        // `-copyts`, which preserves the source's arbitrary start offset and
-        // desyncs the muxer's segment numbering.)
-        if let Some(ticks) = segment_seek_ticks(state, segment_id) {
+        // same seek time (a remux's half second and the end-of-file clamp
+        // included), so they keep the source's timeline and hls.js can splice
+        // the segment in. (Not `-copyts`, which preserves the source's
+        // arbitrary start offset and desyncs the muxer's segment numbering.)
+        if let Some(ticks) = segment_seek_ticks {
             push_split(&mut args, "-output_ts_offset");
-            args.push(seconds_from_ticks(ticks.saturating_add(remux_seek_offset)));
+            args.push(seconds_from_ticks(ticks));
         }
         push_split(&mut args, "-hls_segment_filename");
         args.push(format!("{dir}/{stem}%d.{ext}"));
@@ -2394,18 +2379,25 @@ fn opus_sample_rate(rate: i32) -> i32 {
     }
 }
 
-/// Where a seeked segment's transcode starts, in ticks: its playlist time
-/// (see `start_time_ticks` in the plan). `None` for segment 0, the playlist
-/// build and progressive streams.
-fn segment_seek_ticks(state: &EncodingJobInfo, segment_id: Option<i32>) -> Option<i64> {
-    segment_id
-        .and(state.base_request.start_time_ticks)
-        .filter(|ticks| *ticks > 0)
-}
-
-/// [`segment_seek_ticks`] in whole seconds (see [`round_to_whole_seconds`]).
-fn segment_seek_seconds(state: &EncodingJobInfo, segment_id: Option<i32>) -> Option<i64> {
-    segment_seek_ticks(state, segment_id).map(round_to_whole_seconds)
+/// Where the input seek lands, in ticks, or `None` when the job starts at the
+/// beginning. Port of `GetFastSeekCommandLineParameter`'s arithmetic.
+///
+/// The requested start (`start_time_ticks`: a segment's playlist time, or a
+/// progressive stream's offset) plus `remux_offset` (an HLS remux's half
+/// second), clamped to `[0, runtime − 5 s]` whenever the runtime is known,
+/// for every job type: "seeking beyond EOF makes no sense in transcoding".
+/// The 5 s is upstream's fixed `50000000L`. The request keeps the unclamped
+/// value, which is what the job logs report.
+fn fast_seek_ticks(state: &EncodingJobInfo, remux_offset: i64) -> Option<i64> {
+    let time = state
+        .base_request
+        .start_time_ticks
+        .filter(|ticks| *ticks > 0)?;
+    let seek = time.saturating_add(remux_offset);
+    Some(match state.run_time_ticks.filter(|runtime| *runtime > 0) {
+        Some(runtime) => seek.clamp(0, runtime.saturating_sub(5 * TICKS_PER_SECOND).max(0)),
+        None => seek,
+    })
 }
 
 /// Positive `ticks` in whole seconds, rounded half to even as upstream's
@@ -5274,6 +5266,111 @@ mod tests {
             .find(|w| w[0] == "-output_ts_offset")
             .map(|w| w[1].as_str());
         assert_eq!(offset, ts_offset, "{:?}", plan.arguments);
+    }
+
+    /// `GetFastSeekCommandLineParameter` clamps every seek to `[0, runtime −
+    /// 5 s]`, HLS segments included, after the remux's half second. The
+    /// timestamps follow the clamped seek, so the segment keeps the source's
+    /// timeline: the output offset and the burned-in subtitle's clock both
+    /// name where the input really starts.
+    #[rstest::rstest]
+    #[case::hls_remux(true, None)]
+    #[case::hls_transcode(false, None)]
+    #[case::hls_text_burn_in(false, Some(2))]
+    #[tokio::test]
+    async fn an_hls_seek_into_the_last_five_seconds_starts_five_seconds_before_the_end(
+        #[case] copy_allowed: bool,
+        #[case] subtitle: Option<i32>,
+    ) {
+        // 90 minutes: the last seekable tick is 5395 s.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = copy_allowed;
+        req.current_runtime_ticks = 5398 * TICKS_PER_SECOND;
+        if let Some(index) = subtitle {
+            req.subtitle_stream_index = Some(index);
+            req.subtitle_method = Some("Encode".to_owned());
+        }
+
+        let plan = p
+            .plan(&req, false, Some(1799), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            args.windows(2).any(|w| w == ["-c:v", "copy"]),
+            copy_allowed,
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-ss", "53950000000"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-output_ts_offset", "5395"]),
+            "{args:?}"
+        );
+        // The request still names the segment's own playlist time.
+        assert_eq!(
+            plan.state.base_request.start_time_ticks,
+            Some(5398 * TICKS_PER_SECOND)
+        );
+        if subtitle.is_some() {
+            let vf = args
+                .iter()
+                .position(|a| a == "-vf")
+                .map(|i| args[i + 1].as_str())
+                .expect("-vf present");
+            assert!(
+                vf.starts_with("setpts=PTS+5395/TB,") && vf.ends_with(",setpts=PTS-5395/TB"),
+                "{vf}"
+            );
+        }
+    }
+
+    /// `GetFastSeekCommandLineParameter`'s arithmetic: the remux offset is
+    /// added first, the clamp needs a known runtime, and a file shorter than
+    /// the 5 s margin seeks to its start.
+    #[rstest::rstest]
+    #[case::no_start(None, Some(100), 0, None)]
+    #[case::in_range(Some(10), Some(100), 0, Some(10 * TICKS_PER_SECOND))]
+    #[case::remux_in_range(Some(10), Some(100), HLS_REMUX_SEEK_OFFSET_TICKS, Some(105_000_000))]
+    #[case::remux_past_the_margin(
+        Some(95),
+        Some(100),
+        HLS_REMUX_SEEK_OFFSET_TICKS,
+        Some(95 * TICKS_PER_SECOND)
+    )]
+    #[case::past_the_end(Some(200), Some(100), 0, Some(95 * TICKS_PER_SECOND))]
+    #[case::shorter_than_the_margin(Some(2), Some(3), 0, Some(0))]
+    #[case::unknown_runtime(Some(200), None, 0, Some(200 * TICKS_PER_SECOND))]
+    #[case::zero_runtime(Some(200), Some(0), 0, Some(200 * TICKS_PER_SECOND))]
+    #[tokio::test]
+    async fn fast_seek_ticks_clamps_the_offset_seek_before_the_end(
+        #[case] start_secs: Option<i64>,
+        #[case] runtime_secs: Option<i64>,
+        #[case] remux_offset: i64,
+        #[case] expected: Option<i64>,
+    ) {
+        let p = planner(vec![source("abc", vec![video_stream("h264")])]);
+        let mut state = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .state;
+        state.base_request.start_time_ticks = start_secs.map(|s| s * TICKS_PER_SECOND);
+        state.run_time_ticks = runtime_secs.map(|s| s * TICKS_PER_SECOND);
+        assert_eq!(fast_seek_ticks(&state, remux_offset), expected);
     }
 
     #[rstest::rstest]
