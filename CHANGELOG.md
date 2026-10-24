@@ -395,6 +395,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - A Live TV stream that a client's start and progress reports never named is closed by its stop
   report or by the teardown of its abandoned transcode, as Jellyfin does, instead of holding the
   tuner until a restart
+- The playlists folder is made only at startup, as Jellyfin does, instead of being looked for
+  again, with a rule of its own, on every `GET /Library/MediaFolders` and Folders view request
 
 ## [1.0.0] - 2026-09-05
 
