@@ -238,6 +238,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
   Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
   file converted to ASS does not get Jellyfin's style conversion yet
+- `GET /Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists` and the
+  genre facet of `GET /Items/Filters2` filter their content by kind as Jellyfin's query does. An `includeItemTypes` of only Live TV
+  kinds with no stored rows (`Program`, `Recording`, `ChannelFolderItem`) lists nothing; it
+  listed every value. `excludeItemTypes` counts only when no kind is included, so naming
+  one kind in both lists answers that kind instead of nothing
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

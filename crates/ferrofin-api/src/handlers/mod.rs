@@ -1000,7 +1000,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery, \
                project_query_result) → ferrofin-core item_repository.rs get_artists \
                (item_values_with_counts, item_counts_by_clean_name)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1011,7 +1011,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetAlbumArtists",
         ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_album_artists (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1023,7 +1023,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
                get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1034,7 +1034,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetMusicGenres",
         ferrofin: "handlers/music_genres.rs get_music_genres → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1045,7 +1045,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetStudios",
         ferrofin: "handlers/studios.rs get_studios → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_studios (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
