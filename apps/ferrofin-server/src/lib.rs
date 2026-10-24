@@ -772,7 +772,7 @@ async fn serve_until_drained(
 }
 
 /// The lifetime's router behind the path-case, HTTPS-redirect and base-URL
-/// rewrites, which run before routing.
+/// rewrites, which run before routing, and the panic boundary.
 fn lifetime_app(
     router: axum::Router,
     base: &str,
@@ -782,6 +782,12 @@ fn lifetime_app(
     // Inside the base URL mount, as Jellyfin's `UseHttpsRedirection` is.
     let app =
         axum::middleware::from_fn_with_state(https_redirect, tls::redirect_to_https).layer(app);
+    // Jellyfin's `ExceptionMiddleware` comes first inside the base URL mount.
+    // The API router answers its own panics, so this one is the backstop for
+    // what is mounted beside it (the web client, File Transformation,
+    // `/metrics`) and the rewrites above it.
+    let app =
+        axum::middleware::from_fn(ferrofin_api::panic_boundary::panic_boundary_layer).layer(app);
     let app = axum::middleware::from_fn_with_state(base_url::normalize(base), base_url::rewrite)
         .layer(app);
     axum::Router::new().fallback_service(app)
@@ -1388,6 +1394,108 @@ mod tests {
             response.ends_with(&format!("peer=127.0.0.1 local={address}")),
             "{response}"
         );
+    }
+
+    /// A panic in what the server mounts beside the API router (the web client,
+    /// File Transformation, `/metrics`), here a test-local route, gets the same
+    /// `500` the router's own boundary answers, inside the base URL mount. A
+    /// panic the router's boundary answered reaches this one as an ordinary
+    /// `500`, so either way it is logged once.
+    #[rstest::rstest]
+    #[case::beside_the_router(false)]
+    #[case::inside_the_router(true)]
+    #[tokio::test]
+    async fn lifetime_app_answers_a_panic_with_500(#[case] router_boundary: bool) {
+        use axum::http::header::CONTENT_TYPE;
+
+        const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        async fn exploding() -> &'static str {
+            panic!("the mounted route exploded")
+        }
+        let logs = crate::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let mut router = Router::new().route("/boom", axum::routing::get(exploding));
+        if router_boundary {
+            router = router.layer(axum::middleware::from_fn(
+                ferrofin_api::panic_boundary::panic_boundary_layer,
+            ));
+        }
+        let app = super::lifetime_app(router, "/jellyfin", None);
+        let response = tokio::time::timeout(
+            ANSWER_TIMEOUT,
+            app.oneshot(
+                Request::builder()
+                    .uri("/jellyfin/boom")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("answered in time")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/plain");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Error processing request.");
+        let logged: Vec<String> = logs
+            .lines_at("ERROR")
+            .into_iter()
+            .filter(|line| line.contains("Error processing request"))
+            .collect();
+        assert_eq!(logged.len(), 1, "logged once: {}", logs.text());
+        assert!(logged[0].contains("url.path=/boom "), "{}", logged[0]);
+    }
+
+    /// Over a real connection the panic is answered and the connection lives
+    /// on: the next request on it is served, where the panic used to reset it.
+    #[tokio::test]
+    async fn a_panic_leaves_its_connection_serving() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        async fn exploding() -> &'static str {
+            panic!("the mounted route exploded")
+        }
+        let listener = super::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
+        let address = axum::serve::Listener::local_addr(&listener).expect("local address");
+        let router = Router::new()
+            .route("/boom", axum::routing::get(exploding))
+            .route("/after", axum::routing::get(|| async { "still serving" }));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(super::serve_until_drained(
+            vec![crate::listen::ServedListener::Plain(listener)],
+            router,
+            async move {
+                let _ = stopped.await;
+            },
+            1,
+            "",
+            None,
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                b"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n\
+                  GET /after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("requests");
+        let mut response = String::new();
+        tokio::time::timeout(ANSWER_TIMEOUT, stream.read_to_string(&mut response))
+            .await
+            .expect("answered in time")
+            .expect("responses");
+        let _ = stop.send(());
+        server.await.expect("join").expect("serve");
+
+        assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+        assert!(response.contains("Error processing request."), "{response}");
+        assert!(response.ends_with("still serving"), "{response}");
     }
 
     #[test]

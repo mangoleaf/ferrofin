@@ -618,7 +618,8 @@ async fn get_items(
         internal.user_root_children = false;
     }
 
-    let result = state.library.query_items(&internal).await?;
+    let mut result = state.library.query_items(&internal).await?;
+    sort_items_by_request(&internal, &mut result.items);
     // The requested `Fields` plus the four image/user-data toggles (an
     // `EnableImageTypes=Primary,Backdrop` browse must not answer with a
     // `Logo` tag, and `ImageTypeLimit=1` caps the backdrops).
@@ -747,6 +748,28 @@ pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
             .order_by
             .insert(0, (ItemSortBy::SortName, SortOrder::Ascending));
     }
+}
+
+/// Puts an explicit-ids page back in the order its ids were requested.
+///
+/// v12.2 `Folder.GetItems` (Folder.cs:1065-1083), where `GetItems` sends
+/// explicit ids (ItemsController.cs:591-595): with no `OrderBy` and more than
+/// one id, the repository's page is ordered by `Array.IndexOf(ItemIds, id)`,
+/// a stable sort in which a row whose id was not asked for (`-1`) comes first.
+/// Only the page is reordered; the start index and total stay as they are.
+/// `order_by` is the request's, so `sortBy=Default` still counts as a sort
+/// (the repository drops it later). A search already leads its keys with
+/// `SortName` ([`order_search_by_sort_name`]), standing in for the score sort
+/// upstream applies after this one, so it keeps that order.
+pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
+    if !query.order_by.is_empty() || query.item_ids.len() <= 1 {
+        return;
+    }
+    items.sort_by_cached_key(|row| {
+        Uuid::parse_str(&row.id)
+            .ok()
+            .and_then(|id| ferrofin_util::read_only_list_extension::index_of(&query.item_ids, &id))
+    });
 }
 
 /// Convert HTTP query fields once, retaining the resolved user for DTO projection.
@@ -2539,6 +2562,52 @@ mod tests {
         let resume: ResumeQuery =
             serde_urlencoded::from_str("excludeActiveSessions=true").expect("parses");
         assert_eq!(resume.exclude_active_sessions, Some(true));
+    }
+
+    /// `SortItemsByRequest` (v12.2 Folder.cs:1065-1083): an unsorted request
+    /// for more than one id answers in the request's order, stably, a row by
+    /// the first position of its id, and a row whose id was not asked for
+    /// (`Array.IndexOf` = -1) first. Any requested sort, `Default` included,
+    /// and a single id keep the repository's order.
+    #[test]
+    fn sort_items_by_request_restores_the_requested_id_order() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        let [a, b, c, unasked] = [1, 2, 3, 4].map(Uuid::from_u128);
+        let sorted = |item_ids: &[Uuid], order_by: &[(ItemSortBy, SortOrder)], rows: &[Uuid]| {
+            let query = InternalItemsQuery {
+                item_ids: item_ids.to_vec(),
+                order_by: order_by.to_vec(),
+                ..InternalItemsQuery::default()
+            };
+            let mut items: Vec<BaseItemEntity> = rows
+                .iter()
+                .map(|id| crate::test_support::minimal_base_item(*id, "Item", "Movie"))
+                .collect();
+            sort_items_by_request(&query, &mut items);
+            items
+                .iter()
+                .map(|row| Uuid::parse_str(&row.id).expect("id"))
+                .collect::<Vec<_>>()
+        };
+        // The repository's `SortName` order becomes the request's.
+        assert_eq!(sorted(&[c, a, b], &[], &[a, b, c]), [c, a, b]);
+        for order_by in [ItemSortBy::Default, ItemSortBy::SortName] {
+            assert_eq!(
+                sorted(&[c, a, b], &[(order_by, SortOrder::Ascending)], &[a, b, c]),
+                [a, b, c],
+                "{order_by:?}"
+            );
+        }
+        // `ItemIds.Length > 1`: a single id is left as the repository had it.
+        assert_eq!(sorted(&[a], &[], &[a, unasked]), [a, unasked]);
+        // A repeated id sorts by its first position.
+        assert_eq!(sorted(&[c, a, c, b], &[], &[a, b, c]), [c, a, b]);
+        // Unasked rows lead, and rows tied on a position keep their order.
+        assert_eq!(
+            sorted(&[c, a], &[], &[a, c, unasked, b]),
+            [unasked, b, c, a]
+        );
     }
 
     /// The delete's task runs inside the request's span, so its logs and

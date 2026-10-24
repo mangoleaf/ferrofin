@@ -111,7 +111,8 @@ fn playlist_generator(
 /// stream no session still wants (`ISessionManager.CloseLiveStreamIfNeededAsync`).
 #[async_trait]
 trait LiveStreamReleaser: Send + Sync {
-    /// Closes `live_stream_id` unless another session is still using it.
+    /// Releases `session_id`'s hold on `live_stream_id`, closing the stream
+    /// once no session holds it, or at once when no session registered it.
     async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError>;
 
     /// Publishes a starting job's details against `device_id`.

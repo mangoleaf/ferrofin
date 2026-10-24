@@ -982,11 +982,10 @@ pub async fn build_app_state(
     // library's locations).
     // The playlists media folder lives at `{data}/playlists` (stored as
     // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
-    // `GetClientTypeName()`). Both seams need the path: the user-root store
-    // provisions the folder, and the virtual-folder manager reports it among
-    // the root's physical locations (`LibraryManager.CreateRootFolder` adds it
-    // as a virtual child of the root, so `GET /Library/PhysicalPaths` lists
-    // it).
+    // `GetClientTypeName()`). `aggregate_store.ensure()` above provisioned it;
+    // the virtual-folder manager reports it among the root's physical
+    // locations (`LibraryManager.CreateRootFolder` adds it as a virtual child
+    // of the root, so `GET /Library/PhysicalPaths` lists it).
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
     // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
     // `Items/Root` resolves to and the parent of every library's
@@ -1009,7 +1008,7 @@ pub async fn build_app_state(
             .with_physical_root(db.clone(), root_folder_ids.aggregate)
             .with_user_preferences(db.clone(), Arc::clone(&auth_cache))
             .with_id_derivation(id_derivation.clone())
-            .with_playlists_path(playlists_path.clone())
+            .with_playlists_path(playlists_path)
             .with_user_root(user_root_store.clone())
             .with_scan_progress(scan_progress.clone())
             .with_virtual_paths(virtual_paths.clone())
@@ -1211,10 +1210,9 @@ pub async fn build_app_state(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_dashboard_configuration(Arc::clone(&config_trait), Arc::clone(&localization))
             .with_visibility(Arc::clone(&item_visibility))
-            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
-            // The provisioned row's parent is the `AggregateFolder`, the way
-            // `CreateRootFolder` parents it.
-            .with_root_folder_path(paths.root_folder_path())
+            // The playlists folder it lists is `aggregate_store.ensure()`'s,
+            // made once above, as `CreateRootFolder` makes it once per process.
+            .with_item_store(Arc::clone(&item_persistence_service))
             // Settles the `UserRootFolder` row on the first
             // `GET /Library/MediaFolders`, memoized by the store.
             .with_user_root(user_root_store.clone())

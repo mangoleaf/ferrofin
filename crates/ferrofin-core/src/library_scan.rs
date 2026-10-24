@@ -4812,7 +4812,7 @@ impl LibraryScanner {
             .unwrap_or_else(|panic| {
                 Err(ServiceError::backend(format!(
                     "item refresh panicked: {}",
-                    panic_message(panic.as_ref())
+                    ferrofin_util::panic::message(panic.as_ref())
                 )))
             });
             // The refresh may have written anywhere under its paths (artwork,
@@ -19242,15 +19242,6 @@ impl<'a> PathRoots<'a> {
                 .ancestors()
                 .any(|dir| dir.to_str().is_some_and(|dir| self.0.contains(dir)))
     }
-}
-
-/// A caught panic's message, for the error its waiters get.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-    panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("no message")
 }
 
 /// Whether `path` equals `root` or lies underneath it (component-boundary
