@@ -29,11 +29,9 @@
 //! each change to a playlist FILE, has no caller here: ordering lives in the
 //! linked-children rows.
 //!
-//! Deferred (documented, per the unit-8 minimal-manager rule):
-//! - entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
-//!   entry-id strings) is approximated by the child item id;
-//! - the collections **folder** (`GetCollectionsFolder`) resolution needs the
-//!   user-view tree and returns `None` here.
+//! A playlist entry id is its item's id as a lower-case `Guid('N')`, as v12.2's
+//! `GetPlaylistItems` and `RemoveItemFromPlaylistAsync`/`MoveItemAsync`
+//! address entries (`ItemId?.ToString("N")`).
 
 use std::sync::Arc;
 
@@ -1673,8 +1671,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), ServiceError> {
-        // Entry ids are approximated by the child item id (see module docs). The
-        // wire form is a lower-case `Guid('N')` (`GetPlaylistItems`' `ItemId?
+        // An entry id is the child item id (see module docs). The wire form is
+        // a lower-case `Guid('N')` (`GetPlaylistItems`' `ItemId?
         // .ToString("N")`), but `ChildId` is stored in the canonical dashed
         // uppercase form. Parse and re-format via `guid_to_db` to
         // normalise back to the stored form; skip any entry id that isn't a

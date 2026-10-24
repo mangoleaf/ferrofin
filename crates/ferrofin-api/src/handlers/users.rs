@@ -25,13 +25,17 @@
 //!   [`AuthenticationResultData`] (session DTO + minted access token), which the
 //!   handler assembles into the wire [`AuthenticationResult`] — the client gets a
 //!   real `AccessToken` to present on subsequent requests.
-//! - The `[Authorize(Policy = …)]` gates (`RequiresElevation` /
-//!   `IgnoreParentalControl`) are not enforced by a policy middleware here; the
-//!   in-body admin guards the C# controller itself applies (last-admin,
-//!   disable-admin, "may this caller update this user") are ported faithfully via
-//!   [`is_administrator`].
-//! - `ServerId` (a client-cosmetic display field) is left unset: sourcing it
-//!   needs `IApplicationHost.SystemId`, which is not exposed at this layer.
+//! - The `[Authorize]` attributes are extractors: `Policy = RequiresElevation` is
+//!   [`RequireAdmin`], `Policy = IgnoreParentalControl` is
+//!   [`RequireAuthIgnoringSchedule`], and a plain `[Authorize]` is
+//!   [`RequireAuth`]. The guards the C# controller applies itself ("may this
+//!   caller update this user", the last administrator, an administrator
+//!   disabled, the last enabled user) are ported too; the policy ones run
+//!   inside the save
+//!   ([`UserManager::update_policy_guarded`](ferrofin_traits::library::UserManager::update_policy_guarded)).
+//! - `ServerId` is the server's system id: the user manager sets it on every
+//!   `UserDto` it builds, and the authentication result takes it from the
+//!   session.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
