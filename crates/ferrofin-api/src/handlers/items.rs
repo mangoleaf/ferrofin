@@ -312,6 +312,48 @@ struct ItemsQuery {
     /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
     #[serde(default, rename = "is3D")]
     is_3d: Option<bool>,
+    /// Restrict to missing (virtual) episodes, or exclude them.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_missing: Option<bool>,
+    /// Restrict to episodes not aired yet, or exclude them.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_unaired: Option<bool>,
+    /// Restrict to Live TV news programs (or exclude them).
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_news: Option<bool>,
+    /// Restrict to Live TV kids programs (or exclude them).
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_kids: Option<bool>,
+    /// Restrict to Live TV sports programs (or exclude them).
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_sports: Option<bool>,
+    /// The minimum width of the item. The four dimension bounds bind as
+    /// plain integers: an empty value is a 400, where ASP.NET binds null.
+    #[serde(default)]
+    min_width: Option<i32>,
+    /// The maximum width of the item.
+    #[serde(default)]
+    max_width: Option<i32>,
+    /// The minimum height of the item.
+    #[serde(default)]
+    min_height: Option<i32>,
+    /// The maximum height of the item.
+    #[serde(default)]
+    max_height: Option<i32>,
+    /// The minimum last-saved date, bound as `ItemsController`'s `DateTime`
+    /// and converted to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    min_date_last_saved: Option<DateTime<Utc>>,
+    /// The minimum last-saved date of the caller's user data, bound and
+    /// converted like `minDateLastSaved`.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    min_date_last_saved_for_user: Option<DateTime<Utc>>,
     /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
     #[serde(default)]
     is_locked: Option<bool>,
@@ -747,6 +789,17 @@ fn items_query_options(
         is_4k: query.is_4k,
         is_hd: query.is_hd,
         is_3d: query.is_3d,
+        is_missing: query.is_missing,
+        is_unaired: query.is_unaired,
+        is_news: query.is_news,
+        is_kids: query.is_kids,
+        is_sports: query.is_sports,
+        min_width: query.min_width,
+        max_width: query.max_width,
+        min_height: query.min_height,
+        max_height: query.max_height,
+        min_date_last_saved: query.min_date_last_saved,
+        min_date_last_saved_for_user: query.min_date_last_saved_for_user,
         is_locked: query.is_locked,
         has_overview: query.has_overview,
         has_imdb_id: query.has_imdb_id,
@@ -2201,20 +2254,9 @@ mod tests {
         "albums",
         "artists",
         "hasOfficialRating",
-        "isKids",
-        "isMissing",
-        "isNews",
         "isPlaceHolder",
-        "isSports",
-        "isUnaired",
-        "maxHeight",
         "maxOfficialRating",
-        "maxWidth",
-        "minDateLastSaved",
-        "minDateLastSavedForUser",
-        "minHeight",
         "minOfficialRating",
-        "minWidth",
         "personTypes",
         "seriesStatus",
         "studios",
@@ -2282,6 +2324,74 @@ mod tests {
         let internal = bind("audioLanguages=eng&AudioLanguages=ger");
         assert_eq!(internal.audio_languages, ["eng", "ger"]);
         assert!(internal.subtitle_languages.is_empty());
+    }
+
+    /// The filters `TranslateQuery` already applies reach it from the URL
+    /// (v12 `ItemsController.GetItems`: `IsMissing`, `IsUnaired`, `IsNews`,
+    /// `IsKids`, `IsSports`, the four dimension bounds, and the two
+    /// `MinDateLastSaved` bounds `?.ToUniversalTime()`).
+    #[test]
+    fn items_query_binds_the_translated_filters() {
+        let Query(query) = Query::<ItemsQuery>::try_from_uri(
+            &"/Items?isMissing=false&isUnaired=true&isNews=true&isKids=false&isSports=true\
+              &minWidth=640&maxWidth=1920&minHeight=360&maxHeight=1080\
+              &minDateLastSaved=2026-01-02T03:04:05Z&minDateLastSavedForUser=2026-02-03T04:05:06Z"
+                .parse()
+                .expect("uri"),
+        )
+        .expect("binds");
+        let internal =
+            items_query_options(&query, crate::test_support::sample_user()).expect("maps");
+        assert_eq!(
+            (internal.is_missing, internal.is_unaired),
+            (Some(false), Some(true))
+        );
+        assert_eq!(
+            (internal.is_news, internal.is_kids, internal.is_sports),
+            (Some(true), Some(false), Some(true))
+        );
+        assert_eq!(
+            (
+                internal.min_width,
+                internal.max_width,
+                internal.min_height,
+                internal.max_height
+            ),
+            (Some(640), Some(1920), Some(360), Some(1080))
+        );
+        assert_eq!(
+            internal.min_date_last_saved.map(|d| d.to_rfc3339()),
+            Some("2026-01-02T03:04:05+00:00".to_owned())
+        );
+        assert_eq!(
+            internal
+                .min_date_last_saved_for_user
+                .map(|d| d.to_rfc3339()),
+            Some("2026-02-03T04:05:06+00:00".to_owned())
+        );
+    }
+
+    /// ASP.NET binding of the new filters: a bool binds trimmed and ignoring
+    /// case, an empty one is null, a malformed one is a 400; an offset date
+    /// is converted to UTC.
+    #[test]
+    fn the_translated_filters_bind_like_asp_net() {
+        let bind = |q: &str| {
+            Query::<ItemsQuery>::try_from_uri(&format!("/Items?{q}").parse().expect("uri"))
+                .map(|Query(query)| query)
+        };
+        let query = bind("isMissing=%20FALSE%20&isUnaired=&isKids=True").expect("binds");
+        assert_eq!(
+            (query.is_missing, query.is_unaired, query.is_kids),
+            (Some(false), None, Some(true))
+        );
+        assert!(bind("isSports=maybe").is_err());
+        assert!(bind("minWidth=wide").is_err());
+        let query = bind("minDateLastSaved=2026-01-02T05:04:05%2B02:00").expect("binds");
+        assert_eq!(
+            query.min_date_last_saved.map(|d| d.to_rfc3339()),
+            Some("2026-01-02T03:04:05+00:00".to_owned())
+        );
     }
 
     /// v12 ItemsController.cs:462-474: a language list beside `hasSubtitles`.

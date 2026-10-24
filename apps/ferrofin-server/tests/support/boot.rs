@@ -7,7 +7,7 @@ use std::time::Duration;
 use ferrofin_server::config::Config;
 
 /// How long a server gets to bind and finish booting: the admin seed hashes a
-/// password before the listener opens, so "booting" is seconds of CPU, and a
+/// password before the server is ready, so "booting" is seconds of CPU, and a
 /// poll budget sized for a quiet laptop is exactly what fails on a loaded
 /// runner.
 pub const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
@@ -63,11 +63,6 @@ pub async fn is_up(client: &reqwest::Client, base: &str, name: &str) -> bool {
 /// config carries it. If the port went to somebody else between the probe and
 /// the bind, `run` returns an address-in-use error once it reaches the bind;
 /// take another port rather than poll one that now belongs to another test.
-///
-/// ponytail: a retried boot with `enable_metrics` serves `/metrics` without its
-/// `http_*` and scan series, because `run` installs the process-global
-/// instruments before it binds and the lost attempt's provider took them;
-/// binding before the metrics pipeline would fix it, if a test ever trips it.
 pub async fn spawn_server(
     client: &reqwest::Client,
     make_config: impl Fn(u16) -> Config,

@@ -94,8 +94,39 @@ pub fn is_contained_in(root: &str, candidate: &str) -> bool {
     candidate_str.starts_with(&root_with_sep)
 }
 
+/// The invalid path characters `ManagedFileSystem.GetValidFilename` replaces:
+/// `ManagedFileSystem._invalidPathCharacters`, `"` `<` `>` `|` the control
+/// characters 0–31, `:` `*` `?` `\` and `/`.
+fn is_invalid_path_character(c: char) -> bool {
+    matches!(c, '"' | '<' | '>' | '|' | ':' | '*' | '?' | '\\' | '/') || u32::from(c) <= 31
+}
+
+/// Port of `ManagedFileSystem.GetValidFilename`: every invalid path character
+/// replaced by a space, nothing trimmed. Callers trim as their upstream caller
+/// does (`AddVirtualFolder` trims first, the DVR paths after).
+#[must_use]
+pub fn get_valid_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|c| if is_invalid_path_character(c) { ' ' } else { c })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// `ManagedFileSystemTests.GetValidFilename_ReturnsValidFilename`, plus the
+    /// control characters upstream's array lists.
+    #[rstest::rstest]
+    #[case("ValidFileName", "ValidFileName")]
+    #[case("AC/DC", "AC DC")]
+    #[case("Invalid\0", "Invalid ")]
+    #[case("AC/DC\0KD/A", "AC DC KD A")]
+    #[case("a\tb\nc\u{1f}d", "a b c d")]
+    #[case("\"<>|:*?\\/", "         ")]
+    fn get_valid_filename_replaces_invalid_characters(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(super::get_valid_filename(name), expected);
+    }
+
     use super::*;
     use rstest::rstest;
     use std::env::temp_dir;

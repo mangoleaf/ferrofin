@@ -35,7 +35,7 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// Fails when the database read fails.
 pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
                          WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsMovie" = 1) AS "IsMovie",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p

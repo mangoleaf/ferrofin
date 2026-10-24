@@ -36,6 +36,10 @@ pub struct EpgChannel {
     pub name: String,
     /// The guide's channel number, or [`id`](Self::id) when it carries none.
     pub number: String,
+    /// The guide's channel logo (an XMLTV `<icon src>`, a Schedules Direct
+    /// station's logo), which `ListingsManager.AddMetadata` gives a tuner
+    /// channel matched to it.
+    pub image_url: Option<String>,
 }
 
 /// One channel of a tuner host's lineup, as the matcher needs it.
@@ -368,6 +372,7 @@ mod tests {
 
     fn epg(id: &str, name: &str, number: &str) -> EpgChannel {
         EpgChannel {
+            image_url: None,
             id: id.to_owned(),
             name: name.to_owned(),
             number: number.to_owned(),

@@ -256,6 +256,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   key is a 404, as in Jellyfin (it was a 501, or a file a save had left behind), and saving one
   fails as Jellyfin's does instead of writing a file. `database` reads as the SQLite provider
   Ferrofin runs on, and saving it is refused (400), since no other provider can be used
+- `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
+  every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
 - `GET /Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists` and the
   genre facet of `GET /Items/Filters2` filter their content by kind as Jellyfin's query
   does. An `includeItemTypes` of only Live TV kinds with no stored rows (`Program`,
@@ -280,6 +282,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
+  carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
+  had already run, and cleared it, so a user with a maximum parental rating saw those episodes
+  in lists, counts, Latest, Resume and Next Up until the next full library scan
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
@@ -385,6 +391,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   instead of on every request. One that exists but cannot be read answers 500 instead of
   reading as the defaults, and so does saving the encoding settings over it, so a save cannot
   replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
+- The server opens its HTTP port as soon as it starts, before it adopts or migrates the
+  database (after a scheduled backup restore), and answers while it does, as Jellyfin's
+  startup server does:
+  `/health/live` 200, `/health/ready` 503, `/health` `Degraded`, every other request 503 with
+  `Retry-After` and a "starting" page. Before, the port stayed closed until boot finished,
+  so a long adoption could outlast the chart's startup probe and be restarted in a loop.
+  Boot stages are now logged at `info`
 
 ## [1.0.0] - 2026-09-05
 

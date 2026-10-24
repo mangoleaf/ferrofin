@@ -333,9 +333,10 @@ pub(crate) async fn insert_named_item(
     name: &str,
     is_folder: bool,
     container: Option<Uuid>,
+    is_locked: bool,
 ) -> Result<BaseItemEntity, ServiceError> {
     let mut conn = db.writer().acquire().await.map_err(db_err)?;
-    insert_named_item_in(&mut conn, id, kind, name, is_folder, container).await?;
+    insert_named_item_in(&mut conn, id, kind, name, is_folder, container, is_locked).await?;
     drop(conn);
     sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
@@ -346,6 +347,9 @@ pub(crate) async fn insert_named_item(
 
 /// `insert_named_item`'s insert on a connection the caller holds, normally
 /// a writer transaction that commits the rest of the item with it.
+/// `is_locked` stamps the `IsLocked` column, the way `CreateCollectionAsync`
+/// sets `IsLocked = options.IsLocked`; callers that create an always-unlocked
+/// row (playlists, the auto-provisioned folders) pass `false`.
 pub(crate) async fn insert_named_item_in(
     conn: &mut sqlx::SqliteConnection,
     id: Uuid,
@@ -353,6 +357,7 @@ pub(crate) async fn insert_named_item_in(
     name: &str,
     is_folder: bool,
     container: Option<Uuid>,
+    is_locked: bool,
 ) -> Result<(), ServiceError> {
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
@@ -391,7 +396,7 @@ pub(crate) async fn insert_named_item_in(
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
             "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName",
             "DateCreated", "DateModified", "DateLastSaved")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9)"#,
+           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -409,6 +414,7 @@ pub(crate) async fn insert_named_item_in(
     ))
     .bind(crate::text_util::get_clean_value(name))
     .bind(datetime_to_db(chrono::Utc::now()))
+    .bind(i64::from(is_locked))
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -600,7 +606,7 @@ pub(crate) async fn ensure_container(
     // only, so a row committed without one would never be found again, and
     // every later provision would fail to insert the same id.
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    insert_named_item_in(&mut tx, id, kind, name, true, parent).await?;
+    insert_named_item_in(&mut tx, id, kind, name, true, parent, false).await?;
     set_container_path(&mut *tx, id, path).await?;
     if let Some(data) = data {
         backfill_container_data(&mut *tx, id, data).await?;
@@ -1351,7 +1357,9 @@ impl FerrofinItemPersistenceService {
     /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
     /// — Jellyfin's `MigrateRatingLevels` routine, as 12.2 re-dated it
     /// (`Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs`),
-    /// recorded in `FerrofinMeta` so later boots skip it.
+    /// recorded in `FerrofinMeta` so later boots skip it. Like upstream, it
+    /// does not run where `__EFMigrationsHistory` already records that routine
+    /// (an adopted 12.2 database); the key is recorded and no row is touched.
     ///
     /// In one transaction, for each DISTINCT `OfficialRating`: a null/empty
     /// rating clears both columns; any other resolves through the localization
@@ -1378,7 +1386,22 @@ impl FerrofinItemPersistenceService {
         // `rating_levels_v121` (12.1) and `rating_levels_all_countries` (the
         // first pass with every country's table loaded).
         const META_KEY: &str = "rating_levels_v122";
+        // The upstream routine this key ports. Jellyfin runs a routine only
+        // while its id is missing from `__EFMigrationsHistory`, and on an
+        // adopted 12.2 database it is there: the routine ran and Jellyfin's
+        // later scans re-derived the scores it cleared (an unrated episode's
+        // is its series'). Re-running it would clear them until our next scan.
+        const JELLYFIN_ROUTINE: &str = "20260915120000_MigrateRatingLevels";
         if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        if self
+            .db
+            .jellyfin_migration_applied(JELLYFIN_ROUTINE)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        {
+            self.mark_repair_done(META_KEY).await?;
             return Ok(0);
         }
         let ratings: Vec<Option<String>> =
@@ -2852,8 +2875,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         images: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
-        use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
-        let item = guid_to_db(item_id);
         // Reserve the writer before reading: a concurrent image edit must not
         // invalidate a deferred transaction's snapshot before its first write.
         let mut tx = self
@@ -2862,70 +2883,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        let mut stored = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
-        )
-        .bind(&item)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        // Preserve exact matches first, including their row ids and therefore
-        // the stable order of multiple Backdrops. Consume matches one-to-one
-        // so duplicate paths do not hide additions or removals.
-        let mut changed = Vec::new();
-        for image in images {
-            if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
-                stored.swap_remove(index);
-            } else {
-                changed.push(image);
-            }
-        }
-        // Every reader lists an item's images by type, then by `rowid`
-        // ([`image_rows`]), so kept rows keep their place and the images a
-        // save adds list after them, in the order it was given them.
-        // Upstream draws a random id per row on every save
-        // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`) and reads them
-        // back by `Id`, which shuffles a list of backdrops.
-        for image in changed {
-            // A changed file's metadata updates its own row; a new path/type
-            // gets a new row. The other images remain untouched.
-            let id = stored
-                .iter()
-                .position(|row| {
-                    row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
-                })
-                .map_or_else(
-                    || guid_to_db(Uuid::new_v4()),
-                    |index| stored.swap_remove(index).id,
-                );
-            sqlx::query(
-                r#"INSERT INTO "BaseItemImageInfos"
-                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                   ON CONFLICT("Id") DO UPDATE SET
-                     "Width" = excluded."Width", "Height" = excluded."Height",
-                     "Blurhash" = excluded."Blurhash", "DateModified" = excluded."DateModified""#,
-            )
-            .bind(id)
-            .bind(&item)
-            .bind(image_type_to_disc(image.image_type))
-            .bind(&image.path)
-            .bind(i64::from(image.width))
-            .bind(i64::from(image.height))
-            .bind(image.blur_hash.as_deref().map(str::as_bytes))
-            .bind(datetime_to_db(image.date_modified))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
-        for row in stored {
-            sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = ?1"#)
-                .bind(row.id)
-                .execute(&mut *tx)
+        write_item_images(&mut tx, item_id, images).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn save_items_images(
+        &self,
+        items: &[(Uuid, Vec<ItemImageInfo>)],
+    ) -> Result<(), ServiceError> {
+        // A chunk of items per transaction: one per item would be tens of
+        // thousands of commits on a guide's first refresh, and one for all of
+        // them would hold the single writer for the whole write.
+        for chunk in items.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let mut tx = self
+                .db
+                .writer()
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(db_err)?;
+            for (item_id, images) in chunk {
+                write_item_images(&mut tx, *item_id, images).await?;
+            }
+            tx.commit().await.map_err(db_err)?;
         }
-        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -6564,6 +6545,81 @@ async fn provider_id_sets(
     Ok(sets)
 }
 
+/// Replaces `item_id`'s image rows with `images` inside `tx`, keeping
+/// identical rows (see [`ItemPersistenceService::save_item_images`]).
+async fn write_item_images(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: Uuid,
+    images: &[ItemImageInfo],
+) -> Result<(), ServiceError> {
+    use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
+    let item = guid_to_db(item_id);
+    let mut stored = sqlx::query_as::<_, BaseItemImageInfoEntity>(
+        r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&item)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Preserve exact matches first, including their row ids and therefore
+    // the stable order of multiple Backdrops. Consume matches one-to-one
+    // so duplicate paths do not hide additions or removals.
+    let mut changed = Vec::new();
+    for image in images {
+        if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
+            stored.swap_remove(index);
+        } else {
+            changed.push(image);
+        }
+    }
+    // Every reader lists an item's images by type, then by `rowid`
+    // ([`image_rows`]), so kept rows keep their place and the images a
+    // save adds list after them, in the order it was given them.
+    // Upstream draws a random id per row on every save
+    // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`) and reads them
+    // back by `Id`, which shuffles a list of backdrops.
+    for image in changed {
+        // A changed file's metadata updates its own row; a new path/type
+        // gets a new row. The other images remain untouched.
+        let id = stored
+            .iter()
+            .position(|row| {
+                row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
+            })
+            .map_or_else(
+                || guid_to_db(Uuid::new_v4()),
+                |index| stored.swap_remove(index).id,
+            );
+        sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                   ON CONFLICT("Id") DO UPDATE SET
+                     "Width" = excluded."Width", "Height" = excluded."Height",
+                     "Blurhash" = excluded."Blurhash", "DateModified" = excluded."DateModified""#,
+            )
+            .bind(id)
+            .bind(&item)
+            .bind(image_type_to_disc(image.image_type))
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    for row in stored {
+        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = ?1"#)
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// The image rows of `ids`, each item's in the order every reader lists
 /// them: by type, then by `rowid` (insertion order). Upstream reads them by
 /// `Id` (`Include(e => e.Images!.OrderBy(i => i.Id))`,
@@ -9775,6 +9831,58 @@ mod tests {
         rows
     }
 
+    /// The batched image write and read: each item gets its own list, in one
+    /// pass, and reads back keyed by item.
+    #[tokio::test]
+    async fn many_items_images_are_written_and_read_in_one_pass() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let repo = crate::item_repository::FerrofinItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let (one, two, bare) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for item in [one, two, bare] {
+            seed_item(&db, item, BaseItemKind::LiveTvProgram).await;
+        }
+        let image = |image_type, path: &str| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            ..ItemImageInfo::default()
+        };
+        svc.save_items_images(&[
+            (
+                one,
+                vec![
+                    image(ImageType::Primary, "http://img/1.png"),
+                    image(ImageType::Thumb, "http://img/1t.png"),
+                ],
+            ),
+            (two, vec![image(ImageType::Primary, "http://img/2.png")]),
+        ])
+        .await
+        .expect("write");
+        // A later write replaces only that item's list.
+        svc.save_items_images(&[(one, vec![image(ImageType::Primary, "http://img/1.png")])])
+            .await
+            .expect("rewrite");
+
+        let read = repo
+            .get_image_infos_batch(&[one, two, bare])
+            .await
+            .expect("read");
+        assert_eq!(read.len(), 2, "an item with no images is absent");
+        assert_eq!(read[&one], [image(ImageType::Primary, "http://img/1.png")]);
+        assert_eq!(
+            read[&two],
+            repo.get_image_infos(two).await.expect("one item")
+        );
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn image_saves_only_write_changed_rows() {
@@ -11014,7 +11122,8 @@ mod tests {
     async fn the_named_item_repair_fills_created_box_sets_and_playlists_once() {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
-        let named = |id, kind, name| super::insert_named_item(&db, id, kind, name, true, None);
+        let named =
+            |id, kind, name| super::insert_named_item(&db, id, kind, name, true, None, false);
         // Renamed by the old bare `UPDATE "Name"`: both keys hold the old name.
         let renamed = Uuid::from_u128(0xC0A1);
         named(renamed, BaseItemKind::Playlist, "New Name")
@@ -11102,9 +11211,17 @@ mod tests {
     async fn the_named_item_repair_leaves_adopted_rows_and_other_kinds_alone() {
         let db = test_db().await;
         let adopted = Uuid::from_u128(0xC0A4);
-        super::insert_named_item(&db, adopted, BaseItemKind::BoxSet, "Adopted", true, None)
-            .await
-            .expect("adopted");
+        super::insert_named_item(
+            &db,
+            adopted,
+            BaseItemKind::BoxSet,
+            "Adopted",
+            true,
+            None,
+            false,
+        )
+        .await
+        .expect("adopted");
         sqlx::query(
             r#"UPDATE "BaseItems" SET "CleanName" = 'kept',
                    "DateCreated" = '2025-05-05 00:00:00.0000000'
@@ -11196,7 +11313,7 @@ mod tests {
                 None,
             ),
         ] {
-            super::insert_named_item(&db, id, kind, name, true, None)
+            super::insert_named_item(&db, id, kind, name, true, None, false)
                 .await
                 .expect("row");
             sqlx::query(
@@ -11565,6 +11682,58 @@ mod tests {
                 "{rating}"
             );
         }
+    }
+
+    /// Jellyfin runs `MigrateRatingLevels` once, keyed by its id in
+    /// `__EFMigrationsHistory`, and its later scans give unrated episodes back
+    /// their series' score. An adopted 12.2 database already ran 12.2's
+    /// routine, so the repair must leave those scores alone; one that only ran
+    /// 12.1's still gets 12.2's pass, which clears them as upstream does.
+    #[rstest::rstest]
+    #[case::ran_on_jellyfin_12_2("20260915120000_MigrateRatingLevels", Some(13))]
+    #[case::ran_on_jellyfin_12_1("20260910120000_MigrateRatingLevels", None)]
+    #[tokio::test]
+    async fn repair_rating_levels_skips_a_routine_jellyfin_already_ran(
+        #[case] recorded_id: &str,
+        #[case] expected_score: Option<i64>,
+    ) {
+        use crate::test_support::{fetch_item, save_item, seed_named_item};
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        sqlx::query(
+            r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("history table");
+        sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.0.0')"#)
+            .bind(recorded_id)
+            .execute(db.writer())
+            .await
+            .expect("history row");
+        // An unrated episode carrying its PG-13 series' score, as a 12.2 scan
+        // leaves it.
+        let episode = Uuid::from_u128(0x7D01);
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
+        let mut row = fetch_item(&db, episode).await;
+        row.official_rating = None;
+        row.inherited_parental_rating_value = Some(13);
+        row.inherited_parental_rating_sub_value = None;
+        save_item(&db, &row).await;
+
+        service
+            .repair_rating_levels(&localization)
+            .await
+            .expect("repair");
+
+        let row = fetch_item(&db, episode).await;
+        assert_eq!(row.inherited_parental_rating_value, expected_score);
+        assert_eq!(
+            db.meta_get("rating_levels_v122").await.expect("meta"),
+            Some("1".to_owned()),
+            "either way the key is recorded"
+        );
     }
 
     /// `series_key_scope`: the language falls through row → library → server,

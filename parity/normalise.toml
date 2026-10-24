@@ -1,9 +1,11 @@
 # What the parity comparison treats as equal although two servers cannot agree on it.
 #
 # Nothing is normalised implicitly. Every rule names the exact field paths it applies to and says
-# why; there are no wildcards. A path is the field names from the response root joined by dots,
-# with `[]` after an array's name for "each element" (`Items[].ServerId`). A rule that matches
-# nothing in a run is listed in that run's report. Rules change only through a reviewed PR.
+# why; there are no wildcards over field names (a rule's `requests` may be globs over request ids,
+# and the path `$` is the whole body, only for the requests a rule names). A path is the field
+# names from the response root joined by dots, with `[]` after an array's name for "each element"
+# (`Items[].ServerId`). A rule that matches nothing in a run is listed in that run's report. Rules
+# change only through a reviewed PR.
 #
 # kind = "opaque"     the values may differ, the JSON type and nullness may not: a value that
 #                     becomes null (or a string that becomes a number) is still a difference.
@@ -20,17 +22,14 @@ paths = ["ServerId"]
 kind = "opaque"
 reason = "Each server generates its own server id; the corpus copies do not share one."
 
-# The image tag is a cache key each server derives for itself from the image file; clients only ever
-# compare it with itself. The blurhash maps are keyed by it.
+# A blurhash map is keyed by the image tag, which is compared where the item lists it (ImageTags,
+# BackdropImageTags; a different tag is gl-849 in the ledger). The hashes themselves are compared.
 [[rule]]
-paths = ["ImageTags.Primary", "BackdropImageTags[]"]
-kind = "opaque"
-reason = "Image cache tags are derived by each server from its own view of the file; clients treat them as opaque cache keys."
-
-[[rule]]
-paths = ["ImageBlurHashes.Primary", "ImageBlurHashes.Backdrop"]
+paths = ["ImageBlurHashes.Primary", "ImageBlurHashes.Backdrop",
+         "Items[].ImageBlurHashes.Primary", "Items[].ImageBlurHashes.Backdrop", "Items[].ImageBlurHashes.Logo", "Items[].ImageBlurHashes.Thumb",
+         "[].ImageBlurHashes.Primary", "[].ImageBlurHashes.Backdrop", "[].ImageBlurHashes.Logo", "[].ImageBlurHashes.Thumb"]
 kind = "opaque-keys"
-reason = "The blurhash maps are keyed by the image tag, which differs per server; the hashes themselves are compared."
+reason = "A blurhash map is keyed by the image tag, compared where the item lists its tags; the hashes are compared."
 
 # ── what a write makes differ (rules limited to the write tests of requests/writes.jsonl) ───────────
 # Each server stamps the moment it handled the write, and the two writes are sent a few milliseconds
@@ -39,7 +38,8 @@ reason = "The blurhash maps are keyed by the image tag, which differs per server
 [[rule]]
 paths = ["LastPlayedDate", "UserData.LastPlayedDate", "Items[].UserData.LastPlayedDate"]
 kind = "opaque"
-requests = ["played-movie", "played-movie/*", "unplayed-movie", "unplayed-movie/*", "played-episode", "played-episode/*"]
+requests = ["played-movie", "played-movie/*", "unplayed-movie", "unplayed-movie/*", "played-episode", "played-episode/*",
+            "MarkPlayedItem", "screen-playback-stop/userdata"]
 reason = "Marking an item played stamps the time each server handled the request."
 
 [[rule]]
@@ -59,5 +59,147 @@ reason = "The trace id of an error answer is new for every request on every serv
 [[rule]]
 paths = ["Id"]
 kind = "opaque"
-requests = ["edge-parental-rating/user", "edge-blocked-tags/user"]
+requests = ["edge-parental-rating/user", "edge-blocked-tags/user", "CreateUserByName"]
 reason = "A user created by the test gets a new random id on each server."
+
+# ── what each server stamps for itself (sweep and screens, gl-619) ──────────────────────────────────
+# The harness signs in to each server and sends it the same requests a few milliseconds apart: the time of
+# a sign-in, of a device's or a user's last activity, of a request, can never agree. Nullness and type are
+# still compared.
+[[rule]]
+paths = ["LastActivityDate", "LastLoginDate", "[].LastActivityDate", "[].LastLoginDate", "SessionInfo.LastActivityDate",
+         "User.LastActivityDate", "User.LastLoginDate", "DateLastActivity"]
+kind = "opaque"
+requests = ["GetCurrentUser", "GetUserById", "GetUsers", "AuthenticateUserByName", "GetDeviceInfo"]
+reason = "Each server stamps the time it handled the harness's sign-in and its requests."
+
+[[rule]]
+paths = ["Items[].DateLastActivity"]
+kind = "opaque"
+requests = ["GetDevices"]
+reason = "Each server stamps the time the harness's device was last active on it."
+
+[[rule]]
+paths = ["RequestReceptionTime", "ResponseTransmissionTime", "StartDate", "EndDate", "PinExpirationDate", "DateAdded",
+         "LastUpdatedAt", "Items[].Date"]
+kind = "opaque"
+requests = ["GetUtcTime", "GetGuideInfo", "ForgotPassword", "InitiateQuickConnect", "SyncPlayCreateGroup", "GetLogEntries"]
+reason = "The server's clock at the request (the guide's window starts now, a PIN or a Quick Connect code expires from now, the activity log records the sign-in)."
+
+[[rule]]
+paths = ["DateCreated"]
+kind = "opaque"
+requests = ["GetYear"]
+reason = "A year item is created by the first request for it, at each server's own moment."
+
+[[rule]]
+paths = ["Items[].DateCreated"]
+kind = "opaque"
+requests = ["RevokeKey/key"]
+reason = "The API key the setup step creates carries the time each server created it."
+
+[[rule]]
+paths = ["[].DateCreated", "[].DateModified", "[].Size"]
+kind = "opaque"
+requests = ["GetServerLogs"]
+reason = "Each server's log files hold what it wrote itself."
+
+# Values each server draws at random.
+[[rule]]
+paths = ["AccessToken"]
+kind = "opaque"
+requests = ["AuthenticateUserByName"]
+reason = "A sign-in issues a new random access token on each server."
+
+[[rule]]
+paths = ["Items[].AccessToken"]
+kind = "opaque"
+requests = ["RevokeKey/key"]
+reason = "The API key the setup step creates is a new random token on each server."
+
+[[rule]]
+paths = ["Code", "Secret"]
+kind = "opaque"
+requests = ["InitiateQuickConnect"]
+reason = "A Quick Connect code and secret are drawn at random on each server."
+
+[[rule]]
+paths = ["GroupId"]
+kind = "opaque"
+requests = ["SyncPlayCreateGroup"]
+reason = "A SyncPlay group gets a new random id on each server."
+
+[[rule]]
+paths = ["PlaySessionId"]
+kind = "opaque"
+requests = ["GetPlaybackInfo", "GetPostedPlaybackInfo", "screen-playback-start/info", "screen-playback-stop/info"]
+reason = "A playback-info answer opens a play session with a new random id on each server."
+
+[[rule]]
+paths = ["FileName"]
+kind = "opaque"
+requests = ["LogFile"]
+reason = "An uploaded log's name ends in a new random id on each server."
+
+# Where each container and image puts things.
+[[rule]]
+paths = ["LocalAddress", "WebPath", "WebFolder.Path"]
+kind = "opaque"
+requests = ["GetSystemInfo", "GetPublicSystemInfo", "GetSystemStorage"]
+reason = "The address is each container's own, and each image installs the web client in its own folder."
+
+[[rule]]
+paths = ["$"]
+kind = "opaque"
+requests = ["GetDrives"]
+reason = "The Ferrofin image declares a /data volume the Jellyfin image does not have, so its drive list has one more entry."
+
+# Bodies that are not JSON and can never be byte-equal.
+[[rule]]
+paths = ["$"]
+kind = "opaque"
+requests = ["GetItemImage2", "GetVideoStream", "GetVideoStreamByContainer"]
+reason = "A resized image is encoded by each server's own encoder, and ffmpeg's Matroska muxer writes a random segment and track UID (with CRCs over them) into every remux."
+
+# ── what upstream itself orders at random (gl-619) ──────────────────────────────────────────────────
+# Jellyfin answers these in a random order, so two answers never agree on which items a page holds: a
+# Random sort, every instant mix (MusicManager orders Random), the series, album and artist similar-items
+# providers, and the movie recommendations' baselines. The page's total and type (but for a song's
+# mix, whose total depends on the draw), and the categories' number and kinds, are still compared.
+[[rule]]
+paths = ["Items"]
+kind = "opaque"
+requests = ["*.sortBy.random", "GetInstantMix*", "GetSimilarShows", "screen-series-similar", "GetSimilarAlbums", "GetSimilarArtists"]
+reason = "Upstream orders these at random: a Random sort, instant mixes and the series, album and artist similar-items providers."
+
+[[rule]]
+paths = ["TotalRecordCount"]
+kind = "opaque"
+requests = ["GetInstantMixFromSong"]
+reason = "A song's instant mix is the song, then 200 random songs of its genres without it: 201, or 200 when the draw held the song."
+
+[[rule]]
+paths = ["[].BaselineItemName", "[].CategoryId", "[].Items"]
+kind = "opaque"
+requests = ["GetMovieRecommendations"]
+reason = "Upstream picks the recommendations' baseline items in a random order, so each category's baseline and items differ."
+
+# Jellyfin keeps an item's user data in memory with the key it first computed for it; which key that is
+# depends on which request reached the item first (a full-fields request computes the provider-based
+# key), and the harness's reads run concurrently. These requests list items earlier requests returned.
+[[rule]]
+paths = ["Items[].UserData.Key"]
+kind = "opaque"
+requests = ["GetResumeItems.fields.providerids", "edge-sort-year-name-desc", "edge-sort-rating-desc", "edge-sort-premiere-asc",
+            "edge-sort-mixed-orders", "edge-sort-series-name-desc", "edge-non-null-series"]
+reason = "Jellyfin's in-memory user data keeps the first key computed for an item, which depends on the order the concurrent reads reached it. This also hides Ferrofin's GUID key for a never-written item (gl-675, gl-830) on these requests; the user-data routes and the playlist and folder listings still compare it."
+
+# ── what a remote service answers (gl-619) ──────────────────────────────────────────────────────────
+# Each server asks the live service itself; the service, not the server, decides the order of results
+# it scores equally.
+[[rule]]
+paths = ["$"]
+kind = "unordered"
+by = "Name"
+requests = ["GetMusicAlbumRemoteSearchResults"]
+reason = "Each server asks the live MusicBrainz search, which returns equally scored releases in no fixed order."
