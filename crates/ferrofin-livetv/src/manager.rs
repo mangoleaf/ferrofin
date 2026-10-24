@@ -12516,13 +12516,7 @@ mod tests {
     /// Hides (or restores) the timers table, so a timer read fails with the
     /// pool still open: what a busy or I/O error looks like to the fire path.
     async fn hide_timers_table(mgr: &FerrofinLiveTvManager, hidden: bool) {
-        let sql = if hidden {
-            r#"ALTER TABLE "FerrofinLiveTvTimers" RENAME TO "HiddenTimers""#
-        } else {
-            r#"ALTER TABLE "HiddenTimers" RENAME TO "FerrofinLiveTvTimers""#
-        };
-        sqlx::query(sql)
-            .execute(mgr.db.writer())
+        crate::dvr_repository::test_support::set_timers_table_hidden(&mgr.db, hidden)
             .await
             .expect("rename");
     }
@@ -12645,9 +12639,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             let mgr = manager_with(FakeFetcher(HashMap::new())).await;
             let (id, _) = stored_fire_test_timer(&mgr).await;
-            sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
-                .bind(&id)
-                .execute(mgr.db.writer())
+            crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, &id)
                 .await
                 .expect("corrupt");
             assert!(mgr.all_timers().await.expect("list").is_empty());
@@ -12827,9 +12819,7 @@ mod tests {
             let mgr = manager_with(FakeFetcher(HashMap::new())).await;
             let (id, timer) = stored_fire_test_timer(&mgr).await;
             let corrupt = || async {
-                sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
-                    .bind(&id)
-                    .execute(mgr.db.writer())
+                crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, &id)
                     .await
                     .expect("corrupt");
             };
