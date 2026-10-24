@@ -91,6 +91,16 @@ pub trait LocalApiAccess: Send + Sync {
     /// the base URL, computed per call from the live network state. It never
     /// consults the published server URL.
     async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError>;
+
+    /// C# `GetApiUrlForLocalAccess(allowHttps: false)`: the same address over
+    /// plain HTTP on the HTTP port, for in-process callers whose HTTP client
+    /// would not accept the server's own certificate.
+    ///
+    /// The default is [`Self::get_api_url_for_local_access`], right for a host
+    /// that never listens with HTTPS.
+    async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        self.get_api_url_for_local_access().await
+    }
 }
 
 fn _assert_object_safe_local_api_access(_: &dyn LocalApiAccess) {}

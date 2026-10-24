@@ -114,9 +114,22 @@ pub struct CreatePlaylistDto {
     pub users: Vec<PlaylistUserPermissions>,
 
     /// Gets or sets a value indicating whether the playlist is public.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// C#'s `bool IsPublic { get; set; } = true`: a body without the member is
+    /// public. [`Default`] (no body at all) stays `None`, which the manager
+    /// stores as private, as upstream's `createPlaylistRequest?.IsPublic` does.
+    #[serde(
+        default = "body_default_is_public",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[serde(deserialize_with = "crate::json::value::nullable")]
     pub is_public: Option<bool>,
+}
+
+/// [`CreatePlaylistDto::is_public`] for a body that omits it.
+#[allow(clippy::unnecessary_wraps)] // serde's `default` must return the field's type
+const fn body_default_is_public() -> Option<bool> {
+    Some(true)
 }
 
 /// Update existing playlist dto. Fields set to `null` will not be updated and

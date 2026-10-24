@@ -57,6 +57,9 @@ pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 /// may be bracketed; both spellings are read. An entry that is neither is
 /// dropped rather than ending the walk, since a proxy that writes an obfuscated
 /// identifier should not silently pin the client to the hop before it.
+///
+/// TODO(gl-184): end the walk at such an entry, as ASP.NET's `ApplyForwarders`
+/// and [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers) do.
 #[must_use]
 pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     headers
@@ -70,7 +73,7 @@ pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
 
 /// One `X-Forwarded-For` entry as an address.
 #[must_use]
-fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
+pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
     if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
         return Some(normalize_ip(ip));
     }
@@ -97,6 +100,10 @@ pub struct Inner {
         String,
         Arc<dyn ferrofin_common::configuration::ValidatingConfiguration + Send + Sync>,
     >,
+    /// Checks run after every committed named save, registered by the
+    /// composition root (Jellyfin's `NamedConfigurationUpdated` handlers).
+    pub committed_configuration_checks:
+        Vec<Arc<dyn ferrofin_common::configuration::CommittedConfigurationCheck>>,
     /// The network policy — which peers count as local, and which remote ones
     /// may reach the server at all (`RemoteIPFilter`).
     ///
@@ -389,6 +396,7 @@ impl AppState {
             configuration_write_lock: tokio::sync::Mutex::new(()),
             password_reset_lock: tokio::sync::Mutex::new(()),
             configuration_validators: std::collections::HashMap::new(),
+            committed_configuration_checks: Vec::new(),
             // Wired by the composition root via `with_network`.
             network: None,
             // Overridden by the composition root via
@@ -707,6 +715,23 @@ impl AppState {
         self
     }
 
+    /// Adds a check run after every committed named save.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been cloned.
+    #[must_use]
+    pub fn with_committed_configuration_check(
+        mut self,
+        check: Arc<dyn ferrofin_common::configuration::CommittedConfigurationCheck>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_committed_configuration_check must precede sharing")
+            .committed_configuration_checks
+            .push(check);
+        self
+    }
+
     /// Wires the network policy so the local-network test and the remote-IP
     /// filter are the CONFIGURED ones rather than a private-range guess.
     ///
@@ -745,6 +770,43 @@ impl AppState {
         self.client_address_for(peer, &forwarded_for(&parts.headers))
     }
 
+    /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
+    /// under the configured known proxies. Nothing is forwarded without a
+    /// network policy, as Jellyfin forwards nothing without known proxies.
+    #[must_use]
+    pub fn forwarded_request(
+        &self,
+        peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> crate::forwarded_headers::ForwardedRequest {
+        use crate::forwarded_headers::{ForwardedRequest, forwarded_through};
+        self.inner
+            .network
+            .as_deref()
+            .map_or_else(ForwardedRequest::default, |network| {
+                forwarded_through(network, peer, headers)
+            })
+    }
+
+    /// The scheme `parts`' request has (`HttpRequest.Scheme`), lowercased as
+    /// `UriBuilder` writes it: the one known proxies forwarded, else its
+    /// listener's ([`Transport`](crate::forwarded_headers::Transport)), else
+    /// `http`.
+    #[must_use]
+    pub fn request_scheme(&self, parts: &axum::http::request::Parts) -> String {
+        use crate::forwarded_headers::{Transport, effective_scheme};
+        let forwarded = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .and_then(|axum::extract::ConnectInfo(peer)| {
+                self.forwarded_request(peer.ip(), &parts.headers).scheme
+            });
+        effective_scheme(
+            forwarded.as_deref(),
+            parts.extensions.get::<Transport>().copied(),
+        )
+    }
+
     /// [`Self::client_address`] over an already-extracted peer and chain, so the
     /// middleware (which holds a `Request`, not `Parts`) shares the one rule.
     #[must_use]
@@ -753,15 +815,11 @@ impl AppState {
         peer: std::net::IpAddr,
         forwarded_for: &[std::net::IpAddr],
     ) -> std::net::IpAddr {
-        match self.inner.network.as_ref() {
-            Some(network) => network.read().map_or_else(
-                |e| e.into_inner().client_address(peer, forwarded_for),
-                |n| n.client_address(peer, forwarded_for),
-            ),
-            // No policy wired means no known proxies, and upstream ignores the
-            // header entirely in that case.
-            None => peer,
-        }
+        crate::forwarded_headers::client_address_through(
+            self.inner.network.as_deref(),
+            peer,
+            forwarded_for,
+        )
     }
 
     /// Whether `ip` is on the local network.

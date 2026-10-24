@@ -3128,9 +3128,11 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5501)).await;
         for kind in [BaseItemKind::Playlist, BaseItemKind::BoxSet] {
-            let mut filter = crate::user_view_manager::visible_item_query(kind, &user);
-            filter.top_parent_ids =
-                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)];
+            let filter = crate::user_view_manager::visible_item_query(
+                kind,
+                &user,
+                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)],
+            );
             let mut builder = build_query(&filter, QueryShape::IdsOnly);
             let mut query = builder.build();
             let args = query.take_arguments().expect("arguments").expect("binds");
