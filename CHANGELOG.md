@@ -267,6 +267,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `GET /Items/Counts` answers `ItemCount` with the number of items the query matched, of
   every type, as Jellyfin 12 does. It always answered 0, which only Jellyfin 10.11 did
 
+### Performance
+- `/Persons` with a favourite filter: build the user's favourite-person set once per
+  statement, as Jellyfin does, instead of probing it again for every person row. On the
+  benchmark corpus (one debug build, before and after; the figures below too) that is
+  6.1 s → 7 ms, and `isFavorite=false` (past a minute) → 9 ms
+- `/Artists` and `/Artists/AlbumArtists` with `mediaTypes`: keep the media-type filter
+  from driving the artist lookup (12.7 s → 32 ms for `mediaTypes=Video`). Skip the
+  played and total counts an artist page never shows, as Jellyfin does (plain `/Artists`
+  87 → 37 ms)
+- Recursive `/Items` sorted by `Artist`, `AlbumArtist` or `Studio`: read each item's own
+  values for the sort key (4.0 s → 0.26 s)
+
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
   has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
