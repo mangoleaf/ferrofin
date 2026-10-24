@@ -1,0 +1,14 @@
+[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H日0011223&,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+Style: Tiny,Arial,0.000000000000000000000000000000000000000000001,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.0000000000000000000000000000000000000005,1,2,10,10,10,1
+Style: Big,Arial,9.9999999999999999999999999999,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0.000000000000000000000000000250,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,multibyte colour style
+Dialogue: 0,0:00:02.00,0:00:03.00,Tiny,,0,0,0,,forty-five fraction digits
+Dialogue: 0,0:00:03.00,0:00:04.00,Big,,0,0,0,,twenty-nine significant digits

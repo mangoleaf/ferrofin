@@ -350,6 +350,7 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
             id: p.id,
             entity: p.entity.clone(),
             ancestors: p.ancestors.clone(),
+            generated_names: p.generated_names.clone(),
         })
         .collect()
 }
@@ -544,7 +545,8 @@ async fn playlists_resolve_before_every_other_resolver() {
     let library = |n: u128| Uuid::from_u128(0xF000 + n);
     let db = |id: Uuid| Some(ferrofin_db::store::guid_to_db(id));
     for (rel, parent) in [
-        // TV: a series-level folder, a season's subfolder, a nested one.
+        // TV: a series-level folder, a season's subfolder, and one in an
+        // unnumbered subfolder, which `SeasonResolver` makes a season too.
         ("tv/Mixtape [playlist]", library(2)),
         (
             "tv/Firefly (2002)/Season 01/Gag Reel [playlist]",
@@ -552,7 +554,7 @@ async fn playlists_resolve_before_every_other_resolver() {
         ),
         (
             "tv/Flat Show/bonus/deeper [playlist]",
-            at("tv/Flat Show").id,
+            at("tv/Flat Show/bonus").id,
         ),
         // Music: folders by name and by `playlist.xml`, an album's subfolder.
         ("music/Road Trip [playlist]", library(3)),

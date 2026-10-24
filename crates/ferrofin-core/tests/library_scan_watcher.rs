@@ -1398,15 +1398,16 @@ impl Drop for Unlistable {
     }
 }
 
-/// A flat series whose second season's loose episodes sit in a non-season
-/// subfolder (`Flat/Batch2/`) that fails to list: the episodes are unknown,
-/// not gone, so their virtual season — which no listing planned — must not
-/// be removed, since the `ParentId` cascade would take the episodes, and
-/// their played state, with it. Upstream removes a virtual season only when
-/// it has no episode left (`SeriesMetadataService.cs:172-207`). Neither a
-/// library scan nor a changed-path scan loses a row.
+/// A flat series whose second season's episodes sit in an unnumbered
+/// subfolder (`Flat/Batch2/`, a season of its own, as `SeasonResolver` makes
+/// it) that then fails to list: the episodes are unknown, not gone, so the
+/// season no listing planned must not be removed, since the `ParentId`
+/// cascade would take the episodes, and their played state, with it.
+/// Upstream removes a season only when it has no episode left
+/// (`SeriesMetadataService.cs:172-207`). Neither a library scan nor a
+/// changed-path scan loses a row.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unlistable_subfolder_never_takes_its_episodes_with_their_virtual_season() {
+async fn an_unlistable_subfolder_never_takes_its_episodes_with_their_season() {
     let tmp = tempfile::tempdir().expect("tmp");
     let media = tmp.path().join("tv");
     let series = media.join("Flat");
@@ -1418,7 +1419,11 @@ async fn an_unlistable_subfolder_never_takes_its_episodes_with_their_virtual_sea
         .scanned()
         .await;
     let before = fx.rows().await;
-    assert_eq!(before.len(), 6, "the series, 2 virtual seasons, 3 episodes");
+    assert_eq!(
+        before.len(),
+        6,
+        "the series, a virtual and a folder season, 3 episodes"
+    );
     let played = id(
         BaseItemKind::Episode,
         &series.join("Batch2").join("Flat S02E01.mkv"),
@@ -1737,4 +1742,112 @@ async fn a_sibling_follows_its_season_in_and_out_of_a_mixed_folder() {
     std::fs::remove_file(season.join("Other S01E02.mkv")).expect("rm");
     fx.report(&[&season.join("Other S01E02.mkv")]).await;
     assert!(!mixed().await, "alone again");
+}
+
+/// `SeasonResolver` (v12.2): every folder directly under a series is a season,
+/// even with no season number in its name; the folder names it, its path keys
+/// it, and its episodes are its children. Two such folders keep their own
+/// episodes (the collapse Jellyfin 12.1 fixed, PR 18044); none is grouped
+/// into a virtual "Season Unknown".
+#[tokio::test(flavor = "multi_thread")]
+async fn unnumbered_subfolders_are_seasons_holding_their_own_episodes() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let series = media.join("Sports");
+    let baseball = series.join("My Baseball team");
+    let football = series.join("My Football team");
+    touch(&baseball, "Opening day.mkv");
+    touch(&baseball, "Final.mkv");
+    touch(&football, "Kickoff.mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows)
+        .await
+        .scanned()
+        .await;
+    let rows = fx.rows().await;
+    let series_id = id(BaseItemKind::Series, &series);
+    for season in [&baseball, &football] {
+        let row = rows
+            .get(&id(BaseItemKind::Season, season))
+            .expect("a folder season");
+        assert!(row.1.ends_with(".Season"), "{row:?}");
+        assert_eq!(
+            row.2.as_deref(),
+            Some(series_id.as_str()),
+            "under the series"
+        );
+    }
+    let parent = |path: &Path| rows[&id(BaseItemKind::Episode, path)].2.clone();
+    let baseball_id = Some(id(BaseItemKind::Season, &baseball));
+    assert_eq!(parent(&baseball.join("Opening day.mkv")), baseball_id);
+    assert_eq!(parent(&baseball.join("Final.mkv")), baseball_id);
+    assert_eq!(
+        parent(&football.join("Kickoff.mkv")),
+        Some(id(BaseItemKind::Season, &football))
+    );
+    assert_eq!(rows.len(), 6, "the series, 2 seasons, 3 episodes: {rows:?}");
+
+    // A file added later joins its folder's season on a changed-path scan,
+    // whose scoped plan emits that season row exactly as the full plan did.
+    let season_row = || async {
+        sqlx::query_as::<_, (Option<String>, Option<i64>, Option<String>, Option<String>)>(
+            r#"SELECT "Name", "IndexNumber", "SeriesId", "Path" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(id(BaseItemKind::Season, &football))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("the football season")
+    };
+    let planned = season_row().await;
+    assert_eq!(
+        planned,
+        (
+            Some("My Football team".to_owned()),
+            None,
+            Some(series_id.clone()),
+            Some(football.to_string_lossy().into_owned())
+        )
+    );
+    touch(&football, "Halftime.mkv");
+    fx.report(&[&football.join("Halftime.mkv")]).await;
+    assert_eq!(season_row().await, planned, "the scoped plan's season row");
+    let rows = fx.rows().await;
+    assert_eq!(
+        rows[&id(BaseItemKind::Episode, &football.join("Halftime.mkv"))].2,
+        Some(id(BaseItemKind::Season, &football))
+    );
+    assert_eq!(
+        rows.len(),
+        7,
+        "one episode more, no virtual season: {rows:?}"
+    );
+}
+
+/// `SeasonResolver` declines a folder whose name reads as an episode
+/// (season and episode numbers), whose videos stay loose episodes, and one
+/// with no video anywhere below it, which plans nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_named_like_an_episode_or_holding_no_video_is_no_season() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let series = media.join("Show");
+    let episode_folder = series.join("Show S01E02");
+    touch(&episode_folder, "video.mkv");
+    let artwork = series.join("Artwork");
+    touch(&artwork, "poster.jpg");
+    touch(&series, "Show S01E01.mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows)
+        .await
+        .scanned()
+        .await;
+    let rows = fx.rows().await;
+    assert!(!rows.contains_key(&id(BaseItemKind::Season, &episode_folder)));
+    assert!(!rows.contains_key(&id(BaseItemKind::Season, &artwork)));
+    // The declined folder's video stays a loose episode: its parent is the
+    // series (its season, a virtual one, is only its `SeasonId`).
+    assert_eq!(
+        rows[&id(BaseItemKind::Episode, &episode_folder.join("video.mkv"))].2,
+        Some(id(BaseItemKind::Series, &series))
+    );
+    let episodes = rows.values().filter(|r| r.1.ends_with(".Episode")).count();
+    assert_eq!(episodes, 2, "the artwork plans nothing: {rows:?}");
 }

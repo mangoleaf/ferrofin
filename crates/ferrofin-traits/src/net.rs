@@ -49,6 +49,11 @@ pub struct RequestContext {
     /// The remote endpoint (client IP, possibly with port) as a string, if
     /// known. Mirrors the C# `RemoteEndPoint` used for logging and LAN checks.
     pub remote_endpoint: Option<String>,
+
+    /// The scheme the request arrived with (`HttpRequest.Scheme`): `https`
+    /// over an HTTPS listener, or the scheme a known proxy forwarded. `None`
+    /// when the caller did not resolve it, which reads as `http`.
+    pub scheme: Option<String>,
 }
 
 impl RequestContext {

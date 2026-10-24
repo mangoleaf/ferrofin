@@ -97,7 +97,8 @@ impl Format {
     fn load(self, subtitle: &mut Subtitle, lines: &[String]) -> Result<i32, String> {
         match self {
             Self::SubRip => Ok(srt::load(subtitle, lines)),
-            Self::Ssa | Self::Ass => Ok(ssa::load(subtitle, lines)),
+            Self::Ssa => Ok(ssa::load_ssa(subtitle, lines)),
+            Self::Ass => Ok(ssa::load_ass(subtitle, lines)),
             Self::WebVtt => vtt::load(subtitle, lines),
         }
     }
@@ -174,13 +175,15 @@ impl SubtitleParser for SubtitleEditParser {
 /// Projects a parsed [`Subtitle`] onto the wire [`SubtitleTrackInfo`] DTO.
 ///
 /// Convenience for callers (and tests) that want the ported cues as
-/// [`SubtitleTrackEvent`]s directly.
+/// [`SubtitleTrackEvent`]s directly. SSA/ASS `Comment:` events are left out, as the
+/// encoder leaves them out of every non-SSA/ASS format.
 #[must_use]
 pub fn to_track_info(subtitle: &Subtitle) -> SubtitleTrackInfo {
     SubtitleTrackInfo {
         track_events: subtitle
             .paragraphs
             .iter()
+            .filter(|p| !p.is_comment)
             .map(|p| SubtitleTrackEvent {
                 id: p.number.to_string(),
                 text: p.text.clone(),
