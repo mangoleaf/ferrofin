@@ -247,10 +247,7 @@ pub(crate) fn grouped_view_id(
 /// the `CollectionType` its row's `Data` carries, lower-cased. A mixed library
 /// (`mixed.collection`) has none, as upstream parses it.
 fn library_collection_type(row: &BaseItemEntity) -> Option<String> {
-    crate::item_data::parse_data(row.data.as_deref())
-        .get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_ascii_lowercase)
+    crate::item_data::stored_collection_type(row.data.as_deref())
         .filter(|collection_type| collection_type != "mixed")
 }
 
@@ -693,17 +690,9 @@ impl FerrofinUserViewManager {
             let collection_type = if Some(row.type_.as_str()) == user_view {
                 crate::user_view_repository::view_type_of(row.data.as_deref())
             } else {
-                crate::item_data::parse_data(row.data.as_deref())
-                    .get("CollectionType")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_ascii_lowercase)
+                crate::item_data::stored_collection_type(row.data.as_deref())
             };
-            let linked_kind = match collection_type.as_deref() {
-                Some("playlists") => Some(BaseItemKind::Playlist),
-                Some("boxsets") => Some(BaseItemKind::BoxSet),
-                _ => None,
-            };
-            if let Some(kind) = linked_kind
+            if let Some(kind) = crate::item_visibility::linked_kind(collection_type.as_deref())
                 && !self.has_visible_item(kind, user, visible_items).await?
             {
                 continue;
@@ -713,21 +702,16 @@ impl FerrofinUserViewManager {
         Ok(kept)
     }
 
-    /// 12.2 `UserViewManager.HasVisibleItem`: whether `user` can see at least
-    /// one `kind` (`Playlist` or `BoxSet`) item whose `TopParentId` is a top
-    /// parent of one of the user's root folders, wherever under it the item
-    /// sits — a playlist file inside a music album counts. Memoized in
-    /// `visible_items`: the answer depends on the kind alone, so a request
-    /// pays for it at most once per kind.
+    /// 12.2 `UserViewManager.HasVisibleItem` for `GetUserViews`
+    /// ([`ItemVisibility::has_visible_root_item`]): whether `user` can see at
+    /// least one `kind` (`Playlist` or `BoxSet`) item under the top parents
+    /// of their root folders. Memoized in `visible_items`: the answer depends
+    /// on the kind alone, so a request pays for it at most once per kind.
     ///
-    /// The query names no scope, so the repository confines it to the top
-    /// parents of the user's views (`AddUserToQuery`): each visible library's
-    /// physical folders and the playlists folder, which is upstream's
-    /// `folders.SelectMany(GetTopParentIds)`. It reads ids only, seeking a
-    /// `(Type, TopParentId)` index; `items.Any(item => item.IsVisible(user))`
-    /// then checks them in doubling batches (1, 2, 4, …), so the common
-    /// answer costs one row and a library of hidden ones a handful of
-    /// visibility loads rather than one per item.
+    /// Without a visibility evaluator wired (unit tests over a fake store)
+    /// any matching id counts.
+    ///
+    /// [`ItemVisibility::has_visible_root_item`]: crate::item_visibility::ItemVisibility::has_visible_root_item
     async fn has_visible_item(
         &self,
         kind: BaseItemKind,
@@ -737,25 +721,14 @@ impl FerrofinUserViewManager {
         if let Some(known) = visible_items.get(&kind) {
             return Ok(*known);
         }
-        let ids = self
-            .items
-            .get_item_ids(&visible_item_query(kind, user))
-            .await?;
-        let mut visible = false;
-        if let Some(visibility) = &self.visibility {
-            let (mut start, mut size) = (0, 1);
-            while start < ids.len() && !visible {
-                let end = (start + size).min(ids.len());
-                let rows = self.items.retrieve_items(&ids[start..end]).await?;
-                visible = visibility
-                    .visible(&rows, user, false)
-                    .await?
-                    .contains(&true);
-                (start, size) = (end, size * 2);
-            }
-        } else {
-            visible = !ids.is_empty();
-        }
+        let visible = match &self.visibility {
+            Some(visibility) => visibility.has_visible_root_item(kind, user).await?,
+            None => !self
+                .items
+                .get_item_ids(&visible_item_query(kind, user, Vec::new()))
+                .await?
+                .is_empty(),
+        };
         visible_items.insert(kind, visible);
         Ok(visible)
     }
@@ -1293,13 +1266,23 @@ pub(crate) struct LatestParent {
     collection_type: Option<CollectionType>,
 }
 
-/// The candidate query behind [`FerrofinUserViewManager::has_visible_item`]:
-/// every `kind` item in the user's scope, ungrouped (`GroupByPresentationUniqueKey
-/// = false`).
-pub(crate) fn visible_item_query(kind: BaseItemKind, user: &UserEntity) -> InternalItemsQuery {
+/// The candidate query behind `UserViewManager.HasVisibleItem`
+/// ([`ItemVisibility::has_visible_item`]): every `kind` item under
+/// `top_parent_ids`, ungrouped (`GroupByPresentationUniqueKey = false`). No
+/// top parents leaves the user's own scope to the repository, which only the
+/// evaluator-less fallback of [`FerrofinUserViewManager::has_visible_item`]
+/// asks for.
+///
+/// [`ItemVisibility::has_visible_item`]: crate::item_visibility::ItemVisibility::has_visible_item
+pub(crate) fn visible_item_query(
+    kind: BaseItemKind,
+    user: &UserEntity,
+    top_parent_ids: Vec<Uuid>,
+) -> InternalItemsQuery {
     InternalItemsQuery {
         include_item_types: vec![kind],
         user: Some(user.clone()),
+        top_parent_ids,
         group_by_presentation_unique_key: false,
         ..Default::default()
     }

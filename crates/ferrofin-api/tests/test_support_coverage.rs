@@ -280,6 +280,7 @@ fn fake_system_methods_run_and_panic() {
         headers: Vec::new(),
         query_string: None,
         remote_endpoint: None,
+        scheme: None,
     };
     // The two info getters return `Ok`, so they run without panicking.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -310,6 +311,7 @@ fn fake_app_host_methods_run() {
         headers: Vec::new(),
         query_string: None,
         remote_endpoint: None,
+        scheme: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
