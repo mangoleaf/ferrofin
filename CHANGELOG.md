@@ -381,6 +381,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   instead of on every request. One that exists but cannot be read answers 500 instead of
   reading as the defaults, and so does saving the encoding settings over it, so a save cannot
   replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
+- The server opens its HTTP port as soon as it starts, before it adopts or migrates the
+  database (after a scheduled backup restore), and answers while it does, as Jellyfin's
+  startup server does:
+  `/health/live` 200, `/health/ready` 503, `/health` `Degraded`, every other request 503 with
+  `Retry-After` and a "starting" page. Before, the port stayed closed until boot finished,
+  so a long adoption could outlast the chart's startup probe and be restarted in a loop.
+  Boot stages are now logged at `info`
 
 ## [1.0.0] - 2026-09-05
 
