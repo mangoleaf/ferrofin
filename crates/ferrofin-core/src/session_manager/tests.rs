@@ -793,6 +793,101 @@ async fn logout_by_token_ends_the_session() {
     assert!(matches!(err, ServiceError::Unauthorized(_)));
 }
 
+/// Signs `user` in on `device_id` (`AuthenticateDirect`), returning the token.
+async fn sign_in(mgr: &FerrofinSessionManager, user_id: Uuid, device_id: &str) -> String {
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some(device_id.to_owned()),
+        device_name: Some(device_id.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    mgr.authenticate_direct(&request)
+        .await
+        .unwrap()
+        .access_token
+        .expose()
+        .to_owned()
+}
+
+/// `SessionManager.RevokeUserTokens(userId, currentAccessToken)`: every device
+/// of the user except the one holding `currentAccessToken` (compared ignoring
+/// case) is logged out (`Logout(Device)`: the device row goes and its sessions
+/// end), and nobody else's device is touched. Password change, user deletion
+/// and disabling a user all rely on it.
+#[tokio::test]
+async fn revoking_a_users_tokens_keeps_only_the_current_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let bob_id = Uuid::new_v4();
+    let bob = seed_named_user(&db, bob_id, "bob").await;
+    for user in [&alice, &bob] {
+        set_permission(
+            db.writer(),
+            &user.id,
+            PermissionKind::EnableAllDevices,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let current = sign_in(&mgr, alice_id, "alice-phone").await;
+    let other = sign_in(&mgr, alice_id, "alice-tv").await;
+    let bobs = sign_in(&mgr, bob_id, "bob-laptop").await;
+    mgr.log_session_activity("Web", "1.0", "alice-tv", "TV", "e", Some(&alice))
+        .await
+        .unwrap();
+    let on_tv = |sessions: &[SessionInfoDto]| {
+        sessions
+            .iter()
+            .any(|s| s.device_id.as_deref() == Some("alice-tv"))
+    };
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(on_tv(&sessions), "the TV has a live session to end");
+
+    mgr.revoke_user_tokens(alice_id, &current.to_uppercase())
+        .await
+        .unwrap();
+
+    let devices: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "DeviceId" FROM "Devices" ORDER BY "DeviceId""#)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(devices, ["alice-phone", "bob-laptop"]);
+    for (token, device) in [(&current, "alice-phone"), (&bobs, "bob-laptop")] {
+        mgr.get_session_by_authentication_token(token, device, "e")
+            .await
+            .unwrap_or_else(|e| panic!("{device} keeps its token: {e}"));
+    }
+    let err = mgr
+        .get_session_by_authentication_token(&other, "alice-tv", "e")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::Unauthorized(_)), "{err:?}");
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(!on_tv(&sessions), "the revoked device's session ended");
+
+    // With no current token, every device of the user goes (user deletion,
+    // and a disable through the policy).
+    mgr.revoke_user_tokens(alice_id, "").await.unwrap();
+    let left: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Devices" WHERE "DeviceId" LIKE 'alice-%'"#)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(left, 0);
+}
+
 #[tokio::test]
 async fn get_sessions_non_admin_sees_only_own() {
     let db = test_db().await;
