@@ -442,6 +442,13 @@ pub struct FerrofinLiveTvManager {
     /// `TimerInfo.RetryCount`, which upstream persists; a restart re-arms the
     /// timer anyway, so in memory is enough).
     retry_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// How many times in a row each fired timer's row could not be read, kept
+    /// apart from the capture retries in `retry_counts` — see
+    /// [`FerrofinLiveTvManager::retry_unread_timer`].
+    read_retry_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// The stored rows already reported as unparseable, by table — see
+    /// [`FerrofinLiveTvManager::parse_stored_row`].
+    unparseable_rows: Arc<Mutex<HashMap<&'static str, HashSet<String>>>>,
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
@@ -948,6 +955,8 @@ impl FerrofinLiveTvManager {
             active_recordings: Arc::new(Mutex::new(HashMap::new())),
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
+            read_retry_counts: Arc::new(Mutex::new(HashMap::new())),
+            unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
@@ -3606,11 +3615,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
-        self.json_get(
-            r#"SELECT "Data" FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#,
-            id,
-        )
-        .await
+        self.json_get("FerrofinLiveTvTimers", SELECT_TIMER_SQL, id)
+            .await
     }
 
     async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
@@ -3740,7 +3746,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
         let mut timers: Vec<SeriesTimerInfoDto> = self
-            .json_list(r#"SELECT "Data" FROM "FerrofinLiveTvSeriesTimers""#)
+            .json_list(
+                "FerrofinLiveTvSeriesTimers",
+                r#"SELECT "Id", "Data" FROM "FerrofinLiveTvSeriesTimers""#,
+            )
             .await?;
         sort_series_timers(&mut timers, query);
         Ok(timers)
@@ -3748,6 +3757,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
 
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError> {
         self.json_get(
+            "FerrofinLiveTvSeriesTimers",
             r#"SELECT "Data" FROM "FerrofinLiveTvSeriesTimers" WHERE "Id" = ?1"#,
             id,
         )
@@ -4391,8 +4401,11 @@ impl FerrofinLiveTvManager {
     /// which is what the restart path re-arms from. The trait's `get_timers`
     /// is the FILTERED view on top of this.
     async fn all_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        self.json_list(r#"SELECT "Data" FROM "FerrofinLiveTvTimers" ORDER BY "StartDate""#)
-            .await
+        self.json_list(
+            "FerrofinLiveTvTimers",
+            r#"SELECT "Id", "Data" FROM "FerrofinLiveTvTimers" ORDER BY "StartDate""#,
+        )
+        .await
     }
 
     /// Writes a timer through, DTO and promoted columns together, WITHOUT
@@ -4451,6 +4464,7 @@ impl FerrofinLiveTvManager {
             None => self.delete_by_id(DELETE_TIMER_SQL, id).await?,
         }
         self.disarm_timer(id);
+        self.forget_row_state(id);
         self.cancel_recording(id);
         Ok(())
     }
@@ -4798,15 +4812,39 @@ impl FerrofinLiveTvManager {
         let delay = (start - Utc::now())
             .to_std()
             .unwrap_or(std::time::Duration::ZERO);
-        let manager = self.clone();
-        let fire_id = id.clone();
         tracing::info!(
             timer_id = id,
             name = timer.base.name.as_deref().unwrap_or_default(),
             in_seconds = delay.as_secs(),
             "live tv: recording timer armed"
         );
+        self.schedule_fire(id, delay);
+    }
 
+    /// Registers timer `id` as armed and spawns the task that fires it after
+    /// `delay`; [`disarm_timer`](Self::disarm_timer) stops it.
+    fn schedule_fire(&self, id: String, delay: std::time::Duration) {
+        // The flag is registered BEFORE the task exists, so a zero-delay timer
+        // cannot fire before it is observable. A fire already pending for the
+        // same id is stopped, so one timer never fires twice.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(previous) = self
+            .armed_timers_lock()
+            .insert(id.clone(), Arc::clone(&cancelled))
+        {
+            previous.store(true, Ordering::SeqCst);
+        }
+        self.spawn_fire(id, delay, cancelled);
+    }
+
+    /// Spawns the task that fires timer `id` after `delay`, unless `cancelled`
+    /// (the flag registered for it in `armed_timers`) is set first.
+    fn spawn_fire(
+        &self,
+        id: String,
+        delay: std::time::Duration,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) {
         // Disarming sets a flag the waiting task reads; it never aborts the
         // task. A `JoinHandle::abort` would be a live hazard: by the time
         // `cancel_timer` runs, the task may already BE the capture, and killing
@@ -4814,19 +4852,28 @@ impl FerrofinLiveTvManager {
         // freeze the row at `InProgress`. Cancelling a capture is
         // `cancel_recording`'s job (C# `RecordingsManager.CancelRecording`);
         // this only stops one that has not started.
-        //
-        // The flag is registered BEFORE the task exists, so a zero-delay timer
-        // cannot fire before it is observable.
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.armed_timers_lock().insert(id, Arc::clone(&cancelled));
+        let manager = self.clone();
         tokio::spawn(async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            if cancelled.load(Ordering::SeqCst) {
-                return;
+            // The system timer is one-shot: once it has fired it is no longer
+            // armed, and — crucially — cancelling the recording timer from
+            // here on must stop the CAPTURE (`RecordingsManager.CancelRecording`)
+            // rather than abort the task that is running it. Only this task's
+            // own flag is taken out: a timer re-armed meanwhile keeps its arm.
+            {
+                let mut armed = manager.armed_timers_lock();
+                if cancelled.load(Ordering::SeqCst)
+                    || !armed
+                        .get(&id)
+                        .is_some_and(|flag| Arc::ptr_eq(flag, &cancelled))
+                {
+                    return;
+                }
+                armed.remove(&id);
             }
-            manager.on_timer_fired(fire_id).await;
+            manager.on_timer_fired(id).await;
         });
     }
 
@@ -4854,19 +4901,67 @@ impl FerrofinLiveTvManager {
     /// that has already ended is dropped, one already recording is left alone,
     /// and otherwise the guide is re-read and the capture starts.
     async fn on_timer_fired(&self, timer_id: String) {
-        // The system timer is one-shot: once it has fired it is no longer
-        // armed, and — crucially — cancelling the recording timer from here on
-        // must stop the CAPTURE (`RecordingsManager.CancelRecording`) rather
-        // than abort the task that is running it. Dropping the handle detaches
-        // this task instead of aborting it.
-        self.armed_timers_lock().remove(&timer_id);
-
-        let Ok(Some(timer)) = self.get_timer(&timer_id).await else {
+        let data = match self.stored_data(SELECT_TIMER_SQL, &timer_id).await {
+            Ok(data) => {
+                self.read_retry_counts_lock().remove(&timer_id);
+                data
+            }
+            // The database closes when a server lifetime ends, so this timer
+            // belongs to a host an in-process restart tore down; the new host
+            // re-armed every stored timer itself, and retrying this one would
+            // record the programme twice.
+            Err(error) if self.db.is_closed() => {
+                tracing::debug!(
+                    timer_id,
+                    %error,
+                    "live tv: a recording timer fired after its server stopped; ignoring it"
+                );
+                return;
+            }
+            Err(error) => {
+                self.retry_unread_timer(timer_id, &error);
+                return;
+            }
+        };
+        // C# `TimerManager.TimerCallback` fires nothing for a timer that has
+        // gone from the store since it was armed.
+        let Some(data) = data else {
+            tracing::debug!(
+                timer_id,
+                "live tv: the fired recording timer no longer exists"
+            );
             return;
         };
+        // Not `parse_stored_row`: its warning may already be spent on a list
+        // read, and a recording missed for a broken row must say so when it
+        // is missed (once per fire).
+        let timer: TimerInfoDto = match serde_json::from_str(&data) {
+            Ok(timer) => timer,
+            Err(error) => {
+                // No retry, so `read_retry_counts` needs nothing: the read
+                // above succeeded and already cleared it.
+                tracing::warn!(
+                    timer_id,
+                    %error,
+                    "live tv: the fired recording timer's stored row does not parse; the recording is missed"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            timer_id,
+            name = timer.base.name.as_deref().unwrap_or_default(),
+            "live tv: recording timer fired"
+        );
         let mut info = TimerRecordingInfo::from_timer(&timer);
-        if let Ok(Some(program)) = self.program_row_for_timer(&timer.base).await {
-            apply_program_to_recording_info(&program, &mut info);
+        match self.program_row_for_timer(&timer.base).await {
+            Ok(Some(program)) => apply_program_to_recording_info(&program, &mut info),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                timer_id,
+                %error,
+                "live tv: cannot re-read the guide for the fired recording timer; recording with the timer's own details"
+            ),
         }
 
         if info.recording_end_date() <= Utc::now() {
@@ -4874,7 +4969,13 @@ impl FerrofinLiveTvManager {
                 timer_id,
                 "live tv: the recording timer fired but the programme has already ended"
             );
-            let _ = self.delete_by_id(DELETE_TIMER_SQL, &timer_id).await;
+            if let Err(error) = self.delete_by_id(DELETE_TIMER_SQL, &timer_id).await {
+                tracing::warn!(
+                    timer_id,
+                    %error,
+                    "live tv: deleting the ended recording timer failed"
+                );
+            }
             return;
         }
         if self.active_recordings_lock().contains_key(&timer_id) {
@@ -4885,6 +4986,101 @@ impl FerrofinLiveTvManager {
         // settle failing, which is the only thing left to report.
         if let Err(error) = self.record_stream(timer, info).await {
             tracing::error!(timer_id, %error, "live tv: settling the recording timer failed");
+        }
+    }
+
+    /// Fires a timer whose row could not be read once more,
+    /// [`RETRY_INTERVAL_SECONDS`](crate::dvr::RETRY_INTERVAL_SECONDS) from
+    /// now, up to [`MAX_RETRY_COUNT`](crate::dvr::MAX_RETRY_COUNT) failed
+    /// reads in a row (the interval and count of
+    /// `RecordingsManager.RecordStream`'s capture retry, counted apart from
+    /// it). Once that is spent the recording is missed, but the row stays, so
+    /// the next boot re-arms it. A timer armed again meanwhile (an edit, a
+    /// guide refresh) keeps that arm and is not retried.
+    fn retry_unread_timer(&self, timer_id: String, error: &ServiceError) {
+        /// What became of the retry.
+        enum Retry {
+            /// Armed again for attempt `.0`, under flag `.1`.
+            Scheduled(u32, Arc<AtomicBool>),
+            /// Someone else armed the timer while its read was failing.
+            Superseded,
+            /// The budget is spent.
+            Exhausted,
+        }
+        let retry = {
+            // Checked and registered under one lock, so a concurrent re-arm
+            // is never cancelled by this retry.
+            let mut armed = self.armed_timers_lock();
+            if armed.contains_key(&timer_id) {
+                Retry::Superseded
+            } else {
+                let mut counts = self.read_retry_counts_lock();
+                let count = counts.entry(timer_id.clone()).or_insert(0);
+                if *count < crate::dvr::MAX_RETRY_COUNT {
+                    *count += 1;
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    armed.insert(timer_id.clone(), Arc::clone(&cancelled));
+                    Retry::Scheduled(*count, cancelled)
+                } else {
+                    counts.remove(&timer_id);
+                    Retry::Exhausted
+                }
+            }
+        };
+        match retry {
+            Retry::Scheduled(attempt, cancelled) => {
+                tracing::warn!(
+                    timer_id,
+                    %error,
+                    attempt,
+                    retry_in_seconds = crate::dvr::RETRY_INTERVAL_SECONDS,
+                    "live tv: cannot read the fired recording timer; retrying"
+                );
+                self.spawn_fire(
+                    timer_id,
+                    std::time::Duration::from_secs(
+                        crate::dvr::RETRY_INTERVAL_SECONDS.unsigned_abs(),
+                    ),
+                    cancelled,
+                );
+            }
+            Retry::Superseded => tracing::debug!(
+                timer_id,
+                %error,
+                "live tv: cannot read the fired recording timer, but it has been armed again"
+            ),
+            Retry::Exhausted => tracing::error!(
+                timer_id,
+                %error,
+                "live tv: cannot read the fired recording timer; the recording is missed"
+            ),
+        }
+    }
+
+    /// The fire path's read-retry counts, locked. The guard never spans an
+    /// `.await`.
+    fn read_retry_counts_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, u32>> {
+        self.read_retry_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Forgets the in-memory state kept for a stored timer or series timer
+    /// row: its capture and read retry counts and whether it was reported as
+    /// unparseable. A cancel or a delete ends all of them.
+    fn forget_row_state(&self, id: &str) {
+        self.retry_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        self.read_retry_counts_lock().remove(id);
+        for rows in self
+            .unparseable_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+        {
+            rows.remove(id);
         }
     }
 
@@ -5510,9 +5706,11 @@ impl FerrofinLiveTvManager {
             .await
     }
 
-    /// Reads a JSON `Data` column across all rows of `sql`, deserializing each.
+    /// Reads the `Id` and JSON `Data` columns across all rows of `sql` (over
+    /// `table`), deserializing each and skipping a row that does not parse.
     async fn json_list<T: DeserializeOwned>(
         &self,
+        table: &'static str,
         sql: &'static str,
     ) -> Result<Vec<T>, ServiceError> {
         let rows = sqlx::query(sql)
@@ -5521,31 +5719,100 @@ impl FerrofinLiveTvManager {
             .map_err(db_err)?;
         Ok(rows
             .iter()
-            .filter_map(|r| serde_json::from_str(r.get::<String, _>("Data").as_str()).ok())
+            .filter_map(|r| {
+                self.parse_stored_row(
+                    table,
+                    r.get::<String, _>("Id").as_str(),
+                    r.get::<String, _>("Data").as_str(),
+                )
+            })
             .collect())
     }
 
-    /// Reads and deserializes a single JSON `Data` column by id.
+    /// Reads and deserializes a single JSON `Data` column of `table` by id; a
+    /// row that does not parse reads as absent.
     async fn json_get<T: DeserializeOwned>(
         &self,
+        table: &'static str,
         sql: &'static str,
         id: &str,
     ) -> Result<Option<T>, ServiceError> {
-        let data: Option<String> = sqlx::query_scalar(sql)
+        Ok(self
+            .stored_data(sql, id)
+            .await?
+            .and_then(|d| self.parse_stored_row(table, id, &d)))
+    }
+
+    /// Reads a single JSON `Data` column by id, unparsed.
+    async fn stored_data(
+        &self,
+        sql: &'static str,
+        id: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        sqlx::query_scalar(sql)
             .bind(id)
             .fetch_optional(self.db.pool())
             .await
-            .map_err(db_err)?;
-        Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+            .map_err(db_err)
     }
 
-    /// Runs a `DELETE … WHERE "Id" = ?1` statement.
+    /// Deserializes one stored `Data` blob, reporting a row that does not
+    /// parse rather than letting it vanish (C# `ItemDataProvider` logs "Error
+    /// deserializing" for a store that does not parse).
+    ///
+    /// The readers run per request, so a broken row is a `warn` the first time
+    /// it is seen and a `debug` while it stays broken; once it parses again,
+    /// breaking it again is reported again.
+    fn parse_stored_row<T: DeserializeOwned>(
+        &self,
+        table: &'static str,
+        row_id: &str,
+        data: &str,
+    ) -> Option<T> {
+        let parsed = serde_json::from_str(data);
+        let mut reported = self
+            .unparseable_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match parsed {
+            Ok(value) => {
+                if let Some(rows) = reported.get_mut(table) {
+                    rows.remove(row_id);
+                }
+                Some(value)
+            }
+            Err(error) => {
+                let first = reported.entry(table).or_default().insert(row_id.to_owned());
+                drop(reported);
+                if first {
+                    tracing::warn!(
+                        table,
+                        row_id,
+                        %error,
+                        "live tv: a stored row does not parse; skipping it until it is fixed"
+                    );
+                } else {
+                    tracing::debug!(
+                        table,
+                        row_id,
+                        %error,
+                        "live tv: a stored row does not parse; skipping it"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Runs a `DELETE … WHERE "Id" = ?1` statement over a timer or series
+    /// timer row, and forgets the in-memory state kept for that row.
     async fn delete_by_id(&self, sql: &'static str, id: &str) -> Result<(), ServiceError> {
         sqlx::query(sql)
             .bind(id)
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        self.forget_row_state(id);
         Ok(())
     }
 }
@@ -5770,6 +6037,9 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
 /// consistency with the repository layer's error text.
 /// The `DELETE` that removes one timer row.
 const DELETE_TIMER_SQL: &str = r#"DELETE FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#;
+
+/// Reads one timer's stored `Data` by id.
+const SELECT_TIMER_SQL: &str = r#"SELECT "Data" FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#;
 
 /// One stored series timer: the DTO clients see, plus the two server-owned
 /// identity values the wire DTO has no field for.
@@ -12176,6 +12446,414 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Log lines written while a [`CapturedLogs::install`] guard is held.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        /// Captures this thread's events at every level until the guard drops.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(self.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            )
+        }
+
+        /// The captured lines logged at `level` (`"WARN"`, `"DEBUG"`, …) that
+        /// mention `needle`.
+        fn lines_at(&self, level: &str, needle: &str) -> Vec<String> {
+            let text = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
+            text.lines()
+                .filter(|line| line.contains(&format!(" {level} ")) && line.contains(needle))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A stored timer for an hour-long programme an hour from now, by id.
+    async fn stored_fire_test_timer(mgr: &FerrofinLiveTvManager) -> (String, TimerInfoDto) {
+        let id = Uuid::new_v4().simple().to_string();
+        let start = Utc::now() + chrono::Duration::hours(1);
+        let timer = TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some(id.clone()),
+                channel_id: Uuid::new_v4(),
+                name: Some("fire test".to_owned()),
+                start_date: start,
+                end_date: start + chrono::Duration::hours(1),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        };
+        mgr.persist_timer(&timer).await.expect("seed timer");
+        (id, timer)
+    }
+
+    /// Hides (or restores) the timers table, so a timer read fails with the
+    /// pool still open: what a busy or I/O error looks like to the fire path.
+    async fn hide_timers_table(mgr: &FerrofinLiveTvManager, hidden: bool) {
+        let sql = if hidden {
+            r#"ALTER TABLE "FerrofinLiveTvTimers" RENAME TO "HiddenTimers""#
+        } else {
+            r#"ALTER TABLE "HiddenTimers" RENAME TO "FerrofinLiveTvTimers""#
+        };
+        sqlx::query(sql)
+            .execute(mgr.db.writer())
+            .await
+            .expect("rename");
+    }
+
+    /// The fire path's failed reads so far for `id`.
+    fn read_retries_of(mgr: &FerrofinLiveTvManager, id: &str) -> Option<u32> {
+        mgr.read_retry_counts_lock().get(id).copied()
+    }
+
+    /// The capture retries so far for `id`.
+    fn capture_retries_of(mgr: &FerrofinLiveTvManager, id: &str) -> Option<u32> {
+        mgr.retry_counts.lock().unwrap().get(id).copied()
+    }
+
+    /// A timer whose row cannot be read when it fires (the pool still open) is
+    /// not dropped: it warns and is armed again after `RETRY_INTERVAL_SECONDS`.
+    /// The failed reads are counted apart from the capture retries, and a good
+    /// read clears them.
+    #[tokio::test]
+    async fn fired_timer_unreadable_row_retries() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            hide_timers_table(&mgr, true).await;
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+
+            assert_eq!(
+                logs.lines_at("WARN", &id).len(),
+                1,
+                "one warn naming the timer"
+            );
+            assert!(
+                mgr.armed_timers_lock().contains_key(&id),
+                "the fire is retried"
+            );
+            assert_eq!(read_retries_of(&mgr, &id), Some(1));
+            assert_eq!(capture_retries_of(&mgr, &id), None, "not a capture retry");
+
+            // The retry reads the row; its capture then fails (the channel is
+            // in no lineup), which is the capture budget's business alone.
+            hide_timers_table(&mgr, false).await;
+            mgr.on_timer_fired(id.clone()).await;
+            assert_eq!(read_retries_of(&mgr, &id), None, "a good read clears it");
+            assert_eq!(capture_retries_of(&mgr, &id), Some(1));
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A timer armed again while its read was failing (an edit, a guide
+    /// refresh) keeps that arm: the retry neither replaces nor cancels it.
+    #[tokio::test]
+    async fn fired_timer_rearmed_meanwhile_is_not_retried() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, timer) = stored_fire_test_timer(&mgr).await;
+            mgr.arm_timer(&timer);
+            let arm = Arc::clone(&mgr.armed_timers_lock()[&id]);
+            hide_timers_table(&mgr, true).await;
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+
+            assert!(logs.lines_at("WARN", &id).is_empty(), "no retry warn");
+            assert!(
+                Arc::ptr_eq(&mgr.armed_timers_lock()[&id], &arm),
+                "the new arm stands"
+            );
+            assert!(
+                !arm.load(std::sync::atomic::Ordering::SeqCst),
+                "and is live"
+            );
+            assert_eq!(read_retries_of(&mgr, &id), None);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// Once the read budget is spent the miss is an `error`, nothing is armed,
+    /// and the row stays for the next boot to re-arm.
+    #[tokio::test]
+    async fn fired_timer_retry_budget_exhausted() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            mgr.read_retry_counts_lock()
+                .insert(id.clone(), crate::dvr::MAX_RETRY_COUNT);
+            hide_timers_table(&mgr, true).await;
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+
+            let errors = logs.lines_at("ERROR", &id);
+            assert_eq!(errors.len(), 1, "one error naming the timer");
+            assert!(errors[0].contains("recording is missed"), "{errors:?}");
+            assert!(!mgr.armed_timers_lock().contains_key(&id), "nothing armed");
+            assert_eq!(read_retries_of(&mgr, &id), None, "the budget is cleared");
+            hide_timers_table(&mgr, false).await;
+            assert!(
+                mgr.get_timer(&id).await.expect("read").is_some(),
+                "the row is kept"
+            );
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A fired timer whose row no longer parses says so at fire time, even
+    /// when a list read has already spent that row's once-only warning.
+    #[tokio::test]
+    async fn fired_timer_unparseable_row_warns_at_fire_time() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
+                .bind(&id)
+                .execute(mgr.db.writer())
+                .await
+                .expect("corrupt");
+            assert!(mgr.all_timers().await.expect("list").is_empty());
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+
+            let warns = logs.lines_at("WARN", &id);
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(warns[0].contains("recording is missed"), "{warns:?}");
+            assert!(!mgr.armed_timers_lock().contains_key(&id), "nothing armed");
+            assert_eq!(read_retries_of(&mgr, &id), None, "not retried");
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// Cancelling or deleting a timer forgets its retry counts.
+    #[tokio::test]
+    async fn cancelled_timer_forgets_its_retries() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            mgr.read_retry_counts_lock().insert(id.clone(), 3);
+            mgr.retry_counts.lock().unwrap().insert(id.clone(), 2);
+
+            mgr.cancel_timer(&id).await.expect("cancel");
+
+            assert_eq!(read_retries_of(&mgr, &id), None);
+            assert_eq!(capture_retries_of(&mgr, &id), None);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// How many times `id` has fired on a manager whose pool is closed: each
+    /// fire ends at once at its "fired after its server stopped" line, so a
+    /// fire is countable without the database I/O a paused clock would race.
+    fn fires_of(logs: &CapturedLogs, id: &str) -> usize {
+        logs.lines_at("DEBUG", id)
+            .iter()
+            .filter(|line| line.contains("fired after its server stopped"))
+            .count()
+    }
+
+    /// A manager whose pool is closed, for the paused-clock fire tests.
+    async fn manager_with_closed_pool() -> FerrofinLiveTvManager {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        mgr.db.close().await;
+        mgr
+    }
+
+    /// A pending fire superseded before it is due never runs and never takes
+    /// out the arm that superseded it, whether that arm cancelled it (a
+    /// re-arm) or not (a registration racing it); the live arm fires once.
+    #[tokio::test]
+    async fn a_superseded_fire_task_neither_fires_nor_disarms() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let mgr = tokio::time::timeout(Duration::from_secs(60), manager_with_closed_pool())
+            .await
+            .expect("setup timed out");
+        // Paused only now: the database work above must not race a paused clock.
+        tokio::time::pause();
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        tokio::time::timeout(Duration::from_secs(600), async {
+            let rearmed = "rearmed".to_owned();
+            mgr.schedule_fire(rearmed.clone(), Duration::from_secs(5));
+            let stale = Arc::clone(&mgr.armed_timers_lock()[&rearmed]);
+            mgr.schedule_fire(rearmed.clone(), Duration::from_secs(10));
+            let fresh = Arc::clone(&mgr.armed_timers_lock()[&rearmed]);
+            assert!(stale.load(Ordering::SeqCst), "the re-arm cancels the first");
+
+            let raced = "raced".to_owned();
+            mgr.schedule_fire(raced.clone(), Duration::from_secs(5));
+            let foreign = Arc::new(AtomicBool::new(false));
+            mgr.armed_timers_lock()
+                .insert(raced.clone(), Arc::clone(&foreign));
+
+            // Past both stale deadlines.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            assert_eq!(
+                fires_of(&logs, &rearmed),
+                0,
+                "the cancelled task did not fire"
+            );
+            assert_eq!(fires_of(&logs, &raced), 0, "nor did the superseded one");
+            assert!(Arc::ptr_eq(&mgr.armed_timers_lock()[&rearmed], &fresh));
+            assert!(
+                Arc::ptr_eq(&mgr.armed_timers_lock()[&raced], &foreign),
+                "the newer arm is left in place"
+            );
+
+            // Past the live deadline.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert_eq!(fires_of(&logs, &rearmed), 1, "the live arm fires once");
+            assert!(
+                !mgr.armed_timers_lock().contains_key(&rearmed),
+                "and takes its own arm out"
+            );
+        })
+        .await
+        .expect("test timed out");
+        drop(guard);
+    }
+
+    /// A scheduled read retry really fires through its task, once,
+    /// `RETRY_INTERVAL_SECONDS` after the failed read.
+    #[tokio::test]
+    async fn a_read_retry_fires_after_the_retry_interval() {
+        use std::time::Duration;
+        let interval = Duration::from_secs(crate::dvr::RETRY_INTERVAL_SECONDS.unsigned_abs());
+        let (mgr, id) = tokio::time::timeout(Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            hide_timers_table(&mgr, true).await;
+            mgr.on_timer_fired(id.clone()).await;
+            assert_eq!(read_retries_of(&mgr, &id), Some(1));
+            // The retry then meets a closed pool, which ends it at once.
+            mgr.db.close().await;
+            (mgr, id)
+        })
+        .await
+        .expect("setup timed out");
+        tokio::time::pause();
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        tokio::time::timeout(Duration::from_secs(600), async {
+            tokio::time::sleep(interval.saturating_sub(Duration::from_secs(1))).await;
+            assert_eq!(fires_of(&logs, &id), 0, "not yet");
+            assert!(mgr.armed_timers_lock().contains_key(&id));
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(fires_of(&logs, &id), 1, "the retry fired");
+            assert!(!mgr.armed_timers_lock().contains_key(&id));
+        })
+        .await
+        .expect("test timed out");
+        drop(guard);
+    }
+
+    /// A timer of a host whose database has been closed (an in-process restart
+    /// tore it down; the new host re-armed its own) is ignored without noise
+    /// and never retried, so it cannot record twice.
+    #[tokio::test]
+    async fn fired_timer_after_db_closed_is_ignored() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            mgr.db.close().await;
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+
+            assert!(logs.lines_at("WARN", "").is_empty(), "no warn");
+            assert!(logs.lines_at("ERROR", "").is_empty(), "no error");
+            assert_eq!(logs.lines_at("DEBUG", &id).len(), 1, "a debug line only");
+            assert!(!mgr.armed_timers_lock().contains_key(&id), "nothing armed");
+            assert_eq!(read_retries_of(&mgr, &id), None);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A stored row that no longer parses is skipped with a `warn` naming its
+    /// table and id the first time it is read, and at `debug` while it stays
+    /// broken (the readers run per request). Once it reads again, breaking it
+    /// again is news.
+    #[tokio::test]
+    async fn stored_row_unparseable_is_logged_once() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, timer) = stored_fire_test_timer(&mgr).await;
+            let corrupt = || async {
+                sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
+                    .bind(&id)
+                    .execute(mgr.db.writer())
+                    .await
+                    .expect("corrupt");
+            };
+            corrupt().await;
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            assert!(mgr.all_timers().await.expect("list").is_empty());
+            assert!(mgr.get_timer(&id).await.expect("get").is_none());
+            assert!(mgr.all_timers().await.expect("list").is_empty());
+            let warns = logs.lines_at("WARN", &id);
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(warns[0].contains("FerrofinLiveTvTimers"), "{warns:?}");
+            assert_eq!(logs.lines_at("DEBUG", &id).len(), 2, "repeats at debug");
+
+            mgr.persist_timer(&timer).await.expect("repair");
+            assert_eq!(mgr.all_timers().await.expect("list").len(), 1);
+            corrupt().await;
+            assert!(mgr.all_timers().await.expect("list").is_empty());
+            drop(guard);
+            assert_eq!(logs.lines_at("WARN", &id).len(), 2, "broken again is news");
+        })
+        .await
+        .expect("test timed out");
     }
 }
 

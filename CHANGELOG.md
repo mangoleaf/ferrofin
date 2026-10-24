@@ -397,6 +397,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   tuner until a restart
 - The playlists folder is made only at startup, as Jellyfin does, instead of being looked for
   again, with a rule of its own, on every `GET /Library/MediaFolders` and Folders view request
+- A DVR timer whose row cannot be read when it fires is retried every minute, up to ten
+  times, and logged, instead of the recording being missed with no trace. A stored timer or
+  series timer that no longer parses is logged when it is first read and when it misses its
+  recording, instead of vanishing silently
 
 ## [1.0.0] - 2026-09-05
 
