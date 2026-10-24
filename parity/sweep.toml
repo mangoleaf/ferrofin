@@ -387,6 +387,12 @@ oracle_trap = "Jellyfin 12.2 answers HEAD on a static audio stream with 500"
 oracle_trap = "Jellyfin 12.2 answers 500 to the universal audio stream without a device profile's parameters"
 [op.GetHlsAudioSegment]
 oracle_trap = "a segment of a transcode that was never started: Jellyfin 12.2 answers 500"
+[op.GetHlsVideoSegment]
+oracle_trap = "beside the concurrent reads' other transcodes of the same movie, Jellyfin 12.2 sometimes outlasts the request timeout starting this segment's job"
+[op.GetLiveHlsStream]
+oracle_trap = "beside the concurrent reads' other transcodes of the same movie, Jellyfin 12.2 sometimes outlasts the request timeout starting the live playlist's job"
+[op.GetItemImage2]
+oracle_trap = "beside the concurrent reads of the same image at the same size, Jellyfin 12.2 sometimes aborts the answer (Kestrel: Content-Length mismatch, 0 bytes written)"
 [op.GetTrailers]
 oracle_trap = "Jellyfin 12.2 answers /Trailers with 500 on this corpus, which has no trailers"
 [op.GetSuggestions]
