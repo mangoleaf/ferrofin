@@ -485,6 +485,9 @@ pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileClean
     file_cleaner: C,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
+    /// The throttle's reads of `encoding_config`, which report a document
+    /// that cannot be read once rather than on every due timer.
+    throttle_options: crate::configuration::EncodingOptionsReader,
     pause_keys: super::throttler::PauseKeySlot,
 }
 
@@ -522,6 +525,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             reporter,
             file_cleaner,
             encoding_config: None,
+            throttle_options: crate::configuration::EncodingOptionsReader::new(
+                "transcode throttle",
+            ),
             pause_keys: super::throttler::PauseKeySlot::default(),
         }
     }
@@ -728,13 +734,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             let options = if let Some(options) = override_options {
                 options.clone()
             } else if let Some(config) = &self.encoding_config {
-                match config.get_encoding_options().await {
-                    Ok(options) => options,
-                    Err(error) => {
-                        tracing::error!(%error, "reading transcode throttle configuration failed");
-                        ferrofin_model::configuration::EncodingOptions::default()
-                    }
-                }
+                self.throttle_options.read(config.as_ref()).await
             } else {
                 ferrofin_model::configuration::EncodingOptions::default()
             };
@@ -3249,6 +3249,66 @@ pub(super) mod throttle_tests {
             *child.events.lock().unwrap(),
             vec![b"p".to_vec(), b"u".to_vec(), b"p".to_vec(), b"u".to_vec()]
         );
+    }
+
+    /// A settings file the throttle cannot read is reported once at `warn`,
+    /// then at `debug` while it stays broken. The throttle reads it on every
+    /// due timer of every running job and carries on with the defaults, so an
+    /// `error` per tick would flood the log (LOGGING.md §1).
+    #[tokio::test]
+    async fn an_unreadable_settings_file_is_warned_about_once_not_every_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("out.m3u8");
+        let config = Arc::new(LiveOptions::new(options(60)));
+        config.failed.store(true, Ordering::SeqCst);
+        let manager = Arc::new(
+            TranscodeManagerImpl::new(NoopSessionReporter)
+                .with_pause_keys(Some(PauseKeys::Patched))
+                .with_encoding_configuration(config.clone()),
+        );
+        let child = Arc::new(ChildState::default());
+        let state = state(&path);
+        let handle = manager
+            .start_ffmpeg(
+                &ControlledTranscoder(Arc::clone(&child)),
+                StartFfMpegRequest {
+                    program: "controlled",
+                    state: &state,
+                    output_path: &path,
+                    arguments: Vec::new(),
+                    log_dir: directory.path().join("logs"),
+                    working_dir: None,
+                    env: Vec::new(),
+                    hardware_acceleration_type: HardwareAccelerationType::none,
+                },
+            )
+            .await
+            .unwrap();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        for _ in 0..3 {
+            due(&manager, &handle).await;
+            manager.update_transcoding_jobs().await;
+        }
+        drop(guard);
+
+        assert_eq!(config.reads.load(Ordering::SeqCst), 3);
+        assert!(
+            logs.lines_at("ERROR").is_empty(),
+            "{:#?}",
+            logs.lines_at("ERROR")
+        );
+        let warnings = logs.lines_at("WARN");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("transcode throttle"), "{warnings:#?}");
+        let repeats = logs
+            .lines_at("DEBUG")
+            .into_iter()
+            .filter(|line| line.contains("cannot read the encoding configuration"))
+            .count();
+        assert_eq!(repeats, 2);
     }
 
     #[tokio::test]
