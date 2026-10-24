@@ -2858,8 +2858,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         images: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
-        use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
-        let item = guid_to_db(item_id);
         // Reserve the writer before reading: a concurrent image edit must not
         // invalidate a deferred transaction's snapshot before its first write.
         let mut tx = self
@@ -2868,70 +2866,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        let mut stored = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
-        )
-        .bind(&item)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        // Preserve exact matches first, including their row ids and therefore
-        // the stable order of multiple Backdrops. Consume matches one-to-one
-        // so duplicate paths do not hide additions or removals.
-        let mut changed = Vec::new();
-        for image in images {
-            if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
-                stored.swap_remove(index);
-            } else {
-                changed.push(image);
-            }
-        }
-        // Every reader lists an item's images by type, then by `rowid`
-        // ([`image_rows`]), so kept rows keep their place and the images a
-        // save adds list after them, in the order it was given them.
-        // Upstream draws a random id per row on every save
-        // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`) and reads them
-        // back by `Id`, which shuffles a list of backdrops.
-        for image in changed {
-            // A changed file's metadata updates its own row; a new path/type
-            // gets a new row. The other images remain untouched.
-            let id = stored
-                .iter()
-                .position(|row| {
-                    row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
-                })
-                .map_or_else(
-                    || guid_to_db(Uuid::new_v4()),
-                    |index| stored.swap_remove(index).id,
-                );
-            sqlx::query(
-                r#"INSERT INTO "BaseItemImageInfos"
-                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                   ON CONFLICT("Id") DO UPDATE SET
-                     "Width" = excluded."Width", "Height" = excluded."Height",
-                     "Blurhash" = excluded."Blurhash", "DateModified" = excluded."DateModified""#,
-            )
-            .bind(id)
-            .bind(&item)
-            .bind(image_type_to_disc(image.image_type))
-            .bind(&image.path)
-            .bind(i64::from(image.width))
-            .bind(i64::from(image.height))
-            .bind(image.blur_hash.as_deref().map(str::as_bytes))
-            .bind(datetime_to_db(image.date_modified))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
-        for row in stored {
-            sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = ?1"#)
-                .bind(row.id)
-                .execute(&mut *tx)
+        write_item_images(&mut tx, item_id, images).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn save_items_images(
+        &self,
+        items: &[(Uuid, Vec<ItemImageInfo>)],
+    ) -> Result<(), ServiceError> {
+        // A chunk of items per transaction: one per item would be tens of
+        // thousands of commits on a guide's first refresh, and one for all of
+        // them would hold the single writer for the whole write.
+        for chunk in items.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let mut tx = self
+                .db
+                .writer()
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(db_err)?;
+            for (item_id, images) in chunk {
+                write_item_images(&mut tx, *item_id, images).await?;
+            }
+            tx.commit().await.map_err(db_err)?;
         }
-        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -6570,6 +6528,81 @@ async fn provider_id_sets(
     Ok(sets)
 }
 
+/// Replaces `item_id`'s image rows with `images` inside `tx`, keeping
+/// identical rows (see [`ItemPersistenceService::save_item_images`]).
+async fn write_item_images(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: Uuid,
+    images: &[ItemImageInfo],
+) -> Result<(), ServiceError> {
+    use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
+    let item = guid_to_db(item_id);
+    let mut stored = sqlx::query_as::<_, BaseItemImageInfoEntity>(
+        r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&item)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Preserve exact matches first, including their row ids and therefore
+    // the stable order of multiple Backdrops. Consume matches one-to-one
+    // so duplicate paths do not hide additions or removals.
+    let mut changed = Vec::new();
+    for image in images {
+        if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
+            stored.swap_remove(index);
+        } else {
+            changed.push(image);
+        }
+    }
+    // Every reader lists an item's images by type, then by `rowid`
+    // ([`image_rows`]), so kept rows keep their place and the images a
+    // save adds list after them, in the order it was given them.
+    // Upstream draws a random id per row on every save
+    // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`) and reads them
+    // back by `Id`, which shuffles a list of backdrops.
+    for image in changed {
+        // A changed file's metadata updates its own row; a new path/type
+        // gets a new row. The other images remain untouched.
+        let id = stored
+            .iter()
+            .position(|row| {
+                row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
+            })
+            .map_or_else(
+                || guid_to_db(Uuid::new_v4()),
+                |index| stored.swap_remove(index).id,
+            );
+        sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                   ON CONFLICT("Id") DO UPDATE SET
+                     "Width" = excluded."Width", "Height" = excluded."Height",
+                     "Blurhash" = excluded."Blurhash", "DateModified" = excluded."DateModified""#,
+            )
+            .bind(id)
+            .bind(&item)
+            .bind(image_type_to_disc(image.image_type))
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    for row in stored {
+        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = ?1"#)
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// The image rows of `ids`, each item's in the order every reader lists
 /// them: by type, then by `rowid` (insertion order). Upstream reads them by
 /// `Id` (`Include(e => e.Images!.OrderBy(i => i.Id))`,
@@ -9779,6 +9812,58 @@ mod tests {
             .await
             .unwrap();
         rows
+    }
+
+    /// The batched image write and read: each item gets its own list, in one
+    /// pass, and reads back keyed by item.
+    #[tokio::test]
+    async fn many_items_images_are_written_and_read_in_one_pass() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let repo = crate::item_repository::FerrofinItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let (one, two, bare) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for item in [one, two, bare] {
+            seed_item(&db, item, BaseItemKind::LiveTvProgram).await;
+        }
+        let image = |image_type, path: &str| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            ..ItemImageInfo::default()
+        };
+        svc.save_items_images(&[
+            (
+                one,
+                vec![
+                    image(ImageType::Primary, "http://img/1.png"),
+                    image(ImageType::Thumb, "http://img/1t.png"),
+                ],
+            ),
+            (two, vec![image(ImageType::Primary, "http://img/2.png")]),
+        ])
+        .await
+        .expect("write");
+        // A later write replaces only that item's list.
+        svc.save_items_images(&[(one, vec![image(ImageType::Primary, "http://img/1.png")])])
+            .await
+            .expect("rewrite");
+
+        let read = repo
+            .get_image_infos_batch(&[one, two, bare])
+            .await
+            .expect("read");
+        assert_eq!(read.len(), 2, "an item with no images is absent");
+        assert_eq!(read[&one], [image(ImageType::Primary, "http://img/1.png")]);
+        assert_eq!(
+            read[&two],
+            repo.get_image_infos(two).await.expect("one item")
+        );
     }
 
     #[allow(clippy::too_many_lines)]

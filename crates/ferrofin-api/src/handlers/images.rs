@@ -40,6 +40,8 @@
 //! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
 //! final while the on-disk pipeline is a later wave.
 
+use std::borrow::Cow;
+
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -409,16 +411,45 @@ fn select_image(
         .nth(usize::try_from(index).unwrap_or(0))
 }
 
-/// Serves one [`ItemImageInfo`]'s file, or a `404` when the file is remote or
-/// cannot be served.
+/// `image` with a local path: itself when local, else its downloaded copy
+/// (`ImageController.ConvertImageToLocal`), or a `404` when that fails.
+async fn local_image<'a>(
+    state: &AppState,
+    image: &'a ItemImageInfo,
+) -> Result<Cow<'a, ItemImageInfo>, ApiError> {
+    if image.is_local_file() {
+        return Ok(Cow::Borrowed(image));
+    }
+    let path = state
+        .providers
+        .cached_remote_image(&image.path)
+        .await
+        .map_err(|err| {
+            ApiError::NotFound(format!(
+                "remote image {:?} is unavailable: {err}",
+                image.image_type
+            ))
+        })?;
+    Ok(Cow::Owned(ItemImageInfo {
+        path,
+        ..image.clone()
+    }))
+}
+
+/// Serves one [`ItemImageInfo`]'s file, or a `404` when it cannot be served.
 ///
 /// This is the shared tail of every image route once an image row is resolved.
-/// A remote (`http(s)`) path has no local file to serve without the not-yet-ported
-/// image processor, so it is a `404` (the contract's not-found outcome).
+/// A remote (`http(s)`) row is served from its local copy, downloaded on first
+/// request: `ImageController`'s `if (!imageInfo.IsLocalFile) imageInfo =
+/// ConvertImageToLocal(...)`, through [`ProviderManager::cached_remote_image`]
+/// (which says why the row itself stays remote). One that cannot be
+/// downloaded is a `404` (upstream's exception is a `500`).
 ///
 /// `auto_orient` is `ImageProcessor.ProcessImage`'s photo flag: the image is
 /// turned upright from its EXIF orientation, so it goes through the processor
 /// even when nothing else is asked for, as upstream re-encodes it.
+///
+/// [`ProviderManager::cached_remote_image`]: ferrofin_traits::providers::ProviderManager::cached_remote_image
 pub(crate) async fn serve_image_file(
     state: &AppState,
     item_id: Uuid,
@@ -428,12 +459,14 @@ pub(crate) async fn serve_image_file(
     query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
-    if !image.is_local_file() || image.path.is_empty() {
+    if image.path.is_empty() {
         return Err(ApiError::NotFound(format!(
-            "no local file for image {:?}",
+            "no file for image {:?}",
             image.image_type
         )));
     }
+    let local = local_image(state, image).await?;
+    let image: &ItemImageInfo = &local;
 
     // Run the image through the processor for the requested resize/format. It
     // short-circuits to the original file when nothing is asked for (or the source
